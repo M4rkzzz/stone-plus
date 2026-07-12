@@ -3,7 +3,13 @@ export {
   RefreshAdapterError
 } from './errors'
 export { CredentialLifecycleResolver } from './resolver'
-export { deserializeChatGptCredential, parseChatGptAccountImport, serializeChatGptCredential } from './chatgpt-account'
+export {
+  chatGptAccessTokenOnlyWarning,
+  deserializeChatGptCredential,
+  matchesChatGptCredential,
+  parseChatGptAccountImport,
+  serializeChatGptCredential
+} from './chatgpt-account'
 export type { ChatGptCredentialBundle, ParsedChatGptAccounts } from './chatgpt-account'
 export type {
   ApiKeyCredentialRecord,

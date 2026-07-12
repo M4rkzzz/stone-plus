@@ -707,7 +707,13 @@ export function createMockApi(): GatewayApi {
         availableModels: [], modelPolicy: 'all', modelAllowlist: [], circuitState: 'closed', consecutiveFailures: 0, createdAt: timestamp, updatedAt: timestamp
       }
       snapshot.accounts.push(account)
-      return { snapshot: await changed(), importedAccountIds: [account.id], warnings: ['No refresh token'] }
+      return {
+        snapshot: await changed(),
+        importedAccountIds: [account.id],
+        createdAccountIds: [account.id],
+        updatedAccountIds: [],
+        warnings: ['No refresh token']
+      }
     },
     async deleteAccount(id: string) {
       if (snapshot.pools.some((pool) => pool.members.some((member) => member.accountId === id))) {

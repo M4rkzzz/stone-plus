@@ -32,7 +32,13 @@ import {
 } from './sqlite-state-store'
 import type { PersistedState } from './types'
 import { getProviderAdapter } from '../providers'
-import { deserializeChatGptCredential, parseChatGptAccountImport, serializeChatGptCredential } from '../auth'
+import {
+  chatGptAccessTokenOnlyWarning,
+  deserializeChatGptCredential,
+  matchesChatGptCredential,
+  parseChatGptAccountImport,
+  serializeChatGptCredential
+} from '../auth'
 
 const DEFAULT_GATEWAY: GatewaySettings = {
   host: '127.0.0.1',
@@ -313,25 +319,47 @@ export class AppStore {
     }
     const parsed = parseChatGptAccountImport(input.content)
     const importedAccountIds: string[] = []
+    const createdAccountIds: string[] = []
+    const updatedAccountIds: string[] = []
+    let accessTokenOnlyCount = 0
     const timestamp = Date.now()
     await this.store.update((state) => {
       for (const [index, bundle] of parsed.accounts.entries()) {
-        const existing = state.accounts.find((account) =>
-          account.credentialType === 'chatgpt-oauth' && account.chatgptAccountId === bundle.accountId)
+        let existing: Account | undefined
+        let existingBundle: ReturnType<typeof deserializeChatGptCredential> = undefined
+        for (const candidate of state.accounts) {
+          if (candidate.providerId !== provider.id || candidate.credentialType !== 'chatgpt-oauth') continue
+          const encrypted = state.credentials[candidate.credentialId]
+          const serialized = encrypted ? this.decrypt(encrypted) : undefined
+          const candidateBundle = serialized ? deserializeChatGptCredential(serialized) : undefined
+          if (!candidateBundle || !matchesChatGptCredential(bundle, candidateBundle)) continue
+          existing = candidate
+          existingBundle = candidateBundle
+          break
+        }
+        const credentialBundle = existingBundle?.refreshToken && !bundle.refreshToken
+          ? {
+              ...existingBundle,
+              ...bundle,
+              refreshToken: existingBundle.refreshToken,
+              idToken: bundle.idToken ?? existingBundle.idToken,
+              userId: bundle.userId ?? existingBundle.userId
+            }
+          : bundle
         const accountId = existing?.id ?? createId()
         const credentialId = existing?.credentialId ?? createId()
-        state.credentials[credentialId] = this.encrypt(serializeChatGptCredential(bundle))
+        state.credentials[credentialId] = this.encrypt(serializeChatGptCredential(credentialBundle))
         const account: Account = {
           id: accountId,
           providerId: provider.id,
-          name: requiredName(input.name?.trim() || bundle.email || `ChatGPT account ${index + 1}`, 'Account name'),
+          name: requiredName(input.name?.trim() || existing?.name || credentialBundle.email || `ChatGPT account ${index + 1}`, 'Account name'),
           credentialId,
-          maskedCredential: maskAccountId(bundle.accountId),
+          maskedCredential: maskAccountId(credentialBundle.accountId),
           credentialType: 'chatgpt-oauth',
-          chatgptAccountId: bundle.accountId,
-          credentialExpiresAt: bundle.expiresAt,
-          renewable: Boolean(bundle.refreshToken),
-          status: bundle.expiresAt <= timestamp ? 'expired' : 'active',
+          chatgptAccountId: credentialBundle.accountId,
+          credentialExpiresAt: credentialBundle.expiresAt,
+          renewable: Boolean(credentialBundle.refreshToken),
+          status: credentialBundle.expiresAt <= timestamp ? 'expired' : 'active',
           priority: existing?.priority ?? 10,
           weight: existing?.weight ?? 10,
           maxConcurrency: existing?.maxConcurrency ?? 4,
@@ -352,12 +380,28 @@ export class AppStore {
           createdAt: existing?.createdAt ?? timestamp,
           updatedAt: timestamp
         }
-        if (existing) replaceById(state.accounts, account)
-        else state.accounts.push(account)
+        if (existing) {
+          replaceById(state.accounts, account)
+          updatedAccountIds.push(accountId)
+        } else {
+          state.accounts.push(account)
+          createdAccountIds.push(accountId)
+        }
         importedAccountIds.push(accountId)
+        if (!credentialBundle.refreshToken) accessTokenOnlyCount += 1
       }
     })
-    return { snapshot: this.getSnapshot(), importedAccountIds, warnings: parsed.warnings }
+    const parsedAccessTokenWarning = chatGptAccessTokenOnlyWarning(parsed.accessTokenOnlyCount)
+    const warnings = parsed.warnings.filter((warning) => warning !== parsedAccessTokenWarning)
+    const finalAccessTokenWarning = chatGptAccessTokenOnlyWarning(accessTokenOnlyCount)
+    if (finalAccessTokenWarning) warnings.push(finalAccessTokenWarning)
+    return {
+      snapshot: this.getSnapshot(),
+      importedAccountIds,
+      createdAccountIds,
+      updatedAccountIds,
+      warnings
+    }
   }
 
   public async deleteAccount(id: string): Promise<AppSnapshot> {
@@ -1134,7 +1178,7 @@ function credentialSensitiveValues(decrypted: string, chatGptOAuth: boolean): st
   if (!chatGptOAuth) return [decrypted]
   const bundle = deserializeChatGptCredential(decrypted)
   return bundle
-    ? [decrypted, bundle.accessToken, bundle.accountId, bundle.refreshToken, bundle.idToken]
+    ? [decrypted, bundle.accessToken, bundle.accountId, bundle.userId, bundle.refreshToken, bundle.idToken]
       .filter((value): value is string => Boolean(value))
     : [decrypted]
 }

@@ -5,6 +5,7 @@ export interface ChatGptCredentialBundle {
   refreshToken?: string
   idToken?: string
   accountId: string
+  userId?: string
   email?: string
   expiresAt: number
 }
@@ -12,6 +13,7 @@ export interface ChatGptCredentialBundle {
 export interface ParsedChatGptAccounts {
   accounts: ChatGptCredentialBundle[]
   warnings: string[]
+  accessTokenOnlyCount: number
 }
 
 export function parseChatGptAccountImport(content: string, now = Date.now()): ParsedChatGptAccounts {
@@ -20,18 +22,21 @@ export function parseChatGptAccountImport(content: string, now = Date.now()): Pa
   const values = parseValues(trimmed)
   const accounts: ChatGptCredentialBundle[] = []
   const warnings: string[] = []
-  const seen = new Set<string>()
   for (const value of values) {
     const account = parseAccount(value)
     if (account.expiresAt <= now - 30_000) throw new Error('ChatGPT account access token has expired.')
-    const key = account.accountId || fingerprint(account.accessToken)
-    if (seen.has(key)) continue
-    seen.add(key)
+    const existingIndex = accounts.findIndex((existing) => matchesChatGptCredential(account, existing))
+    if (existingIndex >= 0) {
+      if (account.refreshToken) accounts[existingIndex] = account
+      continue
+    }
     accounts.push(account)
-    if (!account.refreshToken) warnings.push(`${account.email ?? maskAccountId(account.accountId)}: no refresh token; the account stops when its access token expires.`)
   }
   if (!accounts.length) throw new Error('No ChatGPT/Codex accounts were found in the import.')
-  return { accounts, warnings }
+  const accessTokenOnlyCount = accounts.filter((account) => !account.refreshToken).length
+  const accessTokenWarning = chatGptAccessTokenOnlyWarning(accessTokenOnlyCount)
+  if (accessTokenWarning) warnings.push(accessTokenWarning)
+  return { accounts, warnings, accessTokenOnlyCount }
 }
 
 export function serializeChatGptCredential(bundle: ChatGptCredentialBundle): string {
@@ -42,15 +47,24 @@ export function deserializeChatGptCredential(value: string): ChatGptCredentialBu
   try {
     const parsed = JSON.parse(value) as Partial<ChatGptCredentialBundle>
     if (!validString(parsed.accessToken) || !validString(parsed.accountId) || !validTimestamp(parsed.expiresAt)) return undefined
-    return {
+    const bundle: ChatGptCredentialBundle = {
       accessToken: parsed.accessToken.trim(), accountId: parsed.accountId.trim(), expiresAt: parsed.expiresAt,
       ...(validString(parsed.refreshToken) ? { refreshToken: parsed.refreshToken.trim() } : {}),
       ...(validString(parsed.idToken) ? { idToken: parsed.idToken.trim() } : {}),
+      ...(validString(parsed.userId) ? { userId: parsed.userId.trim() } : {}),
       ...(validString(parsed.email) ? { email: parsed.email.trim() } : {})
     }
+    const userId = chatGptUserId(bundle)
+    return userId && !bundle.userId ? { ...bundle, userId } : bundle
   } catch {
     return undefined
   }
+}
+
+export function chatGptAccessTokenOnlyWarning(count: number): string | undefined {
+  if (!Number.isInteger(count) || count <= 0) return undefined
+  const subject = count === 1 ? 'account has' : 'accounts have'
+  return `${count} imported ChatGPT ${subject} no refresh token and will stop when the access token expires.`
 }
 
 function parseValues(content: string): unknown[] {
@@ -71,7 +85,7 @@ function parseAccount(value: unknown): ChatGptCredentialBundle {
   if (!accessToken) throw new Error('ChatGPT account is missing access_token.')
   const claims = jwtClaims(accessToken)
   const auth = objectValue(claims?.['https://api.openai.com/auth'])
-  const accountId = firstString(object, ['account_id'], ['accountId'], ['account', 'id'], ['chatgpt_account_id'])
+  const accountId = firstString(object, ['chatgpt_account_id'], ['chatgptAccountId'], ['account_id'], ['accountId'], ['account', 'id'])
     ?? stringValue(auth?.chatgpt_account_id)
   if (!accountId) throw new Error('ChatGPT account is missing account_id.')
   const expiresAt = firstTimestamp(object, ['expired'], ['expires_at'], ['expiresAt'], ['expires'])
@@ -79,13 +93,92 @@ function parseAccount(value: unknown): ChatGptCredentialBundle {
   if (!expiresAt) throw new Error('ChatGPT account expiration could not be determined.')
   const refreshToken = firstString(object, ['refresh_token'], ['refreshToken'], ['tokens', 'refresh_token'])
   const idToken = firstString(object, ['id_token'], ['idToken'], ['tokens', 'id_token'])
+  const idClaims = idToken ? jwtClaims(idToken) : undefined
+  const idAuth = objectValue(idClaims?.['https://api.openai.com/auth'])
+  const userId = firstString(
+    object,
+    ['chatgpt_account_user_id'], ['chatgptAccountUserId'], ['chatgpt_user_id'], ['chatgptUserId'],
+    ['user_id'], ['userId'], ['user', 'id']
+  )
+    ?? firstString(auth, ['chatgpt_account_user_id'], ['chatgpt_user_id'], ['user_id'])
+    ?? stringValue(claims?.sub)
+    ?? firstString(idAuth, ['chatgpt_account_user_id'], ['chatgpt_user_id'], ['user_id'])
+    ?? stringValue(idClaims?.sub)
   const email = firstString(object, ['email'], ['user', 'email']) ?? stringValue(claims?.email)
   return {
     accessToken, accountId, expiresAt,
     ...(refreshToken ? { refreshToken } : {}),
     ...(idToken ? { idToken } : {}),
+    ...(userId ? { userId } : {}),
     ...(email ? { email } : {})
   }
+}
+
+/**
+ * Access-token-only cards are intentionally keyed by token fingerprint. Team
+ * workspaces can share account and user claims across otherwise distinct cards.
+ */
+export function matchesChatGptCredential(
+  incoming: ChatGptCredentialBundle,
+  stored: ChatGptCredentialBundle
+): boolean {
+  const storedKeys = new Set(chatGptStoredIdentityKeys(stored))
+  return chatGptImportIdentityKeys(incoming).some((key) =>
+    storedKeys.has(key) && !chatGptIdentityConflicts(key, incoming, stored))
+}
+
+function chatGptImportIdentityKeys(bundle: ChatGptCredentialBundle): string[] {
+  const accessKey = identityKey('access', bundle.accessToken)
+  return bundle.refreshToken ? chatGptStoredIdentityKeys(bundle) : [accessKey]
+}
+
+function chatGptStoredIdentityKeys(bundle: ChatGptCredentialBundle): string[] {
+  const keys: string[] = []
+  const userId = chatGptUserId(bundle)
+  const email = chatGptEmail(bundle)
+  if (userId) keys.push(identityKey('user', `${bundle.accountId}\0${userId}`))
+  else if (email) keys.push(identityKey('email', `${bundle.accountId}\0${email.toLowerCase()}`))
+  keys.push(identityKey('access', bundle.accessToken))
+  keys.push(identityKey('account', bundle.accountId))
+  return keys
+}
+
+function chatGptIdentityConflicts(
+  key: string,
+  incoming: ChatGptCredentialBundle,
+  stored: ChatGptCredentialBundle
+): boolean {
+  if (!key.startsWith('account:')) return false
+  const incomingUserId = chatGptUserId(incoming)
+  const storedUserId = chatGptUserId(stored)
+  return Boolean(incomingUserId && storedUserId && incomingUserId !== storedUserId)
+}
+
+function chatGptUserId(bundle: ChatGptCredentialBundle): string | undefined {
+  if (validString(bundle.userId)) return bundle.userId.trim()
+  for (const token of [bundle.accessToken, bundle.idToken]) {
+    if (!token) continue
+    const claims = jwtClaims(token)
+    const auth = objectValue(claims?.['https://api.openai.com/auth'])
+    const userId = firstString(auth, ['chatgpt_account_user_id'], ['chatgpt_user_id'], ['user_id'])
+      ?? stringValue(claims?.sub)
+    if (userId) return userId
+  }
+  return undefined
+}
+
+function chatGptEmail(bundle: ChatGptCredentialBundle): string | undefined {
+  if (validString(bundle.email)) return bundle.email.trim()
+  for (const token of [bundle.accessToken, bundle.idToken]) {
+    if (!token) continue
+    const email = stringValue(jwtClaims(token)?.email)
+    if (email) return email
+  }
+  return undefined
+}
+
+function identityKey(kind: 'user' | 'email' | 'access' | 'account', value: string): string {
+  return `${kind}:${fingerprint(value.trim())}`
 }
 
 function jwtClaims(token: string): Record<string, unknown> | undefined {
@@ -131,4 +224,3 @@ function numberValue(value: unknown): number | undefined {
 function validString(value: unknown): value is string { return typeof value === 'string' && Boolean(value.trim()) }
 function validTimestamp(value: unknown): value is number { return typeof value === 'number' && Number.isFinite(value) && value > 0 }
 function fingerprint(value: string): string { return createHash('sha256').update(value).digest('hex') }
-function maskAccountId(value: string): string { return value.length <= 4 ? '****' : `****${value.slice(-4)}` }

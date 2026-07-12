@@ -427,7 +427,7 @@ export function ProvidersView({
       const result = await api.importChatGptAccounts(chatGptImport)
       setChatGptImportOpen(false)
       setChatGptImport({ ...chatGptImport, content: '' })
-      setImportNotice(`已导入 ${result.importedAccountIds.length} 个 ChatGPT/Codex 账号${result.warnings.length ? `；${result.warnings.join(' ')}` : ''}`)
+      setImportNotice(`导入完成：新增 ${result.createdAccountIds.length} 个，更新 ${result.updatedAccountIds.length} 个 ChatGPT/Codex 账号${result.warnings.length ? `；${result.warnings.join(' ')}` : ''}`)
     } catch (cause) {
       setErrors({ chatgptImport: cause instanceof Error ? cause.message : 'ChatGPT 账号导入失败' })
     }

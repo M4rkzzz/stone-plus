@@ -451,6 +451,8 @@ export interface ChatGptAccountImportInput {
 export interface ChatGptAccountImportResult {
   snapshot: AppSnapshot
   importedAccountIds: string[]
+  createdAccountIds: string[]
+  updatedAccountIds: string[]
   warnings: string[]
 }
 

@@ -23,6 +23,19 @@ import {
 } from '../../src/main/store/sqlite-state-store'
 import type { PersistedState } from '../../src/main/store/types'
 
+function chatGptAccessToken(exp: number, accountId: string, userId: string): string {
+  return ['header', Buffer.from(JSON.stringify({
+    exp,
+    sub: userId,
+    'https://api.openai.com/auth': {
+      chatgpt_account_id: accountId,
+      chatgpt_account_user_id: userId,
+      chatgpt_user_id: userId,
+      user_id: userId
+    }
+  })).toString('base64url'), 'signature'].join('.')
+}
+
 describe('AppStore', () => {
   let directory: string
   const stores: AppStore[] = []
@@ -515,6 +528,75 @@ describe('AppStore', () => {
     expect(imported.warnings).toHaveLength(1)
   })
 
+  it('keeps access-token-only cards in one workspace separate across batch and repeated imports', async () => {
+    const store = createStore()
+    await store.initialize()
+    const expiresAtSeconds = Math.floor(Date.now() / 1000) + 3600
+    const sharedAccountId = 'acct-shared-workspace'
+    const entries = [
+      {
+        access_token: chatGptAccessToken(expiresAtSeconds, sharedAccountId, 'principal-private-a'),
+        account_id: sharedAccountId,
+        email: 'member-a@example.com'
+      },
+      {
+        access_token: chatGptAccessToken(expiresAtSeconds, sharedAccountId, 'principal-private-b'),
+        account_id: sharedAccountId,
+        email: 'member-b@example.com'
+      }
+    ]
+    const content = JSON.stringify(entries)
+
+    const first = await store.importChatGptAccounts({
+      providerId: 'provider-openai',
+      content: JSON.stringify(entries[0])
+    })
+    expect(first.createdAccountIds).toHaveLength(1)
+    expect(first.updatedAccountIds).toEqual([])
+    expect(first.importedAccountIds).toEqual(first.createdAccountIds)
+    expect(first.snapshot.accounts).toHaveLength(1)
+
+    const second = await store.importChatGptAccounts({
+      providerId: 'provider-openai',
+      content: JSON.stringify(entries[1])
+    })
+    expect(second.createdAccountIds).toHaveLength(1)
+    expect(second.updatedAccountIds).toEqual([])
+    expect(second.snapshot.accounts).toHaveLength(2)
+    expect(second.snapshot.accounts.map((account) => account.name)).toEqual([
+      'member-a@example.com',
+      'member-b@example.com'
+    ])
+    expect(JSON.stringify(second.snapshot)).not.toContain('principal-private')
+
+    const repeated = await store.importChatGptAccounts({ providerId: 'provider-openai', content })
+    const importedIds = [...first.createdAccountIds, ...second.createdAccountIds]
+    expect(repeated.createdAccountIds).toEqual([])
+    expect(new Set(repeated.updatedAccountIds)).toEqual(new Set(importedIds))
+    expect(repeated.snapshot.accounts).toHaveLength(2)
+
+    const withSecondProvider = await store.saveProvider({
+      name: 'Second OpenAI Responses',
+      kind: 'openai',
+      baseUrl: 'https://api.openai.com/v1',
+      protocol: 'openai-responses',
+      models: []
+    })
+    const secondProvider = withSecondProvider.providers.find((provider) => provider.name === 'Second OpenAI Responses')!
+    const crossProvider = await store.importChatGptAccounts({
+      providerId: secondProvider.id,
+      content: JSON.stringify(entries[0])
+    })
+    expect(crossProvider.createdAccountIds).toHaveLength(1)
+    expect(crossProvider.updatedAccountIds).toEqual([])
+    expect(crossProvider.snapshot.accounts).toHaveLength(3)
+
+    await store.close()
+    const restarted = createStore()
+    await restarted.initialize()
+    expect(restarted.getSnapshot().accounts).toHaveLength(3)
+  })
+
   it('allows OAuth accounts to bind a proxy and preserves the binding when reimported', async () => {
     const store = createStore()
     await store.initialize()
@@ -528,10 +610,15 @@ describe('AppStore', () => {
     })
     const proxyId = withProxy.proxies[0].id
     const accountId = 'acct-oauth-proxy-binding'
+    const firstAccessToken = chatGptAccessToken(
+      Math.floor(Date.now() / 1000) + 3600,
+      accountId,
+      'proxy-bound-principal'
+    )
     const first = await store.importChatGptAccounts({
       providerId: 'provider-openai',
       content: JSON.stringify({
-        access_token: 'oauth-access-before-reimport',
+        access_token: firstAccessToken,
         refresh_token: 'oauth-refresh-before-reimport',
         account_id: accountId,
         email: 'before@example.com',
@@ -556,7 +643,11 @@ describe('AppStore', () => {
       maxConcurrency: 3
     })
 
-    const secondAccessToken = 'oauth-access-after-reimport'
+    const secondAccessToken = chatGptAccessToken(
+      Math.floor(Date.now() / 1000) + 7200,
+      accountId,
+      'proxy-bound-principal'
+    )
     const secondRefreshToken = 'oauth-refresh-after-reimport'
     const reimported = await store.importChatGptAccounts({
       providerId: 'provider-openai',
@@ -570,7 +661,26 @@ describe('AppStore', () => {
     })
     const account = reimported.snapshot.accounts.find((candidate) => candidate.id === imported.id)!
     expect(reimported.importedAccountIds).toEqual([imported.id])
+    expect(reimported.createdAccountIds).toEqual([])
+    expect(reimported.updatedAccountIds).toEqual([imported.id])
     expect(account).toMatchObject({ proxyId, priority: 7, weight: 8, maxConcurrency: 3 })
+    expect(store.getChatGptCredential(store.getRuntimeAccount(account.id)!.credentialId)).toMatchObject({
+      accessToken: secondAccessToken,
+      refreshToken: secondRefreshToken,
+      accountId
+    })
+
+    const accessOnlyReimport = await store.importChatGptAccounts({
+      providerId: 'provider-openai',
+      content: JSON.stringify({
+        access_token: secondAccessToken,
+        account_id: accountId,
+        email: 'access-only@example.com',
+        expired: new Date(Date.now() + 7_200_000).toISOString()
+      })
+    })
+    expect(accessOnlyReimport.updatedAccountIds).toEqual([imported.id])
+    expect(accessOnlyReimport.warnings).toEqual([])
     expect(store.getChatGptCredential(store.getRuntimeAccount(account.id)!.credentialId)).toMatchObject({
       accessToken: secondAccessToken,
       refreshToken: secondRefreshToken,
