@@ -969,6 +969,30 @@ export function createMockApi(): GatewayApi {
       return changed()
     },
     async rebuildOutboundConnections() {},
+    async runNetworkDiagnostics(input = {}) {
+      await pause(700)
+      const startedAt = Date.now() - 680
+      const proxy = input.proxyId ? snapshot.proxies.find((candidate) => candidate.id === input.proxyId) : undefined
+      const usingProxy = Boolean(proxy)
+      return {
+        startedAt,
+        finishedAt: Date.now(),
+        route: usingProxy
+          ? { kind: 'proxy' as const, name: proxy!.name, proxyId: proxy!.id }
+          : { kind: 'direct' as const, name: '直连' },
+        summary: 'success' as const,
+        results: [
+          { id: 'dns-chatgpt', label: 'DNS 解析', target: 'chatgpt.com', kind: 'dns' as const, status: usingProxy ? 'skipped' as const : 'success' as const, latencyMs: usingProxy ? 0 : 18, message: usingProxy ? '代理模式下由代理节点处理域名解析。' : '已解析 2 个地址', addresses: usingProxy ? undefined : ['104.18.32.47', '172.64.155.209'] },
+          { id: 'tls-chatgpt', label: 'TLS 握手', target: 'chatgpt.com:443', kind: 'tls' as const, status: usingProxy ? 'skipped' as const : 'success' as const, latencyMs: usingProxy ? 0 : 96, message: usingProxy ? '代理模式下由代理链路建立目标连接。' : '握手成功 · TLSv1.3' },
+          { id: 'chatgpt-web', label: 'ChatGPT 网站', target: 'chatgpt.com/', kind: 'http' as const, status: 'success' as const, latencyMs: 182, httpStatus: 200, message: '连接成功 · HTTP 200' },
+          { id: 'codex-models', label: 'Codex 模型接口', target: 'chatgpt.com/backend-api/codex/models', kind: 'http' as const, status: 'success' as const, latencyMs: 224, httpStatus: 401, message: '接口可达 · 未携带账号凭据，HTTP 401 属预期响应' },
+          { id: 'codex-usage', label: 'Codex 额度接口', target: 'chatgpt.com/backend-api/wham/usage', kind: 'http' as const, status: 'success' as const, latencyMs: 238, httpStatus: 401, message: '接口可达 · 未携带账号凭据，HTTP 401 属预期响应' },
+          { id: 'openai-api', label: 'OpenAI API', target: 'api.openai.com/v1/models', kind: 'http' as const, status: 'success' as const, latencyMs: 206, httpStatus: 401, message: '接口可达 · 未携带账号凭据，HTTP 401 属预期响应' },
+          { id: 'openai-auth', label: 'OpenAI OAuth', target: 'auth.openai.com/.well-known/openid-configuration', kind: 'http' as const, status: 'success' as const, latencyMs: 194, httpStatus: 200, message: '连接成功 · HTTP 200' },
+        ],
+        diagnoses: ['基础网络链路正常。若账号请求仍失败，优先检查凭据有效期、账号权限、额度和模型访问资格。']
+      }
+    },
     async checkAccount(id: string) {
       snapshot.accounts = snapshot.accounts.map((account) =>
         account.id === id ? { ...account, status: 'checking', updatedAt: Date.now() } : account,

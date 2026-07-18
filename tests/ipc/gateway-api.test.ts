@@ -79,6 +79,28 @@ describe('refresh provider models IPC', () => {
     expect(harness.store.importChatGptAccounts).not.toHaveBeenCalled()
   })
 
+  it('runs fixed network diagnostics through the selected Stone proxy', async () => {
+    const proxy = testProxy()
+    const upstreamFetch = vi.fn(async () => new Response(null, { status: 401 }))
+    const harness = createHarness([oauthAccount()], {}, upstreamFetch, [proxy])
+    const handler = electron.handlers.get('stone:run-network-diagnostics')
+    if (!handler) throw new Error('run-network-diagnostics handler was not registered')
+    const mainFrame = { url: 'http://127.0.0.1:5173/index.html' }
+
+    const report = await handler(
+      { senderFrame: mainFrame, sender: { mainFrame } },
+      { proxyId: proxy.id }
+    ) as { route: { kind: string; proxyId?: string }; results: Array<{ kind: string; status: string }> }
+
+    expect(report.route).toEqual({ kind: 'proxy', name: proxy.name, proxyId: proxy.id })
+    expect(report.results.slice(0, 2)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'dns', status: 'skipped' }),
+      expect.objectContaining({ kind: 'tls', status: 'skipped' })
+    ]))
+    expect(upstreamFetch).toHaveBeenCalledTimes(5)
+    expect(harness.transport.fetchFor).toHaveBeenCalledWith(proxy, undefined)
+  })
+
   it('detects a pasted batch through the final selected account proxy', async () => {
     const oauth = oauthAccount()
     const proxy = testProxy()

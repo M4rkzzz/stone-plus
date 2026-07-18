@@ -24,6 +24,7 @@ const stone: GatewayApi = {
   startGateway: () => ipcRenderer.invoke('stone:start-gateway'),
   stopGateway: () => ipcRenderer.invoke('stone:stop-gateway'),
   rebuildOutboundConnections: () => ipcRenderer.invoke('stone:rebuild-outbound-connections'),
+  runNetworkDiagnostics: (input) => ipcRenderer.invoke('stone:run-network-diagnostics', input),
   checkAccount: (id) => ipcRenderer.invoke('stone:check-account', id),
   refreshAccountCodexQuota: (id) => ipcRenderer.invoke('stone:refresh-account-codex-quota', id),
   getAccountCodexQuotaHistory: (id, from, to) => ipcRenderer.invoke('stone:get-account-codex-quota-history', id, from, to),

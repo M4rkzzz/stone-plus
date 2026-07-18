@@ -28,6 +28,7 @@ import type { PersistedState } from '../store/types'
 import { serializeDiagnostics } from './diagnostics'
 import { assertTrustedSender } from './trusted-sender'
 import { OutboundTransportManager, probeProxy, resolveEffectiveProxy } from '../proxy'
+import { runNetworkDiagnostics } from '../network-diagnostics'
 
 export interface GatewayController {
   start(settings?: GatewaySettings): Promise<void>
@@ -636,6 +637,23 @@ export function registerGatewayApi(
   ipcMain.handle('stone:rebuild-outbound-connections', async (event) => {
     assertTrustedSender(event)
     await rebuildGatewayConnections(store, outboundTransport)
+  })
+  ipcMain.handle('stone:run-network-diagnostics', async (event, input: Parameters<GatewayApi['runNetworkDiagnostics']>[0] = {}) => {
+    assertTrustedSender(event)
+    if (!input || typeof input !== 'object') throw new Error('Network diagnostic options are invalid.')
+    const proxyId = typeof input.proxyId === 'string' && input.proxyId.trim() ? input.proxyId.trim() : undefined
+    const proxy = proxyId ? store.getSnapshot().proxies.find((candidate) => candidate.id === proxyId) : undefined
+    if (proxyId && !proxy) throw new Error('The selected proxy no longer exists.')
+    const fetchImplementation = outboundTransport.fetchFor(
+      proxy,
+      proxy ? store.getProxyPassword(proxy.id) : undefined
+    )
+    return runNetworkDiagnostics({
+      fetchImplementation,
+      route: proxy
+        ? { kind: 'proxy', name: proxy.name, proxyId: proxy.id }
+        : { kind: 'direct', name: '直连' }
+    })
   })
   ipcMain.handle('stone:check-account', async (event, id: string) => {
     assertTrustedSender(event)

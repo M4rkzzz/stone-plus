@@ -783,6 +783,38 @@ export interface CodexSessionRepairResult {
   retentionWarning?: string
 }
 
+export type NetworkDiagnosticStatus = 'success' | 'warning' | 'error' | 'skipped'
+
+export interface NetworkDiagnosticInput {
+  proxyId?: string
+}
+
+export interface NetworkDiagnosticTargetResult {
+  id: string
+  label: string
+  target: string
+  kind: 'dns' | 'tls' | 'http'
+  status: NetworkDiagnosticStatus
+  latencyMs: number
+  message: string
+  httpStatus?: number
+  addresses?: string[]
+  errorCode?: string
+}
+
+export interface NetworkDiagnosticReport {
+  startedAt: number
+  finishedAt: number
+  route: {
+    kind: 'direct' | 'proxy'
+    name: string
+    proxyId?: string
+  }
+  summary: NetworkDiagnosticStatus
+  results: NetworkDiagnosticTargetResult[]
+  diagnoses: string[]
+}
+
 export interface GatewayApi {
   getSnapshot(): Promise<AppSnapshot>
   saveProvider(input: ProviderInput): Promise<AppSnapshot>
@@ -806,6 +838,7 @@ export interface GatewayApi {
   startGateway(): Promise<AppSnapshot>
   stopGateway(): Promise<AppSnapshot>
   rebuildOutboundConnections(): Promise<void>
+  runNetworkDiagnostics(input?: NetworkDiagnosticInput): Promise<NetworkDiagnosticReport>
   checkAccount(id: string): Promise<AppSnapshot>
   refreshAccountCodexQuota(id: string): Promise<AppSnapshot>
   getAccountCodexQuotaHistory(id: string, from?: number, to?: number): Promise<CodexQuotaHistoryPoint[]>

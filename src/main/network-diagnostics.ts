@@ -1,0 +1,283 @@
+import { lookup } from 'node:dns/promises'
+import { connect as connectTls } from 'node:tls'
+import type {
+  NetworkDiagnosticReport,
+  NetworkDiagnosticStatus,
+  NetworkDiagnosticTargetResult
+} from '../shared/types'
+
+const TEST_TIMEOUT_MS = 10_000
+const CHATGPT_HOST = 'chatgpt.com'
+
+export const NETWORK_DIAGNOSTIC_HTTP_TARGETS = Object.freeze([
+  { id: 'chatgpt-web', label: 'ChatGPT 网站', url: 'https://chatgpt.com/' },
+  { id: 'codex-models', label: 'Codex 模型接口', url: 'https://chatgpt.com/backend-api/codex/models?client_version=0.144.3' },
+  { id: 'codex-usage', label: 'Codex 额度接口', url: 'https://chatgpt.com/backend-api/wham/usage' },
+  { id: 'openai-api', label: 'OpenAI API', url: 'https://api.openai.com/v1/models' },
+  { id: 'openai-auth', label: 'OpenAI OAuth', url: 'https://auth.openai.com/.well-known/openid-configuration' }
+])
+
+type FetchImplementation = (input: string, init?: RequestInit) => Promise<Response>
+
+export interface NetworkDiagnosticOptions {
+  fetchImplementation: FetchImplementation
+  route: NetworkDiagnosticReport['route']
+  now?: () => number
+  lookupImplementation?: typeof lookup
+  tlsProbe?: (hostname: string, timeoutMs: number) => Promise<string>
+}
+
+export async function runNetworkDiagnostics(options: NetworkDiagnosticOptions): Promise<NetworkDiagnosticReport> {
+  const now = options.now ?? (() => Date.now())
+  const startedAt = now()
+  const direct = options.route.kind === 'direct'
+  const infrastructure = direct
+    ? await Promise.all([
+        probeDns(options.lookupImplementation ?? lookup, now),
+        probeTls(options.tlsProbe ?? defaultTlsProbe, now)
+      ])
+    : [
+        skippedResult('dns-chatgpt', 'DNS 解析', CHATGPT_HOST, '代理模式下由代理节点处理域名解析。'),
+        skippedResult('tls-chatgpt', 'TLS 握手', `${CHATGPT_HOST}:443`, '代理模式下由代理链路建立目标连接。')
+      ]
+  const httpResults = await Promise.all(NETWORK_DIAGNOSTIC_HTTP_TARGETS.map((target) =>
+    probeHttp(options.fetchImplementation, target, now)))
+  const results = [...infrastructure, ...httpResults]
+  return {
+    startedAt,
+    finishedAt: now(),
+    route: options.route,
+    summary: summarize(results),
+    results,
+    diagnoses: diagnose(results, options.route)
+  }
+}
+
+async function probeDns(
+  lookupImplementation: typeof lookup,
+  now: () => number
+): Promise<NetworkDiagnosticTargetResult> {
+  const startedAt = now()
+  try {
+    const records = await withTimeout(
+      lookupImplementation(CHATGPT_HOST, { all: true, verbatim: true }),
+      TEST_TIMEOUT_MS,
+      'DNS_TIMEOUT'
+    )
+    const addresses = [...new Set(records.map((record) => record.address))].slice(0, 6)
+    if (addresses.length === 0) throw diagnosticError('DNS_EMPTY', 'DNS 未返回地址')
+    return {
+      id: 'dns-chatgpt', label: 'DNS 解析', target: CHATGPT_HOST, kind: 'dns', status: 'success',
+      latencyMs: elapsed(startedAt, now()), addresses,
+      message: `已解析 ${addresses.length} 个地址`
+    }
+  } catch (error) {
+    return failedResult('dns-chatgpt', 'DNS 解析', CHATGPT_HOST, 'dns', startedAt, now(), error)
+  }
+}
+
+async function probeTls(
+  tlsProbe: (hostname: string, timeoutMs: number) => Promise<string>,
+  now: () => number
+): Promise<NetworkDiagnosticTargetResult> {
+  const startedAt = now()
+  try {
+    const protocol = await tlsProbe(CHATGPT_HOST, TEST_TIMEOUT_MS)
+    return {
+      id: 'tls-chatgpt', label: 'TLS 握手', target: `${CHATGPT_HOST}:443`, kind: 'tls', status: 'success',
+      latencyMs: elapsed(startedAt, now()), message: `握手成功${protocol ? ` · ${protocol}` : ''}`
+    }
+  } catch (error) {
+    return failedResult('tls-chatgpt', 'TLS 握手', `${CHATGPT_HOST}:443`, 'tls', startedAt, now(), error)
+  }
+}
+
+async function probeHttp(
+  fetchImplementation: FetchImplementation,
+  target: (typeof NETWORK_DIAGNOSTIC_HTTP_TARGETS)[number],
+  now: () => number
+): Promise<NetworkDiagnosticTargetResult> {
+  const startedAt = now()
+  try {
+    const response = await fetchImplementation(target.url, {
+      method: 'GET',
+      headers: {
+        Accept: 'application/json, text/html;q=0.8, */*;q=0.5',
+        'User-Agent': 'StonePlus-NetworkDiagnostics/1.0'
+      },
+      redirect: 'follow',
+      signal: AbortSignal.timeout(TEST_TIMEOUT_MS)
+    })
+    await response.body?.cancel().catch(() => undefined)
+    const status = httpDiagnosticStatus(response.status)
+    return {
+      id: target.id,
+      label: target.label,
+      target: displayTarget(target.url),
+      kind: 'http',
+      status,
+      latencyMs: elapsed(startedAt, now()),
+      httpStatus: response.status,
+      message: httpStatusMessage(response.status, status)
+    }
+  } catch (error) {
+    return failedResult(target.id, target.label, displayTarget(target.url), 'http', startedAt, now(), error)
+  }
+}
+
+function defaultTlsProbe(hostname: string, timeoutMs: number): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const socket = connectTls({ host: hostname, port: 443, servername: hostname, rejectUnauthorized: true })
+    const timer = setTimeout(() => {
+      socket.destroy()
+      reject(diagnosticError('TLS_TIMEOUT', 'TLS handshake timed out'))
+    }, timeoutMs)
+    timer.unref?.()
+    const cleanup = (): void => clearTimeout(timer)
+    socket.once('secureConnect', () => {
+      cleanup()
+      const protocol = socket.getProtocol() ?? ''
+      socket.end()
+      resolve(protocol)
+    })
+    socket.once('error', (error) => {
+      cleanup()
+      reject(error)
+    })
+  })
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, code: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  return Promise.race([
+    promise,
+    new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(diagnosticError(code, 'Operation timed out')), timeoutMs)
+      timer.unref?.()
+    })
+  ]).finally(() => {
+    if (timer) clearTimeout(timer)
+  })
+}
+
+function failedResult(
+  id: string,
+  label: string,
+  target: string,
+  kind: NetworkDiagnosticTargetResult['kind'],
+  startedAt: number,
+  finishedAt: number,
+  error: unknown
+): NetworkDiagnosticTargetResult {
+  const code = errorCode(error)
+  return {
+    id, label, target, kind, status: 'error', latencyMs: elapsed(startedAt, finishedAt),
+    errorCode: code,
+    message: failureMessage(code)
+  }
+}
+
+function skippedResult(id: string, label: string, target: string, message: string): NetworkDiagnosticTargetResult {
+  return { id, label, target, kind: id.startsWith('dns-') ? 'dns' : 'tls', status: 'skipped', latencyMs: 0, message }
+}
+
+function httpDiagnosticStatus(status: number): NetworkDiagnosticStatus {
+  if (status === 403 || status === 429 || status >= 500) return 'warning'
+  return status >= 100 && status < 500 ? 'success' : 'error'
+}
+
+function httpStatusMessage(status: number, diagnosticStatus: NetworkDiagnosticStatus): string {
+  if (status === 401) return '接口可达 · 未携带账号凭据，HTTP 401 属预期响应'
+  if (status === 403) return '接口可达 · HTTP 403，可能受出口地区、WAF 或访问策略限制'
+  if (status === 429) return '接口可达 · HTTP 429，当前出口 IP 受到频率限制'
+  if (status >= 500) return `接口可达，但上游服务返回 HTTP ${status}`
+  return diagnosticStatus === 'success' ? `连接成功 · HTTP ${status}` : `返回 HTTP ${status}`
+}
+
+function diagnose(
+  results: NetworkDiagnosticTargetResult[],
+  route: NetworkDiagnosticReport['route']
+): string[] {
+  const diagnoses: string[] = []
+  const byId = new Map(results.map((result) => [result.id, result]))
+  const http = results.filter((result) => result.kind === 'http')
+  const failedHttp = http.filter((result) => result.status === 'error')
+  const codes = results.map((result) => result.errorCode ?? '')
+  if (byId.get('dns-chatgpt')?.status === 'error') {
+    diagnoses.push('本机无法解析 chatgpt.com：优先检查 DNS、TUN 模式、hosts 文件和安全软件的域名过滤。')
+  }
+  if (byId.get('tls-chatgpt')?.status === 'error') {
+    diagnoses.push('TLS 握手失败：检查系统时间、HTTPS 证书拦截、防火墙和代理软件的 TLS/SNI 支持。')
+  }
+  if (codes.some((code) => /TIMEOUT/i.test(code))) {
+    diagnoses.push('存在连接超时：常见原因是节点不可用、链路拥塞、目标被阻断或代理规则没有命中。')
+  }
+  if (codes.some((code) => /ECONNRESET|EPIPE|UND_ERR_SOCKET/i.test(code))) {
+    diagnoses.push('连接被中途重置：检查代理节点稳定性、防火墙、杀毒软件和 TLS 分流规则。')
+  }
+  const chatGptFailed = ['chatgpt-web', 'codex-models', 'codex-usage']
+    .every((id) => byId.get(id)?.status === 'error')
+  if (chatGptFailed && byId.get('openai-api')?.status !== 'error') {
+    diagnoses.push('OpenAI API 可达但 ChatGPT/Codex 域名不可达：检查 chatgpt.com 的单独分流、出口地区或域名阻断。')
+  }
+  if (byId.get('openai-auth')?.status === 'error' && http.some((result) => result.id !== 'openai-auth' && result.status !== 'error')) {
+    diagnoses.push('业务接口可达但 OAuth 域名不可达：ChatGPT Access Token 到期后将无法自动续期，请检查 auth.openai.com 分流。')
+  }
+  if (http.some((result) => result.httpStatus === 403)) {
+    diagnoses.push('HTTP 403 表示网络已到达目标，但出口地区、代理 IP 信誉、WAF 或账号访问策略可能受限。')
+  }
+  if (http.some((result) => result.httpStatus === 429)) {
+    diagnoses.push('HTTP 429 表示目标可达，但当前出口 IP 被限频；更换节点或等待限制窗口恢复。')
+  }
+  if (failedHttp.length === http.length) {
+    diagnoses.push(route.kind === 'proxy'
+      ? `所选代理“${route.name}”无法访问全部 GPT 端点：检查代理地址、认证、节点状态和出站规则。`
+      : '全部 GPT HTTP 端点均不可达：检查系统代理/TUN、DNS、防火墙及当前网络是否允许访问 OpenAI。')
+  }
+  if (diagnoses.length === 0) {
+    diagnoses.push('基础网络链路正常。若账号请求仍失败，优先检查凭据有效期、账号权限、额度和模型访问资格。')
+  }
+  return [...new Set(diagnoses)].slice(0, 8)
+}
+
+function summarize(results: NetworkDiagnosticTargetResult[]): NetworkDiagnosticStatus {
+  const http = results.filter((result) => result.kind === 'http')
+  if (http.length > 0 && http.every((result) => result.status === 'error')) return 'error'
+  if (results.some((result) => result.status === 'error' || result.status === 'warning')) return 'warning'
+  return 'success'
+}
+
+function displayTarget(value: string): string {
+  const url = new URL(value)
+  return `${url.hostname}${url.pathname}`
+}
+
+function elapsed(startedAt: number, finishedAt: number): number {
+  return Math.max(0, finishedAt - startedAt)
+}
+
+function diagnosticError(code: string, message: string): Error & { code: string } {
+  return Object.assign(new Error(message), { code })
+}
+
+function errorCode(error: unknown): string {
+  if (!error || typeof error !== 'object') return 'UNKNOWN'
+  const direct = 'code' in error && typeof error.code === 'string' ? error.code : undefined
+  const cause = 'cause' in error && error.cause && typeof error.cause === 'object'
+    && 'code' in error.cause && typeof error.cause.code === 'string' ? error.cause.code : undefined
+  const name = 'name' in error && typeof error.name === 'string' ? error.name : undefined
+  const message = 'message' in error && typeof error.message === 'string' ? error.message : ''
+  if (direct) return direct.slice(0, 80)
+  if (cause) return cause.slice(0, 80)
+  if (/abort|timeout/i.test(`${name ?? ''} ${message}`)) return 'TIMEOUT'
+  return (name || 'UNKNOWN').slice(0, 80)
+}
+
+function failureMessage(code: string): string {
+  if (/ENOTFOUND|EAI_AGAIN|DNS/i.test(code)) return `域名解析失败 · ${code}`
+  if (/CERT|TLS|SSL|SELF_SIGNED/i.test(code)) return `TLS/证书校验失败 · ${code}`
+  if (/TIMEOUT|UND_ERR_CONNECT_TIMEOUT/i.test(code)) return `连接超时 · ${code}`
+  if (/ECONNREFUSED/i.test(code)) return `连接被拒绝 · ${code}`
+  if (/ECONNRESET|EPIPE|UND_ERR_SOCKET/i.test(code)) return `连接被重置 · ${code}`
+  return `连接失败 · ${code}`
+}
