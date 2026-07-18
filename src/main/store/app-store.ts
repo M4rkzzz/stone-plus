@@ -3,6 +3,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { isAbsolute, join, normalize } from 'node:path'
 import { valid as validSemver } from 'semver'
 import { clientNativeProtocols } from '@shared/types'
+import { summarizeOpenAiTokenCosts } from '@shared/openai-pricing'
 import type {
   Account,
   AccountCodexQuotaSnapshot,
@@ -12,6 +13,8 @@ import type {
   ClientConfigProfile,
   ClientConfigProfileInput,
   ChatGptAccountExportFormat,
+  ChatGptAccountImportInput,
+  ChatGptAccountImportProxyMode,
   CodexQuotaHistoryPoint,
   GatewaySettings,
   GatewayStatus,
@@ -166,7 +169,8 @@ export class AppStore {
       last24Hours: summarizeObservability(state.requestLogs, now - 24 * 60 * 60 * 1000, now),
       last7Days: summarizeObservability(state.requestLogs, now - 7 * 24 * 60 * 60 * 1000, now),
       hourly: summarizeHourly(state.requestLogs, now),
-      tokenRates: summarizeTokenRates(state.requestLogs, now)
+      tokenRates: summarizeTokenRates(state.requestLogs, now),
+      tokenCosts: summarizeOpenAiTokenCosts(state.requestLogs, now)
     }))
     this.observabilityCache = {
       revision: this.requestLogRevision,
@@ -390,7 +394,7 @@ export class AppStore {
     return this.getSnapshot()
   }
 
-  public async importChatGptAccounts(input: { providerId: string; content: string; name?: string }) {
+  public async importChatGptAccounts(input: ChatGptAccountImportInput) {
     const provider = this.store.read().providers.find((candidate) => candidate.id === input.providerId)
     if (!provider) throw new Error('Choose an existing provider before importing ChatGPT accounts.')
     if (provider.kind !== 'openai' || provider.protocol !== 'openai-responses') {
@@ -401,8 +405,10 @@ export class AppStore {
     const createdAccountIds: string[] = []
     const updatedAccountIds: string[] = []
     let accessTokenOnlyCount = 0
+    let ignoredFileProxyCount = 0
     const timestamp = Date.now()
     await this.store.update((state) => {
+      const proxySelection = normalizeAccountImportProxySelection(input.proxyMode, input.proxyId, state.proxies)
       for (const [index, bundle] of parsed.accounts.entries()) {
         let existing: Account | undefined
         let existingBundle: ReturnType<typeof deserializeChatGptCredential> = undefined
@@ -427,6 +433,9 @@ export class AppStore {
           : bundle
         const accountId = existing?.id ?? createId()
         const credentialId = existing?.credentialId ?? createId()
+        const fileProxyId = parsed.proxyIds[index]
+        const proxyId = resolveImportedAccountProxyId(proxySelection, fileProxyId, state.proxies)
+        if (proxySelection.mode === 'preserve' && fileProxyId && !proxyId) ignoredFileProxyCount += 1
         state.credentials[credentialId] = this.encrypt(serializeChatGptCredential(credentialBundle))
         const account: Account = {
           id: accountId,
@@ -447,7 +456,7 @@ export class AppStore {
           modelsRefreshedAt: existing?.modelsRefreshedAt,
           modelPolicy: existing?.modelPolicy ?? (existing?.modelAllowlist.length ? 'selected' : 'all'),
           modelAllowlist: existing?.modelAllowlist ?? [],
-          proxyId: existing?.proxyId,
+          proxyId,
           quota: existing?.quota,
           codexQuota: existing?.codexQuota,
           cooldownUntil: undefined,
@@ -475,6 +484,9 @@ export class AppStore {
     const warnings = parsed.warnings.filter((warning) => warning !== parsedAccessTokenWarning)
     const finalAccessTokenWarning = chatGptAccessTokenOnlyWarning(accessTokenOnlyCount)
     if (finalAccessTokenWarning) warnings.push(finalAccessTokenWarning)
+    if (ignoredFileProxyCount > 0) {
+      warnings.push(`已忽略 ${ignoredFileProxyCount} 个不存在的文件代理配置，相关账号改为直连。`)
+    }
     return {
       snapshot: this.getSnapshot(),
       importedAccountIds,
@@ -1592,6 +1604,55 @@ function optionalProxyId(value: string | undefined, proxies: ProxyDefinition[]):
   if (!id) return undefined
   if (!proxies.some((proxy) => proxy.id === id)) throw new Error('Choose an existing proxy.')
   return id
+}
+
+interface AccountImportProxySelection {
+  mode: ChatGptAccountImportProxyMode
+  proxyId?: string
+}
+
+function normalizeAccountImportProxySelection(
+  mode: ChatGptAccountImportProxyMode | undefined,
+  proxyId: string | undefined,
+  proxies: readonly ProxyDefinition[]
+): AccountImportProxySelection {
+  const normalizedMode = mode ?? 'preserve'
+  if (!['preserve', 'direct', 'proxy'].includes(normalizedMode)) {
+    throw new Error('不支持的账号导入代理选项。')
+  }
+  if (normalizedMode !== 'proxy') return { mode: normalizedMode }
+  const normalizedProxyId = proxyId?.trim()
+  if (!normalizedProxyId) throw new Error('请选择一个出口代理后再导入账号。')
+  if (!proxies.some((proxy) => proxy.id === normalizedProxyId)) {
+    throw new Error('选择的出口代理已被删除，请重新选择后再导入。')
+  }
+  return { mode: 'proxy', proxyId: normalizedProxyId }
+}
+
+export function validateAccountImportProxySelection(
+  mode: ChatGptAccountImportProxyMode | undefined,
+  proxyId: string | undefined,
+  proxies: readonly ProxyDefinition[]
+): void {
+  normalizeAccountImportProxySelection(mode, proxyId, proxies)
+}
+
+export function resolveImportedAccountProxyId(
+  selection: AccountImportProxySelection,
+  fileProxyId: string | undefined,
+  proxies: readonly Pick<ProxyDefinition, 'id'>[]
+): string | undefined {
+  if (selection.mode === 'direct') return undefined
+  if (selection.mode === 'proxy') {
+    if (!selection.proxyId || !proxies.some((proxy) => proxy.id === selection.proxyId)) {
+      throw new Error('选择的出口代理已被删除，请重新选择后再导入。')
+    }
+    return selection.proxyId
+  }
+  const normalizedFileProxyId = fileProxyId?.trim()
+  return normalizedFileProxyId && proxies.some((proxy) => proxy.id === normalizedFileProxyId)
+    ? normalizedFileProxyId
+    : undefined
 }
 
 function normalizeModels(models: unknown): string[] {

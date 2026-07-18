@@ -17,10 +17,13 @@ The first Stone+ release, `v0.8.3`, is based on upstream Stone `v0.8.2`
   state persistence, semantic phase timing, first-body failover, opt-in request hedging,
   OAuth refresh singleflight, adaptive concurrency, and optional speed-aware
   `autobalanced` account scheduling;
+- full-history Token usage and cache-aware OpenAI standard API cost estimates, with
+  strict per-request GPT-5.4 through GPT-5.6 model pricing and long-context rules;
+- account scheduling-fitness and quota-thaw visibility in the management UI;
 - Codex historical-session visibility repair with provider metadata synchronization,
   preview validation, recoverable backups, and transactional SQLite index updates;
 - native CPA/Sub2API JSON batch account import, JWT account-ID recovery, and
-  post-import concurrent account health checks;
+  post-import concurrent account health checks, including per-batch outbound proxy selection;
 - additional tests and desktop integration supporting these features.
 
 Original copyright and license notices are retained in `LICENSE`, `NOTICE`,

@@ -175,6 +175,7 @@ describe('ChatGPT account import', () => {
           name: 'sub2api@example.com',
           platform: 'openai',
           type: 'oauth',
+          proxy_id: 'proxy-sub2api',
           credentials: {
             access_token: accessToken,
             refresh_token: 'refresh-sub2api',
@@ -203,6 +204,7 @@ describe('ChatGPT account import', () => {
       email: 'sub2api@example.com',
       expiresAt: expiresAtSeconds * 1000
     })
+    expect(parsed.proxyIds).toEqual(['proxy-sub2api'])
     expect(parsed.warnings.join(' ')).toContain('Sub2API')
     expect(parsed.warnings.join(' ')).toContain('忽略 1 个')
   })

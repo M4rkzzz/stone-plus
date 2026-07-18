@@ -4,6 +4,8 @@ import {
   ArrowRight,
   CheckCircle2,
   Clock3,
+  CircleDollarSign,
+  Info,
   Network,
   Radio,
   Server,
@@ -11,7 +13,13 @@ import {
   BellRing,
   Waypoints,
 } from 'lucide-react'
-import type { AppSnapshot, RouteClient, TokenRatePoint, TokenRateSeries } from '@shared/types'
+import type {
+  AppSnapshot,
+  OpenAiTokenCostBreakdown,
+  RouteClient,
+  TokenRatePoint,
+  TokenRateSeries
+} from '@shared/types'
 import type { PageId } from '../App'
 import {
   AccountStatusBadge,
@@ -39,6 +47,91 @@ const tokenRateRanges: Array<{ id: TokenRateRange; label: string }> = [
   { id: 'last24Hours', label: '24 小时' },
   { id: 'last7Days', label: '一周' },
 ]
+
+const TOKEN_COST_TOOLTIP = [
+  '按 OpenAI 2026-07-19 标准 API 价格估算（每 100 万 Token）：',
+  '每条请求均按自身日志中的 model 字符串匹配价格，不使用当前模型统一套价。',
+  'gpt-5.6 / Sol：输入 $5、缓存读取 $0.5、输出 $30；',
+  'Terra：$2.5 / $0.25 / $15；Luna：$1 / $0.1 / $6。',
+  'gpt-5.5：$5 / $0.5 / $30；5.5 Pro：$30 / $30 / $180。',
+  'gpt-5.4：$2.5 / $0.25 / $15；5.4 Pro：$30 / $30 / $180；',
+  '5.4 Mini：$0.75 / $0.075 / $4.5；5.4 Nano：$0.20 / $0.02 / $1.25。',
+  '非 Pro 型号的缓存读取价为普通输入价的 10%，即 90% 折扣。',
+  '普通输入 = max(输入 - 缓存读取 - 缓存写入, 0)，避免重复计费。',
+  '5.6 缓存写入若由上游单独上报则按输入价 1.25 倍计入输入成本；未单独上报时计入普通输入。',
+  '5.4、5.4 Pro、5.5、5.5 Pro 单次输入超过 272K Token 时，整次输入价格 2 倍、输出价格 1.5 倍；恰好 272K 不加价。5.6 不套用该规则。',
+  'Pro 没有缓存读取折扣，缓存读取按普通输入价格计算。',
+  '未知模型会显示为未计价，不会套用猜测价格。'
+].join(' ')
+
+function formatUsd(value: number): string {
+  if (value >= 100) return `$${value.toFixed(2)}`
+  if (value >= 1) return `$${value.toFixed(3)}`
+  if (value >= 0.01) return `$${value.toFixed(4)}`
+  return `$${value.toFixed(6)}`
+}
+
+function TokenCostCard({
+  title,
+  description,
+  cost
+}: {
+  title: string
+  description: string
+  cost: OpenAiTokenCostBreakdown
+}) {
+  const hasUsage = cost.totalTokens > 0
+  const unknownModelLabel = cost.unknownModels.length
+    ? `未定价模型：${cost.unknownModels.join('、')}`
+    : undefined
+  return (
+    <article className="panel token-cost-card">
+      <header className="token-cost-card__header">
+        <div className="token-cost-card__heading">
+          <span className="token-cost-card__icon"><CircleDollarSign size={18} /></span>
+          <div><h2>{title}</h2><p>{description}</p></div>
+        </div>
+        <span
+          aria-label={TOKEN_COST_TOOLTIP}
+          className="token-cost-help"
+          data-tooltip={TOKEN_COST_TOOLTIP}
+          role="img"
+          tabIndex={0}
+          title={TOKEN_COST_TOOLTIP}
+        ><Info size={16} /></span>
+      </header>
+      <div className="token-cost-card__total">
+        <div><span>Token 总量</span><strong>{formatCompactNumber(cost.totalTokens)}</strong></div>
+        <div className="token-cost-card__usd">
+          <span>{cost.unpricedTokens ? '可计价部分合计' : '官方 API 价格估算'}</span>
+          <strong>≈ {formatUsd(cost.totalCostUsd)}</strong>
+        </div>
+      </div>
+      <div className="token-cost-breakdown" aria-label={`${title}成本分项`}>
+        <div className="token-cost-breakdown__item token-cost-breakdown__item--input">
+          <span><i />输入成本</span><strong>{formatUsd(cost.inputCostUsd)}</strong>
+        </div>
+        <div className="token-cost-breakdown__item token-cost-breakdown__item--cached">
+          <span><i />缓存输入成本</span><strong>{formatUsd(cost.cachedInputCostUsd)}</strong>
+        </div>
+        <div className="token-cost-breakdown__item token-cost-breakdown__item--output">
+          <span><i />输出成本</span><strong>{formatUsd(cost.outputCostUsd)}</strong>
+        </div>
+      </div>
+      <footer className="token-cost-card__footer">
+        {!hasUsage && <span>暂无包含 Token usage 的请求记录</span>}
+        {hasUsage && !cost.unpricedTokens && <span>已识别并计价 {formatCompactNumber(cost.pricedTokens)} Token</span>}
+        {cost.unpricedTokens > 0 && (
+          <span className="token-cost-unpriced" title={unknownModelLabel}>
+            {formatCompactNumber(cost.unpricedTokens)} Token 因模型价格未知未计价
+          </span>
+        )}
+        {cost.cacheWriteInputTokens > 0 && <span>其中 {formatCompactNumber(cost.cacheWriteInputTokens)} 缓存写入 Token 已按对应模型规则计价</span>}
+        {cost.longContextRequestCount > 0 && <span>{cost.longContextRequestCount} 次长上下文请求已应用附加价格</span>}
+      </footer>
+    </article>
+  )
+}
 
 function initialTokenRateRange(): TokenRateRange {
   try {
@@ -163,6 +256,7 @@ export function OverviewView({ snapshot, navigate }: { snapshot: AppSnapshot; na
   const totalTokens = snapshot.requestLogs.reduce((total, log) => total + (log.inputTokens ?? 0) + (log.outputTokens ?? 0), 0)
   const chartBars = requestActivity(snapshot.requestLogs)
   const daily = snapshot.observability.last24Hours
+  const tokenCosts = snapshot.observability.tokenCosts
   const tokenRatePoints = snapshot.observability.tokenRates?.[tokenRateRange] ?? EMPTY_TOKEN_RATE_POINTS
   const tokenRateStats = useMemo(() => {
     const selected = tokenRatePoints.filter((point) => point.requestCount > 0)
@@ -212,6 +306,19 @@ export function OverviewView({ snapshot, navigate }: { snapshot: AppSnapshot; na
           <strong className="metric-card__uptime">{daily.averageLatencyMs ? durationLabel(daily.averageLatencyMs) : '—'}</strong>
           <span>{daily.failoverCount} 次账号切换 · 运行 {uptimeLabel(snapshot.gatewayStatus.startedAt)}</span>
         </article>
+      </section>
+
+      <section className="token-cost-grid" aria-label="Token 消耗与官方 API 价格估算">
+        <TokenCostCard
+          title="今日 Token"
+          description={`${new Date(tokenCosts.todayStart).toLocaleDateString('zh-CN')} · 本地自然日`}
+          cost={tokenCosts.today}
+        />
+        <TokenCostCard
+          title="总 Token"
+          description="全部持久请求日志"
+          cost={tokenCosts.allTime}
+        />
       </section>
 
       <div className="overview-grid">

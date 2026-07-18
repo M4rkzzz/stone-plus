@@ -21,7 +21,7 @@ import type {
 } from '@shared/types'
 import type { GatewayAccountState, GatewayConfig } from '../gateway'
 import { CHATGPT_CODEX_RESPONSES_URL, codexQuotaCooldownUntil, codexQuotaIsExhausted, getProviderAdapter, getProviderPreset, probeChatGptAccount, probeChatGptCodexModel, probeProviderModel, providerPresets, queryChatGptCodexModels, queryChatGptCodexQuota, resolveChatGptCredential, type ProviderFailure } from '../providers'
-import type { AppStore } from '../store/app-store'
+import { validateAccountImportProxySelection, type AppStore } from '../store/app-store'
 import type { ClientConfigService } from '../client-config'
 import type { DatabaseBackupService } from '../backup'
 import type { PersistedState } from '../store/types'
@@ -225,6 +225,19 @@ export function registerGatewayApi(
     }
   }
 
+  const detectImportedAccounts = async (accountIds: readonly string[]) =>
+    mapConcurrent([...new Set(accountIds)], 3, async (accountId) => {
+      const checked = await probeAndPersistAccount(accountId)
+      const accountName = checked.snapshot.accounts.find((account) => account.id === accountId)?.name ?? 'ChatGPT account'
+      return {
+        accountId,
+        accountName,
+        ok: checked.ok,
+        ...(checked.latencyMs !== undefined ? { latencyMs: checked.latencyMs } : {}),
+        ...(checked.error ? { error: checked.error } : {})
+      }
+    })
+
   gateway.onLog((log) => {
     void store.appendLog(log).then(() => {
       scheduleRuntimePublish()
@@ -373,9 +386,12 @@ export function registerGatewayApi(
     assertTrustedSender(event)
     return testAccountModel(store, outboundTransport, accountId, model)
   })
-  ipcMain.handle('stone:import-chatgpt-accounts', (event, input: Parameters<GatewayApi['importChatGptAccounts']>[0]) => {
+  ipcMain.handle('stone:import-chatgpt-accounts', async (event, input: Parameters<GatewayApi['importChatGptAccounts']>[0]) => {
     assertTrustedSender(event)
-    return store.importChatGptAccounts(input).then((result) => ({ ...result, snapshot: publish(refreshRuntime()) }))
+    const imported = await store.importChatGptAccounts(input)
+    publish(refreshRuntime())
+    const detectionResults = await detectImportedAccounts(imported.importedAccountIds)
+    return { ...imported, detectionResults, snapshot: store.getSnapshot() }
   })
   ipcMain.handle('stone:import-chatgpt-account-files', async (event, input: Parameters<GatewayApi['importChatGptAccountFiles']>[0]) => {
     assertTrustedSender(event)
@@ -396,6 +412,7 @@ export function registerGatewayApi(
     if (selection.canceled || !selection.filePaths.length) {
       return emptyFileImportResult(store.getSnapshot())
     }
+    validateAccountImportProxySelection(input.proxyMode, input.proxyId, store.getRuntimeProxies())
     if (selection.filePaths.length > 100) throw new Error('一次最多导入 100 个账号文件。')
 
     const fileResults: Awaited<ReturnType<GatewayApi['importChatGptAccountFiles']>>['fileResults'] = []
@@ -422,7 +439,12 @@ export function registerGatewayApi(
     const warnings: string[] = []
     for (const file of readableFiles) {
       try {
-        const imported = await store.importChatGptAccounts({ providerId: input.providerId, content: file.content })
+        const imported = await store.importChatGptAccounts({
+          providerId: input.providerId,
+          content: file.content,
+          proxyMode: input.proxyMode,
+          proxyId: input.proxyId
+        })
         importedAccountIds.push(...imported.importedAccountIds)
         createdAccountIds.push(...imported.createdAccountIds)
         updatedAccountIds.push(...imported.updatedAccountIds)
@@ -441,17 +463,7 @@ export function registerGatewayApi(
     publish(refreshRuntime())
 
     const uniqueImportedIds = [...new Set(importedAccountIds)]
-    const detectionResults = await mapConcurrent(uniqueImportedIds, 3, async (accountId) => {
-      const checked = await probeAndPersistAccount(accountId)
-      const accountName = checked.snapshot.accounts.find((account) => account.id === accountId)?.name ?? 'ChatGPT account'
-      return {
-        accountId,
-        accountName,
-        ok: checked.ok,
-        ...(checked.latencyMs !== undefined ? { latencyMs: checked.latencyMs } : {}),
-        ...(checked.error ? { error: checked.error } : {})
-      }
-    })
+    const detectionResults = await detectImportedAccounts(uniqueImportedIds)
     return {
       snapshot: store.getSnapshot(),
       cancelled: false,
@@ -463,6 +475,7 @@ export function registerGatewayApi(
       detectionResults,
       warnings: [...new Set(warnings)]
     }
+
   })
   ipcMain.handle('stone:export-chatgpt-accounts', async (event, input: Parameters<GatewayApi['exportChatGptAccounts']>[0]) => {
     assertTrustedSender(event)

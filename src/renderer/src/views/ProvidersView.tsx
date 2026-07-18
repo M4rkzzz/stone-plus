@@ -20,6 +20,7 @@ import type {
   AccountFitnessSnapshot,
   AccountModelTestResult,
   AppSnapshot,
+  ChatGptAccountImportProxyMode,
   GatewayApi,
   ModelPolicy,
   Protocol,
@@ -47,6 +48,17 @@ import { ProxyManager } from './ProxyManager'
 import { CodexQuotaCompact, CodexQuotaModal } from './CodexQuotaModal'
 
 const HIDE_EXHAUSTED_ACCOUNTS_STORAGE_KEY = 'stone.providers.hide-exhausted-accounts'
+
+function importProxyValue(mode: ChatGptAccountImportProxyMode, proxyId: string): string {
+  if (mode === 'preserve') return '__preserve__'
+  if (mode === 'direct') return '__direct__'
+  return proxyId
+}
+
+function proxySafeSummary(proxy: PublicProxyDefinition): string {
+  const host = proxy.host.includes(':') ? `[${proxy.host}]` : proxy.host
+  return `${proxy.protocol.toUpperCase()} · ${host}:${proxy.port}`
+}
 
 function accountQuotaIsExhausted(account: PublicAccount, now = Date.now()): boolean {
   if (account.quotaRemaining !== undefined && account.quotaRemaining <= 0) return true
@@ -325,7 +337,13 @@ export function ProvidersView({
   const [presets, setPresets] = useState<ProviderPreset[]>([])
   const [wizard, setWizard] = useState({ presetId: '', providerName: '', accountName: '', credential: '' })
   const [chatGptImportOpen, setChatGptImportOpen] = useState(false)
-  const [chatGptImport, setChatGptImport] = useState({ providerId: snapshot.providers.find((provider) => provider.kind === 'openai' && provider.protocol === 'openai-responses')?.id ?? '', name: '', content: '' })
+  const [chatGptImport, setChatGptImport] = useState({
+    providerId: snapshot.providers.find((provider) => provider.kind === 'openai' && provider.protocol === 'openai-responses')?.id ?? '',
+    name: '',
+    content: '',
+    proxyMode: 'preserve' as ChatGptAccountImportProxyMode,
+    proxyId: ''
+  })
   const [importNotice, setImportNotice] = useState('')
   const [fileImportBusy, setFileImportBusy] = useState(false)
   const [quotaAccountId, setQuotaAccountId] = useState<string | null>(null)
@@ -524,13 +542,18 @@ export function ProvidersView({
 
   const submitChatGptImport = async (event: React.FormEvent) => {
     event.preventDefault()
+    setFileImportBusy(true)
+    setErrors({})
     try {
       const result = await api.importChatGptAccounts(chatGptImport)
       setChatGptImportOpen(false)
       setChatGptImport({ ...chatGptImport, content: '' })
-      setImportNotice(`导入完成：新增 ${result.createdAccountIds.length} 个，更新 ${result.updatedAccountIds.length} 个 ChatGPT/Codex 账号${result.warnings.length ? `；${result.warnings.join(' ')}` : ''}`)
+      const detected = result.detectionResults.filter((item) => item.ok).length
+      setImportNotice(`导入完成：新增 ${result.createdAccountIds.length} 个，更新 ${result.updatedAccountIds.length} 个 ChatGPT/Codex 账号；检测可用 ${detected} 个，失败 ${result.detectionResults.length - detected} 个${result.warnings.length ? `；${result.warnings.join(' ')}` : ''}`)
     } catch (cause) {
       setErrors({ chatgptImport: cause instanceof Error ? cause.message : 'ChatGPT 账号导入失败' })
+    } finally {
+      setFileImportBusy(false)
     }
   }
 
@@ -542,7 +565,11 @@ export function ProvidersView({
     setFileImportBusy(true)
     setErrors({})
     try {
-      const result = await api.importChatGptAccountFiles({ providerId: chatGptImport.providerId })
+      const result = await api.importChatGptAccountFiles({
+        providerId: chatGptImport.providerId,
+        proxyMode: chatGptImport.proxyMode,
+        proxyId: chatGptImport.proxyId || undefined
+      })
       if (result.cancelled) return
       setChatGptImportOpen(false)
       const importedFiles = result.fileResults.filter((file) => file.status === 'imported').length
@@ -827,6 +854,29 @@ export function ProvidersView({
       >
         <form id="chatgpt-account-import" className="form-grid" onSubmit={(event) => void submitChatGptImport(event)}>
           <label className="field field--full"><span>OpenAI Responses Provider</span><select required value={chatGptImport.providerId} onChange={(event) => setChatGptImport({ ...chatGptImport, providerId: event.target.value })}><option value="">选择 Provider</option>{snapshot.providers.filter((provider) => provider.kind === 'openai' && provider.protocol === 'openai-responses').map((provider) => <option key={provider.id} value={provider.id}>{provider.name}</option>)}</select><small>没有可选项时，先用接入向导创建 OpenAI Provider。</small></label>
+          <label className="field field--full">
+            <span>出口代理</span>
+            <select
+              value={importProxyValue(chatGptImport.proxyMode, chatGptImport.proxyId)}
+              onChange={(event) => {
+                const value = event.target.value
+                if (value === '__preserve__') setChatGptImport({ ...chatGptImport, proxyMode: 'preserve', proxyId: '' })
+                else if (value === '__direct__') setChatGptImport({ ...chatGptImport, proxyMode: 'direct', proxyId: '' })
+                else setChatGptImport({ ...chatGptImport, proxyMode: 'proxy', proxyId: value })
+              }}
+            >
+              <option value="__preserve__">不指定 / 沿用文件配置</option>
+              <option value="__direct__">直连（清除文件代理）</option>
+              {chatGptImport.proxyMode === 'proxy' && chatGptImport.proxyId && !proxyById.has(chatGptImport.proxyId)
+                && <option value={chatGptImport.proxyId} disabled>原选择已删除，请重新选择</option>}
+              {snapshot.proxies.map((proxy) => <option key={proxy.id} value={proxy.id}>{proxy.name} · {proxySafeSummary(proxy)}</option>)}
+            </select>
+            <small>{chatGptImport.proxyMode === 'preserve'
+              ? '保留文件中仍然存在的 proxyId；未配置或已失效时使用直连。'
+              : chatGptImport.proxyMode === 'direct'
+                ? '本批次所有账号都使用直连，并移除文件中的 proxyId。'
+                : '本批次所有账号统一使用所选代理；导入后的账号检测也通过该代理。'}</small>
+          </label>
           <div className="account-file-import field--full">
             <span className="account-file-import__icon"><Files size={20} /></span>
             <div><strong>批量导入 CPA / Sub2API JSON</strong><span>在文件选择器中按 Ctrl 或 Shift 多选；自动补全缺失的 account_id，导入后立即并发检测账号。</span></div>

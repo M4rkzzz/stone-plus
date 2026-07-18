@@ -20,6 +20,7 @@ import type {
   Route,
   RouteClient,
 } from '@shared/types'
+import { summarizeOpenAiTokenCosts } from '@shared/openai-pricing'
 import { buildPoolModelCoverage, pruneModelSelection } from './model-policy'
 
 const STORAGE_KEY = 'stone.browser-mock.v2'
@@ -348,13 +349,13 @@ const routes: Route[] = [
 ]
 
 const logs: RequestLog[] = [
-  ['req-01', 22, 'codex', 'openai-responses', 'OpenAI Platform', 'OpenAI 主账号', 'gpt-5', 'streaming', 200, 1280, 4812, 0],
+  ['req-01', 22, 'codex', 'openai-responses', 'OpenAI Platform', 'OpenAI 主账号', 'gpt-5.6-sol', 'streaming', 200, 1280, 4812, 0],
   ['req-02', 68, 'claude', 'anthropic-messages', 'Anthropic', 'Claude 主账号', 'claude-sonnet-4', 'success', 200, 2384, 9204, 1837],
   ['req-03', 194, 'claude', 'anthropic-messages', 'Anthropic', 'Claude 备用', 'claude-sonnet-4', 'error', 429, 312, 1240, 0],
   ['req-04', 285, 'gemini', 'gemini', 'Google AI Studio', 'Gemini 开发', 'gemini-2.5-pro', 'success', 200, 1748, 6240, 2210],
   ['req-05', 460, 'codex', 'openai-responses', 'OpenRouter', 'OpenRouter 日常', 'openai/gpt-5-mini', 'success', 200, 936, 3174, 894],
   ['req-06', 725, 'claude', 'anthropic-messages', 'Anthropic', 'Claude 主账号', 'claude-opus-4-1', 'success', 200, 4421, 12140, 3352],
-  ['req-07', 1160, 'codex', 'openai-responses', 'OpenAI Platform', 'OpenAI 主账号', 'gpt-5', 'success', 200, 2156, 8051, 1620],
+  ['req-07', 1160, 'codex', 'openai-responses', 'OpenAI Platform', 'OpenAI 主账号', 'gpt-5.6-sol', 'success', 200, 2156, 8051, 1620],
   ['req-08', 1680, 'gemini', 'gemini', 'Google AI Studio', 'Gemini 开发', 'gemini-2.5-flash', 'success', 200, 604, 1430, 730],
   ['req-09', 2240, 'claude', 'anthropic-messages', 'Anthropic', 'Claude 主账号', 'claude-sonnet-4', 'error', 502, 30004, 6740, 0],
   ['req-10', 3620, 'codex', 'openai-responses', 'OpenRouter', 'OpenRouter 日常', 'anthropic/claude-sonnet-4', 'success', 200, 1602, 5230, 1480],
@@ -388,6 +389,7 @@ const logs: RequestLog[] = [
     latencyMs,
     firstTokenMs: status === 'error' ? undefined : Math.max(80, Math.round(latencyMs * 0.32)),
     inputTokens,
+    cachedInputTokens: model === 'gpt-5.6-sol' ? Math.round(inputTokens * 0.75) : undefined,
     outputTokens,
     error: status === 'error' ? (statusCode === 429 ? '上游请求频率受限' : '上游连接超时') : undefined,
   }
@@ -446,6 +448,7 @@ const initialSnapshot: AppSnapshot = {
       last24Hours: summarizeTokenRate(logs, now, 24 * 60 * 60 * 1000, 48),
       last7Days: summarizeTokenRate(logs, now, 7 * 24 * 60 * 60 * 1000, 56),
     },
+    tokenCosts: summarizeOpenAiTokenCosts(logs, now),
   },
   vaultAvailable: true,
   vaultBackend: '系统凭据保险库',
@@ -587,10 +590,16 @@ function loadSnapshot(): AppSnapshot {
     const saved = window.localStorage.getItem(STORAGE_KEY)
     if (!saved) return clone(initialSnapshot)
     const parsed = JSON.parse(saved) as Partial<AppSnapshot>
+    const requestLogs = parsed.requestLogs ?? clone(initialSnapshot.requestLogs)
     return normalizeLoadedModelPolicies({
       ...clone(initialSnapshot),
       ...parsed,
-      observability: parsed.observability ?? clone(initialSnapshot.observability),
+      requestLogs,
+      observability: {
+        ...clone(initialSnapshot.observability),
+        ...parsed.observability,
+        tokenCosts: summarizeOpenAiTokenCosts(requestLogs)
+      },
       clientProfiles: parsed.clientProfiles ?? clone(initialSnapshot.clientProfiles),
       healthEvents: parsed.healthEvents ?? [],
     })
@@ -769,7 +778,15 @@ export function createMockApi(): GatewayApi {
       }
     },
     async importChatGptAccounts(input) {
-      const parsed = JSON.parse(input.content) as { account_id?: string; email?: string; expired?: string }
+      const parsed = JSON.parse(input.content) as { account_id?: string; email?: string; expired?: string; proxy_id?: string; proxyId?: string }
+      const selectedProxyId = input.proxyMode === 'proxy'
+        ? input.proxyId
+        : input.proxyMode === 'direct'
+          ? undefined
+          : parsed.proxy_id ?? parsed.proxyId
+      if (selectedProxyId && !snapshot.proxies.some((proxy) => proxy.id === selectedProxyId)) {
+        throw new Error(input.proxyMode === 'proxy' ? '选择的出口代理已被删除，请重新选择后再导入。' : '文件代理不存在。')
+      }
       const timestamp = Date.now()
       const account: PublicAccount = {
         id: makeId('chatgpt'), providerId: input.providerId, name: input.name || parsed.email || 'ChatGPT Team',
@@ -777,7 +794,8 @@ export function createMockApi(): GatewayApi {
         credentialType: 'chatgpt-oauth',
         credentialExpiresAt: parsed.expired ? Date.parse(parsed.expired) : timestamp + 3_600_000,
         renewable: false, status: 'active', priority: 10, weight: 10, maxConcurrency: 4, inFlight: 0,
-        availableModels: [], modelPolicy: 'all', modelAllowlist: [], circuitState: 'closed', consecutiveFailures: 0, createdAt: timestamp, updatedAt: timestamp
+        availableModels: [], modelPolicy: 'all', modelAllowlist: [], proxyId: selectedProxyId,
+        circuitState: 'closed', consecutiveFailures: 0, createdAt: timestamp, updatedAt: timestamp
       }
       snapshot.accounts.push(account)
       return {
@@ -785,11 +803,15 @@ export function createMockApi(): GatewayApi {
         importedAccountIds: [account.id],
         createdAccountIds: [account.id],
         updatedAccountIds: [],
-        warnings: ['No refresh token']
+        warnings: ['No refresh token'],
+        detectionResults: [{ accountId: account.id, accountName: account.name, ok: true, latencyMs: 820 }]
       }
     },
     async importChatGptAccountFiles(input) {
       await pause(500)
+      if (input.proxyMode === 'proxy' && !snapshot.proxies.some((proxy) => proxy.id === input.proxyId)) {
+        throw new Error('选择的出口代理已被删除，请重新选择后再导入。')
+      }
       const accountId = makeId('chatgpt-file')
       const timestamp = Date.now()
       const account: PublicAccount = {
@@ -797,6 +819,7 @@ export function createMockApi(): GatewayApi {
         maskedCredential: 'chatgpt-****demo', credentialType: 'chatgpt-oauth',
         credentialExpiresAt: timestamp + 3_600_000, renewable: false, status: 'active', priority: 10, weight: 10,
         maxConcurrency: 4, inFlight: 0, latencyMs: 820, availableModels: [], modelPolicy: 'all', modelAllowlist: [],
+        proxyId: input.proxyMode === 'proxy' ? input.proxyId : undefined,
         circuitState: 'closed', consecutiveFailures: 0, createdAt: timestamp, updatedAt: timestamp
       }
       snapshot.accounts.push(account)

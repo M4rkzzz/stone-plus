@@ -376,6 +376,55 @@ export interface TokenRateSeries {
   last7Days: TokenRatePoint[]
 }
 
+export type OpenAiPricedModelFamily =
+  | 'gpt-5.6-sol'
+  | 'gpt-5.6-terra'
+  | 'gpt-5.6-luna'
+  | 'gpt-5.5'
+  | 'gpt-5.5-pro'
+  | 'gpt-5.4'
+  | 'gpt-5.4-pro'
+  | 'gpt-5.4-mini'
+  | 'gpt-5.4-nano'
+
+export interface OpenAiModelPricing {
+  family: OpenAiPricedModelFamily
+  inputUsdPerMillion: number
+  cachedInputUsdPerMillion: number
+  cacheWriteUsdPerMillion: number
+  outputUsdPerMillion: number
+  longContextThresholdTokens?: number
+  longContextInputMultiplier?: number
+  longContextOutputMultiplier?: number
+}
+
+export interface OpenAiTokenCostBreakdown {
+  totalTokens: number
+  inputTokens: number
+  outputTokens: number
+  standardInputTokens: number
+  cachedInputTokens: number
+  cacheWriteInputTokens: number
+  pricedTokens: number
+  unpricedTokens: number
+  inputCostUsd: number
+  cachedInputCostUsd: number
+  cacheWriteCostUsd: number
+  outputCostUsd: number
+  totalCostUsd: number
+  pricedRequestCount: number
+  unpricedRequestCount: number
+  longContextRequestCount: number
+  unknownModels: string[]
+}
+
+export interface OpenAiTokenCostOverview {
+  generatedAt: number
+  todayStart: number
+  today: OpenAiTokenCostBreakdown
+  allTime: OpenAiTokenCostBreakdown
+}
+
 export interface GatewayStatus {
   running: boolean
   host: string
@@ -421,6 +470,8 @@ export interface RequestLog {
   outputTokens?: number
   error?: string
   cachedInputTokens?: number
+  /** Input tokens written into a prompt cache when the upstream reports them separately. */
+  cacheWriteInputTokens?: number
   reasoningTokens?: number
   failoverCount?: number
 }
@@ -457,6 +508,7 @@ export interface AppSnapshot {
     last7Days: ObservabilitySummary
     hourly: ObservabilityPoint[]
     tokenRates: TokenRateSeries
+    tokenCosts: OpenAiTokenCostOverview
   }
   vaultAvailable: boolean
   vaultBackend: string
@@ -499,7 +551,12 @@ export interface ChatGptAccountImportInput {
   providerId: string
   content: string
   name?: string
+  /** Preserve a valid file proxy by default, explicitly clear it, or override the whole batch. */
+  proxyMode?: ChatGptAccountImportProxyMode
+  proxyId?: string
 }
+
+export type ChatGptAccountImportProxyMode = 'preserve' | 'direct' | 'proxy'
 
 export interface ChatGptAccountImportResult {
   snapshot: AppSnapshot
@@ -507,10 +564,13 @@ export interface ChatGptAccountImportResult {
   createdAccountIds: string[]
   updatedAccountIds: string[]
   warnings: string[]
+  detectionResults: ChatGptAccountDetectionResult[]
 }
 
 export interface ChatGptAccountFileImportInput {
   providerId: string
+  proxyMode?: ChatGptAccountImportProxyMode
+  proxyId?: string
 }
 
 export interface ChatGptAccountFileImportFileResult {

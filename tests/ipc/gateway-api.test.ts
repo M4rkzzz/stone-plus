@@ -76,6 +76,48 @@ describe('refresh provider models IPC', () => {
       filters: expect.arrayContaining([expect.objectContaining({ extensions: ['json', 'txt'] })])
     })
     expect(harness.store.getSnapshot).toHaveBeenCalled()
+    expect(harness.store.importChatGptAccounts).not.toHaveBeenCalled()
+  })
+
+  it('detects a pasted batch through the final selected account proxy', async () => {
+    const oauth = oauthAccount()
+    const proxy = testProxy()
+    const upstreamFetch = vi.fn(async () => new Response(JSON.stringify({
+      rate_limit: { allowed: true, limit_reached: false }
+    }), { status: 200, headers: { 'content-type': 'application/json' } }))
+    const harness = createHarness([oauth], { [oauth.credentialId]: oauthCredential() }, upstreamFetch, [proxy])
+    const handler = electron.handlers.get('stone:import-chatgpt-accounts')
+    if (!handler) throw new Error('import-chatgpt-accounts handler was not registered')
+    const mainFrame = { url: 'http://127.0.0.1:5173/index.html' }
+
+    const result = await handler({ senderFrame: mainFrame, sender: { mainFrame } }, {
+      providerId: provider.id,
+      content: '{"access_token":"redacted-by-mock"}',
+      proxyMode: 'proxy',
+      proxyId: proxy.id
+    }) as { detectionResults: Array<{ ok: boolean }> }
+
+    expect(result.detectionResults).toEqual([expect.objectContaining({ ok: true })])
+    expect(harness.transport.fetchFor).toHaveBeenCalledWith(proxy, undefined)
+    expect(harness.store.importChatGptAccounts).toHaveBeenCalledWith(expect.objectContaining({
+      proxyMode: 'proxy', proxyId: proxy.id
+    }))
+  })
+
+  it('rejects a file batch when its selected proxy was deleted before confirmation', async () => {
+    electron.showOpenDialog.mockResolvedValue({ canceled: false, filePaths: ['C:\\accounts\\batch.json'] })
+    const harness = createHarness([oauthAccount()], {}, vi.fn(), [])
+    const handler = electron.handlers.get('stone:import-chatgpt-account-files')
+    if (!handler) throw new Error('import-chatgpt-account-files handler was not registered')
+    const mainFrame = { url: 'http://127.0.0.1:5173/index.html' }
+
+    await expect(handler({ senderFrame: mainFrame, sender: { mainFrame } }, {
+      providerId: provider.id,
+      proxyMode: 'proxy',
+      proxyId: 'proxy-deleted-after-modal-open'
+    })).rejects.toThrow('出口代理已被删除')
+
+    expect(harness.store.importChatGptAccounts).not.toHaveBeenCalled()
   })
 
   it('coalesces rapid request-log snapshots before publishing to the renderer', async () => {
@@ -460,10 +502,25 @@ function createHarness(
     })),
     getRuntimeAccounts: vi.fn(() => accounts),
     getRuntimeAccount: vi.fn((id: string) => accounts.find((account) => account.id === id)),
+    getRuntimeProxies: vi.fn(() => proxies),
     getAccountModelDiscoveryFingerprint: vi.fn(() => discoveryFingerprint.current),
     getCredential: vi.fn((credentialId: string) => credentials[credentialId]),
     getProxyPassword: vi.fn(() => undefined),
     updateChatGptCredential: vi.fn(async () => undefined),
+    importChatGptAccounts: vi.fn(async (input: { proxyMode?: string; proxyId?: string }) => {
+      const imported = accounts[0]
+      if (!imported) throw new Error('No mock account available for import')
+      imported.proxyId = input.proxyMode === 'proxy' ? input.proxyId : undefined
+      const publicAccount = snapshot.accounts.find((account) => account.id === imported.id)
+      if (publicAccount) publicAccount.proxyId = imported.proxyId
+      return {
+        snapshot,
+        importedAccountIds: [imported.id],
+        createdAccountIds: [],
+        updatedAccountIds: [imported.id],
+        warnings: []
+      }
+    }),
     setAccountCheckResult: vi.fn(async (id: string, patch: Partial<Account>) => {
       const runtimeAccount = accounts.find((account) => account.id === id)
       if (runtimeAccount) Object.assign(runtimeAccount, patch)

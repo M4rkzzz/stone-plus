@@ -816,6 +816,7 @@ describe('AppStore', () => {
         refresh_token: secondRefreshToken,
         account_id: accountId,
         email: 'after@example.com',
+        proxy_id: proxyId,
         expired: new Date(Date.now() + 7_200_000).toISOString()
       })
     })
@@ -836,6 +837,7 @@ describe('AppStore', () => {
         access_token: secondAccessToken,
         account_id: accountId,
         email: 'access-only@example.com',
+        proxy_id: proxyId,
         expired: new Date(Date.now() + 7_200_000).toISOString()
       })
     })
@@ -852,6 +854,83 @@ describe('AppStore', () => {
     expect(serialized).not.toContain(accountId)
     expect(reimported.snapshot.proxies[0]).not.toHaveProperty('credentialId')
     expect(reimported.snapshot.proxies[0]).not.toHaveProperty('password')
+  })
+
+  it('applies preserve, batch override, and direct proxy choices to mixed account imports', async () => {
+    const store = createStore()
+    await store.initialize()
+    const firstProxySnapshot = await store.saveProxy({
+      name: 'Imported file proxy', protocol: 'socks5', host: '127.0.0.1', port: 7890
+    })
+    const fileProxyId = firstProxySnapshot.proxies.find((proxy) => proxy.name === 'Imported file proxy')!.id
+    const secondProxySnapshot = await store.saveProxy({
+      name: 'Batch override proxy', protocol: 'https', host: 'proxy.example.test', port: 8443
+    })
+    const overrideProxyId = secondProxySnapshot.proxies.find((proxy) => proxy.name === 'Batch override proxy')!.id
+    const expiresAtSeconds = Math.floor(Date.now() / 1000) + 3600
+    const content = JSON.stringify([
+      {
+        access_token: chatGptAccessToken(expiresAtSeconds, 'acct-import-proxy-a', 'import-proxy-user-a'),
+        refresh_token: 'refresh-import-proxy-a',
+        account_id: 'acct-import-proxy-a',
+        email: 'proxy-a@example.com',
+        proxy_id: fileProxyId
+      },
+      {
+        access_token: chatGptAccessToken(expiresAtSeconds, 'acct-import-proxy-b', 'import-proxy-user-b'),
+        refresh_token: 'refresh-import-proxy-b',
+        account_id: 'acct-import-proxy-b',
+        email: 'proxy-b@example.com',
+        proxyId: 'deleted-file-proxy'
+      }
+    ])
+
+    const preserved = await store.importChatGptAccounts({
+      providerId: 'provider-openai', content, proxyMode: 'preserve'
+    })
+    const preservedAccounts = preserved.importedAccountIds.map((id) =>
+      preserved.snapshot.accounts.find((account) => account.id === id)!)
+    expect(preservedAccounts.map((account) => account.proxyId)).toEqual([fileProxyId, undefined])
+    expect(preserved.warnings.join(' ')).toContain('不存在的文件代理')
+
+    const overridden = await store.importChatGptAccounts({
+      providerId: 'provider-openai', content, proxyMode: 'proxy', proxyId: overrideProxyId
+    })
+    expect(overridden.importedAccountIds.map((id) =>
+      overridden.snapshot.accounts.find((account) => account.id === id)?.proxyId
+    )).toEqual([overrideProxyId, overrideProxyId])
+
+    const direct = await store.importChatGptAccounts({
+      providerId: 'provider-openai', content, proxyMode: 'direct', proxyId: overrideProxyId
+    })
+    expect(direct.importedAccountIds.map((id) =>
+      direct.snapshot.accounts.find((account) => account.id === id)?.proxyId
+    )).toEqual([undefined, undefined])
+  })
+
+  it('rejects an explicitly selected proxy that disappeared without changing accounts', async () => {
+    const store = createStore()
+    await store.initialize()
+    const withProxy = await store.saveProxy({
+      name: 'Temporary import proxy', protocol: 'http', host: '127.0.0.1', port: 8080
+    })
+    const proxyId = withProxy.proxies.find((proxy) => proxy.name === 'Temporary import proxy')!.id
+    await store.deleteProxy(proxyId)
+    const before = store.getSnapshot().accounts
+
+    await expect(store.importChatGptAccounts({
+      providerId: 'provider-openai',
+      content: JSON.stringify({
+        access_token: 'not-saved-private-token',
+        account_id: 'acct-not-saved',
+        expired: new Date(Date.now() + 3_600_000).toISOString()
+      }),
+      proxyMode: 'proxy',
+      proxyId
+    })).rejects.toThrow('出口代理已被删除')
+
+    expect(store.getSnapshot().accounts).toEqual(before)
+    expect(JSON.stringify(store.getSnapshot())).not.toContain('not-saved-private-token')
   })
 
   it('stores Codex quota history in five-minute buckets and clears it with the account', async () => {
@@ -1591,6 +1670,32 @@ describe('AppStore', () => {
       errorsByStatus: { 429: 1 }
     })
     expect(snapshot.observability.last7Days.requestCount).toBe(2)
+  })
+
+  it('calculates token cost totals from the full persisted log set, not the renderer slice', async () => {
+    const now = Date.now()
+    const store = createStore()
+    await store.initialize()
+    await Promise.all(Array.from({ length: 501 }, (_, index) => store.appendLog({
+      ...requestLog(index, `priced-log-${index}`),
+      timestamp: now,
+      model: 'gpt-5.6-sol',
+      inputTokens: 1_000,
+      cachedInputTokens: 400,
+      outputTokens: 100
+    })))
+
+    const snapshot = store.getSnapshot()
+    expect(snapshot.requestLogs).toHaveLength(500)
+    expect(snapshot.observability.tokenCosts.today).toMatchObject({
+      totalTokens: 551_100,
+      standardInputTokens: 300_600,
+      cachedInputTokens: 200_400,
+      outputTokens: 50_100,
+      pricedRequestCount: 501,
+      unpricedTokens: 0
+    })
+    expect(snapshot.observability.tokenCosts.allTime.totalCostUsd).toBeCloseTo(3.1062, 10)
   })
 
   it('coalesces concurrent request-log writes without changing newest-first order', async () => {

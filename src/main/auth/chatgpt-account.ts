@@ -12,6 +12,8 @@ export interface ChatGptCredentialBundle {
 
 export interface ParsedChatGptAccounts {
   accounts: ChatGptCredentialBundle[]
+  /** File-provided Stone/Sub2API proxy ids, aligned with accounts. */
+  proxyIds: Array<string | undefined>
   warnings: string[]
   accessTokenOnlyCount: number
   repairedAccountIdCount: number
@@ -23,6 +25,7 @@ export function parseChatGptAccountImport(content: string, now = Date.now()): Pa
   const parsedValues = parseValues(trimmed)
   const values = parsedValues.values
   const accounts: ChatGptCredentialBundle[] = []
+  const proxyIds: Array<string | undefined> = []
   const warnings: string[] = []
   let repairedAccountIdCount = 0
   for (const value of values) {
@@ -32,10 +35,14 @@ export function parseChatGptAccountImport(content: string, now = Date.now()): Pa
     if (account.expiresAt <= now - 30_000) throw new Error('ChatGPT account access token has expired.')
     const existingIndex = accounts.findIndex((existing) => matchesChatGptCredential(account, existing))
     if (existingIndex >= 0) {
-      if (account.refreshToken) accounts[existingIndex] = account
+      if (account.refreshToken) {
+        accounts[existingIndex] = account
+        proxyIds[existingIndex] = parsedAccount.proxyId
+      }
       continue
     }
     accounts.push(account)
+    proxyIds.push(parsedAccount.proxyId)
   }
   if (!accounts.length) throw new Error('No ChatGPT/Codex accounts were found in the import.')
   const accessTokenOnlyCount = accounts.filter((account) => !account.refreshToken).length
@@ -50,7 +57,7 @@ export function parseChatGptAccountImport(content: string, now = Date.now()): Pa
   if (repairedAccountIdCount > 0) {
     warnings.push(`已从 JWT user_id 自动补全 ${repairedAccountIdCount} 个 CPA 账号的 account_id。`)
   }
-  return { accounts, warnings, accessTokenOnlyCount, repairedAccountIdCount }
+  return { accounts, proxyIds, warnings, accessTokenOnlyCount, repairedAccountIdCount }
 }
 
 export function serializeChatGptCredential(bundle: ChatGptCredentialBundle): string {
@@ -102,7 +109,7 @@ function parseValues(content: string): { values: unknown[]; sub2Api: boolean; sk
   }
 }
 
-function parseAccount(value: unknown): { bundle: ChatGptCredentialBundle; repairedAccountId: boolean } {
+function parseAccount(value: unknown): { bundle: ChatGptCredentialBundle; repairedAccountId: boolean; proxyId?: string } {
   const object = objectValue(value)
   const accessToken = firstString(
     object,
@@ -165,8 +172,15 @@ function parseAccount(value: unknown): { bundle: ChatGptCredentialBundle; repair
   )
     ?? stringValue(claims?.email)
     ?? emailLike(firstString(object, ['name']))
+  const proxyId = firstString(
+    object,
+    ['proxy_id'], ['proxyId'], ['proxy', 'id'],
+    ['credentials', 'proxy_id'], ['credentials', 'proxyId'],
+    ['extra', 'proxy_id'], ['extra', 'proxyId']
+  )
   return {
     repairedAccountId: !explicitAccountId && Boolean(recoveredUserId),
+    ...(proxyId ? { proxyId } : {}),
     bundle: {
       accessToken, accountId, expiresAt,
       ...(refreshToken ? { refreshToken } : {}),
