@@ -4,7 +4,7 @@
 
 <h1 align="center">Stone+</h1>
 
-<p align="center"><strong>Unofficial community fork of Stone</strong></p>
+<p align="center"><strong>An enhanced community fork of Stone</strong></p>
 
 <p align="center">
   <strong>English</strong> | <a href="README.zh-CN.md">简体中文</a>
@@ -19,7 +19,7 @@
 </p>
 
 <p align="center">
-  <strong>A personal, local-first AI gateway and coding client control center for Windows, macOS, and Linux.</strong>
+  <strong>Stone's local-first AI gateway and coding client control center, extended with more routing, performance, diagnostics, repair, import, and tunneling features.</strong>
 </p>
 
 <p align="center">
@@ -29,7 +29,7 @@
   <a href="SECURITY.md">Security</a>
 </p>
 
-Stone+ brings multi-provider AI access, model routing, protocol conversion, and coding client configuration into one local app. It is based on [upstream Stone](https://github.com/EasyCode-Obsidian/Stone) and clearly maintained as an independent, unofficial community fork. Add your providers, decide which models each account can expose, combine compatible accounts into pools, and connect Claude Code, Codex, or Gemini CLI through one local gateway.
+Stone+ is built on [upstream Stone](https://github.com/EasyCode-Obsidian/Stone) and adds practical features for faster routing, smarter scheduling, request diagnostics, Codex session repair, account import, and FRP tunneling. It remains an independent, unofficial community fork. Add your providers, decide which models each account can expose, combine compatible accounts into pools, and connect Claude Code, Codex, or Gemini CLI through one local gateway.
 
 Stone selects an available account according to its model support, quota, health, and pool policy. It can also translate between OpenAI, Anthropic, and Gemini protocols, so a client and its upstream pool do not need to use the same API format.
 
@@ -39,8 +39,11 @@ Stone selects an available account according to its model support, quota, health
 
 - **Faster streaming path.** Reuses upstream connections, negotiates HTTP/2, flushes SSE headers immediately, and avoids unnecessary state cloning and stream buffering.
 - **Fast On pools.** Optionally enforces the supported `priority` service tier on OpenAI Responses-compatible requests.
+- **Performance-aware routing.** Adds optional `autobalanced` scheduling using EWMA TTFT and output speed, plus output-token speed charts for recent and weekly trends.
 - **Better request diagnostics.** Shows TTFT, conversation titles, compact adjustable columns, and a privacy toggle for titles.
 - **Correct client disconnect semantics.** Records HTTP 499 without cooling down an account or triggering failover.
+- **Codex session repair.** Repairs historical-session provider metadata and SQLite indexes through previews, backups, transactional updates, and rollback.
+- **Batch account import.** Imports CPA and Sub2API JSON files, recovers missing account IDs from JWT claims, and immediately checks imported accounts concurrently.
 - **Embedded FRP tunnel.** Runs a bundled `frpc` from pasted configuration and exposes copyable connection details.
 
 See [CHANGELOG.md](CHANGELOG.md) and [MODIFICATIONS.md](MODIFICATIONS.md) for release and attribution details.
