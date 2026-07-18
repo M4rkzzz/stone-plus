@@ -128,6 +128,13 @@ function responseFor(payload: unknown, status = 200): Response {
   })
 }
 
+function releasePage(version = '0.8.5', url = `/M4rkzzz/stone-plus/releases/tag/v${version}`): Response {
+  return new Response(
+    `<!doctype html><html><head><meta content="${url}" property="og:url"></head></html>`,
+    { status: 200, headers: { 'content-type': 'text/html' } }
+  )
+}
+
 describe('UpdateService', () => {
   it('discovers a newer stable GitHub release with bounded public fields', async () => {
     const { service } = createHarness()
@@ -315,14 +322,11 @@ describe('GitHub release parsing', () => {
     )).rejects.toThrow('untrusted update URL')
   })
 
-  it('falls back to the trusted latest-release redirect when the REST API is rate limited', async () => {
+  it('falls back to the trusted latest-release page when the REST API is rate limited', async () => {
     const fetchImplementation = vi.fn(async (input: string, init?: RequestInit) => {
       if (input.includes('api.github.com')) return responseFor({ message: 'API rate limit exceeded' }, 403)
-      expect(init?.redirect).toBe('manual')
-      return new Response(null, {
-        status: 302,
-        headers: { location: 'https://github.com/M4rkzzz/stone-plus/releases/tag/v0.8.5' }
-      })
+      expect(init?.redirect).toBe('follow')
+      return releasePage()
     })
 
     await expect(fetchLatestRelease(fetchImplementation, '0.8.4')).resolves.toEqual({
@@ -336,10 +340,23 @@ describe('GitHub release parsing', () => {
     expect(fetchImplementation).toHaveBeenCalledTimes(2)
   })
 
-  it('treats the redirect fallback as up to date and rejects untrusted redirect targets', async () => {
+  it('falls back after an API network failure', async () => {
+    const fetchImplementation = vi.fn(async (input: string) => {
+      if (input.includes('api.github.com')) throw new TypeError('fetch failed')
+      return releasePage()
+    })
+
+    await expect(fetchLatestRelease(fetchImplementation, '0.8.4')).resolves.toMatchObject({
+      version: '0.8.5',
+      url: 'https://github.com/M4rkzzz/stone-plus/releases/tag/v0.8.5'
+    })
+    expect(fetchImplementation).toHaveBeenCalledTimes(2)
+  })
+
+  it('treats the page fallback as up to date and rejects untrusted page targets', async () => {
     const rateLimitedThen = (location: string) => vi.fn(async (input: string) => {
       if (input.includes('api.github.com')) return responseFor({ message: 'rate limited' }, 429)
-      return new Response(null, { status: 302, headers: { location } })
+      return releasePage('0.8.5', location)
     })
 
     await expect(fetchLatestRelease(

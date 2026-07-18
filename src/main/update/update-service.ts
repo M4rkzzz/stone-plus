@@ -321,21 +321,29 @@ export async function fetchLatestRelease(
   fetchImplementation: FetchImplementation,
   currentVersion: string
 ): Promise<AppUpdateRelease | undefined> {
-  const response = await fetchImplementation(RELEASE_API_URL, {
-    method: 'GET',
-    headers: {
-      Accept: 'application/vnd.github+json',
-      'User-Agent': `StonePlus/${currentVersion}`,
-      'X-GitHub-Api-Version': '2022-11-28'
-    },
-    redirect: 'error',
-    signal: AbortSignal.timeout(15_000)
-  })
+  let response: Response
+  try {
+    response = await fetchImplementation(RELEASE_API_URL, {
+      method: 'GET',
+      headers: {
+        Accept: 'application/vnd.github+json',
+        'User-Agent': `StonePlus/${currentVersion}`,
+        'X-GitHub-Api-Version': '2022-11-28'
+      },
+      redirect: 'error',
+      signal: AbortSignal.timeout(15_000)
+    })
+  } catch {
+    // api.github.com and github.com may take different network paths. The public
+    // release page is still useful when only the API request is unavailable.
+    return fetchLatestReleaseFromPage(fetchImplementation, currentVersion)
+  }
   // Anonymous GitHub REST requests share a small per-IP quota. Fall back to the
-  // public "latest release" redirect so update checks keep working on shared
-  // networks without requiring a GitHub token in the desktop application.
-  if (response.status === 403 || response.status === 429) {
-    return fetchLatestReleaseFromRedirect(fetchImplementation, currentVersion)
+  // public release page so update checks keep working on shared networks without
+  // requiring a GitHub token in the desktop application.
+  if (response.status === 403 || response.status === 429 || response.status >= 500) {
+    await response.body?.cancel().catch(() => undefined)
+    return fetchLatestReleaseFromPage(fetchImplementation, currentVersion)
   }
   if (!response.ok) throw new Error(`GitHub release request failed with status ${response.status}.`)
   const contentLength = Number(response.headers.get('content-length') ?? 0)
@@ -378,7 +386,7 @@ export async function fetchLatestRelease(
   return { version, tagName, title, notes, publishedAt, url }
 }
 
-async function fetchLatestReleaseFromRedirect(
+async function fetchLatestReleaseFromPage(
   fetchImplementation: FetchImplementation,
   currentVersion: string
 ): Promise<AppUpdateRelease | undefined> {
@@ -388,16 +396,24 @@ async function fetchLatestReleaseFromRedirect(
       Accept: 'text/html',
       'User-Agent': `StonePlus/${currentVersion}`
     },
-    redirect: 'manual',
+    redirect: 'follow',
     signal: AbortSignal.timeout(15_000)
   })
-  if (![301, 302, 303, 307, 308].includes(response.status)) {
-    throw new Error(`GitHub release redirect failed with status ${response.status}.`)
+  if (!response.ok) {
+    throw new Error(`GitHub release page failed with status ${response.status}.`)
+  }
+  const contentLength = Number(response.headers.get('content-length') ?? 0)
+  if (contentLength > MAX_RELEASE_RESPONSE_BYTES) throw new Error('GitHub release page was too large.')
+  const html = await response.text()
+  if (Buffer.byteLength(html, 'utf8') > MAX_RELEASE_RESPONSE_BYTES) {
+    throw new Error('GitHub release page was too large.')
   }
 
-  const location = response.headers.get('location')
-  if (!location) throw new Error('GitHub release redirect did not provide a location.')
-  const url = new URL(location, RELEASE_PAGE_URL).toString()
+  // Electron net.fetch throws "Redirect was cancelled" for redirect: 'manual'
+  // and does not expose the final response URL after redirect: 'follow'. GitHub's
+  // trusted release page publishes the canonical target in its og:url metadata.
+  const path = releaseUrlFromHtml(html)
+  const url = new URL(path, RELEASE_PAGE_URL).toString()
   const tagName = releaseTagFromUrl(url)
   const version = clean(tagName)
   if (!version || !valid(version)) throw new Error('GitHub release version was invalid.')
@@ -411,6 +427,23 @@ async function fetchLatestReleaseFromRedirect(
     publishedAt: '',
     url
   }
+}
+
+function releaseUrlFromHtml(html: string): string {
+  for (const match of html.matchAll(/<meta\b[^>]{0,2048}>/gi)) {
+    const tag = match[0]
+    const property = htmlAttribute(tag, 'property')
+    if (property !== 'og:url') continue
+    const content = htmlAttribute(tag, 'content')
+    if (content) return content
+  }
+  throw new Error('GitHub release page did not provide a canonical release URL.')
+}
+
+function htmlAttribute(tag: string, name: string): string | undefined {
+  const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const match = new RegExp(`\\b${escapedName}\\s*=\\s*(["'])(.*?)\\1`, 'i').exec(tag)
+  return match?.[2]
 }
 
 function assertMatchingUpdate(result: UpdateCheckResult | null, expectedVersion: string): void {
