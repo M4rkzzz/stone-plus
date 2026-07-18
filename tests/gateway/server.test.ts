@@ -110,7 +110,7 @@ async function getModels(port: number, path = '/v1/models', token = 'local-secre
 }
 
 afterEach(async () => {
-  await Promise.all(runningServers.splice(0).map((server) => server.stop()))
+  await Promise.all(runningServers.splice(0).map((server) => server.stop({ force: true })))
 })
 
 describe('GatewayServer', () => {
@@ -821,6 +821,167 @@ describe('GatewayServer', () => {
     await reader!.read()
   })
 
+  it('fails over before committing response headers when a 200 stream has no body', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.pools[0].firstBodyTimeoutMs = 1_000
+    const encoder = new TextEncoder()
+    const upstreamFetch = vi.fn()
+      .mockResolvedValueOnce(new Response(new ReadableStream<Uint8Array>({
+        pull: () => new Promise<void>(() => undefined)
+      }), { status: 200, headers: { 'content-type': 'text/event-stream' } }))
+      .mockResolvedValueOnce(new Response(encoder.encode([
+        'data: {"id":"chat-failover","model":"source-model","choices":[{"index":0,"delta":{"content":"Recovered"},"finish_reason":"stop"}]}',
+        '',
+        'data: [DONE]',
+        '',
+        ''
+      ].join('\n')), { status: 200, headers: { 'content-type': 'text/event-stream' } }))
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: (account) => `key-${account.id}`,
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await post(port, 'local-secret', { stream: true })
+    expect(response.status).toBe(200)
+    expect(await response.text()).toContain('Recovered')
+    expect(upstreamFetch).toHaveBeenCalledTimes(2)
+  }, 10_000)
+
+  it('ignores empty upstream chunks while waiting for the first response body', async () => {
+    const port = await freePort()
+    const encoder = new TextEncoder()
+    const upstreamFetch = vi.fn(async () => new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array(0))
+        controller.enqueue(encoder.encode(
+          'data: {"id":"chat-empty-first","model":"source-model","choices":[{"index":0,"delta":{"content":"Ready"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
+        ))
+        controller.close()
+      }
+    }), { status: 200, headers: { 'content-type': 'text/event-stream' } }))
+    const gateway = new GatewayServer({
+      config: config(port),
+      credentialResolver: () => 'credential',
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await post(port, 'local-secret', { stream: true })
+    expect(await response.text()).toContain('Ready')
+    expect(upstreamFetch).toHaveBeenCalledOnce()
+  })
+
+  it('gracefully drains an active stream when the gateway is restarted', async () => {
+    const port = await freePort()
+    const encoder = new TextEncoder()
+    let releaseTail!: () => void
+    const upstreamFetch = vi.fn(async () => new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode(
+          'data: {"id":"chat-drain","model":"source-model","choices":[{"index":0,"delta":{"content":"Beginning"},"finish_reason":null}]}\n\n'
+        ))
+        releaseTail = () => {
+          controller.enqueue(encoder.encode(
+            'data: {"id":"chat-drain","model":"source-model","choices":[{"index":0,"delta":{"content":" finished"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
+          ))
+          controller.close()
+        }
+      }
+    }), { status: 200, headers: { 'content-type': 'text/event-stream' } }))
+    const logs: RequestLog[] = []
+    const gateway = new GatewayServer({
+      config: config(port), credentialResolver: () => 'credential',
+      fetchImplementation: upstreamFetch as typeof fetch, onLog: (log) => logs.push(log)
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await post(port, 'local-secret', { stream: true })
+    const reader = response.body!.getReader()
+    expect(new TextDecoder().decode((await reader.read()).value)).toContain('Beginning')
+    const stopping = gateway.stop({ drainTimeoutMs: 2_000 })
+    releaseTail()
+    let body = ''
+    for (;;) {
+      const chunk = await reader.read()
+      if (chunk.done) break
+      body += new TextDecoder().decode(chunk.value)
+    }
+    await stopping
+
+    expect(body).toContain('finished')
+    expect(logs).toHaveLength(1)
+    expect(logs[0]).toMatchObject({ status: 'success', statusCode: 200 })
+  })
+
+  it('fails over before committing a converted stream when its first body times out', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.routes[0].inboundProtocol = 'anthropic-messages'
+    gatewayConfig.pools[0].firstBodyTimeoutMs = 1_000
+    const upstreamFetch = vi.fn()
+      .mockResolvedValueOnce(new Response(new ReadableStream<Uint8Array>({
+        pull: () => new Promise<void>(() => undefined)
+      }), { status: 200, headers: { 'content-type': 'text/event-stream' } }))
+      .mockResolvedValueOnce(new Response([
+        'data: {"id":"chat-converted-failover","model":"source-model","choices":[{"index":0,"delta":{"content":"Recovered"},"finish_reason":"stop"}]}',
+        '',
+        'data: [DONE]',
+        '',
+        ''
+      ].join('\n'), { status: 200, headers: { 'content-type': 'text/event-stream' } }))
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: (selected) => `key-${selected.id}`,
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'source-model', stream: true, max_tokens: 64,
+        messages: [{ role: 'user', content: 'Hello' }]
+      })
+    })
+    expect(response.status).toBe(200)
+    expect(await response.text()).toContain('Recovered')
+    expect(upstreamFetch).toHaveBeenCalledTimes(2)
+  }, 10_000)
+
+  it('optionally hedges slow response headers through another hot transport lane', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.pools[0].hedgedRequests = true
+    gatewayConfig.pools[0].hedgeDelayMs = 250
+    const stream = 'data: {"id":"chat-hedged","model":"source-model","choices":[{"index":0,"delta":{"content":"Fast"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
+    const upstreamFetch = vi.fn()
+      .mockImplementationOnce(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 800))
+        return new Response(stream, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+      })
+      .mockResolvedValueOnce(new Response(stream, { status: 200, headers: { 'content-type': 'text/event-stream' } }))
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'credential',
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await post(port, 'local-secret', { stream: true })
+    expect(response.status).toBe(200)
+    expect(await response.text()).toContain('Fast')
+    expect(upstreamFetch).toHaveBeenCalledTimes(2)
+  })
+
   it('logs only 499 without cooldown or failover when the client disconnects', async () => {
     const port = await freePort()
     const states: Array<{ accountId: string; status: string }> = []
@@ -1044,6 +1205,42 @@ describe('GatewayServer', () => {
     expect(states[0]).toMatchObject({ accountId: 'first', status: 'active' })
   })
 
+  it('records request phases without changing legacy cumulative timings', async () => {
+    const port = await freePort()
+    let clock = timestamp
+    const logs: RequestLog[] = []
+    const gateway = new GatewayServer({
+      config: config(port),
+      credentialResolver: async () => {
+        clock += 20
+        return 'credential'
+      },
+      fetchImplementation: vi.fn(async () => {
+        clock += 100
+        return new Response(JSON.stringify({
+          id: 'phase-timing',
+          model: 'source-model',
+          choices: [{ message: { role: 'assistant', content: 'Done' }, finish_reason: 'stop' }]
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }) as typeof fetch,
+      onLog: (log) => logs.push(log),
+      now: () => clock
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    expect((await post(port)).status).toBe(200)
+    expect(logs).toHaveLength(1)
+    expect(logs[0]).toMatchObject({
+      bodyReadMs: 0,
+      schedulerSelectMs: 0,
+      credentialResolveMs: 20,
+      outboundFetchStartMs: 20,
+      upstreamHeadersMs: 120
+    })
+    expect(logs[0].upstreamHeadersMs! - logs[0].outboundFetchStartMs!).toBe(100)
+  })
+
   it('records time to first token and the client-provided conversation identity', async () => {
     const port = await freePort()
     let clock = timestamp
@@ -1108,7 +1305,9 @@ describe('GatewayServer', () => {
       status: 'success',
       conversationId: 'thread-stone-feature',
       conversationName: 'Stone 请求日志功能',
-      firstTokenMs: 40
+      upstreamFirstByteMs: 40,
+      firstTokenMs: 125,
+      accountFirstTokenMs: 125
     })
   })
 

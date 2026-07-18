@@ -21,6 +21,8 @@ export interface GatewayConfig {
   providers: ProviderDefinition[]
   routes: Route[]
   settings: GatewaySettings
+  /** Recent persisted logs used only to seed autobalanced runtime performance. */
+  recentRequestLogs?: RequestLog[]
 }
 
 export interface ResolvedGatewayCredential {
@@ -29,7 +31,7 @@ export interface ResolvedGatewayCredential {
   accountId?: string
 }
 
-export type CredentialResolver = (account: Account, fetchImplementation?: typeof fetch) =>
+export type CredentialResolver = (account: Account, fetchImplementation?: typeof fetch, signal?: AbortSignal) =>
   Promise<ResolvedGatewayCredential | string | undefined> | ResolvedGatewayCredential | string | undefined
 
 export type OutboundFetchResolver = (account: Account, pool: Pool) => typeof fetch
@@ -67,7 +69,7 @@ export interface GatewayServerOptions {
 
 export interface GatewayController {
   start(settings?: GatewaySettings, credentialResolver?: CredentialResolver): Promise<void>
-  stop(): Promise<void>
+  stop(options?: { force?: boolean; drainTimeoutMs?: number }): Promise<void>
   getStatus(): GatewayStatus
   updateConfig(config: GatewayConfig): void
   resetAccountHealth(accountId: string): void

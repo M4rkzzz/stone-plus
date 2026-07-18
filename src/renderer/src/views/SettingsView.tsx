@@ -48,6 +48,7 @@ export function SettingsView({
   const [saved, setSaved] = useState(false)
   const [backups, setBackups] = useState<BackupRecordSummary[]>([])
   const [operationNotice, setOperationNotice] = useState('')
+  const [connectionNotice, setConnectionNotice] = useState('')
 
   useEffect(() => setDraft(snapshot.gateway), [snapshot.gateway])
   useEffect(() => { void api.listStateBackups().then(setBackups).catch(() => undefined) }, [api])
@@ -93,6 +94,16 @@ export function SettingsView({
     setOperationNotice('脱敏诊断报告已复制到剪贴板。')
   }
 
+  const rebuildConnections = async () => {
+    setConnectionNotice('正在建立新的低延迟出口连接…')
+    try {
+      await api.rebuildOutboundConnections()
+      setConnectionNotice('出站连接已重建并预热；旧连接会在现有请求结束后释放。')
+    } catch (cause) {
+      setConnectionNotice(cause instanceof Error ? cause.message : '出站连接重建失败')
+    }
+  }
+
   return (
     <form className="page-stack" onSubmit={(event) => void submit(event)}>
       <PageHeader
@@ -115,6 +126,8 @@ export function SettingsView({
           <SettingRow title="应用启动时运行网关" description="Stone 启动后自动监听本地端口" control={<Toggle checked={draft.autoStart} onChange={(value) => setDraft({ ...draft, autoStart: value })} label="应用启动时运行网关" />} />
           <SettingRow title="登录系统时启动 Stone" description="由操作系统管理桌面应用自启动" control={<Toggle checked={Boolean(draft.launchAtLogin)} onChange={(value) => setDraft({ ...draft, launchAtLogin: value })} label="登录系统时启动 Stone" />} />
           <SettingRow title="桌面健康通知" description="账号停用、冷却、额度耗尽或恢复时通知" control={<Toggle checked={draft.desktopNotifications !== false} onChange={(value) => setDraft({ ...draft, desktopNotifications: value })} label="桌面健康通知" />} />
+          <SettingRow title="重建低延迟出口" description="切换梯子、网络或节点后，建立并预热一代新的多通道连接" control={<button className="button button--secondary" type="button" onClick={() => void rebuildConnections()}><RefreshCw size={16} />重建并预热</button>} />
+          {connectionNotice && <div className="client-config-notice">{connectionNotice}</div>}
         </div>
       </section>
 

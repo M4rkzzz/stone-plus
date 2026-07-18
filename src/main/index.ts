@@ -1,10 +1,10 @@
-import { app, BrowserWindow, Menu, nativeImage, net, shell, Tray } from 'electron'
+import { app, BrowserWindow, Menu, nativeImage, net, powerMonitor, shell, Tray } from 'electron'
 import electronUpdater from 'electron-updater'
 import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { GatewayServer, type GatewayConfig } from './gateway'
 import { ClientConfigService } from './client-config'
-import { registerGatewayApi, warmGatewayConnections } from './ipc/gateway-api'
+import { rebuildGatewayConnections, registerGatewayApi, warmGatewayConnections } from './ipc/gateway-api'
 import { registerUpdateApi } from './ipc/update-api'
 import { AppStore } from './store/app-store'
 import { DatabaseBackupService } from './backup'
@@ -32,6 +32,7 @@ let isQuitting = false
 let storeClosed = false
 let shutdownForUpdate = false
 let shutdownPromise: Promise<void> | undefined
+let flushGatewayApiState: (() => Promise<void>) | undefined
 
 if (process.env.STONE_USER_DATA_DIR) {
   app.setPath('userData', resolve(process.env.STONE_USER_DATA_DIR))
@@ -55,14 +56,16 @@ async function bootstrap(): Promise<void> {
   if (store.getSnapshot().gateway.automaticBackups !== false) backups.startAutomaticBackups()
   gateway = new GatewayServer({
     config: toGatewayConfig(store),
-    credentialResolver: async (account, fetchImplementation = fetch) => {
+    credentialResolver: async (account, fetchImplementation = fetch, signal) => {
       if (account.credentialType === 'chatgpt-oauth') {
         const serialized = store.getCredential(account.credentialId)
         if (!serialized) return undefined
         const resolved = await resolveChatGptCredential(
           serialized,
-          (rotated) => store.updateChatGptCredential(account.id, rotated),
-          fetchImplementation
+          (rotated, expectedSource) => store.updateChatGptCredential(account.id, rotated, expectedSource),
+          fetchImplementation,
+          Date.now(),
+          { refreshKey: account.id, signal }
         )
         return { secret: resolved.bundle.accessToken, kind: 'chatgpt-oauth' as const, accountId: resolved.bundle.accountId }
       }
@@ -105,7 +108,10 @@ async function bootstrap(): Promise<void> {
   })
   await tunnelService.initialize()
 
-  registerGatewayApi(store, gateway, clientConfig, outboundTransport, backups, updateTrayMenu)
+  flushGatewayApiState = registerGatewayApi(store, gateway, clientConfig, outboundTransport, backups, updateTrayMenu)
+  powerMonitor.on('resume', () => {
+    void rebuildGatewayConnections(store, outboundTransport).catch(() => undefined)
+  })
   registerCodexSessionRepairApi(codexSessionRepair)
   registerUpdateApi(updateService)
   registerTunnelApi(tunnelService)
@@ -241,7 +247,7 @@ function updateTrayMenu(): void {
 
 async function toggleGatewayFromTray(): Promise<void> {
   try {
-    if (gateway.getStatus().running) await gateway.stop()
+    if (gateway.getStatus().running) await gateway.stop({ force: true })
     else {
       gateway.updateConfig(toGatewayConfig(store))
       await gateway.start()
@@ -267,13 +273,16 @@ async function toggleRouteFromTray(routeId: string): Promise<void> {
 
 function toGatewayConfig(store: AppStore): GatewayConfig {
   const configuration = store.getRuntimeConfiguration()
+  const recentRequestLogs = store.getSnapshot().requestLogs.filter((log) =>
+    log.timestamp >= Date.now() - 30 * 60_000)
   return {
     providers: configuration.providers,
     accounts: configuration.accounts,
     pools: configuration.pools,
     proxies: configuration.proxies,
     routes: configuration.routes,
-    settings: configuration.gateway
+    settings: configuration.gateway,
+    recentRequestLogs
   }
 }
 
@@ -300,7 +309,8 @@ function shutdownServices(): Promise<void> {
     try {
       if (!shutdownForUpdate && updateService) updateService.close()
       if (tunnelService) await tunnelService.close()
-      if (gateway) await gateway.stop()
+      if (gateway) await gateway.stop({ force: true })
+      if (flushGatewayApiState) await flushGatewayApiState()
       if (backups) await backups.close()
       if (outboundTransport) await outboundTransport.close()
       if (codexConversationTitles) codexConversationTitles.close()

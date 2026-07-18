@@ -67,6 +67,37 @@ const geminiJsonRecording = JSON.stringify([
 ])
 
 describe('canonical streaming protocol conversion', () => {
+  it('captures cached input and reasoning token details from Responses usage', () => {
+    const parser = createCanonicalStreamParser('openai-responses')
+    const events = parser.push(encoder.encode(
+      'data: {"type":"response.completed","response":{"usage":{"input_tokens":100,"output_tokens":20,"total_tokens":120,"input_tokens_details":{"cached_tokens":80},"output_tokens_details":{"reasoning_tokens":12}}}}\n\n'
+    ))
+    expect(events).toContainEqual({
+      type: 'usage',
+      inputTokens: 100,
+      outputTokens: 20,
+      totalTokens: 120,
+      cachedInputTokens: 80,
+      reasoningTokens: 12
+    })
+  })
+
+  it('rebuilds Responses usage with nested token details only', () => {
+    const collector = createOpenAiResponsesStreamCollector()
+    collector.push(encoder.encode(
+      'data: {"type":"response.completed","response":{"id":"resp_usage","status":"completed","output":[],"usage":{"input_tokens":100,"output_tokens":20,"total_tokens":120,"input_tokens_details":{"cached_tokens":80},"output_tokens_details":{"reasoning_tokens":12}}}}\n\n'
+    ))
+    const usage = collector.finish().response?.usage as Record<string, unknown>
+    expect(usage).toMatchObject({
+      input_tokens: 100,
+      output_tokens: 20,
+      input_tokens_details: { cached_tokens: 80 },
+      output_tokens_details: { reasoning_tokens: 12 }
+    })
+    expect(usage).not.toHaveProperty('cached_input_tokens')
+    expect(usage).not.toHaveProperty('reasoning_tokens')
+  })
+
   it('collects a chunked Responses stream into one ordinary response', () => {
     const collector = createOpenAiResponsesStreamCollector({ model: 'gpt-fallback', now: () => 1_700_000_000_000 })
     const recording = [

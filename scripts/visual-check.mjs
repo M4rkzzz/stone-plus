@@ -31,6 +31,14 @@ const modalCases = [
     open: async (page) => {
       await page.getByRole('button', { name: '导入 ChatGPT 账号' }).click()
     }
+  },
+  {
+    name: 'account-export-modal',
+    page: '供应商',
+    scrollTo: '.account-export__list',
+    open: async (page) => {
+      await page.getByRole('button', { name: '导出账号' }).click()
+    }
   }
 ]
 const viewports = [

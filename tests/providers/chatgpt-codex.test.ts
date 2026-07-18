@@ -13,8 +13,10 @@ import {
   queryChatGptCodexModels,
   queryChatGptCodexQuota,
   refreshChatGptCredential,
+  resolveChatGptCredential,
   withChatGptCodexBody
 } from '../../src/main/providers'
+import { serializeChatGptCredential } from '../../src/main/auth'
 import type { Account } from '../../src/shared/types'
 
 const bundle = { accessToken: 'access-private', refreshToken: 'refresh-private', accountId: 'acct-team', expiresAt: Date.now() + 3600_000 }
@@ -153,6 +155,104 @@ describe('ChatGPT Codex provider path', () => {
     expect(String(request.body)).toContain('scope=openid+profile+email')
     expect(String(request.body)).not.toContain('offline_access')
     expect(JSON.stringify(refreshed)).not.toContain('refresh-private')
+  })
+
+  it('singleflights concurrent refreshes and persists refresh-token rotation once', async () => {
+    const now = Date.now()
+    const expiring = { ...bundle, accountId: 'acct-singleflight', expiresAt: now - 1 }
+    const serialized = serializeChatGptCredential(expiring)
+    let completeFetch!: (response: Response) => void
+    const fetchMock = vi.fn(() => new Promise<Response>((resolve) => { completeFetch = resolve }))
+    const persistFirst = vi.fn(async () => undefined)
+    const persistSecond = vi.fn(async () => undefined)
+
+    const first = resolveChatGptCredential(serialized, persistFirst, fetchMock as typeof fetch, now, {
+      refreshKey: 'local-account-singleflight'
+    })
+    const second = resolveChatGptCredential(serialized, persistSecond, fetchMock as typeof fetch, now, {
+      refreshKey: 'local-account-singleflight'
+    })
+    expect(fetchMock).toHaveBeenCalledOnce()
+    completeFetch(new Response(JSON.stringify({
+      access_token: 'singleflight-access', refresh_token: 'singleflight-refresh', expires_in: 3600
+    }), { status: 200 }))
+
+    const results = await Promise.all([first, second])
+    expect(results.map((result) => result.bundle.accessToken)).toEqual(['singleflight-access', 'singleflight-access'])
+    expect(persistFirst).toHaveBeenCalledOnce()
+    expect(persistSecond).not.toHaveBeenCalled()
+  })
+
+  it('does not join refresh flights from different source credentials on the same account', async () => {
+    const now = Date.now()
+    const firstSerialized = serializeChatGptCredential({
+      ...bundle, accountId: 'acct-source-isolation', accessToken: 'source-one', refreshToken: 'refresh-one', expiresAt: now - 1
+    })
+    const secondSerialized = serializeChatGptCredential({
+      ...bundle, accountId: 'acct-source-isolation', accessToken: 'source-two', refreshToken: 'refresh-two', expiresAt: now - 1
+    })
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ access_token: 'result-one', expires_in: 3600 }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ access_token: 'result-two', expires_in: 3600 }), { status: 200 }))
+    const persist = vi.fn(async () => undefined)
+
+    const [first, second] = await Promise.all([
+      resolveChatGptCredential(firstSerialized, persist, fetchMock as typeof fetch, now, { refreshKey: 'same-local-id' }),
+      resolveChatGptCredential(secondSerialized, persist, fetchMock as typeof fetch, now, { refreshKey: 'same-local-id' })
+    ])
+
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect([first.bundle.accessToken, second.bundle.accessToken]).toEqual(['result-one', 'result-two'])
+    expect(persist).toHaveBeenCalledWith(expect.any(String), firstSerialized)
+    expect(persist).toHaveBeenCalledWith(expect.any(String), secondSerialized)
+  })
+
+  it('refreshes proactively without putting OAuth latency on a usable-token request', async () => {
+    const now = Date.now()
+    const usable = { ...bundle, accountId: 'acct-background', expiresAt: now + 5 * 60_000 }
+    const serialized = serializeChatGptCredential(usable)
+    let completeFetch!: (response: Response) => void
+    const fetchMock = vi.fn(() => new Promise<Response>((resolve) => { completeFetch = resolve }))
+    const persist = vi.fn(async () => undefined)
+
+    const result = await resolveChatGptCredential(serialized, persist, fetchMock as typeof fetch, now, {
+      refreshKey: 'local-account-background'
+    })
+    expect(result.bundle.accessToken).toBe(usable.accessToken)
+    expect(fetchMock).toHaveBeenCalledOnce()
+    expect(persist).not.toHaveBeenCalled()
+
+    completeFetch(new Response(JSON.stringify({ access_token: 'background-access', expires_in: 3600 }), { status: 200 }))
+    await vi.waitFor(() => expect(persist).toHaveBeenCalledOnce())
+  })
+
+  it('applies a refresh deadline and lets an aborted waiter leave a shared refresh', async () => {
+    const timeoutFetch = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true })
+    }))
+    await expect(refreshChatGptCredential(bundle, timeoutFetch as typeof fetch, { timeoutMs: 5 }))
+      .rejects.toThrow('ChatGPT token refresh timed out.')
+
+    const now = Date.now()
+    const expired = { ...bundle, accountId: 'acct-aborted-waiter', expiresAt: now - 1 }
+    const serialized = serializeChatGptCredential(expired)
+    let completeFetch!: (response: Response) => void
+    const sharedFetch = vi.fn(() => new Promise<Response>((resolve) => { completeFetch = resolve }))
+    const persist = vi.fn(async () => undefined)
+    const owner = resolveChatGptCredential(serialized, persist, sharedFetch as typeof fetch, now, {
+      refreshKey: 'local-account-aborted-waiter'
+    })
+    const controller = new AbortController()
+    const waiter = resolveChatGptCredential(serialized, persist, sharedFetch as typeof fetch, now, {
+      refreshKey: 'local-account-aborted-waiter', signal: controller.signal
+    })
+    controller.abort(new DOMException('Client disconnected', 'AbortError'))
+    await expect(waiter).rejects.toThrow('Client disconnected')
+    expect(sharedFetch).toHaveBeenCalledOnce()
+
+    completeFetch(new Response(JSON.stringify({ access_token: 'owner-access', expires_in: 3600 }), { status: 200 }))
+    await expect(owner).resolves.toMatchObject({ bundle: { accessToken: 'owner-access' } })
+    expect(persist).toHaveBeenCalledOnce()
   })
 
   it('replaces OAuth transport exceptions with fixed errors', async () => {

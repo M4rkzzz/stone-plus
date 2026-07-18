@@ -1,4 +1,4 @@
-import type { Account, AccountCircuitState, Pool } from '../../shared/types'
+import type { Account, AccountCircuitState, Pool, RequestLog } from '../../shared/types'
 import type { ScheduledAccount, SchedulerSelectionInput } from './types'
 
 interface StickyAssignment {
@@ -18,6 +18,7 @@ export interface AccountFailureOptions {
   retryAfterMs?: number
   baseDelayMs?: number
   maxDelayMs?: number
+  maxConcurrency?: number
 }
 
 export interface AccountPerformanceSample {
@@ -30,7 +31,20 @@ interface AccountPerformanceState {
   sampleCount: number
   firstTokenMs?: number
   outputTokensPerSecond?: number
+  failurePenalty: number
+  updatedAt: number
+  dynamicConcurrency?: number
+  successStreak: number
 }
+
+const AUTO_BALANCED_EXPLORATION_RATE = 0.05
+const FAILURE_PENALTY_HALF_LIFE_MS = 5 * 60_000
+const PERFORMANCE_STALE_AFTER_MS = 30 * 60_000
+const PERFORMANCE_HYDRATION_WINDOW_MS = 30 * 60_000
+const PERFORMANCE_HYDRATION_SAMPLES_PER_ACCOUNT = 20
+const STICKY_ESCAPE_MINIMUM_SAMPLES = 3
+const STICKY_ESCAPE_MINIMUM_DELTA_MS = 1_000
+const STICKY_ESCAPE_RATIO = 1.5
 
 export class NoEligibleAccountError extends Error {
   constructor(message = 'No eligible account is available for this request') {
@@ -94,29 +108,80 @@ export class PoolScheduler {
     }
   }
 
+  /**
+   * Restores only missing runtime performance from recent persisted request
+   * logs. Live samples always win, so routine configuration refreshes cannot
+   * roll the scheduler back to an older measurement.
+   */
+  hydratePerformance(logs: readonly RequestLog[]): void {
+    const cutoff = this.now() - PERFORMANCE_HYDRATION_WINDOW_MS
+    const grouped = new Map<string, RequestLog[]>()
+    for (const log of logs) {
+      if (
+        log.status !== 'success'
+        || !log.accountId
+        || log.timestamp < cutoff
+        || rawFirstBytePerformanceMs(log) === undefined
+      ) continue
+      const samples = grouped.get(log.accountId) ?? []
+      samples.push(log)
+      grouped.set(log.accountId, samples)
+    }
+    for (const [accountId, logsForAccount] of grouped) {
+      if (this.performance.has(accountId)) continue
+      const recent = [...logsForAccount]
+        .sort((a, b) => a.timestamp - b.timestamp)
+        .slice(-PERFORMANCE_HYDRATION_SAMPLES_PER_ACCOUNT)
+      for (const log of recent) {
+        const firstTokenMs = rawFirstBytePerformanceMs(log)
+        if (firstTokenMs === undefined) continue
+        this.updatePerformance(accountId, {
+          firstTokenMs,
+          outputTokens: log.outputTokens,
+          generationDurationMs: Math.max(0, log.latencyMs - (log.upstreamFirstByteMs ?? firstTokenMs))
+        }, log.timestamp, false)
+      }
+    }
+  }
+
   selectAndAcquire(input: SchedulerSelectionInput): ScheduledAccount {
     const { pool, accounts, model, sessionId } = input
     if (!poolAllowsModel(pool, accounts, model)) throw new ModelNotExposedError()
 
     const candidates = accounts
       .filter((account) => accountAllowsModel(account, model))
-      .filter((account) => this.isEligible(account))
+      .filter((account) => this.isEligible(account, pool.strategy === 'autobalanced'))
     if (candidates.length === 0) {
       throw new NoEligibleAccountError()
     }
 
     const stickyKey = sessionId ? `${pool.id}:${sessionId}` : undefined
     let selected: Account | undefined
+    let escapedStickyAccountId: string | undefined
     if (pool.stickySessions && stickyKey) {
       const assignment = this.sticky.get(stickyKey)
       if (assignment && assignment.expiresAt > this.now()) {
         selected = candidates.find((account) => account.id === assignment.accountId)
+        if (
+          selected
+          && pool.strategy === 'autobalanced'
+          && this.shouldEscapeSticky(selected, candidates)
+        ) {
+          escapedStickyAccountId = selected.id
+          selected = undefined
+          this.sticky.delete(stickyKey)
+        }
       } else if (assignment) {
         this.sticky.delete(stickyKey)
       }
     }
 
-    selected ??= this.pick(pool, candidates)
+    selected ??= this.pick(
+      pool,
+      escapedStickyAccountId
+        ? candidates.filter((account) => account.id !== escapedStickyAccountId)
+        : candidates
+    )
     this.active.set(selected.id, (this.active.get(selected.id) ?? 0) + 1)
 
     if (pool.stickySessions && stickyKey) {
@@ -166,6 +231,18 @@ export class PoolScheduler {
       lastFailureAt: this.now()
     }
     this.health.set(accountId, state)
+    const performance = this.performance.get(accountId)
+    this.performance.set(accountId, {
+      sampleCount: performance?.sampleCount ?? 0,
+      firstTokenMs: performance?.firstTokenMs,
+      outputTokensPerSecond: performance?.outputTokensPerSecond,
+      failurePenalty: this.decayedFailurePenalty(performance) + 6,
+      updatedAt: this.now(),
+      dynamicConcurrency: Math.max(1, Math.floor(
+        (performance?.dynamicConcurrency ?? Math.max(1, options.maxConcurrency ?? 2)) / 2
+      )),
+      successStreak: 0
+    })
     return { ...state }
   }
 
@@ -180,6 +257,15 @@ export class PoolScheduler {
   }
 
   recordPerformance(accountId: string, sample: AccountPerformanceSample): void {
+    this.updatePerformance(accountId, sample, this.now(), true)
+  }
+
+  private updatePerformance(
+    accountId: string,
+    sample: AccountPerformanceSample,
+    observedAt: number,
+    adaptConcurrency: boolean
+  ): void {
     const firstTokenMs = positiveMetric(sample.firstTokenMs)
     const outputTokens = positiveMetric(sample.outputTokens)
     const generationDurationMs = positiveMetric(sample.generationDurationMs)
@@ -189,6 +275,10 @@ export class PoolScheduler {
     if (firstTokenMs === undefined && outputTokensPerSecond === undefined) return
     const existing = this.performance.get(accountId)
     const alpha = (existing?.sampleCount ?? 0) < 4 ? 0.5 : 0.25
+    const successStreak = adaptConcurrency ? (existing?.successStreak ?? 0) + 1 : 0
+    const dynamicConcurrency = existing?.dynamicConcurrency === undefined
+      ? undefined
+      : existing.dynamicConcurrency + (adaptConcurrency && successStreak >= 8 ? 1 : 0)
     this.performance.set(accountId, {
       sampleCount: (existing?.sampleCount ?? 0) + 1,
       firstTokenMs: updateEwma(existing?.firstTokenMs, firstTokenMs, alpha),
@@ -196,7 +286,11 @@ export class PoolScheduler {
         existing?.outputTokensPerSecond,
         outputTokensPerSecond,
         alpha
-      )
+      ),
+      failurePenalty: this.decayedFailurePenalty(existing) * 0.5,
+      updatedAt: observedAt,
+      dynamicConcurrency,
+      successStreak: adaptConcurrency && successStreak >= 8 ? 0 : successStreak
     })
   }
 
@@ -221,7 +315,7 @@ export class PoolScheduler {
     this.performance.clear()
   }
 
-  private isEligible(account: Account): boolean {
+  private isEligible(account: Account, adaptiveConcurrency: boolean): boolean {
     const now = this.now()
     const health = this.health.get(account.id)
     if (health?.circuitState === 'open' && (health.cooldownUntil ?? 0) <= now) {
@@ -232,7 +326,7 @@ export class PoolScheduler {
     if (account.status === 'cooldown' && account.cooldownUntil === undefined) return false
     if (quotaExhausted(account, now)) return false
     if (cooldownUntil > now || (health?.circuitState === 'half-open' && this.inFlight(account) > 0)) return false
-    return this.inFlight(account) < Math.max(1, account.maxConcurrency)
+    return this.inFlight(account) < this.concurrencyLimit(account, adaptiveConcurrency)
   }
 
   private pick(pool: Pool, candidates: Account[]): Account {
@@ -243,18 +337,15 @@ export class PoolScheduler {
           || this.inFlight(a) - this.inFlight(b))[0]
       case 'balanced':
         return [...candidates].sort((a, b) => {
-          const utilizationA = this.inFlight(a) / Math.max(1, a.maxConcurrency)
-          const utilizationB = this.inFlight(b) / Math.max(1, b.maxConcurrency)
+          const utilizationA = this.inFlight(a) / this.concurrencyLimit(a, false)
+          const utilizationB = this.inFlight(b) / this.concurrencyLimit(b, false)
           return utilizationA - utilizationB
             || quotaPressure(a) - quotaPressure(b)
             || a.priority - b.priority
             || a.id.localeCompare(b.id)
         })[0]
       case 'autobalanced':
-        return [...candidates].sort((a, b) => {
-          return this.autoBalancedCost(a) - this.autoBalancedCost(b)
-            || a.id.localeCompare(b.id)
-        })[0]
+        return this.pickAutoBalanced(candidates)
       case 'round-robin': {
         const ordered = candidates
         const offset = this.roundRobinOffsets.get(pool.id) ?? 0
@@ -279,22 +370,118 @@ export class PoolScheduler {
     return Math.max(0, account.inFlight) + (this.active.get(account.id) ?? 0)
   }
 
-  private autoBalancedCost(account: Account): number {
-    const utilization = this.inFlight(account) / Math.max(1, account.maxConcurrency)
+  private pickAutoBalanced(candidates: Account[]): Account {
+    const unmeasured = candidates.filter((account) => !this.hasPerformanceSample(account.id))
+    const measured = candidates.filter((account) => this.hasPerformanceSample(account.id))
+    if (unmeasured.length > 0 && measured.length > 0 && this.random() < AUTO_BALANCED_EXPLORATION_RATE) {
+      return unmeasured[Math.min(unmeasured.length - 1, Math.floor(this.random() * unmeasured.length))]
+    }
+    const prior = conservativePerformancePrior(measured.map((account) =>
+      performanceCost(this.performance.get(account.id), this.now())))
+    const scored = candidates.map((account) => ({ account, cost: this.autoBalancedCost(account, prior) }))
+    const minimumCost = Math.min(...scored.map(({ cost }) => cost))
+    const best = scored.filter(({ cost }) => Math.abs(cost - minimumCost) < 0.001)
+    if (best.length > 1) {
+      return best[Math.min(best.length - 1, Math.floor(this.random() * best.length))].account
+    }
+    return best[0].account
+  }
+
+  private shouldEscapeSticky(selected: Account, candidates: Account[]): boolean {
+    const selectedPerformance = this.performance.get(selected.id)
+    if (
+      !selectedPerformance?.firstTokenMs
+      || selectedPerformance.sampleCount < STICKY_ESCAPE_MINIMUM_SAMPLES
+      || this.now() - selectedPerformance.updatedAt >= PERFORMANCE_STALE_AFTER_MS
+    ) return false
+    const alternatives = candidates
+      .filter((account) => account.id !== selected.id)
+      .map((account) => ({ account, performance: this.performance.get(account.id) }))
+      .filter((candidate): candidate is {
+        account: Account
+        performance: AccountPerformanceState & { firstTokenMs: number }
+      } => Boolean(
+        candidate.performance?.firstTokenMs
+        && candidate.performance.sampleCount >= STICKY_ESCAPE_MINIMUM_SAMPLES
+        && this.now() - candidate.performance.updatedAt < PERFORMANCE_STALE_AFTER_MS
+      ))
+      .sort((a, b) => a.performance.firstTokenMs - b.performance.firstTokenMs)
+    const fastest = alternatives[0]
+    if (!fastest) return false
+    return selectedPerformance.firstTokenMs >= Math.max(
+      fastest.performance.firstTokenMs + STICKY_ESCAPE_MINIMUM_DELTA_MS,
+      fastest.performance.firstTokenMs * STICKY_ESCAPE_RATIO
+    )
+  }
+
+  private autoBalancedCost(account: Account, unmeasuredPrior: number): number {
+    const utilization = this.inFlight(account) / this.concurrencyLimit(account, true)
+    const performance = this.performance.get(account.id)
+    const measuredCost = performanceCost(performance, this.now())
+    const staleRegression = performance === undefined
+      ? 1
+      : Math.max(0, Math.min(1, (this.now() - performance.updatedAt) / PERFORMANCE_STALE_AFTER_MS))
+    const performanceEstimate = performance === undefined
+      ? unmeasuredPrior
+      : measuredCost * (1 - staleRegression) + unmeasuredPrior * staleRegression
     return utilization * 1_000
       + quotaPressure(account) * 200
-      + performanceCost(this.performance.get(account.id)) * 10
+      + performanceEstimate * 10
       + account.priority
+  }
+
+  private hasPerformanceSample(accountId: string): boolean {
+    return (this.performance.get(accountId)?.sampleCount ?? 0) > 0
+  }
+
+  private decayedFailurePenalty(state: AccountPerformanceState | undefined): number {
+    if (!state?.failurePenalty) return 0
+    const elapsed = Math.max(0, this.now() - state.updatedAt)
+    return state.failurePenalty * 0.5 ** (elapsed / FAILURE_PENALTY_HALF_LIFE_MS)
+  }
+
+  private concurrencyLimit(account: Account, adaptive: boolean): number {
+    if (!adaptive) return Math.max(1, account.maxConcurrency)
+    return Math.max(1, Math.min(
+      Math.max(1, account.maxConcurrency),
+      this.performance.get(account.id)?.dynamicConcurrency ?? Math.max(1, account.maxConcurrency)
+    ))
   }
 }
 
-function performanceCost(state: AccountPerformanceState | undefined): number {
-  if (!state) return -2
+function performanceCost(state: AccountPerformanceState | undefined, now: number): number {
+  if (!state) return 4
   const firstTokenSeconds = state.firstTokenMs === undefined ? 3 : state.firstTokenMs / 1000
   const outputPenalty = state.outputTokensPerSecond === undefined
     ? 1.5
     : 50 / Math.max(1, state.outputTokensPerSecond)
-  return Math.min(20, firstTokenSeconds) * 0.6 + Math.min(20, outputPenalty) * 1.4
+  const elapsed = Math.max(0, now - state.updatedAt)
+  const failurePenalty = state.failurePenalty * 0.5 ** (elapsed / FAILURE_PENALTY_HALF_LIFE_MS)
+  return Math.min(20, firstTokenSeconds) * 0.6
+    + Math.min(20, outputPenalty) * 1.4
+    + failurePenalty
+}
+
+function conservativePerformancePrior(costs: number[]): number {
+  if (costs.length === 0) return 4
+  const ordered = [...costs].sort((a, b) => a - b)
+  const p75 = ordered[Math.min(ordered.length - 1, Math.ceil(ordered.length * 0.75) - 1)]
+  return Math.max(4, p75 * 1.15)
+}
+
+function rawFirstBytePerformanceMs(log: RequestLog): number | undefined {
+  if (log.upstreamFirstByteMs !== undefined) {
+    // firstTokenMs is request-relative while accountFirstTokenMs is relative to
+    // the successful attempt. Their difference removes time spent in failed
+    // attempts before attributing the raw first byte to the winning account.
+    const previousAttemptsMs = log.firstTokenMs !== undefined && log.accountFirstTokenMs !== undefined
+      ? Math.max(0, log.firstTokenMs - log.accountFirstTokenMs)
+      : 0
+    return positiveMetric(Math.max(0, log.upstreamFirstByteMs - previousAttemptsMs))
+  }
+  // Before phase timing was introduced firstTokenMs meant the raw upstream
+  // chunk. New semantic-TTFT logs can be distinguished by accountFirstTokenMs.
+  return log.accountFirstTokenMs === undefined ? positiveMetric(log.firstTokenMs) : undefined
 }
 
 function positiveMetric(value: number | undefined): number | undefined {

@@ -41,6 +41,11 @@ interface RequestColumnDefinition {
 }
 
 const REQUEST_COLUMN_STORAGE_KEY = 'stone:request-column-widths:v1'
+const displayedFirstTokenMs = (log: RequestLog): number | undefined => log.upstreamFirstByteMs ?? log.firstTokenMs
+const outboundHeadersWaitMs = (log: RequestLog): number | undefined =>
+  log.outboundFetchStartMs === undefined || log.upstreamHeadersMs === undefined
+    ? undefined
+    : Math.max(0, log.upstreamHeadersMs - log.outboundFetchStartMs)
 const REQUEST_COLUMNS: RequestColumnDefinition[] = [
   { id: 'time', label: '时间', defaultWidth: 94, minimumWidth: 80 },
   { id: 'client', label: '客户端', defaultWidth: 100, minimumWidth: 84 },
@@ -150,9 +155,9 @@ export function RequestsView({
   const averageLatency = snapshot.requestLogs.length
     ? Math.round(snapshot.requestLogs.reduce((total, log) => total + log.latencyMs, 0) / snapshot.requestLogs.length)
     : 0
-  const firstTokenLogs = snapshot.requestLogs.filter((log) => log.firstTokenMs !== undefined)
+  const firstTokenLogs = snapshot.requestLogs.filter((log) => displayedFirstTokenMs(log) !== undefined)
   const averageFirstToken = firstTokenLogs.length
-    ? Math.round(firstTokenLogs.reduce((total, log) => total + (log.firstTokenMs ?? 0), 0) / firstTokenLogs.length)
+    ? Math.round(firstTokenLogs.reduce((total, log) => total + (displayedFirstTokenMs(log) ?? 0), 0) / firstTokenLogs.length)
     : 0
   const totalTokens = snapshot.requestLogs.reduce((total, log) => total + (log.inputTokens ?? 0) + (log.outputTokens ?? 0), 0)
   const requestTableWidth = REQUEST_COLUMNS.reduce((total, column) => total + columnWidths[column.id], 0)
@@ -254,7 +259,7 @@ export function RequestsView({
                       <td><span className="mono table-model">{log.model}</span></td>
                       <td><div className="table-primary"><strong>{log.providerName}</strong><span>{log.accountName}</span></div></td>
                       <td><RequestStatusBadge status={log.status} />{log.statusCode && <span className="status-code">{log.statusCode}</span>}</td>
-                      <td>{log.firstTokenMs !== undefined ? durationLabel(log.firstTokenMs) : '—'}</td>
+                      <td>{displayedFirstTokenMs(log) !== undefined ? durationLabel(displayedFirstTokenMs(log)!) : '—'}</td>
                       <td>{durationLabel(log.latencyMs)}</td>
                       <td>{log.inputTokens !== undefined ? formatCompactNumber((log.inputTokens ?? 0) + (log.outputTokens ?? 0)) : '—'}</td>
                     </tr>
@@ -282,9 +287,20 @@ export function RequestsView({
               <DetailItem label="模型" mono>{selected.model}</DetailItem>
               <DetailItem label="供应商">{selected.providerName}</DetailItem>
               <DetailItem label="账号">{selected.accountName}</DetailItem>
-              <DetailItem label="首字时间">{selected.firstTokenMs !== undefined ? durationLabel(selected.firstTokenMs) : '—'}</DetailItem>
+              <DetailItem label="首字时间">{displayedFirstTokenMs(selected) !== undefined ? durationLabel(displayedFirstTokenMs(selected)!) : '—'}</DetailItem>
+              <DetailItem label="可见首字时间">{selected.firstTokenMs !== undefined ? durationLabel(selected.firstTokenMs) : '—'}</DetailItem>
+              <DetailItem label="请求体读取">{selected.bodyReadMs !== undefined ? durationLabel(selected.bodyReadMs) : '—'}</DetailItem>
+              <DetailItem label="账号调度">{selected.schedulerSelectMs !== undefined ? durationLabel(selected.schedulerSelectMs) : '—'}</DetailItem>
+              <DetailItem label="凭据解析">{selected.credentialResolveMs !== undefined ? durationLabel(selected.credentialResolveMs) : '—'}</DetailItem>
+              <DetailItem label="发起上游">{selected.outboundFetchStartMs !== undefined ? durationLabel(selected.outboundFetchStartMs) : '—'}</DetailItem>
+              <DetailItem label="上游等待响应头">{outboundHeadersWaitMs(selected) !== undefined ? durationLabel(outboundHeadersWaitMs(selected)!) : '—'}</DetailItem>
+              <DetailItem label="上游响应头">{selected.upstreamHeadersMs !== undefined ? durationLabel(selected.upstreamHeadersMs) : '—'}</DetailItem>
+              <DetailItem label="客户端首写">{selected.clientFirstWriteMs !== undefined ? durationLabel(selected.clientFirstWriteMs) : '—'}</DetailItem>
+              <DetailItem label="账号可见首字">{selected.accountFirstTokenMs !== undefined ? durationLabel(selected.accountFirstTokenMs) : '—'}</DetailItem>
               <DetailItem label="总耗时">{durationLabel(selected.latencyMs)}</DetailItem>
               <DetailItem label="输入 Token">{selected.inputTokens?.toLocaleString('zh-CN') ?? '—'}</DetailItem>
+              <DetailItem label="缓存输入 Token">{selected.cachedInputTokens?.toLocaleString('zh-CN') ?? '—'}</DetailItem>
+              <DetailItem label="推理 Token">{selected.reasoningTokens?.toLocaleString('zh-CN') ?? '—'}</DetailItem>
               <DetailItem label="输出 Token">{selected.outputTokens?.toLocaleString('zh-CN') ?? '—'}</DetailItem>
             </div>
             {selected.error && <div className="request-error"><TriangleAlert size={17} /><div><strong>上游错误</strong><p>{selected.error}</p></div></div>}

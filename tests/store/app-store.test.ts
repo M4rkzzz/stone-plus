@@ -242,10 +242,14 @@ describe('AppStore', () => {
       stickyTtlMinutes: 30,
       maxRetries: 1,
       forceFastMode: true,
+      hedgedRequests: true,
+      hedgeDelayMs: 1750,
+      firstBodyTimeoutMs: 6500,
       proxyId
     })
     const pool = withPool.pools[0]
     expect(pool.forceFastMode).toBe(true)
+    expect(pool).toMatchObject({ hedgedRequests: true, hedgeDelayMs: 1750, firstBodyTimeoutMs: 6500 })
 
     await expect(store.deleteProxy(proxyId)).rejects.toThrow(/accounts/)
     await store.saveAccount({
@@ -271,6 +275,7 @@ describe('AppStore', () => {
       proxyId: ''
     })
     expect(updatedPool.pools[0].forceFastMode).toBe(true)
+    expect(updatedPool.pools[0]).toMatchObject({ hedgedRequests: true, hedgeDelayMs: 1750, firstBodyTimeoutMs: 6500 })
     expect((await store.deleteProxy(proxyId)).proxies).toHaveLength(0)
   })
 
@@ -559,6 +564,52 @@ describe('AppStore', () => {
     expect(JSON.stringify(imported.snapshot)).not.toContain('acct-team-import')
     expect(store.getChatGptCredential(store.getRuntimeAccount(account.id)!.credentialId)).toMatchObject({ accessToken: 'oauth-access-private', accountId: 'acct-team-import' })
     expect(imported.warnings).toHaveLength(1)
+  })
+
+  it('exports selected ChatGPT accounts as CPA and Sub2API JSON without exposing secrets in snapshots', async () => {
+    const store = createStore()
+    await store.initialize()
+    const expiresAt = Date.now() + 3_600_000
+    const imported = await store.importChatGptAccounts({
+      providerId: 'provider-openai',
+      content: JSON.stringify({
+        access_token: 'export-access-private',
+        refresh_token: 'export-refresh-private',
+        id_token: 'export-id-private',
+        account_id: 'acct-export-private',
+        user_id: 'user-export-private',
+        email: 'export@example.com',
+        expired: new Date(expiresAt).toISOString()
+      })
+    })
+    const accountId = imported.importedAccountIds[0]
+
+    const cpa = store.exportChatGptAccounts([accountId], 'cpa')
+    expect(JSON.parse(cpa.content)).toMatchObject({
+      type: 'codex',
+      access_token: 'export-access-private',
+      refresh_token: 'export-refresh-private',
+      account_id: 'acct-export-private',
+      user_id: 'user-export-private',
+      email: 'export@example.com'
+    })
+    const sub2api = store.exportChatGptAccounts([accountId], 'sub2api')
+    expect(JSON.parse(sub2api.content)).toMatchObject({
+      type: 'sub2api-data',
+      version: 1,
+      accounts: [{
+        platform: 'openai',
+        type: 'oauth',
+        credentials: {
+          access_token: 'export-access-private',
+          refresh_token: 'export-refresh-private',
+          account_id: 'acct-export-private'
+        }
+      }]
+    })
+    expect(JSON.stringify(store.getSnapshot())).not.toContain('export-access-private')
+    expect(cpa.exportedAccounts).toBe(1)
+    expect(sub2api.exportedAccounts).toBe(1)
   })
 
   it('keeps access-token-only cards in one workspace separate across batch and repeated imports', async () => {
@@ -954,6 +1005,38 @@ describe('AppStore', () => {
     expect(restarted.getSnapshot().observability.hourly.at(-1)).toMatchObject({ requestCount: 1, inputTokens: 4 })
   })
 
+  it('round-trips request phase timings while keeping legacy logs compatible', async () => {
+    const store = createStore()
+    await store.initialize()
+    await store.appendLog(requestLog(1, 'legacy-phase-log'))
+    await store.appendLog({
+      ...requestLog(2, 'segmented-phase-log'),
+      bodyReadMs: 12,
+      schedulerSelectMs: 3,
+      credentialResolveMs: 27,
+      outboundFetchStartMs: 58,
+      upstreamHeadersMs: 1_240
+    })
+    await store.close()
+
+    const restarted = createStore()
+    await restarted.initialize()
+    const segmented = restarted.getSnapshot().requestLogs.find((log) => log.id === 'segmented-phase-log')
+    expect(segmented).toMatchObject({
+      bodyReadMs: 12,
+      schedulerSelectMs: 3,
+      credentialResolveMs: 27,
+      outboundFetchStartMs: 58,
+      upstreamHeadersMs: 1_240
+    })
+    const legacy = restarted.getSnapshot().requestLogs.find((log) => log.id === 'legacy-phase-log')
+    expect(legacy).toBeDefined()
+    expect(legacy).not.toHaveProperty('bodyReadMs')
+    expect(legacy).not.toHaveProperty('schedulerSelectMs')
+    expect(legacy).not.toHaveProperty('credentialResolveMs')
+    expect(legacy).not.toHaveProperty('outboundFetchStartMs')
+  })
+
   it('aggregates successful request generation speed for every overview time range', async () => {
     const timestamp = Date.now() - 90_000
     const store = createStore()
@@ -962,7 +1045,8 @@ describe('AppStore', () => {
       ...requestLog(1, 'rate-ten'),
       timestamp,
       latencyMs: 5_000,
-      firstTokenMs: 1_000,
+      upstreamFirstByteMs: 1_000,
+      firstTokenMs: 4_500,
       outputTokens: 40
     })
     await store.appendLog({
@@ -991,6 +1075,25 @@ describe('AppStore', () => {
     expect(tokenRates.last4Hours).toHaveLength(48)
     expect(tokenRates.last24Hours).toHaveLength(48)
     expect(tokenRates.last7Days).toHaveLength(56)
+  })
+
+  it('recomputes observability at most once per second while logs are arriving', async () => {
+    let now = 1_800_000_000_000
+    const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => now)
+    try {
+      const store = createStore()
+      await store.initialize()
+      expect(store.getSnapshot().observability.last24Hours.requestCount).toBe(0)
+
+      await store.appendLog({ ...requestLog(1, 'cached-observability'), timestamp: now })
+      expect(store.getSnapshot().observability.last24Hours.requestCount).toBe(0)
+
+      now += 1_001
+      expect(store.getSnapshot().observability.last24Hours.requestCount).toBe(1)
+      await store.close()
+    } finally {
+      nowSpy.mockRestore()
+    }
   })
 
   it('does not allow an existing client profile to change clients', async () => {
@@ -1058,6 +1161,13 @@ describe('AppStore', () => {
       maxRetries: 1
     })
     await expect(store.deleteAccount(accountId)).rejects.toThrow(/pools/)
+    const withSecondAccount = await store.saveAccount({
+      providerId: 'provider-openai', name: 'Unreferenced key', credential: 'sk-second',
+      priority: 1, weight: 1, maxConcurrency: 1, modelAllowlist: []
+    })
+    const secondAccountId = withSecondAccount.accounts.find((account) => account.name === 'Unreferenced key')!.id
+    await expect(store.deleteAccounts([accountId, secondAccountId])).rejects.toThrow(/pools/)
+    expect(store.getSnapshot().accounts.map((account) => account.id)).toEqual(expect.arrayContaining([accountId, secondAccountId]))
 
     const route = withPool.routes.find((candidate) => candidate.client === 'codex')!
     await store.updateRoute({ ...route, poolId: withPool.pools[0].id, enabled: false })
@@ -1258,6 +1368,18 @@ describe('AppStore', () => {
     })
     const id = imported.importedAccountIds[0]
     const fingerprint = store.getAccountModelDiscoveryFingerprint(id)
+    await store.appendLog(requestLog(1, 'credential-rotation-log'))
+    // A full-state persistence would DELETE and recreate request_logs. Keep a guard
+    // on that table to prove OAuth rotation only touches the credential + account rows.
+    const guardDatabase = new DatabaseSync(join(directory, SQLITE_DATABASE_FILENAME))
+    guardDatabase.exec(`
+      CREATE TRIGGER reject_request_log_delete
+      BEFORE DELETE ON request_logs
+      BEGIN
+        SELECT RAISE(ABORT, 'credential rotation rewrote request history');
+      END;
+    `)
+    guardDatabase.close()
 
     await store.updateChatGptCredential(id, JSON.stringify({
       accessToken: 'oauth-model-access-two',
@@ -1265,10 +1387,68 @@ describe('AppStore', () => {
       accountId,
       expiresAt: Date.now() + 7_200_000
     }))
+    const cleanupGuardDatabase = new DatabaseSync(join(directory, SQLITE_DATABASE_FILENAME))
+    cleanupGuardDatabase.exec('DROP TRIGGER reject_request_log_delete')
+    cleanupGuardDatabase.close()
 
     expect(store.getAccountModelDiscoveryFingerprint(id)).toBe(fingerprint)
     await expect(store.setAccountModels(id, ['gpt-oauth-current'], fingerprint)).resolves.toMatchObject({
       accounts: [expect.objectContaining({ id, availableModels: ['gpt-oauth-current'] })]
+    })
+  })
+
+  it('atomically rejects a stale concurrent OAuth rotation', async () => {
+    const store = createStore()
+    await store.initialize()
+    const imported = await store.importChatGptAccounts({
+      providerId: 'provider-openai',
+      content: JSON.stringify({
+        access_token: 'oauth-race-original', refresh_token: 'oauth-race-refresh',
+        account_id: 'acct-oauth-race', expired: new Date(Date.now() + 60_000).toISOString()
+      })
+    })
+    const id = imported.importedAccountIds[0]
+    const first = store.updateChatGptCredential(id, JSON.stringify({
+      accessToken: 'oauth-race-winner', refreshToken: 'oauth-race-rotated',
+      accountId: 'acct-oauth-race', expiresAt: Date.now() + 3_600_000
+    }))
+    const stale = store.updateChatGptCredential(id, JSON.stringify({
+      accessToken: 'oauth-race-stale', refreshToken: 'oauth-race-stale-refresh',
+      accountId: 'acct-oauth-race', expiresAt: Date.now() + 3_600_000
+    }))
+
+    await first
+    await expect(stale).rejects.toThrow('credential changed while it was being rotated')
+    expect(store.getChatGptCredential(store.getRuntimeAccount(id)!.credentialId)).toMatchObject({
+      accessToken: 'oauth-race-winner', refreshToken: 'oauth-race-rotated'
+    })
+  })
+
+  it('does not let a background refresh overwrite a credential edited after refresh started', async () => {
+    const store = createStore()
+    await store.initialize()
+    const imported = await store.importChatGptAccounts({
+      providerId: 'provider-openai',
+      content: JSON.stringify({
+        access_token: 'oauth-background-old', refresh_token: 'oauth-background-old-refresh',
+        account_id: 'acct-background-cas', expired: new Date(Date.now() + 60_000).toISOString()
+      })
+    })
+    const id = imported.importedAccountIds[0]
+    const account = store.getRuntimeAccount(id)!
+    const sourceSerialized = store.getCredential(account.credentialId)!
+    const editedSerialized = JSON.stringify({
+      accessToken: 'oauth-user-edited', refreshToken: 'oauth-user-edited-refresh',
+      accountId: 'acct-background-cas', expiresAt: Date.now() + 7_200_000
+    })
+    await store.updateChatGptCredential(id, editedSerialized)
+
+    await expect(store.updateChatGptCredential(id, JSON.stringify({
+      accessToken: 'oauth-stale-background-result', refreshToken: 'oauth-stale-background-refresh',
+      accountId: 'acct-background-cas', expiresAt: Date.now() + 3_600_000
+    }), sourceSerialized)).rejects.toThrow('credential changed while it was being rotated')
+    expect(store.getChatGptCredential(account.credentialId)).toMatchObject({
+      accessToken: 'oauth-user-edited', refreshToken: 'oauth-user-edited-refresh'
     })
   })
 
@@ -1411,6 +1591,26 @@ describe('AppStore', () => {
       errorsByStatus: { 429: 1 }
     })
     expect(snapshot.observability.last7Days.requestCount).toBe(2)
+  })
+
+  it('coalesces concurrent request-log writes without changing newest-first order', async () => {
+    const store = createStore()
+    await store.initialize()
+    await Promise.all([
+      store.appendLog(requestLog(1, 'batch-first')),
+      store.appendLog(requestLog(2, 'batch-second')),
+      store.appendLog(requestLog(3, 'batch-third'))
+    ])
+    await store.close()
+
+    const restarted = createStore()
+    await restarted.initialize()
+    expect(restarted.getSnapshot().requestLogs.map((log) => log.id)).toEqual([
+      'batch-third',
+      'batch-second',
+      'batch-first'
+    ])
+    await restarted.close()
   })
 
   it('rolls back a failed snapshot transaction and accepts the next queued update', async () => {

@@ -44,10 +44,13 @@ const strategyDescriptions: Record<PoolStrategy, string> = {
 
 const protocols: Protocol[] = ['anthropic-messages', 'openai-responses', 'openai-chat', 'gemini']
 
-type PoolDraft = Omit<PoolInput, 'modelPolicy' | 'modelAllowlist' | 'forceFastMode'> & {
+type PoolDraft = Omit<PoolInput, 'modelPolicy' | 'modelAllowlist' | 'forceFastMode' | 'hedgedRequests' | 'hedgeDelayMs' | 'firstBodyTimeoutMs'> & {
   modelPolicy: ModelPolicy
   modelAllowlist: string[]
   forceFastMode: boolean
+  hedgedRequests: boolean
+  hedgeDelayMs: number
+  firstBodyTimeoutMs: number
 }
 
 function emptyDraft(): PoolDraft {
@@ -62,6 +65,9 @@ function emptyDraft(): PoolDraft {
     stickyTtlMinutes: 30,
     maxRetries: 2,
     forceFastMode: false,
+    hedgedRequests: false,
+    hedgeDelayMs: 2500,
+    firstBodyTimeoutMs: 8000,
     proxyId: '',
   }
 }
@@ -100,6 +106,9 @@ export function PoolsView({
       stickyTtlMinutes: pool.stickyTtlMinutes,
       maxRetries: pool.maxRetries,
       forceFastMode: pool.forceFastMode ?? false,
+      hedgedRequests: pool.hedgedRequests ?? false,
+      hedgeDelayMs: pool.hedgeDelayMs ?? 2500,
+      firstBodyTimeoutMs: pool.firstBodyTimeoutMs ?? 8000,
       proxyId: pool.proxyId ?? '',
     } : emptyDraft())
     setErrors({})
@@ -247,6 +256,7 @@ export function PoolsView({
                     accountIds,
                     modelAllowlist: pruneModelSelection(draft.modelAllowlist, candidates),
                     forceFastMode: protocol === 'openai-responses' ? draft.forceFastMode : false,
+                    hedgedRequests: protocol === 'openai-responses' ? draft.hedgedRequests : false,
                   })
                 }}
               >
@@ -329,8 +339,14 @@ export function PoolsView({
               <div><strong>会话粘性</strong><span>同一会话优先复用已分配账号</span></div>
               <button className={`toggle ${draft.stickySessions ? 'toggle--on' : ''}`} role="switch" aria-checked={draft.stickySessions} type="button" onClick={() => setDraft({ ...draft, stickySessions: !draft.stickySessions })}><span /></button>
             </div>
+            <div className="field field--full inline-settings">
+              <div><strong>极低延迟竞速</strong><span>{draft.protocol === 'openai-responses' ? '响应头等待过久时通过另一条热连接发起备用请求；可能增加短时额度消耗' : '仅 OpenAI Responses 协议可用'}</span></div>
+              <button className={`toggle ${draft.hedgedRequests ? 'toggle--on' : ''}`} role="switch" aria-label="极低延迟竞速" aria-checked={draft.hedgedRequests} type="button" disabled={draft.protocol !== 'openai-responses'} onClick={() => setDraft({ ...draft, hedgedRequests: !draft.hedgedRequests })}><span /></button>
+            </div>
             {draft.stickySessions && <label className="field"><span>粘性时长（分钟）</span><input type="number" min={1} max={1440} value={draft.stickyTtlMinutes} onChange={(event) => setDraft({ ...draft, stickyTtlMinutes: Number(event.target.value) })} /></label>}
             <label className="field"><span>失败重试次数</span><input type="number" min={0} max={5} value={draft.maxRetries} onChange={(event) => setDraft({ ...draft, maxRetries: Number(event.target.value) })} /></label>
+            <label className="field"><span>首正文截止（毫秒）</span><input type="number" min={1000} max={12000} step={250} value={draft.firstBodyTimeoutMs} onChange={(event) => setDraft({ ...draft, firstBodyTimeoutMs: Number(event.target.value) })} /></label>
+            {draft.hedgedRequests && <label className="field"><span>备用请求启动（毫秒）</span><input type="number" min={250} max={15000} step={250} value={draft.hedgeDelayMs} onChange={(event) => setDraft({ ...draft, hedgeDelayMs: Number(event.target.value) })} /></label>}
           </div>
         </form>
       </Modal>

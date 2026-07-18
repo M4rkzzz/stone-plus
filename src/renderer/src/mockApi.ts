@@ -471,7 +471,11 @@ function summarizeTokenRate(logs: RequestLog[], windowEnd: number, windowMs: num
   for (const log of logs) {
     if (log.status !== 'success' || log.timestamp < windowStart || log.timestamp > windowEnd) continue
     if (!log.outputTokens || log.outputTokens <= 0 || log.latencyMs <= 0) continue
-    const generationDurationMs = log.firstTokenMs === undefined ? log.latencyMs : log.latencyMs - log.firstTokenMs
+    const generationStartedMs = log.upstreamFirstByteMs
+      ?? log.clientFirstWriteMs
+      ?? log.firstTokenMs
+      ?? 0
+    const generationDurationMs = log.latencyMs - generationStartedMs
     if (generationDurationMs <= 0) continue
     const index = Math.min(bucketCount - 1, Math.floor((log.timestamp - windowStart) / bucketMs))
     buckets[index].requestCount += 1
@@ -798,6 +802,25 @@ export function createMockApi(): GatewayApi {
       snapshot.accounts = snapshot.accounts.filter((account) => account.id !== id)
       return changed()
     },
+    async deleteAccounts(ids: string[]) {
+      const selected = new Set(ids)
+      if (snapshot.pools.some((pool) => pool.members.some((member) => selected.has(member.accountId)))) {
+        throw new Error('部分所选账号仍在号池中，请先从号池移除')
+      }
+      snapshot.accounts = snapshot.accounts.filter((account) => !selected.has(account.id))
+      return changed()
+    },
+    async exportChatGptAccounts(input) {
+      await pause(120)
+      return {
+        cancelled: false,
+        exportedAccounts: input.accountIds.length,
+        exportedFiles: input.mode === 'merged' ? 1 : input.accountIds.length,
+        ...(input.mode === 'merged'
+          ? { filePath: `C:\\Users\\Demo\\Downloads\\stoneplus-${input.format}-accounts.json` }
+          : { directoryPath: 'C:\\Users\\Demo\\Downloads\\stoneplus-accounts' })
+      }
+    },
     async saveProxy(input: ProxyInput) {
       const timestamp = Date.now()
       const existing = input.id ? snapshot.proxies.find((proxy) => proxy.id === input.id) : undefined
@@ -858,6 +881,10 @@ export function createMockApi(): GatewayApi {
         maxRetries: input.maxRetries,
         forceFastMode: input.protocol === 'openai-responses'
           && (input.forceFastMode ?? existing?.forceFastMode) === true,
+        hedgedRequests: input.protocol === 'openai-responses'
+          && (input.hedgedRequests ?? existing?.hedgedRequests) === true,
+        hedgeDelayMs: input.hedgeDelayMs ?? existing?.hedgeDelayMs ?? 2_500,
+        firstBodyTimeoutMs: input.firstBodyTimeoutMs ?? existing?.firstBodyTimeoutMs ?? 8_000,
         proxyId: input.proxyId || undefined,
         createdAt: existing?.createdAt ?? timestamp,
         updatedAt: timestamp,
@@ -897,6 +924,7 @@ export function createMockApi(): GatewayApi {
       snapshot.gatewayStatus = { ...snapshot.gatewayStatus, running: false, activeRequests: 0, startedAt: undefined }
       return changed()
     },
+    async rebuildOutboundConnections() {},
     async checkAccount(id: string) {
       snapshot.accounts = snapshot.accounts.map((account) =>
         account.id === id ? { ...account, status: 'checking', updatedAt: Date.now() } : account,

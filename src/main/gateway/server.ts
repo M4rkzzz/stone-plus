@@ -65,6 +65,10 @@ interface IncomingRoute {
   geminiMethod?: 'generateContent' | 'streamGenerateContent'
 }
 
+const MIN_FIRST_BODY_TIMEOUT_MS = 1_000
+const MAX_FIRST_BODY_TIMEOUT_MS = 12_000
+const HEDGE_ERROR_GRACE_MS = 750
+
 export class GatewayServer implements GatewayController {
   private config: GatewayConfig
   private credentialResolver: CredentialResolver
@@ -90,6 +94,7 @@ export class GatewayServer implements GatewayController {
     this.now = options.now ?? (() => Date.now())
     this.scheduler = new PoolScheduler(this.now, options.random)
     this.scheduler.hydrate(this.config.accounts)
+    this.scheduler.hydratePerformance(this.config.recentRequestLogs ?? [])
     if (options.onLog) this.logListeners.add(options.onLog)
     if (options.onAccountState) this.accountStateListeners.add(options.onAccountState)
   }
@@ -99,6 +104,7 @@ export class GatewayServer implements GatewayController {
     if (credentialResolver) this.credentialResolver = credentialResolver
     if (this.server) return
     this.scheduler.hydrate(this.config.accounts)
+    this.scheduler.hydratePerformance(this.config.recentRequestLogs ?? [])
 
     const { host, port } = this.config.settings
     if (!isLoopbackHost(host)) {
@@ -107,6 +113,11 @@ export class GatewayServer implements GatewayController {
     this.server = createServer((request, response) => {
       void this.handle(request, response)
     })
+    // Codex clients frequently submit consecutive turns. Keep their local
+    // connection alive so FRP and cross-network users do not pay another TCP
+    // handshake between requests.
+    this.server.keepAliveTimeout = 120_000
+    this.server.headersTimeout = 125_000
     await new Promise<void>((resolve, reject) => {
       const server = this.server
       if (!server) return reject(new Error('Gateway server was not created'))
@@ -126,12 +137,29 @@ export class GatewayServer implements GatewayController {
     })
   }
 
-  async stop(): Promise<void> {
+  async stop(options: { force?: boolean; drainTimeoutMs?: number } = {}): Promise<void> {
     const server = this.server
     if (!server) return
-    await new Promise<void>((resolve, reject) => {
+    server.closeIdleConnections()
+    const closed = new Promise<void>((resolve, reject) => {
       server.close((error) => error ? reject(error) : resolve())
     })
+    if (options.force) {
+      server.closeAllConnections()
+      await closed
+    } else {
+      const drainTimeoutMs = Math.max(1_000, options.drainTimeoutMs ?? 30_000)
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const drained = await Promise.race([
+        closed.then(() => true),
+        new Promise<false>((resolve) => { timer = setTimeout(() => resolve(false), drainTimeoutMs) })
+      ])
+      if (timer) clearTimeout(timer)
+      if (!drained) {
+        server.closeAllConnections()
+        await closed
+      }
+    }
     this.server = undefined
     this.startedAt = undefined
     this.activeRequests = 0
@@ -153,6 +181,7 @@ export class GatewayServer implements GatewayController {
   updateConfig(config: GatewayConfig): void {
     this.config = config
     this.scheduler.hydrate(config.accounts)
+    this.scheduler.hydratePerformance(config.recentRequestLogs ?? [])
   }
 
   resetAccountHealth(accountId: string): void {
@@ -201,12 +230,33 @@ export class GatewayServer implements GatewayController {
     let conversationId: string | undefined
     let conversationName: string | undefined
     let firstTokenAt: number | undefined
+    let bodyReadMs: number | undefined
+    let schedulerSelectMs: number | undefined
+    let credentialResolveMs: number | undefined
+    let outboundFetchStartMs: number | undefined
+    let upstreamHeadersAt: number | undefined
+    let upstreamFirstByteAt: number | undefined
+    let clientFirstWriteAt: number | undefined
+    let successfulAttemptStarted: number | undefined
     const markFirstToken = (): void => {
       firstTokenAt ??= this.now()
     }
+    const markUpstreamFirstByte = (): void => {
+      upstreamFirstByteAt ??= this.now()
+    }
+    const markClientFirstWrite = (): void => {
+      clientFirstWriteAt ??= this.now()
+    }
+    const phaseTimings = () => ({
+      bodyReadMs,
+      schedulerSelectMs,
+      credentialResolveMs,
+      outboundFetchStartMs
+    })
     try {
       logRoute = this.authenticate(request, incoming.protocol)
       const body = await readJsonBody(request)
+      bodyReadMs = Math.max(0, this.now() - started)
       model = getRequestModel(incoming.protocol, body, pathname)
       if (!model) throw new GatewayHttpError(400, 'A model is required')
       const codexSearch = incoming.operation === 'codex-search'
@@ -239,8 +289,17 @@ export class GatewayServer implements GatewayController {
         let release: (() => void) | undefined
         let attemptedAccount: Account | undefined
         const attemptStarted = this.now()
+        firstTokenAt = undefined
+        schedulerSelectMs = undefined
+        credentialResolveMs = undefined
+        outboundFetchStartMs = undefined
+        upstreamHeadersAt = undefined
+        upstreamFirstByteAt = undefined
+        clientFirstWriteAt = undefined
+        successfulAttemptStarted = attemptStarted
         try {
           let scheduled
+          const schedulerSelectStarted = this.now()
           try {
             scheduled = this.scheduler.selectAndAcquire({
               pool: schedulingPool,
@@ -251,6 +310,8 @@ export class GatewayServer implements GatewayController {
           } catch (error) {
             if (error instanceof NoEligibleAccountError && lastRetryableError) throw lastRetryableError
             throw error
+          } finally {
+            schedulerSelectMs = Math.max(0, this.now() - schedulerSelectStarted)
           }
           const account = scheduled.account
           attemptedAccount = account
@@ -267,7 +328,13 @@ export class GatewayServer implements GatewayController {
             ? { ...body, model: targetModel }
             : convertRequest(incoming.protocol, provider.protocol, body, targetModel).body
           const outboundFetch = this.outboundFetchResolver?.(account, pool) ?? this.fetchImplementation
-          const resolvedValue = await this.credentialResolver(account, outboundFetch)
+          const credentialResolveStarted = this.now()
+          let resolvedValue: Awaited<ReturnType<CredentialResolver>>
+          try {
+            resolvedValue = await this.credentialResolver(account, outboundFetch, clientAbortController.signal)
+          } finally {
+            credentialResolveMs = Math.max(0, this.now() - credentialResolveStarted)
+          }
           if (!resolvedValue) {
             throw new GatewayHttpError(503, 'The selected account credential is unavailable', 'account_unavailable')
           }
@@ -312,26 +379,34 @@ export class GatewayServer implements GatewayController {
             : tieredOutboundBody
           let upstreamResponse: Response
           try {
-            upstreamResponse = await outboundFetch(
-              resolvedCredential.kind === 'chatgpt-oauth'
-                ? codexSearch ? CHATGPT_CODEX_SEARCH_URL : CHATGPT_CODEX_RESPONSES_URL
-                : adapter.buildEndpoint({
+            const upstreamUrl = resolvedCredential.kind === 'chatgpt-oauth'
+              ? codexSearch ? CHATGPT_CODEX_SEARCH_URL : CHATGPT_CODEX_RESPONSES_URL
+              : adapter.buildEndpoint({
                 baseUrl: provider.baseUrl,
                 protocol: provider.protocol,
                 operation: codexSearch ? 'search' : 'generate',
                 model: targetModel,
                 stream: streaming
-              }),
-              {
-                method: 'POST',
-                headers: upstreamHeaders,
-                body: JSON.stringify(upstreamBody),
-                signal: AbortSignal.any([
-                  clientAbortController.signal,
-                  AbortSignal.timeout(Math.max(1, this.config.settings.requestTimeoutSeconds) * 1000)
-                ])
-              }
+              })
+            const upstreamInit: RequestInit = {
+              method: 'POST',
+              headers: upstreamHeaders,
+              body: JSON.stringify(upstreamBody),
+              signal: AbortSignal.any([
+                clientAbortController.signal,
+                AbortSignal.timeout(Math.max(1, this.config.settings.requestTimeoutSeconds) * 1000)
+              ])
+            }
+            outboundFetchStartMs = Math.max(0, this.now() - started)
+            upstreamResponse = await fetchWithOptionalHedge(
+              outboundFetch,
+              upstreamUrl,
+              upstreamInit,
+              streaming && !codexSearch && pool.hedgedRequests === true
+                ? Math.max(250, Math.min(15_000, pool.hedgeDelayMs ?? 2_500))
+                : undefined
             )
+            upstreamHeadersAt = this.now()
           } catch (error) {
             throw gatewayErrorFromProviderFailure(adapter.classifyFailure({ error, now: this.now() }))
           }
@@ -364,13 +439,13 @@ export class GatewayServer implements GatewayController {
             )
           }
 
-          if (!streaming) markFirstToken()
-
           if (codexSearch) {
             const payload = sanitizeUpstreamPayload(
               await readUpstreamJson(upstreamResponse),
               sensitiveValues(resolvedCredential)
             )
+            markFirstToken()
+            markClientFirstWrite()
             this.writeJson(response, upstreamResponse.status, payload)
             const completedAt = this.now()
             this.reportAccountSuccess(account, attemptStarted, headerSignals)
@@ -386,17 +461,32 @@ export class GatewayServer implements GatewayController {
               finished: completedAt,
               conversationId,
               conversationName,
+              firstTokenAt,
               status: 'success',
               statusCode: upstreamResponse.status,
-              failoverCount
+              failoverCount,
+              ...phaseTimings(),
+              upstreamHeadersAt,
+              upstreamFirstByteAt,
+              clientFirstWriteAt,
+              accountFirstTokenMs: firstTokenAt === undefined ? undefined : Math.max(0, firstTokenAt - attemptStarted)
             })
             this.emitLog(log)
             return
           }
 
           if (streaming) {
+            const streamTiming = {
+              firstBodyTimeoutMs: Math.min(MAX_FIRST_BODY_TIMEOUT_MS, Math.max(
+                MIN_FIRST_BODY_TIMEOUT_MS,
+                pool.firstBodyTimeoutMs ?? Math.floor(this.config.settings.requestTimeoutSeconds * 250)
+              )),
+              onFirstByte: markUpstreamFirstByte,
+              onFirstToken: markFirstToken,
+              onClientWrite: markClientFirstWrite
+            }
             const streamResult = incoming.protocol === provider.protocol
-              ? await pipeUpstreamResponse(upstreamResponse, response, provider.protocol, sensitiveValues(resolvedCredential), markFirstToken)
+              ? await pipeUpstreamResponse(upstreamResponse, response, provider.protocol, sensitiveValues(resolvedCredential), streamTiming)
               : await pipeConvertedUpstreamResponse(
                 upstreamResponse,
                 response,
@@ -404,7 +494,7 @@ export class GatewayServer implements GatewayController {
                 incoming.protocol,
                 { id: randomUUID(), model },
                 sensitiveValues(resolvedCredential),
-                markFirstToken
+                streamTiming
               )
             if (!streamResult.completed) {
               throw gatewayErrorFromProviderFailure(adapter.classifyFailure({
@@ -433,7 +523,12 @@ export class GatewayServer implements GatewayController {
               status: 'success',
               statusCode: upstreamResponse.status,
               usage: normalizeLogUsage(streamResult.usage),
-              failoverCount
+              failoverCount,
+              ...phaseTimings(),
+              upstreamHeadersAt,
+              upstreamFirstByteAt,
+              clientFirstWriteAt,
+              accountFirstTokenMs: firstTokenAt === undefined ? undefined : Math.max(0, firstTokenAt - attemptStarted)
             })
             this.recordAccountPerformance(log)
             this.emitLog(log)
@@ -459,6 +554,8 @@ export class GatewayServer implements GatewayController {
           }
           const result = convertResponse(provider.protocol, incoming.protocol, payload, model, this.now)
           const usage = extractProtocolUsage(provider.protocol, payload)
+          markFirstToken()
+          markClientFirstWrite()
           this.writeJson(response, 200, result)
           const completedAt = this.now()
           this.reportAccountSuccess(account, attemptStarted, headerSignals)
@@ -466,7 +563,13 @@ export class GatewayServer implements GatewayController {
           release = undefined
           this.successRequests += 1
           await resolveConversationNameForLog()
-          const log = this.makeLog({ route: logRoute, account, model, started, finished: completedAt, conversationId, conversationName, firstTokenAt, status: 'success', statusCode: 200, usage, failoverCount })
+          const log = this.makeLog({
+            route: logRoute, account, model, started, finished: completedAt, conversationId, conversationName,
+            firstTokenAt, status: 'success', statusCode: 200, usage, failoverCount,
+            ...phaseTimings(),
+            upstreamHeadersAt, upstreamFirstByteAt, clientFirstWriteAt,
+            accountFirstTokenMs: firstTokenAt === undefined ? undefined : Math.max(0, firstTokenAt - attemptStarted)
+          })
           this.recordAccountPerformance(log)
           this.emitLog(log)
           return
@@ -479,7 +582,8 @@ export class GatewayServer implements GatewayController {
           const accountAction = gatewayError.providerFailure?.accountAction
           if (attemptedAccount && (retryable || accountAction === 'disable' || accountAction === 'cooldown')) {
             const health = this.scheduler.recordFailure(attemptedAccount.id, {
-              retryAfterMs: gatewayError.providerFailure?.retryAfterMs
+              retryAfterMs: gatewayError.providerFailure?.retryAfterMs,
+              maxConcurrency: attemptedAccount.maxConcurrency
             })
             this.emitAccountState({
               accountId: attemptedAccount.id,
@@ -511,7 +615,14 @@ export class GatewayServer implements GatewayController {
       )
       if (logRoute && selectedAccount) {
         conversationName ??= await this.resolveConversationName(conversationId)
-        this.emitLog(this.makeLog({ route: logRoute, account: selectedAccount, model, started, conversationId, conversationName, firstTokenAt, status: 'error', statusCode: gatewayError.statusCode, error: gatewayError.message, failoverCount }))
+        this.emitLog(this.makeLog({
+          route: logRoute, account: selectedAccount, model, started, conversationId, conversationName, firstTokenAt,
+          status: 'error', statusCode: gatewayError.statusCode, error: gatewayError.message, failoverCount,
+          ...phaseTimings(),
+          upstreamHeadersAt, upstreamFirstByteAt, clientFirstWriteAt,
+          accountFirstTokenMs: firstTokenAt === undefined || successfulAttemptStarted === undefined
+            ? undefined : Math.max(0, firstTokenAt - successfulAttemptStarted)
+        }))
       }
     } finally {
       request.off('aborted', abortForClientDisconnect)
@@ -611,6 +722,14 @@ export class GatewayServer implements GatewayController {
     conversationId?: string
     conversationName?: string
     firstTokenAt?: number
+    bodyReadMs?: number
+    schedulerSelectMs?: number
+    credentialResolveMs?: number
+    outboundFetchStartMs?: number
+    upstreamHeadersAt?: number
+    upstreamFirstByteAt?: number
+    clientFirstWriteAt?: number
+    accountFirstTokenMs?: number
     status: RequestLog['status']
     statusCode?: number
     error?: string
@@ -634,6 +753,14 @@ export class GatewayServer implements GatewayController {
       status: input.status,
       statusCode: input.statusCode,
       latencyMs: Math.max(0, finished - input.started),
+      bodyReadMs: input.bodyReadMs,
+      schedulerSelectMs: input.schedulerSelectMs,
+      credentialResolveMs: input.credentialResolveMs,
+      outboundFetchStartMs: input.outboundFetchStartMs,
+      upstreamHeadersMs: input.upstreamHeadersAt === undefined ? undefined : Math.max(0, input.upstreamHeadersAt - input.started),
+      upstreamFirstByteMs: input.upstreamFirstByteAt === undefined ? undefined : Math.max(0, input.upstreamFirstByteAt - input.started),
+      clientFirstWriteMs: input.clientFirstWriteAt === undefined ? undefined : Math.max(0, input.clientFirstWriteAt - input.started),
+      accountFirstTokenMs: input.accountFirstTokenMs,
       firstTokenMs: input.firstTokenAt === undefined ? undefined : Math.max(0, input.firstTokenAt - input.started),
       inputTokens: usage?.inputTokens,
       outputTokens: usage?.outputTokens,
@@ -649,11 +776,20 @@ export class GatewayServer implements GatewayController {
   }
 
   private recordAccountPerformance(log: RequestLog): void {
-    if (log.status !== 'success' || !log.accountId || log.firstTokenMs === undefined) return
+    if (log.status !== 'success' || !log.accountId || log.upstreamFirstByteMs === undefined) return
+    const previousAttemptsMs = log.firstTokenMs !== undefined && log.accountFirstTokenMs !== undefined
+      ? Math.max(0, log.firstTokenMs - log.accountFirstTokenMs)
+      : 0
+    const accountFirstByteMs = Math.max(0, log.upstreamFirstByteMs - previousAttemptsMs)
+    if (accountFirstByteMs <= 0) return
+    const generationStartedMs = log.upstreamFirstByteMs
+      ?? log.clientFirstWriteMs
+      ?? log.firstTokenMs
+      ?? accountFirstByteMs
     this.scheduler.recordPerformance(log.accountId, {
-      firstTokenMs: log.firstTokenMs,
+      firstTokenMs: accountFirstByteMs,
       outputTokens: log.outputTokens,
-      generationDurationMs: Math.max(0, log.latencyMs - log.firstTokenMs)
+      generationDurationMs: Math.max(0, log.latencyMs - generationStartedMs)
     })
   }
 
@@ -836,10 +972,93 @@ async function collectOpenAiResponsesUpstream(
   return collector.finish()
 }
 
+async function fetchWithOptionalHedge(
+  fetchImplementation: typeof fetch,
+  input: Parameters<typeof fetch>[0],
+  init: RequestInit,
+  hedgeDelayMs?: number
+): Promise<Response> {
+  if (hedgeDelayMs === undefined) return fetchImplementation(input, init)
+  const start = (controller: AbortController) => fetchImplementation(input, {
+    ...init,
+    signal: init.signal
+      ? AbortSignal.any([init.signal, controller.signal])
+      : controller.signal
+  })
+  const primaryController = new AbortController()
+  const primary = start(primaryController)
+  const first = await Promise.race([
+    primary.then((response) => ({ kind: 'response' as const, response })),
+    new Promise<{ kind: 'delay' }>((resolve) => {
+      const timer = setTimeout(() => resolve({ kind: 'delay' }), hedgeDelayMs)
+      void primary.finally(() => clearTimeout(timer)).catch(() => undefined)
+    })
+  ])
+  if (first.kind === 'response') return first.response
+
+  const secondaryController = new AbortController()
+  const secondary = start(secondaryController)
+  type Outcome = { source: 'primary' | 'secondary'; response?: Response; error?: unknown }
+  const outcome = (source: Outcome['source'], promise: Promise<Response>): Promise<Outcome> => promise.then(
+    (response) => ({ source, response }),
+    (error) => ({ source, error })
+  )
+  const primaryOutcome = outcome('primary', primary)
+  const secondaryOutcome = outcome('secondary', secondary)
+  const firstOutcome = await Promise.race([primaryOutcome, secondaryOutcome])
+  let winner = firstOutcome
+  if (!winner.response) {
+    const other = await (winner.source === 'primary' ? secondaryOutcome : primaryOutcome)
+    winner = other
+  } else if (!winner.response.ok) {
+    // Give the other lane only a short grace window to replace a fast 429/5xx;
+    // never turn a quick upstream error into a full request-timeout wait.
+    const other = await settleWithin(
+      winner.source === 'primary' ? secondaryOutcome : primaryOutcome,
+      HEDGE_ERROR_GRACE_MS
+    )
+    if (other?.response?.ok) winner = other
+  }
+  if (!winner.response) throw winner.error
+
+  const loserController = winner.source === 'primary' ? secondaryController : primaryController
+  const loserOutcome = winner.source === 'primary' ? secondaryOutcome : primaryOutcome
+  loserController.abort(new DOMException('Hedged request lost the response race', 'AbortError'))
+  void loserOutcome.then(async (loser) => {
+    await loser.response?.body?.cancel().catch(() => undefined)
+  })
+  return winner.response
+}
+
+async function settleWithin<T>(promise: Promise<T>, timeoutMs: number): Promise<T | undefined> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<undefined>((resolve) => { timer = setTimeout(() => resolve(undefined), timeoutMs) })
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
 interface StreamPipeResult {
   completed: boolean
-  usage?: { input_tokens?: number; output_tokens?: number; total_tokens?: number }
+  usage?: {
+    input_tokens?: number
+    output_tokens?: number
+    total_tokens?: number
+    cached_input_tokens?: number
+    reasoning_tokens?: number
+  }
   error?: string
+}
+
+interface StreamTimingCallbacks {
+  firstBodyTimeoutMs: number
+  onFirstByte?: () => void
+  onFirstToken?: () => void
+  onClientWrite?: () => void
 }
 
 async function pipeUpstreamResponse(
@@ -847,29 +1066,12 @@ async function pipeUpstreamResponse(
   response: ServerResponse,
   protocol: Protocol,
   secrets: readonly string[],
-  onFirstToken?: () => void
+  timing: StreamTimingCallbacks
 ): Promise<StreamPipeResult> {
-  response.statusCode = upstream.status
-  const contentType = upstream.headers.get('content-type')
-  response.setHeader('content-type', contentType ?? 'text/event-stream; charset=utf-8')
-  const cacheControl = upstream.headers.get('cache-control')
-  response.setHeader('cache-control', cacheControl ?? 'no-cache')
-  const buffering = upstream.headers.get('x-accel-buffering')
-  response.setHeader('x-accel-buffering', buffering ?? 'no')
-  response.flushHeaders()
   const parser = createCanonicalStreamParser(protocol)
   const redactor = new StreamingSecretRedactor(secrets)
   if (!upstream.body) {
-    const encoder = createCanonicalStreamEncoder(protocol, {})
-    const message = 'Upstream stream ended before completion'
-    response.setHeader('content-type', 'text/event-stream; charset=utf-8')
-    await writeStreamChunks(response, [
-      ...encoder.encode({ type: 'error', message, errorType: 'incomplete_stream' }),
-      ...encoder.encode({ type: 'done' }),
-      ...encoder.finish()
-    ])
-    response.end()
-    return { completed: true, error: message }
+    throw new GatewayHttpError(502, 'Upstream stream ended before its first body chunk', 'upstream_stream_error')
   }
   const reader = upstream.body.getReader()
   const usage: NonNullable<StreamPipeResult['usage']> = {}
@@ -889,6 +1091,8 @@ async function pipeUpstreamResponse(
         if (event.inputTokens !== undefined) usage.input_tokens = event.inputTokens
         if (event.outputTokens !== undefined) usage.output_tokens = event.outputTokens
         if (event.totalTokens !== undefined) usage.total_tokens = event.totalTokens
+        if (event.cachedInputTokens !== undefined) usage.cached_input_tokens = event.cachedInputTokens
+        if (event.reasoningTokens !== undefined) usage.reasoning_tokens = event.reasoningTokens
       } else if (event.type === 'error') {
         streamError = redactSensitiveText(event.message, secrets)
       } else if (event.type === 'tool-call-delta') {
@@ -903,6 +1107,7 @@ async function pipeUpstreamResponse(
       )) {
         terminalObserved = true
       }
+      if (meaningfulStreamEvent(event)) timing.onFirstToken?.()
     }
   }
   const observeSafely = (operation: () => CanonicalStreamEvent[], acceptTerminal = true): void => {
@@ -919,23 +1124,43 @@ async function pipeUpstreamResponse(
   }
   response.once('close', cancelOnClose)
   try {
+    const first = await readFirstStreamChunk(reader, timing.firstBodyTimeoutMs)
+    if (first.done || !first.value?.byteLength) {
+      throw new GatewayHttpError(502, 'Upstream stream ended before its first body chunk', 'upstream_stream_error')
+    }
+    timing.onFirstByte?.()
+    response.statusCode = upstream.status
+    response.setHeader('content-type', upstream.headers.get('content-type') ?? 'text/event-stream; charset=utf-8')
+    response.setHeader('cache-control', upstream.headers.get('cache-control') ?? 'no-cache')
+    response.setHeader('x-accel-buffering', upstream.headers.get('x-accel-buffering') ?? 'no')
+    response.flushHeaders()
+    const consume = async (value: Uint8Array): Promise<boolean> => {
+      const events = parser.push(value)
+      observeSafely(() => events)
+      if (response.destroyed) return false
+      for (const chunk of redactor.push(value)) {
+        if (chunk.byteLength > 0) timing.onClientWrite?.()
+        if (!response.write(chunk)) await waitForDrain(response)
+      }
+      return !response.destroyed
+    }
+    if (!await consume(first.value)) {
+      await reader.cancel()
+      return streamPipeResult(logicalCompletionObserved(), usage, streamError)
+    }
     for (;;) {
       const { done, value } = await reader.read()
       if (done) break
-      if (value.byteLength > 0) onFirstToken?.()
-      observeSafely(() => parser.push(value))
-      if (response.destroyed) {
+      if (!await consume(value)) {
         await reader.cancel()
         return streamPipeResult(logicalCompletionObserved(), usage, streamError)
-      }
-      for (const chunk of redactor.push(value)) {
-        if (!response.write(chunk)) await waitForDrain(response)
       }
     }
     if (response.destroyed && logicalCompletionObserved()) {
       return streamPipeResult(true, usage, streamError)
     }
     for (const chunk of redactor.finish()) {
+      if (chunk.byteLength > 0) timing.onClientWrite?.()
       if (!response.write(chunk)) await waitForDrain(response)
     }
     observeSafely(() => parser.finish(), false)
@@ -946,7 +1171,7 @@ async function pipeUpstreamResponse(
     throw error
   } finally {
     response.off('close', cancelOnClose)
-    if (!response.writableEnded && !response.destroyed) response.end()
+    if (response.headersSent && !response.writableEnded && !response.destroyed) response.end()
   }
   return streamPipeResult(logicalCompletionObserved() || !response.destroyed, usage, streamError)
 }
@@ -958,23 +1183,12 @@ async function pipeConvertedUpstreamResponse(
   to: Protocol,
   options: StreamEncodingOptions,
   secrets: readonly string[],
-  onFirstToken?: () => void
+  timing: StreamTimingCallbacks
 ): Promise<StreamPipeResult> {
-  response.statusCode = upstream.status
-  response.setHeader('content-type', 'text/event-stream; charset=utf-8')
-  response.setHeader('cache-control', 'no-cache')
-  response.setHeader('x-accel-buffering', 'no')
   const parser = createCanonicalStreamParser(from)
   const encoder = createCanonicalStreamEncoder(to, options)
   if (!upstream.body) {
-    const message = 'Upstream stream ended before completion'
-    await writeStreamChunks(response, [
-      ...encoder.encode({ type: 'error', message, errorType: 'incomplete_stream' }),
-      ...encoder.encode({ type: 'done' }),
-      ...encoder.finish()
-    ])
-    response.end()
-    return { completed: true, error: message }
+    throw new GatewayHttpError(502, 'Upstream stream ended before its first body chunk', 'upstream_stream_error')
   }
   const reader = upstream.body.getReader()
   const usage: NonNullable<StreamPipeResult['usage']> = {}
@@ -1004,6 +1218,8 @@ async function pipeConvertedUpstreamResponse(
         if (safeEvent.inputTokens !== undefined) usage.input_tokens = safeEvent.inputTokens
         if (safeEvent.outputTokens !== undefined) usage.output_tokens = safeEvent.outputTokens
         if (safeEvent.totalTokens !== undefined) usage.total_tokens = safeEvent.totalTokens
+        if (safeEvent.cachedInputTokens !== undefined) usage.cached_input_tokens = safeEvent.cachedInputTokens
+        if (safeEvent.reasoningTokens !== undefined) usage.reasoning_tokens = safeEvent.reasoningTokens
       } else if (safeEvent.type === 'error') {
         streamError = safeEvent.message
       } else if (safeEvent.type === 'tool-call-delta') {
@@ -1018,17 +1234,31 @@ async function pipeConvertedUpstreamResponse(
       )) {
         terminalObserved = true
       }
-      if (!await writeStreamChunks(response, encoder.encode(safeEvent))) return false
+      if (meaningfulStreamEvent(safeEvent)) timing.onFirstToken?.()
+      if (!await writeStreamChunks(response, encoder.encode(safeEvent), timing.onClientWrite)) return false
     }
     return true
   }
 
   response.once('close', cancelOnClose)
   try {
+    const first = await readFirstStreamChunk(reader, timing.firstBodyTimeoutMs)
+    if (first.done || !first.value?.byteLength) {
+      throw new GatewayHttpError(502, 'Upstream stream ended before its first body chunk', 'upstream_stream_error')
+    }
+    timing.onFirstByte?.()
+    response.statusCode = upstream.status
+    response.setHeader('content-type', 'text/event-stream; charset=utf-8')
+    response.setHeader('cache-control', 'no-cache')
+    response.setHeader('x-accel-buffering', 'no')
+    response.flushHeaders()
+    if (!await forward(parser.push(first.value))) {
+      await reader.cancel()
+      return streamPipeResult(logicalCompletionObserved(), usage, streamError)
+    }
     for (;;) {
       const { done, value } = await reader.read()
       if (done) break
-      if (value.byteLength > 0) onFirstToken?.()
       if (!await forward(parser.push(value))) {
         await reader.cancel()
         return streamPipeResult(logicalCompletionObserved(), usage, streamError)
@@ -1038,20 +1268,23 @@ async function pipeConvertedUpstreamResponse(
       return streamPipeResult(true, usage, streamError)
     }
     if (!await forward(parser.finish(), false)) return streamPipeResult(logicalCompletionObserved(), usage, streamError)
-    if (!await writeStreamChunks(response, encoder.finish())) return streamPipeResult(logicalCompletionObserved(), usage, streamError)
+    if (!await writeStreamChunks(response, encoder.finish(), timing.onClientWrite)) return streamPipeResult(logicalCompletionObserved(), usage, streamError)
   } catch (error) {
     if (response.destroyed) {
       return streamPipeResult(logicalCompletionObserved(), usage, streamError)
     }
+    // A failure before headers/body are committed is still eligible for account
+    // failover. Do not turn it into an implicit HTTP 200 error stream.
+    if (!response.headersSent) throw error
     streamError = error instanceof Error ? error.message : 'Upstream stream failed'
     await forward([
       { type: 'error', message: streamError, errorType: 'upstream_stream_error' },
       { type: 'done' }
     ])
-    await writeStreamChunks(response, encoder.finish())
+    await writeStreamChunks(response, encoder.finish(), timing.onClientWrite)
   } finally {
     response.off('close', cancelOnClose)
-    if (!response.writableEnded && !response.destroyed) response.end()
+    if (response.headersSent && !response.writableEnded && !response.destroyed) response.end()
   }
 
   return streamPipeResult(logicalCompletionObserved() || !response.destroyed, usage, streamError)
@@ -1069,13 +1302,49 @@ function streamPipeResult(
   }
 }
 
-async function writeStreamChunks(response: ServerResponse, chunks: Uint8Array[]): Promise<boolean> {
+async function writeStreamChunks(
+  response: ServerResponse,
+  chunks: Uint8Array[],
+  onClientWrite?: () => void
+): Promise<boolean> {
   for (const chunk of chunks) {
     if (response.destroyed) return false
+    if (chunk.byteLength > 0) onClientWrite?.()
     if (!response.write(Buffer.from(chunk))) await waitForDrain(response)
     if (response.destroyed) return false
   }
   return true
+}
+
+async function readFirstStreamChunk(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  timeoutMs: number
+): Promise<ReadableStreamReadResult<Uint8Array>> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    const timeout = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(new GatewayHttpError(
+        504,
+        `Upstream stream produced no body within ${timeoutMs} ms`,
+        'upstream_first_body_timeout'
+      )), timeoutMs)
+    })
+    for (;;) {
+      const result = await Promise.race([reader.read(), timeout])
+      if (result.done || (result.value?.byteLength ?? 0) > 0) return result
+    }
+  } catch (error) {
+    void reader.cancel().catch(() => undefined)
+    throw error
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
+function meaningfulStreamEvent(event: CanonicalStreamEvent): boolean {
+  return event.type === 'text-delta'
+    || event.type === 'tool-call-delta'
+    || event.type === 'message-complete'
 }
 
 async function waitForDrain(response: ServerResponse): Promise<void> {
@@ -1310,13 +1579,21 @@ function objectValue(value: unknown): JsonObject | undefined {
 }
 
 function normalizeLogUsage(
-  usage: { input_tokens?: number; output_tokens?: number; total_tokens?: number } | undefined
+  usage: {
+    input_tokens?: number
+    output_tokens?: number
+    total_tokens?: number
+    cached_input_tokens?: number
+    reasoning_tokens?: number
+  } | undefined
 ): NormalizedTokenUsage | undefined {
   if (!usage) return undefined
   return {
     inputTokens: usage.input_tokens,
     outputTokens: usage.output_tokens,
-    totalTokens: usage.total_tokens
+    totalTokens: usage.total_tokens,
+    cachedInputTokens: usage.cached_input_tokens,
+    reasoningTokens: usage.reasoning_tokens
   }
 }
 

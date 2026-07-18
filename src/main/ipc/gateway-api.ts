@@ -1,6 +1,6 @@
 import { app, BrowserWindow, dialog, ipcMain, Notification } from 'electron'
 import { randomUUID } from 'node:crypto'
-import { lstat, readFile } from 'node:fs/promises'
+import { lstat, readFile, writeFile } from 'node:fs/promises'
 import { basename, extname, join } from 'node:path'
 import { clientNativeProtocols } from '@shared/types'
 import type {
@@ -30,7 +30,7 @@ import { OutboundTransportManager, probeProxy, resolveEffectiveProxy } from '../
 
 export interface GatewayController {
   start(settings?: GatewaySettings): Promise<void>
-  stop(): Promise<void>
+  stop(options?: { force?: boolean; drainTimeoutMs?: number }): Promise<void>
   getStatus(): GatewayStatus
   updateConfig(config: GatewayConfig): void
   resetAccountHealth(accountId: string): void
@@ -45,10 +45,21 @@ export function registerGatewayApi(
   outboundTransport: OutboundTransportManager,
   backups?: DatabaseBackupService<PersistedState>,
   onRuntimeChanged?: () => void
-): void {
-  const snapshotPublishDelayMs = 250
+): () => Promise<void> {
+  const snapshotPublishDelayMs = 1_000
+  const accountStateFlushDelayMs = 250
   let scheduledSnapshotPublish: ReturnType<typeof setTimeout> | undefined
-  const publish = (snapshot: AppSnapshot): AppSnapshot => {
+  let scheduledAccountStateFlush: ReturnType<typeof setTimeout> | undefined
+  const pendingActiveAccountStates = new Map<string, GatewayAccountState>()
+  const canReceiveSnapshot = (window: BrowserWindow): boolean => {
+    const visible = typeof window.isVisible !== 'function' || window.isVisible()
+    const minimized = typeof window.isMinimized === 'function' && window.isMinimized()
+    return !window.isDestroyed() && visible && !minimized
+  }
+  const publish = (
+    snapshot: AppSnapshot,
+    options: { runtimeChanged?: boolean } = { runtimeChanged: true }
+  ): AppSnapshot => {
     if (scheduledSnapshotPublish) {
       clearTimeout(scheduledSnapshotPublish)
       scheduledSnapshotPublish = undefined
@@ -58,7 +69,18 @@ export function registerGatewayApi(
         window.webContents.send('stone:snapshot', snapshot)
       }
     }
-    onRuntimeChanged?.()
+    if (options.runtimeChanged !== false) onRuntimeChanged?.()
+    return snapshot
+  }
+
+  const publishRoutine = (snapshot: AppSnapshot): AppSnapshot => {
+    if (scheduledSnapshotPublish) {
+      clearTimeout(scheduledSnapshotPublish)
+      scheduledSnapshotPublish = undefined
+    }
+    for (const window of BrowserWindow.getAllWindows()) {
+      if (canReceiveSnapshot(window)) window.webContents.send('stone:snapshot', snapshot)
+    }
     return snapshot
   }
 
@@ -66,9 +88,9 @@ export function registerGatewayApi(
     if (scheduledSnapshotPublish) return
     scheduledSnapshotPublish = setTimeout(() => {
       scheduledSnapshotPublish = undefined
-      gateway.updateConfig(toGatewayConfig(store))
       store.setGatewayStatus(gateway.getStatus())
-      publish(store.getSnapshot())
+      if (!BrowserWindow.getAllWindows().some(canReceiveSnapshot)) return
+      publishRoutine(store.getSnapshot())
     }, snapshotPublishDelayMs)
   }
 
@@ -132,9 +154,9 @@ export function registerGatewayApi(
     })
   })
 
-  gateway.onAccountState((state) => {
+  const persistAccountState = async (state: GatewayAccountState): Promise<void> => {
     const before = store.getRuntimeAccount(state.accountId)
-    void store.updateAccountRuntimeState(state.accountId, {
+    await store.updateAccountRuntimeState(state.accountId, {
       status: state.status,
       circuitState: state.circuitState,
       consecutiveFailures: state.consecutiveFailures,
@@ -144,22 +166,79 @@ export function registerGatewayApi(
       lastUsedAt: state.lastUsedAt,
       ...(state.quota ? { quota: state.quota } : {}),
       ...(state.codexQuota ? { codexQuota: state.codexQuota } : {})
-    }).then(async () => {
-      const account = store.getRuntimeAccount(state.accountId)
-      const provider = account ? store.getRuntimeProvider(account.providerId) : undefined
-      const event = account ? healthEventForTransition(before, account, provider?.name ?? 'Unknown provider') : undefined
-      if (event && account) {
-        await store.appendHealthEvent(event)
-        const snapshot = store.getSnapshot()
-        if (snapshot.gateway.desktopNotifications && Notification.isSupported()) {
-          new Notification({ title: `Stone · ${account.name}`, body: event.message }).show()
-        }
-      }
-      if (event || state.status !== 'active') publish(refreshRuntime())
-      else scheduleRuntimePublish()
-    }).catch((error: unknown) => {
-      console.error('Stone could not persist account health state', error)
     })
+    const account = store.getRuntimeAccount(state.accountId)
+    const provider = account ? store.getRuntimeProvider(account.providerId) : undefined
+    const event = account ? healthEventForTransition(before, account, provider?.name ?? 'Unknown provider') : undefined
+    if (event && account) {
+      await store.appendHealthEvent(event)
+      const snapshot = store.getSnapshot()
+      if (snapshot.gateway.desktopNotifications && Notification.isSupported()) {
+        new Notification({ title: `Stone · ${account.name}`, body: event.message }).show()
+      }
+    }
+    // Routine success telemetry (latency/lastUsedAt) must not rebuild the whole
+    // gateway configuration or tray menu. Only routing-affecting transitions do.
+    if (event || state.status !== 'active') {
+      publish(refreshRuntime())
+    } else if (state.quota) {
+      // Quota affects scheduling, but not the desktop tray. Refresh routing
+      // without triggering unrelated runtime UI side effects.
+      publish(refreshRuntime(), { runtimeChanged: false })
+    } else {
+      scheduleRuntimePublish()
+    }
+  }
+
+  const persistRoutineAccountState = async (state: GatewayAccountState): Promise<void> => {
+    const current = store.getRuntimeAccount(state.accountId)
+    // Coalesced success telemetry is stale-able by design. Never let it undo a
+    // user disable or a newer circuit-breaker transition.
+    if (!current || current.status !== 'active' || current.circuitState === 'open'
+      || current.circuitState === 'half-open' || (current.consecutiveFailures ?? 0) > 0) return
+    await store.updateAccountRuntimeState(state.accountId, {
+      latencyMs: state.latencyMs,
+      lastUsedAt: state.lastUsedAt,
+      ...(state.quota ? { quota: state.quota } : {}),
+      ...(state.codexQuota ? { codexQuota: state.codexQuota } : {})
+    })
+    if (state.quota || state.codexQuota) publishRoutine(refreshRuntime())
+    else scheduleRuntimePublish()
+  }
+
+  const flushPendingAccountStates = async (): Promise<void> => {
+    scheduledAccountStateFlush = undefined
+    const pending = [...pendingActiveAccountStates.values()]
+    pendingActiveAccountStates.clear()
+    await Promise.all(pending.map(async (state) => {
+      await persistRoutineAccountState(state).catch((error: unknown) => {
+        console.error('Stone could not persist account health state', error)
+      })
+    }))
+  }
+
+  gateway.onAccountState((state) => {
+    const before = store.getRuntimeAccount(state.accountId)
+    const routingTransition = state.status !== 'active'
+      || !before
+      || before.status !== 'active'
+      || before.circuitState === 'open'
+      || before.circuitState === 'half-open'
+      || (before.consecutiveFailures ?? 0) > 0
+    if (routingTransition) {
+      pendingActiveAccountStates.delete(state.accountId)
+      void persistAccountState(state).catch((error: unknown) => {
+        console.error('Stone could not persist account health state', error)
+      })
+      return
+    }
+    const pending = pendingActiveAccountStates.get(state.accountId)
+    pendingActiveAccountStates.set(state.accountId, pending ? { ...pending, ...state } : state)
+    if (!scheduledAccountStateFlush) {
+      scheduledAccountStateFlush = setTimeout(() => {
+        void flushPendingAccountStates()
+      }, accountStateFlushDelayMs)
+    }
   })
 
   ipcMain.handle('stone:get-snapshot', (event) => {
@@ -289,9 +368,77 @@ export function registerGatewayApi(
       warnings: [...new Set(warnings)]
     }
   })
+  ipcMain.handle('stone:export-chatgpt-accounts', async (event, input: Parameters<GatewayApi['exportChatGptAccounts']>[0]) => {
+    assertTrustedSender(event)
+    if (!input || !Array.isArray(input.accountIds) || !['cpa', 'sub2api'].includes(input.format)
+      || !['merged', 'separate'].includes(input.mode)) {
+      throw new Error('账号导出参数无效。')
+    }
+    const accountIds = [...new Set(input.accountIds)]
+    if (!accountIds.length) throw new Error('请至少选择一个账号。')
+    if (accountIds.length > 500) throw new Error('一次最多导出 500 个账号。')
+    const owner = BrowserWindow.fromWebContents(event.sender)
+    if (!owner) throw new Error('无法打开账号导出文件选择器。')
+    const date = new Date().toISOString().slice(0, 10)
+    if (input.mode === 'merged') {
+      const exported = store.exportChatGptAccounts(accountIds, input.format)
+      const selection = await dialog.showSaveDialog(owner, {
+        title: `合并导出 ${input.format === 'cpa' ? 'CPA' : 'Sub2API'} 账号 JSON`,
+        buttonLabel: '保存账号 JSON',
+        defaultPath: `stoneplus-${input.format}-accounts-${date}.json`,
+        filters: [{ name: 'JSON', extensions: ['json'] }]
+      })
+      if (selection.canceled || !selection.filePath) {
+        return { cancelled: true, exportedAccounts: 0, exportedFiles: 0 }
+      }
+      await writeFile(selection.filePath, exported.content, { encoding: 'utf8', flag: 'w' })
+      return {
+        cancelled: false,
+        exportedAccounts: exported.exportedAccounts,
+        exportedFiles: 1,
+        filePath: selection.filePath
+      }
+    }
+
+    const selection = await dialog.showOpenDialog(owner, {
+      title: `选择分别导出 ${input.format === 'cpa' ? 'CPA' : 'Sub2API'} JSON 的目录`,
+      buttonLabel: '导出到此目录',
+      properties: ['openDirectory', 'createDirectory']
+    })
+    const directoryPath = selection.filePaths[0]
+    if (selection.canceled || !directoryPath) {
+      return { cancelled: true, exportedAccounts: 0, exportedFiles: 0 }
+    }
+    const snapshot = store.getSnapshot()
+    const accountById = new Map(snapshot.accounts.map((account) => [account.id, account]))
+    const batchId = randomUUID().slice(0, 8)
+    const files = accountIds.map((accountId, index) => {
+      const account = accountById.get(accountId)
+      if (!account) throw new Error('所选账号中有账号已不存在。')
+      const exported = store.exportChatGptAccounts([accountId], input.format)
+      const prefix = String(index + 1).padStart(3, '0')
+      return {
+        path: join(directoryPath, `${prefix}-${safeExportFileName(account.name)}-${input.format}-${batchId}.json`),
+        content: exported.content
+      }
+    })
+    await mapConcurrent(files, 4, async (file) => {
+      await writeFile(file.path, file.content, { encoding: 'utf8', flag: 'wx' })
+    })
+    return {
+      cancelled: false,
+      exportedAccounts: accountIds.length,
+      exportedFiles: files.length,
+      directoryPath
+    }
+  })
   ipcMain.handle('stone:delete-account', (event, id: string) => {
     assertTrustedSender(event)
     return mutate(() => store.deleteAccount(id))
+  })
+  ipcMain.handle('stone:delete-accounts', (event, ids: string[]) => {
+    assertTrustedSender(event)
+    return mutate(() => store.deleteAccounts(ids))
   })
   ipcMain.handle('stone:save-proxy', (event, input: Parameters<GatewayApi['saveProxy']>[0]) => {
     assertTrustedSender(event)
@@ -339,16 +486,19 @@ export function registerGatewayApi(
   ipcMain.handle('stone:update-gateway', async (event, settings: GatewaySettings) => {
     assertTrustedSender(event)
     const wasRunning = gateway.getStatus().running
+    const previousSettings = store.getSnapshot().gateway
+    const requiresRestart = wasRunning
+      && (previousSettings.host !== settings.host || previousSettings.port !== settings.port)
     await store.updateGateway(settings)
     if (backups) {
       await backups.setAutomaticRetention(settings.backupRetention ?? 10)
       if (settings.automaticBackups === false) backups.stopAutomaticBackups()
       else backups.startAutomaticBackups()
     }
-    if (wasRunning) await gateway.stop()
+    if (requiresRestart) await gateway.stop()
     gateway.updateConfig(toGatewayConfig(store))
     try {
-      if (wasRunning) {
+      if (requiresRestart) {
         await gateway.start()
         warmGatewayConnections(store, outboundTransport)
       }
@@ -370,9 +520,13 @@ export function registerGatewayApi(
   })
   ipcMain.handle('stone:stop-gateway', async (event) => {
     assertTrustedSender(event)
-    await gateway.stop()
+    await gateway.stop({ force: true })
     store.setGatewayStatus(gateway.getStatus())
     return publish(store.getSnapshot())
+  })
+  ipcMain.handle('stone:rebuild-outbound-connections', async (event) => {
+    assertTrustedSender(event)
+    await rebuildGatewayConnections(store, outboundTransport)
   })
   ipcMain.handle('stone:check-account', async (event, id: string) => {
     assertTrustedSender(event)
@@ -464,7 +618,7 @@ export function registerGatewayApi(
     assertTrustedSender(event)
     if (!backups) throw new Error('Database backup service is unavailable.')
     const wasRunning = gateway.getStatus().running
-    if (wasRunning) await gateway.stop()
+    if (wasRunning) await gateway.stop({ force: true })
     try {
       const result = await backups.restoreBackup(backupIdFromPath(path))
       await store.sanitizePersistedData()
@@ -554,6 +708,17 @@ export function registerGatewayApi(
       { backupRetention: profile?.backupRetention ?? 10 }
     )
   })
+  return async () => {
+    if (scheduledSnapshotPublish) {
+      clearTimeout(scheduledSnapshotPublish)
+      scheduledSnapshotPublish = undefined
+    }
+    if (scheduledAccountStateFlush) {
+      clearTimeout(scheduledAccountStateFlush)
+      scheduledAccountStateFlush = undefined
+    }
+    await flushPendingAccountStates()
+  }
 }
 
 async function summarizeClientConfigs(service: ClientConfigService, client?: RouteClient): Promise<ClientConfigStatus[]> {
@@ -616,13 +781,16 @@ function assertRouteClient(value: unknown): asserts value is RouteClient {
 
 function toGatewayConfig(store: AppStore): GatewayConfig {
   const configuration = store.getRuntimeConfiguration()
+  const recentRequestLogs = store.getSnapshot().requestLogs.filter((log) =>
+    log.timestamp >= Date.now() - 30 * 60_000)
   return {
     providers: configuration.providers,
     accounts: configuration.accounts,
     proxies: configuration.proxies,
     pools: configuration.pools,
     routes: configuration.routes,
-    settings: configuration.gateway
+    settings: configuration.gateway,
+    recentRequestLogs
   }
 }
 
@@ -659,6 +827,61 @@ export function warmGatewayConnections(store: AppStore, transport: OutboundTrans
   ))
 }
 
+export async function rebuildGatewayConnections(store: AppStore, transport: OutboundTransportManager): Promise<void> {
+  const targets = gatewayConnectionTargets(store)
+  const grouped = new Map<string, {
+    proxy: AppSnapshot['proxies'][number] | undefined
+    password: string | undefined
+    origins: Set<string>
+  }>()
+  for (const target of targets.values()) {
+    const key = target.proxy?.id ?? 'direct'
+    const group = grouped.get(key) ?? {
+      proxy: target.proxy,
+      password: target.password,
+      origins: new Set<string>()
+    }
+    group.origins.add(target.origin)
+    grouped.set(key, group)
+  }
+  await Promise.all([...grouped.values()].map((group) =>
+    transport.rebuild(group.proxy, group.password, [...group.origins])
+  ))
+}
+
+function gatewayConnectionTargets(store: AppStore): Map<string, {
+  proxy: AppSnapshot['proxies'][number] | undefined
+  password: string | undefined
+  origin: string
+}> {
+  const configuration = store.getRuntimeConfiguration()
+  const targets = new Map<string, {
+    proxy: AppSnapshot['proxies'][number] | undefined
+    password: string | undefined
+    origin: string
+  }>()
+  for (const pool of configuration.pools) {
+    for (const member of pool.members) {
+      if (!member.enabled) continue
+      const account = configuration.accounts.find((candidate) => candidate.id === member.accountId)
+      if (!account || account.status === 'disabled' || account.status === 'expired') continue
+      const provider = configuration.providers.find((candidate) => candidate.id === account.providerId)
+      if (!provider) continue
+      const proxy = resolveEffectiveProxy(account, pool, configuration.proxies)
+      const origin = new URL(
+        account.credentialType === 'chatgpt-oauth' ? CHATGPT_CODEX_RESPONSES_URL : provider.baseUrl
+      ).origin
+      const key = `${proxy?.id ?? 'direct'}\0${origin}`
+      if (!targets.has(key)) targets.set(key, {
+        proxy,
+        password: proxy ? store.getProxyPassword(proxy.id) : undefined,
+        origin
+      })
+    }
+  }
+  return targets
+}
+
 async function checkAccount(
   store: AppStore,
   outboundTransport: OutboundTransportManager,
@@ -675,8 +898,10 @@ async function checkAccount(
     if (!serialized) throw new Error('This ChatGPT account has no readable credential.')
     const resolved = await resolveChatGptCredential(
       serialized,
-      (rotated) => store.updateChatGptCredential(account.id, rotated),
-      fetchImplementation
+      (rotated, expectedSource) => store.updateChatGptCredential(account.id, rotated, expectedSource),
+      fetchImplementation,
+      Date.now(),
+      { refreshKey: account.id }
     )
     try {
       const result = await queryChatGptCodexQuota(
@@ -751,8 +976,10 @@ export async function discoverAccountModels(
   if (!serialized) throw new Error('The selected ChatGPT account has no readable credential.')
   const resolved = await resolveChatGptCredential(
     serialized,
-    (rotated) => store.updateChatGptCredential(account.id, rotated),
-    fetchImplementation
+    (rotated, expectedSource) => store.updateChatGptCredential(account.id, rotated, expectedSource),
+    fetchImplementation,
+    Date.now(),
+    { refreshKey: account.id }
   )
   return queryChatGptCodexModels(
     resolved.bundle,
@@ -786,8 +1013,10 @@ export async function testAccountModel(
     if (!serialized) throw new Error('The selected ChatGPT account has no readable credential.')
     const resolved = await resolveChatGptCredential(
       serialized,
-      (rotated) => store.updateChatGptCredential(account.id, rotated),
-      fetchImplementation
+      (rotated, expectedSource) => store.updateChatGptCredential(account.id, rotated, expectedSource),
+      fetchImplementation,
+      Date.now(),
+      { refreshKey: account.id, signal }
     )
     return probeChatGptCodexModel({
       bundle: resolved.bundle,
@@ -825,8 +1054,10 @@ async function refreshAccountCodexQuota(
   const fetchImplementation = accountFetchImplementation(store, outboundTransport, account)
   const resolved = await resolveChatGptCredential(
     serialized,
-    (rotated) => store.updateChatGptCredential(account.id, rotated),
-    fetchImplementation
+    (rotated, expectedSource) => store.updateChatGptCredential(account.id, rotated, expectedSource),
+    fetchImplementation,
+    Date.now(),
+    { refreshKey: account.id }
   )
   return (await queryChatGptCodexQuota(
     resolved.bundle,
@@ -952,4 +1183,16 @@ function importErrorMessage(error: unknown): string {
   if (/expiration/i.test(message)) return '无法确定账号过期时间。'
   if (/JSON|Unexpected token|Unexpected end/i.test(message)) return 'JSON 格式无效。'
   return message.slice(0, 240)
+}
+
+function safeExportFileName(value: string): string {
+  const withoutControls = Array.from(value.normalize('NFKC'))
+    .map((character) => character.charCodeAt(0) < 32 ? '_' : character)
+    .join('')
+  const normalized = withoutControls
+    .replace(/[<>:"/\\|?*]/g, '_')
+    .replace(/[. ]+$/g, '')
+    .trim()
+    .slice(0, 80)
+  return normalized || 'account'
 }

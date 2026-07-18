@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Account, AppSnapshot, ProviderDefinition, PublicProxyDefinition, RequestLog } from '../../src/shared/types'
 import type { GatewayController } from '../../src/main/ipc/gateway-api'
+import type { GatewayAccountState } from '../../src/main/gateway'
 import { registerGatewayApi } from '../../src/main/ipc/gateway-api'
 import type { AppStore } from '../../src/main/store/app-store'
 import type { ClientConfigService } from '../../src/main/client-config'
@@ -95,13 +96,77 @@ describe('refresh provider models IPC', () => {
       await Promise.resolve()
       await Promise.resolve()
 
-      await vi.advanceTimersByTimeAsync(249)
+      await vi.advanceTimersByTimeAsync(999)
       expect(send).not.toHaveBeenCalled()
       await vi.advanceTimersByTimeAsync(1)
       expect(send).toHaveBeenCalledOnce()
       expect(harness.store.appendLog).toHaveBeenCalledTimes(2)
+      expect(harness.gateway.updateConfig).not.toHaveBeenCalled()
+      expect(harness.runtimeChanged).not.toHaveBeenCalled()
     } finally {
       electron.getAllWindows.mockReturnValue([])
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not push routine telemetry snapshots to a hidden window', async () => {
+    vi.useFakeTimers()
+    const send = vi.fn()
+    electron.getAllWindows.mockReturnValue([{
+      isDestroyed: () => false,
+      isVisible: () => false,
+      isMinimized: () => false,
+      webContents: { send }
+    }])
+    try {
+      const harness = createHarness([oauthAccount()], {}, vi.fn())
+      harness.emitLog({
+        id: 'hidden-log', timestamp: Date.now(), client: 'codex', protocol: 'openai-responses',
+        providerName: 'OpenAI', accountName: 'Account', model: 'gpt', status: 'success', latencyMs: 10
+      })
+      await vi.advanceTimersByTimeAsync(1_000)
+      expect(send).not.toHaveBeenCalled()
+    } finally {
+      electron.getAllWindows.mockReturnValue([])
+      vi.useRealTimers()
+    }
+  })
+
+  it('coalesces routine active account telemetry without refreshing gateway config', async () => {
+    vi.useFakeTimers()
+    try {
+      const oauth = oauthAccount()
+      const harness = createHarness([oauth], {}, vi.fn())
+      harness.emitAccountState(activeAccountState(oauth.id, 100, 1_000))
+      harness.emitAccountState(activeAccountState(oauth.id, 80, 2_000))
+
+      await vi.advanceTimersByTimeAsync(249)
+      expect(harness.store.updateAccountRuntimeState).not.toHaveBeenCalled()
+      await vi.advanceTimersByTimeAsync(1)
+      expect(harness.store.updateAccountRuntimeState).toHaveBeenCalledOnce()
+      expect(harness.store.updateAccountRuntimeState).toHaveBeenCalledWith(oauth.id, expect.objectContaining({
+        latencyMs: 80,
+        lastUsedAt: 2_000
+      }))
+      expect(harness.gateway.updateConfig).not.toHaveBeenCalled()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not let delayed success telemetry re-enable a manually disabled account', async () => {
+    vi.useFakeTimers()
+    try {
+      const oauth = oauthAccount()
+      const harness = createHarness([oauth], {}, vi.fn())
+      harness.emitAccountState(activeAccountState(oauth.id, 100, 1_000))
+      oauth.status = 'disabled'
+
+      await vi.advanceTimersByTimeAsync(250)
+
+      expect(harness.store.updateAccountRuntimeState).not.toHaveBeenCalled()
+      expect(oauth.status).toBe('disabled')
+    } finally {
       vi.useRealTimers()
     }
   })
@@ -324,7 +389,14 @@ function createHarness(
   upstreamFetch: ReturnType<typeof vi.fn>,
   proxies: PublicProxyDefinition[] = [],
   discoveryFingerprint: { current: string } = { current: 'discovery-fingerprint' }
-): { store: AppStore; transport: OutboundTransportManager; emitLog: (log: RequestLog) => void } {
+): {
+  store: AppStore
+  gateway: GatewayController
+  transport: OutboundTransportManager
+  emitLog: (log: RequestLog) => void
+  emitAccountState: (state: GatewayAccountState) => void
+  runtimeChanged: ReturnType<typeof vi.fn>
+} {
   const snapshot = {
     providers: [{ ...provider, models: [] }],
     accounts: accounts.map(({ credentialId: _credentialId, chatgptAccountId: _chatgptAccountId, ...account }) => account),
@@ -385,9 +457,16 @@ function createHarness(
       return snapshot
     }),
     setGatewayStatus: vi.fn(),
-    appendLog: vi.fn(async () => undefined)
+    appendLog: vi.fn(async () => undefined),
+    updateAccountRuntimeState: vi.fn(async (id: string, patch: Partial<Account>) => {
+      const runtimeAccount = accounts.find((account) => account.id === id)
+      if (runtimeAccount) Object.assign(runtimeAccount, patch)
+    }),
+    getRuntimeProvider: vi.fn((id: string) => snapshot.providers.find((candidate) => candidate.id === id)),
+    appendHealthEvent: vi.fn(async () => snapshot)
   } as unknown as AppStore
   let logListener: ((log: RequestLog) => void) | undefined
+  let accountStateListener: ((state: GatewayAccountState) => void) | undefined
   const gateway = {
     start: vi.fn(async () => undefined),
     stop: vi.fn(async () => undefined),
@@ -398,25 +477,48 @@ function createHarness(
       logListener = listener
       return () => undefined
     }),
-    onAccountState: vi.fn(() => () => undefined)
+    onAccountState: vi.fn((listener: (state: GatewayAccountState) => void) => {
+      accountStateListener = listener
+      return () => undefined
+    })
   } as unknown as GatewayController
   const transport = {
     fetchFor: vi.fn(() => upstreamFetch as unknown as typeof fetch)
   } as unknown as OutboundTransportManager
+  const runtimeChanged = vi.fn()
 
   registerGatewayApi(
     store,
     gateway,
     {} as ClientConfigService,
-    transport
+    transport,
+    undefined,
+    runtimeChanged
   )
   return {
     store,
+    gateway,
     transport,
+    runtimeChanged,
     emitLog: (log) => {
       if (!logListener) throw new Error('Gateway log listener was not registered')
       logListener(log)
+    },
+    emitAccountState: (state) => {
+      if (!accountStateListener) throw new Error('Gateway account-state listener was not registered')
+      accountStateListener(state)
     }
+  }
+}
+
+function activeAccountState(accountId: string, latencyMs: number, lastUsedAt: number): GatewayAccountState {
+  return {
+    accountId,
+    status: 'active',
+    circuitState: 'closed',
+    consecutiveFailures: 0,
+    latencyMs,
+    lastUsedAt
   }
 }
 

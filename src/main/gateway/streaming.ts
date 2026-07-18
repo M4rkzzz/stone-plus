@@ -22,7 +22,7 @@ export type CanonicalStreamEvent =
   | { type: 'tool-call-complete'; index: number }
   /** Lifecycle signal emitted when a Responses assistant message output item is complete. */
   | { type: 'message-complete'; index: number }
-  | { type: 'usage'; inputTokens?: number; outputTokens?: number; totalTokens?: number }
+  | { type: 'usage'; inputTokens?: number; outputTokens?: number; totalTokens?: number; cachedInputTokens?: number; reasoningTokens?: number }
   | { type: 'stop'; reason: CanonicalStopReason; rawReason?: string }
   | { type: 'error'; message: string; code?: string; errorType?: string }
   | { type: 'done' }
@@ -48,7 +48,7 @@ export interface CanonicalStreamEncoder {
 
 export interface OpenAiResponsesStreamResult {
   response?: JsonObject
-  usage?: { input_tokens?: number; output_tokens?: number; total_tokens?: number }
+  usage?: { input_tokens?: number; output_tokens?: number; total_tokens?: number; cached_input_tokens?: number; reasoning_tokens?: number }
   error?: string
 }
 
@@ -180,6 +180,8 @@ class ResponsesStreamCollector implements OpenAiResponsesStreamCollector {
         if (event.inputTokens !== undefined) this.usage.input_tokens = event.inputTokens
         if (event.outputTokens !== undefined) this.usage.output_tokens = event.outputTokens
         if (event.totalTokens !== undefined) this.usage.total_tokens = event.totalTokens
+        if (event.cachedInputTokens !== undefined) this.usage.cached_input_tokens = event.cachedInputTokens
+        if (event.reasoningTokens !== undefined) this.usage.reasoning_tokens = event.reasoningTokens
       } else if (event.type === 'stop') {
         this.stopReason = event.reason
       } else if (event.type === 'error') {
@@ -233,7 +235,15 @@ class ResponsesStreamCollector implements OpenAiResponsesStreamCollector {
     const status = this.terminalType === 'response.incomplete' || this.stopReason === 'length'
       ? 'incomplete'
       : 'completed'
-    const aggregateUsage = omitUndefined({ ...this.usage })
+    const aggregateUsage = omitUndefined({
+      input_tokens: this.usage.input_tokens,
+      output_tokens: this.usage.output_tokens,
+      total_tokens: this.usage.total_tokens,
+      input_tokens_details: this.usage.cached_input_tokens === undefined
+        ? undefined : { cached_tokens: this.usage.cached_input_tokens },
+      output_tokens_details: this.usage.reasoning_tokens === undefined
+        ? undefined : { reasoning_tokens: this.usage.reasoning_tokens }
+    })
     const aggregate: JsonObject = {
       id,
       object: 'response',
@@ -251,7 +261,9 @@ class ResponsesStreamCollector implements OpenAiResponsesStreamCollector {
     const output = terminalOutput && (terminalOutput.length > 0 || aggregateOutput.length === 0)
       ? terminalOutput
       : aggregateOutput
-    const terminalUsage = objectValue(terminal.usage)
+    const terminalUsage = { ...(objectValue(terminal.usage) ?? {}) }
+    delete terminalUsage.cached_input_tokens
+    delete terminalUsage.reasoning_tokens
     return {
       ...aggregate,
       ...terminal,
@@ -375,6 +387,8 @@ class ProtocolParser implements CanonicalStreamParser {
   private usageInputTokens: number | undefined
   private usageOutputTokens: number | undefined
   private usageTotalTokens: number | undefined
+  private usageCachedInputTokens: number | undefined
+  private usageReasoningTokens: number | undefined
 
   constructor(private readonly protocol: Protocol) {
     if (protocol !== 'gemini') this.framing = 'sse'
@@ -794,20 +808,29 @@ class ProtocolParser implements CanonicalStreamParser {
     const parsedInputTokens = numberValue(usage[inputKey])
     const parsedOutputTokens = numberValue(usage[outputKey])
     const parsedTotalTokens = numberValue(totalKey ? usage[totalKey] : undefined)
-    if (parsedInputTokens === undefined && parsedOutputTokens === undefined && parsedTotalTokens === undefined) return
+    const inputDetails = objectValue(usage.input_tokens_details) ?? objectValue(usage.prompt_tokens_details)
+    const outputDetails = objectValue(usage.output_tokens_details) ?? objectValue(usage.completion_tokens_details)
+    const parsedCachedInputTokens = numberValue(inputDetails?.cached_tokens)
+    const parsedReasoningTokens = numberValue(outputDetails?.reasoning_tokens)
+    if (parsedInputTokens === undefined && parsedOutputTokens === undefined && parsedTotalTokens === undefined
+      && parsedCachedInputTokens === undefined && parsedReasoningTokens === undefined) return
     this.usageInputTokens = parsedInputTokens ?? this.usageInputTokens
     this.usageOutputTokens = parsedOutputTokens ?? this.usageOutputTokens
     this.usageTotalTokens = parsedTotalTokens
       ?? sumDefined(this.usageInputTokens, this.usageOutputTokens)
       ?? this.usageTotalTokens
-    const signature = `${this.usageInputTokens ?? ''}:${this.usageOutputTokens ?? ''}:${this.usageTotalTokens ?? ''}`
+    this.usageCachedInputTokens = parsedCachedInputTokens ?? this.usageCachedInputTokens
+    this.usageReasoningTokens = parsedReasoningTokens ?? this.usageReasoningTokens
+    const signature = `${this.usageInputTokens ?? ''}:${this.usageOutputTokens ?? ''}:${this.usageTotalTokens ?? ''}:${this.usageCachedInputTokens ?? ''}:${this.usageReasoningTokens ?? ''}`
     if (signature === this.lastUsage) return
     this.lastUsage = signature
     this.events.push(omitUndefinedEvent({
       type: 'usage',
       inputTokens: this.usageInputTokens,
       outputTokens: this.usageOutputTokens,
-      totalTokens: this.usageTotalTokens
+      totalTokens: this.usageTotalTokens,
+      cachedInputTokens: this.usageCachedInputTokens,
+      reasoningTokens: this.usageReasoningTokens
     }))
   }
 
@@ -1194,7 +1217,9 @@ class ProtocolEncoder implements CanonicalStreamEncoder {
       type: 'usage',
       inputTokens,
       outputTokens,
-      totalTokens: event.totalTokens ?? sumDefined(inputTokens, outputTokens) ?? this.usage.totalTokens
+      totalTokens: event.totalTokens ?? sumDefined(inputTokens, outputTokens) ?? this.usage.totalTokens,
+      cachedInputTokens: event.cachedInputTokens ?? this.usage.cachedInputTokens,
+      reasoningTokens: event.reasoningTokens ?? this.usage.reasoningTokens
     }
   }
 
@@ -1566,7 +1591,9 @@ function openAiUsage(event: Extract<CanonicalStreamEvent, { type: 'usage' }>): J
     prompt_tokens: event.inputTokens,
     completion_tokens: event.outputTokens,
     total_tokens: event.totalTokens
-      ?? sumDefined(event.inputTokens, event.outputTokens)
+      ?? sumDefined(event.inputTokens, event.outputTokens),
+    prompt_tokens_details: event.cachedInputTokens === undefined ? undefined : { cached_tokens: event.cachedInputTokens },
+    completion_tokens_details: event.reasoningTokens === undefined ? undefined : { reasoning_tokens: event.reasoningTokens }
   })
 }
 
@@ -1575,7 +1602,9 @@ function responsesUsage(event: Extract<CanonicalStreamEvent, { type: 'usage' }>)
     input_tokens: event.inputTokens,
     output_tokens: event.outputTokens,
     total_tokens: event.totalTokens
-      ?? sumDefined(event.inputTokens, event.outputTokens)
+      ?? sumDefined(event.inputTokens, event.outputTokens),
+    input_tokens_details: event.cachedInputTokens === undefined ? undefined : { cached_tokens: event.cachedInputTokens },
+    output_tokens_details: event.reasoningTokens === undefined ? undefined : { reasoning_tokens: event.reasoningTokens }
   })
 }
 
@@ -1603,6 +1632,8 @@ function hasUsage(event: Extract<CanonicalStreamEvent, { type: 'usage' }>): bool
   return event.inputTokens !== undefined
     || event.outputTokens !== undefined
     || event.totalTokens !== undefined
+    || event.cachedInputTokens !== undefined
+    || event.reasoningTokens !== undefined
 }
 
 function canonicalError(event: Extract<CanonicalStreamEvent, { type: 'error' }>): JsonObject {

@@ -171,6 +171,13 @@ export class SqliteStateStore<T extends SqlitePersistedShape> {
   private data: T
   private database: DatabaseSync | undefined
   private writeChain = Promise.resolve()
+  private readonly pendingRequestLogs: Array<{
+    log: Identified
+    maximumRows: number
+    resolve: () => void
+    reject: (error: unknown) => void
+  }> = []
+  private requestLogFlushScheduled = false
 
   public constructor(private readonly options: SqliteStateStoreOptions<T>) {
     this.data = this.normalize(options.initialData)
@@ -253,37 +260,57 @@ export class SqliteStateStore<T extends SqlitePersistedShape> {
     return pending
   }
 
-  public async appendRequestLog(log: Identified, maximumRows: number): Promise<void> {
+  public appendRequestLog(log: Identified, maximumRows: number): Promise<void> {
+    const completion = new Promise<void>((resolve, reject) => {
+      this.pendingRequestLogs.push({ log: structuredClone(log), maximumRows, resolve, reject })
+    })
+    this.scheduleRequestLogFlush()
+    return completion
+  }
+
+  private scheduleRequestLogFlush(): void {
+    if (this.requestLogFlushScheduled) return
+    this.requestLogFlushScheduled = true
     const operation = async (): Promise<void> => {
-      const database = this.requireDatabase()
-      database.exec('BEGIN IMMEDIATE')
+      // Let completions from the same event-loop burst join one transaction.
+      await Promise.resolve()
+      const batch = this.pendingRequestLogs.splice(0)
+      if (batch.length === 0) return
       try {
-        database.prepare(`
+        const database = this.requireDatabase()
+        const retainedRows = Math.min(...batch.map((entry) => entry.maximumRows))
+        database.exec('BEGIN IMMEDIATE')
+        const insert = database.prepare(`
           INSERT INTO request_logs (id, ordinal, payload)
           VALUES (?, COALESCE((SELECT MIN(ordinal) - 1 FROM request_logs), 0), ?)
         `)
-          .run(log.id, JSON.stringify(log))
+        for (const { log: entry } of batch) insert.run(entry.id, JSON.stringify(entry))
         database.prepare(`
           DELETE FROM request_logs
           WHERE id IN (
             SELECT id FROM request_logs ORDER BY ordinal LIMIT -1 OFFSET ?
           )
-        `).run(maximumRows)
+        `).run(retainedRows)
         database.exec('COMMIT')
+        const newestFirst = batch.map((entry) => structuredClone(entry.log)).reverse()
+        const requestLogs = [...newestFirst, ...this.data.requestLogs].slice(0, retainedRows)
+        this.data = { ...this.data, requestLogs }
+        for (const entry of batch) entry.resolve()
       } catch (error) {
-        rollback(database)
+        if (this.database) rollback(this.database)
+        for (const entry of batch) entry.reject(error)
         throw error
       }
-      const requestLogs = [structuredClone(log), ...this.data.requestLogs].slice(0, maximumRows)
-      this.data = { ...this.data, requestLogs }
     }
 
     const pending = this.writeChain.then(operation, operation)
-    this.writeChain = pending.then(
-      () => undefined,
-      () => undefined
-    )
-    await pending
+    this.writeChain = pending.then(() => undefined, () => undefined)
+    void pending.finally(() => {
+      this.requestLogFlushScheduled = false
+      if (this.pendingRequestLogs.length > 0) this.scheduleRequestLogFlush()
+    }).catch(() => {
+      // Individual callers receive the write failure through their completion.
+    })
   }
 
   public async updateAccount<TAccount extends Identified>(
@@ -318,6 +345,67 @@ export class SqliteStateStore<T extends SqlitePersistedShape> {
       () => undefined,
       () => undefined
     )
+    return pending
+  }
+
+  /**
+   * Atomically rotates one encrypted credential and the small account row that
+   * describes it. Unlike update(), this does not clone and rewrite the rest of
+   * the application state (including request history) on the latency path.
+   */
+  public async updateAccountCredential<TAccount extends Identified & { credentialId: string }>(
+    accountId: string,
+    credentialId: string,
+    encryptedValue: string,
+    mutator: (account: TAccount) => void,
+    expectedEncryptedValue?: string
+  ): Promise<TAccount> {
+    const operation = async (): Promise<TAccount> => {
+      const database = this.requireDatabase()
+      const index = this.data.accounts.findIndex((account) => account.id === accountId)
+      if (index < 0) throw new Error('Account not found.')
+      const account = structuredClone(this.data.accounts[index]) as TAccount
+      if (account.credentialId !== credentialId) throw new Error('Account credential changed while it was being rotated.')
+      if (expectedEncryptedValue !== undefined && this.data.credentials[credentialId] !== expectedEncryptedValue) {
+        throw new Error('Account credential changed while it was being rotated.')
+      }
+      mutator(account)
+      if (account.id !== accountId || account.credentialId !== credentialId) {
+        throw new Error('A credential rotation cannot change account identity.')
+      }
+      database.exec('BEGIN IMMEDIATE')
+      try {
+        const accountResult = database.prepare('UPDATE accounts SET payload = ? WHERE id = ?')
+          .run(JSON.stringify(account), accountId)
+        if (accountResult.changes !== 1) throw new Error('Account not found.')
+        if (expectedEncryptedValue === undefined) {
+          database.prepare(`
+            INSERT INTO credentials (id, encrypted_value) VALUES (?, ?)
+            ON CONFLICT(id) DO UPDATE SET encrypted_value = excluded.encrypted_value
+          `).run(credentialId, encryptedValue)
+        } else {
+          const credentialResult = database.prepare(`
+            UPDATE credentials SET encrypted_value = ? WHERE id = ? AND encrypted_value = ?
+          `).run(encryptedValue, credentialId, expectedEncryptedValue)
+          if (credentialResult.changes !== 1) throw new Error('Account credential changed while it was being rotated.')
+        }
+        database.exec('COMMIT')
+      } catch (error) {
+        rollback(database)
+        throw error
+      }
+      const accounts = [...this.data.accounts]
+      accounts[index] = structuredClone(account)
+      this.data = {
+        ...this.data,
+        accounts,
+        credentials: { ...this.data.credentials, [credentialId]: encryptedValue }
+      }
+      return structuredClone(account)
+    }
+
+    const pending = this.writeChain.then(operation, operation)
+    this.writeChain = pending.then(() => undefined, () => undefined)
     return pending
   }
 
@@ -472,7 +560,12 @@ export class SqliteStateStore<T extends SqlitePersistedShape> {
   }
 
   public async close(): Promise<void> {
-    await this.writeChain
+    do {
+      await this.writeChain
+      // Allow a completed batch to schedule any arrivals that joined while it
+      // was committing before deciding the repository is fully drained.
+      await Promise.resolve()
+    } while (this.requestLogFlushScheduled || this.pendingRequestLogs.length > 0)
     this.database?.close()
     this.database = undefined
   }

@@ -125,6 +125,14 @@ export default function App() {
     return () => window.removeEventListener('hashchange', handleHashChange)
   }, [])
 
+  useEffect(() => {
+    const rebuildAfterNetworkReturn = () => {
+      void api.rebuildOutboundConnections().catch(() => undefined)
+    }
+    window.addEventListener('online', rebuildAfterNetworkReturn)
+    return () => window.removeEventListener('online', rebuildAfterNetworkReturn)
+  }, [api])
+
   const runAction: ActionRunner = useCallback(async (key, operation) => {
     setBusyKeys((current) => new Set(current).add(key))
     setError(null)

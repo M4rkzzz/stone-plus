@@ -2578,6 +2578,204 @@ code,
   border-bottom: 1px solid var(--border);
 }
 
+.account-table-toolbar {
+  min-height: 50px;
+  flex-wrap: wrap;
+}
+
+.account-toolbar-summary,
+.account-toolbar-actions,
+.account-selection-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.account-toolbar-summary { gap: 12px; }
+.account-toolbar-summary > strong { color: var(--muted); font-size: 10px; font-weight: 600; }
+.account-toolbar-actions { margin-left: auto; }
+
+.account-selection-actions {
+  padding: 3px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-subtle);
+}
+
+.account-selection-actions button,
+.account-export__selection-bar button {
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.account-selection-actions button { padding: 5px 7px; }
+.account-selection-actions button:hover:not(:disabled),
+.account-export__selection-bar button:hover:not(:disabled) { background: var(--surface); color: var(--text); }
+
+.account-quota-filter {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text);
+  font-size: 11px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.account-quota-filter input {
+  width: 15px;
+  height: 15px;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.account-quota-filter small {
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: var(--surface-subtle);
+  color: var(--muted);
+  font-size: 9px;
+}
+
+.account-filter-empty {
+  display: grid;
+  min-height: 180px;
+  place-items: center;
+  align-content: center;
+  gap: 7px;
+  padding: 24px;
+  color: var(--muted);
+  text-align: center;
+}
+
+.account-filter-empty svg { color: var(--accent); }
+.account-filter-empty strong { color: var(--text); font-size: 13px; }
+.account-filter-empty span { font-size: 10px; }
+
+.account-select-column {
+  width: 38px;
+  min-width: 38px;
+  text-align: center !important;
+}
+
+.account-select-column input,
+.account-export__list input {
+  width: 15px;
+  height: 15px;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.modal-selection-count {
+  margin-right: auto;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.account-export { display: grid; gap: 14px; }
+
+.account-export__format {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.account-export__format > button {
+  display: grid;
+  gap: 4px;
+  padding: 13px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-subtle);
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.account-export__format > button.selected {
+  border-color: color-mix(in srgb, var(--accent) 58%, var(--border));
+  background: color-mix(in srgb, var(--accent) 9%, var(--surface));
+}
+
+.account-export__format strong { font-size: 12px; }
+.account-export__format span { color: var(--muted); font-size: 9px; line-height: 14px; }
+
+.account-export__mode {
+  display: grid;
+  grid-template-columns: auto repeat(2, minmax(0, 1fr));
+  align-items: stretch;
+  gap: 7px;
+}
+
+.account-export__mode > span {
+  display: flex;
+  align-items: center;
+  padding-right: 5px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 650;
+}
+
+.account-export__mode > button {
+  display: grid;
+  gap: 2px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-subtle);
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.account-export__mode > button.selected {
+  border-color: color-mix(in srgb, var(--accent) 50%, var(--border));
+  background: color-mix(in srgb, var(--accent) 8%, var(--surface));
+}
+
+.account-export__mode strong { font-size: 10px; }
+.account-export__mode small { color: var(--muted); font-size: 8px; }
+
+.account-export__selection-bar {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.account-export__selection-bar > span { margin-right: auto; font-size: 11px; font-weight: 700; }
+.account-export__selection-bar button { padding: 6px 8px; background: var(--surface-subtle); }
+
+.account-export__list {
+  display: grid;
+  max-height: 330px;
+  gap: 6px;
+  overflow: auto;
+}
+
+.account-export__list > label {
+  display: grid;
+  grid-template-columns: 18px 30px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  padding: 9px 10px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--surface-subtle);
+  cursor: pointer;
+}
+
+.account-export__list > label.selected { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); }
+.account-export__list > label > span:nth-child(3) { display: grid; min-width: 0; gap: 2px; }
+.account-export__list strong { overflow: hidden; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.account-export__list small { color: var(--muted); font-size: 9px; }
+
 .search-input {
   display: flex;
   width: min(360px, 100%);
@@ -4125,6 +4323,17 @@ body.request-column-resizing {
   .mapping-row > span { grid-column: 2; grid-row: 1; text-align: center; }
   .mapping-row .icon-button { grid-column: 2; grid-row: 2; }
   .table-toolbar { align-items: stretch; flex-direction: column; }
+  .account-toolbar-summary,
+  .account-toolbar-actions { flex-wrap: wrap; }
+  .account-toolbar-actions { margin-left: 0; }
+  .account-selection-actions { overflow-x: auto; }
+  .account-selection-actions button { flex: 0 0 auto; }
+  .account-export__format { grid-template-columns: minmax(0, 1fr); }
+  .account-export__mode { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .account-export__mode > span { grid-column: 1 / -1; }
+  .account-export__selection-bar { flex-wrap: wrap; }
+  .account-export__selection-bar > span { flex-basis: 100%; }
+  .modal-selection-count { flex-basis: 100%; }
   .search-input { width: 100%; }
   .filter-group { display: grid; grid-template-columns: auto 1fr 1fr; }
   .filter-group select { width: 100%; min-width: 0; }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import type { Account, Pool } from '../../src/shared/types'
+import type { Account, Pool, RequestLog } from '../../src/shared/types'
 import { ModelNotExposedError, NoEligibleAccountError, PoolScheduler } from '../../src/main/gateway'
 
 const timestamp = 1_700_000_000_000
@@ -39,6 +39,26 @@ function pool(overrides: Partial<Pool> = {}): Pool {
     modelAllowlist: [],
     createdAt: timestamp,
     updatedAt: timestamp,
+    ...overrides
+  }
+}
+
+function requestLog(accountId: string, overrides: Partial<RequestLog> = {}): RequestLog {
+  return {
+    id: `${accountId}-${overrides.timestamp ?? timestamp}`,
+    accountId,
+    timestamp,
+    client: 'codex',
+    protocol: 'openai-responses',
+    providerName: 'OpenAI',
+    accountName: accountId,
+    model: 'model',
+    status: 'success',
+    latencyMs: 5_000,
+    upstreamFirstByteMs: 1_000,
+    firstTokenMs: 4_000,
+    accountFirstTokenMs: 4_000,
+    outputTokens: 200,
     ...overrides
   }
 }
@@ -137,8 +157,139 @@ describe('PoolScheduler', () => {
     expect(selected.account.id).toBe(fast.id)
   })
 
-  it('explores an unmeasured autobalanced account before concentrating on known performance', () => {
-    const scheduler = new PoolScheduler()
+  it('uses a conservative prior for unmeasured autobalanced accounts by default', () => {
+    const scheduler = new PoolScheduler(() => timestamp, () => 0.5)
+    const measured = account('measured', { maxConcurrency: 4 })
+    const unmeasured = account('unmeasured', { maxConcurrency: 4 })
+    scheduler.recordPerformance(measured.id, {
+      firstTokenMs: 800,
+      outputTokens: 200,
+      generationDurationMs: 4_000
+    })
+
+    const selected = scheduler.selectAndAcquire({
+      pool: pool({ strategy: 'autobalanced' }),
+      accounts: [measured, unmeasured],
+      model: 'model'
+    })
+
+    expect(selected.account.id).toBe(measured.id)
+  })
+
+  it('hydrates autobalanced performance from persisted raw first-byte timing', () => {
+    const scheduler = new PoolScheduler(() => timestamp, () => 0.5)
+    const rawFastVisibleSlow = account('raw-fast', { maxConcurrency: 4 })
+    const rawSlowVisibleFast = account('raw-slow', { maxConcurrency: 4 })
+    scheduler.hydratePerformance([
+      ...Array.from({ length: 4 }, (_, index) => requestLog(rawFastVisibleSlow.id, {
+        id: `raw-fast-${index}`,
+        timestamp: timestamp - 4_000 + index,
+        upstreamFirstByteMs: 800,
+        firstTokenMs: 4_500,
+        accountFirstTokenMs: 4_500
+      })),
+      ...Array.from({ length: 4 }, (_, index) => requestLog(rawSlowVisibleFast.id, {
+        id: `raw-slow-${index}`,
+        timestamp: timestamp - 4_000 + index,
+        upstreamFirstByteMs: 2_500,
+        firstTokenMs: 900,
+        accountFirstTokenMs: 900
+      }))
+    ])
+
+    const selected = scheduler.selectAndAcquire({
+      pool: pool({ strategy: 'autobalanced' }),
+      accounts: [rawSlowVisibleFast, rawFastVisibleSlow],
+      model: 'model'
+    })
+
+    expect(selected.account.id).toBe(rawFastVisibleSlow.id)
+  })
+
+  it('deducts failed-attempt time when hydrating the winning account performance', () => {
+    const scheduler = new PoolScheduler(() => timestamp, () => 0.5)
+    const fastAfterFailover = account('fast-after-failover', { maxConcurrency: 4 })
+    const genuinelySlower = account('genuinely-slower', { maxConcurrency: 4 })
+    scheduler.hydratePerformance([
+      ...Array.from({ length: 4 }, (_, index) => requestLog(fastAfterFailover.id, {
+        id: `failover-winner-${index}`,
+        timestamp: timestamp - 4_000 + index,
+        latencyMs: 10_000,
+        upstreamFirstByteMs: 6_100,
+        firstTokenMs: 6_500,
+        accountFirstTokenMs: 1_500
+      })),
+      ...Array.from({ length: 4 }, (_, index) => requestLog(genuinelySlower.id, {
+        id: `slower-${index}`,
+        timestamp: timestamp - 4_000 + index,
+        latencyMs: 10_000,
+        upstreamFirstByteMs: 2_000,
+        firstTokenMs: 2_400,
+        accountFirstTokenMs: 2_400
+      }))
+    ])
+
+    const selected = scheduler.selectAndAcquire({
+      pool: pool({ strategy: 'autobalanced' }),
+      accounts: [genuinelySlower, fastAfterFailover],
+      model: 'model'
+    })
+
+    expect(selected.account.id).toBe(fastAfterFailover.id)
+  })
+
+  it('ignores stale persisted performance during autobalanced hydration', () => {
+    const scheduler = new PoolScheduler(() => timestamp, () => 0.99)
+    const first = account('a')
+    const second = account('z')
+    scheduler.hydratePerformance([
+      requestLog(first.id, { timestamp: timestamp - 31 * 60_000, upstreamFirstByteMs: 100 })
+    ])
+
+    const selected = scheduler.selectAndAcquire({
+      pool: pool({ strategy: 'autobalanced' }), accounts: [first, second], model: 'model'
+    })
+
+    expect(selected.account.id).toBe(second.id)
+  })
+
+  it('randomizes equal-cost autobalanced cold starts instead of sorting by account id', () => {
+    const scheduler = new PoolScheduler(() => timestamp, () => 0.99)
+    const alphabeticallyFirst = account('a')
+    const alphabeticallyLast = account('z')
+
+    const selected = scheduler.selectAndAcquire({
+      pool: pool({ strategy: 'autobalanced' }),
+      accounts: [alphabeticallyFirst, alphabeticallyLast],
+      model: 'model'
+    })
+
+    expect(selected.account.id).toBe(alphabeticallyLast.id)
+  })
+
+  it('randomizes equal-cost measured autobalanced accounts instead of sorting by account id', () => {
+    const scheduler = new PoolScheduler(() => timestamp, () => 0.99)
+    const alphabeticallyFirst = account('a')
+    const alphabeticallyLast = account('z')
+    for (const candidate of [alphabeticallyFirst, alphabeticallyLast]) {
+      scheduler.recordPerformance(candidate.id, {
+        firstTokenMs: 1_000,
+        outputTokens: 100,
+        generationDurationMs: 2_000
+      })
+    }
+
+    const selected = scheduler.selectAndAcquire({
+      pool: pool({ strategy: 'autobalanced' }),
+      accounts: [alphabeticallyFirst, alphabeticallyLast],
+      model: 'model'
+    })
+
+    expect(selected.account.id).toBe(alphabeticallyLast.id)
+  })
+
+  it('reserves a small exploration budget for unmeasured autobalanced accounts', () => {
+    const scheduler = new PoolScheduler(() => timestamp, () => 0.01)
     const measured = account('measured', { maxConcurrency: 4 })
     const unmeasured = account('unmeasured', { maxConcurrency: 4 })
     scheduler.recordPerformance(measured.id, {
@@ -156,6 +307,98 @@ describe('PoolScheduler', () => {
     expect(selected.account.id).toBe(unmeasured.id)
   })
 
+  it('penalizes recently failing autobalanced accounts and decays that penalty', () => {
+    let now = timestamp
+    const scheduler = new PoolScheduler(() => now, () => 0)
+    const recovered = account('a-recovered', { maxConcurrency: 4 })
+    const stable = account('z-stable', { maxConcurrency: 4 })
+    for (const candidate of [recovered, stable]) {
+      scheduler.recordPerformance(candidate.id, {
+        firstTokenMs: 1_000,
+        outputTokens: 100,
+        generationDurationMs: 4_000
+      })
+    }
+    scheduler.recordFailure(recovered.id, { baseDelayMs: 1_000, maxDelayMs: 1_000 })
+    now += 1_001
+
+    const immediately = scheduler.selectAndAcquire({
+      pool: pool({ strategy: 'autobalanced' }), accounts: [recovered, stable], model: 'model'
+    })
+    expect(immediately.account.id).toBe(stable.id)
+    immediately.release()
+
+    now += 2 * 60 * 60_000
+    const afterDecay = scheduler.selectAndAcquire({
+      pool: pool({ strategy: 'autobalanced' }), accounts: [recovered, stable], model: 'model'
+    })
+    expect(afterDecay.account.id).toBe(recovered.id)
+  })
+
+  it('uses AIMD-style adaptive concurrency after a failure and gradual recovery', () => {
+    let now = timestamp
+    const scheduler = new PoolScheduler(() => now, () => 0.5)
+    const selectedAccount = account('adaptive', { maxConcurrency: 4 })
+    scheduler.recordFailure(selectedAccount.id, {
+      baseDelayMs: 1_000,
+      maxDelayMs: 1_000,
+      maxConcurrency: selectedAccount.maxConcurrency
+    })
+    now += 1_001
+
+    const first = scheduler.selectAndAcquire({
+      pool: pool({ strategy: 'autobalanced' }), accounts: [selectedAccount], model: 'model'
+    })
+    expect(() => scheduler.selectAndAcquire({
+      pool: pool({ strategy: 'autobalanced' }), accounts: [selectedAccount], model: 'model'
+    })).toThrow(NoEligibleAccountError)
+    first.release()
+    scheduler.recordSuccess(selectedAccount.id)
+
+    const balancedSelections = Array.from({ length: 4 }, () => scheduler.selectAndAcquire({
+      pool: pool({ strategy: 'balanced' }), accounts: [selectedAccount], model: 'model'
+    }))
+    expect(() => scheduler.selectAndAcquire({
+      pool: pool({ strategy: 'balanced' }), accounts: [selectedAccount], model: 'model'
+    })).toThrow(NoEligibleAccountError)
+    for (const selection of balancedSelections) selection.release()
+
+    const reducedFirst = scheduler.selectAndAcquire({
+      pool: pool({ strategy: 'autobalanced' }), accounts: [selectedAccount], model: 'model'
+    })
+    const reducedSecond = scheduler.selectAndAcquire({
+      pool: pool({ strategy: 'autobalanced' }), accounts: [selectedAccount], model: 'model'
+    })
+    expect(() => scheduler.selectAndAcquire({
+      pool: pool({ strategy: 'autobalanced' }), accounts: [selectedAccount], model: 'model'
+    })).toThrow(NoEligibleAccountError)
+    reducedFirst.release()
+    reducedSecond.release()
+
+    for (let index = 0; index < 8; index += 1) {
+      scheduler.recordPerformance(selectedAccount.id, {
+        firstTokenMs: 1_000,
+        outputTokens: 100,
+        generationDurationMs: 2_000
+      })
+    }
+    const recoveredFirst = scheduler.selectAndAcquire({
+      pool: pool({ strategy: 'autobalanced' }), accounts: [selectedAccount], model: 'model'
+    })
+    const recoveredSecond = scheduler.selectAndAcquire({
+      pool: pool({ strategy: 'autobalanced' }), accounts: [selectedAccount], model: 'model'
+    })
+    const recoveredThird = scheduler.selectAndAcquire({
+      pool: pool({ strategy: 'autobalanced' }), accounts: [selectedAccount], model: 'model'
+    })
+    expect(() => scheduler.selectAndAcquire({
+      pool: pool({ strategy: 'autobalanced' }), accounts: [selectedAccount], model: 'model'
+    })).toThrow(NoEligibleAccountError)
+    recoveredFirst.release()
+    recoveredSecond.release()
+    recoveredThird.release()
+  })
+
   it('keeps a sticky session on its assigned eligible account', () => {
     const scheduler = new PoolScheduler(() => timestamp)
     const accounts = [account('a'), account('b')]
@@ -167,6 +410,128 @@ describe('PoolScheduler', () => {
 
     const second = scheduler.selectAndAcquire({ pool: stickyPool, accounts, model: 'model', sessionId: 'session' })
     expect(second.account.id).toBe('a')
+  })
+
+  it('escapes an obviously slow sticky assignment only for autobalanced pools', () => {
+    const scheduler = new PoolScheduler(() => timestamp, () => 0)
+    const slow = account('a-slow', { maxConcurrency: 4 })
+    const fast = account('z-fast', { maxConcurrency: 4 })
+    const stickyPool = pool({ strategy: 'autobalanced', stickySessions: true })
+
+    const initial = scheduler.selectAndAcquire({
+      pool: stickyPool, accounts: [slow, fast], model: 'model', sessionId: 'session'
+    })
+    expect(initial.account.id).toBe(slow.id)
+    initial.release()
+    for (let index = 0; index < 3; index += 1) {
+      scheduler.recordPerformance(slow.id, { firstTokenMs: 4_000, outputTokens: 100, generationDurationMs: 2_000 })
+      scheduler.recordPerformance(fast.id, { firstTokenMs: 1_000, outputTokens: 100, generationDurationMs: 2_000 })
+    }
+
+    const escaped = scheduler.selectAndAcquire({
+      pool: stickyPool, accounts: [slow, fast], model: 'model', sessionId: 'session'
+    })
+    expect(escaped.account.id).toBe(fast.id)
+  })
+
+  it('does not immediately reselect the account that triggered sticky escape', () => {
+    const scheduler = new PoolScheduler(() => timestamp, () => 0)
+    const slowFirstByte = account('slow-first-byte', { maxConcurrency: 4 })
+    const fastFirstByte = account('fast-first-byte', { maxConcurrency: 4 })
+    const stickyPool = pool({ strategy: 'autobalanced', stickySessions: true })
+
+    const initial = scheduler.selectAndAcquire({
+      pool: stickyPool,
+      accounts: [slowFirstByte, fastFirstByte],
+      model: 'model',
+      sessionId: 'session'
+    })
+    expect(initial.account.id).toBe(slowFirstByte.id)
+    initial.release()
+
+    for (let index = 0; index < 3; index += 1) {
+      // The slow-TTFT account has enough throughput to win the ordinary
+      // aggregate score. Sticky escape must still move this turn away from it.
+      scheduler.recordPerformance(slowFirstByte.id, {
+        firstTokenMs: 4_000,
+        outputTokens: 2_000,
+        generationDurationMs: 2_000
+      })
+      scheduler.recordPerformance(fastFirstByte.id, {
+        firstTokenMs: 1_000,
+        outputTokens: 2,
+        generationDurationMs: 2_000
+      })
+    }
+
+    const escaped = scheduler.selectAndAcquire({
+      pool: stickyPool,
+      accounts: [slowFirstByte, fastFirstByte],
+      model: 'model',
+      sessionId: 'session'
+    })
+
+    expect(escaped.account.id).toBe(fastFirstByte.id)
+  })
+
+  it('does not escape a sticky assignment using stale performance samples', () => {
+    let now = timestamp
+    const scheduler = new PoolScheduler(() => now, () => 0)
+    const previouslySlow = account('previously-slow', { maxConcurrency: 4 })
+    const previouslyFast = account('previously-fast', { maxConcurrency: 4 })
+    const stickyPool = pool({ strategy: 'autobalanced', stickySessions: true, stickyTtlMinutes: 60 })
+
+    const initial = scheduler.selectAndAcquire({
+      pool: stickyPool,
+      accounts: [previouslySlow, previouslyFast],
+      model: 'model',
+      sessionId: 'session'
+    })
+    expect(initial.account.id).toBe(previouslySlow.id)
+    initial.release()
+    for (let index = 0; index < 3; index += 1) {
+      scheduler.recordPerformance(previouslySlow.id, {
+        firstTokenMs: 4_000,
+        outputTokens: 100,
+        generationDurationMs: 2_000
+      })
+      scheduler.recordPerformance(previouslyFast.id, {
+        firstTokenMs: 1_000,
+        outputTokens: 100,
+        generationDurationMs: 2_000
+      })
+    }
+    now += 31 * 60_000
+
+    const stillSticky = scheduler.selectAndAcquire({
+      pool: stickyPool,
+      accounts: [previouslySlow, previouslyFast],
+      model: 'model',
+      sessionId: 'session'
+    })
+
+    expect(stillSticky.account.id).toBe(previouslySlow.id)
+  })
+
+  it('does not apply slow-account sticky escape to balanced pools', () => {
+    const scheduler = new PoolScheduler(() => timestamp, () => 0)
+    const slow = account('a-slow', { maxConcurrency: 4 })
+    const fast = account('z-fast', { maxConcurrency: 4 })
+    const stickyPool = pool({ strategy: 'balanced', stickySessions: true })
+
+    const initial = scheduler.selectAndAcquire({
+      pool: stickyPool, accounts: [slow, fast], model: 'model', sessionId: 'session'
+    })
+    initial.release()
+    for (let index = 0; index < 3; index += 1) {
+      scheduler.recordPerformance(slow.id, { firstTokenMs: 4_000, outputTokens: 100, generationDurationMs: 2_000 })
+      scheduler.recordPerformance(fast.id, { firstTokenMs: 1_000, outputTokens: 100, generationDurationMs: 2_000 })
+    }
+
+    const stillSticky = scheduler.selectAndAcquire({
+      pool: stickyPool, accounts: [slow, fast], model: 'model', sessionId: 'session'
+    })
+    expect(stillSticky.account.id).toBe(slow.id)
   })
 
   it('routes each model only to accounts that expose it', () => {

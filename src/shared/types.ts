@@ -292,6 +292,9 @@ export interface Pool {
   stickyTtlMinutes: number
   maxRetries: number
   forceFastMode?: boolean
+  hedgedRequests?: boolean
+  hedgeDelayMs?: number
+  firstBodyTimeoutMs?: number
   proxyId?: string
   createdAt: number
   updatedAt: number
@@ -382,6 +385,22 @@ export interface RequestLog {
   status: 'success' | 'error' | 'streaming'
   statusCode?: number
   latencyMs: number
+  /** Time from request acceptance until the complete JSON request body has been read and parsed. */
+  bodyReadMs?: number
+  /** Time spent selecting and acquiring the account used by the logged attempt. */
+  schedulerSelectMs?: number
+  /** Time spent resolving the credential for the account used by the logged attempt. */
+  credentialResolveMs?: number
+  /** Time from request acceptance until Stone starts the logged attempt's outbound fetch. */
+  outboundFetchStartMs?: number
+  /** Time from request acceptance until upstream response headers. */
+  upstreamHeadersMs?: number
+  /** Time from request acceptance until the first upstream response byte. */
+  upstreamFirstByteMs?: number
+  /** Time from request acceptance until Stone first writes response bytes to the client. */
+  clientFirstWriteMs?: number
+  /** Semantic first-token latency of the successful account attempt only. */
+  accountFirstTokenMs?: number
   firstTokenMs?: number
   inputTokens?: number
   outputTokens?: number
@@ -508,6 +527,23 @@ export interface ChatGptAccountFileImportResult {
   warnings: string[]
 }
 
+export type ChatGptAccountExportFormat = 'sub2api' | 'cpa'
+export type ChatGptAccountExportMode = 'merged' | 'separate'
+
+export interface ChatGptAccountExportInput {
+  accountIds: string[]
+  format: ChatGptAccountExportFormat
+  mode: ChatGptAccountExportMode
+}
+
+export interface ChatGptAccountExportResult {
+  cancelled: boolean
+  exportedAccounts: number
+  exportedFiles: number
+  filePath?: string
+  directoryPath?: string
+}
+
 export interface PoolInput {
   id?: string
   name: string
@@ -520,6 +556,9 @@ export interface PoolInput {
   stickyTtlMinutes: number
   maxRetries: number
   forceFastMode?: boolean
+  hedgedRequests?: boolean
+  hedgeDelayMs?: number
+  firstBodyTimeoutMs?: number
   proxyId?: string
 }
 
@@ -679,7 +718,9 @@ export interface GatewayApi {
   testAccountModel(accountId: string, model: string): Promise<AccountModelTestResult>
   importChatGptAccounts(input: ChatGptAccountImportInput): Promise<ChatGptAccountImportResult>
   importChatGptAccountFiles(input: ChatGptAccountFileImportInput): Promise<ChatGptAccountFileImportResult>
+  exportChatGptAccounts(input: ChatGptAccountExportInput): Promise<ChatGptAccountExportResult>
   deleteAccount(id: string): Promise<AppSnapshot>
+  deleteAccounts(ids: string[]): Promise<AppSnapshot>
   saveProxy(input: ProxyInput): Promise<AppSnapshot>
   deleteProxy(id: string): Promise<AppSnapshot>
   checkProxy(id: string): Promise<AppSnapshot>
@@ -689,6 +730,7 @@ export interface GatewayApi {
   updateGateway(settings: GatewaySettings): Promise<AppSnapshot>
   startGateway(): Promise<AppSnapshot>
   stopGateway(): Promise<AppSnapshot>
+  rebuildOutboundConnections(): Promise<void>
   checkAccount(id: string): Promise<AppSnapshot>
   refreshAccountCodexQuota(id: string): Promise<AppSnapshot>
   getAccountCodexQuotaHistory(id: string, from?: number, to?: number): Promise<CodexQuotaHistoryPoint[]>

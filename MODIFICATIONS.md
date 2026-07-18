@@ -13,8 +13,10 @@ The first Stone+ release, `v0.8.3`, is based on upstream Stone `v0.8.2`
 - request time-to-first-token, conversation title, adjustable columns, and compact log UI;
 - client-disconnect handling as HTTP 499 without account cooldown or failover;
 - lower-latency connection reuse, HTTP/2 negotiation, immediate SSE header/chunk forwarding,
-  connection warming, reduced stream-redaction buffering, targeted state persistence,
-  and optional speed-aware `autobalanced` account scheduling;
+  multi-lane connection warming, reduced stream-redaction buffering, targeted/batched
+  state persistence, semantic phase timing, first-body failover, opt-in request hedging,
+  OAuth refresh singleflight, adaptive concurrency, and optional speed-aware
+  `autobalanced` account scheduling;
 - Codex historical-session visibility repair with provider metadata synchronization,
   preview validation, recoverable backups, and transactional SQLite index updates;
 - native CPA/Sub2API JSON batch account import, JWT account-ID recovery, and

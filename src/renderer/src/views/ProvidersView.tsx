@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import {
   Boxes,
   CheckCircle2,
+  Download,
   Edit3,
   Files,
   FolderOpen,
@@ -43,6 +44,22 @@ import {
 } from '../ui'
 import { ProxyManager } from './ProxyManager'
 import { CodexQuotaCompact, CodexQuotaModal } from './CodexQuotaModal'
+
+const HIDE_EXHAUSTED_ACCOUNTS_STORAGE_KEY = 'stone.providers.hide-exhausted-accounts'
+
+function accountQuotaIsExhausted(account: PublicAccount, now = Date.now()): boolean {
+  if (account.quotaRemaining !== undefined && account.quotaRemaining <= 0) return true
+  if (account.codexQuota?.limitReached || account.codexQuota?.allowed === false) return true
+  if ([account.codexQuota?.fiveHour, account.codexQuota?.sevenDay].some((window) =>
+    window !== undefined && window.usedPercent >= 100 && (window.resetAt === undefined || window.resetAt > now)
+  )) return true
+  return [account.quota?.requests, account.quota?.tokens, account.quota?.inputTokens, account.quota?.outputTokens]
+    .some((window) => window?.remaining === 0 && (window.resetAt === undefined || window.resetAt > now))
+}
+
+function accountIsCooling(account: PublicAccount, now = Date.now()): boolean {
+  return account.status === 'cooldown' || (account.cooldownUntil !== undefined && account.cooldownUntil > now)
+}
 import { ModelPolicyEditor } from './ModelPolicyEditor'
 import { accountModelCatalog, effectiveAccountModels, isAccountModelWildcard } from '../model-policy'
 
@@ -267,12 +284,38 @@ export function ProvidersView({
   const [importNotice, setImportNotice] = useState('')
   const [fileImportBusy, setFileImportBusy] = useState(false)
   const [quotaAccountId, setQuotaAccountId] = useState<string | null>(null)
+  const [selectedAccountIds, setSelectedAccountIds] = useState<string[]>([])
+  const [bulkDeleteOpen, setBulkDeleteOpen] = useState(false)
+  const [exportOpen, setExportOpen] = useState(false)
+  const [exportFormat, setExportFormat] = useState<'sub2api' | 'cpa'>('sub2api')
+  const [exportMode, setExportMode] = useState<'merged' | 'separate'>('merged')
+  const [exportAccountIds, setExportAccountIds] = useState<string[]>([])
+  const [exportBusy, setExportBusy] = useState(false)
+  const [exportNotice, setExportNotice] = useState('')
+  const [hideExhaustedAccounts, setHideExhaustedAccounts] = useState(() =>
+    window.localStorage.getItem(HIDE_EXHAUSTED_ACCOUNTS_STORAGE_KEY) === 'true'
+  )
 
   const providerById = useMemo(() => new Map(snapshot.providers.map((provider) => [provider.id, provider])), [snapshot.providers])
   const proxyById = useMemo(() => new Map(snapshot.proxies.map((proxy) => [proxy.id, proxy])), [snapshot.proxies])
   const quotaAccount = quotaAccountId ? snapshot.accounts.find((account) => account.id === quotaAccountId) ?? null : null
   const editingAccount = accountDraft.id ? snapshot.accounts.find((account) => account.id === accountDraft.id) : undefined
   const accountModelsBusy = Boolean(accountDraft.id && busyKeys.has(`refresh-account-models-${accountDraft.id}`))
+  const exhaustedAccountCount = useMemo(
+    () => snapshot.accounts.filter((account) => accountQuotaIsExhausted(account)).length,
+    [snapshot.accounts]
+  )
+  const visibleAccounts = useMemo(
+    () => hideExhaustedAccounts
+      ? snapshot.accounts.filter((account) => !accountQuotaIsExhausted(account))
+      : snapshot.accounts,
+    [hideExhaustedAccounts, snapshot.accounts]
+  )
+  const checkingAllAccounts = busyKeys.has('check-all-accounts')
+  const oauthAccounts = useMemo(
+    () => snapshot.accounts.filter((account) => account.credentialType === 'chatgpt-oauth'),
+    [snapshot.accounts]
+  )
   const refreshModelsDisabledReason = !accountDraft.id
     ? '请先保存账号，再拉取此账号的可用模型。'
     : accountDraft.credential?.trim()
@@ -298,6 +341,16 @@ export function ProvidersView({
       modelAllowlist: [...persisted.modelAllowlist],
     } : current)
   }, [accountModal, persistedAccountModelState])
+
+  useEffect(() => {
+    window.localStorage.setItem(HIDE_EXHAUSTED_ACCOUNTS_STORAGE_KEY, String(hideExhaustedAccounts))
+  }, [hideExhaustedAccounts])
+
+  useEffect(() => {
+    const existingIds = new Set(snapshot.accounts.map((account) => account.id))
+    setSelectedAccountIds((current) => current.filter((id) => existingIds.has(id)))
+    setExportAccountIds((current) => current.filter((id) => existingIds.has(id)))
+  }, [snapshot.accounts])
 
   const openProvider = (provider?: ProviderDefinition) => {
     setProviderDraft(provider ? {
@@ -467,6 +520,86 @@ export function ProvidersView({
     }
   }
 
+  const checkAllAccounts = async () => {
+    if (!snapshot.accounts.length || checkingAllAccounts) return
+    await runAction('check-all-accounts', async () => {
+      const accountIds = snapshot.accounts.map((account) => account.id)
+      let cursor = 0
+      const worker = async (): Promise<void> => {
+        for (;;) {
+          const index = cursor
+          cursor += 1
+          if (index >= accountIds.length) return
+          await api.checkAccount(accountIds[index]).catch(() => undefined)
+        }
+      }
+      await Promise.all(Array.from({ length: Math.min(4, accountIds.length) }, () => worker()))
+      return api.getSnapshot()
+    })
+  }
+
+  const selectAccounts = (predicate: (account: PublicAccount) => boolean) => {
+    setSelectedAccountIds(snapshot.accounts.filter(predicate).map((account) => account.id))
+  }
+
+  const toggleSelectedAccount = (accountId: string) => {
+    setSelectedAccountIds((current) => current.includes(accountId)
+      ? current.filter((id) => id !== accountId)
+      : [...current, accountId])
+  }
+
+  const toggleVisibleAccounts = (checked: boolean) => {
+    const visibleIds = new Set(visibleAccounts.map((account) => account.id))
+    setSelectedAccountIds((current) => checked
+      ? [...new Set([...current, ...visibleIds])]
+      : current.filter((id) => !visibleIds.has(id)))
+  }
+
+  const openAccountExport = () => {
+    const oauthIds = new Set(oauthAccounts.map((account) => account.id))
+    const alreadySelected = selectedAccountIds.filter((id) => oauthIds.has(id))
+    setExportAccountIds(alreadySelected.length ? alreadySelected : [...oauthIds])
+    setExportNotice('')
+    setErrors({})
+    setExportOpen(true)
+  }
+
+  const selectExportAccounts = (predicate: (account: PublicAccount) => boolean) => {
+    setExportAccountIds(oauthAccounts.filter(predicate).map((account) => account.id))
+  }
+
+  const toggleExportAccount = (accountId: string) => {
+    setExportAccountIds((current) => current.includes(accountId)
+      ? current.filter((id) => id !== accountId)
+      : [...current, accountId])
+  }
+
+  const exportSelectedAccounts = async () => {
+    if (!exportAccountIds.length || exportBusy) return
+    setExportBusy(true)
+    setExportNotice('')
+    try {
+      const result = await api.exportChatGptAccounts({ accountIds: exportAccountIds, format: exportFormat, mode: exportMode })
+      if (result.cancelled) return
+      setExportOpen(false)
+      const target = result.filePath ?? result.directoryPath ?? '导出位置'
+      setExportNotice(`已导出 ${result.exportedAccounts} 个账号、${result.exportedFiles} 个文件：${target}`)
+    } catch (cause) {
+      setErrors({ accountExport: cause instanceof Error ? cause.message : '账号导出失败' })
+    } finally {
+      setExportBusy(false)
+    }
+  }
+
+  const confirmBulkDelete = async () => {
+    if (!selectedAccountIds.length) return
+    const success = await runAction('delete-accounts', () => api.deleteAccounts(selectedAccountIds))
+    if (success) {
+      setSelectedAccountIds([])
+      setBulkDeleteOpen(false)
+    }
+  }
+
   return (
     <div className="page-stack">
       <PageHeader
@@ -494,17 +627,37 @@ export function ProvidersView({
         </button>
       </div>
       {importNotice && <div className="client-config-notice"><CheckCircle2 size={16} />{importNotice}</div>}
+      {exportNotice && <div className="client-config-notice"><Download size={16} />{exportNotice}</div>}
 
       {tab === 'accounts' ? (
         <section className="panel panel--flush">
           {snapshot.accounts.length ? (
-            <div className="table-wrap">
+            <>
+              <div className="table-toolbar account-table-toolbar">
+                <div className="account-toolbar-summary">
+                  <label className="account-quota-filter"><input type="checkbox" checked={hideExhaustedAccounts} onChange={(event) => setHideExhaustedAccounts(event.target.checked)} /><span>隐藏额度耗尽账号</span><small>{exhaustedAccountCount ? `${exhaustedAccountCount} 个` : '暂无'}</small></label>
+                  <strong>已选择 {selectedAccountIds.length} 个</strong>
+                </div>
+                <div className="account-selection-actions" aria-label="按条件选择账号">
+                  <button type="button" onClick={() => selectAccounts(() => true)}>全选</button>
+                  <button type="button" onClick={() => selectAccounts((account) => !accountIsCooling(account))}>非冷却</button>
+                  <button type="button" onClick={() => selectAccounts((account) => accountIsCooling(account))}>冷却中</button>
+                  <button type="button" onClick={() => selectAccounts((account) => accountQuotaIsExhausted(account))}>额度耗尽</button>
+                  <button type="button" disabled={!selectedAccountIds.length} onClick={() => setSelectedAccountIds([])}>清空</button>
+                </div>
+                <div className="account-toolbar-actions">
+                  <button className="button button--secondary" type="button" disabled={!oauthAccounts.length} onClick={openAccountExport}><Download size={16} />导出账号</button>
+                  <button className="button button--secondary button--danger-text" type="button" disabled={!selectedAccountIds.length} onClick={() => setBulkDeleteOpen(true)}><Trash2 size={16} />删除所选</button>
+                  <button className="button button--secondary" type="button" disabled={checkingAllAccounts} onClick={() => void checkAllAccounts()}>{checkingAllAccounts ? <LoaderCircle size={16} className="spin" /> : <RefreshCw size={16} />}{checkingAllAccounts ? '正在检测…' : '检测全部'}</button>
+                </div>
+              </div>
+              {visibleAccounts.length ? <div className="table-wrap">
               <table className="data-table accounts-table">
-                <thead><tr><th>账号</th><th>状态</th><th>凭据</th><th>并发</th><th>额度</th><th>延迟</th><th>最近使用</th><th aria-label="操作" /></tr></thead>
+                <thead><tr><th className="account-select-column"><input type="checkbox" aria-label="选择当前显示的全部账号" checked={visibleAccounts.length > 0 && visibleAccounts.every((account) => selectedAccountIds.includes(account.id))} onChange={(event) => toggleVisibleAccounts(event.target.checked)} /></th><th>账号</th><th>状态</th><th>凭据</th><th>并发</th><th>额度</th><th>延迟</th><th>最近使用</th><th aria-label="操作" /></tr></thead>
                 <tbody>
-                  {snapshot.accounts.map((account) => {
+                  {visibleAccounts.map((account) => {
                     const provider = providerById.get(account.providerId)
-                    const checking = busyKeys.has(`check-${account.id}`) || account.status === 'checking'
+                    const checking = checkingAllAccounts || busyKeys.has(`check-${account.id}`) || account.status === 'checking'
                     const refreshingModels = busyKeys.has(`refresh-account-models-${account.id}`)
                     const openModels = effectiveAccountModels(account, provider?.models)
                     const modelSummary = isAccountModelWildcard(account)
@@ -514,6 +667,7 @@ export function ProvidersView({
                         : `开放 ${openModels.length} 个模型`
                     return (
                       <tr key={account.id}>
+                        <td className="account-select-column"><input type="checkbox" aria-label={`选择账号 ${account.name}`} checked={selectedAccountIds.includes(account.id)} onChange={() => toggleSelectedAccount(account.id)} /></td>
                         <td><div className="provider-cell"><span className="provider-avatar" style={{ '--provider-color': provider?.color ?? '#61736f' } as React.CSSProperties}>{provider?.name.slice(0, 1) ?? '?'}</span><div><strong>{account.name}</strong><span>{provider?.name ?? '供应商已删除'}{account.proxyId ? ` · ${proxyById.get(account.proxyId)?.name ?? '代理已删除'}` : ''} · {modelSummary}</span></div></div></td>
                         <td><AccountStatusBadge status={account.status} circuitState={account.circuitState} />{account.credentialType === 'chatgpt-oauth' && <span className="row-note">ChatGPT OAuth · {account.renewable ? '可续期' : '会话到期即停用'}</span>}{Boolean(account.consecutiveFailures) && <span className="row-note">连续失败 {account.consecutiveFailures}</span>}{account.lastError && <span className="row-note row-note--danger" title={account.lastError}>{account.lastError}</span>}</td>
                         <td><span className="mono masked-key">{account.maskedCredential}</span></td>
@@ -536,7 +690,8 @@ export function ProvidersView({
                   })}
                 </tbody>
               </table>
-            </div>
+              </div> : <div className="account-filter-empty"><CheckCircle2 size={22} /><strong>额度耗尽账号已隐藏</strong><span>取消勾选即可重新显示全部 {snapshot.accounts.length} 个账号。</span></div>}
+            </>
           ) : (
             <EmptyState
               icon={<KeyRound size={24} />}
@@ -578,6 +733,42 @@ export function ProvidersView({
           <section className="panel"><EmptyState icon={<Server size={24} />} title="尚未配置供应商" description="先建立一个上游端点，再添加访问凭据" action={<button className="button button--primary" type="button" onClick={() => openProvider()}><Plus size={16} />添加供应商</button>} /></section>
         )
       ) : <ProxyManager snapshot={snapshot} api={api} runAction={runAction} busyKeys={busyKeys} />}
+
+      <Modal
+        open={exportOpen}
+        title="导出 ChatGPT / Codex 账号"
+        description="选择账号和目标格式；导出文件包含 Access Token 与 Refresh Token，请妥善保存。"
+        onClose={() => !exportBusy && setExportOpen(false)}
+        width="large"
+        closable={!exportBusy}
+        footer={<><span className="modal-selection-count">已选择 {exportAccountIds.length} / {oauthAccounts.length}</span><button className="button button--secondary" type="button" disabled={exportBusy} onClick={() => setExportOpen(false)}>取消</button><button className="button button--primary" type="button" disabled={exportBusy || !exportAccountIds.length} onClick={() => void exportSelectedAccounts()}>{exportBusy ? <LoaderCircle size={16} className="spin" /> : <Download size={16} />}{exportBusy ? '正在导出…' : exportMode === 'merged' ? '选择文件并导出' : '选择目录并导出'}</button></>}
+      >
+        <div className="account-export">
+          <div className="account-export__format" role="radiogroup" aria-label="账号导出格式">
+            <button type="button" role="radio" aria-checked={exportFormat === 'sub2api'} className={exportFormat === 'sub2api' ? 'selected' : ''} onClick={() => setExportFormat('sub2api')}><strong>Sub2API JSON</strong><span>包含 accounts、credentials、并发和优先级</span></button>
+            <button type="button" role="radio" aria-checked={exportFormat === 'cpa'} className={exportFormat === 'cpa' ? 'selected' : ''} onClick={() => setExportFormat('cpa')}><strong>CPA JSON</strong><span>snake_case Codex OAuth 账号对象</span></button>
+          </div>
+          <div className="account-export__mode" role="radiogroup" aria-label="账号文件组织方式">
+            <span>文件组织</span>
+            <button type="button" role="radio" aria-checked={exportMode === 'merged'} className={exportMode === 'merged' ? 'selected' : ''} onClick={() => setExportMode('merged')}><strong>合并导出</strong><small>全部账号写入一个 JSON 文件</small></button>
+            <button type="button" role="radio" aria-checked={exportMode === 'separate'} className={exportMode === 'separate' ? 'selected' : ''} onClick={() => setExportMode('separate')}><strong>分别导出</strong><small>每个账号生成一个独立 JSON 文件</small></button>
+          </div>
+          <div className="account-export__selection-bar">
+            <span>选择账号</span>
+            <button type="button" onClick={() => selectExportAccounts(() => true)}>一键全选</button>
+            <button type="button" onClick={() => selectExportAccounts((account) => !accountIsCooling(account))}>选中非冷却账号</button>
+            <button type="button" disabled={!exportAccountIds.length} onClick={() => setExportAccountIds([])}>清空</button>
+          </div>
+          <div className="account-export__list">
+            {oauthAccounts.map((account) => {
+              const provider = providerById.get(account.providerId)
+              const selected = exportAccountIds.includes(account.id)
+              return <label className={selected ? 'selected' : ''} key={account.id}><input type="checkbox" checked={selected} onChange={() => toggleExportAccount(account.id)} /><span className="provider-avatar" style={{ '--provider-color': provider?.color ?? '#61736f' } as React.CSSProperties}>{provider?.name.slice(0, 1) ?? '?'}</span><span><strong>{account.name}</strong><small>{provider?.name ?? '供应商已删除'} · {accountIsCooling(account) ? '冷却中' : '非冷却'} · {account.renewable ? '可续期' : 'Access Token only'}</small></span><AccountStatusBadge status={account.status} circuitState={account.circuitState} /></label>
+            })}
+          </div>
+          <FieldError>{errors.accountExport}</FieldError>
+        </div>
+      </Modal>
 
       <Modal
         open={chatGptImportOpen}
@@ -641,6 +832,15 @@ export function ProvidersView({
       </Modal>
 
       <CodexQuotaModal account={quotaAccount} api={api} runAction={runAction} busyKeys={busyKeys} onClose={() => setQuotaAccountId(null)} />
+
+      <ConfirmDialog
+        open={bulkDeleteOpen}
+        title="批量删除账号"
+        message={`确定删除已选择的 ${selectedAccountIds.length} 个账号吗？仍属于号池的账号会阻止整次删除。此操作无法撤销。`}
+        busy={busyKeys.has('delete-accounts')}
+        onCancel={() => setBulkDeleteOpen(false)}
+        onConfirm={() => void confirmBulkDelete()}
+      />
 
       <ConfirmDialog
         open={Boolean(deleteTarget)}

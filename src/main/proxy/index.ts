@@ -3,5 +3,6 @@ export {
   probeProxy,
   proxyEntryAddress,
   resolveEffectiveProxy,
+  type OutboundTransportManagerOptions,
   type ProxyProbeResult
 } from './transport'

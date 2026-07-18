@@ -11,6 +11,7 @@ import type {
   AppSnapshot,
   ClientConfigProfile,
   ClientConfigProfileInput,
+  ChatGptAccountExportFormat,
   CodexQuotaHistoryPoint,
   GatewaySettings,
   GatewayStatus,
@@ -155,10 +156,11 @@ export class AppStore {
 
   private getObservability(): AppSnapshot['observability'] {
     const now = Date.now()
-    if (
-      this.observabilityCache?.revision === this.requestLogRevision
-      && this.observabilityCache.expiresAt > now
-    ) return structuredClone(this.observabilityCache.value)
+    // Observability is derived from up to 20k rows. Keep its recomputation rate
+    // bounded even while new logs continuously advance the revision.
+    if (this.observabilityCache && this.observabilityCache.expiresAt > now) {
+      return structuredClone(this.observabilityCache.value)
+    }
     const value = this.store.select((state) => ({
       last24Hours: summarizeObservability(state.requestLogs, now - 24 * 60 * 60 * 1000, now),
       last7Days: summarizeObservability(state.requestLogs, now - 7 * 24 * 60 * 60 * 1000, now),
@@ -480,17 +482,90 @@ export class AppStore {
   }
 
   public async deleteAccount(id: string): Promise<AppSnapshot> {
-    await this.store.update((state) => {
-      if (state.pools.some((pool) => pool.members.some((member) => member.accountId === id))) {
-        throw new Error('Remove this account from its pools before deleting it.')
-      }
+    return this.deleteAccounts([id])
+  }
+
+  public exportChatGptAccounts(
+    accountIds: string[],
+    format: ChatGptAccountExportFormat
+  ): { content: string; exportedAccounts: number } {
+    if (format !== 'cpa' && format !== 'sub2api') throw new Error('Unsupported account export format.')
+    const selectedIds = [...new Set(accountIds.filter((id) => typeof id === 'string' && id.trim()))]
+    if (!selectedIds.length) throw new Error('Select at least one account to export.')
+    const state = this.store.read()
+    const selected = selectedIds.map((id) => {
       const account = state.accounts.find((candidate) => candidate.id === id)
-      if (account) {
-        delete state.credentials[account.credentialId]
+      if (!account) throw new Error('One of the selected accounts no longer exists.')
+      if (account.credentialType !== 'chatgpt-oauth') {
+        throw new Error(`Account “${account.name}” is not a ChatGPT OAuth account.`)
       }
-      state.accounts = state.accounts.filter((candidate) => candidate.id !== id)
+      const encrypted = state.credentials[account.credentialId]
+      const serialized = encrypted ? this.decrypt(encrypted) : undefined
+      const credential = serialized ? deserializeChatGptCredential(serialized) : undefined
+      if (!credential) throw new Error(`Credential for “${account.name}” is unavailable.`)
+      return { account, credential }
     })
-    await this.store.deleteCodexQuotaHistory(id)
+    const exportedAt = new Date().toISOString()
+    const cpaAccounts = selected.map(({ account, credential }) => ({
+      type: 'codex',
+      name: account.name,
+      access_token: credential.accessToken,
+      refresh_token: credential.refreshToken ?? '',
+      id_token: credential.idToken ?? '',
+      account_id: credential.accountId,
+      chatgpt_account_id: credential.accountId,
+      user_id: credential.userId ?? '',
+      email: credential.email ?? '',
+      expired: new Date(credential.expiresAt).toISOString(),
+      expires_at: Math.floor(credential.expiresAt / 1000)
+    }))
+    const payload = format === 'cpa'
+      ? cpaAccounts.length === 1 ? cpaAccounts[0] : cpaAccounts
+      : {
+          type: 'sub2api-data',
+          version: 1,
+          exported_at: exportedAt,
+          proxies: [],
+          accounts: selected.map(({ account, credential }) => ({
+            name: account.name,
+            platform: 'openai',
+            type: 'oauth',
+            credentials: {
+              access_token: credential.accessToken,
+              refresh_token: credential.refreshToken ?? '',
+              id_token: credential.idToken ?? '',
+              account_id: credential.accountId,
+              user_id: credential.userId ?? '',
+              email: credential.email ?? ''
+            },
+            expires_at: Math.floor(credential.expiresAt / 1000),
+            concurrency: account.maxConcurrency,
+            priority: account.priority
+          }))
+        }
+    return { content: `${JSON.stringify(payload, null, 2)}\n`, exportedAccounts: selected.length }
+  }
+
+  public async deleteAccounts(ids: string[]): Promise<AppSnapshot> {
+    const selectedIds = [...new Set(ids.filter((id) => typeof id === 'string' && id.trim()))]
+    if (!selectedIds.length) throw new Error('Select at least one account to delete.')
+    const selectedIdSet = new Set(selectedIds)
+    await this.store.update((state) => {
+      const missing = selectedIds.filter((id) => !state.accounts.some((account) => account.id === id))
+      if (missing.length) throw new Error('One of the selected accounts no longer exists.')
+      const blockedIds = new Set(state.pools.flatMap((pool) => pool.members
+        .filter((member) => selectedIdSet.has(member.accountId))
+        .map((member) => member.accountId)))
+      if (blockedIds.size) {
+        const names = state.accounts.filter((account) => blockedIds.has(account.id)).map((account) => account.name)
+        throw new Error(`Remove selected accounts from their pools before deleting them: ${names.join(', ')}`)
+      }
+      for (const account of state.accounts) {
+        if (selectedIdSet.has(account.id)) delete state.credentials[account.credentialId]
+      }
+      state.accounts = state.accounts.filter((candidate) => !selectedIdSet.has(candidate.id))
+    })
+    await Promise.all(selectedIds.map((id) => this.store.deleteCodexQuotaHistory(id)))
     return this.getSnapshot()
   }
 
@@ -738,6 +813,10 @@ export class AppStore {
         maxRetries: nonNegativeInteger(input.maxRetries),
         forceFastMode: input.protocol === 'openai-responses'
           && (input.forceFastMode ?? existing?.forceFastMode) === true,
+        hedgedRequests: input.protocol === 'openai-responses'
+          && (input.hedgedRequests ?? existing?.hedgedRequests) === true,
+        hedgeDelayMs: Math.max(250, Math.min(15_000, positiveInteger(input.hedgeDelayMs ?? existing?.hedgeDelayMs ?? 2_500, 2_500))),
+        firstBodyTimeoutMs: Math.max(1_000, Math.min(12_000, positiveInteger(input.firstBodyTimeoutMs ?? existing?.firstBodyTimeoutMs ?? 8_000, 8_000))),
         proxyId: input.proxyId === undefined ? existing?.proxyId : optionalProxyId(input.proxyId, state.proxies),
         createdAt: existing?.createdAt ?? timestamp,
         updatedAt: timestamp
@@ -967,18 +1046,31 @@ export class AppStore {
     return serialized ? deserializeChatGptCredential(serialized) : undefined
   }
 
-  public async updateChatGptCredential(accountId: string, serialized: string): Promise<void> {
+  public async updateChatGptCredential(
+    accountId: string,
+    serialized: string,
+    expectedSourceSerialized?: string
+  ): Promise<void> {
     const bundle = deserializeChatGptCredential(serialized)
     if (!bundle) throw new Error('Refreshed ChatGPT credential is invalid.')
-    await this.store.update((state) => {
-      const account = state.accounts.find((candidate) => candidate.id === accountId)
-      if (!account || account.credentialType !== 'chatgpt-oauth') throw new Error('ChatGPT account not found.')
-      state.credentials[account.credentialId] = this.encrypt(serialized)
-      account.chatgptAccountId = bundle.accountId
-      account.credentialExpiresAt = bundle.expiresAt
-      account.renewable = Boolean(bundle.refreshToken)
-      account.updatedAt = Date.now()
-    })
+    const account = this.store.select((state) => state.accounts.find((candidate) => candidate.id === accountId))
+    if (!account || account.credentialType !== 'chatgpt-oauth') throw new Error('ChatGPT account not found.')
+    const previousEncrypted = this.store.select((state) => state.credentials[account.credentialId])
+    if (expectedSourceSerialized !== undefined && (
+      previousEncrypted === undefined || this.decrypt(previousEncrypted) !== expectedSourceSerialized
+    )) {
+      throw new Error('Account credential changed while it was being rotated.')
+    }
+    const encrypted = this.encrypt(serialized)
+    await this.store.updateAccountCredential<Account>(accountId, account.credentialId, encrypted, (candidate) => {
+      if (candidate.credentialType !== 'chatgpt-oauth') throw new Error('ChatGPT account not found.')
+      candidate.chatgptAccountId = bundle.accountId
+      candidate.credentialExpiresAt = bundle.expiresAt
+      candidate.renewable = Boolean(bundle.refreshToken)
+      candidate.updatedAt = Date.now()
+    }, previousEncrypted)
+    if (previousEncrypted) this.decryptedCredentialCache.delete(previousEncrypted)
+    this.decryptedCredentialCache.set(encrypted, serialized)
   }
 
   private encrypt(credential: string): string {
@@ -1326,9 +1418,15 @@ function summarizeTokenRates(requestLogs: RequestLog[], now: number): TokenRateS
   for (const log of requestLogs) {
     if (log.status !== 'success' || log.timestamp > now) continue
     if (!log.outputTokens || log.outputTokens <= 0 || log.latencyMs <= 0) continue
-    const generationDurationMs = log.firstTokenMs === undefined
-      ? log.latencyMs
-      : log.latencyMs - log.firstTokenMs
+    // `firstTokenMs` is the first user-visible semantic token. Reasoning tokens
+    // are generated before that point, so using it as the start while counting
+    // all output tokens creates huge artificial rates. The first upstream body
+    // byte marks the beginning of the streamed generation envelope instead.
+    const generationStartedMs = log.upstreamFirstByteMs
+      ?? log.clientFirstWriteMs
+      ?? log.firstTokenMs
+      ?? 0
+    const generationDurationMs = log.latencyMs - generationStartedMs
     if (generationDurationMs <= 0) continue
     const tokensPerSecond = log.outputTokens * 1000 / generationDurationMs
     for (const configuration of configurations) {

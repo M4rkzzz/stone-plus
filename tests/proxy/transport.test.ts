@@ -1,4 +1,8 @@
-import { createServer as createHttpServer, type Server as HttpServer } from 'node:http'
+import {
+  createServer as createHttpServer,
+  type Server as HttpServer,
+  type ServerResponse
+} from 'node:http'
 import { connect as connectTcp, type Socket } from 'node:net'
 import { afterEach, describe, expect, it } from 'vitest'
 import {
@@ -96,8 +100,207 @@ describe('outbound proxy transport', () => {
     const response = await manager.fetchFor(undefined)(`${originUrl}/after-warm`)
 
     expect(await response.text()).toBe('ok')
+    expect(response.url).toBe(`${originUrl}/after-warm`)
     expect(headRequests).toBe(1)
     expect(connections).toBeGreaterThan(0)
+  })
+
+  it('does not let a failed speculative warmup block or fail a real request', async () => {
+    let headStarted: (() => void) | undefined
+    const headObserved = new Promise<void>((resolve) => { headStarted = resolve })
+    const origin = createHttpServer((request, response) => {
+      if (request.method === 'HEAD') {
+        headStarted?.()
+        request.socket.destroy()
+        return
+      }
+      response.writeHead(200, { 'content-type': 'text/plain' })
+      response.end('real request succeeded')
+    })
+    const address = await listen(origin)
+    const manager = trackManager(new OutboundTransportManager())
+    const originUrl = `http://127.0.0.1:${address.port}`
+
+    const warming = manager.warmFor(undefined, undefined, originUrl)
+    const warmingFailure = warming.then(
+      () => undefined,
+      (error: unknown) => error
+    )
+    await headObserved
+    const response = await manager.fetchFor(undefined)(`${originUrl}/real`)
+
+    expect(await response.text()).toBe('real request succeeded')
+    expect(await warmingFailure).toBeInstanceOf(Error)
+  })
+
+  it('warms only the primary lane and creates a backup lazily for a concurrent stream', async () => {
+    let headRequests = 0
+    const requestPorts = new Map<string, number>()
+    const heldResponses: ServerResponse[] = []
+    const origin = createHttpServer((request, response) => {
+      if (request.method === 'HEAD') {
+        headRequests += 1
+        response.writeHead(204)
+        response.end()
+        return
+      }
+      requestPorts.set(request.url ?? '', request.socket.remotePort ?? -1)
+      response.writeHead(200, { 'content-type': 'text/plain' })
+      response.write('ready')
+      if (request.url === '/quick') response.end()
+      else heldResponses.push(response)
+    })
+    const address = await listen(origin)
+    const manager = trackManager(new OutboundTransportManager({ laneCountForOrigin: () => 2 }))
+    const originUrl = `http://127.0.0.1:${address.port}`
+
+    await Promise.all([
+      manager.warmFor(undefined, undefined, originUrl),
+      manager.warmFor(undefined, undefined, originUrl)
+    ])
+    const held = await manager.fetchFor(undefined)(`${originUrl}/held`)
+    const quick = await manager.fetchFor(undefined)(`${originUrl}/quick`)
+    expect(await quick.text()).toBe('ready')
+    const next = await manager.fetchFor(undefined)(`${originUrl}/next`)
+
+    expect(headRequests).toBe(1)
+    expect(requestPorts.get('/held')).not.toBe(requestPorts.get('/quick'))
+    // The free lane may open another HTTP/1.1 socket before Undici has put the
+    // just-consumed socket back into its idle queue, but it must not pick the
+    // lane whose response body is still held open.
+    expect(requestPorts.get('/next')).not.toBe(requestPorts.get('/held'))
+
+    await held.body?.cancel()
+    await next.body?.cancel()
+    for (const response of heldResponses) response.end()
+  })
+
+  it('continues serving sequential requests after a lazy backup has been used', async () => {
+    let headRequests = 0
+    const requestPorts = new Map<string, number>()
+    let releaseHeld!: () => void
+    const origin = createHttpServer((request, response) => {
+      const port = request.socket.remotePort ?? -1
+      if (request.method === 'HEAD') {
+        headRequests += 1
+        response.writeHead(204)
+        response.end()
+        return
+      }
+      requestPorts.set(request.url ?? '', port)
+      if (request.url === '/held') {
+        response.writeHead(200, { 'content-type': 'text/plain', 'content-length': '8' })
+        response.write('held')
+        releaseHeld = () => response.end('done')
+      } else {
+        response.writeHead(200, { 'content-type': 'text/plain', 'content-length': '2' })
+        response.end('ok')
+      }
+    })
+    const address = await listen(origin)
+    const manager = trackManager(new OutboundTransportManager({ laneCountForOrigin: () => 2 }))
+    const originUrl = `http://127.0.0.1:${address.port}`
+
+    await manager.warmFor(undefined, undefined, originUrl)
+    const held = await manager.fetchFor(undefined)(`${originUrl}/held`)
+    const concurrent = await manager.fetchFor(undefined)(`${originUrl}/concurrent`)
+    expect(await concurrent.text()).toBe('ok')
+    expect(requestPorts.get('/concurrent')).not.toBe(requestPorts.get('/held'))
+
+    releaseHeld()
+    expect(await held.text()).toBe('helddone')
+    // Give Undici a turn to return the completed H1 response to its dispatcher.
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    const sequential = await manager.fetchFor(undefined)(`${originUrl}/sequential`)
+
+    expect(await sequential.text()).toBe('ok')
+    expect(headRequests).toBe(1)
+  })
+
+  it('warms a replacement generation before atomically rotating traffic', async () => {
+    let headRequests = 0
+    const requestPorts = new Map<string, number>()
+    const origin = createHttpServer((request, response) => {
+      if (request.method === 'HEAD') headRequests += 1
+      else requestPorts.set(request.url ?? '', request.socket.remotePort ?? -1)
+      response.writeHead(request.method === 'HEAD' ? 204 : 200)
+      response.end(request.method === 'HEAD' ? undefined : 'ok')
+    })
+    const address = await listen(origin)
+    const manager = trackManager(new OutboundTransportManager({ laneCountForOrigin: () => 2 }))
+    const originUrl = `http://127.0.0.1:${address.port}`
+    const capturedFetch = manager.fetchFor(undefined)
+
+    await manager.warmFor(undefined, undefined, originUrl)
+    await (await capturedFetch(`${originUrl}/before`)).text()
+    await Promise.all([manager.rotate(), manager.rebuild()])
+    expect(manager.fetchFor(undefined)).toBe(capturedFetch)
+    // A gateway request can capture its transport before credential resolution.
+    // The captured handle must follow an atomic same-configuration rotation
+    // rather than dispatching through a generation that is already retiring.
+    await (await capturedFetch(`${originUrl}/after`)).text()
+
+    expect(headRequests).toBe(2)
+    expect(requestPorts.get('/after')).not.toBe(requestPorts.get('/before'))
+  })
+
+  it('does not let an older proxy rotation overwrite a newer proxy generation', async () => {
+    let releaseHead!: () => void
+    let observeHead!: () => void
+    const headObserved = new Promise<void>((resolve) => { observeHead = resolve })
+    const origin = createHttpServer((request, response) => {
+      if (request.method === 'HEAD') {
+        observeHead()
+        releaseHead = () => {
+          response.writeHead(204)
+          response.end()
+        }
+        return
+      }
+      response.end('ok')
+    })
+    const originAddress = await listen(origin)
+    const proxy = createHttpServer((_request, response) => {
+      response.writeHead(502)
+      response.end()
+    })
+    proxy.on('connect', (request, clientSocket, head) => forwardTunnel(request.url, clientSocket, head))
+    const proxyAddress = await listen(proxy)
+    const manager = trackManager(new OutboundTransportManager())
+    const firstProxy = proxyDefinition({ id: 'rotating-proxy', host: '127.0.0.1', port: proxyAddress.port, updatedAt: 1 })
+    const secondProxy = { ...firstProxy, updatedAt: 2 }
+    const oldConfigurationFetch = manager.fetchFor(firstProxy)
+
+    const rotation = manager.rotate(firstProxy, undefined, [`http://127.0.0.1:${originAddress.port}`])
+    await headObserved
+    const newerFetch = manager.fetchFor(secondProxy)
+    releaseHead()
+    await rotation
+
+    expect(manager.fetchFor(secondProxy)).toBe(newerFetch)
+    expect(newerFetch).not.toBe(oldConfigurationFetch)
+  })
+
+  it('does not resurrect a generation when closed during rotation', async () => {
+    let releaseHead!: () => void
+    let observeHead!: () => void
+    const headObserved = new Promise<void>((resolve) => { observeHead = resolve })
+    const origin = createHttpServer((request, response) => {
+      observeHead()
+      releaseHead = () => {
+        response.writeHead(204)
+        response.end()
+      }
+    })
+    const address = await listen(origin)
+    const manager = trackManager(new OutboundTransportManager())
+    const rotation = manager.rotate(undefined, undefined, [`http://127.0.0.1:${address.port}`])
+    await headObserved
+    const closing = manager.close()
+    releaseHead()
+    await Promise.all([rotation, closing])
+
+    expect(() => manager.fetchFor(undefined)).toThrow('manager is closed')
   })
 
   it('forwards a real HTTP request through the configured HTTP proxy', async () => {

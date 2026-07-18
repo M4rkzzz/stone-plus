@@ -1,4 +1,5 @@
 import type { Account, AccountCodexQuotaSnapshot } from '@shared/types'
+import { createHash } from 'node:crypto'
 import type { ProviderFailure } from './types'
 import { parseRetryAfter } from './failure'
 import { extractCodexQuotaFromUsagePayload } from './quota'
@@ -36,32 +37,97 @@ export interface ChatGptCredentialAccess {
   serialized: string
 }
 
+export interface ChatGptCredentialRefreshOptions {
+  /** Stable local account/credential key used to isolate concurrent refreshes. */
+  refreshKey?: string
+  /** Stop waiting for a blocking refresh without cancelling a refresh shared by other requests. */
+  signal?: AbortSignal
+  /** Hard deadline for the OAuth endpoint. */
+  timeoutMs?: number
+  /** Refresh in the background while the current access token is still safely usable. */
+  backgroundRefreshWindowMs?: number
+  /** Never return an access token this close to expiry while a refresh is needed. */
+  blockingRefreshWindowMs?: number
+}
+
+const DEFAULT_REFRESH_TIMEOUT_MS = 10_000
+const DEFAULT_BACKGROUND_REFRESH_WINDOW_MS = 15 * 60 * 1000
+const DEFAULT_BLOCKING_REFRESH_WINDOW_MS = 30_000
+const credentialRefreshFlights = new Map<string, Promise<ChatGptCredentialAccess>>()
+const recentlyRefreshedCredentials = new Map<string, {
+  sourceAccessToken: string
+  access: ChatGptCredentialAccess
+  expiresAt: number
+}>()
+const RECENT_REFRESH_TTL_MS = 15 * 60_000
+const MAX_RECENT_REFRESHES = 256
+
 export async function resolveChatGptCredential(
   encryptedValue: string,
-  persistRotated: (serialized: string) => Promise<void>,
+  persistRotated: (serialized: string, expectedSourceSerialized?: string) => Promise<void>,
   fetchImplementation: typeof fetch = fetch,
-  now = Date.now()
+  now = Date.now(),
+  options: ChatGptCredentialRefreshOptions = {}
 ): Promise<ChatGptCredentialAccess> {
   const current = deserializeChatGptCredential(encryptedValue)
   if (!current) throw new Error('ChatGPT account credential is invalid.')
-  if (current.expiresAt - now > 5 * 60 * 1000) return { bundle: current, serialized: encryptedValue }
-  if (!current.refreshToken) throw new Error('ChatGPT account access token expired and has no refresh token.')
-  const refreshed = await refreshChatGptCredential(current, fetchImplementation)
-  const serialized = serializeChatGptCredential(refreshed)
-  await persistRotated(serialized)
-  return { bundle: refreshed, serialized }
+  const refreshKey = options.refreshKey ?? current.accountId
+  const sourceKey = credentialSourceKey(refreshKey, encryptedValue)
+  const cached = recentlyRefreshedCredentials.get(sourceKey)
+  if (cached && cached.expiresAt <= now) recentlyRefreshedCredentials.delete(sourceKey)
+  if (
+    cached
+    && cached.expiresAt > now
+    && (cached.sourceAccessToken === current.accessToken || cached.access.bundle.accessToken === current.accessToken)
+    && cached.access.bundle.expiresAt > current.expiresAt
+    && cached.access.bundle.expiresAt > now
+  ) return cached.access
+
+  const remainingMs = current.expiresAt - now
+  const backgroundWindowMs = Math.max(0, options.backgroundRefreshWindowMs ?? DEFAULT_BACKGROUND_REFRESH_WINDOW_MS)
+  const blockingWindowMs = Math.max(0, Math.min(
+    backgroundWindowMs,
+    options.blockingRefreshWindowMs ?? DEFAULT_BLOCKING_REFRESH_WINDOW_MS
+  ))
+  if (remainingMs > backgroundWindowMs) return { bundle: current, serialized: encryptedValue }
+  if (!current.refreshToken) {
+    if (remainingMs > 0) return { bundle: current, serialized: encryptedValue }
+    throw new Error('ChatGPT account access token expired and has no refresh token.')
+  }
+
+  const refresh = getOrStartCredentialRefresh(
+    current,
+    sourceKey,
+    encryptedValue,
+    persistRotated,
+    fetchImplementation,
+    options.timeoutMs ?? DEFAULT_REFRESH_TIMEOUT_MS
+  )
+  if (remainingMs > blockingWindowMs) {
+    // The token remains safely usable. Do not put OAuth endpoint latency on the request path.
+    void refresh.catch(() => undefined)
+    return { bundle: current, serialized: encryptedValue }
+  }
+  return await waitForSharedRefresh(refresh, options.signal)
 }
 
 export async function refreshChatGptCredential(
   current: ChatGptCredentialBundle,
-  fetchImplementation: typeof fetch = fetch
+  fetchImplementation: typeof fetch = fetch,
+  options: Pick<ChatGptCredentialRefreshOptions, 'signal' | 'timeoutMs'> = {}
 ): Promise<ChatGptCredentialBundle> {
   if (!current.refreshToken) throw new Error('ChatGPT account has no refresh token.')
+  const timeoutMs = Math.max(1, options.timeoutMs ?? DEFAULT_REFRESH_TIMEOUT_MS)
+  const timeoutSignal = AbortSignal.timeout(timeoutMs)
+  const signal = options.signal
+    ? AbortSignal.any([options.signal, timeoutSignal])
+    : timeoutSignal
   let response: Response
   try {
     response = await fetchImplementation('https://auth.openai.com/oauth/token', {
       method: 'POST',
       headers: { 'content-type': 'application/x-www-form-urlencoded', 'user-agent': `codex-cli/${CODEX_CLIENT_VERSION}` },
+      signal,
       body: new URLSearchParams({
         grant_type: 'refresh_token', refresh_token: current.refreshToken,
         client_id: CODEX_OAUTH_CLIENT_ID,
@@ -84,6 +150,73 @@ export async function refreshChatGptCredential(
     refreshToken: typeof payload.refresh_token === 'string' && payload.refresh_token.trim() ? payload.refresh_token.trim() : current.refreshToken,
     idToken: typeof payload.id_token === 'string' && payload.id_token.trim() ? payload.id_token.trim() : current.idToken
   }
+}
+
+function getOrStartCredentialRefresh(
+  current: ChatGptCredentialBundle,
+  key: string,
+  sourceSerialized: string,
+  persistRotated: (serialized: string, expectedSourceSerialized?: string) => Promise<void>,
+  fetchImplementation: typeof fetch,
+  timeoutMs: number
+): Promise<ChatGptCredentialAccess> {
+  const active = credentialRefreshFlights.get(key)
+  if (active) return active
+  const refresh = (async (): Promise<ChatGptCredentialAccess> => {
+    const refreshed = await refreshChatGptCredential(current, fetchImplementation, { timeoutMs })
+    const serialized = serializeChatGptCredential(refreshed)
+    // Persist before publishing the refreshed token. This is especially important when
+    // refresh-token rotation invalidates the token used by this request.
+    await persistRotated(serialized, sourceSerialized)
+    const access = { bundle: refreshed, serialized }
+    rememberRefreshedCredential(key, current.accessToken, access)
+    return access
+  })()
+  credentialRefreshFlights.set(key, refresh)
+  void refresh.finally(() => {
+    if (credentialRefreshFlights.get(key) === refresh) credentialRefreshFlights.delete(key)
+  }).catch(() => undefined)
+  return refresh
+}
+
+function credentialSourceKey(refreshKey: string, serialized: string): string {
+  const fingerprint = createHash('sha256').update(serialized).digest('hex')
+  return `${refreshKey}:${fingerprint}`
+}
+
+function rememberRefreshedCredential(
+  key: string,
+  sourceAccessToken: string,
+  access: ChatGptCredentialAccess
+): void {
+  recentlyRefreshedCredentials.delete(key)
+  recentlyRefreshedCredentials.set(key, {
+    sourceAccessToken,
+    access,
+    expiresAt: Date.now() + RECENT_REFRESH_TTL_MS
+  })
+  while (recentlyRefreshedCredentials.size > MAX_RECENT_REFRESHES) {
+    const oldest = recentlyRefreshedCredentials.keys().next().value as string | undefined
+    if (!oldest) break
+    recentlyRefreshedCredentials.delete(oldest)
+  }
+}
+
+async function waitForSharedRefresh(
+  refresh: Promise<ChatGptCredentialAccess>,
+  signal?: AbortSignal
+): Promise<ChatGptCredentialAccess> {
+  if (!signal) return await refresh
+  if (signal.aborted) throw abortReason(signal)
+  return await new Promise<ChatGptCredentialAccess>((resolve, reject) => {
+    const aborted = (): void => reject(abortReason(signal))
+    signal.addEventListener('abort', aborted, { once: true })
+    void refresh.then(resolve, reject).finally(() => signal.removeEventListener('abort', aborted))
+  })
+}
+
+function abortReason(signal: AbortSignal): Error {
+  return signal.reason instanceof Error ? signal.reason : new DOMException('The operation was aborted.', 'AbortError')
 }
 
 export function applyChatGptCodexHeaders(
