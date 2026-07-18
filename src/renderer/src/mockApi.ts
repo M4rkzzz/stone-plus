@@ -1091,7 +1091,7 @@ export function createMockApi(): GatewayApi {
         release: {
           version: '0.8.1',
           tagName: 'v0.8.1',
-          title: 'Stone 0.8.1 · 更稳健的本地更新体验',
+          title: 'Stone+ 0.8.1 · 更稳健的本地更新体验',
           publishedAt: new Date().toISOString(),
           url: 'https://github.com/M4rkzzz/stone-plus/releases/tag/v0.8.1',
           notes: [

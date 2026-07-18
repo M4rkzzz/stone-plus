@@ -5,6 +5,7 @@ import { clean, eq, gt, gte, valid } from 'semver'
 const RELEASE_API_URL = 'https://api.github.com/repos/M4rkzzz/stone-plus/releases/latest'
 const RELEASE_PAGE_URL = 'https://github.com/M4rkzzz/stone-plus/releases/latest'
 const RELEASE_PATH_PREFIX = '/M4rkzzz/stone-plus/releases/'
+const RELEASE_TAG_PATH_PATTERN = /^\/M4rkzzz\/stone-plus\/releases\/tag\/(v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))\/?$/
 const MAX_RELEASE_RESPONSE_BYTES = 512 * 1024
 const MAX_RELEASE_NOTES_LENGTH = 32_000
 const DEFAULT_CHECK_DELAY_MS = 12_000
@@ -53,7 +54,7 @@ export class UpdateService {
       options.environment ?? process.env
     )
     const currentVersion = valid(options.currentVersion)
-    if (!currentVersion) throw new Error('Stone has an invalid application version.')
+    if (!currentVersion) throw new Error('Stone+ has an invalid application version.')
 
     this.state = {
       revision: 0,
@@ -324,12 +325,18 @@ export async function fetchLatestRelease(
     method: 'GET',
     headers: {
       Accept: 'application/vnd.github+json',
-      'User-Agent': `Stone/${currentVersion}`,
+      'User-Agent': `StonePlus/${currentVersion}`,
       'X-GitHub-Api-Version': '2022-11-28'
     },
     redirect: 'error',
     signal: AbortSignal.timeout(15_000)
   })
+  // Anonymous GitHub REST requests share a small per-IP quota. Fall back to the
+  // public "latest release" redirect so update checks keep working on shared
+  // networks without requiring a GitHub token in the desktop application.
+  if (response.status === 403 || response.status === 429) {
+    return fetchLatestReleaseFromRedirect(fetchImplementation, currentVersion)
+  }
   if (!response.ok) throw new Error(`GitHub release request failed with status ${response.status}.`)
   const contentLength = Number(response.headers.get('content-length') ?? 0)
   if (contentLength > MAX_RELEASE_RESPONSE_BYTES) throw new Error('GitHub release response was too large.')
@@ -363,12 +370,47 @@ export async function fetchLatestRelease(
     : ''
   const title = typeof release.name === 'string' && release.name.trim()
     ? release.name.trim().slice(0, 200)
-    : `Stone v${version}`
+    : `Stone+ v${version}`
   const notes = typeof release.body === 'string' && release.body.trim()
     ? release.body.slice(0, MAX_RELEASE_NOTES_LENGTH)
     : '此版本没有提供更新说明。'
 
   return { version, tagName, title, notes, publishedAt, url }
+}
+
+async function fetchLatestReleaseFromRedirect(
+  fetchImplementation: FetchImplementation,
+  currentVersion: string
+): Promise<AppUpdateRelease | undefined> {
+  const response = await fetchImplementation(RELEASE_PAGE_URL, {
+    method: 'GET',
+    headers: {
+      Accept: 'text/html',
+      'User-Agent': `StonePlus/${currentVersion}`
+    },
+    redirect: 'manual',
+    signal: AbortSignal.timeout(15_000)
+  })
+  if (![301, 302, 303, 307, 308].includes(response.status)) {
+    throw new Error(`GitHub release redirect failed with status ${response.status}.`)
+  }
+
+  const location = response.headers.get('location')
+  if (!location) throw new Error('GitHub release redirect did not provide a location.')
+  const url = new URL(location, RELEASE_PAGE_URL).toString()
+  const tagName = releaseTagFromUrl(url)
+  const version = clean(tagName)
+  if (!version || !valid(version)) throw new Error('GitHub release version was invalid.')
+  if (!gt(version, currentVersion)) return undefined
+
+  return {
+    version,
+    tagName,
+    title: `Stone+ v${version}`,
+    notes: '完整更新说明请打开 GitHub Release 查看。',
+    publishedAt: '',
+    url
+  }
 }
 
 function assertMatchingUpdate(result: UpdateCheckResult | null, expectedVersion: string): void {
@@ -401,8 +443,16 @@ function assertTrustedReleaseUrl(value: string): void {
     throw new Error('GitHub release URL was invalid.')
   }
   if (url.protocol !== 'https:' || url.hostname !== 'github.com' || !url.pathname.startsWith(RELEASE_PATH_PREFIX)) {
-    throw new Error('Stone rejected an untrusted update URL.')
+    throw new Error('Stone+ rejected an untrusted update URL.')
   }
+}
+
+function releaseTagFromUrl(value: string): string {
+  assertTrustedReleaseUrl(value)
+  const url = new URL(value)
+  const match = RELEASE_TAG_PATH_PATTERN.exec(url.pathname)
+  if (!match || url.search || url.hash) throw new Error('GitHub release redirect URL was invalid.')
+  return match[1]
 }
 
 function updateCheckErrorMessage(error: unknown): string {

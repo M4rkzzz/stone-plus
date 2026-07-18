@@ -153,13 +153,13 @@ export function SettingsView({
       </section>
 
       <section className="settings-section">
-        <header><div className="settings-section__icon settings-section__icon--update"><Sparkles size={18} /></div><div><h2>应用更新</h2><p>从 GitHub Releases 检查并安装 Stone</p></div></header>
+        <header><div className="settings-section__icon settings-section__icon--update"><Sparkles size={18} /></div><div><h2>应用更新</h2><p>从 GitHub Releases 检查并安装 Stone+</p></div></header>
         <div className="settings-section__content">
           <div className="update-settings-status">
             <div>
               <span className="update-settings-status__icon">{appUpdate?.status === 'checking' || appUpdate?.status === 'downloading' || appUpdate?.status === 'installing' ? <LoaderCircle size={19} className="spin" /> : appUpdate?.status === 'downloaded' || appUpdate?.status === 'up-to-date' ? <CheckCircle2 size={19} /> : <Sparkles size={19} />}</span>
               <div>
-                <strong>{appUpdate?.release ? `Stone ${appUpdate.release.version}` : `Stone ${appUpdate?.currentVersion ?? __APP_VERSION__}`}</strong>
+                <strong>{appUpdate?.release ? `Stone+ ${appUpdate.release.version}` : `Stone+ ${appUpdate?.currentVersion ?? __APP_VERSION__}`}</strong>
                 <span>{updateSettingsDescription(appUpdate)}</span>
               </div>
             </div>
@@ -214,10 +214,10 @@ function updateSettingsDescription(update: AppUpdateController['state']): string
   if (update.status === 'unsupported') return '当前安装形式不支持应用内自动更新。'
   if (update.status === 'idle') return '手动检查 GitHub Releases 中的最新版本。'
   if (update.status === 'checking') return '正在获取最新版本与发布说明。'
-  if (update.status === 'up-to-date') return '当前安装的 Stone 已是最新版本。'
+  if (update.status === 'up-to-date') return '当前安装的 Stone+ 已是最新版本。'
   if (update.status === 'available') return update.ignoredVersion === update.release?.version ? '此版本已忽略，仍可手动查看或下载。' : '新版本已发布，可查看说明后下载。'
   if (update.status === 'downloading') return '安装包正在后台下载。'
-  if (update.status === 'downloaded') return '安装包已就绪，重启 Stone 即可完成更新。'
-  if (update.status === 'installing') return 'Stone 正在关闭并安装新版本。'
+  if (update.status === 'downloaded') return '安装包已就绪，重启 Stone+ 即可完成更新。'
+  if (update.status === 'installing') return 'Stone+ 正在关闭并安装新版本。'
   return '更新操作失败，当前版本仍可继续使用。'
 }

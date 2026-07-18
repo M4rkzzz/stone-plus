@@ -9,6 +9,9 @@
 - Extended direct and proxied HTTP/2 connection keepalive and added connection warming.
 - Added an optional `autobalanced` strategy that prefers accounts with better EWMA
   TTFT/output speed without changing the existing `balanced` behavior.
+- Kept update checks working when GitHub's anonymous REST API is rate limited by
+  falling back to the trusted latest-release redirect, and completed Stone+ branding
+  across the application-update UI.
 
 ## 0.8.4
 

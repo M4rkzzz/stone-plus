@@ -117,7 +117,7 @@ export function UpdateDialog({
   return (
     <Modal
       open={open}
-      title={release?.title || (state.status === 'up-to-date' ? 'Stone 已是最新版本' : 'Stone 应用更新')}
+      title={release?.title || (state.status === 'up-to-date' ? 'Stone+ 已是最新版本' : 'Stone+ 应用更新')}
       description={release ? `v${state.currentVersion} → v${release.version}` : `当前版本 v${state.currentVersion}`}
       width="large"
       closable={state.status !== 'installing'}
@@ -151,7 +151,7 @@ export function UpdateDialog({
               {action === 'install' ? <LoaderCircle size={16} className="spin" /> : <Rocket size={16} />}更新并重启
             </button>
           )}
-          {state.status === 'installing' && <button className="button button--primary" type="button" disabled><LoaderCircle size={16} className="spin" />正在重启 Stone</button>}
+          {state.status === 'installing' && <button className="button button--primary" type="button" disabled><LoaderCircle size={16} className="spin" />正在重启 Stone+</button>}
           {state.status === 'error' && release && state.automaticUpdateSupported && (
             <button className="button button--primary" type="button" disabled={busy} onClick={() => void onDownload()}><RefreshCw size={16} />重新下载</button>
           )}
@@ -192,7 +192,7 @@ export function UpdateDialog({
             </div>
           </section>
         ) : (
-          <div className="update-dialog__empty">{state.status === 'up-to-date' ? <CheckCircle2 size={28} /> : <RefreshCw size={26} />}<span>{state.status === 'up-to-date' ? '当前安装的 Stone 已是最新版本。' : '手动检查后会在这里显示版本信息和发布说明。'}</span></div>
+          <div className="update-dialog__empty">{state.status === 'up-to-date' ? <CheckCircle2 size={28} /> : <RefreshCw size={26} />}<span>{state.status === 'up-to-date' ? '当前安装的 Stone+ 已是最新版本。' : '手动检查后会在这里显示版本信息和发布说明。'}</span></div>
         )}
       </div>
     </Modal>
@@ -247,11 +247,11 @@ function updateIcon(state: AppUpdateState) {
 }
 
 function bannerTitle(state: AppUpdateState): string {
-  if (state.status === 'downloading') return `正在下载 Stone ${state.release?.version}`
-  if (state.status === 'downloaded') return `Stone ${state.release?.version} 已准备就绪`
-  if (state.status === 'installing') return 'Stone 正在安装更新'
-  if (state.status === 'error') return 'Stone 更新遇到问题'
-  return `发现 Stone ${state.release?.version}`
+  if (state.status === 'downloading') return `正在下载 Stone+ ${state.release?.version}`
+  if (state.status === 'downloaded') return `Stone+ ${state.release?.version} 已准备就绪`
+  if (state.status === 'installing') return 'Stone+ 正在安装更新'
+  if (state.status === 'error') return 'Stone+ 更新遇到问题'
+  return `发现 Stone+ ${state.release?.version}`
 }
 
 function bannerDescription(state: AppUpdateState): string {
@@ -263,8 +263,8 @@ function bannerDescription(state: AppUpdateState): string {
 }
 
 function statusTitle(state: AppUpdateState): string {
-  if (state.release) return `Stone ${state.release.version}`
-  return `Stone ${state.currentVersion}`
+  if (state.release) return `Stone+ ${state.release.version}`
+  return `Stone+ ${state.currentVersion}`
 }
 
 function statusDescription(state: AppUpdateState): string {
@@ -274,7 +274,7 @@ function statusDescription(state: AppUpdateState): string {
   if (state.status === 'available') return '新版本已发布，可查看说明并选择安装。'
   if (state.status === 'downloading') return '安装包正在后台下载。'
   if (state.status === 'downloaded') return '安装包已完成校验，可以更新并重启。'
-  if (state.status === 'installing') return 'Stone 将在安装完成后重新启动。'
+  if (state.status === 'installing') return 'Stone+ 将在安装完成后重新启动。'
   if (state.status === 'error') return '更新操作未完成，现有版本仍可继续使用。'
   return '手动检查 GitHub Releases 中的最新版本。'
 }

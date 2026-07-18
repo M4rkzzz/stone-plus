@@ -111,7 +111,7 @@ function createHarness(options: HarnessOptions = {}) {
 function releasePayload(version = '0.8.1', overrides: Record<string, unknown> = {}) {
   return {
     tag_name: `v${version}`,
-    name: `Stone v${version}`,
+    name: `Stone+ v${version}`,
     body: '## Changes\n\n- Safer updates',
     html_url: `https://github.com/M4rkzzz/stone-plus/releases/tag/v${version}`,
     published_at: '2026-07-13T00:00:00Z',
@@ -140,7 +140,7 @@ describe('UpdateService', () => {
     expect(state.release).toEqual({
       version: '0.8.1',
       tagName: 'v0.8.1',
-      title: 'Stone v0.8.1',
+      title: 'Stone+ v0.8.1',
       notes: '## Changes\n\n- Safer updates',
       publishedAt: '2026-07-13T00:00:00Z',
       url: 'https://github.com/M4rkzzz/stone-plus/releases/tag/v0.8.1'
@@ -312,6 +312,43 @@ describe('GitHub release parsing', () => {
     await expect(fetchLatestRelease(
       async () => responseFor(releasePayload('0.8.1', { html_url: 'https://example.com/update.exe' })),
       '0.8.0'
+    )).rejects.toThrow('untrusted update URL')
+  })
+
+  it('falls back to the trusted latest-release redirect when the REST API is rate limited', async () => {
+    const fetchImplementation = vi.fn(async (input: string, init?: RequestInit) => {
+      if (input.includes('api.github.com')) return responseFor({ message: 'API rate limit exceeded' }, 403)
+      expect(init?.redirect).toBe('manual')
+      return new Response(null, {
+        status: 302,
+        headers: { location: 'https://github.com/M4rkzzz/stone-plus/releases/tag/v0.8.5' }
+      })
+    })
+
+    await expect(fetchLatestRelease(fetchImplementation, '0.8.4')).resolves.toEqual({
+      version: '0.8.5',
+      tagName: 'v0.8.5',
+      title: 'Stone+ v0.8.5',
+      notes: '完整更新说明请打开 GitHub Release 查看。',
+      publishedAt: '',
+      url: 'https://github.com/M4rkzzz/stone-plus/releases/tag/v0.8.5'
+    })
+    expect(fetchImplementation).toHaveBeenCalledTimes(2)
+  })
+
+  it('treats the redirect fallback as up to date and rejects untrusted redirect targets', async () => {
+    const rateLimitedThen = (location: string) => vi.fn(async (input: string) => {
+      if (input.includes('api.github.com')) return responseFor({ message: 'rate limited' }, 429)
+      return new Response(null, { status: 302, headers: { location } })
+    })
+
+    await expect(fetchLatestRelease(
+      rateLimitedThen('https://github.com/M4rkzzz/stone-plus/releases/tag/v0.8.5'),
+      '0.8.5'
+    )).resolves.toBeUndefined()
+    await expect(fetchLatestRelease(
+      rateLimitedThen('https://example.com/M4rkzzz/stone-plus/releases/tag/v9.9.9'),
+      '0.8.5'
     )).rejects.toThrow('untrusted update URL')
   })
 })
