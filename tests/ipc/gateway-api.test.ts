@@ -154,6 +154,35 @@ describe('refresh provider models IPC', () => {
     }
   })
 
+  it('cools an exhausted OAuth account until the reset reported by the usage probe', async () => {
+    const oauth = oauthAccount()
+    const resetAfterSeconds = 3_600
+    const upstreamFetch = vi.fn(async () => new Response(JSON.stringify({
+      rate_limit: {
+        allowed: false,
+        limit_reached: true,
+        primary_window: { used_percent: 100, limit_window_seconds: 18_000, reset_after_seconds: resetAfterSeconds },
+        secondary_window: { used_percent: 80, limit_window_seconds: 604_800, reset_after_seconds: 86_400 }
+      }
+    }), { status: 200, headers: { 'content-type': 'application/json' } }))
+    const harness = createHarness([oauth], { [oauth.credentialId]: oauthCredential() }, upstreamFetch)
+    void harness
+    const handler = electron.handlers.get('stone:refresh-account-codex-quota')
+    if (!handler) throw new Error('refresh-account-codex-quota handler was not registered')
+    const before = Date.now()
+    const mainFrame = { url: 'http://127.0.0.1:5173/index.html' }
+
+    await handler({ senderFrame: mainFrame, sender: { mainFrame } }, oauth.id)
+
+    expect(oauth).toMatchObject({
+      status: 'cooldown',
+      circuitState: 'open',
+      cooldownReason: 'quota'
+    })
+    expect(oauth.cooldownUntil).toBeGreaterThanOrEqual(before + resetAfterSeconds * 1_000)
+    expect(oauth.cooldownUntil).toBeLessThanOrEqual(Date.now() + resetAfterSeconds * 1_000)
+  })
+
   it('does not let delayed success telemetry re-enable a manually disabled account', async () => {
     vi.useFakeTimers()
     try {
@@ -435,6 +464,13 @@ function createHarness(
     getCredential: vi.fn((credentialId: string) => credentials[credentialId]),
     getProxyPassword: vi.fn(() => undefined),
     updateChatGptCredential: vi.fn(async () => undefined),
+    setAccountCheckResult: vi.fn(async (id: string, patch: Partial<Account>) => {
+      const runtimeAccount = accounts.find((account) => account.id === id)
+      if (runtimeAccount) Object.assign(runtimeAccount, patch)
+      const publicAccount = snapshot.accounts.find((account) => account.id === id)
+      if (publicAccount) Object.assign(publicAccount, patch)
+      return snapshot
+    }),
     setProviderModels: vi.fn(async (_id: string, models: string[]) => {
       snapshot.providers[0].models = models
       return snapshot

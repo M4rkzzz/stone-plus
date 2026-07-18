@@ -4,6 +4,7 @@ import { lstat, readFile, writeFile } from 'node:fs/promises'
 import { basename, extname, join } from 'node:path'
 import { clientNativeProtocols } from '@shared/types'
 import type {
+  AccountFitnessSnapshot,
   AccountModelTestResult,
   AppSnapshot,
   ClientConfigEditorSaveInput,
@@ -19,7 +20,7 @@ import type {
   RouteClient
 } from '@shared/types'
 import type { GatewayAccountState, GatewayConfig } from '../gateway'
-import { CHATGPT_CODEX_RESPONSES_URL, getProviderAdapter, getProviderPreset, probeChatGptAccount, probeChatGptCodexModel, probeProviderModel, providerPresets, queryChatGptCodexModels, queryChatGptCodexQuota, resolveChatGptCredential, type ProviderFailure } from '../providers'
+import { CHATGPT_CODEX_RESPONSES_URL, codexQuotaCooldownUntil, codexQuotaIsExhausted, getProviderAdapter, getProviderPreset, probeChatGptAccount, probeChatGptCodexModel, probeProviderModel, providerPresets, queryChatGptCodexModels, queryChatGptCodexQuota, resolveChatGptCredential, type ProviderFailure } from '../providers'
 import type { AppStore } from '../store/app-store'
 import type { ClientConfigService } from '../client-config'
 import type { DatabaseBackupService } from '../backup'
@@ -34,6 +35,7 @@ export interface GatewayController {
   getStatus(): GatewayStatus
   updateConfig(config: GatewayConfig): void
   resetAccountHealth(accountId: string): void
+  getAccountFitness(): Record<string, AccountFitnessSnapshot>
   onLog(listener: (log: RequestLog) => void): () => void
   onAccountState(listener: (state: GatewayAccountState) => void): () => void
 }
@@ -51,6 +53,20 @@ export function registerGatewayApi(
   let scheduledSnapshotPublish: ReturnType<typeof setTimeout> | undefined
   let scheduledAccountStateFlush: ReturnType<typeof setTimeout> | undefined
   const pendingActiveAccountStates = new Map<string, GatewayAccountState>()
+  const quotaProbeTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  const quotaProbeFlights = new Set<string>()
+  const lastQuotaProbeAt = new Map<string, number>()
+  let closed = false
+  const withRuntimeMetrics = (snapshot: AppSnapshot): AppSnapshot => {
+    const fitness = gateway.getAccountFitness?.() ?? {}
+    return {
+      ...snapshot,
+      accounts: snapshot.accounts.map((account) => ({
+        ...account,
+        ...(fitness[account.id] ? { fitness: fitness[account.id] } : {})
+      }))
+    }
+  }
   const canReceiveSnapshot = (window: BrowserWindow): boolean => {
     const visible = typeof window.isVisible !== 'function' || window.isVisible()
     const minimized = typeof window.isMinimized === 'function' && window.isMinimized()
@@ -60,28 +76,30 @@ export function registerGatewayApi(
     snapshot: AppSnapshot,
     options: { runtimeChanged?: boolean } = { runtimeChanged: true }
   ): AppSnapshot => {
+    const enriched = withRuntimeMetrics(snapshot)
     if (scheduledSnapshotPublish) {
       clearTimeout(scheduledSnapshotPublish)
       scheduledSnapshotPublish = undefined
     }
     for (const window of BrowserWindow.getAllWindows()) {
       if (!window.isDestroyed()) {
-        window.webContents.send('stone:snapshot', snapshot)
+        window.webContents.send('stone:snapshot', enriched)
       }
     }
     if (options.runtimeChanged !== false) onRuntimeChanged?.()
-    return snapshot
+    return enriched
   }
 
   const publishRoutine = (snapshot: AppSnapshot): AppSnapshot => {
+    const enriched = withRuntimeMetrics(snapshot)
     if (scheduledSnapshotPublish) {
       clearTimeout(scheduledSnapshotPublish)
       scheduledSnapshotPublish = undefined
     }
     for (const window of BrowserWindow.getAllWindows()) {
-      if (canReceiveSnapshot(window)) window.webContents.send('stone:snapshot', snapshot)
+      if (canReceiveSnapshot(window)) window.webContents.send('stone:snapshot', enriched)
     }
-    return snapshot
+    return enriched
   }
 
   const scheduleRuntimePublish = (): void => {
@@ -98,6 +116,58 @@ export function registerGatewayApi(
     gateway.updateConfig(toGatewayConfig(store))
     store.setGatewayStatus(gateway.getStatus())
     return store.getSnapshot()
+  }
+
+  const scheduleQuotaProbe = (accountId: string, at: number): void => {
+    const existing = quotaProbeTimers.get(accountId)
+    if (existing) clearTimeout(existing)
+    if (closed) return
+    const delay = Math.max(1_000, Math.min(2_147_000_000, at - Date.now()))
+    const timer = setTimeout(() => {
+      quotaProbeTimers.delete(accountId)
+      void probeQuotaCooldownAccount(accountId)
+    }, delay)
+    timer.unref?.()
+    quotaProbeTimers.set(accountId, timer)
+  }
+
+  const probeQuotaCooldownAccount = async (accountId: string): Promise<void> => {
+    if (closed || quotaProbeFlights.has(accountId)) return
+    const account = store.getRuntimeAccount(accountId)
+    if (!account || account.credentialType !== 'chatgpt-oauth' || account.cooldownReason !== 'quota') return
+    quotaProbeFlights.add(accountId)
+    lastQuotaProbeAt.set(accountId, Date.now())
+    try {
+      const quota = await refreshAccountCodexQuota(store, outboundTransport, accountId)
+      if (closed) return
+      const now = Date.now()
+      const exhausted = codexQuotaIsExhausted(quota, now)
+      const cooldownUntil = exhausted ? codexQuotaCooldownUntil(quota, now) ?? now + 60_000 : undefined
+      await store.setAccountCheckResult(accountId, exhausted ? {
+        codexQuota: quota,
+        status: 'cooldown',
+        circuitState: 'open',
+        cooldownReason: 'quota',
+        cooldownUntil,
+        lastError: 'ChatGPT Codex 额度已耗尽。'
+      } : {
+        codexQuota: quota,
+        status: 'active',
+        circuitState: 'closed',
+        consecutiveFailures: 0,
+        cooldownReason: undefined,
+        cooldownUntil: undefined,
+        lastError: undefined
+      })
+      if (exhausted && cooldownUntil !== undefined) scheduleQuotaProbe(accountId, cooldownUntil + 1_000)
+      else gateway.resetAccountHealth(accountId)
+      publish(refreshRuntime())
+    } catch (error) {
+      console.error('Stone could not probe an exhausted ChatGPT account quota', error)
+      scheduleQuotaProbe(accountId, Date.now() + 60_000)
+    } finally {
+      quotaProbeFlights.delete(accountId)
+    }
   }
 
   const mutate = async (operation: () => Promise<AppSnapshot>): Promise<AppSnapshot> => {
@@ -118,18 +188,26 @@ export function registerGatewayApi(
     publish(refreshRuntime())
     try {
       const result = await checkAccount(store, outboundTransport, id)
+      const now = Date.now()
+      const exhausted = codexQuotaIsExhausted(result.codexQuota, now)
+      const cooldownUntil = exhausted
+        ? codexQuotaCooldownUntil(result.codexQuota, now) ?? now + 60_000
+        : undefined
       await store.setAccountCheckResult(id, {
-        status: 'active',
-        circuitState: 'closed',
+        status: exhausted ? 'cooldown' : 'active',
+        circuitState: exhausted ? 'open' : 'closed',
         consecutiveFailures: 0,
         latencyMs: result.latencyMs,
-        lastError: undefined,
-        lastUsedAt: Date.now(),
-        cooldownUntil: undefined,
+        lastError: exhausted ? 'ChatGPT Codex 额度已耗尽。' : undefined,
+        lastUsedAt: now,
+        cooldownUntil,
+        cooldownReason: exhausted ? 'quota' : undefined,
         ...(result.codexQuota ? { codexQuota: result.codexQuota } : {})
       })
-      gateway.resetAccountHealth(id)
-      return { snapshot: publish(refreshRuntime()), ok: true, latencyMs: result.latencyMs }
+      if (exhausted && cooldownUntil !== undefined) scheduleQuotaProbe(id, cooldownUntil + 1_000)
+      else gateway.resetAccountHealth(id)
+      return { snapshot: publish(refreshRuntime()), ok: !exhausted, latencyMs: result.latencyMs,
+        ...(exhausted ? { error: 'ChatGPT Codex 额度已耗尽。' } : {}) }
     } catch (error: unknown) {
       const failure = error instanceof AccountProbeError ? error.failure : undefined
       const shouldDisable = failure?.accountAction === 'disable'
@@ -140,6 +218,7 @@ export function registerGatewayApi(
         circuitState: shouldDisable || shouldCooldown ? 'open' : previous?.circuitState,
         consecutiveFailures: (store.getSnapshot().accounts.find((account) => account.id === id)?.consecutiveFailures ?? 0) + 1,
         cooldownUntil: shouldCooldown ? Date.now() + (failure?.retryAfterMs ?? 30_000) : previous?.cooldownUntil,
+        cooldownReason: shouldCooldown ? 'failure' : previous?.cooldownReason,
         lastError: errorMessage
       })
       return { snapshot: publish(refreshRuntime()), ok: false, error: errorMessage }
@@ -161,6 +240,7 @@ export function registerGatewayApi(
       circuitState: state.circuitState,
       consecutiveFailures: state.consecutiveFailures,
       cooldownUntil: state.cooldownUntil,
+      cooldownReason: state.cooldownReason,
       latencyMs: state.latencyMs,
       lastError: state.lastError,
       lastUsedAt: state.lastUsedAt,
@@ -168,6 +248,15 @@ export function registerGatewayApi(
       ...(state.codexQuota ? { codexQuota: state.codexQuota } : {})
     })
     const account = store.getRuntimeAccount(state.accountId)
+    if (account?.cooldownReason === 'quota' && account.credentialType === 'chatgpt-oauth') {
+      const knownResetAt = codexQuotaCooldownUntil(account.codexQuota)
+      const recentlyProbed = Date.now() - (lastQuotaProbeAt.get(account.id) ?? 0) < 30_000
+      scheduleQuotaProbe(account.id, recentlyProbed && knownResetAt ? knownResetAt + 1_000 : Date.now() + 1_000)
+    } else {
+      const timer = quotaProbeTimers.get(state.accountId)
+      if (timer) clearTimeout(timer)
+      quotaProbeTimers.delete(state.accountId)
+    }
     const provider = account ? store.getRuntimeProvider(account.providerId) : undefined
     const event = account ? healthEventForTransition(before, account, provider?.name ?? 'Unknown provider') : undefined
     if (event && account) {
@@ -241,10 +330,17 @@ export function registerGatewayApi(
     }
   })
 
+  for (const account of store.getRuntimeAccounts()) {
+    if (account.credentialType === 'chatgpt-oauth' && account.cooldownReason === 'quota') {
+      const resetAt = codexQuotaCooldownUntil(account.codexQuota)
+      scheduleQuotaProbe(account.id, resetAt ? resetAt + 1_000 : Date.now() + 1_000)
+    }
+  }
+
   ipcMain.handle('stone:get-snapshot', (event) => {
     assertTrustedSender(event)
     store.setGatewayStatus(gateway.getStatus())
-    return store.getSnapshot()
+    return withRuntimeMetrics(store.getSnapshot())
   })
   ipcMain.handle('stone:save-provider', (event, input: Parameters<GatewayApi['saveProvider']>[0]) => {
     assertTrustedSender(event)
@@ -535,7 +631,30 @@ export function registerGatewayApi(
   ipcMain.handle('stone:refresh-account-codex-quota', async (event, id: string) => {
     assertTrustedSender(event)
     const quota = await refreshAccountCodexQuota(store, outboundTransport, id)
-    await store.setAccountCheckResult(id, { codexQuota: quota })
+    const account = store.getRuntimeAccount(id)
+    const now = Date.now()
+    const exhausted = codexQuotaIsExhausted(quota, now)
+    const cooldownUntil = exhausted ? codexQuotaCooldownUntil(quota, now) ?? now + 60_000 : undefined
+    await store.setAccountCheckResult(id, exhausted ? {
+      codexQuota: quota,
+      status: 'cooldown',
+      circuitState: 'open',
+      cooldownReason: 'quota',
+      cooldownUntil,
+      lastError: 'ChatGPT Codex 额度已耗尽。'
+    } : {
+      codexQuota: quota,
+      ...(account?.cooldownReason === 'quota' ? {
+        status: 'active' as const,
+        circuitState: 'closed' as const,
+        consecutiveFailures: 0,
+        cooldownReason: undefined,
+        cooldownUntil: undefined,
+        lastError: undefined
+      } : {})
+    })
+    if (exhausted && cooldownUntil !== undefined) scheduleQuotaProbe(id, cooldownUntil + 1_000)
+    else if (account?.cooldownReason === 'quota') gateway.resetAccountHealth(id)
     return publish(refreshRuntime())
   })
   ipcMain.handle('stone:get-account-codex-quota-history', (event, id: string, from?: number, to?: number) => {
@@ -709,6 +828,9 @@ export function registerGatewayApi(
     )
   })
   return async () => {
+    closed = true
+    for (const timer of quotaProbeTimers.values()) clearTimeout(timer)
+    quotaProbeTimers.clear()
     if (scheduledSnapshotPublish) {
       clearTimeout(scheduledSnapshotPublish)
       scheduledSnapshotPublish = undefined
@@ -1119,8 +1241,10 @@ function healthEventForTransition(
 }
 
 function quotaExhausted(account: AppSnapshot['accounts'][number] | undefined): boolean {
-  if (!account?.quota) return false
+  if (!account) return false
   const now = Date.now()
+  if (codexQuotaIsExhausted(account.codexQuota, now)) return true
+  if (!account.quota) return false
   return [account.quota.requests, account.quota.tokens, account.quota.inputTokens, account.quota.outputTokens]
     .some((window) => window?.remaining === 0 && (window.resetAt === undefined || window.resetAt > now))
 }

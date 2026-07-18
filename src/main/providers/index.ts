@@ -49,6 +49,8 @@ export {
   extractProtocolUsage,
   extractCodexQuotaFromHeaders,
   extractCodexQuotaFromUsagePayload,
+  codexQuotaCooldownUntil,
+  codexQuotaIsExhausted,
   extractQuotaSignals,
   extractRateLimitSignals,
   mergeQuotaSignals,

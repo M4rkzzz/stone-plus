@@ -1,4 +1,4 @@
-import type { Account, AccountCircuitState, Pool, RequestLog } from '../../shared/types'
+import type { Account, AccountCircuitState, AccountFitnessSnapshot, Pool, RequestLog } from '../../shared/types'
 import type { ScheduledAccount, SchedulerSelectionInput } from './types'
 
 interface StickyAssignment {
@@ -101,7 +101,7 @@ export class PoolScheduler {
       this.health.set(account.id, {
         accountId: account.id,
         circuitState: account.circuitState === 'half-open' ? 'half-open' : 'open',
-        consecutiveFailures: Math.max(1, account.consecutiveFailures ?? 0),
+        consecutiveFailures: Math.max(account.cooldownReason === 'quota' ? 0 : 1, account.consecutiveFailures ?? 0),
         cooldownUntil: account.cooldownUntil,
         lastFailureAt: account.updatedAt
       })
@@ -209,9 +209,9 @@ export class PoolScheduler {
     this.health.set(accountId, {
       accountId,
       circuitState: 'open',
-      consecutiveFailures: Math.max(1, existing?.consecutiveFailures ?? 0),
+      consecutiveFailures: existing?.consecutiveFailures ?? 0,
       cooldownUntil: Math.max(until, existing?.cooldownUntil ?? 0),
-      lastFailureAt: existing?.lastFailureAt ?? this.now()
+      lastFailureAt: existing?.lastFailureAt
     })
   }
 
@@ -305,6 +305,44 @@ export class PoolScheduler {
 
   getInFlight(account: Account): number {
     return this.inFlight(account)
+  }
+
+  getFitness(accounts: readonly Account[]): Record<string, AccountFitnessSnapshot> {
+    const now = this.now()
+    const measured = accounts
+      .map((account) => ({ account, state: this.performance.get(account.id) }))
+      .filter((candidate): candidate is { account: Account; state: AccountPerformanceState } =>
+        Boolean(candidate.state && candidate.state.sampleCount > 0))
+    const prior = conservativePerformancePrior(measured.map(({ state }) => performanceCost(state, now)))
+    const costs = measured.map(({ account, state }) => ({
+      account,
+      state,
+      cost: estimatedPerformanceCost(state, prior, now)
+    }))
+    const bestCost = costs.length > 0 ? Math.min(...costs.map(({ cost }) => cost)) : undefined
+    const result: Record<string, AccountFitnessSnapshot> = {}
+    for (const account of accounts) {
+      const state = this.performance.get(account.id)
+      if (!state || state.sampleCount <= 0 || bestCost === undefined) {
+        result[account.id] = { sampleCount: 0, failurePenalty: 0, stale: true }
+        continue
+      }
+      const cost = costs.find((candidate) => candidate.account.id === account.id)?.cost
+        ?? estimatedPerformanceCost(state, prior, now)
+      const elapsed = Math.max(0, now - state.updatedAt)
+      const score = Math.max(1, Math.min(100, Math.round(100 * (bestCost + 0.5) / (cost + 0.5))))
+      result[account.id] = {
+        score,
+        sampleCount: state.sampleCount,
+        firstTokenMs: state.firstTokenMs,
+        outputTokensPerSecond: state.outputTokensPerSecond,
+        failurePenalty: state.failurePenalty * 0.5 ** (elapsed / FAILURE_PENALTY_HALF_LIFE_MS),
+        updatedAt: state.updatedAt,
+        stale: elapsed >= PERFORMANCE_STALE_AFTER_MS,
+        dynamicConcurrency: state.dynamicConcurrency
+      }
+    }
+    return result
   }
 
   clear(): void {
@@ -417,13 +455,7 @@ export class PoolScheduler {
   private autoBalancedCost(account: Account, unmeasuredPrior: number): number {
     const utilization = this.inFlight(account) / this.concurrencyLimit(account, true)
     const performance = this.performance.get(account.id)
-    const measuredCost = performanceCost(performance, this.now())
-    const staleRegression = performance === undefined
-      ? 1
-      : Math.max(0, Math.min(1, (this.now() - performance.updatedAt) / PERFORMANCE_STALE_AFTER_MS))
-    const performanceEstimate = performance === undefined
-      ? unmeasuredPrior
-      : measuredCost * (1 - staleRegression) + unmeasuredPrior * staleRegression
+    const performanceEstimate = estimatedPerformanceCost(performance, unmeasuredPrior, this.now())
     return utilization * 1_000
       + quotaPressure(account) * 200
       + performanceEstimate * 10
@@ -447,6 +479,17 @@ export class PoolScheduler {
       this.performance.get(account.id)?.dynamicConcurrency ?? Math.max(1, account.maxConcurrency)
     ))
   }
+}
+
+function estimatedPerformanceCost(
+  state: AccountPerformanceState | undefined,
+  unmeasuredPrior: number,
+  now: number
+): number {
+  if (!state) return unmeasuredPrior
+  const measuredCost = performanceCost(state, now)
+  const staleRegression = Math.max(0, Math.min(1, (now - state.updatedAt) / PERFORMANCE_STALE_AFTER_MS))
+  return measuredCost * (1 - staleRegression) + unmeasuredPrior * staleRegression
 }
 
 function performanceCost(state: AccountPerformanceState | undefined, now: number): number {

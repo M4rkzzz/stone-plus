@@ -2,6 +2,7 @@ import type {
   Account,
   AccountCircuitState,
   AccountCodexQuotaSnapshot,
+  AccountFitnessSnapshot,
   AccountQuotaSnapshot,
   AccountStatus,
   GatewaySettings,
@@ -44,6 +45,7 @@ export interface GatewayAccountState {
   circuitState: AccountCircuitState
   consecutiveFailures: number
   cooldownUntil?: number
+  cooldownReason?: 'quota' | 'failure'
   latencyMs?: number
   lastError?: string
   lastUsedAt?: number
@@ -73,6 +75,7 @@ export interface GatewayController {
   getStatus(): GatewayStatus
   updateConfig(config: GatewayConfig): void
   resetAccountHealth(accountId: string): void
+  getAccountFitness(): Record<string, AccountFitnessSnapshot>
   onLog(listener: GatewayLogHandler): () => void
   onAccountState(listener: GatewayAccountStateHandler): () => void
 }

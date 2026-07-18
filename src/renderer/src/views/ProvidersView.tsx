@@ -17,6 +17,7 @@ import {
 } from 'lucide-react'
 import type {
   AccountInput,
+  AccountFitnessSnapshot,
   AccountModelTestResult,
   AppSnapshot,
   GatewayApi,
@@ -59,6 +60,50 @@ function accountQuotaIsExhausted(account: PublicAccount, now = Date.now()): bool
 
 function accountIsCooling(account: PublicAccount, now = Date.now()): boolean {
   return account.status === 'cooldown' || (account.cooldownUntil !== undefined && account.cooldownUntil > now)
+}
+
+function thawCountdown(until: number, now: number): string {
+  const seconds = Math.max(0, Math.ceil((until - now) / 1000))
+  if (seconds < 60) return `${seconds} 秒`
+  const minutes = Math.ceil(seconds / 60)
+  if (minutes < 60) return `${minutes} 分钟`
+  const hours = Math.floor(minutes / 60)
+  const remainderMinutes = minutes % 60
+  if (hours < 24) return remainderMinutes ? `${hours} 小时 ${remainderMinutes} 分` : `${hours} 小时`
+  const days = Math.floor(hours / 24)
+  const remainderHours = hours % 24
+  return remainderHours ? `${days} 天 ${remainderHours} 小时` : `${days} 天`
+}
+
+function AccountFitness({ fitness }: { fitness?: AccountFitnessSnapshot }) {
+  if (!fitness) return <span className="muted">未启用</span>
+  if (fitness.score === undefined) {
+    return <div className="fitness-cell"><span className="fitness-score fitness-score--pending">待采样</span><small>智能均衡尚无数据</small></div>
+  }
+  const tone = fitness.score >= 85 ? 'strong' : fitness.score >= 60 ? 'medium' : 'weak'
+  const details = [
+    fitness.firstTokenMs === undefined ? undefined : `首字 ${durationLabel(fitness.firstTokenMs)}`,
+    fitness.outputTokensPerSecond === undefined ? undefined : `${fitness.outputTokensPerSecond.toFixed(1)} tok/s`,
+    `${fitness.sampleCount} 个样本`
+  ].filter(Boolean).join(' · ')
+  return <div className="fitness-cell" title={`相对体质分；当前最佳账号为 100 分。${details ? ` ${details}` : ''}`}>
+    <span className={`fitness-score fitness-score--${tone}`}>{fitness.score} 分</span>
+    <small>{fitness.stale ? '历史样本 · ' : ''}{details}</small>
+  </div>
+}
+
+function CooldownCountdown({ account }: { account: PublicAccount }) {
+  const [now, setNow] = useState(() => Date.now())
+  const until = account.cooldownUntil
+  useEffect(() => {
+    if (until === undefined || until <= Date.now()) return
+    const timer = window.setInterval(() => setNow(Date.now()), 1_000)
+    return () => window.clearInterval(timer)
+  }, [until])
+  if (until === undefined || until <= now) return null
+  return <span className="row-note row-note--warning" title={`预计解冻：${new Date(until).toLocaleString()}`}>
+    {account.cooldownReason === 'quota' ? '额度' : '冷却'}距解冻 {thawCountdown(until, now)}
+  </span>
 }
 import { ModelPolicyEditor } from './ModelPolicyEditor'
 import { accountModelCatalog, effectiveAccountModels, isAccountModelWildcard } from '../model-policy'
@@ -653,7 +698,7 @@ export function ProvidersView({
               </div>
               {visibleAccounts.length ? <div className="table-wrap">
               <table className="data-table accounts-table">
-                <thead><tr><th className="account-select-column"><input type="checkbox" aria-label="选择当前显示的全部账号" checked={visibleAccounts.length > 0 && visibleAccounts.every((account) => selectedAccountIds.includes(account.id))} onChange={(event) => toggleVisibleAccounts(event.target.checked)} /></th><th>账号</th><th>状态</th><th>凭据</th><th>并发</th><th>额度</th><th>延迟</th><th>最近使用</th><th aria-label="操作" /></tr></thead>
+                <thead><tr><th className="account-select-column"><input type="checkbox" aria-label="选择当前显示的全部账号" checked={visibleAccounts.length > 0 && visibleAccounts.every((account) => selectedAccountIds.includes(account.id))} onChange={(event) => toggleVisibleAccounts(event.target.checked)} /></th><th>账号</th><th>状态</th><th>体质</th><th>凭据</th><th>并发</th><th>额度</th><th>延迟</th><th>最近使用</th><th aria-label="操作" /></tr></thead>
                 <tbody>
                   {visibleAccounts.map((account) => {
                     const provider = providerById.get(account.providerId)
@@ -669,7 +714,8 @@ export function ProvidersView({
                       <tr key={account.id}>
                         <td className="account-select-column"><input type="checkbox" aria-label={`选择账号 ${account.name}`} checked={selectedAccountIds.includes(account.id)} onChange={() => toggleSelectedAccount(account.id)} /></td>
                         <td><div className="provider-cell"><span className="provider-avatar" style={{ '--provider-color': provider?.color ?? '#61736f' } as React.CSSProperties}>{provider?.name.slice(0, 1) ?? '?'}</span><div><strong>{account.name}</strong><span>{provider?.name ?? '供应商已删除'}{account.proxyId ? ` · ${proxyById.get(account.proxyId)?.name ?? '代理已删除'}` : ''} · {modelSummary}</span></div></div></td>
-                        <td><AccountStatusBadge status={account.status} circuitState={account.circuitState} />{account.credentialType === 'chatgpt-oauth' && <span className="row-note">ChatGPT OAuth · {account.renewable ? '可续期' : '会话到期即停用'}</span>}{Boolean(account.consecutiveFailures) && <span className="row-note">连续失败 {account.consecutiveFailures}</span>}{account.lastError && <span className="row-note row-note--danger" title={account.lastError}>{account.lastError}</span>}</td>
+                        <td><AccountStatusBadge status={account.status} circuitState={account.circuitState} /><CooldownCountdown account={account} />{account.credentialType === 'chatgpt-oauth' && <span className="row-note">ChatGPT OAuth · {account.renewable ? '可续期' : '会话到期即停用'}</span>}{Boolean(account.consecutiveFailures) && <span className="row-note">连续失败 {account.consecutiveFailures}</span>}{account.lastError && <span className="row-note row-note--danger" title={account.lastError}>{account.lastError}</span>}</td>
+                        <td><AccountFitness fitness={account.fitness} /></td>
                         <td><span className="mono masked-key">{account.maskedCredential}</span></td>
                         <td><div className="concurrency-cell"><strong>{account.inFlight} / {account.maxConcurrency}</strong><div className="mini-progress"><span style={{ width: `${Math.min(100, account.inFlight / account.maxConcurrency * 100)}%` }} /></div></div></td>
                         <td>{account.credentialType === 'chatgpt-oauth'

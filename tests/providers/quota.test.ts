@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
+  codexQuotaCooldownUntil,
+  codexQuotaIsExhausted,
   extractCodexQuotaFromHeaders,
   extractCodexQuotaFromUsagePayload,
   extractProtocolUsage,
@@ -11,6 +13,32 @@ import {
 } from '../../src/main/providers'
 
 const now = Date.parse('2026-07-12T00:00:00.000Z')
+
+describe('Codex quota cooldown', () => {
+  it('waits for every exhausted window and uses the latest actual reset', () => {
+    const quota = {
+      observedAt: now,
+      source: 'usage-endpoint' as const,
+      allowed: false,
+      limitReached: true,
+      fiveHour: { usedPercent: 100, resetAt: now + 30 * 60_000 },
+      sevenDay: { usedPercent: 100, resetAt: now + 2 * 60 * 60_000 }
+    }
+    expect(codexQuotaIsExhausted(quota, now)).toBe(true)
+    expect(codexQuotaCooldownUntil(quota, now)).toBe(now + 2 * 60 * 60_000)
+  })
+
+  it('probes at the nearest known reset when only the top-level flag is exhausted', () => {
+    const quota = {
+      observedAt: now,
+      source: 'usage-endpoint' as const,
+      limitReached: true,
+      fiveHour: { usedPercent: 93, resetAt: now + 20 * 60_000 },
+      sevenDay: { usedPercent: 75, resetAt: now + 3 * 60 * 60_000 }
+    }
+    expect(codexQuotaCooldownUntil(quota, now)).toBe(now + 20 * 60_000)
+  })
+})
 
 describe('quota response header extraction', () => {
   it('normalizes numeric counters, composite durations, and retry delays', () => {

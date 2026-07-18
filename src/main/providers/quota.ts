@@ -165,6 +165,41 @@ export function extractCodexQuotaFromUsagePayload(
   })
 }
 
+export function codexQuotaIsExhausted(
+  quota: AccountCodexQuotaSnapshot | undefined,
+  now = Date.now()
+): boolean {
+  if (!quota) return false
+  if (quota.allowed === false || quota.limitReached === true) return true
+  return codexQuotaWindows(quota).some((window) =>
+    window.usedPercent >= 100 && (window.resetAt === undefined || window.resetAt > now))
+}
+
+/**
+ * Returns the earliest safe time at which an exhausted account can be tried again.
+ * When several windows are exhausted, all of them must reset, so the latest reset wins.
+ * If the upstream only supplies a top-level exhausted flag, probe at the nearest known reset.
+ */
+export function codexQuotaCooldownUntil(
+  quota: AccountCodexQuotaSnapshot | undefined,
+  now = Date.now()
+): number | undefined {
+  if (!codexQuotaIsExhausted(quota, now) || !quota) return undefined
+  const windows = codexQuotaWindows(quota)
+  const exhaustedResets = windows
+    .filter((window) => window.usedPercent >= 100 && window.resetAt !== undefined && window.resetAt > now)
+    .map((window) => window.resetAt!)
+  if (exhaustedResets.length > 0) return Math.max(...exhaustedResets)
+  const futureResets = windows
+    .filter((window) => window.resetAt !== undefined && window.resetAt > now)
+    .map((window) => window.resetAt!)
+  return futureResets.length > 0 ? Math.min(...futureResets) : undefined
+}
+
+function codexQuotaWindows(quota: AccountCodexQuotaSnapshot): CodexQuotaWindow[] {
+  return [quota.fiveHour, quota.sevenDay].filter((window): window is CodexQuotaWindow => Boolean(window))
+}
+
 export function parseQuotaResetAt(value: string | undefined, now = Date.now()): number | undefined {
   const normalized = value?.trim()
   if (!normalized) return undefined

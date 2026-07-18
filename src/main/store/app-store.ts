@@ -75,6 +75,7 @@ type AccountCheckPatch = Partial<Pick<Account,
   'lastError' |
   'lastUsedAt' |
   'cooldownUntil' |
+  'cooldownReason' |
   'circuitState' |
   'consecutiveFailures' |
   'quota' |
@@ -364,6 +365,7 @@ export class AppStore {
         quota: existing?.quota,
         codexQuota: existing?.codexQuota,
         cooldownUntil: credentialChanged ? undefined : existing?.cooldownUntil,
+        cooldownReason: credentialChanged ? undefined : existing?.cooldownReason,
         circuitState: credentialChanged ? 'closed' : existing?.circuitState,
         consecutiveFailures: credentialChanged ? 0 : existing?.consecutiveFailures,
         latencyMs: existing?.latencyMs,
@@ -449,6 +451,7 @@ export class AppStore {
           quota: existing?.quota,
           codexQuota: existing?.codexQuota,
           cooldownUntil: undefined,
+          cooldownReason: undefined,
           circuitState: 'closed',
           consecutiveFailures: 0,
           latencyMs: existing?.latencyMs,

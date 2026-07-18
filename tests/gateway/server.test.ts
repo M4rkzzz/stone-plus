@@ -616,7 +616,7 @@ describe('GatewayServer', () => {
     })
   })
 
-  it('honors Retry-After and reports account circuit state before failover', async () => {
+  it('uses the actual exhausted quota reset when it is later than Retry-After', async () => {
     const port = await freePort()
     const states: Array<{ accountId: string; status: string; cooldownUntil?: number; consecutiveFailures: number }> = []
     const upstreamFetch = vi.fn()
@@ -652,7 +652,8 @@ describe('GatewayServer', () => {
     expect(states[0]).toMatchObject({
       accountId: 'first',
       status: 'cooldown',
-      cooldownUntil: timestamp + 120_000,
+      cooldownUntil: timestamp + 604_800_000,
+      cooldownReason: 'quota',
       consecutiveFailures: 1,
       codexQuota: {
         fiveHour: expect.objectContaining({ usedPercent: 96 }),

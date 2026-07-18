@@ -221,6 +221,7 @@ export interface Account {
   quota?: AccountQuotaSnapshot
   codexQuota?: AccountCodexQuotaSnapshot
   cooldownUntil?: number
+  cooldownReason?: 'quota' | 'failure'
   circuitState?: AccountCircuitState
   consecutiveFailures?: number
   latencyMs?: number
@@ -230,7 +231,21 @@ export interface Account {
   updatedAt: number
 }
 
-export type PublicAccount = Omit<Account, 'chatgptAccountId' | 'credentialId'>
+export interface AccountFitnessSnapshot {
+  /** Relative score among measured accounts in smart-balanced pools; the best is always 100. */
+  score?: number
+  sampleCount: number
+  firstTokenMs?: number
+  outputTokensPerSecond?: number
+  failurePenalty: number
+  updatedAt?: number
+  stale: boolean
+  dynamicConcurrency?: number
+}
+
+export type PublicAccount = Omit<Account, 'chatgptAccountId' | 'credentialId'> & {
+  fitness?: AccountFitnessSnapshot
+}
 
 export interface QuotaWindow {
   limit?: number

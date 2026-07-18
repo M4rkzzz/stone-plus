@@ -9,6 +9,8 @@ import {
   CHATGPT_CODEX_RESPONSES_URL,
   CHATGPT_CODEX_SEARCH_URL,
   classifyChatGptCodexFailure,
+  codexQuotaCooldownUntil,
+  codexQuotaIsExhausted,
   isChatGptCodexResponsesLiteBody,
   withChatGptCodexBody,
   type NormalizedTokenUsage,
@@ -186,6 +188,13 @@ export class GatewayServer implements GatewayController {
 
   resetAccountHealth(accountId: string): void {
     this.scheduler.recordSuccess(accountId)
+  }
+
+  getAccountFitness(): ReturnType<PoolScheduler['getFitness']> {
+    const smartAccountIds = new Set(this.config.pools
+      .filter((pool) => pool.strategy === 'autobalanced')
+      .flatMap((pool) => pool.members.filter((member) => member.enabled).map((member) => member.accountId)))
+    return this.scheduler.getFitness(this.config.accounts.filter((account) => smartAccountIds.has(account.id)))
   }
 
   onLog(listener: GatewayLogHandler): () => void {
@@ -581,8 +590,14 @@ export class GatewayServer implements GatewayController {
           const retryable = isRetryable(gatewayError)
           const accountAction = gatewayError.providerFailure?.accountAction
           if (attemptedAccount && (retryable || accountAction === 'disable' || accountAction === 'cooldown')) {
+            const failureNow = this.now()
+            const actualResetAt = quotaSignalCooldownUntil(gatewayError.quotaSignals, failureNow)
+            const retryAfterMs = Math.max(
+              gatewayError.providerFailure?.retryAfterMs ?? 0,
+              actualResetAt === undefined ? 0 : Math.max(0, actualResetAt - failureNow)
+            )
             const health = this.scheduler.recordFailure(attemptedAccount.id, {
-              retryAfterMs: gatewayError.providerFailure?.retryAfterMs,
+              retryAfterMs,
               maxConcurrency: attemptedAccount.maxConcurrency
             })
             this.emitAccountState({
@@ -591,6 +606,9 @@ export class GatewayServer implements GatewayController {
               circuitState: health.circuitState,
               consecutiveFailures: health.consecutiveFailures,
               cooldownUntil: accountAction === 'disable' ? undefined : health.cooldownUntil,
+              cooldownReason: accountAction === 'disable'
+                ? undefined
+                : gatewayError.providerFailure?.category === 'rate_limit' ? 'quota' : 'failure',
               lastError: gatewayError.message,
               lastUsedAt: this.now(),
               ...gatewayError.quotaSignals
@@ -794,17 +812,26 @@ export class GatewayServer implements GatewayController {
   }
 
   private reportAccountSuccess(account: Account, attemptStarted: number, signals?: NormalizedQuotaSignals): void {
-    const health = this.scheduler.recordSuccess(account.id)
+    const now = this.now()
+    const quota = observedQuotaSignals(signals, now)
+    const actualResetAt = quotaSignalCooldownUntil(quota, now)
+    const quotaExhausted = codexQuotaIsExhausted(quota.codexQuota, now)
+      || genericQuotaExhausted(quota.quota, now)
+    if (quotaExhausted && actualResetAt !== undefined) this.scheduler.setCooldown(account.id, actualResetAt)
+    const health = quotaExhausted && actualResetAt !== undefined
+      ? this.scheduler.getHealth(account.id)
+      : this.scheduler.recordSuccess(account.id)
     this.emitAccountState({
       accountId: account.id,
-      status: 'active',
+      status: quotaExhausted && actualResetAt !== undefined ? 'cooldown' : 'active',
       circuitState: health.circuitState,
       consecutiveFailures: health.consecutiveFailures,
-      cooldownUntil: undefined,
-      latencyMs: Math.max(0, this.now() - attemptStarted),
+      cooldownUntil: quotaExhausted ? actualResetAt : undefined,
+      cooldownReason: quotaExhausted ? 'quota' : undefined,
+      latencyMs: Math.max(0, now - attemptStarted),
       lastError: undefined,
-      lastUsedAt: this.now(),
-      ...observedQuotaSignals(signals, this.now())
+      lastUsedAt: now,
+      ...quota
     })
   }
 
@@ -1605,4 +1632,24 @@ function observedQuotaSignals(
     ...(signals?.rateLimits ? { quota: { ...signals.rateLimits, observedAt } } : {}),
     ...(signals?.codexQuota ? { codexQuota: signals.codexQuota } : {})
   }
+}
+
+function quotaSignalCooldownUntil(
+  signals: GatewayHttpError['quotaSignals'] | undefined,
+  now: number
+): number | undefined {
+  const codexResetAt = codexQuotaCooldownUntil(signals?.codexQuota, now)
+  const genericResetAt = signals?.quota
+    ? [signals.quota.requests, signals.quota.tokens, signals.quota.inputTokens, signals.quota.outputTokens]
+        .filter((window) => window?.remaining === 0 && window.resetAt !== undefined && window.resetAt > now)
+        .map((window) => window!.resetAt!)
+    : []
+  const candidates = [codexResetAt, ...genericResetAt].filter((value): value is number => value !== undefined)
+  return candidates.length > 0 ? Math.max(...candidates) : undefined
+}
+
+function genericQuotaExhausted(quota: AccountQuotaSnapshot | undefined, now: number): boolean {
+  if (!quota) return false
+  return [quota.requests, quota.tokens, quota.inputTokens, quota.outputTokens]
+    .some((window) => window?.remaining === 0 && (window.resetAt === undefined || window.resetAt > now))
 }

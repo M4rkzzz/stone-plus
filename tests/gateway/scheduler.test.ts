@@ -64,6 +64,24 @@ function requestLog(accountId: string, overrides: Partial<RequestLog> = {}): Req
 }
 
 describe('PoolScheduler', () => {
+  it('scores the best measured smart-balanced account at 100 relative to its peers', () => {
+    const scheduler = new PoolScheduler(() => timestamp)
+    const fast = account('fast')
+    const slow = account('slow')
+    const unmeasured = account('unmeasured')
+    scheduler.recordPerformance(fast.id, { firstTokenMs: 500, outputTokens: 200, generationDurationMs: 2_000 })
+    scheduler.recordPerformance(slow.id, { firstTokenMs: 2_500, outputTokens: 50, generationDurationMs: 4_000 })
+
+    const fitness = scheduler.getFitness([fast, slow, unmeasured])
+
+    expect(fitness.fast.score).toBe(100)
+    expect(fitness.slow.score).toBeLessThan(100)
+    expect(fitness.unmeasured).toMatchObject({ sampleCount: 0, stale: true })
+    expect(fitness.unmeasured.score).toBeUndefined()
+    expect(fitness.fast.firstTokenMs).toBe(500)
+    expect(fitness.fast.outputTokensPerSecond).toBe(100)
+  })
+
   it('acquires one concurrency slot and releases it exactly once', () => {
     const scheduler = new PoolScheduler()
     const onlyAccount = account('a')

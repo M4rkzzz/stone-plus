@@ -1293,7 +1293,7 @@ code,
 }
 
 .accounts-table {
-  min-width: 940px;
+  min-width: 1080px;
 }
 
 .accounts-table td:nth-child(2) {
@@ -1329,6 +1329,41 @@ code,
 .row-note--danger {
   color: var(--red);
 }
+
+.row-note--warning {
+  color: #9a6700;
+  font-weight: 700;
+}
+
+.fitness-cell {
+  display: grid;
+  min-width: 108px;
+  gap: 4px;
+}
+
+.fitness-cell small {
+  max-width: 150px;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fitness-score {
+  width: fit-content;
+  padding: 3px 7px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 800;
+}
+
+.fitness-score--strong { border-color: #9ed8bd; background: #e9f8f1; color: #157347; }
+.fitness-score--medium { border-color: #ecd28b; background: #fff8df; color: #8a6500; }
+.fitness-score--weak { border-color: #efb5b5; background: #fff0f0; color: #b42318; }
+.fitness-score--pending { border-color: var(--border); background: var(--surface-muted); color: var(--muted); }
 
 .actions-cell {
   display: flex;
