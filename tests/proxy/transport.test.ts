@@ -73,6 +73,33 @@ describe('proxy entry presentation', () => {
 })
 
 describe('outbound proxy transport', () => {
+  it('warms a direct upstream origin before the first application request', async () => {
+    let connections = 0
+    let headRequests = 0
+    const origin = createHttpServer((request, response) => {
+      if (request.method === 'HEAD') {
+        headRequests += 1
+        response.writeHead(204)
+        response.end()
+        return
+      }
+      response.writeHead(200, { 'content-type': 'text/plain', 'content-length': '2' })
+      response.end('ok')
+    })
+    origin.on('connection', () => { connections += 1 })
+    const address = await listen(origin)
+    const manager = trackManager(new OutboundTransportManager())
+    const originUrl = `http://127.0.0.1:${address.port}`
+
+    await manager.warmFor(undefined, undefined, originUrl)
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    const response = await manager.fetchFor(undefined)(`${originUrl}/after-warm`)
+
+    expect(await response.text()).toBe('ok')
+    expect(headRequests).toBe(1)
+    expect(connections).toBeGreaterThan(0)
+  })
+
   it('forwards a real HTTP request through the configured HTTP proxy', async () => {
     let originHits = 0
     let proxyConnects = 0

@@ -4,7 +4,7 @@ import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { GatewayServer, type GatewayConfig } from './gateway'
 import { ClientConfigService } from './client-config'
-import { registerGatewayApi } from './ipc/gateway-api'
+import { registerGatewayApi, warmGatewayConnections } from './ipc/gateway-api'
 import { registerUpdateApi } from './ipc/update-api'
 import { AppStore } from './store/app-store'
 import { DatabaseBackupService } from './backup'
@@ -112,6 +112,7 @@ async function bootstrap(): Promise<void> {
   if (store.getSnapshot().gateway.autoStart) {
     try {
       await gateway.start()
+      warmGatewayConnections(store, outboundTransport)
     } catch (error: unknown) {
       console.error('Stone could not auto-start the gateway', error)
     } finally {
@@ -261,14 +262,14 @@ async function toggleRouteFromTray(routeId: string): Promise<void> {
 }
 
 function toGatewayConfig(store: AppStore): GatewayConfig {
-  const snapshot = store.getSnapshot()
+  const configuration = store.getRuntimeConfiguration()
   return {
-    providers: snapshot.providers,
-    accounts: store.getRuntimeAccounts(),
-    pools: snapshot.pools,
-    proxies: snapshot.proxies,
-    routes: snapshot.routes,
-    settings: snapshot.gateway
+    providers: configuration.providers,
+    accounts: configuration.accounts,
+    pools: configuration.pools,
+    proxies: configuration.proxies,
+    routes: configuration.routes,
+    settings: configuration.gateway
   }
 }
 

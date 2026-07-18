@@ -372,20 +372,25 @@ export class GatewayServer implements GatewayController {
               sensitiveValues(resolvedCredential)
             )
             this.writeJson(response, upstreamResponse.status, payload)
+            const completedAt = this.now()
             this.reportAccountSuccess(account, attemptStarted, headerSignals)
+            release?.()
+            release = undefined
             this.successRequests += 1
             await resolveConversationNameForLog()
-            this.emitLog(this.makeLog({
+            const log = this.makeLog({
               route: logRoute,
               account,
               model,
               started,
+              finished: completedAt,
               conversationId,
               conversationName,
               status: 'success',
               statusCode: upstreamResponse.status,
               failoverCount
-            }))
+            })
+            this.emitLog(log)
             return
           }
 
@@ -410,14 +415,18 @@ export class GatewayServer implements GatewayController {
             if (streamResult.error) {
               throw new GatewayHttpError(502, streamResult.error, 'upstream_stream_error')
             }
+            const completedAt = this.now()
             this.reportAccountSuccess(account, attemptStarted, headerSignals)
+            release?.()
+            release = undefined
             this.successRequests += 1
             await resolveConversationNameForLog()
-            this.emitLog(this.makeLog({
+            const log = this.makeLog({
               route: logRoute,
               account,
               model,
               started,
+              finished: completedAt,
               conversationId,
               conversationName,
               firstTokenAt,
@@ -425,7 +434,9 @@ export class GatewayServer implements GatewayController {
               statusCode: upstreamResponse.status,
               usage: normalizeLogUsage(streamResult.usage),
               failoverCount
-            }))
+            })
+            this.recordAccountPerformance(log)
+            this.emitLog(log)
             return
           }
 
@@ -449,10 +460,15 @@ export class GatewayServer implements GatewayController {
           const result = convertResponse(provider.protocol, incoming.protocol, payload, model, this.now)
           const usage = extractProtocolUsage(provider.protocol, payload)
           this.writeJson(response, 200, result)
+          const completedAt = this.now()
           this.reportAccountSuccess(account, attemptStarted, headerSignals)
+          release?.()
+          release = undefined
           this.successRequests += 1
           await resolveConversationNameForLog()
-          this.emitLog(this.makeLog({ route: logRoute, account, model, started, conversationId, conversationName, status: 'success', statusCode: 200, usage, failoverCount }))
+          const log = this.makeLog({ route: logRoute, account, model, started, finished: completedAt, conversationId, conversationName, firstTokenAt, status: 'success', statusCode: 200, usage, failoverCount })
+          this.recordAccountPerformance(log)
+          this.emitLog(log)
           return
         } catch (error) {
           if (clientAbortController.signal.aborted) {
@@ -591,6 +607,7 @@ export class GatewayServer implements GatewayController {
     account: Account
     model: string
     started: number
+    finished?: number
     conversationId?: string
     conversationName?: string
     firstTokenAt?: number
@@ -602,12 +619,13 @@ export class GatewayServer implements GatewayController {
   }): RequestLog {
     const providerName = this.config.providers.find((provider) => provider.id === input.account.providerId)?.name ?? 'Unknown provider'
     const usage = input.usage
+    const finished = input.finished ?? this.now()
     return {
       id: randomUUID(),
       accountId: input.account.id,
       conversationId: input.conversationId,
       conversationName: input.conversationName,
-      timestamp: this.now(),
+      timestamp: finished,
       client: input.route.client,
       protocol: input.route.inboundProtocol,
       providerName,
@@ -615,7 +633,7 @@ export class GatewayServer implements GatewayController {
       model: input.model,
       status: input.status,
       statusCode: input.statusCode,
-      latencyMs: Math.max(0, this.now() - input.started),
+      latencyMs: Math.max(0, finished - input.started),
       firstTokenMs: input.firstTokenAt === undefined ? undefined : Math.max(0, input.firstTokenAt - input.started),
       inputTokens: usage?.inputTokens,
       outputTokens: usage?.outputTokens,
@@ -628,6 +646,15 @@ export class GatewayServer implements GatewayController {
 
   private emitLog(log: RequestLog): void {
     for (const listener of this.logListeners) listener(log)
+  }
+
+  private recordAccountPerformance(log: RequestLog): void {
+    if (log.status !== 'success' || !log.accountId || log.firstTokenMs === undefined) return
+    this.scheduler.recordPerformance(log.accountId, {
+      firstTokenMs: log.firstTokenMs,
+      outputTokens: log.outputTokens,
+      generationDurationMs: Math.max(0, log.latencyMs - log.firstTokenMs)
+    })
   }
 
   private reportAccountSuccess(account: Account, attemptStarted: number, signals?: NormalizedQuotaSignals): void {

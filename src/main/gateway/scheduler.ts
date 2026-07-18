@@ -20,6 +20,18 @@ export interface AccountFailureOptions {
   maxDelayMs?: number
 }
 
+export interface AccountPerformanceSample {
+  firstTokenMs?: number
+  outputTokens?: number
+  generationDurationMs?: number
+}
+
+interface AccountPerformanceState {
+  sampleCount: number
+  firstTokenMs?: number
+  outputTokensPerSecond?: number
+}
+
 export class NoEligibleAccountError extends Error {
   constructor(message = 'No eligible account is available for this request') {
     super(message)
@@ -51,6 +63,7 @@ export class PoolScheduler {
   private readonly roundRobinOffsets = new Map<string, number>()
   private readonly sticky = new Map<string, StickyAssignment>()
   private readonly health = new Map<string, AccountRuntimeHealth>()
+  private readonly performance = new Map<string, AccountPerformanceState>()
 
   constructor(
     private readonly now: () => number = () => Date.now(),
@@ -61,6 +74,9 @@ export class PoolScheduler {
     const accountIds = new Set(accounts.map((account) => account.id))
     for (const accountId of this.health.keys()) {
       if (!accountIds.has(accountId)) this.health.delete(accountId)
+    }
+    for (const accountId of this.performance.keys()) {
+      if (!accountIds.has(accountId)) this.performance.delete(accountId)
     }
     for (const account of accounts) {
       if (this.health.has(account.id)) continue
@@ -163,6 +179,27 @@ export class PoolScheduler {
     return state
   }
 
+  recordPerformance(accountId: string, sample: AccountPerformanceSample): void {
+    const firstTokenMs = positiveMetric(sample.firstTokenMs)
+    const outputTokens = positiveMetric(sample.outputTokens)
+    const generationDurationMs = positiveMetric(sample.generationDurationMs)
+    const outputTokensPerSecond = outputTokens !== undefined && generationDurationMs !== undefined
+      ? outputTokens * 1000 / generationDurationMs
+      : undefined
+    if (firstTokenMs === undefined && outputTokensPerSecond === undefined) return
+    const existing = this.performance.get(accountId)
+    const alpha = (existing?.sampleCount ?? 0) < 4 ? 0.5 : 0.25
+    this.performance.set(accountId, {
+      sampleCount: (existing?.sampleCount ?? 0) + 1,
+      firstTokenMs: updateEwma(existing?.firstTokenMs, firstTokenMs, alpha),
+      outputTokensPerSecond: updateEwma(
+        existing?.outputTokensPerSecond,
+        outputTokensPerSecond,
+        alpha
+      )
+    })
+  }
+
   getHealth(accountId: string): AccountRuntimeHealth {
     const state = this.health.get(accountId)
     if (!state) return { accountId, circuitState: 'closed', consecutiveFailures: 0 }
@@ -181,6 +218,7 @@ export class PoolScheduler {
     this.roundRobinOffsets.clear()
     this.sticky.clear()
     this.health.clear()
+    this.performance.clear()
   }
 
   private isEligible(account: Account): boolean {
@@ -212,6 +250,11 @@ export class PoolScheduler {
             || a.priority - b.priority
             || a.id.localeCompare(b.id)
         })[0]
+      case 'autobalanced':
+        return [...candidates].sort((a, b) => {
+          return this.autoBalancedCost(a) - this.autoBalancedCost(b)
+            || a.id.localeCompare(b.id)
+        })[0]
       case 'round-robin': {
         const ordered = candidates
         const offset = this.roundRobinOffsets.get(pool.id) ?? 0
@@ -235,6 +278,37 @@ export class PoolScheduler {
   private inFlight(account: Account): number {
     return Math.max(0, account.inFlight) + (this.active.get(account.id) ?? 0)
   }
+
+  private autoBalancedCost(account: Account): number {
+    const utilization = this.inFlight(account) / Math.max(1, account.maxConcurrency)
+    return utilization * 1_000
+      + quotaPressure(account) * 200
+      + performanceCost(this.performance.get(account.id)) * 10
+      + account.priority
+  }
+}
+
+function performanceCost(state: AccountPerformanceState | undefined): number {
+  if (!state) return -2
+  const firstTokenSeconds = state.firstTokenMs === undefined ? 3 : state.firstTokenMs / 1000
+  const outputPenalty = state.outputTokensPerSecond === undefined
+    ? 1.5
+    : 50 / Math.max(1, state.outputTokensPerSecond)
+  return Math.min(20, firstTokenSeconds) * 0.6 + Math.min(20, outputPenalty) * 1.4
+}
+
+function positiveMetric(value: number | undefined): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined
+}
+
+function updateEwma(
+  current: number | undefined,
+  sample: number | undefined,
+  alpha: number
+): number | undefined {
+  if (sample === undefined) return current
+  if (current === undefined) return sample
+  return current + alpha * (sample - current)
 }
 
 function quotaWindows(account: Account) {

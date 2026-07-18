@@ -278,7 +278,7 @@ export interface PoolMember {
   enabled: boolean
 }
 
-export type PoolStrategy = 'balanced' | 'priority' | 'round-robin' | 'weighted-random'
+export type PoolStrategy = 'balanced' | 'autobalanced' | 'priority' | 'round-robin' | 'weighted-random'
 
 export interface Pool {
   id: string
@@ -342,6 +342,20 @@ export interface ObservabilityPoint {
   outputTokens: number
   averageLatencyMs: number
   failoverCount: number
+}
+
+export interface TokenRatePoint {
+  timestamp: number
+  requestCount: number
+  outputTokens: number
+  tokensPerSecond: number
+}
+
+export interface TokenRateSeries {
+  last30Minutes: TokenRatePoint[]
+  last4Hours: TokenRatePoint[]
+  last24Hours: TokenRatePoint[]
+  last7Days: TokenRatePoint[]
 }
 
 export interface GatewayStatus {
@@ -408,6 +422,7 @@ export interface AppSnapshot {
     last24Hours: ObservabilitySummary
     last7Days: ObservabilitySummary
     hourly: ObservabilityPoint[]
+    tokenRates: TokenRateSeries
   }
   vaultAvailable: boolean
   vaultBackend: string

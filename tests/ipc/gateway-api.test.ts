@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import type { Account, AppSnapshot, ProviderDefinition, PublicProxyDefinition } from '../../src/shared/types'
+import type { Account, AppSnapshot, ProviderDefinition, PublicProxyDefinition, RequestLog } from '../../src/shared/types'
 import type { GatewayController } from '../../src/main/ipc/gateway-api'
 import { registerGatewayApi } from '../../src/main/ipc/gateway-api'
 import type { AppStore } from '../../src/main/store/app-store'
@@ -48,6 +48,35 @@ describe('refresh provider models IPC', () => {
   beforeEach(() => {
     electron.handlers.clear()
     vi.stubEnv('ELECTRON_RENDERER_URL', 'http://127.0.0.1:5173')
+  })
+
+  it('coalesces rapid request-log snapshots before publishing to the renderer', async () => {
+    vi.useFakeTimers()
+    const send = vi.fn()
+    electron.getAllWindows.mockReturnValue([{
+      isDestroyed: () => false,
+      webContents: { send }
+    }])
+    try {
+      const harness = createHarness([oauthAccount()], {}, vi.fn())
+      const log = {
+        id: 'log', timestamp: Date.now(), client: 'codex', protocol: 'openai-responses',
+        providerName: 'OpenAI', accountName: 'Account', model: 'gpt', status: 'success', latencyMs: 10
+      } satisfies RequestLog
+      harness.emitLog(log)
+      harness.emitLog({ ...log, id: 'log-2' })
+      await Promise.resolve()
+      await Promise.resolve()
+
+      await vi.advanceTimersByTimeAsync(249)
+      expect(send).not.toHaveBeenCalled()
+      await vi.advanceTimersByTimeAsync(1)
+      expect(send).toHaveBeenCalledOnce()
+      expect(harness.store.appendLog).toHaveBeenCalledTimes(2)
+    } finally {
+      electron.getAllWindows.mockReturnValue([])
+      vi.useRealTimers()
+    }
   })
 
   it('uses the ChatGPT Codex model catalog with the unpacked OAuth credential', async () => {
@@ -268,7 +297,7 @@ function createHarness(
   upstreamFetch: ReturnType<typeof vi.fn>,
   proxies: PublicProxyDefinition[] = [],
   discoveryFingerprint: { current: string } = { current: 'discovery-fingerprint' }
-): { store: AppStore; transport: OutboundTransportManager } {
+): { store: AppStore; transport: OutboundTransportManager; emitLog: (log: RequestLog) => void } {
   const snapshot = {
     providers: [{ ...provider, models: [] }],
     accounts: accounts.map(({ credentialId: _credentialId, chatgptAccountId: _chatgptAccountId, ...account }) => account),
@@ -286,13 +315,21 @@ function createHarness(
     healthEvents: [],
     requestLogs: [],
     clientProfiles: [],
-    observability: { last24Hours: {}, last7Days: {}, hourly: [] },
+    observability: { last24Hours: {}, last7Days: {}, hourly: [], tokenRates: { last30Minutes: [], last4Hours: [], last24Hours: [], last7Days: [] } },
     vaultAvailable: true,
     vaultBackend: 'test'
   } as unknown as AppSnapshot
 
   const store = {
     getSnapshot: vi.fn(() => snapshot),
+    getRuntimeConfiguration: vi.fn(() => ({
+      providers: snapshot.providers,
+      accounts,
+      proxies,
+      pools: snapshot.pools,
+      routes: snapshot.routes,
+      gateway: snapshot.gateway
+    })),
     getRuntimeAccounts: vi.fn(() => accounts),
     getRuntimeAccount: vi.fn((id: string) => accounts.find((account) => account.id === id)),
     getAccountModelDiscoveryFingerprint: vi.fn(() => discoveryFingerprint.current),
@@ -320,15 +357,20 @@ function createHarness(
       }
       return snapshot
     }),
-    setGatewayStatus: vi.fn()
+    setGatewayStatus: vi.fn(),
+    appendLog: vi.fn(async () => undefined)
   } as unknown as AppStore
+  let logListener: ((log: RequestLog) => void) | undefined
   const gateway = {
     start: vi.fn(async () => undefined),
     stop: vi.fn(async () => undefined),
     getStatus: vi.fn(() => snapshot.gatewayStatus),
     updateConfig: vi.fn(),
     resetAccountHealth: vi.fn(),
-    onLog: vi.fn(() => () => undefined),
+    onLog: vi.fn((listener: (log: RequestLog) => void) => {
+      logListener = listener
+      return () => undefined
+    }),
     onAccountState: vi.fn(() => () => undefined)
   } as unknown as GatewayController
   const transport = {
@@ -341,7 +383,14 @@ function createHarness(
     {} as ClientConfigService,
     transport
   )
-  return { store, transport }
+  return {
+    store,
+    transport,
+    emitLog: (log) => {
+      if (!logListener) throw new Error('Gateway log listener was not registered')
+      logListener(log)
+    }
+  }
 }
 
 async function invokeRefresh(harness: { store: AppStore; transport: OutboundTransportManager }): Promise<AppSnapshot> {

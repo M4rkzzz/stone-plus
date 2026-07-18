@@ -28,15 +28,18 @@ function account(id: string, priority: number): Account {
 }
 
 async function freePort(): Promise<number> {
-  const server = createNodeServer()
-  await new Promise<void>((resolve, reject) => {
-    server.once('error', reject)
-    server.listen(0, '127.0.0.1', resolve)
-  })
-  const address = server.address()
-  if (!address || typeof address === 'string') throw new Error('Failed to allocate a test port')
-  await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
-  return address.port
+  for (;;) {
+    const server = createNodeServer()
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject)
+      server.listen(0, '127.0.0.1', resolve)
+    })
+    const address = server.address()
+    if (!address || typeof address === 'string') throw new Error('Failed to allocate a test port')
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
+    // Fetch blocks a fixed list of legacy service ports; all of them are below 11,000.
+    if (address.port >= 11_000) return address.port
+  }
 }
 
 function config(port: number, overrides: Partial<GatewaySettings> = {}): GatewayConfig {
@@ -1107,6 +1110,40 @@ describe('GatewayServer', () => {
       conversationName: 'Stone 请求日志功能',
       firstTokenMs: 40
     })
+  })
+
+  it('releases account capacity before asynchronous conversation title lookup finishes', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.accounts[1].status = 'disabled'
+    gatewayConfig.pools[0].maxRetries = 0
+    let releaseTitles!: () => void
+    const titleGate = new Promise<void>((resolve) => { releaseTitles = resolve })
+    const upstreamFetch = vi.fn(async () => new Response(JSON.stringify({
+      id: 'chat-capacity',
+      model: 'source-model',
+      choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }]
+    }), { status: 200, headers: { 'content-type': 'application/json' } }))
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'credential',
+      fetchImplementation: upstreamFetch as typeof fetch,
+      conversationTitleResolver: async () => {
+        await titleGate
+        return 'Resolved later'
+      }
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const first = await post(port, 'local-secret', { metadata: { session_id: 'first-title' } })
+    const second = await post(port, 'local-secret', { metadata: { session_id: 'second-title' } })
+
+    expect(first.status).toBe(200)
+    expect(second.status).toBe(200)
+    expect(upstreamFetch).toHaveBeenCalledTimes(2)
+    releaseTitles()
+    await Promise.all([first.text(), second.text()])
   })
 
   it('preserves a same-protocol stream error while marking the account request as failed', async () => {

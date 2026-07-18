@@ -30,7 +30,7 @@ describe('diagnostic report privacy', () => {
         providerName: 'Sensitive provider name',
         message: 'Stored secret access-private'
       }],
-      observability: { last24Hours: {}, last7Days: {}, hourly: [] }
+      observability: { last24Hours: {}, last7Days: {}, hourly: [], tokenRates: { last30Minutes: [], last4Hours: [], last24Hours: [], last7Days: [] } }
     } as unknown as AppSnapshot
 
     const report = serializeDiagnostics(snapshot, {

@@ -8,6 +8,11 @@ const PROBE_TARGETS = [
   { url: 'https://api.ipify.org?format=json', parse: parseJsonIp },
   { url: 'https://icanhazip.com', parse: parseTextIp }
 ] as const
+const OUTBOUND_CONNECTIONS = 16
+const OUTBOUND_CONNECT_TIMEOUT_MS = 10_000
+const OUTBOUND_KEEP_ALIVE_TIMEOUT_MS = 5 * 60_000
+const OUTBOUND_KEEP_ALIVE_MAX_TIMEOUT_MS = 10 * 60_000
+const OUTBOUND_H2_PING_INTERVAL_MS = 30_000
 
 interface CachedDispatcher {
   updatedAt: number
@@ -29,16 +34,15 @@ export class OutboundTransportManager {
     if (!proxy) {
       if (!this.direct) {
         const dispatcher = new Agent({
-          connections: 16,
+          connections: OUTBOUND_CONNECTIONS,
           pipelining: 1,
           allowH2: true,
-          keepAliveTimeout: 60_000,
-          keepAliveMaxTimeout: 10 * 60_000,
-          connect: {
-            timeout: 10_000,
-            autoSelectFamily: true,
-            autoSelectFamilyAttemptTimeout: 250
-          }
+          pingInterval: OUTBOUND_H2_PING_INTERVAL_MS,
+          keepAliveTimeout: OUTBOUND_KEEP_ALIVE_TIMEOUT_MS,
+          keepAliveMaxTimeout: OUTBOUND_KEEP_ALIVE_MAX_TIMEOUT_MS,
+          connectTimeout: OUTBOUND_CONNECT_TIMEOUT_MS,
+          autoSelectFamily: true,
+          autoSelectFamilyAttemptTimeout: 250
         })
         this.direct = { dispatcher, fetchImplementation: fetchWithDispatcher(dispatcher) }
       }
@@ -68,6 +72,21 @@ export class OutboundTransportManager {
     this.cache.clear()
     this.direct = undefined
     await Promise.all(dispatchers.map((dispatcher) => dispatcher.close().catch(() => undefined)))
+  }
+
+  public async warmFor(
+    proxy: PublicProxyDefinition | undefined,
+    password: string | undefined,
+    origin: string,
+    signal: AbortSignal = AbortSignal.timeout(5_000)
+  ): Promise<void> {
+    const target = new URL('/', origin)
+    const response = await this.fetchFor(proxy, password)(target, {
+      method: 'HEAD',
+      redirect: 'manual',
+      signal
+    })
+    await response.arrayBuffer()
   }
 }
 
@@ -129,19 +148,55 @@ export async function probeProxy(
 function createDispatcher(proxy: PublicProxyDefinition, password?: string): Dispatcher {
   if (proxy.hasPassword && !password) throw new Error('Proxy authentication is unavailable from the credential vault.')
   if (proxy.protocol === 'socks4' || proxy.protocol === 'socks5') {
-    return socksDispatcher({
-      type: proxy.protocol === 'socks4' ? 4 : 5,
-      host: proxy.host,
-      port: proxy.port,
-      ...(proxy.username ? { userId: proxy.username } : {}),
-      ...(password ? { password } : {})
-    })
+    return socksDispatcher(
+      {
+        type: proxy.protocol === 'socks4' ? 4 : 5,
+        host: proxy.host,
+        port: proxy.port,
+        ...(proxy.username ? { userId: proxy.username } : {}),
+        ...(password ? { password } : {})
+      },
+      {
+        connections: OUTBOUND_CONNECTIONS,
+        pipelining: 1,
+        allowH2: true,
+        pingInterval: OUTBOUND_H2_PING_INTERVAL_MS,
+        keepAliveTimeout: OUTBOUND_KEEP_ALIVE_TIMEOUT_MS,
+        keepAliveMaxTimeout: OUTBOUND_KEEP_ALIVE_MAX_TIMEOUT_MS,
+        connect: {
+          allowH2: true,
+          timeout: OUTBOUND_CONNECT_TIMEOUT_MS
+        }
+      }
+    )
   }
 
   const uri = new URL(proxyEntryAddress(proxy))
   if (proxy.username) uri.username = proxy.username
   if (password) uri.password = password
-  return new ProxyAgent({ uri: uri.toString() })
+  return new ProxyAgent({
+    uri: uri.toString(),
+    connections: OUTBOUND_CONNECTIONS,
+    pipelining: 1,
+    allowH2: true,
+    pingInterval: OUTBOUND_H2_PING_INTERVAL_MS,
+    keepAliveTimeout: OUTBOUND_KEEP_ALIVE_TIMEOUT_MS,
+    keepAliveMaxTimeout: OUTBOUND_KEEP_ALIVE_MAX_TIMEOUT_MS,
+    connectTimeout: OUTBOUND_CONNECT_TIMEOUT_MS,
+    autoSelectFamily: true,
+    autoSelectFamilyAttemptTimeout: 250,
+    requestTls: {
+      allowH2: true,
+      timeout: OUTBOUND_CONNECT_TIMEOUT_MS,
+      autoSelectFamily: true,
+      autoSelectFamilyAttemptTimeout: 250
+    },
+    proxyTls: {
+      timeout: OUTBOUND_CONNECT_TIMEOUT_MS,
+      autoSelectFamily: true,
+      autoSelectFamilyAttemptTimeout: 250
+    }
+  })
 }
 
 async function readLimitedText(response: Response, maximumBytes: number): Promise<string> {

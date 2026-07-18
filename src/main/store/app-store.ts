@@ -20,10 +20,12 @@ import type {
   PoolInput,
   ProxyDefinition,
   ProxyInput,
+  PublicProxyDefinition,
   ProviderDefinition,
   ProviderInput,
   RequestLog,
-  Route
+  Route,
+  TokenRateSeries
 } from '@shared/types'
 import {
   LEGACY_JSON_FILENAME,
@@ -64,10 +66,29 @@ const DEFAULT_STATUS: GatewayStatus = {
 const MAX_PERSISTED_REQUEST_LOGS = 20_000
 const MAX_RENDERER_REQUEST_LOGS = 500
 const IGNORED_UPDATE_VERSION_KEY = 'ignored_update_version'
+const OBSERVABILITY_CACHE_TTL_MS = 1_000
+
+type AccountCheckPatch = Partial<Pick<Account,
+  'status' |
+  'latencyMs' |
+  'lastError' |
+  'lastUsedAt' |
+  'cooldownUntil' |
+  'circuitState' |
+  'consecutiveFailures' |
+  'quota' |
+  'codexQuota'
+>>
 
 export class AppStore {
   private readonly store: SqliteStateStore<PersistedState>
   private status: GatewayStatus = { ...DEFAULT_STATUS }
+  private requestLogRevision = 0
+  private observabilityCache?: {
+    revision: number
+    expiresAt: number
+    value: AppSnapshot['observability']
+  }
   private readonly vaultAvailable: boolean
   private readonly vaultBackend: string
   private readonly decryptedCredentialCache = new Map<string, string>()
@@ -119,13 +140,37 @@ export class AppStore {
   }
 
   public getSnapshot(): AppSnapshot {
-    const state = this.store.read()
+    const state = this.store.select((current) => ({
+      ...current,
+      requestLogs: current.requestLogs.slice(0, MAX_RENDERER_REQUEST_LOGS)
+    }))
     return toSnapshot(
       state,
       this.status,
       this.vaultAvailable,
-      this.vaultBackend
+      this.vaultBackend,
+      this.getObservability()
     )
+  }
+
+  private getObservability(): AppSnapshot['observability'] {
+    const now = Date.now()
+    if (
+      this.observabilityCache?.revision === this.requestLogRevision
+      && this.observabilityCache.expiresAt > now
+    ) return structuredClone(this.observabilityCache.value)
+    const value = this.store.select((state) => ({
+      last24Hours: summarizeObservability(state.requestLogs, now - 24 * 60 * 60 * 1000, now),
+      last7Days: summarizeObservability(state.requestLogs, now - 7 * 24 * 60 * 60 * 1000, now),
+      hourly: summarizeHourly(state.requestLogs, now),
+      tokenRates: summarizeTokenRates(state.requestLogs, now)
+    }))
+    this.observabilityCache = {
+      revision: this.requestLogRevision,
+      expiresAt: now + OBSERVABILITY_CACHE_TTL_MS,
+      value
+    }
+    return structuredClone(value)
   }
 
   public getRuntimeAccounts(): Account[] {
@@ -136,8 +181,33 @@ export class AppStore {
     return this.store.select((state) => state.accounts.find((account) => account.id === id))
   }
 
+  public getRuntimeProvider(id: string): ProviderDefinition | undefined {
+    return this.store.select((state) => state.providers.find((provider) => provider.id === id))
+  }
+
   public getRuntimeProxies(): ProxyDefinition[] {
     return this.store.select((state) => state.proxies)
+  }
+
+  public getRuntimeConfiguration(): {
+    providers: ProviderDefinition[]
+    accounts: Account[]
+    proxies: PublicProxyDefinition[]
+    pools: Pool[]
+    routes: Route[]
+    gateway: GatewaySettings
+  } {
+    return this.store.select((state) => ({
+      providers: state.providers,
+      accounts: state.accounts,
+      proxies: state.proxies.map(({ credentialId: _credentialId, ...proxy }) => ({
+        ...proxy,
+        hasPassword: Boolean(_credentialId && state.credentials[_credentialId])
+      })),
+      pools: state.pools,
+      routes: state.routes,
+      gateway: state.gateway
+    }))
   }
 
   public setGatewayStatus(status: GatewayStatus): void {
@@ -738,31 +808,22 @@ export class AppStore {
 
   public async setAccountCheckResult(
     id: string,
-    patch: Partial<Pick<Account,
-      'status' |
-      'latencyMs' |
-      'lastError' |
-      'lastUsedAt' |
-      'cooldownUntil' |
-      'circuitState' |
-      'consecutiveFailures'
-      | 'quota'
-      | 'codexQuota'
-    >>
+    patch: AccountCheckPatch
   ): Promise<AppSnapshot> {
+    await this.updateAccountRuntimeState(id, patch)
+    return this.getSnapshot()
+  }
+
+  public async updateAccountRuntimeState(id: string, patch: AccountCheckPatch): Promise<void> {
     let codexQuotaToSample: AccountCodexQuotaSnapshot | undefined
-    await this.store.update((state) => {
-      const account = state.accounts.find((candidate) => candidate.id === id)
-      if (!account) {
-        throw new Error('Account not found.')
-      }
+    const safePatch = patch.lastError === undefined
+      ? patch
+      : { ...patch, lastError: this.safePersistedMessage(this.store.read(), patch.lastError) }
+    await this.store.updateAccount<Account>(id, (account) => {
       const mergedQuota = patch.quota ? mergeAccountQuota(account.quota, patch.quota) : undefined
       const mergedCodexQuota = patch.codexQuota
         ? mergeAccountCodexQuota(account.codexQuota, patch.codexQuota)
         : undefined
-      const safePatch = patch.lastError === undefined
-        ? patch
-        : { ...patch, lastError: this.safePersistedMessage(state, patch.lastError) }
       Object.assign(account, safePatch, {
         ...(mergedQuota ? { quota: mergedQuota } : {}),
         ...(mergedCodexQuota ? { codexQuota: mergedCodexQuota } : {}),
@@ -771,7 +832,6 @@ export class AppStore {
       codexQuotaToSample = mergedCodexQuota
     })
     if (codexQuotaToSample) await this.appendCodexQuotaSample(id, codexQuotaToSample)
-    return this.getSnapshot()
   }
 
   public getAccountCodexQuotaHistory(accountId: string, from?: number, to?: number): CodexQuotaHistoryPoint[] {
@@ -781,11 +841,11 @@ export class AppStore {
   }
 
   public async appendLog(log: RequestLog): Promise<void> {
-    const state = this.store.read()
     const safeLog = log.error === undefined
       ? log
-      : { ...log, error: this.safePersistedMessage(state, log.error) }
+      : { ...log, error: this.safePersistedMessage(this.store.read(), log.error) }
     await this.store.appendRequestLog(safeLog, MAX_PERSISTED_REQUEST_LOGS)
+    this.requestLogRevision += 1
   }
 
   public async refreshRequestConversationTitles(resolve: (conversationId: string) => string | undefined): Promise<void> {
@@ -804,6 +864,7 @@ export class AppStore {
     await this.store.update((state) => {
       state.requestLogs = []
     })
+    this.requestLogRevision += 1
     return this.getSnapshot()
   }
 
@@ -1137,10 +1198,10 @@ function toSnapshot(
   state: PersistedState,
   status: GatewayStatus,
   vaultAvailable: boolean,
-  vaultBackend: string
+  vaultBackend: string,
+  observability: AppSnapshot['observability']
 ): AppSnapshot {
   const { credentials: _credentials, accounts, proxies, ...safeState } = state
-  const now = Date.now()
   return {
     ...safeState,
     accounts: accounts.map(({
@@ -1152,13 +1213,9 @@ function toSnapshot(
       ...proxy,
       hasPassword: Boolean(_credentialId && state.credentials[_credentialId])
     })),
-    requestLogs: state.requestLogs.slice(0, MAX_RENDERER_REQUEST_LOGS),
+    requestLogs: state.requestLogs,
     healthEvents: state.healthEvents,
-    observability: {
-      last24Hours: summarizeObservability(state.requestLogs, now - 24 * 60 * 60 * 1000, now),
-      last7Days: summarizeObservability(state.requestLogs, now - 7 * 24 * 60 * 60 * 1000, now),
-      hourly: summarizeHourly(state.requestLogs, now)
-    },
+    observability,
     gatewayStatus: { ...status },
     vaultAvailable,
     vaultBackend
@@ -1238,6 +1295,66 @@ function summarizeHourly(requestLogs: RequestLog[], now: number) {
     ...bucket,
     averageLatencyMs: bucket.requestCount ? Math.round(latencyTotal / bucket.requestCount) : 0
   }))
+}
+
+function summarizeTokenRates(requestLogs: RequestLog[], now: number): TokenRateSeries {
+  const configurations: Array<{
+    key: keyof TokenRateSeries
+    windowMs: number
+    bucketCount: number
+  }> = [
+    { key: 'last30Minutes', windowMs: 30 * 60 * 1000, bucketCount: 30 },
+    { key: 'last4Hours', windowMs: 4 * 60 * 60 * 1000, bucketCount: 48 },
+    { key: 'last24Hours', windowMs: 24 * 60 * 60 * 1000, bucketCount: 48 },
+    { key: 'last7Days', windowMs: 7 * 24 * 60 * 60 * 1000, bucketCount: 56 }
+  ]
+  const series = Object.fromEntries(configurations.map((configuration) => [
+    configuration.key,
+    Array.from({ length: configuration.bucketCount }, (_, index) => ({
+      timestamp: now - configuration.windowMs + index * configuration.windowMs / configuration.bucketCount,
+      requestCount: 0,
+      outputTokens: 0,
+      rateTotal: 0
+    }))
+  ])) as Record<keyof TokenRateSeries, Array<{
+    timestamp: number
+    requestCount: number
+    outputTokens: number
+    rateTotal: number
+  }>>
+
+  for (const log of requestLogs) {
+    if (log.status !== 'success' || log.timestamp > now) continue
+    if (!log.outputTokens || log.outputTokens <= 0 || log.latencyMs <= 0) continue
+    const generationDurationMs = log.firstTokenMs === undefined
+      ? log.latencyMs
+      : log.latencyMs - log.firstTokenMs
+    if (generationDurationMs <= 0) continue
+    const tokensPerSecond = log.outputTokens * 1000 / generationDurationMs
+    for (const configuration of configurations) {
+      const windowStart = now - configuration.windowMs
+      if (log.timestamp < windowStart) continue
+      const bucketMs = configuration.windowMs / configuration.bucketCount
+      const bucketIndex = Math.min(
+        configuration.bucketCount - 1,
+        Math.floor((log.timestamp - windowStart) / bucketMs)
+      )
+      const bucket = series[configuration.key][bucketIndex]
+      bucket.requestCount += 1
+      bucket.outputTokens += log.outputTokens
+      bucket.rateTotal += tokensPerSecond
+    }
+  }
+
+  return Object.fromEntries(configurations.map(({ key }) => [
+    key,
+    series[key].map(({ rateTotal, ...bucket }) => ({
+      ...bucket,
+      tokensPerSecond: bucket.requestCount
+        ? Math.round(rateTotal / bucket.requestCount * 10) / 10
+        : 0
+    }))
+  ])) as unknown as TokenRateSeries
 }
 
 function summarizeObservability(requestLogs: RequestLog[], windowStart: number, windowEnd: number) {

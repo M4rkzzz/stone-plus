@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.8.5
+
+- Added an overview chart for average output-token speed over 30 minutes, 4 hours,
+  24 hours, and one week.
+- Reduced gateway main-thread work with targeted SQLite writes, cached observability
+  summaries, and coalesced renderer snapshot updates.
+- Extended direct and proxied HTTP/2 connection keepalive and added connection warming.
+- Added an optional `autobalanced` strategy that prefers accounts with better EWMA
+  TTFT/output speed without changing the existing `balanced` behavior.
+
 ## 0.8.4
 
 - Fixed completed streams being recorded as HTTP 499 when a client closed the

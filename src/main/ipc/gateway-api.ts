@@ -18,7 +18,7 @@ import type {
   RouteClient
 } from '@shared/types'
 import type { GatewayAccountState, GatewayConfig } from '../gateway'
-import { getProviderAdapter, getProviderPreset, probeChatGptAccount, probeChatGptCodexModel, probeProviderModel, providerPresets, queryChatGptCodexModels, queryChatGptCodexQuota, resolveChatGptCredential, type ProviderFailure } from '../providers'
+import { CHATGPT_CODEX_RESPONSES_URL, getProviderAdapter, getProviderPreset, probeChatGptAccount, probeChatGptCodexModel, probeProviderModel, providerPresets, queryChatGptCodexModels, queryChatGptCodexQuota, resolveChatGptCredential, type ProviderFailure } from '../providers'
 import type { AppStore } from '../store/app-store'
 import type { ClientConfigService } from '../client-config'
 import type { DatabaseBackupService } from '../backup'
@@ -45,7 +45,13 @@ export function registerGatewayApi(
   backups?: DatabaseBackupService<PersistedState>,
   onRuntimeChanged?: () => void
 ): void {
+  const snapshotPublishDelayMs = 250
+  let scheduledSnapshotPublish: ReturnType<typeof setTimeout> | undefined
   const publish = (snapshot: AppSnapshot): AppSnapshot => {
+    if (scheduledSnapshotPublish) {
+      clearTimeout(scheduledSnapshotPublish)
+      scheduledSnapshotPublish = undefined
+    }
     for (const window of BrowserWindow.getAllWindows()) {
       if (!window.isDestroyed()) {
         window.webContents.send('stone:snapshot', snapshot)
@@ -53,6 +59,16 @@ export function registerGatewayApi(
     }
     onRuntimeChanged?.()
     return snapshot
+  }
+
+  const scheduleRuntimePublish = (): void => {
+    if (scheduledSnapshotPublish) return
+    scheduledSnapshotPublish = setTimeout(() => {
+      scheduledSnapshotPublish = undefined
+      gateway.updateConfig(toGatewayConfig(store))
+      store.setGatewayStatus(gateway.getStatus())
+      publish(store.getSnapshot())
+    }, snapshotPublishDelayMs)
   }
 
   const refreshRuntime = (): AppSnapshot => {
@@ -63,21 +79,22 @@ export function registerGatewayApi(
 
   const mutate = async (operation: () => Promise<AppSnapshot>): Promise<AppSnapshot> => {
     await operation()
-    return publish(refreshRuntime())
+    const snapshot = publish(refreshRuntime())
+    if (gateway.getStatus().running) warmGatewayConnections(store, outboundTransport)
+    return snapshot
   }
 
   gateway.onLog((log) => {
     void store.appendLog(log).then(() => {
-      store.setGatewayStatus(gateway.getStatus())
-      publish(store.getSnapshot())
+      scheduleRuntimePublish()
     }).catch((error: unknown) => {
       console.error('Stone could not persist a gateway request log', error)
     })
   })
 
   gateway.onAccountState((state) => {
-    const before = store.getSnapshot().accounts.find((account) => account.id === state.accountId)
-    void store.setAccountCheckResult(state.accountId, {
+    const before = store.getRuntimeAccount(state.accountId)
+    void store.updateAccountRuntimeState(state.accountId, {
       status: state.status,
       circuitState: state.circuitState,
       consecutiveFailures: state.consecutiveFailures,
@@ -88,17 +105,18 @@ export function registerGatewayApi(
       ...(state.quota ? { quota: state.quota } : {}),
       ...(state.codexQuota ? { codexQuota: state.codexQuota } : {})
     }).then(async () => {
-      const snapshot = store.getSnapshot()
-      const account = snapshot.accounts.find((candidate) => candidate.id === state.accountId)
-      const provider = snapshot.providers.find((candidate) => candidate.id === account?.providerId)
+      const account = store.getRuntimeAccount(state.accountId)
+      const provider = account ? store.getRuntimeProvider(account.providerId) : undefined
       const event = account ? healthEventForTransition(before, account, provider?.name ?? 'Unknown provider') : undefined
       if (event && account) {
         await store.appendHealthEvent(event)
+        const snapshot = store.getSnapshot()
         if (snapshot.gateway.desktopNotifications && Notification.isSupported()) {
           new Notification({ title: `Stone · ${account.name}`, body: event.message }).show()
         }
       }
-      publish(refreshRuntime())
+      if (event || state.status !== 'active') publish(refreshRuntime())
+      else scheduleRuntimePublish()
     }).catch((error: unknown) => {
       console.error('Stone could not persist account health state', error)
     })
@@ -203,7 +221,10 @@ export function registerGatewayApi(
     if (wasRunning) await gateway.stop()
     gateway.updateConfig(toGatewayConfig(store))
     try {
-      if (wasRunning) await gateway.start()
+      if (wasRunning) {
+        await gateway.start()
+        warmGatewayConnections(store, outboundTransport)
+      }
     } catch (error: unknown) {
       store.setGatewayStatus(gateway.getStatus())
       publish(store.getSnapshot())
@@ -216,6 +237,7 @@ export function registerGatewayApi(
     assertTrustedSender(event)
     gateway.updateConfig(toGatewayConfig(store))
     await gateway.start()
+    warmGatewayConnections(store, outboundTransport)
     store.setGatewayStatus(gateway.getStatus())
     return publish(store.getSnapshot())
   })
@@ -495,15 +517,48 @@ function assertRouteClient(value: unknown): asserts value is RouteClient {
 }
 
 function toGatewayConfig(store: AppStore): GatewayConfig {
-  const snapshot = store.getSnapshot()
+  const configuration = store.getRuntimeConfiguration()
   return {
-    providers: snapshot.providers,
-    accounts: store.getRuntimeAccounts(),
-    proxies: snapshot.proxies,
-    pools: snapshot.pools,
-    routes: snapshot.routes,
-    settings: snapshot.gateway
+    providers: configuration.providers,
+    accounts: configuration.accounts,
+    proxies: configuration.proxies,
+    pools: configuration.pools,
+    routes: configuration.routes,
+    settings: configuration.gateway
   }
+}
+
+export function warmGatewayConnections(store: AppStore, transport: OutboundTransportManager): void {
+  const configuration = store.getRuntimeConfiguration()
+  const targets = new Map<string, {
+    proxy: AppSnapshot['proxies'][number] | undefined
+    password: string | undefined
+    origin: string
+  }>()
+  for (const pool of configuration.pools) {
+    for (const member of pool.members) {
+      if (!member.enabled) continue
+      const account = configuration.accounts.find((candidate) => candidate.id === member.accountId)
+      if (!account || account.status === 'disabled' || account.status === 'expired') continue
+      const provider = configuration.providers.find((candidate) => candidate.id === account.providerId)
+      if (!provider) continue
+      const proxy = resolveEffectiveProxy(account, pool, configuration.proxies)
+      const origin = new URL(
+        account.credentialType === 'chatgpt-oauth' ? CHATGPT_CODEX_RESPONSES_URL : provider.baseUrl
+      ).origin
+      const key = `${proxy?.id ?? 'direct'}\0${origin}`
+      if (!targets.has(key)) {
+        targets.set(key, {
+          proxy,
+          password: proxy ? store.getProxyPassword(proxy.id) : undefined,
+          origin
+        })
+      }
+    }
+  }
+  void Promise.allSettled([...targets.values()].map((target) =>
+    transport.warmFor(target.proxy, target.password, target.origin)
+  ))
 }
 
 async function checkAccount(

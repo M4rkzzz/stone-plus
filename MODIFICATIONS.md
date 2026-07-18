@@ -13,7 +13,8 @@ The first Stone+ release, `v0.8.3`, is based on upstream Stone `v0.8.2`
 - request time-to-first-token, conversation title, adjustable columns, and compact log UI;
 - client-disconnect handling as HTTP 499 without account cooldown or failover;
 - lower-latency connection reuse, HTTP/2 negotiation, immediate SSE header/chunk forwarding,
-  reduced stream-redaction buffering, and cheaper request-path state lookups;
+  connection warming, reduced stream-redaction buffering, targeted state persistence,
+  and optional speed-aware `autobalanced` account scheduling;
 - additional tests and desktop integration supporting these features.
 
 Original copyright and license notices are retained in `LICENSE`, `NOTICE`,

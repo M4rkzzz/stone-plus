@@ -253,8 +253,8 @@ export class SqliteStateStore<T extends SqlitePersistedShape> {
     return pending
   }
 
-  public async appendRequestLog(log: Identified, maximumRows: number): Promise<T> {
-    const operation = async (): Promise<T> => {
+  public async appendRequestLog(log: Identified, maximumRows: number): Promise<void> {
+    const operation = async (): Promise<void> => {
       const database = this.requireDatabase()
       database.exec('BEGIN IMMEDIATE')
       try {
@@ -274,9 +274,43 @@ export class SqliteStateStore<T extends SqlitePersistedShape> {
         rollback(database)
         throw error
       }
-      const requestLogs = [log, ...this.data.requestLogs].slice(0, maximumRows)
-      this.data = this.normalize({ ...this.data, requestLogs } as T)
-      return this.read()
+      const requestLogs = [structuredClone(log), ...this.data.requestLogs].slice(0, maximumRows)
+      this.data = { ...this.data, requestLogs }
+    }
+
+    const pending = this.writeChain.then(operation, operation)
+    this.writeChain = pending.then(
+      () => undefined,
+      () => undefined
+    )
+    await pending
+  }
+
+  public async updateAccount<TAccount extends Identified>(
+    id: string,
+    mutator: (account: TAccount) => void
+  ): Promise<TAccount> {
+    const operation = async (): Promise<TAccount> => {
+      const database = this.requireDatabase()
+      const index = this.data.accounts.findIndex((account) => account.id === id)
+      if (index < 0) throw new Error('Account not found.')
+      const account = structuredClone(this.data.accounts[index]) as TAccount
+      mutator(account)
+      if (account.id !== id) throw new Error('An account update cannot change its id.')
+      database.exec('BEGIN IMMEDIATE')
+      try {
+        const result = database.prepare('UPDATE accounts SET payload = ? WHERE id = ?')
+          .run(JSON.stringify(account), id)
+        if (result.changes !== 1) throw new Error('Account not found.')
+        database.exec('COMMIT')
+      } catch (error) {
+        rollback(database)
+        throw error
+      }
+      const accounts = [...this.data.accounts]
+      accounts[index] = structuredClone(account)
+      this.data = { ...this.data, accounts }
+      return structuredClone(account)
     }
 
     const pending = this.writeChain.then(operation, operation)

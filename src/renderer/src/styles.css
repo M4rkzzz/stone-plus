@@ -3442,6 +3442,24 @@ body.request-column-resizing {
 .observability-legend i { width: 8px; height: 8px; border-radius: 2px; }
 .legend-success { background: #8fc8b8; }
 .legend-error { background: #dc7777; }
+.token-rate-panel__header { align-items: center; }
+.token-rate-range { flex: 0 0 auto; }
+.token-rate-summary { display: flex; align-items: center; gap: 28px; margin: -2px 0 8px 58px; }
+.token-rate-summary > div { display: flex; align-items: baseline; gap: 7px; }
+.token-rate-summary span { color: var(--muted); font-size: 10px; }
+.token-rate-summary strong { font-size: 13px; font-weight: 680; }
+.token-rate-chart { position: relative; width: 100%; min-height: 220px; }
+.token-rate-chart svg { display: block; width: 100%; height: 220px; overflow: visible; }
+.token-rate-chart__grid { stroke: #e8eeeb; stroke-width: 1; vector-effect: non-scaling-stroke; }
+.token-rate-chart__line { fill: none; stroke: var(--accent); stroke-linecap: round; stroke-linejoin: round; stroke-width: 2.5; vector-effect: non-scaling-stroke; }
+.token-rate-chart__point { fill: var(--surface); stroke: var(--accent); stroke-width: 2; vector-effect: non-scaling-stroke; }
+.token-rate-chart__point:hover { fill: var(--accent); }
+.token-rate-chart__y-label,
+.token-rate-chart__x-label { fill: var(--faint); font: 9px var(--font-sans); }
+.token-rate-chart__y-label { text-anchor: end; }
+.token-rate-chart__x-label--middle { text-anchor: middle; }
+.token-rate-chart__x-label--end { text-anchor: end; }
+.token-rate-chart__empty { position: absolute; top: 50%; left: 50%; padding: 7px 10px; border-radius: 5px; background: rgb(255 255 255 / 86%); color: var(--muted); font-size: 11px; transform: translate(-50%, -50%); }
 .health-event-list { display: grid; gap: 7px; }
 .health-event { display: grid; grid-template-columns: 10px minmax(0, 1fr) auto; align-items: center; gap: 9px; padding: 9px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface-subtle); }
 .health-event .status-dot { background: var(--accent); }
@@ -4081,6 +4099,11 @@ body.request-column-resizing {
   .update-notes__body { padding: 12px; }
   .update-notes > header { align-items: flex-start; flex-direction: column; gap: 4px; }
   .client-config-message.error-banner { margin: 0; }
+  .token-rate-panel__header { align-items: stretch; flex-direction: column; }
+  .token-rate-range { width: 100%; }
+  .token-rate-range button { min-width: 68px; flex: 1; justify-content: center; padding: 0 7px; }
+  .token-rate-summary { justify-content: space-between; gap: 10px; margin-left: 0; }
+  .token-rate-summary > div { align-items: flex-start; flex-direction: column; gap: 1px; }
   .segmented-control { max-width: 100%; overflow-x: auto; }
   .segmented-control button { flex: 0 0 auto; }
   .proxy-toolbar { align-items: stretch; flex-direction: column; }

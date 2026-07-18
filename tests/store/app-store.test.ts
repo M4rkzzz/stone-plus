@@ -319,6 +319,36 @@ describe('AppStore', () => {
     })).rejects.toThrow(/pool protocol/)
   })
 
+  it('persists autobalanced as an opt-in pool strategy', async () => {
+    const store = createStore()
+    await store.initialize()
+    const withAccount = await store.saveAccount({
+      providerId: 'provider-openai',
+      name: 'Auto balanced key',
+      credential: 'sk-auto-balanced',
+      priority: 1,
+      weight: 1,
+      maxConcurrency: 2,
+      modelAllowlist: []
+    })
+
+    const saved = await store.savePool({
+      name: 'Adaptive pool',
+      protocol: 'openai-responses',
+      strategy: 'autobalanced',
+      accountIds: [withAccount.accounts[0].id],
+      stickySessions: true,
+      stickyTtlMinutes: 30,
+      maxRetries: 1
+    })
+    expect(saved.pools[0].strategy).toBe('autobalanced')
+    await store.close()
+
+    const restarted = createStore()
+    await restarted.initialize()
+    expect(restarted.getSnapshot().pools[0].strategy).toBe('autobalanced')
+  })
+
   it('requires a new credential when moving an account to another provider', async () => {
     const store = createStore()
     await store.initialize()
@@ -922,6 +952,45 @@ describe('AppStore', () => {
     expect(restarted.getSnapshot().healthEvents).toContainEqual(expect.objectContaining({ id: 'health-one' }))
     expect(restarted.getSnapshot().observability.hourly).toHaveLength(24)
     expect(restarted.getSnapshot().observability.hourly.at(-1)).toMatchObject({ requestCount: 1, inputTokens: 4 })
+  })
+
+  it('aggregates successful request generation speed for every overview time range', async () => {
+    const timestamp = Date.now() - 90_000
+    const store = createStore()
+    await store.initialize()
+    await store.appendLog({
+      ...requestLog(1, 'rate-ten'),
+      timestamp,
+      latencyMs: 5_000,
+      firstTokenMs: 1_000,
+      outputTokens: 40
+    })
+    await store.appendLog({
+      ...requestLog(2, 'rate-twenty'),
+      timestamp,
+      latencyMs: 6_000,
+      firstTokenMs: 1_000,
+      outputTokens: 100
+    })
+    await store.appendLog({
+      ...requestLog(3, 'rate-error'),
+      timestamp,
+      status: 'error',
+      latencyMs: 2_000,
+      firstTokenMs: 500,
+      outputTokens: 1_000
+    })
+
+    const tokenRates = store.getSnapshot().observability.tokenRates
+    for (const series of Object.values(tokenRates)) {
+      const populated = series.filter((point) => point.requestCount > 0)
+      expect(populated).toHaveLength(1)
+      expect(populated[0]).toMatchObject({ requestCount: 2, outputTokens: 140, tokensPerSecond: 15 })
+    }
+    expect(tokenRates.last30Minutes).toHaveLength(30)
+    expect(tokenRates.last4Hours).toHaveLength(48)
+    expect(tokenRates.last24Hours).toHaveLength(48)
+    expect(tokenRates.last7Days).toHaveLength(56)
   })
 
   it('does not allow an existing client profile to change clients', async () => {

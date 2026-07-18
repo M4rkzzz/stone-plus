@@ -28,13 +28,15 @@ import { ModelPolicyEditor } from './ModelPolicyEditor'
 
 const strategyLabels: Record<PoolStrategy, string> = {
   balanced: '均衡调度',
+  autobalanced: '智能均衡',
   priority: '优先级',
   'round-robin': '轮询',
   'weighted-random': '加权随机',
 }
 
 const strategyDescriptions: Record<PoolStrategy, string> = {
-  balanced: '结合负载与延迟选择账号',
+  balanced: '按并发负载与额度均衡分配',
+  autobalanced: '根据首字与输出速度动态择优',
   priority: '优先使用数值较小的账号',
   'round-robin': '按固定顺序依次分配请求',
   'weighted-random': '按照账号权重随机分配',

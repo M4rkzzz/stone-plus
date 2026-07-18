@@ -419,6 +419,12 @@ const initialSnapshot: AppSnapshot = {
     last24Hours: summarizeLogs(logs, now - 24 * 60 * 60 * 1000, now),
     last7Days: summarizeLogs(logs, now - 7 * 24 * 60 * 60 * 1000, now),
     hourly: [],
+    tokenRates: {
+      last30Minutes: summarizeTokenRate(logs, now, 30 * 60 * 1000, 30),
+      last4Hours: summarizeTokenRate(logs, now, 4 * 60 * 60 * 1000, 48),
+      last24Hours: summarizeTokenRate(logs, now, 24 * 60 * 60 * 1000, 48),
+      last7Days: summarizeTokenRate(logs, now, 7 * 24 * 60 * 60 * 1000, 56),
+    },
   },
   vaultAvailable: true,
   vaultBackend: '系统凭据保险库',
@@ -451,6 +457,31 @@ function summarizeLogs(logs: RequestLog[], windowStart: number, windowEnd: numbe
     failoverCount: selected.reduce((total, log) => total + (log.failoverCount ?? 0), 0),
     errorsByStatus,
   }
+}
+
+function summarizeTokenRate(logs: RequestLog[], windowEnd: number, windowMs: number, bucketCount: number) {
+  const windowStart = windowEnd - windowMs
+  const bucketMs = windowMs / bucketCount
+  const buckets = Array.from({ length: bucketCount }, (_, index) => ({
+    timestamp: windowStart + index * bucketMs,
+    requestCount: 0,
+    outputTokens: 0,
+    rateTotal: 0,
+  }))
+  for (const log of logs) {
+    if (log.status !== 'success' || log.timestamp < windowStart || log.timestamp > windowEnd) continue
+    if (!log.outputTokens || log.outputTokens <= 0 || log.latencyMs <= 0) continue
+    const generationDurationMs = log.firstTokenMs === undefined ? log.latencyMs : log.latencyMs - log.firstTokenMs
+    if (generationDurationMs <= 0) continue
+    const index = Math.min(bucketCount - 1, Math.floor((log.timestamp - windowStart) / bucketMs))
+    buckets[index].requestCount += 1
+    buckets[index].outputTokens += log.outputTokens
+    buckets[index].rateTotal += log.outputTokens * 1000 / generationDurationMs
+  }
+  return buckets.map(({ rateTotal, ...bucket }) => ({
+    ...bucket,
+    tokensPerSecond: bucket.requestCount ? Math.round(rateTotal / bucket.requestCount * 10) / 10 : 0,
+  }))
 }
 
 const clone = <T,>(value: T): T => structuredClone(value)

@@ -87,6 +87,75 @@ describe('PoolScheduler', () => {
     expect(selected.account.id).toBe('earlier')
   })
 
+  it('keeps balanced scheduling independent from runtime speed samples', () => {
+    const scheduler = new PoolScheduler()
+    const slow = account('a-slow', { maxConcurrency: 4 })
+    const fast = account('z-fast', { maxConcurrency: 4 })
+    scheduler.recordPerformance(slow.id, {
+      firstTokenMs: 4_000,
+      outputTokens: 40,
+      generationDurationMs: 4_000
+    })
+    scheduler.recordPerformance(fast.id, {
+      firstTokenMs: 1_000,
+      outputTokens: 160,
+      generationDurationMs: 4_000
+    })
+
+    const selected = scheduler.selectAndAcquire({
+      pool: pool({ strategy: 'balanced' }),
+      accounts: [slow, fast],
+      model: 'model'
+    })
+
+    expect(selected.account.id).toBe(slow.id)
+  })
+
+  it('uses EWMA first-token and output speed for equally loaded autobalanced accounts', () => {
+    const scheduler = new PoolScheduler()
+    const slow = account('a-slow', { maxConcurrency: 4 })
+    const fast = account('z-fast', { maxConcurrency: 4 })
+    for (let index = 0; index < 4; index += 1) {
+      scheduler.recordPerformance(slow.id, {
+        firstTokenMs: 4_000,
+        outputTokens: 40,
+        generationDurationMs: 4_000
+      })
+      scheduler.recordPerformance(fast.id, {
+        firstTokenMs: 1_000,
+        outputTokens: 160,
+        generationDurationMs: 4_000
+      })
+    }
+
+    const selected = scheduler.selectAndAcquire({
+      pool: pool({ strategy: 'autobalanced' }),
+      accounts: [slow, fast],
+      model: 'model'
+    })
+
+    expect(selected.account.id).toBe(fast.id)
+  })
+
+  it('explores an unmeasured autobalanced account before concentrating on known performance', () => {
+    const scheduler = new PoolScheduler()
+    const measured = account('measured', { maxConcurrency: 4 })
+    const unmeasured = account('unmeasured', { maxConcurrency: 4 })
+    scheduler.recordPerformance(measured.id, {
+      firstTokenMs: 800,
+      outputTokens: 200,
+      generationDurationMs: 4_000
+    })
+
+    const selected = scheduler.selectAndAcquire({
+      pool: pool({ strategy: 'autobalanced' }),
+      accounts: [measured, unmeasured],
+      model: 'model'
+    })
+
+    expect(selected.account.id).toBe(unmeasured.id)
+  })
+
   it('keeps a sticky session on its assigned eligible account', () => {
     const scheduler = new PoolScheduler(() => timestamp)
     const accounts = [account('a'), account('b')]
