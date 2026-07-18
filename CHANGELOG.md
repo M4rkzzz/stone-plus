@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.4
+
+- Fixed completed streams being recorded as HTTP 499 when a client closed the
+  connection immediately after receiving the protocol terminal event.
+- A close before the terminal event remains a real 499 and still does not cool
+  down the account or trigger failover.
+
 ## 0.8.3 — Stone+ initial release
 
 - Added embedded FRP tunnel management and copyable remote endpoint/token.

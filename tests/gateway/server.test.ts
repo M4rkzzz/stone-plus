@@ -878,6 +878,52 @@ describe('GatewayServer', () => {
     expect(upstreamFetch).toHaveBeenCalledTimes(2)
   })
 
+  it('records success when the client closes after receiving the terminal stream event', async () => {
+    const port = await freePort()
+    const logs: RequestLog[] = []
+    const states: Array<{ accountId: string; status: string }> = []
+    const encoder = new TextEncoder()
+    const upstreamFetch = vi.fn(async () => new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode([
+          'data: {"id":"chat-finished","model":"source-model","choices":[{"index":0,"delta":{"content":"Done"},"finish_reason":"stop"}]}',
+          '',
+          'data: [DONE]',
+          '',
+          ''
+        ].join('\n')))
+        setTimeout(() => {
+          try { controller.close() } catch { /* The downstream cancellation already closed it. */ }
+        }, 50)
+      }
+    }), { status: 200, headers: { 'content-type': 'text/event-stream' } }))
+    const gateway = new GatewayServer({
+      config: config(port),
+      credentialResolver: () => 'credential',
+      fetchImplementation: upstreamFetch as typeof fetch,
+      onAccountState: (state) => states.push(state),
+      onLog: (log) => logs.push(log)
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'source-model', stream: true, messages: [{ role: 'user', content: 'Hello' }] })
+    })
+    const reader = response.body?.getReader()
+    expect(reader).toBeDefined()
+    const first = await reader!.read()
+    expect(new TextDecoder().decode(first.value)).toContain('[DONE]')
+    await reader!.cancel()
+
+    await vi.waitFor(() => expect(logs).toHaveLength(1))
+    expect(logs[0]).toMatchObject({ status: 'success', statusCode: 200 })
+    expect(states).toHaveLength(1)
+    expect(states[0]).toMatchObject({ accountId: 'first', status: 'active' })
+  })
+
   it('records time to first token and the client-provided conversation identity', async () => {
     const port = await freePort()
     let clock = timestamp

@@ -847,8 +847,9 @@ async function pipeUpstreamResponse(
   const reader = upstream.body.getReader()
   const usage: NonNullable<StreamPipeResult['usage']> = {}
   let streamError: string | undefined
+  let terminalObserved = false
   let observationFailed = false
-  const observe = (events: CanonicalStreamEvent[]): void => {
+  const observe = (events: CanonicalStreamEvent[], acceptTerminal: boolean): void => {
     for (const event of events) {
       if (event.type === 'usage') {
         if (event.inputTokens !== undefined) usage.input_tokens = event.inputTokens
@@ -856,13 +857,15 @@ async function pipeUpstreamResponse(
         if (event.totalTokens !== undefined) usage.total_tokens = event.totalTokens
       } else if (event.type === 'error') {
         streamError = redactSensitiveText(event.message, secrets)
+      } else if (acceptTerminal && event.type === 'done') {
+        terminalObserved = true
       }
     }
   }
-  const observeSafely = (operation: () => CanonicalStreamEvent[]): void => {
+  const observeSafely = (operation: () => CanonicalStreamEvent[], acceptTerminal = true): void => {
     if (observationFailed) return
     try {
-      observe(operation())
+      observe(operation(), acceptTerminal)
     } catch (error) {
       observationFailed = true
       streamError = error instanceof Error ? error.message : 'Unable to inspect upstream stream'
@@ -877,28 +880,24 @@ async function pipeUpstreamResponse(
       const { done, value } = await reader.read()
       if (done) break
       if (value.byteLength > 0) onFirstToken?.()
+      observeSafely(() => parser.push(value))
       if (response.destroyed) {
         await reader.cancel()
-        return { completed: false }
+        return streamPipeResult(terminalObserved, usage, streamError)
       }
       for (const chunk of redactor.push(value)) {
         if (!response.write(chunk)) await waitForDrain(response)
       }
-      observeSafely(() => parser.push(value))
     }
     for (const chunk of redactor.finish()) {
       if (!response.write(chunk)) await waitForDrain(response)
     }
-    observeSafely(() => parser.finish())
+    observeSafely(() => parser.finish(), false)
   } finally {
     response.off('close', cancelOnClose)
     if (!response.writableEnded && !response.destroyed) response.end()
   }
-  return {
-    completed: !response.destroyed,
-    ...(Object.keys(usage).length > 0 ? { usage } : {}),
-    ...(streamError ? { error: streamError } : {})
-  }
+  return streamPipeResult(terminalObserved || !response.destroyed, usage, streamError)
 }
 
 async function pipeConvertedUpstreamResponse(
@@ -929,10 +928,11 @@ async function pipeConvertedUpstreamResponse(
   const reader = upstream.body.getReader()
   const usage: NonNullable<StreamPipeResult['usage']> = {}
   let streamError: string | undefined
+  let terminalObserved = false
   const cancelOnClose = (): void => {
     void reader.cancel()
   }
-  const forward = async (events: CanonicalStreamEvent[]): Promise<boolean> => {
+  const forward = async (events: CanonicalStreamEvent[], acceptTerminal = true): Promise<boolean> => {
     for (const event of events) {
       const safeEvent = event.type === 'error'
         ? {
@@ -948,6 +948,8 @@ async function pipeConvertedUpstreamResponse(
         if (safeEvent.totalTokens !== undefined) usage.total_tokens = safeEvent.totalTokens
       } else if (safeEvent.type === 'error') {
         streamError = safeEvent.message
+      } else if (acceptTerminal && safeEvent.type === 'done') {
+        terminalObserved = true
       }
       if (!await writeStreamChunks(response, encoder.encode(safeEvent))) return false
     }
@@ -960,13 +962,13 @@ async function pipeConvertedUpstreamResponse(
       const { done, value } = await reader.read()
       if (done) break
       if (value.byteLength > 0) onFirstToken?.()
-      if (response.destroyed || !await forward(parser.push(value))) {
+      if (!await forward(parser.push(value))) {
         await reader.cancel()
-        return { completed: false }
+        return streamPipeResult(terminalObserved, usage, streamError)
       }
     }
-    if (!await forward(parser.finish())) return { completed: false }
-    if (!await writeStreamChunks(response, encoder.finish())) return { completed: false }
+    if (!await forward(parser.finish(), false)) return streamPipeResult(terminalObserved, usage, streamError)
+    if (!await writeStreamChunks(response, encoder.finish())) return streamPipeResult(terminalObserved, usage, streamError)
   } catch (error) {
     if (response.destroyed) return { completed: false }
     streamError = error instanceof Error ? error.message : 'Upstream stream failed'
@@ -980,10 +982,18 @@ async function pipeConvertedUpstreamResponse(
     if (!response.writableEnded && !response.destroyed) response.end()
   }
 
+  return streamPipeResult(terminalObserved || !response.destroyed, usage, streamError)
+}
+
+function streamPipeResult(
+  completed: boolean,
+  usage: NonNullable<StreamPipeResult['usage']>,
+  error?: string
+): StreamPipeResult {
   return {
-    completed: !response.destroyed,
+    completed,
     ...(Object.keys(usage).length > 0 ? { usage } : {}),
-    ...(streamError ? { error: streamError } : {})
+    ...(error ? { error } : {})
   }
 }
 
