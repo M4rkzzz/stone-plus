@@ -10,6 +10,7 @@ const stone: GatewayApi = {
   refreshAccountModels: (id) => ipcRenderer.invoke('stone:refresh-account-models', id),
   testAccountModel: (accountId, model) => ipcRenderer.invoke('stone:test-account-model', accountId, model),
   importChatGptAccounts: (input) => ipcRenderer.invoke('stone:import-chatgpt-accounts', input),
+  importChatGptAccountFiles: (input) => ipcRenderer.invoke('stone:import-chatgpt-account-files', input),
   deleteAccount: (id) => ipcRenderer.invoke('stone:delete-account', id),
   saveProxy: (input) => ipcRenderer.invoke('stone:save-proxy', input),
   deleteProxy: (id) => ipcRenderer.invoke('stone:delete-proxy', id),
@@ -56,6 +57,9 @@ const stone: GatewayApi = {
   startFrpTunnel: () => ipcRenderer.invoke('stone:start-frp-tunnel'),
   stopFrpTunnel: () => ipcRenderer.invoke('stone:stop-frp-tunnel'),
   clearFrpTunnelLogs: () => ipcRenderer.invoke('stone:clear-frp-tunnel-logs'),
+  inspectCodexSessionRepair: () => ipcRenderer.invoke('stone:inspect-codex-session-repair'),
+  previewCodexSessionRepair: (targetProvider) => ipcRenderer.invoke('stone:preview-codex-session-repair', targetProvider),
+  repairCodexSessions: (targetProvider, expectedRevision) => ipcRenderer.invoke('stone:repair-codex-sessions', targetProvider, expectedRevision),
   onSnapshot: (listener) => {
     const handler = (_event: Electron.IpcRendererEvent, snapshot: Awaited<ReturnType<GatewayApi['getSnapshot']>>) => {
       listener(snapshot)

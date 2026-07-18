@@ -475,6 +475,39 @@ export interface ChatGptAccountImportResult {
   warnings: string[]
 }
 
+export interface ChatGptAccountFileImportInput {
+  providerId: string
+}
+
+export interface ChatGptAccountFileImportFileResult {
+  fileName: string
+  status: 'imported' | 'failed'
+  importedAccounts: number
+  createdAccounts: number
+  updatedAccounts: number
+  error?: string
+}
+
+export interface ChatGptAccountDetectionResult {
+  accountId: string
+  accountName: string
+  ok: boolean
+  latencyMs?: number
+  error?: string
+}
+
+export interface ChatGptAccountFileImportResult {
+  snapshot: AppSnapshot
+  cancelled: boolean
+  selectedFiles: number
+  fileResults: ChatGptAccountFileImportFileResult[]
+  importedAccountIds: string[]
+  createdAccountIds: string[]
+  updatedAccountIds: string[]
+  detectionResults: ChatGptAccountDetectionResult[]
+  warnings: string[]
+}
+
 export interface PoolInput {
   id?: string
   name: string
@@ -593,6 +626,49 @@ export interface FrpTunnelState {
   logs: string[]
 }
 
+export type CodexSessionRepairTargetSource = 'config' | 'rollout' | 'sqlite'
+
+export interface CodexSessionRepairTarget {
+  id: string
+  sources: CodexSessionRepairTargetSource[]
+  isCurrentProvider: boolean
+}
+
+export interface CodexSessionRepairOverview {
+  codexHome: string
+  currentProvider: string
+  targets: CodexSessionRepairTarget[]
+  sessionFiles: number
+  archivedSessionFiles: number
+  indexedThreads: number
+  sqliteDatabases: string[]
+  skippedFiles: string[]
+}
+
+export interface CodexSessionRepairPreview extends CodexSessionRepairOverview {
+  targetProvider: string
+  revision: string
+  rolloutFilesToUpdate: number
+  sqliteProviderRowsToUpdate: number
+  sqliteUserEventRowsToUpdate: number
+  sqliteCwdRowsToUpdate: number
+  encryptedSessionFiles: number
+  encryptedSourceProviders: string[]
+}
+
+export interface CodexSessionRepairResult {
+  targetProvider: string
+  repairedRolloutFiles: number
+  sqliteProviderRowsUpdated: number
+  sqliteUserEventRowsUpdated: number
+  sqliteCwdRowsUpdated: number
+  skippedFiles: string[]
+  encryptedSessionFiles: number
+  encryptedSourceProviders: string[]
+  backupPath?: string
+  retentionWarning?: string
+}
+
 export interface GatewayApi {
   getSnapshot(): Promise<AppSnapshot>
   saveProvider(input: ProviderInput): Promise<AppSnapshot>
@@ -602,6 +678,7 @@ export interface GatewayApi {
   refreshAccountModels(id: string): Promise<AppSnapshot>
   testAccountModel(accountId: string, model: string): Promise<AccountModelTestResult>
   importChatGptAccounts(input: ChatGptAccountImportInput): Promise<ChatGptAccountImportResult>
+  importChatGptAccountFiles(input: ChatGptAccountFileImportInput): Promise<ChatGptAccountFileImportResult>
   deleteAccount(id: string): Promise<AppSnapshot>
   saveProxy(input: ProxyInput): Promise<AppSnapshot>
   deleteProxy(id: string): Promise<AppSnapshot>
@@ -648,6 +725,9 @@ export interface GatewayApi {
   startFrpTunnel(): Promise<FrpTunnelState>
   stopFrpTunnel(): Promise<FrpTunnelState>
   clearFrpTunnelLogs(): Promise<FrpTunnelState>
+  inspectCodexSessionRepair(): Promise<CodexSessionRepairOverview>
+  previewCodexSessionRepair(targetProvider: string): Promise<CodexSessionRepairPreview>
+  repairCodexSessions(targetProvider: string, expectedRevision: string): Promise<CodexSessionRepairResult>
   onSnapshot(listener: (snapshot: AppSnapshot) => void): () => void
   onUpdateState(listener: (state: AppUpdateState) => void): () => void
 }

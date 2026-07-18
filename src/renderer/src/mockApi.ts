@@ -763,6 +763,34 @@ export function createMockApi(): GatewayApi {
         warnings: ['No refresh token']
       }
     },
+    async importChatGptAccountFiles(input) {
+      await pause(500)
+      const accountId = makeId('chatgpt-file')
+      const timestamp = Date.now()
+      const account: PublicAccount = {
+        id: accountId, providerId: input.providerId, name: 'CPA Plus Account',
+        maskedCredential: 'chatgpt-****demo', credentialType: 'chatgpt-oauth',
+        credentialExpiresAt: timestamp + 3_600_000, renewable: false, status: 'active', priority: 10, weight: 10,
+        maxConcurrency: 4, inFlight: 0, latencyMs: 820, availableModels: [], modelPolicy: 'all', modelAllowlist: [],
+        circuitState: 'closed', consecutiveFailures: 0, createdAt: timestamp, updatedAt: timestamp
+      }
+      snapshot.accounts.push(account)
+      publish()
+      return {
+        snapshot: clone(snapshot),
+        cancelled: false,
+        selectedFiles: 2,
+        fileResults: [
+          { fileName: 'codex-plus-1.json', status: 'imported', importedAccounts: 1, createdAccounts: 1, updatedAccounts: 0 },
+          { fileName: 'sub2api-export.json', status: 'imported', importedAccounts: 1, createdAccounts: 0, updatedAccounts: 1 },
+        ],
+        importedAccountIds: [accountId],
+        createdAccountIds: [accountId],
+        updatedAccountIds: [],
+        detectionResults: [{ accountId, accountName: account.name, ok: true, latencyMs: 820 }],
+        warnings: ['codex-plus-1.json：已从 JWT user_id 自动补全 1 个 CPA 账号的 account_id。']
+      }
+    },
     async deleteAccount(id: string) {
       if (snapshot.pools.some((pool) => pool.members.some((member) => member.accountId === id))) {
         throw new Error('该账号仍在号池中，请先从号池移除')
@@ -1153,6 +1181,48 @@ export function createMockApi(): GatewayApi {
     async clearFrpTunnelLogs() {
       frpTunnelState = { ...frpTunnelState, logs: [] }
       return clone(frpTunnelState)
+    },
+    async inspectCodexSessionRepair() {
+      return {
+        codexHome: 'C:\\Users\\demo\\.codex',
+        currentProvider: 'stone',
+        targets: [
+          { id: 'stone', sources: ['config', 'rollout', 'sqlite'], isCurrentProvider: true },
+          { id: 'openai', sources: ['config', 'rollout', 'sqlite'], isCurrentProvider: false },
+        ],
+        sessionFiles: 44,
+        archivedSessionFiles: 64,
+        indexedThreads: 107,
+        sqliteDatabases: ['C:\\Users\\demo\\.codex\\state_5.sqlite'],
+        skippedFiles: [],
+      }
+    },
+    async previewCodexSessionRepair(targetProvider) {
+      return {
+        ...(await this.inspectCodexSessionRepair()),
+        targetProvider,
+        revision: 'a'.repeat(64),
+        rolloutFilesToUpdate: targetProvider === 'stone' ? 18 : 90,
+        sqliteProviderRowsToUpdate: targetProvider === 'stone' ? 21 : 86,
+        sqliteUserEventRowsToUpdate: 2,
+        sqliteCwdRowsToUpdate: 3,
+        encryptedSessionFiles: 1,
+        encryptedSourceProviders: ['openai'],
+      }
+    },
+    async repairCodexSessions(targetProvider) {
+      await pause(420)
+      return {
+        targetProvider,
+        repairedRolloutFiles: 18,
+        sqliteProviderRowsUpdated: 21,
+        sqliteUserEventRowsUpdated: 2,
+        sqliteCwdRowsUpdated: 3,
+        skippedFiles: [],
+        encryptedSessionFiles: 1,
+        encryptedSourceProviders: ['openai'],
+        backupPath: 'C:\\Users\\demo\\.codex\\backups_state\\stone-session-repair\\20260718210000000-demo',
+      }
     },
     onSnapshot(listener) {
       listeners.add(listener)

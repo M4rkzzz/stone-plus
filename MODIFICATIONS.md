@@ -15,6 +15,10 @@ The first Stone+ release, `v0.8.3`, is based on upstream Stone `v0.8.2`
 - lower-latency connection reuse, HTTP/2 negotiation, immediate SSE header/chunk forwarding,
   connection warming, reduced stream-redaction buffering, targeted state persistence,
   and optional speed-aware `autobalanced` account scheduling;
+- Codex historical-session visibility repair with provider metadata synchronization,
+  preview validation, recoverable backups, and transactional SQLite index updates;
+- native CPA/Sub2API JSON batch account import, JWT account-ID recovery, and
+  post-import concurrent account health checks;
 - additional tests and desktop integration supporting these features.
 
 Original copyright and license notices are retained in `LICENSE`, `NOTICE`,

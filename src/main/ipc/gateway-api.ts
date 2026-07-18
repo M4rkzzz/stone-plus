@@ -1,6 +1,7 @@
-import { app, BrowserWindow, ipcMain, Notification } from 'electron'
+import { app, BrowserWindow, dialog, ipcMain, Notification } from 'electron'
 import { randomUUID } from 'node:crypto'
-import { basename, join } from 'node:path'
+import { lstat, readFile } from 'node:fs/promises'
+import { basename, extname, join } from 'node:path'
 import { clientNativeProtocols } from '@shared/types'
 import type {
   AccountModelTestResult,
@@ -84,6 +85,45 @@ export function registerGatewayApi(
     return snapshot
   }
 
+  const probeAndPersistAccount = async (id: string): Promise<{
+    snapshot: AppSnapshot
+    ok: boolean
+    latencyMs?: number
+    error?: string
+  }> => {
+    const previous = store.getSnapshot().accounts.find((account) => account.id === id)
+    await store.setAccountCheckResult(id, { status: 'checking', lastError: undefined })
+    publish(refreshRuntime())
+    try {
+      const result = await checkAccount(store, outboundTransport, id)
+      await store.setAccountCheckResult(id, {
+        status: 'active',
+        circuitState: 'closed',
+        consecutiveFailures: 0,
+        latencyMs: result.latencyMs,
+        lastError: undefined,
+        lastUsedAt: Date.now(),
+        cooldownUntil: undefined,
+        ...(result.codexQuota ? { codexQuota: result.codexQuota } : {})
+      })
+      gateway.resetAccountHealth(id)
+      return { snapshot: publish(refreshRuntime()), ok: true, latencyMs: result.latencyMs }
+    } catch (error: unknown) {
+      const failure = error instanceof AccountProbeError ? error.failure : undefined
+      const shouldDisable = failure?.accountAction === 'disable'
+      const shouldCooldown = failure?.accountAction === 'cooldown'
+      const errorMessage = error instanceof Error ? error.message : 'Account check failed.'
+      await store.setAccountCheckResult(id, {
+        status: shouldDisable ? 'disabled' : shouldCooldown ? 'cooldown' : previous?.status ?? 'disabled',
+        circuitState: shouldDisable || shouldCooldown ? 'open' : previous?.circuitState,
+        consecutiveFailures: (store.getSnapshot().accounts.find((account) => account.id === id)?.consecutiveFailures ?? 0) + 1,
+        cooldownUntil: shouldCooldown ? Date.now() + (failure?.retryAfterMs ?? 30_000) : previous?.cooldownUntil,
+        lastError: errorMessage
+      })
+      return { snapshot: publish(refreshRuntime()), ok: false, error: errorMessage }
+    }
+  }
+
   gateway.onLog((log) => {
     void store.appendLog(log).then(() => {
       scheduleRuntimePublish()
@@ -161,6 +201,93 @@ export function registerGatewayApi(
   ipcMain.handle('stone:import-chatgpt-accounts', (event, input: Parameters<GatewayApi['importChatGptAccounts']>[0]) => {
     assertTrustedSender(event)
     return store.importChatGptAccounts(input).then((result) => ({ ...result, snapshot: publish(refreshRuntime()) }))
+  })
+  ipcMain.handle('stone:import-chatgpt-account-files', async (event, input: Parameters<GatewayApi['importChatGptAccountFiles']>[0]) => {
+    assertTrustedSender(event)
+    if (!input || typeof input.providerId !== 'string' || !input.providerId.trim()) {
+      throw new Error('批量导入前请选择 OpenAI Responses Provider。')
+    }
+    const owner = BrowserWindow.fromWebContents(event.sender)
+    if (!owner) throw new Error('无法打开账号文件选择器。')
+    const selection = await dialog.showOpenDialog(owner, {
+      title: '选择 CPA / Sub2API 账号 JSON',
+      buttonLabel: '导入并检测',
+      properties: ['openFile', 'multiSelections'],
+      filters: [
+        { name: 'CPA / Sub2API JSON', extensions: ['json', 'txt'] },
+        { name: 'JSON', extensions: ['json'] }
+      ]
+    })
+    if (selection.canceled || !selection.filePaths.length) {
+      return emptyFileImportResult(store.getSnapshot())
+    }
+    if (selection.filePaths.length > 100) throw new Error('一次最多导入 100 个账号文件。')
+
+    const fileResults: Awaited<ReturnType<GatewayApi['importChatGptAccountFiles']>>['fileResults'] = []
+    const readableFiles: Array<{ fileName: string; content: string }> = []
+    let totalBytes = 0
+    for (const path of selection.filePaths) {
+      const fileName = basename(path)
+      try {
+        if (!['.json', '.txt'].includes(extname(fileName).toLowerCase())) throw new Error('只支持 .json 或 .txt 文件。')
+        const info = await lstat(path)
+        if (!info.isFile() || info.isSymbolicLink()) throw new Error('所选路径不是普通账号文件。')
+        if (info.size > 4 * 1024 * 1024) throw new Error('单个账号文件不能超过 4 MB。')
+        totalBytes += info.size
+        readableFiles.push({ fileName, content: await readFile(path, 'utf8') })
+      } catch (error) {
+        fileResults.push({ fileName, status: 'failed', importedAccounts: 0, createdAccounts: 0, updatedAccounts: 0, error: importErrorMessage(error) })
+      }
+    }
+    if (totalBytes > 32 * 1024 * 1024) throw new Error('本次所选账号文件总大小不能超过 32 MB。')
+
+    const importedAccountIds: string[] = []
+    const createdAccountIds: string[] = []
+    const updatedAccountIds: string[] = []
+    const warnings: string[] = []
+    for (const file of readableFiles) {
+      try {
+        const imported = await store.importChatGptAccounts({ providerId: input.providerId, content: file.content })
+        importedAccountIds.push(...imported.importedAccountIds)
+        createdAccountIds.push(...imported.createdAccountIds)
+        updatedAccountIds.push(...imported.updatedAccountIds)
+        warnings.push(...imported.warnings.map((warning) => `${file.fileName}：${warning}`))
+        fileResults.push({
+          fileName: file.fileName,
+          status: 'imported',
+          importedAccounts: imported.importedAccountIds.length,
+          createdAccounts: imported.createdAccountIds.length,
+          updatedAccounts: imported.updatedAccountIds.length
+        })
+      } catch (error) {
+        fileResults.push({ fileName: file.fileName, status: 'failed', importedAccounts: 0, createdAccounts: 0, updatedAccounts: 0, error: importErrorMessage(error) })
+      }
+    }
+    publish(refreshRuntime())
+
+    const uniqueImportedIds = [...new Set(importedAccountIds)]
+    const detectionResults = await mapConcurrent(uniqueImportedIds, 3, async (accountId) => {
+      const checked = await probeAndPersistAccount(accountId)
+      const accountName = checked.snapshot.accounts.find((account) => account.id === accountId)?.name ?? 'ChatGPT account'
+      return {
+        accountId,
+        accountName,
+        ok: checked.ok,
+        ...(checked.latencyMs !== undefined ? { latencyMs: checked.latencyMs } : {}),
+        ...(checked.error ? { error: checked.error } : {})
+      }
+    })
+    return {
+      snapshot: store.getSnapshot(),
+      cancelled: false,
+      selectedFiles: selection.filePaths.length,
+      fileResults: fileResults.sort((left, right) => left.fileName.localeCompare(right.fileName)),
+      importedAccountIds: uniqueImportedIds,
+      createdAccountIds: [...new Set(createdAccountIds)],
+      updatedAccountIds: [...new Set(updatedAccountIds)],
+      detectionResults,
+      warnings: [...new Set(warnings)]
+    }
   })
   ipcMain.handle('stone:delete-account', (event, id: string) => {
     assertTrustedSender(event)
@@ -249,36 +376,7 @@ export function registerGatewayApi(
   })
   ipcMain.handle('stone:check-account', async (event, id: string) => {
     assertTrustedSender(event)
-    const previous = store.getSnapshot().accounts.find((account) => account.id === id)
-    await store.setAccountCheckResult(id, { status: 'checking', lastError: undefined })
-    publish(refreshRuntime())
-    try {
-      const result = await checkAccount(store, outboundTransport, id)
-      await store.setAccountCheckResult(id, {
-        status: 'active',
-        circuitState: 'closed',
-        consecutiveFailures: 0,
-        latencyMs: result.latencyMs,
-        lastError: undefined,
-        lastUsedAt: Date.now(),
-        cooldownUntil: undefined,
-        ...(result.codexQuota ? { codexQuota: result.codexQuota } : {})
-      })
-      gateway.resetAccountHealth(id)
-      return publish(refreshRuntime())
-    } catch (error: unknown) {
-      const failure = error instanceof AccountProbeError ? error.failure : undefined
-      const shouldDisable = failure?.accountAction === 'disable'
-      const shouldCooldown = failure?.accountAction === 'cooldown'
-      await store.setAccountCheckResult(id, {
-        status: shouldDisable ? 'disabled' : shouldCooldown ? 'cooldown' : previous?.status ?? 'disabled',
-        circuitState: shouldDisable || shouldCooldown ? 'open' : previous?.circuitState,
-        consecutiveFailures: (store.getSnapshot().accounts.find((account) => account.id === id)?.consecutiveFailures ?? 0) + 1,
-        cooldownUntil: shouldCooldown ? Date.now() + (failure?.retryAfterMs ?? 30_000) : previous?.cooldownUntil,
-        lastError: error instanceof Error ? error.message : 'Account check failed.'
-      })
-      return publish(refreshRuntime())
-    }
+    return (await probeAndPersistAccount(id)).snapshot
   })
   ipcMain.handle('stone:refresh-account-codex-quota', async (event, id: string) => {
     assertTrustedSender(event)
@@ -812,4 +910,46 @@ function backupIdFromPath(path: string): string {
   const expectedPath = join(app.getPath('userData'), 'backups', id)
   if (path !== id && path !== expectedPath) throw new Error('Backup path is outside Stone backup storage.')
   return id
+}
+
+function emptyFileImportResult(snapshot: AppSnapshot): Awaited<ReturnType<GatewayApi['importChatGptAccountFiles']>> {
+  return {
+    snapshot,
+    cancelled: true,
+    selectedFiles: 0,
+    fileResults: [],
+    importedAccountIds: [],
+    createdAccountIds: [],
+    updatedAccountIds: [],
+    detectionResults: [],
+    warnings: []
+  }
+}
+
+async function mapConcurrent<T, R>(
+  values: T[],
+  concurrency: number,
+  operation: (value: T) => Promise<R>
+): Promise<R[]> {
+  const results = new Array<R>(values.length)
+  let nextIndex = 0
+  const worker = async (): Promise<void> => {
+    while (nextIndex < values.length) {
+      const index = nextIndex
+      nextIndex += 1
+      results[index] = await operation(values[index])
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(Math.max(1, concurrency), values.length) }, () => worker()))
+  return results
+}
+
+function importErrorMessage(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error)
+  if (/access_token/i.test(message)) return '未找到 access_token。'
+  if (/account_id/i.test(message)) return '未找到 account_id，且无法从 JWT user_id 自动补全。'
+  if (/expired/i.test(message)) return '账号 Access Token 已过期。'
+  if (/expiration/i.test(message)) return '无法确定账号过期时间。'
+  if (/JSON|Unexpected token|Unexpected end/i.test(message)) return 'JSON 格式无效。'
+  return message.slice(0, 240)
 }

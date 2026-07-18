@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.8.6
+
+- Added Codex historical-session repair with provider discovery, dry-run counts,
+  stale-preview protection, automatic rollout/SQLite backups, transactional index
+  updates, rollback, encrypted-content guidance, and a dedicated Stone+ UI.
+- Added native multi-file CPA and Sub2API JSON account imports, automatic recovery
+  of missing CPA `account_id` values from JWT claims, and immediate concurrent
+  account health checks after import.
+
 ## 0.8.5
 
 - Added an overview chart for average output-token speed over 30 minutes, 4 hours,

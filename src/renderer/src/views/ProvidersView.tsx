@@ -3,6 +3,8 @@ import {
   Boxes,
   CheckCircle2,
   Edit3,
+  Files,
+  FolderOpen,
   KeyRound,
   LoaderCircle,
   MoreHorizontal,
@@ -263,6 +265,7 @@ export function ProvidersView({
   const [chatGptImportOpen, setChatGptImportOpen] = useState(false)
   const [chatGptImport, setChatGptImport] = useState({ providerId: snapshot.providers.find((provider) => provider.kind === 'openai' && provider.protocol === 'openai-responses')?.id ?? '', name: '', content: '' })
   const [importNotice, setImportNotice] = useState('')
+  const [fileImportBusy, setFileImportBusy] = useState(false)
   const [quotaAccountId, setQuotaAccountId] = useState<string | null>(null)
 
   const providerById = useMemo(() => new Map(snapshot.providers.map((provider) => [provider.id, provider])), [snapshot.providers])
@@ -433,6 +436,37 @@ export function ProvidersView({
     }
   }
 
+  const importChatGptFiles = async () => {
+    if (!chatGptImport.providerId) {
+      setErrors({ chatgptImport: '批量导入前请选择 OpenAI Responses Provider' })
+      return
+    }
+    setFileImportBusy(true)
+    setErrors({})
+    try {
+      const result = await api.importChatGptAccountFiles({ providerId: chatGptImport.providerId })
+      if (result.cancelled) return
+      setChatGptImportOpen(false)
+      const importedFiles = result.fileResults.filter((file) => file.status === 'imported').length
+      const failedFiles = result.fileResults.filter((file) => file.status === 'failed')
+      const detected = result.detectionResults.filter((item) => item.ok).length
+      const detectionFailed = result.detectionResults.length - detected
+      const details = [
+        `批量导入完成：选择 ${result.selectedFiles} 个文件，成功 ${importedFiles} 个，失败 ${failedFiles.length} 个`,
+        `新增 ${result.createdAccountIds.length} 个，更新 ${result.updatedAccountIds.length} 个账号`,
+        `检测可用 ${detected} 个，检测失败 ${detectionFailed} 个`,
+        ...failedFiles.slice(0, 3).map((file) => `${file.fileName}：${file.error ?? '导入失败'}`),
+        ...result.detectionResults.filter((item) => !item.ok).slice(0, 3).map((item) => `${item.accountName}：${item.error ?? '检测失败'}`),
+        ...result.warnings.slice(0, 3),
+      ]
+      setImportNotice(details.join('；'))
+    } catch (cause) {
+      setErrors({ chatgptImport: cause instanceof Error ? cause.message : 'CPA / Sub2API 文件导入失败' })
+    } finally {
+      setFileImportBusy(false)
+    }
+  }
+
   return (
     <div className="page-stack">
       <PageHeader
@@ -547,16 +581,24 @@ export function ProvidersView({
 
       <Modal
         open={chatGptImportOpen}
-        title="导入 ChatGPT Team / Business 账号"
-        description="导入 Codex OAuth session JSON。Stone 会加密保存 Token，并通过 ChatGPT Codex 后端而不是 Platform API 使用账号。"
+        title="导入 ChatGPT / Codex 账号"
+        description="支持 CPA、Sub2API 导出和 Codex OAuth session JSON；Stone+ 会加密保存 Token。"
         onClose={() => setChatGptImportOpen(false)}
         width="large"
-        footer={<><button className="button button--secondary" type="button" onClick={() => setChatGptImportOpen(false)}>取消</button><button className="button button--primary" type="submit" form="chatgpt-account-import"><KeyRound size={16} />导入账号</button></>}
+        closable={!fileImportBusy}
+        footer={<><button className="button button--secondary" type="button" disabled={fileImportBusy} onClick={() => setChatGptImportOpen(false)}>取消</button><button className="button button--primary" type="submit" form="chatgpt-account-import" disabled={fileImportBusy}><KeyRound size={16} />粘贴内容导入</button></>}
       >
         <form id="chatgpt-account-import" className="form-grid" onSubmit={(event) => void submitChatGptImport(event)}>
           <label className="field field--full"><span>OpenAI Responses Provider</span><select required value={chatGptImport.providerId} onChange={(event) => setChatGptImport({ ...chatGptImport, providerId: event.target.value })}><option value="">选择 Provider</option>{snapshot.providers.filter((provider) => provider.kind === 'openai' && provider.protocol === 'openai-responses').map((provider) => <option key={provider.id} value={provider.id}>{provider.name}</option>)}</select><small>没有可选项时，先用接入向导创建 OpenAI Provider。</small></label>
+          <div className="account-file-import field--full">
+            <span className="account-file-import__icon"><Files size={20} /></span>
+            <div><strong>批量导入 CPA / Sub2API JSON</strong><span>在文件选择器中按 Ctrl 或 Shift 多选；自动补全缺失的 account_id，导入后立即并发检测账号。</span></div>
+            <button className="button button--secondary" type="button" disabled={fileImportBusy || !chatGptImport.providerId} onClick={() => void importChatGptFiles()}>
+              {fileImportBusy ? <LoaderCircle size={16} className="spin" /> : <FolderOpen size={16} />}{fileImportBusy ? '正在导入并检测…' : '选择多个 JSON'}
+            </button>
+          </div>
           <label className="field field--full"><span>账号名称（可选）</span><input value={chatGptImport.name} onChange={(event) => setChatGptImport({ ...chatGptImport, name: event.target.value })} placeholder="留空则使用账号邮箱" /></label>
-          <label className="field field--full"><span>Session JSON</span><textarea required className="mono" rows={12} value={chatGptImport.content} onChange={(event) => setChatGptImport({ ...chatGptImport, content: event.target.value })} placeholder={'粘贴 accents/*.json 内容\n支持单个对象、数组或每行一个 JSON'} /><small>支持 access_token、account_id、expired、refresh_token 等字段；不会将内容发送到 renderer 之外的第三方。</small><FieldError>{errors.chatgptImport}</FieldError></label>
+          <label className="field field--full"><span>粘贴 JSON / Token</span><textarea required className="mono" rows={10} value={chatGptImport.content} onChange={(event) => setChatGptImport({ ...chatGptImport, content: event.target.value })} placeholder={'粘贴 CPA 对象、Sub2API 导出、数组、逐行 JSON 或 Access Token'} /><small>支持 snake_case、camelCase、Sub2API credentials 嵌套字段，以及从 JWT user_id 自动修复空 account_id。</small><FieldError>{errors.chatgptImport}</FieldError></label>
         </form>
       </Modal>
 

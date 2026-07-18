@@ -11,7 +11,8 @@ type InvokeHandler = (event: unknown, ...args: unknown[]) => unknown
 const electron = vi.hoisted(() => ({
   handlers: new Map<string, InvokeHandler>(),
   fromWebContents: vi.fn(() => ({})),
-  getAllWindows: vi.fn(() => [])
+  getAllWindows: vi.fn(() => []),
+  showOpenDialog: vi.fn()
 }))
 
 vi.mock('electron', () => ({
@@ -24,6 +25,9 @@ vi.mock('electron', () => ({
   BrowserWindow: {
     fromWebContents: electron.fromWebContents,
     getAllWindows: electron.getAllWindows
+  },
+  dialog: {
+    showOpenDialog: electron.showOpenDialog
   },
   ipcMain: {
     handle: vi.fn((channel: string, handler: InvokeHandler) => electron.handlers.set(channel, handler))
@@ -47,7 +51,30 @@ const provider: ProviderDefinition = {
 describe('refresh provider models IPC', () => {
   beforeEach(() => {
     electron.handlers.clear()
+    electron.showOpenDialog.mockReset()
+    electron.fromWebContents.mockReturnValue({})
     vi.stubEnv('ELECTRON_RENDERER_URL', 'http://127.0.0.1:5173')
+  })
+
+  it('opens a multi-file picker for CPA and Sub2API account JSON imports', async () => {
+    electron.showOpenDialog.mockResolvedValue({ canceled: true, filePaths: [] })
+    const harness = createHarness([oauthAccount()], {}, vi.fn())
+    const handler = electron.handlers.get('stone:import-chatgpt-account-files')
+    if (!handler) throw new Error('import-chatgpt-account-files handler was not registered')
+    const mainFrame = { url: 'http://127.0.0.1:5173/index.html' }
+
+    const result = await handler(
+      { senderFrame: mainFrame, sender: { mainFrame } },
+      { providerId: provider.id }
+    ) as { cancelled: boolean; selectedFiles: number }
+
+    expect(result).toMatchObject({ cancelled: true, selectedFiles: 0 })
+    expect(electron.showOpenDialog).toHaveBeenCalledOnce()
+    expect(electron.showOpenDialog.mock.calls[0][1]).toMatchObject({
+      properties: ['openFile', 'multiSelections'],
+      filters: expect.arrayContaining([expect.objectContaining({ extensions: ['json', 'txt'] })])
+    })
+    expect(harness.store.getSnapshot).toHaveBeenCalled()
   })
 
   it('coalesces rapid request-log snapshots before publishing to the renderer', async () => {

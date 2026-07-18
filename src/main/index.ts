@@ -13,7 +13,8 @@ import { OutboundTransportManager, resolveEffectiveProxy } from './proxy'
 import { UpdateService } from './update'
 import { FrpTunnelService } from './tunnel'
 import { registerTunnelApi } from './ipc/tunnel-api'
-import { CodexConversationTitleResolver } from './codex'
+import { CodexConversationTitleResolver, CodexSessionRepairService } from './codex'
+import { registerCodexSessionRepairApi } from './ipc/session-repair-api'
 
 const { autoUpdater } = electronUpdater
 
@@ -26,6 +27,7 @@ let outboundTransport: OutboundTransportManager
 let updateService: UpdateService
 let tunnelService: FrpTunnelService
 let codexConversationTitles: CodexConversationTitleResolver
+let codexSessionRepair: CodexSessionRepairService
 let isQuitting = false
 let storeClosed = false
 let shutdownForUpdate = false
@@ -42,6 +44,7 @@ async function bootstrap(): Promise<void> {
   await store.initialize()
   outboundTransport = new OutboundTransportManager()
   codexConversationTitles = new CodexConversationTitleResolver(app.getPath('home'))
+  codexSessionRepair = new CodexSessionRepairService({ codexHome: join(app.getPath('home'), '.codex') })
   await store.refreshRequestConversationTitles((conversationId) => codexConversationTitles.resolve(conversationId))
   backups = new DatabaseBackupService({
     userDataPath: app.getPath('userData'),
@@ -103,6 +106,7 @@ async function bootstrap(): Promise<void> {
   await tunnelService.initialize()
 
   registerGatewayApi(store, gateway, clientConfig, outboundTransport, backups, updateTrayMenu)
+  registerCodexSessionRepairApi(codexSessionRepair)
   registerUpdateApi(updateService)
   registerTunnelApi(tunnelService)
   createWindow()

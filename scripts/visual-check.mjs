@@ -5,7 +5,7 @@ import { chromium } from 'playwright-core'
 
 const baseUrl = process.env.STONE_PREVIEW_URL ?? 'http://127.0.0.1:5173'
 const outputDirectory = fileURLToPath(new URL('../.artifacts/visual/', import.meta.url))
-const pages = ['总览', '供应商', '号池', '路由', '客户端', '请求', '设置']
+const pages = ['总览', '供应商', '号池', '路由', '客户端', '会话修复', '请求', '设置']
 const modalCases = [
   {
     name: 'account-model-modal',
@@ -22,6 +22,14 @@ const modalCases = [
     open: async (page) => {
       const card = page.locator('.pool-card').filter({ hasText: 'Codex 主线路' })
       await card.locator('.text-button').filter({ hasText: '编辑配置' }).click()
+    }
+  },
+  {
+    name: 'account-import-modal',
+    page: '供应商',
+    scrollTo: '.account-file-import',
+    open: async (page) => {
+      await page.getByRole('button', { name: '导入 ChatGPT 账号' }).click()
     }
   }
 ]
@@ -59,7 +67,7 @@ try {
       await modalCase.open(page)
       const modal = page.locator('.modal')
       await modal.waitFor()
-      await modal.locator('.model-policy').scrollIntoViewIfNeeded()
+      await modal.locator(modalCase.scrollTo ?? '.model-policy').scrollIntoViewIfNeeded()
       await page.waitForTimeout(150)
       const layout = await inspectLayout(page, '.modal')
       await page.screenshot({ path: join(outputDirectory, `${viewport.name}-${modalCase.name}.png`) })

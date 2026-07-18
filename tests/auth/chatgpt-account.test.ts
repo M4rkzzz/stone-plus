@@ -134,6 +134,79 @@ describe('ChatGPT account import', () => {
     expect(parsed.warnings[0]).not.toContain('claim@example.com')
   })
 
+  it('repairs CPA JSON with an empty account_id from the JWT auth user_id claim', () => {
+    const expiresAtSeconds = Math.floor(Date.now() / 1000) + 3600
+    const accessToken = ['header', Buffer.from(JSON.stringify({
+      exp: expiresAtSeconds,
+      email: 'cpa@example.com',
+      sub: 'auth0|not-the-cpa-account-id',
+      'https://api.openai.com/auth': { user_id: 'user-cpa-123' }
+    })).toString('base64url'), 'signature'].join('.')
+
+    const parsed = parseChatGptAccountImport(JSON.stringify({
+      type: 'codex',
+      access_token: accessToken,
+      account_id: '',
+      chatgpt_account_id: '',
+      email: 'cpa@example.com',
+      expired: new Date(expiresAtSeconds * 1000).toISOString(),
+      refresh_token: ''
+    }))
+
+    expect(parsed.accounts[0]).toMatchObject({
+      accountId: 'user-cpa-123',
+      userId: 'user-cpa-123',
+      email: 'cpa@example.com'
+    })
+    expect(parsed.repairedAccountIdCount).toBe(1)
+    expect(parsed.warnings.join(' ')).toContain('自动补全')
+  })
+
+  it('imports OpenAI OAuth credentials from a Sub2API data export and ignores other platforms', () => {
+    const expiresAtSeconds = Math.floor(Date.now() / 1000) + 3600
+    const accessToken = token(expiresAtSeconds, 'acct_sub2api', 'user_sub2api')
+    const parsed = parseChatGptAccountImport(JSON.stringify({
+      type: 'sub2api-data',
+      version: 1,
+      exported_at: new Date().toISOString(),
+      proxies: [],
+      accounts: [
+        {
+          name: 'sub2api@example.com',
+          platform: 'openai',
+          type: 'oauth',
+          credentials: {
+            access_token: accessToken,
+            refresh_token: 'refresh-sub2api',
+            account_id: 'acct_sub2api',
+            email: 'sub2api@example.com'
+          },
+          expires_at: expiresAtSeconds,
+          concurrency: 10,
+          priority: 1
+        },
+        {
+          name: 'claude-account',
+          platform: 'anthropic',
+          type: 'oauth',
+          credentials: { access_token: 'ignored' }
+        }
+      ]
+    }))
+
+    expect(parsed.accounts).toHaveLength(1)
+    expect(parsed.accounts[0]).toMatchObject({
+      accessToken,
+      refreshToken: 'refresh-sub2api',
+      accountId: 'acct_sub2api',
+      userId: 'user_sub2api',
+      email: 'sub2api@example.com',
+      expiresAt: expiresAtSeconds * 1000
+    })
+    expect(parsed.warnings.join(' ')).toContain('Sub2API')
+    expect(parsed.warnings.join(' ')).toContain('忽略 1 个')
+  })
+
   it('rejects expired sessions and round-trips valid encrypted payloads', () => {
     expect(() => parseChatGptAccountImport(JSON.stringify({
       access_token: token(1), account_id: 'acct_expired', expired: '2000-01-01T00:00:00Z'
