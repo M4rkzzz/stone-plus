@@ -4947,7 +4947,7 @@ html.is-electron .boot-screen { background: var(--app-chrome); }
   .app-shell--collapsed .sidebar__brand { justify-content: flex-start; padding: 0 17px; }
   .app-shell--collapsed .sidebar__brand-text,
   .app-shell--collapsed .nav-item > span:not(.nav-count),
-  .app-shell--collapsed .sidebar-collapse span { display: initial; }
+  .app-shell--collapsed .sidebar-collapse span { opacity: 1; pointer-events: auto; }
   .app-shell--collapsed .nav-item { justify-content: flex-start; padding: 0 11px; }
   .app-shell--collapsed .nav-count { position: static; min-width: 20px; height: 20px; margin-left: auto; padding: 0 6px; font-size: 11px; }
   .app-shell--collapsed .sidebar-collapse { justify-content: flex-start; padding: 0 10px; }
