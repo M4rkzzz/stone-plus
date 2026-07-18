@@ -1,6 +1,7 @@
-import { useEffect, useId, type PropsWithChildren, type ReactNode } from 'react'
-import { AlertCircle, Check, LoaderCircle, X } from 'lucide-react'
-import type { AccountCircuitState, AccountStatus, Protocol, RequestLog } from '@shared/types'
+import { useEffect, useId, useLayoutEffect, useRef, useState, type CSSProperties, type PropsWithChildren, type ReactNode } from 'react'
+import { createPortal } from 'react-dom'
+import { AlertCircle, Check, LoaderCircle, MoreHorizontal, X } from 'lucide-react'
+import type { AccountCircuitState, AccountImportProgress, AccountStatus, Protocol, RequestLog } from '@shared/types'
 
 export const protocolLabels: Record<Protocol, string> = {
   'anthropic-messages': 'Anthropic Messages',
@@ -173,6 +174,97 @@ export function Toggle({ checked, onChange, label }: { checked: boolean; onChang
       <span />
     </button>
   )
+}
+
+export function OverflowMenu({
+  open,
+  onOpenChange,
+  label,
+  children,
+}: PropsWithChildren<{
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  label: string
+}>) {
+  const triggerRef = useRef<HTMLButtonElement>(null)
+  const menuRef = useRef<HTMLDivElement>(null)
+  const [position, setPosition] = useState<CSSProperties>({ visibility: 'hidden' })
+
+  useLayoutEffect(() => {
+    if (!open) return
+    const updatePosition = () => {
+      const trigger = triggerRef.current
+      const menu = menuRef.current
+      if (!trigger || !menu) return
+      const triggerRect = trigger.getBoundingClientRect()
+      const menuRect = menu.getBoundingClientRect()
+      const viewportMargin = 8
+      const gap = 4
+      const maximumLeft = Math.max(viewportMargin, window.innerWidth - menuRect.width - viewportMargin)
+      const left = Math.max(viewportMargin, Math.min(maximumLeft, triggerRect.right - menuRect.width))
+      const roomBelow = window.innerHeight - triggerRect.bottom - viewportMargin
+      const top = roomBelow >= menuRect.height + gap
+        ? triggerRect.bottom + gap
+        : Math.max(viewportMargin, triggerRect.top - menuRect.height - gap)
+      setPosition({ top, left, visibility: 'visible' })
+    }
+    updatePosition()
+    window.addEventListener('resize', updatePosition)
+    window.addEventListener('scroll', updatePosition, true)
+    return () => {
+      window.removeEventListener('resize', updatePosition)
+      window.removeEventListener('scroll', updatePosition, true)
+    }
+  }, [open])
+
+  useEffect(() => {
+    if (!open) return
+    const closeOnOutsidePointer = (event: PointerEvent) => {
+      const target = event.target as Node
+      if (!triggerRef.current?.contains(target) && !menuRef.current?.contains(target)) onOpenChange(false)
+    }
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        onOpenChange(false)
+        triggerRef.current?.focus()
+      }
+    }
+    document.addEventListener('pointerdown', closeOnOutsidePointer)
+    document.addEventListener('keydown', closeOnEscape)
+    return () => {
+      document.removeEventListener('pointerdown', closeOnOutsidePointer)
+      document.removeEventListener('keydown', closeOnEscape)
+    }
+  }, [onOpenChange, open])
+
+  return <div className="menu-wrap">
+    <button
+      ref={triggerRef}
+      className="icon-button"
+      type="button"
+      title={label}
+      aria-label={label}
+      aria-haspopup="menu"
+      aria-expanded={open}
+      onClick={() => onOpenChange(!open)}
+    >
+      <MoreHorizontal size={18} />
+    </button>
+    {open && createPortal(
+      <div ref={menuRef} className="context-menu context-menu--portal" role="menu" style={position}>{children}</div>,
+      document.body,
+    )}
+  </div>
+}
+
+export function ImportProgress({ progress }: { progress: AccountImportProgress }) {
+  const percent = Math.max(0, Math.min(100, Math.round(progress.percent)))
+  const phaseLabel = progress.phase === 'importing' ? '导入账号' : progress.phase === 'refreshing' ? '刷新状态与模型' : '处理完成'
+  return <div className="account-import-progress" role="progressbar" aria-label="账号导入总体进度" aria-valuemin={0} aria-valuemax={100} aria-valuenow={percent}>
+    <div className="account-import-progress__heading"><strong>{phaseLabel}</strong><span>{percent}%</span></div>
+    <div className="account-import-progress__track"><span style={{ width: `${percent}%` }} /></div>
+    <div className="account-import-progress__detail"><span>{progress.message}</span><small>导入 0–50% · 状态与模型 50–100%</small></div>
+  </div>
 }
 
 export function EmptyState({ icon, title, description, action }: { icon: ReactNode; title: string; description: string; action?: ReactNode }) {

@@ -589,20 +589,21 @@ export class AppStore {
     const selectedIds = [...new Set(ids.filter((id) => typeof id === 'string' && id.trim()))]
     if (!selectedIds.length) throw new Error('Select at least one account to delete.')
     const selectedIdSet = new Set(selectedIds)
+    const timestamp = Date.now()
     await this.store.update((state) => {
       const missing = selectedIds.filter((id) => !state.accounts.some((account) => account.id === id))
       if (missing.length) throw new Error('One of the selected accounts no longer exists.')
-      const blockedIds = new Set(state.pools.flatMap((pool) => pool.members
-        .filter((member) => selectedIdSet.has(member.accountId))
-        .map((member) => member.accountId)))
-      if (blockedIds.size) {
-        const names = state.accounts.filter((account) => blockedIds.has(account.id)).map((account) => account.name)
-        throw new Error(`Remove selected accounts from their pools before deleting them: ${names.join(', ')}`)
+      for (const pool of state.pools) {
+        const members = pool.members.filter((member) => !selectedIdSet.has(member.accountId))
+        if (members.length === pool.members.length) continue
+        pool.members = members
+        pool.updatedAt = timestamp
       }
       for (const account of state.accounts) {
         if (selectedIdSet.has(account.id)) delete state.credentials[account.credentialId]
       }
       state.accounts = state.accounts.filter((candidate) => !selectedIdSet.has(candidate.id))
+      reconcilePoolModelAllowlists(state, timestamp)
     })
     await Promise.all(selectedIds.map((id) => this.store.deleteCodexQuotaHistory(id)))
     return this.getSnapshot()

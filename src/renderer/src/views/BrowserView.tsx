@@ -18,11 +18,12 @@ import {
 } from 'lucide-react'
 import type {
   AppSnapshot,
+  AccountImportProgress,
   BrowserImportQueueState,
   ChatGptAccountImportProxyMode,
   GatewayApi,
 } from '@shared/types'
-import { Badge, Modal } from '../ui'
+import { Badge, ImportProgress, Modal } from '../ui'
 
 const DEFAULT_URL = 'https://aiprobe.top/'
 const SHORTCUTS_KEY = 'stone.builtin-browser.shortcuts.v1'
@@ -79,6 +80,8 @@ export function BrowserView({ snapshot, api }: { snapshot: AppSnapshot; api: Gat
   const [proxyMode, setProxyMode] = useState<ChatGptAccountImportProxyMode>('preserve')
   const [proxyId, setProxyId] = useState('')
   const [busy, setBusy] = useState(false)
+  const [importProgress, setImportProgress] = useState<AccountImportProgress | null>(null)
+  const importProgressId = useRef<string | null>(null)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
 
@@ -95,6 +98,10 @@ export function BrowserView({ snapshot, api }: { snapshot: AppSnapshot; api: Gat
     void api.getBrowserImportQueue().then(setQueue).catch(() => undefined)
     return api.onBrowserImportQueue(setQueue)
   }, [api])
+
+  useEffect(() => api.onAccountImportProgress((progress) => {
+    if (progress.progressId === importProgressId.current) setImportProgress(progress)
+  }), [api])
 
   const updateTab = useCallback((id: string, patch: Partial<BrowserTab>): void => {
     setTabs((current) => current.map((tab) => tab.id === id ? { ...tab, ...patch } : tab))
@@ -175,6 +182,9 @@ export function BrowserView({ snapshot, api }: { snapshot: AppSnapshot; api: Gat
   const importSelected = async (): Promise<void> => {
     if (!providerId) { setError('请选择 OpenAI Responses Provider。'); return }
     if (!selectedReadyIds.length) { setError('请至少选择一个已下载完成的 JSON。'); return }
+    const progressId = crypto.randomUUID()
+    importProgressId.current = progressId
+    setImportProgress({ progressId, phase: 'importing', completed: 0, total: selectedReadyIds.length, percent: 0, message: '正在准备批量导入…' })
     setBusy(true)
     setError('')
     try {
@@ -183,14 +193,19 @@ export function BrowserView({ snapshot, api }: { snapshot: AppSnapshot; api: Gat
         providerId,
         proxyMode,
         proxyId: proxyMode === 'proxy' ? proxyId : undefined,
+        progressId,
       })
       const succeeded = result.fileResults.filter((item) => item.status === 'imported').length
       const failed = result.fileResults.filter((item) => item.status === 'failed')
-      setNotice(`批量导入完成：文件成功 ${succeeded} 个、失败 ${failed.length} 个；新增 ${result.createdAccountIds.length} 个账号、更新 ${result.updatedAccountIds.length} 个账号。${failed[0]?.error ? ` ${failed[0].fileName}：${failed[0].error}` : ''}`)
+      const modelsRefreshed = result.detectionResults.filter((item) => item.availableModelCount !== undefined).length
+      const modelFailures = result.detectionResults.filter((item) => item.modelRefreshError)
+      setNotice(`批量导入完成：文件成功 ${succeeded} 个、失败 ${failed.length} 个；新增 ${result.createdAccountIds.length} 个账号、更新 ${result.updatedAccountIds.length} 个账号；模型刷新成功 ${modelsRefreshed} 个、失败 ${modelFailures.length} 个。${failed[0]?.error ? ` ${failed[0].fileName}：${failed[0].error}` : modelFailures[0]?.modelRefreshError ? ` ${modelFailures[0].accountName}：${modelFailures[0].modelRefreshError}` : ''}`)
       setImportOpen(false)
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : '挂起 JSON 批量导入失败')
     } finally {
+      importProgressId.current = null
+      setImportProgress(null)
       setBusy(false)
     }
   }
@@ -296,8 +311,9 @@ export function BrowserView({ snapshot, api }: { snapshot: AppSnapshot; api: Gat
             if (value === '__preserve__') { setProxyMode('preserve'); setProxyId('') }
             else if (value === '__direct__') { setProxyMode('direct'); setProxyId('') }
             else { setProxyMode('proxy'); setProxyId(value) }
-          }}><option value="__preserve__">不指定 / 沿用 JSON 配置</option><option value="__direct__">直连（清除 JSON 代理）</option>{snapshot.proxies.map((proxy) => <option value={proxy.id} key={proxy.id}>{proxy.name} · {proxy.protocol.toUpperCase()} · {proxy.host}:{proxy.port}</option>)}</select><small>{proxyMode === 'proxy' ? '本批账号统一使用所选代理，导入后的账号检测也走该代理。' : proxyMode === 'direct' ? '本批账号全部直连，并清除 JSON 中的代理设置。' : '保留 JSON 内仍有效的 proxyId；没有有效代理时使用直连。'}</small></label>
+          }}><option value="__preserve__">不指定 / 沿用 JSON 配置</option><option value="__direct__">直连（清除 JSON 代理）</option>{snapshot.proxies.map((proxy) => <option value={proxy.id} key={proxy.id}>{proxy.name} · {proxy.protocol.toUpperCase()} · {proxy.host}:{proxy.port}</option>)}</select><small>{proxyMode === 'proxy' ? '本批账号统一使用所选代理，导入后的状态刷新与模型查询也走该代理。' : proxyMode === 'direct' ? '本批账号全部直连，并清除 JSON 中的代理设置。' : '保留 JSON 内仍有效的 proxyId；没有有效代理时使用直连。'}</small></label>
         </div>
+        {busy && importProgress && <ImportProgress progress={importProgress} />}
         {error && <div className="client-config-message error-banner"><XCircle size={16} /><span>{error}</span></div>}
         <div className="browser-import-list">
           <div className="browser-import-list__head"><label><input type="checkbox" checked={readyItems.length > 0 && selectedReadyIds.length === readyItems.length} onChange={(event) => setSelectedIds(event.target.checked ? readyItems.map((item) => item.id) : [])} />全选已完成文件</label><span>{queue.items.length} 个记录</span></div>

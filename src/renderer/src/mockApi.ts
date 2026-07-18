@@ -1,5 +1,6 @@
 import type {
   AccountInput,
+  AccountImportProgress,
   AppSnapshot,
   AppUpdateState,
   BrowserImportQueueState,
@@ -631,6 +632,7 @@ export function createMockApi(): GatewayApi {
     logs: [],
   }
   const listeners = new Set<(value: AppSnapshot) => void>()
+  const accountImportProgressListeners = new Set<(value: AccountImportProgress) => void>()
   const updateListeners = new Set<(value: AppUpdateState) => void>()
   const browserImportListeners = new Set<(value: BrowserImportQueueState) => void>()
   let browserImportQueue: BrowserImportQueueState = { items: [], readyCount: 0, totalBytes: 0, revision: 0 }
@@ -662,6 +664,12 @@ export function createMockApi(): GatewayApi {
     const value = clone(snapshot)
     listeners.forEach((listener) => listener(value))
     return value
+  }
+
+  const emitImportProgress = (progressId: string | undefined, progress: Omit<AccountImportProgress, 'progressId'>) => {
+    if (!progressId) return
+    const value = { progressId, ...progress }
+    for (const listener of accountImportProgressListeners) listener(value)
   }
 
   const changed = async () => {
@@ -793,6 +801,7 @@ export function createMockApi(): GatewayApi {
       }
     },
     async importChatGptAccounts(input) {
+      emitImportProgress(input.progressId, { phase: 'importing', completed: 0, total: 1, percent: 0, message: '正在解析并导入账号…' })
       const parsed = JSON.parse(input.content) as { account_id?: string; email?: string; expired?: string; proxy_id?: string; proxyId?: string }
       const selectedProxyId = input.proxyMode === 'proxy'
         ? input.proxyId
@@ -813,17 +822,30 @@ export function createMockApi(): GatewayApi {
         circuitState: 'closed', consecutiveFailures: 0, createdAt: timestamp, updatedAt: timestamp
       }
       snapshot.accounts.push(account)
+      await changed()
+      emitImportProgress(input.progressId, { phase: 'importing', completed: 1, total: 1, percent: 50, message: '已导入 1 个账号' })
+      emitImportProgress(input.progressId, { phase: 'refreshing', completed: 0, total: 1, percent: 50, message: '正在刷新状态与查询模型 0/1' })
+      await pause(180)
+      account.availableModels = ['gpt-5.5', 'gpt-5.5-mini']
+      account.modelsRefreshedAt = Date.now()
+      const refreshedSnapshot = publish()
+      emitImportProgress(input.progressId, { phase: 'refreshing', completed: 1, total: 1, percent: 100, message: '正在刷新状态与查询模型 1/1' })
+      emitImportProgress(input.progressId, { phase: 'complete', completed: 1, total: 1, percent: 100, message: '导入、状态刷新与模型查询已完成' })
       return {
-        snapshot: await changed(),
+        snapshot: refreshedSnapshot,
         importedAccountIds: [account.id],
         createdAccountIds: [account.id],
         updatedAccountIds: [],
         warnings: ['No refresh token'],
-        detectionResults: [{ accountId: account.id, accountName: account.name, ok: true, latencyMs: 820 }]
+        detectionResults: [{ accountId: account.id, accountName: account.name, ok: true, latencyMs: 820, availableModelCount: 2 }]
       }
     },
     async importChatGptAccountFiles(input) {
-      await pause(500)
+      emitImportProgress(input.progressId, { phase: 'importing', completed: 0, total: 2, percent: 0, message: '正在导入文件 0/2' })
+      await pause(180)
+      emitImportProgress(input.progressId, { phase: 'importing', completed: 1, total: 2, percent: 25, message: '正在导入文件 1/2' })
+      await pause(180)
+      emitImportProgress(input.progressId, { phase: 'importing', completed: 2, total: 2, percent: 50, message: '正在导入文件 2/2' })
       if (input.proxyMode === 'proxy' && !snapshot.proxies.some((proxy) => proxy.id === input.proxyId)) {
         throw new Error('选择的出口代理已被删除，请重新选择后再导入。')
       }
@@ -839,6 +861,13 @@ export function createMockApi(): GatewayApi {
       }
       snapshot.accounts.push(account)
       publish()
+      emitImportProgress(input.progressId, { phase: 'refreshing', completed: 0, total: 1, percent: 50, message: '正在刷新状态与查询模型 0/1' })
+      await pause(180)
+      account.availableModels = ['gpt-5.5', 'gpt-5.5-mini']
+      account.modelsRefreshedAt = Date.now()
+      publish()
+      emitImportProgress(input.progressId, { phase: 'refreshing', completed: 1, total: 1, percent: 100, message: '正在刷新状态与查询模型 1/1' })
+      emitImportProgress(input.progressId, { phase: 'complete', completed: 1, total: 1, percent: 100, message: '导入、状态刷新与模型查询已完成' })
       return {
         snapshot: clone(snapshot),
         cancelled: false,
@@ -850,7 +879,7 @@ export function createMockApi(): GatewayApi {
         importedAccountIds: [accountId],
         createdAccountIds: [accountId],
         updatedAccountIds: [],
-        detectionResults: [{ accountId, accountName: account.name, ok: true, latencyMs: 820 }],
+        detectionResults: [{ accountId, accountName: account.name, ok: true, latencyMs: 820, availableModelCount: 2 }],
         warnings: ['codex-plus-1.json：已从 JWT user_id 自动补全 1 个 CPA 账号的 account_id。']
       }
     },
@@ -887,18 +916,22 @@ export function createMockApi(): GatewayApi {
       return { ...result, selectedFiles }
     },
     async deleteAccount(id: string) {
-      if (snapshot.pools.some((pool) => pool.members.some((member) => member.accountId === id))) {
-        throw new Error('该账号仍在号池中，请先从号池移除')
-      }
       snapshot.accounts = snapshot.accounts.filter((account) => account.id !== id)
+      snapshot.pools = snapshot.pools.map((pool) => ({
+        ...pool,
+        members: pool.members.filter((member) => member.accountId !== id),
+      }))
+      reconcileMockPoolModels()
       return changed()
     },
     async deleteAccounts(ids: string[]) {
       const selected = new Set(ids)
-      if (snapshot.pools.some((pool) => pool.members.some((member) => selected.has(member.accountId)))) {
-        throw new Error('部分所选账号仍在号池中，请先从号池移除')
-      }
       snapshot.accounts = snapshot.accounts.filter((account) => !selected.has(account.id))
+      snapshot.pools = snapshot.pools.map((pool) => ({
+        ...pool,
+        members: pool.members.filter((member) => !selected.has(member.accountId)),
+      }))
+      reconcileMockPoolModels()
       return changed()
     },
     async exportChatGptAccounts(input) {
@@ -1378,6 +1411,10 @@ export function createMockApi(): GatewayApi {
     onSnapshot(listener) {
       listeners.add(listener)
       return () => listeners.delete(listener)
+    },
+    onAccountImportProgress(listener) {
+      accountImportProgressListeners.add(listener)
+      return () => accountImportProgressListeners.delete(listener)
     },
     onBrowserImportQueue(listener) {
       browserImportListeners.add(listener)

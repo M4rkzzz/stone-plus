@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type UIEvent } from 'react'
 import {
   Activity,
   Boxes,
@@ -86,6 +86,7 @@ export default function App() {
   const [updateError, setUpdateError] = useState<string | null>(null)
   const [updateDialogOpen, setUpdateDialogOpen] = useState(false)
   const updateRevision = useRef(-1)
+  const scrollbarHideTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
 
   const acceptUpdateState = useCallback((next: AppUpdateState) => {
     if (next.revision <= updateRevision.current) return
@@ -162,6 +163,20 @@ export default function App() {
     window.history.replaceState(null, '', `#${id}`)
     setMobileNavOpen(false)
   }
+
+  const revealContentScrollbar = useCallback((event: UIEvent<HTMLElement>) => {
+    const element = event.currentTarget
+    element.classList.add('page-content--scrolling')
+    if (scrollbarHideTimer.current) clearTimeout(scrollbarHideTimer.current)
+    scrollbarHideTimer.current = setTimeout(() => {
+      element.classList.remove('page-content--scrolling')
+      scrollbarHideTimer.current = undefined
+    }, 700)
+  }, [])
+
+  useEffect(() => () => {
+    if (scrollbarHideTimer.current) clearTimeout(scrollbarHideTimer.current)
+  }, [])
 
   const runUpdateStateOperation = useCallback(async (
     action: UpdateAction,
@@ -294,13 +309,9 @@ export default function App() {
         </nav>
 
         <div className="sidebar__footer">
-          <div className="vault-indicator" title={`凭据存储：${snapshot.vaultBackend}`}>
-            <span className={`status-dot ${snapshot.vaultAvailable ? 'status-dot--online' : 'status-dot--error'}`} />
-            <span>{snapshot.vaultAvailable ? '凭据保险库可用' : '凭据保险库不可用'}</span>
-          </div>
           <button className="sidebar-collapse" type="button" onClick={() => setSidebarCollapsed((value) => !value)} title={sidebarCollapsed ? '展开侧栏' : '收起侧栏'}>
             <ChevronLeft size={17} />
-            <span>收起侧栏</span>
+            <span>{sidebarCollapsed ? '展开侧栏' : '收起侧栏'}</span>
           </button>
         </div>
       </aside>
@@ -363,7 +374,7 @@ export default function App() {
           />
         )}
 
-        <main className="page-content">
+        <main className="page-content" onScroll={revealContentScrollbar}>
           {page === 'overview' && <OverviewView snapshot={snapshot} navigate={setActivePage} />}
           {page === 'providers' && <ProvidersView snapshot={snapshot} api={api} runAction={runAction} busyKeys={busyKeys} />}
           {page === 'pools' && <PoolsView snapshot={snapshot} api={api} runAction={runAction} busyKeys={busyKeys} />}

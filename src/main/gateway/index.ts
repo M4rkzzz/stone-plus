@@ -36,6 +36,7 @@ export type {
   GatewayConfig,
   GatewayController,
   GatewayLogHandler,
+  GatewayRuntimeStateHandler,
   GatewayServerOptions,
   ProtocolRequest,
   ScheduledAccount,

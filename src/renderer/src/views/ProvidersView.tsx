@@ -8,7 +8,6 @@ import {
   FolderOpen,
   KeyRound,
   LoaderCircle,
-  MoreHorizontal,
   Network,
   Plus,
   RefreshCw,
@@ -18,6 +17,7 @@ import {
 import type {
   AccountInput,
   AccountFitnessSnapshot,
+  AccountImportProgress,
   AccountModelTestResult,
   AppSnapshot,
   ChatGptAccountImportProxyMode,
@@ -39,7 +39,9 @@ import {
   durationLabel,
   EmptyState,
   FieldError,
+  ImportProgress,
   Modal,
+  OverflowMenu,
   PageHeader,
   protocolLabels,
   relativeTime,
@@ -445,6 +447,8 @@ export function ProvidersView({
   })
   const [importNotice, setImportNotice] = useState('')
   const [fileImportBusy, setFileImportBusy] = useState(false)
+  const [importProgress, setImportProgress] = useState<AccountImportProgress | null>(null)
+  const importProgressId = useRef<string | null>(null)
   const [quotaAccountId, setQuotaAccountId] = useState<string | null>(null)
   const [selectedAccountIds, setSelectedAccountIds] = useState<string[]>([])
   const [bulkDeleteOpen, setBulkDeleteOpen] = useState(false)
@@ -577,6 +581,10 @@ export function ProvidersView({
   useEffect(() => {
     window.localStorage.setItem(HIDE_EXHAUSTED_ACCOUNTS_STORAGE_KEY, String(hideExhaustedAccounts))
   }, [hideExhaustedAccounts])
+
+  useEffect(() => api.onAccountImportProgress((progress) => {
+    if (progress.progressId === importProgressId.current) setImportProgress(progress)
+  }), [api])
 
   useEffect(() => {
     const existingIds = new Set(snapshot.accounts.map((account) => account.id))
@@ -711,17 +719,25 @@ export function ProvidersView({
 
   const submitChatGptImport = async (event: React.FormEvent) => {
     event.preventDefault()
+    const progressId = crypto.randomUUID()
+    importProgressId.current = progressId
+    setImportProgress({ progressId, phase: 'importing', completed: 0, total: 1, percent: 0, message: '正在准备导入…' })
     setFileImportBusy(true)
     setErrors({})
     try {
-      const result = await api.importChatGptAccounts(chatGptImport)
+      const result = await api.importChatGptAccounts({ ...chatGptImport, progressId })
       setChatGptImportOpen(false)
       setChatGptImport({ ...chatGptImport, content: '' })
       const detected = result.detectionResults.filter((item) => item.ok).length
-      setImportNotice(`导入完成：新增 ${result.createdAccountIds.length} 个，更新 ${result.updatedAccountIds.length} 个 ChatGPT/Codex 账号；检测可用 ${detected} 个，失败 ${result.detectionResults.length - detected} 个${result.warnings.length ? `；${result.warnings.join(' ')}` : ''}`)
+      const modelsRefreshed = result.detectionResults.filter((item) => item.availableModelCount !== undefined).length
+      const modelFailures = result.detectionResults.length - modelsRefreshed
+      const modelWarnings = result.detectionResults.filter((item) => item.modelRefreshError).slice(0, 3).map((item) => `${item.accountName} 模型：${item.modelRefreshError}`)
+      setImportNotice(`导入完成：新增 ${result.createdAccountIds.length} 个，更新 ${result.updatedAccountIds.length} 个 ChatGPT/Codex 账号；检测可用 ${detected} 个，失败 ${result.detectionResults.length - detected} 个；模型刷新成功 ${modelsRefreshed} 个，失败 ${modelFailures} 个${[...modelWarnings, ...result.warnings].length ? `；${[...modelWarnings, ...result.warnings].join(' ')}` : ''}`)
     } catch (cause) {
       setErrors({ chatgptImport: cause instanceof Error ? cause.message : 'ChatGPT 账号导入失败' })
     } finally {
+      importProgressId.current = null
+      setImportProgress(null)
       setFileImportBusy(false)
     }
   }
@@ -731,13 +747,17 @@ export function ProvidersView({
       setErrors({ chatgptImport: '批量导入前请选择 OpenAI Responses Provider' })
       return
     }
+    const progressId = crypto.randomUUID()
+    importProgressId.current = progressId
+    setImportProgress({ progressId, phase: 'importing', completed: 0, total: 1, percent: 0, message: '等待选择账号文件…' })
     setFileImportBusy(true)
     setErrors({})
     try {
       const result = await api.importChatGptAccountFiles({
         providerId: chatGptImport.providerId,
         proxyMode: chatGptImport.proxyMode,
-        proxyId: chatGptImport.proxyId || undefined
+        proxyId: chatGptImport.proxyId || undefined,
+        progressId,
       })
       if (result.cancelled) return
       setChatGptImportOpen(false)
@@ -745,18 +765,24 @@ export function ProvidersView({
       const failedFiles = result.fileResults.filter((file) => file.status === 'failed')
       const detected = result.detectionResults.filter((item) => item.ok).length
       const detectionFailed = result.detectionResults.length - detected
+      const modelsRefreshed = result.detectionResults.filter((item) => item.availableModelCount !== undefined).length
+      const modelFailures = result.detectionResults.length - modelsRefreshed
       const details = [
         `批量导入完成：选择 ${result.selectedFiles} 个文件，成功 ${importedFiles} 个，失败 ${failedFiles.length} 个`,
         `新增 ${result.createdAccountIds.length} 个，更新 ${result.updatedAccountIds.length} 个账号`,
         `检测可用 ${detected} 个，检测失败 ${detectionFailed} 个`,
+        `模型刷新成功 ${modelsRefreshed} 个，失败 ${modelFailures} 个`,
         ...failedFiles.slice(0, 3).map((file) => `${file.fileName}：${file.error ?? '导入失败'}`),
         ...result.detectionResults.filter((item) => !item.ok).slice(0, 3).map((item) => `${item.accountName}：${item.error ?? '检测失败'}`),
+        ...result.detectionResults.filter((item) => item.modelRefreshError).slice(0, 3).map((item) => `${item.accountName} 模型：${item.modelRefreshError}`),
         ...result.warnings.slice(0, 3),
       ]
       setImportNotice(details.join('；'))
     } catch (cause) {
       setErrors({ chatgptImport: cause instanceof Error ? cause.message : 'CPA / Sub2API 文件导入失败' })
     } finally {
+      importProgressId.current = null
+      setImportProgress(null)
       setFileImportBusy(false)
     }
   }
@@ -883,6 +909,7 @@ export function ProvidersView({
                   <button type="button" onClick={() => selectAccounts(() => true)}>全选</button>
                   <button type="button" onClick={() => selectAccounts((account) => !accountIsCooling(account))}>非冷却</button>
                   <button type="button" onClick={() => selectAccounts((account) => accountIsCooling(account))}>冷却中</button>
+                  <button type="button" onClick={() => selectAccounts((account) => account.status === 'disabled')}>已停用</button>
                   <button type="button" onClick={() => selectAccounts((account) => accountQuotaIsExhausted(account))}>额度耗尽</button>
                   <button type="button" disabled={!selectedAccountIds.length} onClick={() => setSelectedAccountIds([])}>清空</button>
                 </div>
@@ -926,10 +953,7 @@ export function ProvidersView({
                         <td className="actions-cell">
                           <button className="icon-button" type="button" title="刷新此账号的可用模型" disabled={refreshingModels} onClick={() => void runAction(`refresh-account-models-${account.id}`, () => api.refreshAccountModels(account.id))}>{refreshingModels ? <LoaderCircle size={16} className="spin" /> : <Boxes size={16} />}</button>
                           <button className="icon-button" type="button" title="检测账号" disabled={checking} onClick={() => void runAction(`check-${account.id}`, () => api.checkAccount(account.id))}>{checking ? <LoaderCircle size={16} className="spin" /> : <RefreshCw size={16} />}</button>
-                          <div className="menu-wrap">
-                            <button className="icon-button" type="button" title="更多操作" onClick={() => setMenuOpen(menuOpen === account.id ? null : account.id)}><MoreHorizontal size={18} /></button>
-                            {menuOpen === account.id && <div className="context-menu"><button type="button" onClick={() => openAccount(account)}><Edit3 size={15} />编辑</button><button className="danger" type="button" onClick={() => { setDeleteTarget({ kind: 'account', id: account.id, name: account.name }); setMenuOpen(null) }}><Trash2 size={15} />删除</button></div>}
-                          </div>
+                          <OverflowMenu open={menuOpen === account.id} onOpenChange={(open) => setMenuOpen(open ? account.id : null)} label="更多操作"><button type="button" onClick={() => openAccount(account)}><Edit3 size={15} />编辑</button><button className="danger" type="button" onClick={() => { setDeleteTarget({ kind: 'account', id: account.id, name: account.name }); setMenuOpen(null) }}><Trash2 size={15} />删除</button></OverflowMenu>
                         </td>
                       </tr>
                     )
@@ -959,10 +983,7 @@ export function ProvidersView({
                   <div className="provider-card__top">
                     <span className="provider-avatar provider-avatar--large" style={{ '--provider-color': provider.color ?? '#61736f' } as React.CSSProperties}>{provider.name.slice(0, 1)}</span>
                     <div><h2>{provider.name}</h2><span>{providerKindLabels[provider.kind]}</span></div>
-                    <div className="menu-wrap">
-                      <button className="icon-button" type="button" title="供应商操作" onClick={() => setMenuOpen(menuOpen === provider.id ? null : provider.id)}><MoreHorizontal size={18} /></button>
-                      {menuOpen === provider.id && <div className="context-menu"><button type="button" onClick={() => openProvider(provider)}><Edit3 size={15} />编辑</button><button className="danger" type="button" onClick={() => { setDeleteTarget({ kind: 'provider', id: provider.id, name: provider.name }); setMenuOpen(null) }}><Trash2 size={15} />删除</button></div>}
-                    </div>
+                    <OverflowMenu open={menuOpen === provider.id} onOpenChange={(open) => setMenuOpen(open ? provider.id : null)} label="供应商操作"><button type="button" onClick={() => openProvider(provider)}><Edit3 size={15} />编辑</button><button className="danger" type="button" onClick={() => { setDeleteTarget({ kind: 'provider', id: provider.id, name: provider.name }); setMenuOpen(null) }}><Trash2 size={15} />删除</button></OverflowMenu>
                   </div>
                   <div className="provider-card__endpoint"><span>基础地址</span><code>{provider.baseUrl}</code></div>
                   <div className="provider-card__meta"><Badge tone="info">{protocolLabels[provider.protocol]}</Badge><span><KeyRound size={14} />{count} 个账号</span><span><Boxes size={14} />{provider.models.length} 个模型</span></div>
@@ -1023,7 +1044,7 @@ export function ProvidersView({
         onClose={() => setChatGptImportOpen(false)}
         width="large"
         closable={!fileImportBusy}
-        footer={<><button className="button button--secondary" type="button" disabled={fileImportBusy} onClick={() => setChatGptImportOpen(false)}>取消</button><button className="button button--primary" type="submit" form="chatgpt-account-import" disabled={fileImportBusy}><KeyRound size={16} />粘贴内容导入</button></>}
+        footer={<><button className="button button--secondary" type="button" disabled={fileImportBusy} onClick={() => setChatGptImportOpen(false)}>取消</button><button className="button button--primary" type="submit" form="chatgpt-account-import" disabled={fileImportBusy}>{fileImportBusy ? <LoaderCircle size={16} className="spin" /> : <KeyRound size={16} />}{fileImportBusy ? '正在导入并刷新…' : '粘贴内容导入'}</button></>}
       >
         <form id="chatgpt-account-import" className="form-grid" onSubmit={(event) => void submitChatGptImport(event)}>
           <label className="field field--full"><span>OpenAI Responses Provider</span><select required value={chatGptImport.providerId} onChange={(event) => setChatGptImport({ ...chatGptImport, providerId: event.target.value })}><option value="">选择 Provider</option>{snapshot.providers.filter((provider) => provider.kind === 'openai' && provider.protocol === 'openai-responses').map((provider) => <option key={provider.id} value={provider.id}>{provider.name}</option>)}</select><small>没有可选项时，先用接入向导创建 OpenAI Provider。</small></label>
@@ -1048,15 +1069,16 @@ export function ProvidersView({
               ? '保留文件中仍然存在的 proxyId；未配置或已失效时使用直连。'
               : chatGptImport.proxyMode === 'direct'
                 ? '本批次所有账号都使用直连，并移除文件中的 proxyId。'
-                : '本批次所有账号统一使用所选代理；导入后的账号检测也通过该代理。'}</small>
+                : '本批次所有账号统一使用所选代理；导入后的状态刷新与模型查询也通过该代理。'}</small>
           </label>
           <div className="account-file-import field--full">
             <span className="account-file-import__icon"><Files size={20} /></span>
-            <div><strong>批量导入 CPA / Sub2API JSON</strong><span>在文件选择器中按 Ctrl 或 Shift 多选；自动补全缺失的 account_id，导入后立即并发检测账号。</span></div>
+            <div><strong>批量导入 CPA / Sub2API JSON</strong><span>在文件选择器中按 Ctrl 或 Shift 多选；自动补全缺失的 account_id，导入后立即刷新状态并查询可用模型。</span></div>
             <button className="button button--secondary" type="button" disabled={fileImportBusy || !chatGptImport.providerId} onClick={() => void importChatGptFiles()}>
               {fileImportBusy ? <LoaderCircle size={16} className="spin" /> : <FolderOpen size={16} />}{fileImportBusy ? '正在导入并检测…' : '选择多个 JSON'}
             </button>
           </div>
+          {fileImportBusy && importProgress && <div className="field--full"><ImportProgress progress={importProgress} /></div>}
           <label className="field field--full"><span>账号名称（可选）</span><input value={chatGptImport.name} onChange={(event) => setChatGptImport({ ...chatGptImport, name: event.target.value })} placeholder="留空则使用账号邮箱" /></label>
           <label className="field field--full"><span>粘贴 JSON / Token</span><textarea required className="mono" rows={10} value={chatGptImport.content} onChange={(event) => setChatGptImport({ ...chatGptImport, content: event.target.value })} placeholder={'粘贴 CPA 对象、Sub2API 导出、数组、逐行 JSON 或 Access Token'} /><small>支持 snake_case、camelCase、Sub2API credentials 嵌套字段，以及从 JWT user_id 自动修复空 account_id。</small><FieldError>{errors.chatgptImport}</FieldError></label>
         </form>
@@ -1105,7 +1127,7 @@ export function ProvidersView({
       <ConfirmDialog
         open={bulkDeleteOpen}
         title="批量删除账号"
-        message={`确定删除已选择的 ${selectedAccountIds.length} 个账号吗？仍属于号池的账号会阻止整次删除。此操作无法撤销。`}
+        message={`确定删除已选择的 ${selectedAccountIds.length} 个账号吗？这些账号会自动从所属号池移除，此操作无法撤销。`}
         busy={busyKeys.has('delete-accounts')}
         onCancel={() => setBulkDeleteOpen(false)}
         onConfirm={() => void confirmBulkDelete()}
@@ -1114,7 +1136,9 @@ export function ProvidersView({
       <ConfirmDialog
         open={Boolean(deleteTarget)}
         title={`删除${deleteTarget?.kind === 'provider' ? '供应商' : '账号'}`}
-        message={`确定删除“${deleteTarget?.name ?? ''}”吗？此操作无法撤销。`}
+        message={deleteTarget?.kind === 'account'
+          ? `确定删除“${deleteTarget.name}”吗？该账号会自动从所属号池移除，此操作无法撤销。`
+          : `确定删除“${deleteTarget?.name ?? ''}”吗？此操作无法撤销。`}
         busy={busyKeys.has('delete-item')}
         onCancel={() => setDeleteTarget(null)}
         onConfirm={() => void confirmDelete()}

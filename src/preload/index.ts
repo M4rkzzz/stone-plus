@@ -76,6 +76,13 @@ const stone: GatewayApi = {
     ipcRenderer.on('stone:snapshot', handler)
     return () => ipcRenderer.removeListener('stone:snapshot', handler)
   },
+  onAccountImportProgress: (listener) => {
+    const handler = (_event: Electron.IpcRendererEvent, progress: Parameters<typeof listener>[0]) => {
+      listener(progress)
+    }
+    ipcRenderer.on('stone:account-import-progress', handler)
+    return () => ipcRenderer.removeListener('stone:account-import-progress', handler)
+  },
   onBrowserImportQueue: (listener) => {
     const handler = (_event: Electron.IpcRendererEvent, state: Awaited<ReturnType<GatewayApi['getBrowserImportQueue']>>) => {
       listener(state)

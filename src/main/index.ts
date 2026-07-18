@@ -173,8 +173,16 @@ function createWindow(): void {
     minWidth: 1040,
     minHeight: 680,
     show: false,
-    backgroundColor: '#f3f5f4',
+    backgroundColor: '#f9fbfa',
     icon: stoneIconPath(),
+    titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'hidden',
+    ...(process.platform === 'darwin' ? {} : {
+      titleBarOverlay: {
+        color: '#f9fbfa00',
+        symbolColor: '#3d4a45',
+        height: 38
+      }
+    }),
     webPreferences: {
       preload: join(__dirname, '../preload/index.cjs'),
       contextIsolation: true,

@@ -5,7 +5,6 @@ import {
   Edit3,
   Layers3,
   LoaderCircle,
-  MoreHorizontal,
   Network,
   Plus,
   Shuffle,
@@ -21,6 +20,7 @@ import {
   EmptyState,
   FieldError,
   Modal,
+  OverflowMenu,
   PageHeader,
   protocolLabels,
 } from '../ui'
@@ -177,10 +177,7 @@ export function PoolsView({
                 <header className="pool-card__header">
                   <div className="pool-icon"><Network size={19} /></div>
                   <div><h2>{pool.name}</h2><span>{protocolLabels[pool.protocol]} · {wildcard ? `兼容通配（已枚举 ${openModels.length}）` : `开放 ${openModels.length} 个模型`}</span></div>
-                  <div className="menu-wrap">
-                    <button className="icon-button" type="button" title="号池操作" onClick={() => setMenuOpen(menuOpen === pool.id ? null : pool.id)}><MoreHorizontal size={18} /></button>
-                    {menuOpen === pool.id && <div className="context-menu"><button type="button" onClick={() => openPool(pool)}><Edit3 size={15} />编辑</button><button className="danger" type="button" onClick={() => { setDeleteTarget(pool); setMenuOpen(null) }}><Trash2 size={15} />删除</button></div>}
-                  </div>
+                  <OverflowMenu open={menuOpen === pool.id} onOpenChange={(open) => setMenuOpen(open ? pool.id : null)} label="号池操作"><button type="button" onClick={() => openPool(pool)}><Edit3 size={15} />编辑</button><button className="danger" type="button" onClick={() => { setDeleteTarget(pool); setMenuOpen(null) }}><Trash2 size={15} />删除</button></OverflowMenu>
                 </header>
 
                 <div className="pool-card__stats">

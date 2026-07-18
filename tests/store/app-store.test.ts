@@ -1232,7 +1232,7 @@ describe('AppStore', () => {
     })
   })
 
-  it('blocks destructive deletes while configuration objects are still referenced', async () => {
+  it('cascades account removal from pools while still blocking other referenced deletes', async () => {
     const store = createStore()
     await store.initialize()
     const withAccount = await store.saveAccount({
@@ -1256,14 +1256,15 @@ describe('AppStore', () => {
       stickyTtlMinutes: 30,
       maxRetries: 1
     })
-    await expect(store.deleteAccount(accountId)).rejects.toThrow(/pools/)
     const withSecondAccount = await store.saveAccount({
       providerId: 'provider-openai', name: 'Unreferenced key', credential: 'sk-second',
       priority: 1, weight: 1, maxConcurrency: 1, modelAllowlist: []
     })
     const secondAccountId = withSecondAccount.accounts.find((account) => account.name === 'Unreferenced key')!.id
-    await expect(store.deleteAccounts([accountId, secondAccountId])).rejects.toThrow(/pools/)
-    expect(store.getSnapshot().accounts.map((account) => account.id)).toEqual(expect.arrayContaining([accountId, secondAccountId]))
+    const afterAccountDelete = await store.deleteAccounts([accountId, secondAccountId])
+    expect(afterAccountDelete.accounts.map((account) => account.id)).not.toContain(accountId)
+    expect(afterAccountDelete.accounts.map((account) => account.id)).not.toContain(secondAccountId)
+    expect(afterAccountDelete.pools.find((pool) => pool.id === withPool.pools[0].id)?.members).toEqual([])
 
     const route = withPool.routes.find((candidate) => candidate.client === 'codex')!
     await store.updateRoute({ ...route, poolId: withPool.pools[0].id, enabled: false })

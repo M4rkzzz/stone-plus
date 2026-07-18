@@ -106,7 +106,6 @@ export function TunnelView({ snapshot, api }: { snapshot: AppSnapshot; api: Gate
       {!state?.binaryAvailable && (
         <div className="warning-banner"><div><AlertTriangle size={17} /><div><strong>内置 frpc 不可用</strong><span>安装包缺少 frpc.exe，或被杀毒软件隔离。配置仍可编辑，但无法启动。</span></div></div></div>
       )}
-      <div className="warning-banner warning-banner--danger"><div><AlertTriangle size={17} /><div><strong>远端端口是裸 HTTP</strong><span>所有使用者共用 Stone 的 Codex 路由令牌；没有独立用户、限流或传输层加密。</span></div></div></div>
       {error && <div className="error-banner" role="alert"><div><AlertTriangle size={16} /><span>{error}</span></div></div>}
       {state?.lastError && !error && <div className="error-banner" role="alert"><div><AlertTriangle size={16} /><span>{state.lastError}</span></div></div>}
 

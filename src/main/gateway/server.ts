@@ -54,6 +54,7 @@ import type {
   GatewayConfig,
   GatewayController,
   GatewayLogHandler,
+  GatewayRuntimeStateHandler,
   OutboundFetchResolver,
   ConversationTitleResolver,
   GatewayServerOptions
@@ -80,10 +81,12 @@ export class GatewayServer implements GatewayController {
   private readonly scheduler: PoolScheduler
   private readonly logListeners = new Set<GatewayLogHandler>()
   private readonly accountStateListeners = new Set<GatewayAccountStateHandler>()
+  private readonly runtimeStateListeners = new Set<GatewayRuntimeStateHandler>()
   private readonly now: () => number
   private server?: Server
   private startedAt?: number
   private activeRequests = 0
+  private runtimeGeneration = 0
   private totalRequests = 0
   private successRequests = 0
 
@@ -131,6 +134,7 @@ export class GatewayServer implements GatewayController {
       const onListening = (): void => {
         server.off('error', onError)
         this.startedAt = this.now()
+        this.emitRuntimeState()
         resolve()
       }
       server.once('error', onError)
@@ -164,8 +168,10 @@ export class GatewayServer implements GatewayController {
     }
     this.server = undefined
     this.startedAt = undefined
+    this.runtimeGeneration += 1
     this.activeRequests = 0
     this.scheduler.clear()
+    this.emitRuntimeState()
   }
 
   getStatus(): GatewayStatus {
@@ -197,6 +203,13 @@ export class GatewayServer implements GatewayController {
     return this.scheduler.getFitness(this.config.accounts.filter((account) => smartAccountIds.has(account.id)))
   }
 
+  getAccountInFlight(): Record<string, number> {
+    return Object.fromEntries(this.config.accounts.map((account) => [
+      account.id,
+      this.scheduler.getInFlight(account)
+    ]))
+  }
+
   onLog(listener: GatewayLogHandler): () => void {
     this.logListeners.add(listener)
     return () => this.logListeners.delete(listener)
@@ -205,6 +218,11 @@ export class GatewayServer implements GatewayController {
   onAccountState(listener: GatewayAccountStateHandler): () => void {
     this.accountStateListeners.add(listener)
     return () => this.accountStateListeners.delete(listener)
+  }
+
+  onRuntimeState(listener: GatewayRuntimeStateHandler): () => void {
+    this.runtimeStateListeners.add(listener)
+    return () => this.runtimeStateListeners.delete(listener)
   }
 
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
@@ -224,6 +242,8 @@ export class GatewayServer implements GatewayController {
 
     this.totalRequests += 1
     this.activeRequests += 1
+    const runtimeGeneration = this.runtimeGeneration
+    this.emitRuntimeState()
     const clientAbortController = new AbortController()
     const abortForClientDisconnect = (): void => {
       if (!clientAbortController.signal.aborted && !response.writableEnded) {
@@ -325,7 +345,8 @@ export class GatewayServer implements GatewayController {
           const account = scheduled.account
           attemptedAccount = account
           selectedAccount = account
-          release = scheduled.release
+          release = this.runtimeTrackedRelease(scheduled.release, runtimeGeneration)
+          this.emitRuntimeState()
 
           const provider = this.config.providers.find((candidate) => candidate.id === account.providerId)
           if (!provider) throw new GatewayHttpError(503, 'The selected account has no provider', 'account_unavailable')
@@ -645,7 +666,10 @@ export class GatewayServer implements GatewayController {
     } finally {
       request.off('aborted', abortForClientDisconnect)
       response.off('close', abortForClientDisconnect)
-      this.activeRequests = Math.max(0, this.activeRequests - 1)
+      if (runtimeGeneration === this.runtimeGeneration) {
+        this.activeRequests = Math.max(0, this.activeRequests - 1)
+        this.emitRuntimeState()
+      }
     }
   }
 
@@ -846,6 +870,27 @@ export class GatewayServer implements GatewayController {
 
   private emitAccountState(state: GatewayAccountState): void {
     for (const listener of this.accountStateListeners) listener(state)
+  }
+
+  private runtimeTrackedRelease(release: () => void, runtimeGeneration: number): () => void {
+    let released = false
+    return () => {
+      if (released) return
+      released = true
+      if (runtimeGeneration !== this.runtimeGeneration) return
+      release()
+      this.emitRuntimeState()
+    }
+  }
+
+  private emitRuntimeState(): void {
+    for (const listener of this.runtimeStateListeners) {
+      try {
+        listener()
+      } catch (error) {
+        console.error('Stone runtime state listener failed', error)
+      }
+    }
   }
 }
 

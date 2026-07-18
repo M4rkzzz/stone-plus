@@ -581,6 +581,7 @@ export interface ChatGptAccountImportInput {
   providerId: string
   content: string
   name?: string
+  progressId?: string
   /** Preserve a valid file proxy by default, explicitly clear it, or override the whole batch. */
   proxyMode?: ChatGptAccountImportProxyMode
   proxyId?: string
@@ -601,6 +602,18 @@ export interface ChatGptAccountFileImportInput {
   providerId: string
   proxyMode?: ChatGptAccountImportProxyMode
   proxyId?: string
+  progressId?: string
+}
+
+export type AccountImportProgressPhase = 'importing' | 'refreshing' | 'complete'
+
+export interface AccountImportProgress {
+  progressId: string
+  phase: AccountImportProgressPhase
+  completed: number
+  total: number
+  percent: number
+  message: string
 }
 
 export interface ChatGptAccountFileImportFileResult {
@@ -618,6 +631,8 @@ export interface ChatGptAccountDetectionResult {
   ok: boolean
   latencyMs?: number
   error?: string
+  availableModelCount?: number
+  modelRefreshError?: string
 }
 
 export interface ChatGptAccountFileImportResult {
@@ -942,6 +957,7 @@ export interface GatewayApi {
   previewCodexSessionRepair(targetProvider: string): Promise<CodexSessionRepairPreview>
   repairCodexSessions(targetProvider: string, expectedRevision: string): Promise<CodexSessionRepairResult>
   onSnapshot(listener: (snapshot: AppSnapshot) => void): () => void
+  onAccountImportProgress(listener: (progress: AccountImportProgress) => void): () => void
   onBrowserImportQueue(listener: (state: BrowserImportQueueState) => void): () => void
   onBrowserOpenTab(listener: (request: BrowserOpenTabRequest) => void): () => void
   onUpdateState(listener: (state: AppUpdateState) => void): () => void

@@ -2,13 +2,9 @@ import { useEffect, useMemo, useState } from 'react'
 import {
   AlertTriangle,
   CheckCircle2,
-  Database,
-  HardDrive,
   LoaderCircle,
-  LockKeyhole,
   Network,
   Save,
-  ShieldCheck,
   Timer,
   Archive,
   RotateCcw,
@@ -150,9 +146,9 @@ export function SettingsView({
           <SettingRow title="登录系统时启动 Stone" description="由操作系统管理桌面应用自启动" control={<Toggle checked={Boolean(draft.launchAtLogin)} onChange={(value) => setDraft({ ...draft, launchAtLogin: value })} label="登录系统时启动 Stone" />} />
           <SettingRow title="桌面健康通知" description="账号停用、冷却、额度耗尽或恢复时通知" control={<Toggle checked={draft.desktopNotifications !== false} onChange={(value) => setDraft({ ...draft, desktopNotifications: value })} label="桌面健康通知" />} />
           <SettingRow
-            title="全局出站网络"
-            description="“跟随系统代理”适合 Clash 等 Windows 系统代理模式，无需开启 TUN；账号或号池的显式代理始终优先。"
-            control={<select aria-label="全局出站网络" value={draft.outboundNetworkMode ?? 'direct'} onChange={(event) => setDraft({ ...draft, outboundNetworkMode: event.target.value === 'system' ? 'system' : 'direct' })}><option value="direct">直连（默认）</option><option value="system">跟随系统代理</option></select>}
+            title="适配系统代理"
+            description="开启后自动跟随 Windows 系统代理或 PAC，适合 Clash 系统代理模式，无需开启 TUN；账号或号池的显式代理仍优先。"
+            control={<Toggle checked={draft.outboundNetworkMode === 'system'} onChange={(value) => setDraft({ ...draft, outboundNetworkMode: value ? 'system' : 'direct' })} label="适配系统代理" />}
           />
           <SettingRow title="检测系统代理" description="读取系统/PAC 对 ChatGPT 与 OpenAI 的实际分流，不显示代理认证信息。" control={<button className="button button--secondary" type="button" disabled={detectingSystemProxy} onClick={() => void detectSystemProxy()}>{detectingSystemProxy ? <LoaderCircle size={16} className="spin" /> : <Network size={16} />}检测系统代理</button>} />
           {systemProxyStatus && <div className="system-proxy-status">{systemProxyStatus.targets.map((target) => <div key={target.target}><span className={target.reachable ? 'status-dot status-dot--online' : 'status-dot status-dot--error'} /><span><strong>{new URL(target.target).hostname}</strong><small>{target.summary}{target.latencyMs !== undefined ? ` · ${target.latencyMs} ms` : ''}{target.error ? ` · ${target.error}` : ''}</small></span></div>)}</div>}
@@ -169,21 +165,6 @@ export function SettingsView({
           <div className="settings-actions"><button className="button button--secondary" type="button" onClick={() => void createBackup()}><Archive size={16} />立即备份</button><button className="button button--secondary" type="button" onClick={() => void exportDiagnostics()}><FileDown size={16} />复制诊断报告</button><button className="button button--secondary" type="button" onClick={() => void api.clearHealthEvents()}><BellRing size={16} />清除健康事件</button></div>
           {operationNotice && <div className="client-config-notice">{operationNotice}</div>}
           <div className="state-backup-list">{backups.slice(0, 6).map((backup) => <div key={backup.path}><span><strong>{new Date(backup.createdAt).toLocaleString()}</strong><small>{Math.ceil(backup.size / 1024)} KB · {backup.automatic ? '自动' : '手动'} · {backup.integrity === 'valid' ? '校验通过' : '损坏'}</small></span><button className="icon-button" type="button" disabled={backup.integrity !== 'valid'} title="恢复此备份" onClick={() => void restoreBackup(backup)}><RotateCcw size={15} /></button></div>)}{!backups.length && <span className="muted">暂无状态备份</span>}</div>
-        </div>
-      </section>
-
-      <section className="settings-section">
-        <header><div className="settings-section__icon settings-section__icon--secure"><ShieldCheck size={18} /></div><div><h2>安全与凭据</h2><p>上游密钥的本机存储状态</p></div></header>
-        <div className="settings-section__content">
-          <div className={`vault-status ${snapshot.vaultAvailable ? 'vault-status--available' : 'vault-status--unavailable'}`}>
-            <div><LockKeyhole size={21} /><div><strong>{snapshot.vaultAvailable ? '凭据保险库可用' : '凭据保险库不可用'}</strong><span>{snapshot.vaultBackend}</span></div></div>
-            <Badge tone={snapshot.vaultAvailable ? 'success' : 'danger'}>{snapshot.vaultAvailable ? '受保护' : '需要处理'}</Badge>
-          </div>
-          <div className="security-facts">
-            <div><HardDrive size={16} /><span>元数据</span><strong>本地 SQLite</strong></div>
-            <div><Database size={16} /><span>供应商凭据</span><strong>{snapshot.vaultBackend}</strong></div>
-            <div><ShieldCheck size={16} /><span>网关监听</span><strong>仅回环地址</strong></div>
-          </div>
         </div>
       </section>
 

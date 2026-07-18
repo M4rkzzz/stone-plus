@@ -116,6 +116,20 @@ describe('refresh provider models IPC', () => {
     ])
   })
 
+  it('overlays live account concurrency without persisting it in the store snapshot', async () => {
+    const oauth = oauthAccount()
+    const harness = createHarness([oauth], {}, vi.fn())
+    vi.mocked(harness.gateway.getAccountInFlight).mockReturnValue({ [oauth.id]: 2 })
+    const handler = electron.handlers.get('stone:get-snapshot')
+    if (!handler) throw new Error('get-snapshot handler was not registered')
+    const mainFrame = { url: 'http://127.0.0.1:5173/index.html' }
+
+    const result = await handler({ senderFrame: mainFrame, sender: { mainFrame } }) as AppSnapshot
+
+    expect(result.accounts.find((account) => account.id === oauth.id)?.inFlight).toBe(2)
+    expect(harness.store.getSnapshot().accounts.find((account) => account.id === oauth.id)?.inFlight).toBe(0)
+  })
+
   it('applies an outbound mode change without restarting the local gateway', async () => {
     const harness = createHarness([oauthAccount()], {}, vi.fn())
     const handler = electron.handlers.get('stone:update-gateway')
@@ -139,25 +153,41 @@ describe('refresh provider models IPC', () => {
     const oauth = oauthAccount()
     const proxy = testProxy()
     const upstreamFetch = vi.fn(async () => new Response(JSON.stringify({
-      rate_limit: { allowed: true, limit_reached: false }
+      rate_limit: { allowed: true, limit_reached: false },
+      models: [{ slug: 'gpt-5.6-sol' }, { slug: 'gpt-5.6-terra' }]
     }), { status: 200, headers: { 'content-type': 'application/json' } }))
     const harness = createHarness([oauth], { [oauth.credentialId]: oauthCredential() }, upstreamFetch, [proxy])
     const handler = electron.handlers.get('stone:import-chatgpt-accounts')
     if (!handler) throw new Error('import-chatgpt-accounts handler was not registered')
     const mainFrame = { url: 'http://127.0.0.1:5173/index.html' }
+    const send = vi.fn()
+    const sender = { mainFrame, send, isDestroyed: () => false }
 
-    const result = await handler({ senderFrame: mainFrame, sender: { mainFrame } }, {
+    const result = await handler({ senderFrame: mainFrame, sender }, {
       providerId: provider.id,
       content: '{"access_token":"redacted-by-mock"}',
       proxyMode: 'proxy',
-      proxyId: proxy.id
-    }) as { detectionResults: Array<{ ok: boolean }> }
+      proxyId: proxy.id,
+      progressId: 'paste-import-progress'
+    }) as { detectionResults: Array<{ ok: boolean; availableModelCount?: number }> }
 
-    expect(result.detectionResults).toEqual([expect.objectContaining({ ok: true })])
+    expect(result.detectionResults).toEqual([expect.objectContaining({ ok: true, availableModelCount: 2 })])
     expect(harness.transport.fetchFor).toHaveBeenCalledWith(proxy, undefined)
     expect(harness.store.importChatGptAccounts).toHaveBeenCalledWith(expect.objectContaining({
       proxyMode: 'proxy', proxyId: proxy.id
     }))
+    expect(harness.store.setAccountModels).toHaveBeenCalledWith(
+      oauth.id,
+      ['gpt-5.6-sol', 'gpt-5.6-terra'],
+      expect.any(String)
+    )
+    expect(send.mock.calls.filter(([channel]) => channel === 'stone:account-import-progress').map(([, progress]) => progress))
+      .toEqual(expect.arrayContaining([
+        expect.objectContaining({ progressId: 'paste-import-progress', phase: 'importing', percent: 0 }),
+        expect.objectContaining({ progressId: 'paste-import-progress', phase: 'importing', percent: 50 }),
+        expect.objectContaining({ progressId: 'paste-import-progress', phase: 'refreshing', percent: 100 }),
+        expect.objectContaining({ progressId: 'paste-import-progress', phase: 'complete', percent: 100 })
+      ]))
   })
 
   it('rejects a file batch when its selected proxy was deleted before confirmation', async () => {
@@ -201,6 +231,35 @@ describe('refresh provider models IPC', () => {
       expect(harness.store.appendLog).toHaveBeenCalledTimes(2)
       expect(harness.gateway.updateConfig).not.toHaveBeenCalled()
       expect(harness.runtimeChanged).not.toHaveBeenCalled()
+    } finally {
+      electron.getAllWindows.mockReturnValue([])
+      vi.useRealTimers()
+    }
+  })
+
+  it('pushes live account concurrency changes with a short trailing update', async () => {
+    vi.useFakeTimers()
+    const send = vi.fn()
+    electron.getAllWindows.mockReturnValue([{
+      isDestroyed: () => false,
+      webContents: { send }
+    }])
+    try {
+      const oauth = oauthAccount()
+      const harness = createHarness([oauth], {}, vi.fn())
+      vi.mocked(harness.gateway.getAccountInFlight).mockReturnValue({ [oauth.id]: 1 })
+
+      harness.emitRuntimeState()
+      expect(send).toHaveBeenCalledOnce()
+      expect(send.mock.calls[0][1].accounts.find((account: Account) => account.id === oauth.id)?.inFlight).toBe(1)
+
+      vi.mocked(harness.gateway.getAccountInFlight).mockReturnValue({ [oauth.id]: 0 })
+      harness.emitRuntimeState()
+      await vi.advanceTimersByTimeAsync(49)
+      expect(send).toHaveBeenCalledOnce()
+      await vi.advanceTimersByTimeAsync(1)
+      expect(send).toHaveBeenCalledTimes(2)
+      expect(send.mock.calls[1][1].accounts.find((account: Account) => account.id === oauth.id)?.inFlight).toBe(0)
     } finally {
       electron.getAllWindows.mockReturnValue([])
       vi.useRealTimers()
@@ -522,6 +581,7 @@ function createHarness(
   transport: OutboundTransportManager
   emitLog: (log: RequestLog) => void
   emitAccountState: (state: GatewayAccountState) => void
+  emitRuntimeState: () => void
   runtimeChanged: ReturnType<typeof vi.fn>
 } {
   const snapshot = {
@@ -621,18 +681,25 @@ function createHarness(
   } as unknown as AppStore
   let logListener: ((log: RequestLog) => void) | undefined
   let accountStateListener: ((state: GatewayAccountState) => void) | undefined
+  let runtimeStateListener: (() => void) | undefined
   const gateway = {
     start: vi.fn(async () => undefined),
     stop: vi.fn(async () => undefined),
     getStatus: vi.fn(() => snapshot.gatewayStatus),
     updateConfig: vi.fn(),
     resetAccountHealth: vi.fn(),
+    getAccountFitness: vi.fn(() => ({})),
+    getAccountInFlight: vi.fn(() => Object.fromEntries(accounts.map((account) => [account.id, account.inFlight]))),
     onLog: vi.fn((listener: (log: RequestLog) => void) => {
       logListener = listener
       return () => undefined
     }),
     onAccountState: vi.fn((listener: (state: GatewayAccountState) => void) => {
       accountStateListener = listener
+      return () => undefined
+    }),
+    onRuntimeState: vi.fn((listener: () => void) => {
+      runtimeStateListener = listener
       return () => undefined
     })
   } as unknown as GatewayController
@@ -667,6 +734,10 @@ function createHarness(
     emitAccountState: (state) => {
       if (!accountStateListener) throw new Error('Gateway account-state listener was not registered')
       accountStateListener(state)
+    },
+    emitRuntimeState: () => {
+      if (!runtimeStateListener) throw new Error('Gateway runtime-state listener was not registered')
+      runtimeStateListener()
     }
   }
 }

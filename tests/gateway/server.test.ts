@@ -114,6 +114,54 @@ afterEach(async () => {
 })
 
 describe('GatewayServer', () => {
+  it('reports live per-account concurrency while an upstream request is running', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.accounts[1].status = 'disabled'
+    gatewayConfig.pools[0].maxRetries = 0
+    let markUpstreamStarted!: () => void
+    let releaseUpstream!: (response: Response) => void
+    const upstreamStarted = new Promise<void>((resolve) => { markUpstreamStarted = resolve })
+    const upstreamResponse = new Promise<Response>((resolve) => { releaseUpstream = resolve })
+    const upstreamFetch = vi.fn(async () => {
+      markUpstreamStarted()
+      return upstreamResponse
+    })
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'credential',
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    const runtimeStates: Array<{ activeRequests: number; first: number }> = []
+    gateway.onRuntimeState(() => runtimeStates.push({
+      activeRequests: gateway.getStatus().activeRequests,
+      first: gateway.getAccountInFlight().first
+    }))
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const pendingResponse = post(port)
+    await upstreamStarted
+    expect(gateway.getStatus().activeRequests).toBe(1)
+    expect(gateway.getAccountInFlight()).toMatchObject({ first: 1, second: 0 })
+
+    releaseUpstream(new Response(JSON.stringify({
+      id: 'response-live-concurrency',
+      choices: [{ index: 0, message: { role: 'assistant', content: 'Done' }, finish_reason: 'stop' }]
+    }), { status: 200, headers: { 'content-type': 'application/json' } }))
+    const response = await pendingResponse
+    expect(response.status).toBe(200)
+    await response.text()
+    await vi.waitFor(() => {
+      expect(gateway.getStatus().activeRequests).toBe(0)
+      expect(gateway.getAccountInFlight().first).toBe(0)
+    })
+    expect(runtimeStates).toEqual(expect.arrayContaining([
+      expect.objectContaining({ activeRequests: 1, first: 1 }),
+      expect.objectContaining({ activeRequests: 0, first: 0 })
+    ]))
+  })
+
   it('requires the matching local route token before calling upstream', async () => {
     const port = await freePort()
     const upstreamFetch = vi.fn(async () => new Response('{}'))

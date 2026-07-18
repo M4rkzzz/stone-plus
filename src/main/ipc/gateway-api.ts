@@ -1,10 +1,11 @@
-import { app, BrowserWindow, dialog, ipcMain, Notification } from 'electron'
+import { app, BrowserWindow, dialog, ipcMain, Notification, type WebContents } from 'electron'
 import { randomUUID } from 'node:crypto'
 import { lstat, readFile, writeFile } from 'node:fs/promises'
 import { basename, extname, join } from 'node:path'
 import { clientNativeProtocols } from '@shared/types'
 import type {
   AccountFitnessSnapshot,
+  AccountImportProgress,
   AccountModelTestResult,
   AppSnapshot,
   ClientConfigEditorSaveInput,
@@ -38,8 +39,10 @@ export interface GatewayController {
   updateConfig(config: GatewayConfig): void
   resetAccountHealth(accountId: string): void
   getAccountFitness(): Record<string, AccountFitnessSnapshot>
+  getAccountInFlight(): Record<string, number>
   onLog(listener: (log: RequestLog) => void): () => void
   onAccountState(listener: (state: GatewayAccountState) => void): () => void
+  onRuntimeState(listener: () => void): () => void
 }
 
 export function registerGatewayApi(
@@ -52,8 +55,11 @@ export function registerGatewayApi(
   browserImports?: BrowserImportQueue
 ): () => Promise<void> {
   const snapshotPublishDelayMs = 1_000
+  const liveRuntimePublishIntervalMs = 50
   const accountStateFlushDelayMs = 250
   let scheduledSnapshotPublish: ReturnType<typeof setTimeout> | undefined
+  let scheduledLiveRuntimePublish: ReturnType<typeof setTimeout> | undefined
+  let lastLiveRuntimePublishAt: number | undefined
   let scheduledAccountStateFlush: ReturnType<typeof setTimeout> | undefined
   const pendingActiveAccountStates = new Map<string, GatewayAccountState>()
   const quotaProbeTimers = new Map<string, ReturnType<typeof setTimeout>>()
@@ -62,10 +68,12 @@ export function registerGatewayApi(
   let closed = false
   const withRuntimeMetrics = (snapshot: AppSnapshot): AppSnapshot => {
     const fitness = gateway.getAccountFitness?.() ?? {}
+    const inFlight = gateway.getAccountInFlight()
     return {
       ...snapshot,
       accounts: snapshot.accounts.map((account) => ({
         ...account,
+        inFlight: Math.max(0, inFlight[account.id] ?? account.inFlight),
         ...(fitness[account.id] ? { fitness: fitness[account.id] } : {})
       }))
     }
@@ -120,6 +128,31 @@ export function registerGatewayApi(
       publishRoutine(store.getSnapshot())
     }, snapshotPublishDelayMs)
   }
+
+  const flushLiveRuntimePublish = (): void => {
+    scheduledLiveRuntimePublish = undefined
+    if (closed) return
+    lastLiveRuntimePublishAt = Date.now()
+    store.setGatewayStatus(gateway.getStatus())
+    if (!BrowserWindow.getAllWindows().some(canReceiveSnapshot)) return
+    publishRoutine(store.getSnapshot())
+  }
+
+  const scheduleLiveRuntimePublish = (): void => {
+    if (closed || scheduledLiveRuntimePublish) return
+    const elapsed = lastLiveRuntimePublishAt === undefined
+      ? liveRuntimePublishIntervalMs
+      : Date.now() - lastLiveRuntimePublishAt
+    const delay = Math.max(0, liveRuntimePublishIntervalMs - elapsed)
+    if (delay === 0) {
+      flushLiveRuntimePublish()
+      return
+    }
+    scheduledLiveRuntimePublish = setTimeout(flushLiveRuntimePublish, delay)
+    scheduledLiveRuntimePublish.unref?.()
+  }
+
+  const unsubscribeRuntimeState = gateway.onRuntimeState(scheduleLiveRuntimePublish)
 
   const refreshRuntime = (): AppSnapshot => {
     gateway.updateConfig(toGatewayConfig(store))
@@ -234,18 +267,48 @@ export function registerGatewayApi(
     }
   }
 
-  const detectImportedAccounts = async (accountIds: readonly string[]) =>
-    mapConcurrent([...new Set(accountIds)], 3, async (accountId) => {
+  const detectImportedAccounts = async (
+    accountIds: readonly string[],
+    onProgress?: (completed: number, total: number) => void
+  ) => {
+    const uniqueIds = [...new Set(accountIds)]
+    let completed = 0
+    return mapConcurrent(uniqueIds, 3, async (accountId) => {
       const checked = await probeAndPersistAccount(accountId)
-      const accountName = checked.snapshot.accounts.find((account) => account.id === accountId)?.name ?? 'ChatGPT account'
-      return {
+      let availableModelCount: number | undefined
+      let modelRefreshError: string | undefined
+      try {
+        const discoveryFingerprint = store.getAccountModelDiscoveryFingerprint(accountId)
+        const models = await discoverAccountModels(store, outboundTransport, accountId)
+        await store.setAccountModels(accountId, models, discoveryFingerprint)
+        availableModelCount = models.length
+      } catch (error) {
+        modelRefreshError = error instanceof Error ? error.message : 'Account model refresh failed.'
+      }
+      const accountName = store.getSnapshot().accounts.find((account) => account.id === accountId)?.name ?? 'ChatGPT account'
+      const result = {
         accountId,
         accountName,
         ok: checked.ok,
         ...(checked.latencyMs !== undefined ? { latencyMs: checked.latencyMs } : {}),
-        ...(checked.error ? { error: checked.error } : {})
+        ...(checked.error ? { error: checked.error } : {}),
+        ...(availableModelCount !== undefined ? { availableModelCount } : {}),
+        ...(modelRefreshError ? { modelRefreshError } : {})
       }
+      completed += 1
+      onProgress?.(completed, uniqueIds.length)
+      return result
     })
+  }
+
+  const emitImportProgress = (
+    sender: WebContents,
+    progressId: unknown,
+    progress: Omit<AccountImportProgress, 'progressId'>
+  ): void => {
+    if (typeof progressId !== 'string' || !progressId || progressId.length > 120 || sender.isDestroyed()) return
+    sender.send('stone:account-import-progress', { progressId, ...progress } satisfies AccountImportProgress)
+  }
 
   gateway.onLog((log) => {
     void store.appendLog(log).then(() => {
@@ -397,9 +460,16 @@ export function registerGatewayApi(
   })
   ipcMain.handle('stone:import-chatgpt-accounts', async (event, input: Parameters<GatewayApi['importChatGptAccounts']>[0]) => {
     assertTrustedSender(event)
+    emitImportProgress(event.sender, input?.progressId, { phase: 'importing', completed: 0, total: 1, percent: 0, message: '正在解析并导入账号…' })
     const imported = await store.importChatGptAccounts(input)
+    emitImportProgress(event.sender, input?.progressId, { phase: 'importing', completed: 1, total: 1, percent: 50, message: `已导入 ${imported.importedAccountIds.length} 个账号` })
     publish(refreshRuntime())
-    const detectionResults = await detectImportedAccounts(imported.importedAccountIds)
+    emitImportProgress(event.sender, input?.progressId, { phase: 'refreshing', completed: 0, total: imported.importedAccountIds.length, percent: 50, message: `正在刷新状态与查询模型 0/${imported.importedAccountIds.length}` })
+    const detectionResults = await detectImportedAccounts(imported.importedAccountIds, (completed, total) => {
+      emitImportProgress(event.sender, input?.progressId, { phase: 'refreshing', completed, total, percent: 50 + Math.round(completed / Math.max(1, total) * 50), message: `正在刷新状态与查询模型 ${completed}/${total}` })
+    })
+    publish(refreshRuntime())
+    emitImportProgress(event.sender, input?.progressId, { phase: 'complete', completed: imported.importedAccountIds.length, total: imported.importedAccountIds.length, percent: 100, message: '导入、状态刷新与模型查询已完成' })
     return { ...imported, detectionResults, snapshot: store.getSnapshot() }
   })
   ipcMain.handle('stone:import-chatgpt-account-files', async (event, input: Parameters<GatewayApi['importChatGptAccountFiles']>[0]) => {
@@ -421,6 +491,7 @@ export function registerGatewayApi(
     if (selection.canceled || !selection.filePaths.length) {
       return emptyFileImportResult(store.getSnapshot())
     }
+    emitImportProgress(event.sender, input.progressId, { phase: 'importing', completed: 0, total: selection.filePaths.length, percent: 0, message: `正在导入文件 0/${selection.filePaths.length}` })
     validateAccountImportProxySelection(input.proxyMode, input.proxyId, store.getRuntimeProxies())
     if (selection.filePaths.length > 100) throw new Error('一次最多导入 100 个账号文件。')
 
@@ -446,6 +517,10 @@ export function registerGatewayApi(
     const createdAccountIds: string[] = []
     const updatedAccountIds: string[] = []
     const warnings: string[] = []
+    let processedFiles = fileResults.length
+    if (processedFiles > 0) {
+      emitImportProgress(event.sender, input.progressId, { phase: 'importing', completed: processedFiles, total: selection.filePaths.length, percent: Math.round(processedFiles / selection.filePaths.length * 50), message: `正在导入文件 ${processedFiles}/${selection.filePaths.length}` })
+    }
     for (const file of readableFiles) {
       try {
         const imported = await store.importChatGptAccounts({
@@ -468,11 +543,18 @@ export function registerGatewayApi(
       } catch (error) {
         fileResults.push({ fileName: file.fileName, status: 'failed', importedAccounts: 0, createdAccounts: 0, updatedAccounts: 0, error: importErrorMessage(error) })
       }
+      processedFiles += 1
+      emitImportProgress(event.sender, input.progressId, { phase: 'importing', completed: processedFiles, total: selection.filePaths.length, percent: Math.round(processedFiles / selection.filePaths.length * 50), message: `正在导入文件 ${processedFiles}/${selection.filePaths.length}` })
     }
     publish(refreshRuntime())
 
     const uniqueImportedIds = [...new Set(importedAccountIds)]
-    const detectionResults = await detectImportedAccounts(uniqueImportedIds)
+    emitImportProgress(event.sender, input.progressId, { phase: 'refreshing', completed: 0, total: uniqueImportedIds.length, percent: 50, message: `正在刷新状态与查询模型 0/${uniqueImportedIds.length}` })
+    const detectionResults = await detectImportedAccounts(uniqueImportedIds, (completed, total) => {
+      emitImportProgress(event.sender, input.progressId, { phase: 'refreshing', completed, total, percent: 50 + Math.round(completed / Math.max(1, total) * 50), message: `正在刷新状态与查询模型 ${completed}/${total}` })
+    })
+    publish(refreshRuntime())
+    emitImportProgress(event.sender, input.progressId, { phase: 'complete', completed: uniqueImportedIds.length, total: uniqueImportedIds.length, percent: 100, message: '导入、状态刷新与模型查询已完成' })
     return {
       snapshot: store.getSnapshot(),
       cancelled: false,
@@ -508,6 +590,7 @@ export function registerGatewayApi(
     if (!Array.isArray(input.itemIds)) throw new Error('请选择需要导入的挂起 JSON。')
     validateAccountImportProxySelection(input.proxyMode, input.proxyId, store.getRuntimeProxies())
     const files = browserImports.getReadyItems(input.itemIds)
+    emitImportProgress(event.sender, input.progressId, { phase: 'importing', completed: 0, total: files.length, percent: 0, message: `正在导入文件 0/${files.length}` })
     const fileResults: Awaited<ReturnType<GatewayApi['importBrowserJsonQueue']>>['fileResults'] = []
     const importedAccountIds: string[] = []
     const createdAccountIds: string[] = []
@@ -515,6 +598,7 @@ export function registerGatewayApi(
     const importedItemIds: string[] = []
     const warnings: string[] = []
 
+    let processedFiles = 0
     for (const file of files) {
       try {
         const imported = await store.importChatGptAccounts({
@@ -545,11 +629,18 @@ export function registerGatewayApi(
           error: importErrorMessage(error)
         })
       }
+      processedFiles += 1
+      emitImportProgress(event.sender, input.progressId, { phase: 'importing', completed: processedFiles, total: files.length, percent: Math.round(processedFiles / Math.max(1, files.length) * 50), message: `正在导入文件 ${processedFiles}/${files.length}` })
     }
     if (importedItemIds.length) browserImports.removeMany(importedItemIds)
     publish(refreshRuntime())
     const uniqueImportedIds = [...new Set(importedAccountIds)]
-    const detectionResults = await detectImportedAccounts(uniqueImportedIds)
+    emitImportProgress(event.sender, input.progressId, { phase: 'refreshing', completed: 0, total: uniqueImportedIds.length, percent: 50, message: `正在刷新状态与查询模型 0/${uniqueImportedIds.length}` })
+    const detectionResults = await detectImportedAccounts(uniqueImportedIds, (completed, total) => {
+      emitImportProgress(event.sender, input.progressId, { phase: 'refreshing', completed, total, percent: 50 + Math.round(completed / Math.max(1, total) * 50), message: `正在刷新状态与查询模型 ${completed}/${total}` })
+    })
+    publish(refreshRuntime())
+    emitImportProgress(event.sender, input.progressId, { phase: 'complete', completed: uniqueImportedIds.length, total: uniqueImportedIds.length, percent: 100, message: '导入、状态刷新与模型查询已完成' })
     return {
       snapshot: store.getSnapshot(),
       cancelled: false,
@@ -961,12 +1052,17 @@ export function registerGatewayApi(
   })
   return async () => {
     closed = true
+    unsubscribeRuntimeState()
     unsubscribeBrowserImports?.()
     for (const timer of quotaProbeTimers.values()) clearTimeout(timer)
     quotaProbeTimers.clear()
     if (scheduledSnapshotPublish) {
       clearTimeout(scheduledSnapshotPublish)
       scheduledSnapshotPublish = undefined
+    }
+    if (scheduledLiveRuntimePublish) {
+      clearTimeout(scheduledLiveRuntimePublish)
+      scheduledLiveRuntimePublish = undefined
     }
     if (scheduledAccountStateFlush) {
       clearTimeout(scheduledAccountStateFlush)

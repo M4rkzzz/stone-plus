@@ -55,6 +55,8 @@ export interface GatewayAccountState {
 
 export type GatewayAccountStateHandler = (state: GatewayAccountState) => void
 
+export type GatewayRuntimeStateHandler = () => void
+
 export type ConversationTitleResolver = (conversationId: string) => Promise<string | undefined> | string | undefined
 
 export interface GatewayServerOptions {
@@ -76,8 +78,10 @@ export interface GatewayController {
   updateConfig(config: GatewayConfig): void
   resetAccountHealth(accountId: string): void
   getAccountFitness(): Record<string, AccountFitnessSnapshot>
+  getAccountInFlight(): Record<string, number>
   onLog(listener: GatewayLogHandler): () => void
   onAccountState(listener: GatewayAccountStateHandler): () => void
+  onRuntimeState(listener: GatewayRuntimeStateHandler): () => void
 }
 
 export interface ScheduledAccount {

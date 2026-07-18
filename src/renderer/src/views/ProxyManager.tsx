@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { CheckCircle2, Edit3, Gauge, LoaderCircle, Network, Plus, RefreshCw, ShieldCheck, Trash2 } from 'lucide-react'
+import { CheckCircle2, Edit3, Gauge, LoaderCircle, Network, Plus, RefreshCw, Trash2 } from 'lucide-react'
 import type { AppSnapshot, GatewayApi, ProxyInput, ProxyProtocol, PublicProxyDefinition } from '@shared/types'
 import type { ActionRunner } from '../App'
 import { Badge, ConfirmDialog, durationLabel, EmptyState, FieldError, Modal, relativeTime } from '../ui'
@@ -130,7 +130,7 @@ export function ProxyManager({
           <label className="field"><span>{draft.protocol === 'socks4' ? 'User ID（可选）' : '用户名（可选）'}</span><input autoComplete="off" value={draft.username ?? ''} onChange={(event) => setDraft({ ...draft, username: event.target.value })} /></label>
           <label className="field"><span>密码（可选）</span><input type="password" autoComplete="new-password" disabled={draft.protocol === 'socks4'} value={draft.password ?? ''} onChange={(event) => setDraft({ ...draft, password: event.target.value, clearPassword: false })} placeholder={existingHasPassword ? '留空表示保留现有密码' : ''} /><FieldError>{errors.password}</FieldError></label>
           {existingHasPassword && draft.protocol !== 'socks4' && <label className="proxy-clear-auth field--full"><input type="checkbox" checked={Boolean(draft.clearPassword)} onChange={(event) => setDraft({ ...draft, clearPassword: event.target.checked, password: event.target.checked ? '' : draft.password })} /><span>清除已保存的代理密码</span></label>}
-          <div className="form-context field--full"><Gauge size={16} /><span>入口</span><code>{draft.host ? entryAddress(draft as Pick<PublicProxyDefinition, 'protocol' | 'host' | 'port'>) : '—'}</code><ShieldCheck size={15} /><span>密码由系统凭据保险库加密</span></div>
+          <div className="form-context field--full"><Gauge size={16} /><span>入口</span><code>{draft.host ? entryAddress(draft as Pick<PublicProxyDefinition, 'protocol' | 'host' | 'port'>) : '—'}</code></div>
         </form>
       </Modal>
 

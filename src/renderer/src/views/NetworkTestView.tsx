@@ -186,11 +186,6 @@ function buildLocalChecks(snapshot: AppSnapshot, proxyId: string): LocalDiagnost
         : '当前未启动；网络诊断仍可运行，但客户端暂时无法通过 Stone 请求。'
     },
     {
-      id: 'vault', label: '系统凭据保险库',
-      status: snapshot.vaultAvailable ? 'success' : 'error',
-      message: snapshot.vaultAvailable ? `${snapshot.vaultBackend} 可用` : '凭据保险库不可用，Stone 无法读取已保存的账号和代理密码。'
-    },
-    {
       id: 'accounts', label: '上游账号',
       status: activeAccounts > 0 ? unavailableAccounts > 0 || exhaustedAccounts > 0 ? 'warning' : 'success' : 'error',
       message: `${activeAccounts} 个可用 · ${unavailableAccounts} 个停用/过期 · ${exhaustedAccounts} 个额度冷却`
