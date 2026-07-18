@@ -51,6 +51,11 @@ const stone: GatewayApi = {
   downloadUpdate: () => ipcRenderer.invoke('stone:download-update'),
   installUpdate: () => ipcRenderer.invoke('stone:install-update'),
   openUpdatePage: () => ipcRenderer.invoke('stone:open-update-page'),
+  getFrpTunnelState: () => ipcRenderer.invoke('stone:get-frp-tunnel-state'),
+  saveFrpTunnelConfig: (content) => ipcRenderer.invoke('stone:save-frp-tunnel-config', content),
+  startFrpTunnel: () => ipcRenderer.invoke('stone:start-frp-tunnel'),
+  stopFrpTunnel: () => ipcRenderer.invoke('stone:stop-frp-tunnel'),
+  clearFrpTunnelLogs: () => ipcRenderer.invoke('stone:clear-frp-tunnel-logs'),
   onSnapshot: (listener) => {
     const handler = (_event: Electron.IpcRendererEvent, snapshot: Awaited<ReturnType<GatewayApi['getSnapshot']>>) => {
       listener(snapshot)

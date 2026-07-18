@@ -11,6 +11,7 @@ import {
   Power,
   RefreshCw,
   Route as RouteIcon,
+  Share2,
   Settings,
   Square,
   X,
@@ -24,6 +25,7 @@ import { RoutesView } from './views/RoutesView'
 import { RequestsView } from './views/RequestsView'
 import { SettingsView } from './views/SettingsView'
 import { ClientsView } from './views/ClientsView'
+import { TunnelView } from './views/TunnelView'
 import { gatewayBaseUrl } from './ui'
 import { StoneMark } from './StoneMark'
 import {
@@ -33,7 +35,7 @@ import {
   type UpdateAction,
 } from './UpdateDialog'
 
-export type PageId = 'overview' | 'providers' | 'pools' | 'routes' | 'clients' | 'requests' | 'settings'
+export type PageId = 'overview' | 'providers' | 'pools' | 'routes' | 'clients' | 'tunnel' | 'requests' | 'settings'
 export type ActionRunner = (key: string, operation: () => Promise<AppSnapshot>) => Promise<boolean>
 
 const navigation: Array<{ id: PageId; label: string; icon: typeof Activity }> = [
@@ -42,6 +44,7 @@ const navigation: Array<{ id: PageId; label: string; icon: typeof Activity }> = 
   { id: 'pools', label: '号池', icon: Network },
   { id: 'routes', label: '路由', icon: RouteIcon },
   { id: 'clients', label: '客户端', icon: MonitorCog },
+  { id: 'tunnel', label: '内网穿透', icon: Share2 },
   { id: 'requests', label: '请求', icon: Activity },
   { id: 'settings', label: '设置', icon: Settings },
 ]
@@ -244,7 +247,7 @@ export default function App() {
         <div className="sidebar__brand">
           <StoneMark />
           <div className="sidebar__brand-text">
-            <strong>Stone</strong>
+            <strong>Stone+</strong>
             <span>Local Gateway</span>
           </div>
           <button className="icon-button sidebar__mobile-close" type="button" onClick={() => setMobileNavOpen(false)} title="关闭导航">
@@ -349,6 +352,7 @@ export default function App() {
           {page === 'pools' && <PoolsView snapshot={snapshot} api={api} runAction={runAction} busyKeys={busyKeys} />}
           {page === 'routes' && <RoutesView snapshot={snapshot} api={api} runAction={runAction} busyKeys={busyKeys} />}
           {page === 'clients' && <ClientsView snapshot={snapshot} api={api} />}
+          {page === 'tunnel' && <TunnelView snapshot={snapshot} api={api} />}
           {page === 'requests' && <RequestsView snapshot={snapshot} api={api} runAction={runAction} busyKeys={busyKeys} />}
           {page === 'settings' && <SettingsView snapshot={snapshot} api={api} runAction={runAction} busyKeys={busyKeys} update={updateController} />}
         </main>

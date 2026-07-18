@@ -1,6 +1,6 @@
 import { isIP } from 'node:net'
 import { createHash } from 'node:crypto'
-import { fetch as undiciFetch, ProxyAgent, type Dispatcher } from 'undici'
+import { Agent, fetch as undiciFetch, ProxyAgent, type Dispatcher } from 'undici'
 import { socksDispatcher } from 'fetch-socks'
 import type { Account, Pool, PublicProxyDefinition } from '@shared/types'
 
@@ -23,9 +23,27 @@ export interface ProxyProbeResult {
 
 export class OutboundTransportManager {
   private readonly cache = new Map<string, CachedDispatcher>()
+  private direct?: Pick<CachedDispatcher, 'dispatcher' | 'fetchImplementation'>
 
   public fetchFor(proxy: PublicProxyDefinition | undefined, password?: string): typeof fetch {
-    if (!proxy) return fetch
+    if (!proxy) {
+      if (!this.direct) {
+        const dispatcher = new Agent({
+          connections: 16,
+          pipelining: 1,
+          allowH2: true,
+          keepAliveTimeout: 60_000,
+          keepAliveMaxTimeout: 10 * 60_000,
+          connect: {
+            timeout: 10_000,
+            autoSelectFamily: true,
+            autoSelectFamilyAttemptTimeout: 250
+          }
+        })
+        this.direct = { dispatcher, fetchImplementation: fetchWithDispatcher(dispatcher) }
+      }
+      return this.direct.fetchImplementation
+    }
     if (proxy.hasPassword && !password) throw new Error('Proxy authentication is unavailable from the credential vault.')
     const authenticationFingerprint = createHash('sha256')
       .update(`${proxy.username ?? ''}\0${password ?? ''}`)
@@ -37,20 +55,28 @@ export class OutboundTransportManager {
     if (cached) void cached.dispatcher.close().catch(() => undefined)
 
     const dispatcher = createDispatcher(proxy, password)
-    const fetchImplementation = ((input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) =>
-      undiciFetch(input as Parameters<typeof undiciFetch>[0], {
-        ...init,
-        dispatcher
-      } as Parameters<typeof undiciFetch>[1]) as unknown as Promise<Response>) as typeof fetch
+    const fetchImplementation = fetchWithDispatcher(dispatcher)
     this.cache.set(proxy.id, { updatedAt: proxy.updatedAt, authenticationFingerprint, dispatcher, fetchImplementation })
     return fetchImplementation
   }
 
   public async close(): Promise<void> {
-    const dispatchers = [...this.cache.values()].map(({ dispatcher }) => dispatcher)
+    const dispatchers = [
+      ...[...this.cache.values()].map(({ dispatcher }) => dispatcher),
+      ...(this.direct ? [this.direct.dispatcher] : [])
+    ]
     this.cache.clear()
+    this.direct = undefined
     await Promise.all(dispatchers.map((dispatcher) => dispatcher.close().catch(() => undefined)))
   }
+}
+
+function fetchWithDispatcher(dispatcher: Dispatcher): typeof fetch {
+  return ((input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) =>
+    undiciFetch(input as Parameters<typeof undiciFetch>[0], {
+      ...init,
+      dispatcher
+    } as Parameters<typeof undiciFetch>[1]) as unknown as Promise<Response>) as typeof fetch
 }
 
 export function resolveEffectiveProxy(

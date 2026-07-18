@@ -2,18 +2,20 @@
   <img src="build/icon.svg" width="96" alt="Stone 图标">
 </p>
 
-<h1 align="center">Stone Desktop</h1>
+<h1 align="center">Stone+</h1>
+
+<p align="center"><strong>Unofficial community fork of Stone</strong></p>
 
 <p align="center">
   <a href="README.md">English</a> | <strong>简体中文</strong>
 </p>
 
 <p align="center">
-  <a href="https://github.com/EasyCode-Obsidian/Stone/releases/latest"><img src="https://img.shields.io/github/v/release/EasyCode-Obsidian/Stone?display_name=tag&sort=semver" alt="最新版本"></a>
-  <a href="https://github.com/EasyCode-Obsidian/Stone/actions/workflows/release.yml"><img src="https://github.com/EasyCode-Obsidian/Stone/actions/workflows/release.yml/badge.svg" alt="发布构建"></a>
-  <a href="https://github.com/EasyCode-Obsidian/Stone/releases/latest"><img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-555" alt="Windows、macOS 与 Linux"></a>
+  <a href="https://github.com/M4rkzzz/stone-plus/releases/latest"><img src="https://img.shields.io/github/v/release/M4rkzzz/stone-plus?display_name=tag&sort=semver" alt="最新版本"></a>
+  <a href="https://github.com/M4rkzzz/stone-plus/actions/workflows/release.yml"><img src="https://github.com/M4rkzzz/stone-plus/actions/workflows/release.yml/badge.svg" alt="发布构建"></a>
+  <a href="https://github.com/M4rkzzz/stone-plus/releases/latest"><img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-555" alt="Windows、macOS 与 Linux"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="Apache-2.0 许可证"></a>
-  <a href="https://github.com/EasyCode-Obsidian/Stone/stargazers"><img src="https://img.shields.io/github/stars/EasyCode-Obsidian/Stone?style=flat&logo=github" alt="GitHub Stars"></a>
+  <a href="https://github.com/M4rkzzz/stone-plus/stargazers"><img src="https://img.shields.io/github/stars/M4rkzzz/stone-plus?style=flat&logo=github" alt="GitHub Stars"></a>
 </p>
 
 <p align="center">
@@ -21,20 +23,30 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/EasyCode-Obsidian/Stone/releases/latest"><strong>下载最新版本</strong></a> ·
+  <a href="https://github.com/M4rkzzz/stone-plus/releases/latest"><strong>下载最新版本</strong></a> ·
   <a href="#快速开始">快速开始</a> ·
   <a href="#界面预览">界面预览</a> ·
   <a href="SECURITY.md">安全说明</a>
 </p>
 
-Stone Desktop 把多厂商 AI 接入、模型路由、协议转换和编程客户端配置集中到一个本地应用中。你可以添加自己的上游，决定每个账号开放哪些模型，将兼容账号组成号池，再让 Claude Code、Codex 或 Gemini CLI 通过同一个本地网关使用它们。
+Stone+ 把多厂商 AI 接入、模型路由、协议转换和编程客户端配置集中到一个本地应用中。它基于[上游 Stone](https://github.com/EasyCode-Obsidian/Stone)，由社区独立维护，与上游官方无隶属或背书关系。你可以添加自己的上游，决定每个账号开放哪些模型，将兼容账号组成号池，再让 Claude Code、Codex 或 Gemini CLI 通过同一个本地网关使用它们。
 
 Stone 会根据模型支持情况、剩余额度、账号健康状态和号池策略，自动选择当前可用的账号。它还能在 OpenAI、Anthropic 和 Gemini 协议之间转换，因此客户端和上游号池不必使用相同的 API 格式。
 
 > Stone 仅用于你本人拥有或已获授权使用的凭据与订阅，不提供账号共享、账号转售、公共访问，也不提供绕过厂商限制的机制。
 
+## Stone+ 新增能力
+
+- **更快的流式链路。** 复用上游连接、协商 HTTP/2、立即发送 SSE 响应头，并减少请求链路上的状态复制和流缓冲。
+- **号池 Fast On。** 对 OpenAI Responses 兼容请求按需强制使用受支持的 `priority` 服务层级。
+- **更完整的请求诊断。** 显示首字时间、对话标题、紧凑可调列宽，并支持一键隐藏标题。
+- **正确处理客户端断开。** 只记录 HTTP 499，不冷却账号，也不触发故障转移。
+- **内嵌 FRP 穿透。** 可粘贴配置运行内置 `frpc`，并复制远端地址与访问令牌。
+
+版本变化和许可证归属详见 [CHANGELOG.md](CHANGELOG.md) 与 [MODIFICATIONS.md](MODIFICATIONS.md)。
+
 <p align="center">
-  <img src="docs/media/stone-demo.gif" width="100%" alt="Stone Desktop 功能演示">
+  <img src="docs/media/stone-demo.gif" width="100%" alt="Stone+ 功能演示">
 </p>
 
 <p align="center">
@@ -92,7 +104,7 @@ Claude Code / Codex / Gemini CLI
 
 ### 1. 下载 Stone
 
-从 [GitHub Releases](https://github.com/EasyCode-Obsidian/Stone/releases/latest) 下载适合当前平台的安装包及 `SHA256SUMS`。
+从 [GitHub Releases](https://github.com/M4rkzzz/stone-plus/releases/latest) 下载适合当前平台的安装包及 `SHA256SUMS`。
 
 | 平台 | 选择 |
 | --- | --- |
@@ -150,18 +162,18 @@ sudo apt install ./Stone-*.deb
 
 ## 交流社区
 
-使用疑问和工作流交流可前往 [GitHub Discussions](https://github.com/EasyCode-Obsidian/Stone/discussions)，可复现的问题与功能建议请提交到 [GitHub Issues](https://github.com/EasyCode-Obsidian/Stone/issues)，疑似安全漏洞请使用 [Private Vulnerability Reporting](https://github.com/EasyCode-Obsidian/Stone/security/advisories/new)。分享诊断信息前请先阅读[安全政策](SECURITY.md)，切勿公开真实凭据或账号资料。
+使用疑问和工作流交流可前往 [GitHub Discussions](https://github.com/M4rkzzz/stone-plus/discussions)，可复现的问题与功能建议请提交到 [GitHub Issues](https://github.com/M4rkzzz/stone-plus/issues)，疑似安全漏洞请使用 [Private Vulnerability Reporting](https://github.com/M4rkzzz/stone-plus/security/advisories/new)。分享诊断信息前请先阅读[安全政策](SECURITY.md)，切勿公开真实凭据或账号资料。
 
 中文交流也可加入 QQ 群 **1061282900**。社区不支持账号共享、账号交易或绕过厂商条款的相关讨论。
 
 ## Star 趋势
 
 <p align="center">
-  <a href="https://github.com/EasyCode-Obsidian/Stone/stargazers">
+  <a href="https://github.com/M4rkzzz/stone-plus/stargazers">
     <img src="docs/star-history.svg" alt="Stone Star 趋势图">
   </a>
 </p>
 
 ## 许可证
 
-Stone Desktop 根据 [Apache License 2.0](LICENSE) 开源。版权与第三方许可信息见 [NOTICE](NOTICE) 和 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+Stone+ 根据 [Apache License 2.0](LICENSE) 开源。版权与第三方许可信息见 [NOTICE](NOTICE) 和 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

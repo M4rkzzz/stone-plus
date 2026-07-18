@@ -11,6 +11,9 @@ import { DatabaseBackupService } from './backup'
 import { resolveChatGptCredential } from './providers'
 import { OutboundTransportManager, resolveEffectiveProxy } from './proxy'
 import { UpdateService } from './update'
+import { FrpTunnelService } from './tunnel'
+import { registerTunnelApi } from './ipc/tunnel-api'
+import { CodexConversationTitleResolver } from './codex'
 
 const { autoUpdater } = electronUpdater
 
@@ -21,6 +24,8 @@ let gateway: GatewayServer
 let backups: DatabaseBackupService<import('./store/types').PersistedState>
 let outboundTransport: OutboundTransportManager
 let updateService: UpdateService
+let tunnelService: FrpTunnelService
+let codexConversationTitles: CodexConversationTitleResolver
 let isQuitting = false
 let storeClosed = false
 let shutdownForUpdate = false
@@ -36,6 +41,8 @@ async function bootstrap(): Promise<void> {
   store = new AppStore(app.getPath('userData'))
   await store.initialize()
   outboundTransport = new OutboundTransportManager()
+  codexConversationTitles = new CodexConversationTitleResolver(app.getPath('home'))
+  await store.refreshRequestConversationTitles((conversationId) => codexConversationTitles.resolve(conversationId))
   backups = new DatabaseBackupService({
     userDataPath: app.getPath('userData'),
     store: store.getStateRepository(),
@@ -60,9 +67,10 @@ async function bootstrap(): Promise<void> {
       return secret ? { secret, kind: 'api-key' as const } : undefined
     },
     outboundFetchResolver: (account, pool) => {
-      const proxy = resolveEffectiveProxy(account, pool, store.getSnapshot().proxies)
+      const proxy = resolveEffectiveProxy(account, pool, store.getRuntimeProxies())
       return outboundTransport.fetchFor(proxy, proxy ? store.getProxyPassword(proxy.id) : undefined)
-    }
+    },
+    conversationTitleResolver: (conversationId) => codexConversationTitles.resolve(conversationId)
   })
   const clientConfigHome = process.env.STONE_CLIENT_CONFIG_HOME
   const clientConfig = new ClientConfigService({
@@ -86,8 +94,17 @@ async function bootstrap(): Promise<void> {
   })
   await updateService.initialize()
 
+  tunnelService = new FrpTunnelService({
+    userDataPath: app.getPath('userData'),
+    binaryPath: app.isPackaged
+      ? join(process.resourcesPath, 'frp', 'frpc.exe')
+      : resolve('build/frp/frpc.exe')
+  })
+  await tunnelService.initialize()
+
   registerGatewayApi(store, gateway, clientConfig, outboundTransport, backups, updateTrayMenu)
   registerUpdateApi(updateService)
+  registerTunnelApi(tunnelService)
   createWindow()
   createTray()
   updateService.startAutomaticChecks()
@@ -277,9 +294,11 @@ function shutdownServices(): Promise<void> {
   shutdownPromise = (async () => {
     try {
       if (!shutdownForUpdate && updateService) updateService.close()
+      if (tunnelService) await tunnelService.close()
       if (gateway) await gateway.stop()
       if (backups) await backups.close()
       if (outboundTransport) await outboundTransport.close()
+      if (codexConversationTitles) codexConversationTitles.close()
       if (store) await store.close()
     } catch (error: unknown) {
       console.error('Stone could not finish graceful shutdown', error)

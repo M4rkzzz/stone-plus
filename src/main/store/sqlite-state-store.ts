@@ -216,6 +216,10 @@ export class SqliteStateStore<T extends SqlitePersistedShape> {
     return structuredClone(this.data)
   }
 
+  public select<TResult>(selector: (state: Readonly<T>) => TResult): TResult {
+    return structuredClone(selector(this.data))
+  }
+
   public readAppMetadata(key: string): string | undefined {
     return readMetadata(this.requireDatabase(), key)
   }

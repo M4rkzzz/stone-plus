@@ -113,7 +113,7 @@ function releasePayload(version = '0.8.1', overrides: Record<string, unknown> = 
     tag_name: `v${version}`,
     name: `Stone v${version}`,
     body: '## Changes\n\n- Safer updates',
-    html_url: `https://github.com/EasyCode-Obsidian/Stone/releases/tag/v${version}`,
+    html_url: `https://github.com/M4rkzzz/stone-plus/releases/tag/v${version}`,
     published_at: '2026-07-13T00:00:00Z',
     draft: false,
     prerelease: false,
@@ -143,7 +143,7 @@ describe('UpdateService', () => {
       title: 'Stone v0.8.1',
       notes: '## Changes\n\n- Safer updates',
       publishedAt: '2026-07-13T00:00:00Z',
-      url: 'https://github.com/EasyCode-Obsidian/Stone/releases/tag/v0.8.1'
+      url: 'https://github.com/M4rkzzz/stone-plus/releases/tag/v0.8.1'
     })
     expect(state.checkedAt).toBe(1_234)
   })
@@ -299,7 +299,7 @@ describe('UpdateService', () => {
 
     await service.openUpdatePage()
 
-    expect(openExternal).toHaveBeenCalledWith('https://github.com/EasyCode-Obsidian/Stone/releases/tag/v0.8.1')
+    expect(openExternal).toHaveBeenCalledWith('https://github.com/M4rkzzz/stone-plus/releases/tag/v0.8.1')
   })
 })
 

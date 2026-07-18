@@ -70,6 +70,7 @@ export class AppStore {
   private status: GatewayStatus = { ...DEFAULT_STATUS }
   private readonly vaultAvailable: boolean
   private readonly vaultBackend: string
+  private readonly decryptedCredentialCache = new Map<string, string>()
 
   public constructor(userDataPath: string) {
     const vault = inspectCredentialVault()
@@ -128,11 +129,15 @@ export class AppStore {
   }
 
   public getRuntimeAccounts(): Account[] {
-    return this.store.read().accounts
+    return this.store.select((state) => state.accounts)
   }
 
   public getRuntimeAccount(id: string): Account | undefined {
-    return this.store.read().accounts.find((account) => account.id === id)
+    return this.store.select((state) => state.accounts.find((account) => account.id === id))
+  }
+
+  public getRuntimeProxies(): ProxyDefinition[] {
+    return this.store.select((state) => state.proxies)
   }
 
   public setGatewayStatus(status: GatewayStatus): void {
@@ -661,6 +666,8 @@ export class AppStore {
         stickySessions: input.stickySessions,
         stickyTtlMinutes: positiveInteger(input.stickyTtlMinutes, 60),
         maxRetries: nonNegativeInteger(input.maxRetries),
+        forceFastMode: input.protocol === 'openai-responses'
+          && (input.forceFastMode ?? existing?.forceFastMode) === true,
         proxyId: input.proxyId === undefined ? existing?.proxyId : optionalProxyId(input.proxyId, state.proxies),
         createdAt: existing?.createdAt ?? timestamp,
         updatedAt: timestamp
@@ -781,6 +788,18 @@ export class AppStore {
     await this.store.appendRequestLog(safeLog, MAX_PERSISTED_REQUEST_LOGS)
   }
 
+  public async refreshRequestConversationTitles(resolve: (conversationId: string) => string | undefined): Promise<void> {
+    await this.store.update((state) => {
+      state.requestLogs = state.requestLogs.map((log) => {
+        if (!log.conversationId || (log.conversationName && !log.conversationName.startsWith('对话 '))) return log
+        const conversationName = resolve(log.conversationId)
+        return conversationName && conversationName !== log.conversationName
+          ? { ...log, conversationName }
+          : log
+      })
+    })
+  }
+
   public async clearLogs(): Promise<AppSnapshot> {
     await this.store.update((state) => {
       state.requestLogs = []
@@ -807,20 +826,25 @@ export class AppStore {
   }
 
   public getCredential(credentialId: string): string | undefined {
-    const encryptedCredential = this.store.read().credentials[credentialId]
+    const encryptedCredential = this.store.select((state) => state.credentials[credentialId])
     if (!encryptedCredential) return undefined
     return this.decrypt(encryptedCredential)
   }
 
   public getProxyPassword(proxyId: string): string | undefined {
-    const proxy = this.store.read().proxies.find((candidate) => candidate.id === proxyId)
+    const proxy = this.store.select((state) => state.proxies.find((candidate) => candidate.id === proxyId))
     return proxy?.credentialId ? this.getCredential(proxy.credentialId) : undefined
   }
 
   private decrypt(encryptedCredential: string): string | undefined {
+    if (this.decryptedCredentialCache.has(encryptedCredential)) {
+      return this.decryptedCredentialCache.get(encryptedCredential)
+    }
     if (!this.vaultAvailable) return undefined
     try {
-      return safeStorage.decryptString(Buffer.from(encryptedCredential, 'base64'))
+      const decrypted = safeStorage.decryptString(Buffer.from(encryptedCredential, 'base64'))
+      this.decryptedCredentialCache.set(encryptedCredential, decrypted)
+      return decrypted
     } catch {
       return undefined
     }
@@ -1184,47 +1208,78 @@ function credentialSensitiveValues(decrypted: string, chatGptOAuth: boolean): st
 }
 
 function summarizeHourly(requestLogs: RequestLog[], now: number) {
-  return Array.from({ length: 24 }, (_, index) => {
+  const hourMs = 60 * 60 * 1000
+  const buckets = Array.from({ length: 24 }, (_, index) => {
     const timestamp = now - (23 - index) * 60 * 60 * 1000
-    const windowStart = timestamp - 60 * 60 * 1000
-    const logs = requestLogs.filter((log) => log.timestamp > windowStart && log.timestamp <= timestamp)
     return {
       timestamp,
-      requestCount: logs.length,
-      errorCount: logs.filter((log) => log.status === 'error').length,
-      inputTokens: logs.reduce((total, log) => total + (log.inputTokens ?? 0), 0),
-      outputTokens: logs.reduce((total, log) => total + (log.outputTokens ?? 0), 0),
-      averageLatencyMs: logs.length ? Math.round(logs.reduce((total, log) => total + log.latencyMs, 0) / logs.length) : 0,
-      failoverCount: logs.reduce((total, log) => total + (log.failoverCount ?? 0), 0)
+      requestCount: 0,
+      errorCount: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      latencyTotal: 0,
+      failoverCount: 0
     }
   })
+  for (const log of requestLogs) {
+    if (log.timestamp > now) continue
+    const hoursAgo = Math.floor((now - log.timestamp) / hourMs)
+    const index = 23 - hoursAgo
+    if (index < 0 || index >= buckets.length) continue
+    const bucket = buckets[index]
+    bucket.requestCount += 1
+    if (log.status === 'error') bucket.errorCount += 1
+    bucket.inputTokens += log.inputTokens ?? 0
+    bucket.outputTokens += log.outputTokens ?? 0
+    bucket.latencyTotal += log.latencyMs
+    bucket.failoverCount += log.failoverCount ?? 0
+  }
+  return buckets.map(({ latencyTotal, ...bucket }) => ({
+    ...bucket,
+    averageLatencyMs: bucket.requestCount ? Math.round(latencyTotal / bucket.requestCount) : 0
+  }))
 }
 
 function summarizeObservability(requestLogs: RequestLog[], windowStart: number, windowEnd: number) {
-  const logs = requestLogs.filter((log) => log.timestamp >= windowStart && log.timestamp <= windowEnd)
-  const successCount = logs.filter((log) => log.status === 'success').length
-  const errorCount = logs.filter((log) => log.status === 'error').length
+  let requestCount = 0
+  let successCount = 0
+  let errorCount = 0
+  let latencyTotal = 0
+  let inputTokens = 0
+  let outputTokens = 0
+  let cachedInputTokens = 0
+  let reasoningTokens = 0
+  let failoverCount = 0
   const errorsByStatus: Record<string, number> = {}
-  for (const log of logs) {
-    if (log.status !== 'error') continue
-    const key = String(log.statusCode ?? 'unknown')
-    errorsByStatus[key] = (errorsByStatus[key] ?? 0) + 1
+  for (const log of requestLogs) {
+    if (log.timestamp < windowStart || log.timestamp > windowEnd) continue
+    requestCount += 1
+    if (log.status === 'success') successCount += 1
+    if (log.status === 'error') {
+      errorCount += 1
+      const key = String(log.statusCode ?? 'unknown')
+      errorsByStatus[key] = (errorsByStatus[key] ?? 0) + 1
+    }
+    latencyTotal += log.latencyMs
+    inputTokens += log.inputTokens ?? 0
+    outputTokens += log.outputTokens ?? 0
+    cachedInputTokens += log.cachedInputTokens ?? 0
+    reasoningTokens += log.reasoningTokens ?? 0
+    failoverCount += log.failoverCount ?? 0
   }
   return {
     windowStart,
     windowEnd,
-    requestCount: logs.length,
+    requestCount,
     successCount,
     errorCount,
-    successRate: logs.length ? successCount / logs.length : 0,
-    averageLatencyMs: logs.length
-      ? Math.round(logs.reduce((total, log) => total + log.latencyMs, 0) / logs.length)
-      : 0,
-    inputTokens: logs.reduce((total, log) => total + (log.inputTokens ?? 0), 0),
-    outputTokens: logs.reduce((total, log) => total + (log.outputTokens ?? 0), 0),
-    cachedInputTokens: logs.reduce((total, log) => total + (log.cachedInputTokens ?? 0), 0),
-    reasoningTokens: logs.reduce((total, log) => total + (log.reasoningTokens ?? 0), 0),
-    failoverCount: logs.reduce((total, log) => total + (log.failoverCount ?? 0), 0),
+    successRate: requestCount ? successCount / requestCount : 0,
+    averageLatencyMs: requestCount ? Math.round(latencyTotal / requestCount) : 0,
+    inputTokens,
+    outputTokens,
+    cachedInputTokens,
+    reasoningTokens,
+    failoverCount,
     errorsByStatus
   }
 }

@@ -241,9 +241,11 @@ describe('AppStore', () => {
       stickySessions: false,
       stickyTtlMinutes: 30,
       maxRetries: 1,
+      forceFastMode: true,
       proxyId
     })
     const pool = withPool.pools[0]
+    expect(pool.forceFastMode).toBe(true)
 
     await expect(store.deleteProxy(proxyId)).rejects.toThrow(/accounts/)
     await store.saveAccount({
@@ -257,7 +259,7 @@ describe('AppStore', () => {
       proxyId: ''
     })
     await expect(store.deleteProxy(proxyId)).rejects.toThrow(/pools/)
-    await store.savePool({
+    const updatedPool = await store.savePool({
       id: pool.id,
       name: pool.name,
       protocol: pool.protocol,
@@ -268,6 +270,7 @@ describe('AppStore', () => {
       maxRetries: pool.maxRetries,
       proxyId: ''
     })
+    expect(updatedPool.pools[0].forceFastMode).toBe(true)
     expect((await store.deleteProxy(proxyId)).proxies).toHaveLength(0)
   })
 

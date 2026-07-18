@@ -278,7 +278,7 @@ try {
   console.log(JSON.stringify(result, null, 2))
 
   if (
-    result.title !== 'Stone' ||
+    result.title !== 'Stone+' ||
     result.providers < 1 ||
     result.routes !== 3 ||
     result.credentialsExposed ||

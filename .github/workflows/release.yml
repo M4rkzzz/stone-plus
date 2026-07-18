@@ -65,39 +65,39 @@ jobs:
             os: windows-latest
             builder_args: --win nsis portable --x64
             artifact_path: |
-              release/Stone-*-windows-x64-setup.exe
-              release/Stone-*-windows-x64-setup.exe.blockmap
-              release/Stone-*-windows-x64-portable.exe
+              release/StonePlus-*-windows-x64-setup.exe
+              release/StonePlus-*-windows-x64-setup.exe.blockmap
+              release/StonePlus-*-windows-x64-portable.exe
               release/latest.yml
           - name: Linux x64
             id: linux-x64
             os: ubuntu-latest
             builder_args: --linux AppImage deb --x64
             artifact_path: |
-              release/Stone-*-linux-x86_64.AppImage
-              release/Stone-*-linux-amd64.deb
+              release/StonePlus-*-linux-x86_64.AppImage
+              release/StonePlus-*-linux-amd64.deb
               release/latest-linux.yml
           - name: Linux arm64
             id: linux-arm64
             os: ubuntu-24.04-arm
             builder_args: --linux AppImage deb --arm64
             artifact_path: |
-              release/Stone-*-linux-arm64.AppImage
-              release/Stone-*-linux-arm64.deb
+              release/StonePlus-*-linux-arm64.AppImage
+              release/StonePlus-*-linux-arm64.deb
               release/latest-linux-arm64.yml
           - name: macOS Intel and Apple Silicon
             id: macos
             os: macos-15
             builder_args: --mac dmg zip --x64 --arm64 --config.mac.identity=- --config.mac.hardenedRuntime=false
             artifact_path: |
-              release/Stone-*-macos-x64.dmg
-              release/Stone-*-macos-x64.dmg.blockmap
-              release/Stone-*-macos-x64.zip
-              release/Stone-*-macos-x64.zip.blockmap
-              release/Stone-*-macos-arm64.dmg
-              release/Stone-*-macos-arm64.dmg.blockmap
-              release/Stone-*-macos-arm64.zip
-              release/Stone-*-macos-arm64.zip.blockmap
+              release/StonePlus-*-macos-x64.dmg
+              release/StonePlus-*-macos-x64.dmg.blockmap
+              release/StonePlus-*-macos-x64.zip
+              release/StonePlus-*-macos-x64.zip.blockmap
+              release/StonePlus-*-macos-arm64.dmg
+              release/StonePlus-*-macos-arm64.dmg.blockmap
+              release/StonePlus-*-macos-arm64.zip
+              release/StonePlus-*-macos-arm64.zip.blockmap
               release/latest-mac.yml
     env:
       CSC_IDENTITY_AUTO_DISCOVERY: 'false'
@@ -170,21 +170,21 @@ jobs:
         run: |
           version="${RELEASE_TAG#v}"
           expected=(
-            "Stone-${version}-windows-x64-setup.exe"
-            "Stone-${version}-windows-x64-setup.exe.blockmap"
-            "Stone-${version}-windows-x64-portable.exe"
-            "Stone-${version}-linux-x86_64.AppImage"
-            "Stone-${version}-linux-amd64.deb"
-            "Stone-${version}-linux-arm64.AppImage"
-            "Stone-${version}-linux-arm64.deb"
-            "Stone-${version}-macos-x64.dmg"
-            "Stone-${version}-macos-x64.dmg.blockmap"
-            "Stone-${version}-macos-x64.zip"
-            "Stone-${version}-macos-x64.zip.blockmap"
-            "Stone-${version}-macos-arm64.dmg"
-            "Stone-${version}-macos-arm64.dmg.blockmap"
-            "Stone-${version}-macos-arm64.zip"
-            "Stone-${version}-macos-arm64.zip.blockmap"
+            "StonePlus-${version}-windows-x64-setup.exe"
+            "StonePlus-${version}-windows-x64-setup.exe.blockmap"
+            "StonePlus-${version}-windows-x64-portable.exe"
+            "StonePlus-${version}-linux-x86_64.AppImage"
+            "StonePlus-${version}-linux-amd64.deb"
+            "StonePlus-${version}-linux-arm64.AppImage"
+            "StonePlus-${version}-linux-arm64.deb"
+            "StonePlus-${version}-macos-x64.dmg"
+            "StonePlus-${version}-macos-x64.dmg.blockmap"
+            "StonePlus-${version}-macos-x64.zip"
+            "StonePlus-${version}-macos-x64.zip.blockmap"
+            "StonePlus-${version}-macos-arm64.dmg"
+            "StonePlus-${version}-macos-arm64.dmg.blockmap"
+            "StonePlus-${version}-macos-arm64.zip"
+            "StonePlus-${version}-macos-arm64.zip.blockmap"
             "latest.yml"
             "latest-mac.yml"
             "latest-linux.yml"
@@ -215,21 +215,21 @@ jobs:
           const version = process.env.RELEASE_TAG.replace(/^v/, '')
           const manifests = {
             'latest.yml': [
-              `Stone-${version}-windows-x64-setup.exe`,
+              `StonePlus-${version}-windows-x64-setup.exe`,
             ],
             'latest-mac.yml': [
-              `Stone-${version}-macos-x64.dmg`,
-              `Stone-${version}-macos-x64.zip`,
-              `Stone-${version}-macos-arm64.dmg`,
-              `Stone-${version}-macos-arm64.zip`,
+              `StonePlus-${version}-macos-x64.dmg`,
+              `StonePlus-${version}-macos-x64.zip`,
+              `StonePlus-${version}-macos-arm64.dmg`,
+              `StonePlus-${version}-macos-arm64.zip`,
             ],
             'latest-linux.yml': [
-              `Stone-${version}-linux-x86_64.AppImage`,
-              `Stone-${version}-linux-amd64.deb`,
+              `StonePlus-${version}-linux-x86_64.AppImage`,
+              `StonePlus-${version}-linux-amd64.deb`,
             ],
             'latest-linux-arm64.yml': [
-              `Stone-${version}-linux-arm64.AppImage`,
-              `Stone-${version}-linux-arm64.deb`,
+              `StonePlus-${version}-linux-arm64.AppImage`,
+              `StonePlus-${version}-linux-arm64.deb`,
             ],
           }
 
@@ -289,7 +289,7 @@ jobs:
               --draft
               --repo "$GITHUB_REPOSITORY"
               --target "$GITHUB_SHA"
-              --title "Stone ${RELEASE_TAG}"
+              --title "Stone+ ${RELEASE_TAG}"
               --generate-notes
               --notes $'> [!WARNING]\n> macOS artifacts are ad-hoc signed and are not Apple-notarized. Windows artifacts are unsigned. Linux credential storage requires a Secret Service-compatible keyring; AppImage may require FUSE 2.'
             )

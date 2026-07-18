@@ -1,6 +1,6 @@
 import { createServer as createNodeServer } from 'node:net'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import type { Account, GatewaySettings, Pool, ProviderDefinition, Route } from '../../src/shared/types'
+import type { Account, GatewaySettings, Pool, ProviderDefinition, RequestLog, Route } from '../../src/shared/types'
 import { createCanonicalStreamParser, GatewayServer } from '../../src/main/gateway'
 import type { GatewayConfig } from '../../src/main/gateway'
 
@@ -169,6 +169,7 @@ describe('GatewayServer', () => {
     gatewayConfig.providers[0].protocol = 'openai-responses'
     gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
     gatewayConfig.pools[0].protocol = 'openai-responses'
+    gatewayConfig.pools[0].forceFastMode = true
     gatewayConfig.accounts[0] = {
       ...gatewayConfig.accounts[0],
       credentialType: 'chatgpt-oauth',
@@ -193,7 +194,7 @@ describe('GatewayServer', () => {
     const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
       method: 'POST',
       headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
-      body: JSON.stringify({ model: 'gpt-5.1', input: 'Hello', stream: true })
+      body: JSON.stringify({ model: 'gpt-5.1', input: 'Hello', stream: true, service_tier: 'default' })
     })
     expect(response.status).toBe(200)
     expect(await response.text()).toContain('response.completed')
@@ -203,7 +204,7 @@ describe('GatewayServer', () => {
     expect(headers.get('authorization')).toBe('Bearer oauth-private')
     expect(headers.get('chatgpt-account-id')).toBe('acct-team')
     expect(headers.get('originator')).toBe('codex_cli_rs')
-    expect(JSON.parse(String(request.body))).toMatchObject({ store: false, stream: true })
+    expect(JSON.parse(String(request.body))).toMatchObject({ store: false, stream: true, service_tier: 'priority' })
   })
 
   it('keeps Responses Lite and Search operations on one OAuth account and returns Search JSON directly', async () => {
@@ -499,7 +500,7 @@ describe('GatewayServer', () => {
         for (let offset = 0; offset < encoded.length; offset += 5) controller.enqueue(encoded.slice(offset, offset + 5))
         controller.close()
       }
-    }), { status: 200, headers: { 'content-type': 'text/event-stream' } }))
+    }, { highWaterMark: 0 }), { status: 200, headers: { 'content-type': 'text/event-stream' } }))
     const gateway = new GatewayServer({
       config: gatewayConfig,
       credentialResolver: () => ({ secret: accessToken, kind: 'chatgpt-oauth', accountId }),
@@ -767,6 +768,182 @@ describe('GatewayServer', () => {
     expect(response.headers.get('cache-control')).toBe('no-cache')
     expect(await response.text()).toBe('data: {"delta":"one"}\n\ndata: [DONE]\n\n')
     expect(gateway.getStatus()).toMatchObject({ activeRequests: 0, successRequests: 1 })
+  })
+
+  it('forwards the first safe stream chunk without waiting for a later chunk', async () => {
+    const port = await freePort()
+    const encoder = new TextEncoder()
+    let releaseTail!: () => void
+    const tailGate = new Promise<void>((resolve) => { releaseTail = resolve })
+    let pullCount = 0
+    const upstreamFetch = vi.fn(async () => new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode('data: {"delta":"first"}\n\n'))
+      },
+      async pull(controller) {
+        pullCount += 1
+        if (pullCount > 1) return
+        await tailGate
+        controller.enqueue(encoder.encode('data: [DONE]\n\n'))
+        controller.close()
+      }
+    }), {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream' }
+    }))
+    const gateway = new GatewayServer({
+      config: config(port),
+      credentialResolver: () => 'credential-with-a-long-value-that-must-not-delay-unrelated-safe-output',
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'source-model', stream: true, messages: [{ role: 'user', content: 'Hello' }] })
+    })
+    const reader = response.body?.getReader()
+    expect(reader).toBeDefined()
+    const first = await Promise.race([
+      reader!.read(),
+      new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error('first chunk was buffered')), 250))
+    ])
+    expect(new TextDecoder().decode(first.value)).toContain('"first"')
+
+    releaseTail()
+    const remaining = await reader!.read()
+    expect(new TextDecoder().decode(remaining.value)).toContain('[DONE]')
+    await reader!.read()
+  })
+
+  it('logs only 499 without cooldown or failover when the client disconnects', async () => {
+    const port = await freePort()
+    const states: Array<{ accountId: string; status: string }> = []
+    const logs: RequestLog[] = []
+    const selectedAccountIds: string[] = []
+    const upstreamFetch = vi.fn()
+      .mockImplementationOnce(async (_input: string | URL | Request, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+        const signal = init?.signal
+        if (signal?.aborted) {
+          reject(signal.reason)
+          return
+        }
+        signal?.addEventListener('abort', () => reject(signal.reason), { once: true })
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        id: 'completion-after-abort',
+        model: 'source-model',
+        choices: [{ message: { role: 'assistant', content: 'Done' }, finish_reason: 'stop' }]
+      }), { status: 200, headers: { 'content-type': 'application/json' } }))
+    const gateway = new GatewayServer({
+      config: config(port),
+      credentialResolver: (selected) => {
+        selectedAccountIds.push(selected.id)
+        return `key-${selected.id}`
+      },
+      fetchImplementation: upstreamFetch as typeof fetch,
+      onAccountState: (state) => states.push(state),
+      onLog: (log) => logs.push(log)
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const controller = new AbortController()
+    const disconnectedRequest = fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'source-model', messages: [{ role: 'user', content: 'Hello' }] }),
+      signal: controller.signal
+    }).catch((error: unknown) => error)
+    await vi.waitFor(() => expect(upstreamFetch).toHaveBeenCalledOnce())
+    controller.abort()
+    await disconnectedRequest
+    await vi.waitFor(() => expect(logs).toHaveLength(1))
+
+    expect(upstreamFetch).toHaveBeenCalledOnce()
+    expect(states).toHaveLength(0)
+    expect(logs[0]).toMatchObject({
+      status: 'error',
+      statusCode: 499,
+      error: 'Client closed the request',
+      failoverCount: 0,
+      accountId: 'first'
+    })
+
+    const nextResponse = await post(port)
+    expect(nextResponse.status).toBe(200)
+    expect(selectedAccountIds).toEqual(['first', 'first'])
+    expect(upstreamFetch).toHaveBeenCalledTimes(2)
+  })
+
+  it('records time to first token and the client-provided conversation identity', async () => {
+    const port = await freePort()
+    let clock = timestamp
+    let step = 0
+    const encoder = new TextEncoder()
+    const chunks = [
+      'data: {"id":"chat-ttft","model":"source-model","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}\n\n',
+      'data: {"id":"chat-ttft","model":"source-model","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}\n\ndata: [DONE]\n\n'
+    ]
+    const upstreamFetch = vi.fn(async () => new Response(new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (step >= chunks.length) {
+          controller.close()
+          return
+        }
+        if (step === 0) {
+          clock = timestamp + 40
+          controller.enqueue(encoder.encode(chunks[step]))
+          step += 1
+          return
+        }
+        step += 1
+        return new Promise<void>((resolve) => {
+          setTimeout(() => {
+            clock = timestamp + 125
+            controller.enqueue(encoder.encode(chunks[1]))
+            resolve()
+          }, 5)
+        })
+      }
+    }), { status: 200, headers: { 'content-type': 'text/event-stream' } }))
+    const logs: RequestLog[] = []
+    const gateway = new GatewayServer({
+      config: config(port),
+      credentialResolver: () => 'credential',
+      fetchImplementation: upstreamFetch as typeof fetch,
+      onLog: (log) => logs.push(log),
+      conversationTitleResolver: (conversationId) => conversationId === 'thread-stone-feature' ? 'Stone 请求日志功能' : undefined,
+      now: () => clock
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer local-secret',
+        'content-type': 'application/json',
+        'thread-id': 'thread-stone-feature'
+      },
+      body: JSON.stringify({
+        model: 'source-model',
+        stream: true,
+        messages: [{ role: 'user', content: 'Hello' }]
+      })
+    })
+    expect(response.status).toBe(200)
+    await response.text()
+
+    expect(logs).toHaveLength(1)
+    expect(logs[0]).toMatchObject({
+      status: 'success',
+      conversationId: 'thread-stone-feature',
+      conversationName: 'Stone 请求日志功能',
+      firstTokenMs: 40
+    })
   })
 
   it('preserves a same-protocol stream error while marking the account request as failed', async () => {

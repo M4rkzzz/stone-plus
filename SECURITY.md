@@ -60,7 +60,7 @@ Do not open a public Issue for a suspected vulnerability.
 
 Please use GitHub **Private Vulnerability Reporting**:
 
-1. Open the repository's [Security advisories page](https://github.com/EasyCode-Obsidian/Stone/security/advisories/new).
+1. Open the repository's [Security advisories page](https://github.com/M4rkzzz/stone-plus/security/advisories/new).
 2. Select **Report a vulnerability**.
 3. Submit the smallest safe reproduction using dummy credentials and anonymized metadata.
 
@@ -70,7 +70,7 @@ If Private Vulnerability Reporting is unavailable, open a public Issue only to a
 
 请使用 GitHub **Private Vulnerability Reporting**：
 
-1. 打开仓库的 [Security advisories 页面](https://github.com/EasyCode-Obsidian/Stone/security/advisories/new)。
+1. 打开仓库的 [Security advisories 页面](https://github.com/M4rkzzz/stone-plus/security/advisories/new)。
 2. 选择 **Report a vulnerability**。
 3. 使用虚拟凭据和匿名元数据提交最小、安全的复现过程。
 

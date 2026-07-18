@@ -8,6 +8,7 @@ import type {
   ClientConfigStatus,
   GatewayApi,
   GatewaySettings,
+  FrpTunnelState,
   Pool,
   PoolInput,
   ProxyInput,
@@ -353,6 +354,8 @@ const logs: RequestLog[] = [
   ]
   return {
     id,
+    conversationId: `thread-${id}`,
+    conversationName: client === 'codex' ? `Stone 开发对话 ${id.slice(-2)}` : `${clientNamesForMock(client)} 会话 ${id.slice(-2)}`,
     timestamp: now - secondsAgo * 1000,
     client,
     protocol,
@@ -362,11 +365,18 @@ const logs: RequestLog[] = [
     status,
     statusCode,
     latencyMs,
+    firstTokenMs: status === 'error' ? undefined : Math.max(80, Math.round(latencyMs * 0.32)),
     inputTokens,
     outputTokens,
     error: status === 'error' ? (statusCode === 429 ? '上游请求频率受限' : '上游连接超时') : undefined,
   }
 })
+
+function clientNamesForMock(client: RequestLog['client']): string {
+  if (client === 'claude') return 'Claude'
+  if (client === 'gemini') return 'Gemini'
+  return 'Codex'
+}
 
 const initialSnapshot: AppSnapshot = {
   providers,
@@ -535,6 +545,13 @@ function loadSnapshot(): AppSnapshot {
 
 export function createMockApi(): GatewayApi {
   const snapshot = loadSnapshot()
+  let frpTunnelState: FrpTunnelState = {
+    config: '',
+    configSaved: false,
+    binaryAvailable: true,
+    running: false,
+    logs: [],
+  }
   const listeners = new Set<(value: AppSnapshot) => void>()
   const updateListeners = new Set<(value: AppUpdateState) => void>()
   const clientBackups: ClientConfigBackup[] = []
@@ -780,6 +797,8 @@ export function createMockApi(): GatewayApi {
         stickySessions: input.stickySessions,
         stickyTtlMinutes: input.stickyTtlMinutes,
         maxRetries: input.maxRetries,
+        forceFastMode: input.protocol === 'openai-responses'
+          && (input.forceFastMode ?? existing?.forceFastMode) === true,
         proxyId: input.proxyId || undefined,
         createdAt: existing?.createdAt ?? timestamp,
         updatedAt: timestamp,
@@ -1043,7 +1062,7 @@ export function createMockApi(): GatewayApi {
           tagName: 'v0.8.1',
           title: 'Stone 0.8.1 · 更稳健的本地更新体验',
           publishedAt: new Date().toISOString(),
-          url: 'https://github.com/EasyCode-Obsidian/Stone/releases/tag/v0.8.1',
+          url: 'https://github.com/M4rkzzz/stone-plus/releases/tag/v0.8.1',
           notes: [
             '本次更新',
             '',
@@ -1087,6 +1106,23 @@ export function createMockApi(): GatewayApi {
       publishUpdate({ status: 'installing', error: undefined })
     },
     async openUpdatePage() { await pause(80) },
+    async getFrpTunnelState() { return clone(frpTunnelState) },
+    async saveFrpTunnelConfig(content) {
+      frpTunnelState = { ...frpTunnelState, config: content, configSaved: Boolean(content.trim()), lastError: undefined }
+      return clone(frpTunnelState)
+    },
+    async startFrpTunnel() {
+      frpTunnelState = { ...frpTunnelState, running: true, pid: 14521, startedAt: Date.now(), remoteAddress: 'http://frps.example.com:15721/v1', serverAddress: 'frps.example.com', remotePort: 15721, logs: [...frpTunnelState.logs, '[12:00:00] frpc started.'] }
+      return clone(frpTunnelState)
+    },
+    async stopFrpTunnel() {
+      frpTunnelState = { ...frpTunnelState, running: false, pid: undefined, startedAt: undefined, logs: [...frpTunnelState.logs, '[12:01:00] frpc stopped.'] }
+      return clone(frpTunnelState)
+    },
+    async clearFrpTunnelLogs() {
+      frpTunnelState = { ...frpTunnelState, logs: [] }
+      return clone(frpTunnelState)
+    },
     onSnapshot(listener) {
       listeners.add(listener)
       return () => listeners.delete(listener)

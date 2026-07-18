@@ -2,9 +2,9 @@ import type { AppUpdateProgress, AppUpdateRelease, AppUpdateState } from '@share
 import type { AppUpdater, ProgressInfo, UpdateCheckResult, UpdateDownloadedEvent } from 'electron-updater'
 import { clean, eq, gt, gte, valid } from 'semver'
 
-const RELEASE_API_URL = 'https://api.github.com/repos/EasyCode-Obsidian/Stone/releases/latest'
-const RELEASE_PAGE_URL = 'https://github.com/EasyCode-Obsidian/Stone/releases/latest'
-const RELEASE_PATH_PREFIX = '/EasyCode-Obsidian/Stone/releases/'
+const RELEASE_API_URL = 'https://api.github.com/repos/M4rkzzz/stone-plus/releases/latest'
+const RELEASE_PAGE_URL = 'https://github.com/M4rkzzz/stone-plus/releases/latest'
+const RELEASE_PATH_PREFIX = '/M4rkzzz/stone-plus/releases/'
 const MAX_RELEASE_RESPONSE_BYTES = 512 * 1024
 const MAX_RELEASE_NOTES_LENGTH = 32_000
 const DEFAULT_CHECK_DELAY_MS = 12_000

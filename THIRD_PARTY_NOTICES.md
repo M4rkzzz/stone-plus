@@ -1,6 +1,6 @@
 # Third-Party Notices
 
-Stone Desktop is licensed under the Apache License, Version 2.0. Third-party
+Stone+ is licensed under the Apache License, Version 2.0. Third-party
 components remain under their respective licenses; the Stone license does not
 replace or modify those terms.
 
@@ -53,9 +53,20 @@ Font License, Version 1.1.
 
 The complete OFL text is retained in each Fontsource package.
 
+## FRP
+
+Stone+'s Windows package includes the `frpc` v0.69.0 executable from the FRP project,
+Copyright 2015 fatedier, licensed under the Apache License, Version 2.0.
+The corresponding license text is distributed as `frp/LICENSE.frp.txt`.
+Project: https://github.com/fatedier/frp
+
+The bundled executable is obtained from the official `frp_0.69.0_windows_amd64.zip`
+release archive. The source archive is verified before extraction against SHA-256
+`0e38f6dbe7761d648ca5c6ee323b7309544f48c01e9476f553902f3bc0949089`.
+
 ## Electron And Chromium
 
-Stone Desktop is distributed with Electron, which includes Chromium, Node.js,
+Stone+ is distributed with Electron, which includes Chromium, Node.js,
 and other third-party components. Electron's MIT license is distributed as
 `LICENSE.electron.txt`; Chromium and embedded component notices are distributed
 as `LICENSES.chromium.html`. These files are generated and included by the

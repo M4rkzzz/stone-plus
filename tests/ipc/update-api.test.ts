@@ -32,7 +32,7 @@ const availableState: AppUpdateState = {
     title: 'Stone v0.8.1',
     notes: 'Changes',
     publishedAt: '2026-07-13T00:00:00Z',
-    url: 'https://github.com/EasyCode-Obsidian/Stone/releases/tag/v0.8.1'
+    url: 'https://github.com/M4rkzzz/stone-plus/releases/tag/v0.8.1'
   }
 }
 

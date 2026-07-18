@@ -51,6 +51,8 @@ export interface GatewayAccountState {
 
 export type GatewayAccountStateHandler = (state: GatewayAccountState) => void
 
+export type ConversationTitleResolver = (conversationId: string) => Promise<string | undefined> | string | undefined
+
 export interface GatewayServerOptions {
   config: GatewayConfig
   credentialResolver: CredentialResolver
@@ -58,6 +60,7 @@ export interface GatewayServerOptions {
   onAccountState?: GatewayAccountStateHandler
   fetchImplementation?: typeof fetch
   outboundFetchResolver?: OutboundFetchResolver
+  conversationTitleResolver?: ConversationTitleResolver
   now?: () => number
   random?: () => number
 }

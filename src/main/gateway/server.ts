@@ -53,6 +53,7 @@ import type {
   GatewayController,
   GatewayLogHandler,
   OutboundFetchResolver,
+  ConversationTitleResolver,
   GatewayServerOptions
 } from './types'
 
@@ -69,6 +70,7 @@ export class GatewayServer implements GatewayController {
   private credentialResolver: CredentialResolver
   private readonly fetchImplementation: typeof fetch
   private readonly outboundFetchResolver?: OutboundFetchResolver
+  private readonly conversationTitleResolver?: ConversationTitleResolver
   private readonly scheduler: PoolScheduler
   private readonly logListeners = new Set<GatewayLogHandler>()
   private readonly accountStateListeners = new Set<GatewayAccountStateHandler>()
@@ -84,6 +86,7 @@ export class GatewayServer implements GatewayController {
     this.credentialResolver = options.credentialResolver
     this.fetchImplementation = options.fetchImplementation ?? fetch
     this.outboundFetchResolver = options.outboundFetchResolver
+    this.conversationTitleResolver = options.conversationTitleResolver
     this.now = options.now ?? (() => Date.now())
     this.scheduler = new PoolScheduler(this.now, options.random)
     this.scheduler.hydrate(this.config.accounts)
@@ -167,6 +170,7 @@ export class GatewayServer implements GatewayController {
   }
 
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    request.socket.setNoDelay(true)
     const started = this.now()
     const pathname = new URL(request.url ?? '/', 'http://localhost').pathname
     const modelListKind = request.method === 'GET' ? classifyModelListRoute(pathname) : undefined
@@ -194,6 +198,12 @@ export class GatewayServer implements GatewayController {
     let logRoute: Route | undefined
     let model = ''
     let failoverCount = 0
+    let conversationId: string | undefined
+    let conversationName: string | undefined
+    let firstTokenAt: number | undefined
+    const markFirstToken = (): void => {
+      firstTokenAt ??= this.now()
+    }
     try {
       logRoute = this.authenticate(request, incoming.protocol)
       const body = await readJsonBody(request)
@@ -210,6 +220,12 @@ export class GatewayServer implements GatewayController {
         pool.members.some((member) => member.accountId === account.id && member.enabled)
       )
       const sessionId = getSessionId(request, body)
+      conversationId = sessionId
+      conversationName = getConversationName(request, body)
+      const resolveConversationNameForLog = async (): Promise<string | undefined> => {
+        conversationName ??= await this.resolveConversationName(sessionId)
+        return conversationName
+      }
       const targetModel = logRoute.modelMap[model] ?? model
       const streaming = !codexSearch && (body.stream === true || incoming.geminiMethod === 'streamGenerateContent')
       const responsesLite = incoming.protocol === 'openai-responses' && isChatGptCodexResponsesLiteBody(body)
@@ -288,9 +304,12 @@ export class GatewayServer implements GatewayController {
           const outboundBody = codexSearch
             ? convertedBody
             : withStreamingFlag(convertedBody, provider.protocol, streaming)
-          const upstreamBody = resolvedCredential.kind === 'chatgpt-oauth' && !codexSearch
-            ? withChatGptCodexBody(outboundBody)
+          const tieredOutboundBody = !codexSearch && provider.protocol === 'openai-responses'
+            ? normalizeOpenAIServiceTier(outboundBody, pool.forceFastMode === true)
             : outboundBody
+          const upstreamBody = resolvedCredential.kind === 'chatgpt-oauth' && !codexSearch
+            ? withChatGptCodexBody(tieredOutboundBody)
+            : tieredOutboundBody
           let upstreamResponse: Response
           try {
             upstreamResponse = await outboundFetch(
@@ -345,6 +364,8 @@ export class GatewayServer implements GatewayController {
             )
           }
 
+          if (!streaming) markFirstToken()
+
           if (codexSearch) {
             const payload = sanitizeUpstreamPayload(
               await readUpstreamJson(upstreamResponse),
@@ -353,11 +374,14 @@ export class GatewayServer implements GatewayController {
             this.writeJson(response, upstreamResponse.status, payload)
             this.reportAccountSuccess(account, attemptStarted, headerSignals)
             this.successRequests += 1
+            await resolveConversationNameForLog()
             this.emitLog(this.makeLog({
               route: logRoute,
               account,
               model,
               started,
+              conversationId,
+              conversationName,
               status: 'success',
               statusCode: upstreamResponse.status,
               failoverCount
@@ -367,14 +391,15 @@ export class GatewayServer implements GatewayController {
 
           if (streaming) {
             const streamResult = incoming.protocol === provider.protocol
-              ? await pipeUpstreamResponse(upstreamResponse, response, provider.protocol, sensitiveValues(resolvedCredential))
+              ? await pipeUpstreamResponse(upstreamResponse, response, provider.protocol, sensitiveValues(resolvedCredential), markFirstToken)
               : await pipeConvertedUpstreamResponse(
                 upstreamResponse,
                 response,
                 provider.protocol,
                 incoming.protocol,
                 { id: randomUUID(), model },
-                sensitiveValues(resolvedCredential)
+                sensitiveValues(resolvedCredential),
+                markFirstToken
               )
             if (!streamResult.completed) {
               throw gatewayErrorFromProviderFailure(adapter.classifyFailure({
@@ -387,11 +412,15 @@ export class GatewayServer implements GatewayController {
             }
             this.reportAccountSuccess(account, attemptStarted, headerSignals)
             this.successRequests += 1
+            await resolveConversationNameForLog()
             this.emitLog(this.makeLog({
               route: logRoute,
               account,
               model,
               started,
+              conversationId,
+              conversationName,
+              firstTokenAt,
               status: 'success',
               statusCode: upstreamResponse.status,
               usage: normalizeLogUsage(streamResult.usage),
@@ -422,9 +451,13 @@ export class GatewayServer implements GatewayController {
           this.writeJson(response, 200, result)
           this.reportAccountSuccess(account, attemptStarted, headerSignals)
           this.successRequests += 1
-          this.emitLog(this.makeLog({ route: logRoute, account, model, started, status: 'success', statusCode: 200, usage, failoverCount }))
+          await resolveConversationNameForLog()
+          this.emitLog(this.makeLog({ route: logRoute, account, model, started, conversationId, conversationName, status: 'success', statusCode: 200, usage, failoverCount }))
           return
         } catch (error) {
+          if (clientAbortController.signal.aborted) {
+            throw new GatewayHttpError(499, 'Client closed the request', 'client_closed')
+          }
           const gatewayError = normalizeError(error)
           const retryable = isRetryable(gatewayError)
           const accountAction = gatewayError.providerFailure?.accountAction
@@ -461,7 +494,8 @@ export class GatewayServer implements GatewayController {
         gatewayError.responseBody ?? { error: { message: gatewayError.message, type: gatewayError.type } }
       )
       if (logRoute && selectedAccount) {
-        this.emitLog(this.makeLog({ route: logRoute, account: selectedAccount, model, started, status: 'error', statusCode: gatewayError.statusCode, error: gatewayError.message, failoverCount }))
+        conversationName ??= await this.resolveConversationName(conversationId)
+        this.emitLog(this.makeLog({ route: logRoute, account: selectedAccount, model, started, conversationId, conversationName, firstTokenAt, status: 'error', statusCode: gatewayError.statusCode, error: gatewayError.message, failoverCount }))
       }
     } finally {
       request.off('aborted', abortForClientDisconnect)
@@ -478,6 +512,17 @@ export class GatewayServer implements GatewayController {
     )
     if (!route) throw new GatewayHttpError(401, 'Invalid local gateway token', 'authentication_error')
     return route
+  }
+
+  private async resolveConversationName(sessionId?: string): Promise<string | undefined> {
+    if (!sessionId) return undefined
+    try {
+      const resolved = normalizeConversationName(await this.conversationTitleResolver?.(sessionId))
+      if (resolved) return resolved
+    } catch {
+      // Missing, locked, or foreign Codex title data must never affect routing.
+    }
+    return fallbackConversationName(sessionId)
   }
 
   private handleModelList(
@@ -546,6 +591,9 @@ export class GatewayServer implements GatewayController {
     account: Account
     model: string
     started: number
+    conversationId?: string
+    conversationName?: string
+    firstTokenAt?: number
     status: RequestLog['status']
     statusCode?: number
     error?: string
@@ -557,6 +605,8 @@ export class GatewayServer implements GatewayController {
     return {
       id: randomUUID(),
       accountId: input.account.id,
+      conversationId: input.conversationId,
+      conversationName: input.conversationName,
       timestamp: this.now(),
       client: input.route.client,
       protocol: input.route.inboundProtocol,
@@ -566,6 +616,7 @@ export class GatewayServer implements GatewayController {
       status: input.status,
       statusCode: input.statusCode,
       latencyMs: Math.max(0, this.now() - input.started),
+      firstTokenMs: input.firstTokenAt === undefined ? undefined : Math.max(0, input.firstTokenAt - input.started),
       inputTokens: usage?.inputTokens,
       outputTokens: usage?.outputTokens,
       cachedInputTokens: usage?.cachedInputTokens,
@@ -768,15 +819,17 @@ async function pipeUpstreamResponse(
   upstream: Response,
   response: ServerResponse,
   protocol: Protocol,
-  secrets: readonly string[]
+  secrets: readonly string[],
+  onFirstToken?: () => void
 ): Promise<StreamPipeResult> {
   response.statusCode = upstream.status
   const contentType = upstream.headers.get('content-type')
-  if (contentType) response.setHeader('content-type', contentType)
+  response.setHeader('content-type', contentType ?? 'text/event-stream; charset=utf-8')
   const cacheControl = upstream.headers.get('cache-control')
-  if (cacheControl) response.setHeader('cache-control', cacheControl)
+  response.setHeader('cache-control', cacheControl ?? 'no-cache')
   const buffering = upstream.headers.get('x-accel-buffering')
-  if (buffering) response.setHeader('x-accel-buffering', buffering)
+  response.setHeader('x-accel-buffering', buffering ?? 'no')
+  response.flushHeaders()
   const parser = createCanonicalStreamParser(protocol)
   const redactor = new StreamingSecretRedactor(secrets)
   if (!upstream.body) {
@@ -823,6 +876,7 @@ async function pipeUpstreamResponse(
     for (;;) {
       const { done, value } = await reader.read()
       if (done) break
+      if (value.byteLength > 0) onFirstToken?.()
       if (response.destroyed) {
         await reader.cancel()
         return { completed: false }
@@ -853,7 +907,8 @@ async function pipeConvertedUpstreamResponse(
   from: Protocol,
   to: Protocol,
   options: StreamEncodingOptions,
-  secrets: readonly string[]
+  secrets: readonly string[],
+  onFirstToken?: () => void
 ): Promise<StreamPipeResult> {
   response.statusCode = upstream.status
   response.setHeader('content-type', 'text/event-stream; charset=utf-8')
@@ -904,6 +959,7 @@ async function pipeConvertedUpstreamResponse(
     for (;;) {
       const { done, value } = await reader.read()
       if (done) break
+      if (value.byteLength > 0) onFirstToken?.()
       if (response.destroyed || !await forward(parser.push(value))) {
         await reader.cancel()
         return { completed: false }
@@ -985,6 +1041,63 @@ function getSessionId(request: IncomingMessage, body: JsonObject): string | unde
   return candidates.find((value): value is string => typeof value === 'string' && Boolean(value.trim()))?.trim()
 }
 
+function getConversationName(request: IncomingMessage, body: JsonObject): string | undefined {
+  const headerNames = [
+    'x-stone-conversation-name',
+    'x-codex-conversation-name',
+    'x-conversation-name',
+    'conversation-name',
+    'x-thread-name'
+  ] as const
+  for (const name of headerNames) {
+    const value = request.headers[name]
+    const first = Array.isArray(value) ? value[0] : value
+    const normalized = normalizeConversationName(first)
+    if (normalized) return normalized
+  }
+  const clientMetadata = objectValue(body.client_metadata)
+  const metadata = objectValue(body.metadata)
+  const candidates = [
+    clientMetadata?.conversation_name,
+    clientMetadata?.conversation_title,
+    clientMetadata?.thread_name,
+    clientMetadata?.title,
+    metadata?.conversation_name,
+    metadata?.conversation_title,
+    metadata?.thread_name,
+    metadata?.title,
+    body.conversation_name,
+    body.conversation_title,
+    body.thread_name
+  ]
+  for (const value of candidates) {
+    const normalized = normalizeConversationName(value)
+    if (normalized) return normalized
+  }
+  return undefined
+}
+
+function fallbackConversationName(sessionId: string): string {
+  const compact = sessionId.length > 24
+    ? `${sessionId.slice(0, 10)}…${sessionId.slice(-6)}`
+    : sessionId
+  return `对话 ${compact}`
+}
+
+function normalizeConversationName(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined
+  const normalized = value.replace(/\s+/g, ' ').trim().slice(0, 120)
+  return normalized || undefined
+}
+
+function normalizeOpenAIServiceTier(body: JsonObject, forceFastMode: boolean): JsonObject {
+  if (forceFastMode) return { ...body, service_tier: 'priority' }
+  if (typeof body.service_tier === 'string' && body.service_tier.trim().toLowerCase() === 'fast') {
+    return { ...body, service_tier: 'priority' }
+  }
+  return body
+}
+
 function readLocalToken(request: IncomingMessage): string | undefined {
   const authorization = request.headers.authorization
   if (typeof authorization === 'string' && authorization.startsWith('Bearer ')) return authorization.slice(7).trim()
@@ -1057,14 +1170,12 @@ function sensitiveValues(credential: { secret: string; accountId?: string }): st
 class StreamingSecretRedactor {
   private pending = Buffer.alloc(0)
   private readonly secrets: Buffer[]
-  private readonly retainedBytes: number
   private readonly replacement = Buffer.from('[REDACTED]', 'utf8')
 
   constructor(values: readonly string[]) {
     this.secrets = [...new Set(values.filter(Boolean))]
       .map((value) => Buffer.from(value, 'utf8'))
       .sort((left, right) => right.length - left.length)
-    this.retainedBytes = Math.max(0, ...this.secrets.map((secret) => secret.length - 1))
   }
 
   push(chunk: Uint8Array): Buffer[] {
@@ -1081,7 +1192,8 @@ class StreamingSecretRedactor {
       output.push(this.replacement)
       this.pending = this.pending.subarray(match.index + match.secret.length)
     }
-    const flushLength = this.pending.length - Math.min(this.retainedBytes, this.pending.length)
+    const retainedBytes = longestSecretPrefixSuffix(this.pending, this.secrets)
+    const flushLength = this.pending.length - retainedBytes
     if (flushLength > 0) output.push(this.pending.subarray(0, flushLength))
     this.pending = this.pending.subarray(flushLength)
     return output
@@ -1093,6 +1205,22 @@ class StreamingSecretRedactor {
     this.pending = Buffer.alloc(0)
     return [final]
   }
+}
+
+function longestSecretPrefixSuffix(value: Buffer, secrets: readonly Buffer[]): number {
+  let retained = 0
+  for (const secret of secrets) {
+    const maximum = Math.min(value.length, secret.length - 1)
+    for (let length = maximum; length > retained; length -= 1) {
+      const start = value.length - length
+      if (value[start] !== secret[0]) continue
+      if (value.subarray(start).equals(secret.subarray(0, length))) {
+        retained = length
+        break
+      }
+    }
+  }
+  return retained
 }
 
 function objectValue(value: unknown): JsonObject | undefined {

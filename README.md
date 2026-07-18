@@ -2,18 +2,20 @@
   <img src="build/icon.svg" width="96" alt="Stone logo">
 </p>
 
-<h1 align="center">Stone Desktop</h1>
+<h1 align="center">Stone+</h1>
+
+<p align="center"><strong>Unofficial community fork of Stone</strong></p>
 
 <p align="center">
   <strong>English</strong> | <a href="README.zh-CN.md">简体中文</a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/EasyCode-Obsidian/Stone/releases/latest"><img src="https://img.shields.io/github/v/release/EasyCode-Obsidian/Stone?display_name=tag&sort=semver" alt="Latest release"></a>
-  <a href="https://github.com/EasyCode-Obsidian/Stone/actions/workflows/release.yml"><img src="https://github.com/EasyCode-Obsidian/Stone/actions/workflows/release.yml/badge.svg" alt="Release build"></a>
-  <a href="https://github.com/EasyCode-Obsidian/Stone/releases/latest"><img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-555" alt="Windows, macOS, and Linux"></a>
+  <a href="https://github.com/M4rkzzz/stone-plus/releases/latest"><img src="https://img.shields.io/github/v/release/M4rkzzz/stone-plus?display_name=tag&sort=semver" alt="Latest release"></a>
+  <a href="https://github.com/M4rkzzz/stone-plus/actions/workflows/release.yml"><img src="https://github.com/M4rkzzz/stone-plus/actions/workflows/release.yml/badge.svg" alt="Release build"></a>
+  <a href="https://github.com/M4rkzzz/stone-plus/releases/latest"><img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-555" alt="Windows, macOS, and Linux"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="Apache-2.0 license"></a>
-  <a href="https://github.com/EasyCode-Obsidian/Stone/stargazers"><img src="https://img.shields.io/github/stars/EasyCode-Obsidian/Stone?style=flat&logo=github" alt="GitHub stars"></a>
+  <a href="https://github.com/M4rkzzz/stone-plus/stargazers"><img src="https://img.shields.io/github/stars/M4rkzzz/stone-plus?style=flat&logo=github" alt="GitHub stars"></a>
 </p>
 
 <p align="center">
@@ -21,20 +23,30 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/EasyCode-Obsidian/Stone/releases/latest"><strong>Download latest release</strong></a> ·
+  <a href="https://github.com/M4rkzzz/stone-plus/releases/latest"><strong>Download latest release</strong></a> ·
   <a href="#quick-start">Quick start</a> ·
   <a href="#screenshots">Screenshots</a> ·
   <a href="SECURITY.md">Security</a>
 </p>
 
-Stone Desktop brings multi-provider AI access, model routing, protocol conversion, and coding client configuration into one local app. Add your providers, decide which models each account can expose, combine compatible accounts into pools, and connect Claude Code, Codex, or Gemini CLI through one local gateway.
+Stone+ brings multi-provider AI access, model routing, protocol conversion, and coding client configuration into one local app. It is based on [upstream Stone](https://github.com/EasyCode-Obsidian/Stone) and clearly maintained as an independent, unofficial community fork. Add your providers, decide which models each account can expose, combine compatible accounts into pools, and connect Claude Code, Codex, or Gemini CLI through one local gateway.
 
 Stone selects an available account according to its model support, quota, health, and pool policy. It can also translate between OpenAI, Anthropic, and Gemini protocols, so a client and its upstream pool do not need to use the same API format.
 
 > Stone is intended for credentials and subscriptions that you own or are authorized to use. It does not provide account sharing, resale, public access, or mechanisms to bypass provider limits.
 
+## Stone+ additions
+
+- **Faster streaming path.** Reuses upstream connections, negotiates HTTP/2, flushes SSE headers immediately, and avoids unnecessary state cloning and stream buffering.
+- **Fast On pools.** Optionally enforces the supported `priority` service tier on OpenAI Responses-compatible requests.
+- **Better request diagnostics.** Shows TTFT, conversation titles, compact adjustable columns, and a privacy toggle for titles.
+- **Correct client disconnect semantics.** Records HTTP 499 without cooling down an account or triggering failover.
+- **Embedded FRP tunnel.** Runs a bundled `frpc` from pasted configuration and exposes copyable connection details.
+
+See [CHANGELOG.md](CHANGELOG.md) and [MODIFICATIONS.md](MODIFICATIONS.md) for release and attribution details.
+
 <p align="center">
-  <img src="docs/media/stone-demo.gif" width="100%" alt="Stone Desktop product tour">
+  <img src="docs/media/stone-demo.gif" width="100%" alt="Stone+ product tour">
 </p>
 
 <p align="center">
@@ -92,7 +104,7 @@ The client connects only to Stone's local address. Stone chooses a suitable acco
 
 ### 1. Download Stone
 
-Download the package for your platform and `SHA256SUMS` from [GitHub Releases](https://github.com/EasyCode-Obsidian/Stone/releases/latest).
+Download the package for your platform and `SHA256SUMS` from [GitHub Releases](https://github.com/M4rkzzz/stone-plus/releases/latest).
 
 | Platform | Choose |
 | --- | --- |
@@ -153,18 +165,18 @@ The default gateway address is `http://127.0.0.1:15721`. Manual connection value
 
 ## Community
 
-Use [GitHub Discussions](https://github.com/EasyCode-Obsidian/Stone/discussions) for questions and workflow ideas, [GitHub Issues](https://github.com/EasyCode-Obsidian/Stone/issues) for reproducible bugs and feature requests, and [Private Vulnerability Reporting](https://github.com/EasyCode-Obsidian/Stone/security/advisories/new) for suspected security issues. Read the [Security Policy](SECURITY.md) before sharing diagnostics, and never post real credentials or account data.
+Use [GitHub Discussions](https://github.com/M4rkzzz/stone-plus/discussions) for questions and workflow ideas, [GitHub Issues](https://github.com/M4rkzzz/stone-plus/issues) for reproducible bugs and feature requests, and [Private Vulnerability Reporting](https://github.com/M4rkzzz/stone-plus/security/advisories/new) for suspected security issues. Read the [Security Policy](SECURITY.md) before sharing diagnostics, and never post real credentials or account data.
 
 Chinese-language discussion is also welcome in QQ group **1061282900**. The community does not support credential sharing, account trading, or advice for bypassing provider terms.
 
 ## Star History
 
 <p align="center">
-  <a href="https://github.com/EasyCode-Obsidian/Stone/stargazers">
+  <a href="https://github.com/M4rkzzz/stone-plus/stargazers">
     <img src="docs/star-history.svg" alt="Stone star history">
   </a>
 </p>
 
 ## License
 
-Stone Desktop is open source under the [Apache License 2.0](LICENSE). See [NOTICE](NOTICE) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for attribution and third-party licenses.
+Stone+ is open source under the [Apache License 2.0](LICENSE). See [NOTICE](NOTICE) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for attribution and third-party licenses.

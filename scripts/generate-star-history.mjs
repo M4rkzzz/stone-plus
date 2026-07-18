@@ -1,7 +1,7 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
 
-const DEFAULT_REPOSITORY = 'EasyCode-Obsidian/Stone'
+const DEFAULT_REPOSITORY = 'M4rkzzz/stone-plus'
 const DEFAULT_OUTPUT = 'docs/star-history.svg'
 const PAGE_SIZE = 100
 

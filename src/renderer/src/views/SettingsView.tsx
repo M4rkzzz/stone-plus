@@ -204,7 +204,7 @@ export function SettingsView({
         </div>
       </section>
 
-      <section className="about-line"><StoneMark small /><div><strong>Stone Desktop</strong><span>{__APP_VERSION__} · Local-first AI Gateway</span></div><Badge tone={appUpdate ? statusTone(appUpdate) : 'neutral'}>{appUpdate ? statusLabel(appUpdate) : 'GitHub Releases'}</Badge></section>
+      <section className="about-line"><StoneMark small /><div><strong>Stone+</strong><span>{__APP_VERSION__} · Unofficial community fork</span></div><Badge tone={appUpdate ? statusTone(appUpdate) : 'neutral'}>{appUpdate ? statusLabel(appUpdate) : 'GitHub Releases'}</Badge></section>
     </form>
   )
 }

@@ -11,7 +11,7 @@ body:
 
         感谢帮助改进 Stone。提交前，请移除所有 API Key、Token、密码、Cookie、session JSON、account ID、路由 Token、私有 URL、数据库文件、提示词和模型回复。
 
-        **Security vulnerabilities must not be reported here. Use [GitHub Private Vulnerability Reporting](https://github.com/EasyCode-Obsidian/Stone/security/advisories/new). / 安全漏洞请使用 GitHub 私密漏洞报告，禁止在此公开细节。**
+        **Security vulnerabilities must not be reported here. Use [GitHub Private Vulnerability Reporting](https://github.com/M4rkzzz/stone-plus/security/advisories/new). / 安全漏洞请使用 GitHub 私密漏洞报告，禁止在此公开细节。**
 
   - type: input
     id: stone-version

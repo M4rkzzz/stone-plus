@@ -1,10 +1,10 @@
 {
   "name": "stone-desktop",
-  "version": "0.8.2",
+  "version": "0.8.3",
   "private": true,
-  "description": "Local-first AI gateway and coding client control center",
+  "description": "Stone+ — Unofficial community fork of Stone",
   "author": {
-    "name": "Stone Contributors"
+    "name": "Stone+ Contributors"
   },
   "license": "Apache-2.0",
   "main": "out/main/index.js",
@@ -17,6 +17,7 @@
     "visual:check": "node scripts/visual-check.mjs",
     "smoke:electron": "node scripts/electron-smoke.mjs",
     "release:check": "node scripts/validate-release-tag.mjs",
+    "frp:fetch": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/fetch-frpc.ps1",
     "package": "npm run build && electron-builder --dir",
     "dist": "npm run build && electron-builder",
     "typecheck": "tsc --noEmit",
@@ -59,12 +60,12 @@
     "vitest": "^4.1.10"
   },
   "build": {
-    "appId": "io.stone.gateway",
-    "productName": "Stone",
+    "appId": "io.github.m4rkzzz.stoneplus",
+    "productName": "Stone+",
     "publish": {
       "provider": "github",
-      "owner": "EasyCode-Obsidian",
-      "repo": "Stone"
+      "owner": "M4rkzzz",
+      "repo": "stone-plus"
     },
     "directories": {
       "output": "release"
@@ -89,13 +90,17 @@
       {
         "from": "THIRD_PARTY_NOTICES.md",
         "to": "THIRD_PARTY_NOTICES.md"
+      },
+      {
+        "from": "MODIFICATIONS.md",
+        "to": "MODIFICATIONS.md"
       }
     ],
     "asar": true,
     "mac": {
       "category": "public.app-category.developer-tools",
       "icon": "build/icon.icns",
-      "artifactName": "${productName}-${version}-macos-${arch}.${ext}",
+      "artifactName": "StonePlus-${version}-macos-${arch}.${ext}",
       "target": [
         "dmg",
         "zip"
@@ -103,21 +108,31 @@
     },
     "win": {
       "icon": "build/icon.ico",
+      "extraResources": [
+        {
+          "from": "build/frp/frpc.exe",
+          "to": "frp/frpc.exe"
+        },
+        {
+          "from": "build/frp/LICENSE.frp.txt",
+          "to": "frp/LICENSE.frp.txt"
+        }
+      ],
       "target": [
         "nsis",
         "portable"
       ]
     },
     "nsis": {
-      "artifactName": "${productName}-${version}-windows-${arch}-setup.${ext}"
+      "artifactName": "StonePlus-${version}-windows-${arch}-setup.${ext}"
     },
     "portable": {
-      "artifactName": "${productName}-${version}-windows-${arch}-portable.${ext}"
+      "artifactName": "StonePlus-${version}-windows-${arch}-portable.${ext}"
     },
     "linux": {
       "category": "Development",
       "icon": "build/icons",
-      "artifactName": "${productName}-${version}-linux-${arch}.${ext}",
+      "artifactName": "StonePlus-${version}-linux-${arch}.${ext}",
       "target": [
         "AppImage",
         "deb"

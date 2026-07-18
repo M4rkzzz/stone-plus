@@ -291,6 +291,7 @@ export interface Pool {
   stickySessions: boolean
   stickyTtlMinutes: number
   maxRetries: number
+  forceFastMode?: boolean
   proxyId?: string
   createdAt: number
   updatedAt: number
@@ -356,6 +357,8 @@ export interface GatewayStatus {
 export interface RequestLog {
   id: string
   accountId?: string
+  conversationId?: string
+  conversationName?: string
   timestamp: number
   client: RouteClient
   protocol: Protocol
@@ -365,6 +368,7 @@ export interface RequestLog {
   status: 'success' | 'error' | 'streaming'
   statusCode?: number
   latencyMs: number
+  firstTokenMs?: number
   inputTokens?: number
   outputTokens?: number
   error?: string
@@ -467,6 +471,7 @@ export interface PoolInput {
   stickySessions: boolean
   stickyTtlMinutes: number
   maxRetries: number
+  forceFastMode?: boolean
   proxyId?: string
 }
 
@@ -559,6 +564,20 @@ export interface AppUpdateState {
   error?: string
 }
 
+export interface FrpTunnelState {
+  config: string
+  configSaved: boolean
+  binaryAvailable: boolean
+  running: boolean
+  pid?: number
+  startedAt?: number
+  remoteAddress?: string
+  serverAddress?: string
+  remotePort?: number
+  lastError?: string
+  logs: string[]
+}
+
 export interface GatewayApi {
   getSnapshot(): Promise<AppSnapshot>
   saveProvider(input: ProviderInput): Promise<AppSnapshot>
@@ -609,6 +628,11 @@ export interface GatewayApi {
   downloadUpdate(): Promise<AppUpdateState>
   installUpdate(): Promise<void>
   openUpdatePage(): Promise<void>
+  getFrpTunnelState(): Promise<FrpTunnelState>
+  saveFrpTunnelConfig(content: string): Promise<FrpTunnelState>
+  startFrpTunnel(): Promise<FrpTunnelState>
+  stopFrpTunnel(): Promise<FrpTunnelState>
+  clearFrpTunnelLogs(): Promise<FrpTunnelState>
   onSnapshot(listener: (snapshot: AppSnapshot) => void): () => void
   onUpdateState(listener: (state: AppUpdateState) => void): () => void
 }

@@ -1,5 +1,5 @@
 blank_issues_enabled: false
 contact_links:
   - name: Security vulnerability / 安全漏洞
-    url: https://github.com/EasyCode-Obsidian/Stone/security/advisories/new
+    url: https://github.com/M4rkzzz/stone-plus/security/advisories/new
     about: Report vulnerabilities privately. Never post tokens, passwords, databases, or exploit details in a public Issue. / 请私下报告漏洞，禁止在公开 Issue 中发布 Token、密码、数据库或利用细节。

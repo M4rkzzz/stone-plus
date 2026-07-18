@@ -42,9 +42,10 @@ const strategyDescriptions: Record<PoolStrategy, string> = {
 
 const protocols: Protocol[] = ['anthropic-messages', 'openai-responses', 'openai-chat', 'gemini']
 
-type PoolDraft = Omit<PoolInput, 'modelPolicy' | 'modelAllowlist'> & {
+type PoolDraft = Omit<PoolInput, 'modelPolicy' | 'modelAllowlist' | 'forceFastMode'> & {
   modelPolicy: ModelPolicy
   modelAllowlist: string[]
+  forceFastMode: boolean
 }
 
 function emptyDraft(): PoolDraft {
@@ -58,6 +59,7 @@ function emptyDraft(): PoolDraft {
     stickySessions: true,
     stickyTtlMinutes: 30,
     maxRetries: 2,
+    forceFastMode: false,
     proxyId: '',
   }
 }
@@ -95,6 +97,7 @@ export function PoolsView({
       stickySessions: pool.stickySessions,
       stickyTtlMinutes: pool.stickyTtlMinutes,
       maxRetries: pool.maxRetries,
+      forceFastMode: pool.forceFastMode ?? false,
       proxyId: pool.proxyId ?? '',
     } : emptyDraft())
     setErrors({})
@@ -184,7 +187,7 @@ export function PoolsView({
                 </div>
 
                 <div className="pool-members">
-                  <div className="pool-members__heading"><span>账号顺序</span><Badge tone={pool.stickySessions ? 'info' : 'neutral'}>{pool.stickySessions ? `${pool.stickyTtlMinutes} 分钟粘性` : '无会话粘性'}</Badge></div>
+                  <div className="pool-members__heading"><span>账号顺序</span><div className="badge-row">{pool.forceFastMode && <Badge tone="info">Fast On</Badge>}<Badge tone={pool.stickySessions ? 'info' : 'neutral'}>{pool.stickySessions ? `${pool.stickyTtlMinutes} 分钟粘性` : '无会话粘性'}</Badge></div></div>
                   {members.map((account, index) => {
                     if (!account) return null
                     const provider = providerById.get(account.providerId)
@@ -241,6 +244,7 @@ export function PoolsView({
                     protocol,
                     accountIds,
                     modelAllowlist: pruneModelSelection(draft.modelAllowlist, candidates),
+                    forceFastMode: protocol === 'openai-responses' ? draft.forceFastMode : false,
                   })
                 }}
               >
@@ -306,6 +310,18 @@ export function PoolsView({
                 emptyMessage="所选成员账号没有开放模型；请先在账号中拉取并开放模型。"
                 emptySelectionMessage="已明确不对外开放任何模型；保存后此号池不会承接模型请求。"
               />
+            </div>
+            <div className="field field--full inline-settings">
+              <div><strong>Fast On</strong><span>{draft.protocol === 'openai-responses' ? '强制号池内所有对话使用 Fast 服务层' : '仅 OpenAI Responses 协议可用'}</span></div>
+              <button
+                className={`toggle ${draft.forceFastMode ? 'toggle--on' : ''}`}
+                role="switch"
+                aria-label="Fast On"
+                aria-checked={draft.forceFastMode}
+                type="button"
+                disabled={draft.protocol !== 'openai-responses'}
+                onClick={() => setDraft({ ...draft, forceFastMode: !draft.forceFastMode })}
+              ><span /></button>
             </div>
             <div className="field field--full inline-settings">
               <div><strong>会话粘性</strong><span>同一会话优先复用已分配账号</span></div>
