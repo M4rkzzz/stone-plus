@@ -2,6 +2,8 @@
 
 ## 0.8.6
 
+- Fixed session repair exhausting memory and terminating Stone+ when Codex history
+  contains multiple gigabytes of rollout files; previews now scan bounded metadata.
 - Added Codex historical-session repair with provider discovery, dry-run counts,
   stale-preview protection, automatic rollout/SQLite backups, transactional index
   updates, rollback, encrypted-content guidance, and a dedicated Stone+ UI.

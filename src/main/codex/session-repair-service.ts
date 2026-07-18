@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { copyFile, mkdir, readFile, readdir, rm, stat, utimes, writeFile } from 'node:fs/promises'
+import { copyFile, mkdir, open, readFile, readdir, rm, stat, utimes, writeFile } from 'node:fs/promises'
 import { basename, dirname, extname, join, relative, resolve, sep } from 'node:path'
 import { backup, DatabaseSync } from 'node:sqlite'
 import { parse } from 'smol-toml'
@@ -17,6 +17,7 @@ const BACKUP_KEEP_COUNT = 5
 const BACKUP_MARKER = 'Stone+ session repair'
 const PROVIDER_PATTERN = /^[A-Za-z0-9_.-]+$/
 const SQLITE_EXTENSIONS = new Set(['.db', '.sqlite', '.sqlite3'])
+const ROLLOUT_SCAN_BYTES = 1024 * 1024
 
 interface SessionRepairServiceOptions {
   codexHome: string
@@ -28,10 +29,8 @@ interface RolloutPlan {
   path: string
   relativePath: string
   archived: boolean
-  originalText: string
-  nextText: string
   originalHash: string
-  nextHash: string
+  nextHash?: string
   originalAtimeMs: number
   originalMtimeMs: number
   providers: string[]
@@ -119,7 +118,9 @@ export class CodexSessionRepairService {
       const writtenDatabases: DatabasePlan[] = []
       try {
         for (const rollout of changedRollouts) {
-          await atomicWriteFile(rollout.path, rollout.nextText, this.randomId)
+          const rewritten = await rewriteRollout(rollout.path, plan.targetProvider)
+          rollout.nextHash = rewritten.nextHash
+          await atomicWriteFile(rollout.path, rewritten.nextText, this.randomId)
           await preserveMtime(rollout)
           writtenRollouts.push(rollout)
         }
@@ -128,7 +129,7 @@ export class CodexSessionRepairService {
           writtenDatabases.push(database)
         }
       } catch (error) {
-        const rollbackFailures = await this.rollback(writtenRollouts, writtenDatabases)
+        const rollbackFailures = await this.rollback(writtenRollouts, writtenDatabases, backupPath)
         const suffix = rollbackFailures.length
           ? `；部分自动回滚失败，请从备份目录恢复：${backupPath}`
           : `；已自动回滚，备份保留在：${backupPath}`
@@ -235,7 +236,17 @@ export class CodexSessionRepairService {
   }
 
   private async readRollout(path: string, targetProvider: string): Promise<RolloutPlan> {
-    const [originalText, info] = await Promise.all([readFile(path, 'utf8'), stat(path)])
+    const info = await stat(path)
+    const handle = await open(path, 'r')
+    let prefix: Buffer
+    try {
+      prefix = Buffer.allocUnsafe(Math.min(info.size, ROLLOUT_SCAN_BYTES))
+      const { bytesRead } = await handle.read(prefix, 0, prefix.length, 0)
+      prefix = prefix.subarray(0, bytesRead)
+    } finally {
+      await handle.close()
+    }
+    const originalText = prefix.toString('utf8')
     let threadId: string | undefined
     let cwd: string | undefined
     let hasUserEvent = false
@@ -243,14 +254,12 @@ export class CodexSessionRepairService {
     let sessionMetaCount = 0
     let rewriteNeeded = false
     const providers: string[] = []
-    const nextSegments: string[] = []
     for (const segment of originalText.match(/.*(?:\r\n|\n|$)/g) ?? []) {
       if (!segment) continue
       const lineEnding = segment.endsWith('\r\n') ? '\r\n' : segment.endsWith('\n') ? '\n' : ''
       const line = lineEnding ? segment.slice(0, -lineEnding.length) : segment
       if (line.includes('"user_message"') || line.includes('"user_input"')) hasUserEvent = true
       if (line.includes('"encrypted_content"')) encryptedContent = true
-      let nextLine = line
       if (line.includes('"session_meta"')) {
         try {
           const record = JSON.parse(line) as Record<string, unknown>
@@ -262,8 +271,6 @@ export class CodexSessionRepairService {
             const originalProvider = typeof payload.model_provider === 'string' ? payload.model_provider : ''
             if (originalProvider) providers.push(originalProvider)
             if (originalProvider !== targetProvider) {
-              payload.model_provider = targetProvider
-              nextLine = JSON.stringify(record)
               rewriteNeeded = true
             }
           }
@@ -271,17 +278,13 @@ export class CodexSessionRepairService {
           // Non-JSON diagnostic lines are preserved byte-for-byte.
         }
       }
-      nextSegments.push(nextLine + lineEnding)
     }
-    const nextText = nextSegments.join('')
+    const relativePath = safeRelative(this.codexHome, path)
     return {
       path,
-      relativePath: safeRelative(this.codexHome, path),
-      archived: safeRelative(this.codexHome, path).startsWith(`archived_sessions${sep}`),
-      originalText,
-      nextText,
-      originalHash: sha256(originalText),
-      nextHash: sha256(nextText),
+      relativePath,
+      archived: relativePath.startsWith(`archived_sessions${sep}`),
+      originalHash: rolloutFingerprint(info.size, info.mtimeMs, prefix),
       originalAtimeMs: info.atimeMs,
       originalMtimeMs: info.mtimeMs,
       providers,
@@ -376,7 +379,7 @@ export class CodexSessionRepairService {
 
   private async assertRolloutsUnchanged(rollouts: RolloutPlan[]): Promise<void> {
     for (const rollout of rollouts) {
-      if (sha256(await readFile(rollout.path, 'utf8')) !== rollout.originalHash) {
+      if (await fastRolloutFingerprint(rollout.path) !== rollout.originalHash) {
         throw new Error(`会话文件在修复前发生变化，请重新预览：${rollout.relativePath}`)
       }
     }
@@ -492,19 +495,19 @@ export class CodexSessionRepairService {
     }
   }
 
-  private async rollback(rollouts: RolloutPlan[], databases: DatabasePlan[]): Promise<string[]> {
+  private async rollback(rollouts: RolloutPlan[], databases: DatabasePlan[], backupPath: string): Promise<string[]> {
     const failures: string[] = []
     for (const database of [...databases].reverse()) {
       try { this.rollbackDatabasePlan(database) } catch { failures.push(database.path) }
     }
     for (const rollout of [...rollouts].reverse()) {
       try {
-        const currentHash = sha256(await readFile(rollout.path, 'utf8'))
-        if (currentHash !== rollout.nextHash) {
+        const currentHash = await sha256File(rollout.path)
+        if (!rollout.nextHash || currentHash !== rollout.nextHash) {
           failures.push(rollout.path)
           continue
         }
-        await atomicWriteFile(rollout.path, rollout.originalText, this.randomId)
+        await copyFile(join(backupPath, 'rollouts', rollout.relativePath), rollout.path)
         await preserveMtime(rollout)
       } catch { failures.push(rollout.path) }
     }
@@ -598,6 +601,75 @@ function revisionFor(targetProvider: string, rollouts: RolloutPlan[], databases:
       ]),
     ]),
   }))
+}
+
+async function rewriteRollout(path: string, targetProvider: string): Promise<{ nextText: string; nextHash: string }> {
+  const originalText = await readFile(path, 'utf8')
+  const output: string[] = []
+  let offset = 0
+  while (offset < originalText.length) {
+    const newlineAt = originalText.indexOf('\n', offset)
+    const end = newlineAt >= 0 ? newlineAt + 1 : originalText.length
+    const segment = originalText.slice(offset, end)
+    const lineEnding = segment.endsWith('\r\n') ? '\r\n' : segment.endsWith('\n') ? '\n' : ''
+    const line = lineEnding ? segment.slice(0, -lineEnding.length) : segment
+    let nextLine = line
+    if (line.includes('"session_meta"')) {
+      try {
+        const record = JSON.parse(line) as Record<string, unknown>
+        if (record.type === 'session_meta' && record.payload && typeof record.payload === 'object' && !Array.isArray(record.payload)) {
+          const payload = record.payload as Record<string, unknown>
+          if (payload.model_provider !== targetProvider) {
+            payload.model_provider = targetProvider
+            nextLine = JSON.stringify(record)
+          }
+        }
+      } catch {
+        // Preserve non-JSON diagnostic lines byte-for-byte.
+      }
+    }
+    output.push(nextLine, lineEnding)
+    offset = end
+  }
+  const nextText = output.join('')
+  return { nextText, nextHash: sha256(nextText) }
+}
+
+async function fastRolloutFingerprint(path: string): Promise<string> {
+  const info = await stat(path)
+  const handle = await open(path, 'r')
+  try {
+    const prefix = Buffer.allocUnsafe(Math.min(info.size, ROLLOUT_SCAN_BYTES))
+    const { bytesRead } = await handle.read(prefix, 0, prefix.length, 0)
+    return rolloutFingerprint(info.size, info.mtimeMs, prefix.subarray(0, bytesRead))
+  } finally {
+    await handle.close()
+  }
+}
+
+function rolloutFingerprint(size: number, mtimeMs: number, prefix: Uint8Array): string {
+  const hash = createHash('sha256')
+  hash.update(`${size}:${mtimeMs}:`)
+  hash.update(prefix)
+  return hash.digest('hex')
+}
+
+async function sha256File(path: string): Promise<string> {
+  const handle = await open(path, 'r')
+  const hash = createHash('sha256')
+  const buffer = Buffer.allocUnsafe(1024 * 1024)
+  try {
+    let position = 0
+    while (true) {
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, position)
+      if (!bytesRead) break
+      hash.update(buffer.subarray(0, bytesRead))
+      position += bytesRead
+    }
+    return hash.digest('hex')
+  } finally {
+    await handle.close()
+  }
 }
 
 function databaseHasThreads(path: string): boolean {

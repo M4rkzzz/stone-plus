@@ -49,6 +49,10 @@ try {
     if (message.type() === 'error') pageErrors.push(message.text())
   })
   await window.locator('.app-shell').waitFor({ timeout: 30_000 })
+  await window.locator('.nav-item').filter({ hasText: '会话修复' }).click()
+  await window.getByRole('heading', { name: '会话修复' }).waitFor({ timeout: 30_000 })
+  await window.locator('.session-repair-loading').waitFor({ state: 'hidden', timeout: 30_000 })
+  const sessionRepairLoaded = await window.locator('.session-repair-panel').isVisible()
 
   const bootSnapshot = await window.evaluate(() => window.stone.getSnapshot())
   const initial = await window.evaluate(({ settings, port }) => window.stone.updateGateway({
@@ -273,6 +277,7 @@ try {
     gatewayStarted: started.gatewayStatus.running,
     gatewayProbeStatus: probe.status,
     gatewayStopped: !stopped.gatewayStatus.running,
+    sessionRepairLoaded,
     pageErrors
   }
   console.log(JSON.stringify(result, null, 2))
@@ -313,6 +318,7 @@ try {
     !result.gatewayStarted ||
     result.gatewayProbeStatus !== 404 ||
     !result.gatewayStopped ||
+    !result.sessionRepairLoaded ||
     result.pageErrors.length > 0
   ) {
     process.exitCode = 1
