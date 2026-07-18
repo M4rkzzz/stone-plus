@@ -300,6 +300,23 @@ describe('AppStore', () => {
     })).rejects.toThrow(/loopback/)
   })
 
+  it('defaults legacy outbound networking to direct and persists system proxy mode', async () => {
+    const store = createStore()
+    await store.initialize()
+    expect(store.getSnapshot().gateway.outboundNetworkMode).toBe('direct')
+
+    await store.updateGateway({
+      ...store.getSnapshot().gateway,
+      outboundNetworkMode: 'system'
+    })
+    expect(store.getSnapshot().gateway.outboundNetworkMode).toBe('system')
+    await store.close()
+
+    const restarted = createStore()
+    await restarted.initialize()
+    expect(restarted.getSnapshot().gateway.outboundNetworkMode).toBe('system')
+  })
+
   it('only accepts accounts whose provider protocol matches the pool', async () => {
     const store = createStore()
     await store.initialize()
@@ -1264,6 +1281,7 @@ describe('AppStore', () => {
       providers: [{ id: 'legacy-provider', name: 'Legacy Provider' }],
       accounts: [{ id: 'legacy-account', maskedCredential: '****cret' }],
       requestLogs: [{ id: 'legacy-log' }],
+      gateway: { outboundNetworkMode: 'direct' },
       clientProfiles: [
         { id: 'default-claude' },
         { id: 'default-codex' },
@@ -1670,6 +1688,34 @@ describe('AppStore', () => {
       errorsByStatus: { 429: 1 }
     })
     expect(snapshot.observability.last7Days.requestCount).toBe(2)
+  })
+
+  it('derives a bounded moving-fitness history from existing persisted request logs', async () => {
+    const now = Date.now()
+    const store = createStore()
+    await store.initialize()
+    await store.appendLog({
+      ...requestLog(0, 'fitness-success'), accountId: 'account-a', timestamp: now - 60_000
+    })
+    await store.appendLog({
+      ...requestLog(1, 'fitness-failure'), accountId: 'account-a', timestamp: now - 120_000,
+      status: 'error', statusCode: 429
+    })
+    await store.appendLog({
+      ...requestLog(2, 'fitness-old'), accountId: 'account-a', timestamp: now - 31 * 24 * 60 * 60_000
+    })
+    await store.appendLog({
+      ...requestLog(3, 'fitness-unattributed'), timestamp: now - 30_000
+    })
+    await store.close()
+
+    const restarted = createStore()
+    await restarted.initialize()
+
+    expect(restarted.getAccountFitnessHistory(now).map((log) => log.id)).toEqual([
+      'fitness-failure',
+      'fitness-success'
+    ])
   })
 
   it('calculates token cost totals from the full persisted log set, not the renderer slice', async () => {

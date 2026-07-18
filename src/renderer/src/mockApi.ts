@@ -2,6 +2,7 @@ import type {
   AccountInput,
   AppSnapshot,
   AppUpdateState,
+  BrowserImportQueueState,
   ClientConfigBackup,
   ClientConfigEditorState,
   ClientConfigFileRole,
@@ -162,11 +163,17 @@ const accounts: PublicAccount[] = [
       limitReached: false,
     },
     fitness: {
-      score: 100,
+      score: 91,
       sampleCount: 18,
+      successCount: 17,
+      failureCount: 1,
+      successRate: 91.6,
+      recentSuccessRate: 96.4,
+      confidence: 77.7,
       firstTokenMs: 654,
       outputTokensPerSecond: 72.4,
       failurePenalty: 0,
+      components: { reliability: 94, responsiveness: 81, throughput: 80, stability: 100 },
       updatedAt: now - 1000 * 9,
       stale: false,
       dynamicConcurrency: 6,
@@ -203,11 +210,17 @@ const accounts: PublicAccount[] = [
       limitReached: false,
     },
     fitness: {
-      score: 86,
+      score: 82,
       sampleCount: 12,
+      successCount: 10,
+      failureCount: 2,
+      successRate: 81.8,
+      recentSuccessRate: 84.7,
+      confidence: 63.2,
       firstTokenMs: 812,
       outputTokensPerSecond: 58.7,
       failurePenalty: 0.4,
+      components: { reliability: 83, responsiveness: 74, throughput: 73, stability: 96 },
       updatedAt: now - 1000 * 60 * 2,
       stale: false,
       dynamicConcurrency: 4,
@@ -619,6 +632,8 @@ export function createMockApi(): GatewayApi {
   }
   const listeners = new Set<(value: AppSnapshot) => void>()
   const updateListeners = new Set<(value: AppUpdateState) => void>()
+  const browserImportListeners = new Set<(value: BrowserImportQueueState) => void>()
+  let browserImportQueue: BrowserImportQueueState = { items: [], readyCount: 0, totalBytes: 0, revision: 0 }
   const clientBackups: ClientConfigBackup[] = []
   let updateState: AppUpdateState = {
     revision: 0,
@@ -839,6 +854,38 @@ export function createMockApi(): GatewayApi {
         warnings: ['codex-plus-1.json：已从 JWT user_id 自动补全 1 个 CPA 账号的 account_id。']
       }
     },
+    async getBrowserImportQueue() {
+      return clone(browserImportQueue)
+    },
+    async removeBrowserImportItem(id) {
+      browserImportQueue = {
+        ...browserImportQueue,
+        items: browserImportQueue.items.filter((item) => item.id !== id),
+        revision: browserImportQueue.revision + 1,
+      }
+      browserImportQueue.readyCount = browserImportQueue.items.filter((item) => item.status === 'ready').length
+      browserImportQueue.totalBytes = browserImportQueue.items.reduce((total, item) => total + item.sizeBytes, 0)
+      for (const listener of browserImportListeners) listener(clone(browserImportQueue))
+      return clone(browserImportQueue)
+    },
+    async clearBrowserImportQueue() {
+      browserImportQueue = { items: [], readyCount: 0, totalBytes: 0, revision: browserImportQueue.revision + 1 }
+      for (const listener of browserImportListeners) listener(clone(browserImportQueue))
+      return clone(browserImportQueue)
+    },
+    async importBrowserJsonQueue(input) {
+      if (!input.itemIds.length) throw new Error('请至少选择一个已挂起的 JSON 文件。')
+      const selectedFiles = input.itemIds.length
+      const result = await this.importChatGptAccountFiles(input)
+      browserImportQueue = {
+        ...browserImportQueue,
+        items: browserImportQueue.items.filter((item) => !input.itemIds.includes(item.id)),
+        revision: browserImportQueue.revision + 1,
+      }
+      browserImportQueue.readyCount = browserImportQueue.items.filter((item) => item.status === 'ready').length
+      browserImportQueue.totalBytes = browserImportQueue.items.reduce((total, item) => total + item.sizeBytes, 0)
+      return { ...result, selectedFiles }
+    },
     async deleteAccount(id: string) {
       if (snapshot.pools.some((pool) => pool.members.some((member) => member.accountId === id))) {
         throw new Error('该账号仍在号池中，请先从号池移除')
@@ -969,6 +1016,15 @@ export function createMockApi(): GatewayApi {
       return changed()
     },
     async rebuildOutboundConnections() {},
+    async detectSystemProxy() {
+      return {
+        detectedAt: Date.now(),
+        targets: [
+          { target: 'https://chatgpt.com', summary: 'DIRECT', reachable: true, latencyMs: 120 },
+          { target: 'https://api.openai.com', summary: 'DIRECT', reachable: true, latencyMs: 135 }
+        ]
+      }
+    },
     async runNetworkDiagnostics(input = {}) {
       await pause(700)
       const startedAt = Date.now() - 680
@@ -987,7 +1043,6 @@ export function createMockApi(): GatewayApi {
           { id: 'chatgpt-web', label: 'ChatGPT 网站', target: 'chatgpt.com/', kind: 'http' as const, status: 'success' as const, latencyMs: 182, httpStatus: 200, message: '连接成功 · HTTP 200' },
           { id: 'codex-models', label: 'Codex 模型接口', target: 'chatgpt.com/backend-api/codex/models', kind: 'http' as const, status: 'success' as const, latencyMs: 224, httpStatus: 401, message: '接口可达 · 未携带账号凭据，HTTP 401 属预期响应' },
           { id: 'codex-usage', label: 'Codex 额度接口', target: 'chatgpt.com/backend-api/wham/usage', kind: 'http' as const, status: 'success' as const, latencyMs: 238, httpStatus: 401, message: '接口可达 · 未携带账号凭据，HTTP 401 属预期响应' },
-          { id: 'openai-api', label: 'OpenAI API', target: 'api.openai.com/v1/models', kind: 'http' as const, status: 'success' as const, latencyMs: 206, httpStatus: 401, message: '接口可达 · 未携带账号凭据，HTTP 401 属预期响应' },
           { id: 'openai-auth', label: 'OpenAI OAuth', target: 'auth.openai.com/.well-known/openid-configuration', kind: 'http' as const, status: 'success' as const, latencyMs: 194, httpStatus: 200, message: '连接成功 · HTTP 200' },
         ],
         diagnoses: ['基础网络链路正常。若账号请求仍失败，优先检查凭据有效期、账号权限、额度和模型访问资格。']
@@ -1323,6 +1378,13 @@ export function createMockApi(): GatewayApi {
     onSnapshot(listener) {
       listeners.add(listener)
       return () => listeners.delete(listener)
+    },
+    onBrowserImportQueue(listener) {
+      browserImportListeners.add(listener)
+      return () => browserImportListeners.delete(listener)
+    },
+    onBrowserOpenTab() {
+      return () => undefined
     },
     onUpdateState(listener) {
       updateListeners.add(listener)

@@ -14,6 +14,7 @@ export type ModelPolicy = 'all' | 'selected'
 
 export type ProxyProtocol = 'http' | 'https' | 'socks4' | 'socks5'
 export type ProxyStatus = 'unchecked' | 'available' | 'error'
+export type OutboundNetworkMode = 'direct' | 'system'
 
 export interface ProxyDefinition {
   id: string
@@ -232,12 +233,27 @@ export interface Account {
 }
 
 export interface AccountFitnessSnapshot {
-  /** Relative score among measured accounts in smart-balanced pools; the best is always 100. */
+  /** Absolute moving fitness rating. It is not normalized against the currently available peers. */
   score?: number
   sampleCount: number
+  /** Number of successful and failed historical observations used by the moving evaluator. */
+  successCount?: number
+  failureCount?: number
+  /** Bayesian long-term success rate, expressed as a percentage. */
+  successRate?: number
+  /** Failure-sensitive exponentially weighted recent success rate, expressed as a percentage. */
+  recentSuccessRate?: number
+  /** Confidence in the rating, from 0 to 100, based on effective historical sample weight. */
+  confidence?: number
   firstTokenMs?: number
   outputTokensPerSecond?: number
   failurePenalty: number
+  components?: {
+    reliability: number
+    responsiveness: number
+    throughput: number
+    stability: number
+  }
   updatedAt?: number
   stale: boolean
   dynamicConcurrency?: number
@@ -337,6 +353,20 @@ export interface GatewaySettings {
   desktopNotifications?: boolean
   automaticBackups?: boolean
   backupRetention?: number
+  outboundNetworkMode?: OutboundNetworkMode
+}
+
+export interface SystemProxyTargetStatus {
+  target: string
+  summary: string
+  reachable: boolean
+  latencyMs?: number
+  error?: string
+}
+
+export interface SystemProxyDetectionResult {
+  detectedAt: number
+  targets: SystemProxyTargetStatus[]
 }
 
 export type HealthEventKind = 'account-disabled' | 'account-cooldown' | 'account-recovered' | 'quota-exhausted' | 'quota-restored'
@@ -602,6 +632,34 @@ export interface ChatGptAccountFileImportResult {
   warnings: string[]
 }
 
+export type BrowserPendingJsonStatus = 'downloading' | 'ready' | 'failed'
+
+export interface BrowserPendingJsonItem {
+  id: string
+  fileName: string
+  sourceUrl: string
+  receivedAt: number
+  sizeBytes: number
+  status: BrowserPendingJsonStatus
+  error?: string
+}
+
+export interface BrowserImportQueueState {
+  items: BrowserPendingJsonItem[]
+  readyCount: number
+  totalBytes: number
+  revision: number
+}
+
+export interface BrowserOpenTabRequest {
+  url: string
+  guestId: number
+}
+
+export interface BrowserJsonImportInput extends ChatGptAccountFileImportInput {
+  itemIds: string[]
+}
+
 export type ChatGptAccountExportFormat = 'sub2api' | 'cpa'
 export type ChatGptAccountExportMode = 'merged' | 'separate'
 
@@ -806,7 +864,7 @@ export interface NetworkDiagnosticReport {
   startedAt: number
   finishedAt: number
   route: {
-    kind: 'direct' | 'proxy'
+    kind: 'direct' | 'proxy' | 'system'
     name: string
     proxyId?: string
   }
@@ -825,6 +883,10 @@ export interface GatewayApi {
   testAccountModel(accountId: string, model: string): Promise<AccountModelTestResult>
   importChatGptAccounts(input: ChatGptAccountImportInput): Promise<ChatGptAccountImportResult>
   importChatGptAccountFiles(input: ChatGptAccountFileImportInput): Promise<ChatGptAccountFileImportResult>
+  getBrowserImportQueue(): Promise<BrowserImportQueueState>
+  removeBrowserImportItem(id: string): Promise<BrowserImportQueueState>
+  clearBrowserImportQueue(): Promise<BrowserImportQueueState>
+  importBrowserJsonQueue(input: BrowserJsonImportInput): Promise<ChatGptAccountFileImportResult>
   exportChatGptAccounts(input: ChatGptAccountExportInput): Promise<ChatGptAccountExportResult>
   deleteAccount(id: string): Promise<AppSnapshot>
   deleteAccounts(ids: string[]): Promise<AppSnapshot>
@@ -838,6 +900,7 @@ export interface GatewayApi {
   startGateway(): Promise<AppSnapshot>
   stopGateway(): Promise<AppSnapshot>
   rebuildOutboundConnections(): Promise<void>
+  detectSystemProxy(): Promise<SystemProxyDetectionResult>
   runNetworkDiagnostics(input?: NetworkDiagnosticInput): Promise<NetworkDiagnosticReport>
   checkAccount(id: string): Promise<AppSnapshot>
   refreshAccountCodexQuota(id: string): Promise<AppSnapshot>
@@ -879,5 +942,7 @@ export interface GatewayApi {
   previewCodexSessionRepair(targetProvider: string): Promise<CodexSessionRepairPreview>
   repairCodexSessions(targetProvider: string, expectedRevision: string): Promise<CodexSessionRepairResult>
   onSnapshot(listener: (snapshot: AppSnapshot) => void): () => void
+  onBrowserImportQueue(listener: (state: BrowserImportQueueState) => void): () => void
+  onBrowserOpenTab(listener: (request: BrowserOpenTabRequest) => void): () => void
   onUpdateState(listener: (state: AppUpdateState) => void): () => void
 }

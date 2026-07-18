@@ -13,7 +13,6 @@ export const NETWORK_DIAGNOSTIC_HTTP_TARGETS = Object.freeze([
   { id: 'chatgpt-web', label: 'ChatGPT 网站', url: 'https://chatgpt.com/' },
   { id: 'codex-models', label: 'Codex 模型接口', url: 'https://chatgpt.com/backend-api/codex/models?client_version=0.144.3' },
   { id: 'codex-usage', label: 'Codex 额度接口', url: 'https://chatgpt.com/backend-api/wham/usage' },
-  { id: 'openai-api', label: 'OpenAI API', url: 'https://api.openai.com/v1/models' },
   { id: 'openai-auth', label: 'OpenAI OAuth', url: 'https://auth.openai.com/.well-known/openid-configuration' }
 ])
 
@@ -214,11 +213,6 @@ function diagnose(
   }
   if (codes.some((code) => /ECONNRESET|EPIPE|UND_ERR_SOCKET/i.test(code))) {
     diagnoses.push('连接被中途重置：检查代理节点稳定性、防火墙、杀毒软件和 TLS 分流规则。')
-  }
-  const chatGptFailed = ['chatgpt-web', 'codex-models', 'codex-usage']
-    .every((id) => byId.get(id)?.status === 'error')
-  if (chatGptFailed && byId.get('openai-api')?.status !== 'error') {
-    diagnoses.push('OpenAI API 可达但 ChatGPT/Codex 域名不可达：检查 chatgpt.com 的单独分流、出口地区或域名阻断。')
   }
   if (byId.get('openai-auth')?.status === 'error' && http.some((result) => result.id !== 'openai-auth' && result.status !== 'error')) {
     diagnoses.push('业务接口可达但 OAuth 域名不可达：ChatGPT Access Token 到期后将无法自动续期，请检查 auth.openai.com 分流。')

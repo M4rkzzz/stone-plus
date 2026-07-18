@@ -11,6 +11,10 @@ const stone: GatewayApi = {
   testAccountModel: (accountId, model) => ipcRenderer.invoke('stone:test-account-model', accountId, model),
   importChatGptAccounts: (input) => ipcRenderer.invoke('stone:import-chatgpt-accounts', input),
   importChatGptAccountFiles: (input) => ipcRenderer.invoke('stone:import-chatgpt-account-files', input),
+  getBrowserImportQueue: () => ipcRenderer.invoke('stone:get-browser-import-queue'),
+  removeBrowserImportItem: (id) => ipcRenderer.invoke('stone:remove-browser-import-item', id),
+  clearBrowserImportQueue: () => ipcRenderer.invoke('stone:clear-browser-import-queue'),
+  importBrowserJsonQueue: (input) => ipcRenderer.invoke('stone:import-browser-json-queue', input),
   exportChatGptAccounts: (input) => ipcRenderer.invoke('stone:export-chatgpt-accounts', input),
   deleteAccount: (id) => ipcRenderer.invoke('stone:delete-account', id),
   deleteAccounts: (ids) => ipcRenderer.invoke('stone:delete-accounts', ids),
@@ -24,6 +28,7 @@ const stone: GatewayApi = {
   startGateway: () => ipcRenderer.invoke('stone:start-gateway'),
   stopGateway: () => ipcRenderer.invoke('stone:stop-gateway'),
   rebuildOutboundConnections: () => ipcRenderer.invoke('stone:rebuild-outbound-connections'),
+  detectSystemProxy: () => ipcRenderer.invoke('stone:detect-system-proxy'),
   runNetworkDiagnostics: (input) => ipcRenderer.invoke('stone:run-network-diagnostics', input),
   checkAccount: (id) => ipcRenderer.invoke('stone:check-account', id),
   refreshAccountCodexQuota: (id) => ipcRenderer.invoke('stone:refresh-account-codex-quota', id),
@@ -70,6 +75,27 @@ const stone: GatewayApi = {
     }
     ipcRenderer.on('stone:snapshot', handler)
     return () => ipcRenderer.removeListener('stone:snapshot', handler)
+  },
+  onBrowserImportQueue: (listener) => {
+    const handler = (_event: Electron.IpcRendererEvent, state: Awaited<ReturnType<GatewayApi['getBrowserImportQueue']>>) => {
+      listener(state)
+    }
+    ipcRenderer.on('stone:browser-import-queue', handler)
+    return () => ipcRenderer.removeListener('stone:browser-import-queue', handler)
+  },
+  onBrowserOpenTab: (listener) => {
+    const handler = (_event: Electron.IpcRendererEvent, request: { url?: unknown; guestId?: unknown }) => {
+      if (typeof request?.url !== 'string' || typeof request?.guestId !== 'number') return
+      try {
+        const protocol = new URL(request.url).protocol
+        if (protocol !== 'http:' && protocol !== 'https:') return
+      } catch {
+        return
+      }
+      listener({ url: request.url, guestId: request.guestId })
+    }
+    ipcRenderer.on('stone:browser-open-tab', handler)
+    return () => ipcRenderer.removeListener('stone:browser-open-tab', handler)
   },
   onUpdateState: (listener) => {
     const handler = (_event: Electron.IpcRendererEvent, state: Awaited<ReturnType<GatewayApi['getUpdateState']>>) => {

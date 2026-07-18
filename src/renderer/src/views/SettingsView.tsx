@@ -20,7 +20,13 @@ import {
   Rocket,
   Sparkles,
 } from 'lucide-react'
-import type { AppSnapshot, BackupRecordSummary, GatewayApi, GatewaySettings } from '@shared/types'
+import type {
+  AppSnapshot,
+  BackupRecordSummary,
+  GatewayApi,
+  GatewaySettings,
+  SystemProxyDetectionResult
+} from '@shared/types'
 import type { ActionRunner } from '../App'
 import { Badge, FieldError, gatewayBaseUrl, PageHeader, Toggle } from '../ui'
 import { StoneMark } from '../StoneMark'
@@ -49,6 +55,8 @@ export function SettingsView({
   const [backups, setBackups] = useState<BackupRecordSummary[]>([])
   const [operationNotice, setOperationNotice] = useState('')
   const [connectionNotice, setConnectionNotice] = useState('')
+  const [systemProxyStatus, setSystemProxyStatus] = useState<SystemProxyDetectionResult>()
+  const [detectingSystemProxy, setDetectingSystemProxy] = useState(false)
 
   useEffect(() => setDraft(snapshot.gateway), [snapshot.gateway])
   useEffect(() => { void api.listStateBackups().then(setBackups).catch(() => undefined) }, [api])
@@ -104,6 +112,21 @@ export function SettingsView({
     }
   }
 
+  const detectSystemProxy = async () => {
+    setDetectingSystemProxy(true)
+    setConnectionNotice('正在读取 Windows 系统代理并检测 OpenAI 连接…')
+    try {
+      const result = await api.detectSystemProxy()
+      setSystemProxyStatus(result)
+      const reachable = result.targets.filter((target) => target.reachable).length
+      setConnectionNotice(`系统代理检测完成：${reachable}/${result.targets.length} 个目标可达。`)
+    } catch (cause) {
+      setConnectionNotice(cause instanceof Error ? cause.message : '系统代理检测失败')
+    } finally {
+      setDetectingSystemProxy(false)
+    }
+  }
+
   return (
     <form className="page-stack" onSubmit={(event) => void submit(event)}>
       <PageHeader
@@ -126,6 +149,13 @@ export function SettingsView({
           <SettingRow title="应用启动时运行网关" description="Stone 启动后自动监听本地端口" control={<Toggle checked={draft.autoStart} onChange={(value) => setDraft({ ...draft, autoStart: value })} label="应用启动时运行网关" />} />
           <SettingRow title="登录系统时启动 Stone" description="由操作系统管理桌面应用自启动" control={<Toggle checked={Boolean(draft.launchAtLogin)} onChange={(value) => setDraft({ ...draft, launchAtLogin: value })} label="登录系统时启动 Stone" />} />
           <SettingRow title="桌面健康通知" description="账号停用、冷却、额度耗尽或恢复时通知" control={<Toggle checked={draft.desktopNotifications !== false} onChange={(value) => setDraft({ ...draft, desktopNotifications: value })} label="桌面健康通知" />} />
+          <SettingRow
+            title="全局出站网络"
+            description="“跟随系统代理”适合 Clash 等 Windows 系统代理模式，无需开启 TUN；账号或号池的显式代理始终优先。"
+            control={<select aria-label="全局出站网络" value={draft.outboundNetworkMode ?? 'direct'} onChange={(event) => setDraft({ ...draft, outboundNetworkMode: event.target.value === 'system' ? 'system' : 'direct' })}><option value="direct">直连（默认）</option><option value="system">跟随系统代理</option></select>}
+          />
+          <SettingRow title="检测系统代理" description="读取系统/PAC 对 ChatGPT 与 OpenAI 的实际分流，不显示代理认证信息。" control={<button className="button button--secondary" type="button" disabled={detectingSystemProxy} onClick={() => void detectSystemProxy()}>{detectingSystemProxy ? <LoaderCircle size={16} className="spin" /> : <Network size={16} />}检测系统代理</button>} />
+          {systemProxyStatus && <div className="system-proxy-status">{systemProxyStatus.targets.map((target) => <div key={target.target}><span className={target.reachable ? 'status-dot status-dot--online' : 'status-dot status-dot--error'} /><span><strong>{new URL(target.target).hostname}</strong><small>{target.summary}{target.latencyMs !== undefined ? ` · ${target.latencyMs} ms` : ''}{target.error ? ` · ${target.error}` : ''}</small></span></div>)}</div>}
           <SettingRow title="重建低延迟出口" description="切换梯子、网络或节点后，建立并预热一代新的多通道连接" control={<button className="button button--secondary" type="button" onClick={() => void rebuildConnections()}><RefreshCw size={16} />重建并预热</button>} />
           {connectionNotice && <div className="client-config-notice">{connectionNotice}</div>}
         </div>

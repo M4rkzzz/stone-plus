@@ -55,7 +55,8 @@ const DEFAULT_GATEWAY: GatewaySettings = {
   launchAtLogin: false,
   desktopNotifications: true,
   automaticBackups: true,
-  backupRetention: 10
+  backupRetention: 10,
+  outboundNetworkMode: 'direct'
 }
 
 const DEFAULT_STATUS: GatewayStatus = {
@@ -69,6 +70,8 @@ const DEFAULT_STATUS: GatewayStatus = {
 
 const MAX_PERSISTED_REQUEST_LOGS = 20_000
 const MAX_RENDERER_REQUEST_LOGS = 500
+const FITNESS_HISTORY_WINDOW_MS = 30 * 24 * 60 * 60_000
+const FITNESS_HISTORY_ROWS_PER_ACCOUNT = 400
 const IGNORED_UPDATE_VERSION_KEY = 'ignored_update_version'
 const OBSERVABILITY_CACHE_TTL_MS = 1_000
 
@@ -156,6 +159,27 @@ export class AppStore {
       this.vaultBackend,
       this.getObservability()
     )
+  }
+
+  /**
+   * Returns a bounded, persisted history for the moving account evaluator.
+   * Request logs are the compatibility layer here: existing installations can
+   * immediately derive a long-term rating without a schema migration.
+   */
+  public getAccountFitnessHistory(now = Date.now()): RequestLog[] {
+    const cutoff = now - FITNESS_HISTORY_WINDOW_MS
+    return this.store.select((state) => {
+      const counts = new Map<string, number>()
+      const selected: RequestLog[] = []
+      for (const log of state.requestLogs) {
+        if (!log.accountId || log.timestamp < cutoff || log.status === 'streaming') continue
+        const count = counts.get(log.accountId) ?? 0
+        if (count >= FITNESS_HISTORY_ROWS_PER_ACCOUNT) continue
+        counts.set(log.accountId, count + 1)
+        selected.push(log)
+      }
+      return selected
+    })
   }
 
   private getObservability(): AppSnapshot['observability'] {
@@ -1239,6 +1263,11 @@ function normalizePersistedState(state: PersistedState): PersistedState {
     })),
     accounts,
     pools,
+    gateway: {
+      ...DEFAULT_GATEWAY,
+      ...state.gateway,
+      outboundNetworkMode: state.gateway.outboundNetworkMode === 'system' ? 'system' : 'direct'
+    },
     requestLogs: state.requestLogs.slice(0, MAX_PERSISTED_REQUEST_LOGS),
     clientProfiles: [
       ...defaults.map((profile) => profiles.find((candidate) => candidate.id === profile.id) ?? profile),
@@ -1836,6 +1865,7 @@ function normalizeGatewaySettings(settings: GatewaySettings): GatewaySettings {
     launchAtLogin: Boolean(settings.launchAtLogin),
     desktopNotifications: settings.desktopNotifications !== false,
     automaticBackups: settings.automaticBackups !== false,
-    backupRetention: boundedInteger(settings.backupRetention ?? 10, 1, 100, 10)
+    backupRetention: boundedInteger(settings.backupRetention ?? 10, 1, 100, 10),
+    outboundNetworkMode: settings.outboundNetworkMode === 'system' ? 'system' : 'direct'
   }
 }

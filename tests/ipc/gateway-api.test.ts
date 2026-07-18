@@ -97,8 +97,42 @@ describe('refresh provider models IPC', () => {
       expect.objectContaining({ kind: 'dns', status: 'skipped' }),
       expect.objectContaining({ kind: 'tls', status: 'skipped' })
     ]))
-    expect(upstreamFetch).toHaveBeenCalledTimes(5)
+    expect(upstreamFetch).toHaveBeenCalledTimes(4)
     expect(harness.transport.fetchFor).toHaveBeenCalledWith(proxy, undefined)
+  })
+
+  it('detects the Electron system proxy targets through the transport manager', async () => {
+    const harness = createHarness([oauthAccount()], {}, vi.fn())
+    const handler = electron.handlers.get('stone:detect-system-proxy')
+    if (!handler) throw new Error('detect-system-proxy handler was not registered')
+    const mainFrame = { url: 'http://127.0.0.1:5173/index.html' }
+
+    const result = await handler({ senderFrame: mainFrame, sender: { mainFrame } })
+
+    expect(result).toMatchObject({ targets: [{ summary: 'DIRECT', reachable: true }] })
+    expect(harness.transport.detectSystemProxy).toHaveBeenCalledWith([
+      'https://chatgpt.com',
+      'https://api.openai.com'
+    ])
+  })
+
+  it('applies an outbound mode change without restarting the local gateway', async () => {
+    const harness = createHarness([oauthAccount()], {}, vi.fn())
+    const handler = electron.handlers.get('stone:update-gateway')
+    if (!handler) throw new Error('update-gateway handler was not registered')
+    const mainFrame = { url: 'http://127.0.0.1:5173/index.html' }
+
+    await handler({ senderFrame: mainFrame, sender: { mainFrame } }, {
+      host: '127.0.0.1',
+      port: 15721,
+      autoStart: false,
+      logPayloads: false,
+      requestTimeoutSeconds: 120,
+      outboundNetworkMode: 'system'
+    })
+
+    expect(harness.transport.configureOutboundNetwork).toHaveBeenCalledWith('system', 15721)
+    expect(harness.gateway.stop).not.toHaveBeenCalled()
   })
 
   it('detects a pasted batch through the final selected account proxy', async () => {
@@ -514,6 +548,7 @@ function createHarness(
 
   const store = {
     getSnapshot: vi.fn(() => snapshot),
+    getAccountFitnessHistory: vi.fn(() => snapshot.requestLogs),
     getRuntimeConfiguration: vi.fn(() => ({
       providers: snapshot.providers,
       accounts,
@@ -572,6 +607,10 @@ function createHarness(
       return snapshot
     }),
     setGatewayStatus: vi.fn(),
+    updateGateway: vi.fn(async (settings) => {
+      Object.assign(snapshot.gateway, settings)
+      return snapshot
+    }),
     appendLog: vi.fn(async () => undefined),
     updateAccountRuntimeState: vi.fn(async (id: string, patch: Partial<Account>) => {
       const runtimeAccount = accounts.find((account) => account.id === id)
@@ -598,7 +637,13 @@ function createHarness(
     })
   } as unknown as GatewayController
   const transport = {
-    fetchFor: vi.fn(() => upstreamFetch as unknown as typeof fetch)
+    fetchFor: vi.fn(() => upstreamFetch as unknown as typeof fetch),
+    configureOutboundNetwork: vi.fn(),
+    invalidateSystemProxyCache: vi.fn(),
+    detectSystemProxy: vi.fn(async () => ({
+      detectedAt: Date.now(),
+      targets: [{ target: 'https://chatgpt.com', summary: 'DIRECT', reachable: true }]
+    }))
   } as unknown as OutboundTransportManager
   const runtimeChanged = vi.fn()
 

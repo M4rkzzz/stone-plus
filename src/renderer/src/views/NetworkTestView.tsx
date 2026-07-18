@@ -57,7 +57,7 @@ export function NetworkTestView({ snapshot, api }: { snapshot: AppSnapshot; api:
   return <div className="page-stack network-test-page">
     <PageHeader
       title="诊断"
-      description="一键检查本地配置、账号状态以及 ChatGPT、Codex、OpenAI 与 OAuth 网络"
+      description="一键检查本地配置、账号状态以及 ChatGPT、Codex 与 OAuth 网络"
       actions={<button className="button button--primary" type="button" disabled={running} onClick={() => void run()}>
         {running ? <LoaderCircle size={16} className="spin" /> : <RefreshCw size={16} />}
         {running ? '正在诊断…' : report ? '重新诊断' : '一键诊断'}
@@ -73,7 +73,7 @@ export function NetworkTestView({ snapshot, api }: { snapshot: AppSnapshot; api:
           {snapshot.proxies.map((proxy) => <option value={proxy.id} key={proxy.id}>{proxy.name} · {proxy.protocol.toUpperCase()}</option>)}
         </select>
       </div>
-      <div className="network-test-scope"><ShieldCheck size={16} /><span>仅访问内置白名单端点；Codex 与 OpenAI API 测试不携带 Token，收到 401 代表接口可达。</span></div>
+      <div className="network-test-scope"><ShieldCheck size={16} /><span>仅访问内置白名单端点；Codex 测试不携带 Token，收到 401 代表接口可达。</span></div>
     </section>
 
     <section className="panel panel--flush network-test-local">

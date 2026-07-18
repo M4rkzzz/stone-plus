@@ -4,6 +4,7 @@ import {
   Boxes,
   ChevronLeft,
   CircleGauge,
+  Globe2,
   Menu,
   MonitorCog,
   Network,
@@ -30,6 +31,7 @@ import { ClientsView } from './views/ClientsView'
 import { TunnelView } from './views/TunnelView'
 import { SessionRepairView } from './views/SessionRepairView'
 import { NetworkTestView } from './views/NetworkTestView'
+import { BrowserView } from './views/BrowserView'
 import { gatewayBaseUrl } from './ui'
 import { StoneMark } from './StoneMark'
 import {
@@ -39,7 +41,7 @@ import {
   type UpdateAction,
 } from './UpdateDialog'
 
-export type PageId = 'overview' | 'providers' | 'pools' | 'routes' | 'clients' | 'session-repair' | 'tunnel' | 'diagnostics' | 'requests' | 'settings'
+export type PageId = 'overview' | 'providers' | 'pools' | 'routes' | 'clients' | 'session-repair' | 'tunnel' | 'browser' | 'diagnostics' | 'requests' | 'settings'
 export type ActionRunner = (key: string, operation: () => Promise<AppSnapshot>) => Promise<boolean>
 
 const navigation: Array<{ id: PageId; label: string; icon: typeof Activity }> = [
@@ -50,6 +52,7 @@ const navigation: Array<{ id: PageId; label: string; icon: typeof Activity }> = 
   { id: 'clients', label: '客户端', icon: MonitorCog },
   { id: 'session-repair', label: '会话修复', icon: Wrench },
   { id: 'tunnel', label: '内网穿透', icon: Share2 },
+  { id: 'browser', label: '内置浏览器', icon: Globe2 },
   { id: 'diagnostics', label: '诊断', icon: Stethoscope },
   { id: 'requests', label: '请求', icon: Activity },
   { id: 'settings', label: '设置', icon: Settings },
@@ -368,6 +371,7 @@ export default function App() {
           {page === 'clients' && <ClientsView snapshot={snapshot} api={api} />}
           {page === 'session-repair' && <SessionRepairView api={api} />}
           {page === 'tunnel' && <TunnelView snapshot={snapshot} api={api} />}
+          {page === 'browser' && <BrowserView snapshot={snapshot} api={api} />}
           {page === 'diagnostics' && <NetworkTestView snapshot={snapshot} api={api} />}
           {page === 'requests' && <RequestsView snapshot={snapshot} api={api} runAction={runAction} busyKeys={busyKeys} />}
           {page === 'settings' && <SettingsView snapshot={snapshot} api={api} runAction={runAction} busyKeys={busyKeys} update={updateController} />}

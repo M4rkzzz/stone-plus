@@ -64,7 +64,7 @@ function requestLog(accountId: string, overrides: Partial<RequestLog> = {}): Req
 }
 
 describe('PoolScheduler', () => {
-  it('scores the best measured smart-balanced account at 100 relative to its peers', () => {
+  it('uses an absolute confidence-weighted rating instead of forcing the current best account to 100', () => {
     const scheduler = new PoolScheduler(() => timestamp)
     const fast = account('fast')
     const slow = account('slow')
@@ -74,12 +74,78 @@ describe('PoolScheduler', () => {
 
     const fitness = scheduler.getFitness([fast, slow, unmeasured])
 
-    expect(fitness.fast.score).toBe(100)
-    expect(fitness.slow.score).toBeLessThan(100)
+    expect(fitness.fast.score).toBeGreaterThan(fitness.slow.score!)
+    expect(fitness.fast.score).toBeLessThan(100)
+    expect(fitness.fast).toMatchObject({
+      successCount: 1,
+      failureCount: 0,
+      successRate: expect.any(Number),
+      recentSuccessRate: 100,
+      confidence: expect.any(Number),
+      components: {
+        reliability: expect.any(Number),
+        responsiveness: expect.any(Number),
+        throughput: expect.any(Number),
+        stability: 100
+      }
+    })
     expect(fitness.unmeasured).toMatchObject({ sampleCount: 0, stale: true })
     expect(fitness.unmeasured.score).toBeUndefined()
     expect(fitness.fast.firstTokenMs).toBe(500)
     expect(fitness.fast.outputTokensPerSecond).toBe(100)
+  })
+
+  it('combines persisted successes and failures with a failure-sensitive moving evaluation', () => {
+    const now = timestamp + 10 * 24 * 60 * 60_000
+    const reliable = account('reliable')
+    const unstable = account('unstable')
+    const logs: RequestLog[] = []
+    for (let index = 0; index < 30; index += 1) {
+      const observedAt = now - (30 - index) * 6 * 60 * 60_000
+      logs.push(requestLog(reliable.id, { timestamp: observedAt, upstreamFirstByteMs: 700, latencyMs: 3_000 }))
+      logs.push(requestLog(unstable.id, {
+        timestamp: observedAt,
+        upstreamFirstByteMs: 700,
+        latencyMs: 3_000,
+        ...(index >= 20 && index % 2 === 0
+          ? { status: 'error', statusCode: 429, error: 'rate limited', upstreamFirstByteMs: undefined }
+          : {})
+      }))
+    }
+    const scheduler = new PoolScheduler(() => now)
+    scheduler.hydratePerformance(logs)
+
+    const fitness = scheduler.getFitness([reliable, unstable])
+
+    expect(fitness.reliable.score).toBeLessThan(100)
+    expect(fitness.reliable.score).toBeGreaterThan(fitness.unstable.score!)
+    expect(fitness.unstable.failureCount).toBe(5)
+    expect(fitness.unstable.recentSuccessRate).toBeLessThan(fitness.unstable.successRate!)
+    expect(fitness.unstable.components!.reliability).toBeLessThan(fitness.reliable.components!.reliability)
+  })
+
+  it('keeps historical evidence while recent successes gradually recover a failed account', () => {
+    let now = timestamp
+    const target = account('target')
+    const scheduler = new PoolScheduler(() => now)
+    for (let index = 0; index < 20; index += 1) {
+      scheduler.recordPerformance(target.id, { firstTokenMs: 800, outputTokens: 100, generationDurationMs: 2_000 })
+      now += 1_000
+    }
+    const beforeFailure = scheduler.getFitness([target]).target
+    scheduler.recordFailure(target.id)
+    const afterFailure = scheduler.getFitness([target]).target
+    for (let index = 0; index < 4; index += 1) {
+      now += 1_000
+      scheduler.recordPerformance(target.id, { firstTokenMs: 800, outputTokens: 100, generationDurationMs: 2_000 })
+    }
+    const recovered = scheduler.getFitness([target]).target
+
+    expect(afterFailure.score).toBeLessThan(beforeFailure.score!)
+    expect(recovered.score).toBeGreaterThan(afterFailure.score!)
+    expect(recovered.failureCount).toBe(1)
+    expect(recovered.successCount).toBe(24)
+    expect(recovered.score).toBeLessThanOrEqual(beforeFailure.score!)
   })
 
   it('acquires one concurrency slot and releases it exactly once', () => {

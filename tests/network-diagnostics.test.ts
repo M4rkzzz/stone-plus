@@ -17,7 +17,7 @@ describe('network diagnostics', () => {
     })
 
     expect(report.summary).toBe('success')
-    expect(report.results).toHaveLength(7)
+    expect(report.results).toHaveLength(6)
     expect(report.results.find((result) => result.id === 'dns-chatgpt')).toMatchObject({
       status: 'success', addresses: ['104.18.32.47', '172.64.155.209']
     })
@@ -29,7 +29,7 @@ describe('network diagnostics', () => {
     ])
   })
 
-  it('diagnoses ChatGPT-only routing failures when OpenAI API remains reachable', async () => {
+  it('diagnoses timeouts when ChatGPT and Codex routes are unavailable', async () => {
     const fetchImplementation = vi.fn(async (input: string) => {
       if (input.includes('chatgpt.com')) throw Object.assign(new TypeError('fetch failed'), { cause: { code: 'UND_ERR_CONNECT_TIMEOUT' } })
       return new Response(null, { status: input.includes('openid-configuration') ? 200 : 401 })
@@ -43,9 +43,9 @@ describe('network diagnostics', () => {
 
     expect(report.summary).toBe('warning')
     expect(report.diagnoses).toEqual(expect.arrayContaining([
-      expect.stringContaining('连接超时'),
-      expect.stringContaining('OpenAI API 可达但 ChatGPT/Codex 域名不可达')
+      expect.stringContaining('连接超时')
     ]))
+    expect(report.results.some((result) => result.id === 'openai-api')).toBe(false)
   })
 
   it('skips local DNS/TLS checks for a proxy and identifies a completely unusable proxy route', async () => {

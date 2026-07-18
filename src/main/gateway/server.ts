@@ -794,12 +794,21 @@ export class GatewayServer implements GatewayController {
   }
 
   private recordAccountPerformance(log: RequestLog): void {
-    if (log.status !== 'success' || !log.accountId || log.upstreamFirstByteMs === undefined) return
+    if (log.status !== 'success' || !log.accountId) return
+    if (log.upstreamFirstByteMs === undefined) {
+      // Reliability still learns from successful non-streaming responses even
+      // when the upstream did not expose phase timings.
+      this.scheduler.recordPerformance(log.accountId, {})
+      return
+    }
     const previousAttemptsMs = log.firstTokenMs !== undefined && log.accountFirstTokenMs !== undefined
       ? Math.max(0, log.firstTokenMs - log.accountFirstTokenMs)
       : 0
     const accountFirstByteMs = Math.max(0, log.upstreamFirstByteMs - previousAttemptsMs)
-    if (accountFirstByteMs <= 0) return
+    if (accountFirstByteMs <= 0) {
+      this.scheduler.recordPerformance(log.accountId, {})
+      return
+    }
     const generationStartedMs = log.upstreamFirstByteMs
       ?? log.clientFirstWriteMs
       ?? log.firstTokenMs

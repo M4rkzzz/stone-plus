@@ -77,6 +77,179 @@ describe('proxy entry presentation', () => {
 })
 
 describe('outbound proxy transport', () => {
+  it('caches system proxy resolution by origin and supports explicit invalidation', async () => {
+    let resolutions = 0
+    let now = 1_000
+    let proxyConnects = 0
+    const origin = await listen(createHttpServer((_request, response) => response.end('through system proxy')))
+    const proxy = fixedTunnelProxy(origin.port, () => { proxyConnects += 1 })
+    const proxyAddress = await listen(proxy)
+    const manager = trackManager(new OutboundTransportManager({
+      outboundNetworkMode: 'system',
+      systemProxyCacheTtlMs: 1_000,
+      now: () => now,
+      resolveSystemProxy: async () => {
+        resolutions += 1
+        return `PROXY 127.0.0.1:${proxyAddress.port}; DIRECT`
+      }
+    }))
+    const fetchImplementation = manager.fetchFor(undefined)
+
+    expect(await (await fetchImplementation('http://system-cache.test/one')).text()).toBe('through system proxy')
+    expect(await (await fetchImplementation('http://system-cache.test/two')).text()).toBe('through system proxy')
+    expect(resolutions).toBe(1)
+
+    now += 1_001
+    expect(await (await fetchImplementation('http://system-cache.test/expired')).text()).toBe('through system proxy')
+    expect(resolutions).toBe(2)
+
+    manager.invalidateSystemProxyCache('http://system-cache.test')
+    expect(await (await fetchImplementation('http://system-cache.test/three')).text()).toBe('through system proxy')
+    expect(resolutions).toBe(3)
+    expect(proxyConnects).toBeGreaterThan(0)
+  })
+
+  it('advances through an ordered PAC proxy chain with a replayable POST body', async () => {
+    let receivedBody = ''
+    let workingProxyConnects = 0
+    const origin = await listen(createHttpServer((request, response) => {
+      request.setEncoding('utf8')
+      request.on('data', (chunk) => { receivedBody += String(chunk) })
+      request.on('end', () => response.end('posted'))
+    }))
+    const unavailableProxy = createHttpServer()
+    const unavailableAddress = await listen(unavailableProxy)
+    await closeServer(unavailableProxy)
+    const workingProxyAddress = await listen(fixedTunnelProxy(origin.port, () => { workingProxyConnects += 1 }))
+    const manager = trackManager(new OutboundTransportManager({
+      outboundNetworkMode: 'system',
+      resolveSystemProxy: async () => (
+        `PROXY 127.0.0.1:${unavailableAddress.port}; PROXY 127.0.0.1:${workingProxyAddress.port}; DIRECT`
+      )
+    }))
+
+    const response = await manager.fetchFor(undefined)('http://pac-fallback.test/request', {
+      method: 'POST',
+      body: JSON.stringify({ safe: true })
+    })
+
+    expect(await response.text()).toBe('posted')
+    expect(receivedBody).toBe('{"safe":true}')
+    expect(workingProxyConnects).toBeGreaterThan(0)
+  })
+
+  it('does not duplicate a one-shot stream body across PAC fallbacks', async () => {
+    let backupProxyConnects = 0
+    const origin = await listen(createHttpServer((_request, response) => response.end('must not arrive')))
+    const unavailableProxy = createHttpServer()
+    const unavailableAddress = await listen(unavailableProxy)
+    await closeServer(unavailableProxy)
+    const backupProxyAddress = await listen(fixedTunnelProxy(origin.port, () => { backupProxyConnects += 1 }))
+    const manager = trackManager(new OutboundTransportManager({
+      outboundNetworkMode: 'system',
+      resolveSystemProxy: async () => (
+        `PROXY 127.0.0.1:${unavailableAddress.port}; PROXY 127.0.0.1:${backupProxyAddress.port}`
+      )
+    }))
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('one shot'))
+        controller.close()
+      }
+    })
+
+    await expect(manager.fetchFor(undefined)('http://pac-stream.test/request', {
+      method: 'POST',
+      body,
+      duplex: 'half'
+    } as RequestInit & { duplex: 'half' })).rejects.toThrow('System proxy request failed')
+    expect(backupProxyConnects).toBe(0)
+  })
+
+  it('keeps an explicit account proxy ahead of the global system proxy', async () => {
+    let systemResolutions = 0
+    let explicitConnects = 0
+    const origin = await listen(createHttpServer((_request, response) => response.end('explicit proxy')))
+    const systemProxyAddress = await listen(fixedTunnelProxy(origin.port))
+    const explicitProxyAddress = await listen(fixedTunnelProxy(origin.port, () => { explicitConnects += 1 }))
+    const manager = trackManager(new OutboundTransportManager({
+      outboundNetworkMode: 'system',
+      resolveSystemProxy: async () => {
+        systemResolutions += 1
+        return `PROXY 127.0.0.1:${systemProxyAddress.port}`
+      }
+    }))
+    const explicitFetch = manager.fetchFor(proxyDefinition({
+      id: 'explicit-account-proxy',
+      host: '127.0.0.1',
+      port: explicitProxyAddress.port
+    }))
+
+    expect(await (await explicitFetch('http://explicit-priority.test/request')).text()).toBe('explicit proxy')
+    expect(explicitConnects).toBeGreaterThan(0)
+    expect(systemResolutions).toBe(0)
+  })
+
+  it('falls back to DIRECT when system proxy resolution fails and warns only once', async () => {
+    const warnings: string[] = []
+    const origin = await listen(createHttpServer((_request, response) => response.end('direct fallback')))
+    const manager = trackManager(new OutboundTransportManager({
+      outboundNetworkMode: 'system',
+      resolveSystemProxy: async () => { throw new Error('PAC unavailable') },
+      onSystemProxyWarning: (message) => warnings.push(message)
+    }))
+    const target = `http://127.0.0.1:${origin.port}`
+
+    const first = await manager.detectSystemProxy([target])
+    const second = await manager.detectSystemProxy([target])
+
+    expect(first.targets[0]).toMatchObject({ summary: 'DIRECT', reachable: true })
+    expect(second.targets[0]).toMatchObject({ summary: 'DIRECT', reachable: true })
+    expect(warnings).toEqual(['System proxy resolution failed; using DIRECT.'])
+  })
+
+  it('bypasses system proxy resolution for loopback destinations', async () => {
+    let resolutions = 0
+    const origin = await listen(createHttpServer((_request, response) => response.end('local')))
+    const manager = trackManager(new OutboundTransportManager({
+      outboundNetworkMode: 'system',
+      resolveSystemProxy: async () => {
+        resolutions += 1
+        return 'PROXY 127.0.0.1:7890'
+      }
+    }))
+
+    const response = await manager.fetchFor(undefined)(`http://127.0.0.1:${origin.port}/local`)
+
+    expect(await response.text()).toBe('local')
+    expect(resolutions).toBe(0)
+  })
+
+  it('switches new requests to system proxy without interrupting an existing direct stream', async () => {
+    let releaseHeld!: () => void
+    const directOrigin = await listen(createHttpServer((request, response) => {
+      if (request.url === '/held') {
+        response.writeHead(200, { 'content-length': '8' })
+        response.write('held')
+        releaseHeld = () => response.end('done')
+      } else response.end('direct')
+    }))
+    const proxiedOrigin = await listen(createHttpServer((_request, response) => response.end('system')))
+    const proxyAddress = await listen(fixedTunnelProxy(proxiedOrigin.port))
+    const manager = trackManager(new OutboundTransportManager({
+      outboundNetworkMode: 'direct',
+      resolveSystemProxy: async () => `PROXY 127.0.0.1:${proxyAddress.port}`
+    }))
+    const implicitFetch = manager.fetchFor(undefined)
+    const held = await implicitFetch(`http://127.0.0.1:${directOrigin.port}/held`)
+
+    manager.configureOutboundNetwork('system', 15721)
+    const next = await implicitFetch('http://mode-switch.test/next')
+    expect(await next.text()).toBe('system')
+    releaseHeld()
+    expect(await held.text()).toBe('helddone')
+  })
+
   it('warms a direct upstream origin before the first application request', async () => {
     let connections = 0
     let headRequests = 0
@@ -431,6 +604,26 @@ function forwardTunnel(target: string | undefined, clientSocket: Socket, head: B
     clientSocket.destroy()
   })
   clientSocket.once('error', () => upstream.destroy())
+}
+
+function fixedTunnelProxy(targetPort: number, onConnect?: () => void): HttpServer {
+  const proxy = createHttpServer((_request, response) => {
+    response.writeHead(502)
+    response.end()
+  })
+  proxy.on('connect', (_request, clientSocket, head) => {
+    onConnect?.()
+    const upstream = connectTcp(targetPort, '127.0.0.1')
+    upstream.once('connect', () => {
+      clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n')
+      if (head.byteLength > 0) upstream.write(head)
+      upstream.pipe(clientSocket)
+      clientSocket.pipe(upstream)
+    })
+    upstream.once('error', () => clientSocket.destroy())
+    clientSocket.once('error', () => upstream.destroy())
+  })
+  return proxy
 }
 
 function trackManager(manager: OutboundTransportManager): OutboundTransportManager {

@@ -29,6 +29,12 @@ export interface AccountPerformanceSample {
 
 interface AccountPerformanceState {
   sampleCount: number
+  successCount: number
+  failureCount: number
+  performanceSampleCount: number
+  historySuccessWeight: number
+  historyFailureWeight: number
+  recentSuccessRate: number
   firstTokenMs?: number
   outputTokensPerSecond?: number
   failurePenalty: number
@@ -40,8 +46,12 @@ interface AccountPerformanceState {
 const AUTO_BALANCED_EXPLORATION_RATE = 0.05
 const FAILURE_PENALTY_HALF_LIFE_MS = 5 * 60_000
 const PERFORMANCE_STALE_AFTER_MS = 30 * 60_000
-const PERFORMANCE_HYDRATION_WINDOW_MS = 30 * 60_000
-const PERFORMANCE_HYDRATION_SAMPLES_PER_ACCOUNT = 20
+const FITNESS_STALE_AFTER_MS = 24 * 60 * 60_000
+const PERFORMANCE_HYDRATION_WINDOW_MS = 30 * 24 * 60 * 60_000
+const PERFORMANCE_HYDRATION_SAMPLES_PER_ACCOUNT = 400
+const FITNESS_HISTORY_HALF_LIFE_MS = 7 * 24 * 60 * 60_000
+const FITNESS_NEUTRAL_PRIOR = 72
+const FITNESS_CONFIDENCE_SAMPLES = 12
 const STICKY_ESCAPE_MINIMUM_SAMPLES = 3
 const STICKY_ESCAPE_MINIMUM_DELTA_MS = 1_000
 const STICKY_ESCAPE_RATIO = 1.5
@@ -118,10 +128,9 @@ export class PoolScheduler {
     const grouped = new Map<string, RequestLog[]>()
     for (const log of logs) {
       if (
-        log.status !== 'success'
-        || !log.accountId
+        !log.accountId
+        || log.status === 'streaming'
         || log.timestamp < cutoff
-        || rawFirstBytePerformanceMs(log) === undefined
       ) continue
       const samples = grouped.get(log.accountId) ?? []
       samples.push(log)
@@ -133,12 +142,13 @@ export class PoolScheduler {
         .sort((a, b) => a.timestamp - b.timestamp)
         .slice(-PERFORMANCE_HYDRATION_SAMPLES_PER_ACCOUNT)
       for (const log of recent) {
-        const firstTokenMs = rawFirstBytePerformanceMs(log)
-        if (firstTokenMs === undefined) continue
-        this.updatePerformance(accountId, {
+        const firstTokenMs = log.status === 'success' ? rawFirstBytePerformanceMs(log) : undefined
+        this.observeOutcome(accountId, log.status === 'success', {
           firstTokenMs,
           outputTokens: log.outputTokens,
-          generationDurationMs: Math.max(0, log.latencyMs - (log.upstreamFirstByteMs ?? firstTokenMs))
+          generationDurationMs: firstTokenMs === undefined
+            ? undefined
+            : Math.max(0, log.latencyMs - (log.upstreamFirstByteMs ?? firstTokenMs))
         }, log.timestamp, false)
       }
     }
@@ -232,17 +242,14 @@ export class PoolScheduler {
     }
     this.health.set(accountId, state)
     const performance = this.performance.get(accountId)
-    this.performance.set(accountId, {
-      sampleCount: performance?.sampleCount ?? 0,
-      firstTokenMs: performance?.firstTokenMs,
-      outputTokensPerSecond: performance?.outputTokensPerSecond,
-      failurePenalty: this.decayedFailurePenalty(performance) + 6,
-      updatedAt: this.now(),
-      dynamicConcurrency: Math.max(1, Math.floor(
+    this.observeOutcome(accountId, false, {}, this.now(), true)
+    const updated = this.performance.get(accountId)
+    if (updated) {
+      updated.dynamicConcurrency = Math.max(1, Math.floor(
         (performance?.dynamicConcurrency ?? Math.max(1, options.maxConcurrency ?? 2)) / 2
-      )),
-      successStreak: 0
-    })
+      ))
+      updated.successStreak = 0
+    }
     return { ...state }
   }
 
@@ -257,11 +264,12 @@ export class PoolScheduler {
   }
 
   recordPerformance(accountId: string, sample: AccountPerformanceSample): void {
-    this.updatePerformance(accountId, sample, this.now(), true)
+    this.observeOutcome(accountId, true, sample, this.now(), true)
   }
 
-  private updatePerformance(
+  private observeOutcome(
     accountId: string,
+    success: boolean,
     sample: AccountPerformanceSample,
     observedAt: number,
     adaptConcurrency: boolean
@@ -272,25 +280,40 @@ export class PoolScheduler {
     const outputTokensPerSecond = outputTokens !== undefined && generationDurationMs !== undefined
       ? outputTokens * 1000 / generationDurationMs
       : undefined
-    if (firstTokenMs === undefined && outputTokensPerSecond === undefined) return
     const existing = this.performance.get(accountId)
-    const alpha = (existing?.sampleCount ?? 0) < 4 ? 0.5 : 0.25
-    const successStreak = adaptConcurrency ? (existing?.successStreak ?? 0) + 1 : 0
+    const elapsed = Math.max(0, observedAt - (existing?.updatedAt ?? observedAt))
+    const historyDecay = 0.5 ** (elapsed / FITNESS_HISTORY_HALF_LIFE_MS)
+    const historySuccessWeight = (existing?.historySuccessWeight ?? 0) * historyDecay + (success ? 1 : 0)
+    const historyFailureWeight = (existing?.historyFailureWeight ?? 0) * historyDecay + (success ? 0 : 1)
+    const recentAlpha = success ? 0.12 : 0.28
+    const recentSuccessRate = updateEwma(existing?.recentSuccessRate, success ? 1 : 0, recentAlpha) ?? (success ? 1 : 0)
+    const performanceSampleCount = (existing?.performanceSampleCount ?? 0)
+      + (success && (firstTokenMs !== undefined || outputTokensPerSecond !== undefined) ? 1 : 0)
+    const alpha = performanceSampleCount < 5 ? 0.45 : 0.18
+    const successStreak = adaptConcurrency && success ? (existing?.successStreak ?? 0) + 1 : 0
     const dynamicConcurrency = existing?.dynamicConcurrency === undefined
       ? undefined
-      : existing.dynamicConcurrency + (adaptConcurrency && successStreak >= 8 ? 1 : 0)
+      : existing.dynamicConcurrency + (adaptConcurrency && success && successStreak >= 8 ? 1 : 0)
     this.performance.set(accountId, {
       sampleCount: (existing?.sampleCount ?? 0) + 1,
+      successCount: (existing?.successCount ?? 0) + (success ? 1 : 0),
+      failureCount: (existing?.failureCount ?? 0) + (success ? 0 : 1),
+      performanceSampleCount,
+      historySuccessWeight,
+      historyFailureWeight,
+      recentSuccessRate,
       firstTokenMs: updateEwma(existing?.firstTokenMs, firstTokenMs, alpha),
       outputTokensPerSecond: updateEwma(
         existing?.outputTokensPerSecond,
         outputTokensPerSecond,
         alpha
       ),
-      failurePenalty: this.decayedFailurePenalty(existing) * 0.5,
+      failurePenalty: success
+        ? decayedFailurePenaltyAt(existing, observedAt) * 0.65
+        : decayedFailurePenaltyAt(existing, observedAt) + 6,
       updatedAt: observedAt,
       dynamicConcurrency,
-      successStreak: adaptConcurrency && successStreak >= 8 ? 0 : successStreak
+      successStreak: adaptConcurrency && success && successStreak >= 8 ? 0 : successStreak
     })
   }
 
@@ -309,36 +332,55 @@ export class PoolScheduler {
 
   getFitness(accounts: readonly Account[]): Record<string, AccountFitnessSnapshot> {
     const now = this.now()
-    const measured = accounts
-      .map((account) => ({ account, state: this.performance.get(account.id) }))
-      .filter((candidate): candidate is { account: Account; state: AccountPerformanceState } =>
-        Boolean(candidate.state && candidate.state.sampleCount > 0))
-    const prior = conservativePerformancePrior(measured.map(({ state }) => performanceCost(state, now)))
-    const costs = measured.map(({ account, state }) => ({
-      account,
-      state,
-      cost: estimatedPerformanceCost(state, prior, now)
-    }))
-    const bestCost = costs.length > 0 ? Math.min(...costs.map(({ cost }) => cost)) : undefined
     const result: Record<string, AccountFitnessSnapshot> = {}
     for (const account of accounts) {
       const state = this.performance.get(account.id)
-      if (!state || state.sampleCount <= 0 || bestCost === undefined) {
+      if (!state || state.sampleCount <= 0) {
         result[account.id] = { sampleCount: 0, failurePenalty: 0, stale: true }
         continue
       }
-      const cost = costs.find((candidate) => candidate.account.id === account.id)?.cost
-        ?? estimatedPerformanceCost(state, prior, now)
       const elapsed = Math.max(0, now - state.updatedAt)
-      const score = Math.max(1, Math.min(100, Math.round(100 * (bestCost + 0.5) / (cost + 0.5))))
+      const historyDecay = 0.5 ** (elapsed / FITNESS_HISTORY_HALF_LIFE_MS)
+      const successWeight = state.historySuccessWeight * historyDecay
+      const failureWeight = state.historyFailureWeight * historyDecay
+      const effectiveSamples = successWeight + failureWeight
+      // An 80% Beta prior prevents one lucky request from receiving a top rating.
+      const longTermSuccessRate = (successWeight + 8) / (effectiveSamples + 10)
+      const recentMemory = 0.5 ** (elapsed / FITNESS_STALE_AFTER_MS)
+      const recentSuccessRate = Math.max(0, Math.min(1,
+        state.recentSuccessRate * recentMemory + longTermSuccessRate * (1 - recentMemory)
+      ))
+      const reliability = 100 * (longTermSuccessRate * 0.65 + recentSuccessRate * 0.35)
+      const responsiveness = responseFitness(state.firstTokenMs)
+      const throughput = throughputFitness(state.outputTokensPerSecond)
+      const failurePenalty = state.failurePenalty * 0.5 ** (elapsed / FAILURE_PENALTY_HALF_LIFE_MS)
+      const circuitPenalty = account.cooldownReason === 'failure' || account.circuitState === 'open'
+        ? 35
+        : Math.min(25, Math.max(0, account.consecutiveFailures ?? 0) * 6)
+      const stability = Math.max(0, 100 * Math.exp(-failurePenalty / 10) - circuitPenalty)
+      const components = {
+        reliability: roundedRating(reliability),
+        responsiveness: roundedRating(responsiveness),
+        throughput: roundedRating(throughput),
+        stability: roundedRating(stability)
+      }
+      const rawScore = reliability * 0.48 + responsiveness * 0.24 + throughput * 0.16 + stability * 0.12
+      const confidenceRatio = 1 - Math.exp(-effectiveSamples / FITNESS_CONFIDENCE_SAMPLES)
+      const score = roundedRating(rawScore * confidenceRatio + FITNESS_NEUTRAL_PRIOR * (1 - confidenceRatio))
       result[account.id] = {
         score,
         sampleCount: state.sampleCount,
+        successCount: state.successCount,
+        failureCount: state.failureCount,
+        successRate: roundedPercent(longTermSuccessRate),
+        recentSuccessRate: roundedPercent(recentSuccessRate),
+        confidence: roundedPercent(confidenceRatio),
         firstTokenMs: state.firstTokenMs,
         outputTokensPerSecond: state.outputTokensPerSecond,
-        failurePenalty: state.failurePenalty * 0.5 ** (elapsed / FAILURE_PENALTY_HALF_LIFE_MS),
+        failurePenalty,
+        components,
         updatedAt: state.updatedAt,
-        stale: elapsed >= PERFORMANCE_STALE_AFTER_MS,
+        stale: elapsed >= FITNESS_STALE_AFTER_MS,
         dynamicConcurrency: state.dynamicConcurrency
       }
     }
@@ -539,6 +581,30 @@ function updateEwma(
   if (sample === undefined) return current
   if (current === undefined) return sample
   return current + alpha * (sample - current)
+}
+
+function responseFitness(firstTokenMs: number | undefined): number {
+  if (firstTokenMs === undefined) return FITNESS_NEUTRAL_PRIOR
+  return 100 / (1 + (Math.max(1, firstTokenMs) / 1_800) ** 1.25)
+}
+
+function throughputFitness(tokensPerSecond: number | undefined): number {
+  if (tokensPerSecond === undefined) return FITNESS_NEUTRAL_PRIOR
+  return 100 * (1 - Math.exp(-Math.max(0, tokensPerSecond) / 45))
+}
+
+function decayedFailurePenaltyAt(state: AccountPerformanceState | undefined, observedAt: number): number {
+  if (!state?.failurePenalty) return 0
+  const elapsed = Math.max(0, observedAt - state.updatedAt)
+  return state.failurePenalty * 0.5 ** (elapsed / FAILURE_PENALTY_HALF_LIFE_MS)
+}
+
+function roundedRating(value: number): number {
+  return Math.max(0, Math.min(100, Math.round(value)))
+}
+
+function roundedPercent(value: number): number {
+  return Math.max(0, Math.min(100, Math.round(value * 1_000) / 10))
 }
 
 function quotaWindows(account: Account) {

@@ -103,8 +103,7 @@ function TokenCostCard({
       <div className="token-cost-card__total">
         <div><span>Token 总量</span><strong>{formatCompactNumber(cost.totalTokens)}</strong></div>
         <div className="token-cost-card__usd">
-          <span>{cost.unpricedTokens ? '可计价部分合计' : '官方 API 价格估算'}</span>
-          <strong>≈ {formatUsd(cost.totalCostUsd)}</strong>
+          <strong>{formatUsd(cost.totalCostUsd)}</strong>
         </div>
       </div>
       <div className="token-cost-breakdown" aria-label={`${title}成本分项`}>
@@ -118,9 +117,8 @@ function TokenCostCard({
           <span><i />输出成本</span><strong>{formatUsd(cost.outputCostUsd)}</strong>
         </div>
       </div>
-      <footer className="token-cost-card__footer">
+      {(!hasUsage || cost.unpricedTokens > 0 || cost.cacheWriteInputTokens > 0 || cost.longContextRequestCount > 0) && <footer className="token-cost-card__footer">
         {!hasUsage && <span>暂无包含 Token usage 的请求记录</span>}
-        {hasUsage && !cost.unpricedTokens && <span>已识别并计价 {formatCompactNumber(cost.pricedTokens)} Token</span>}
         {cost.unpricedTokens > 0 && (
           <span className="token-cost-unpriced" title={unknownModelLabel}>
             {formatCompactNumber(cost.unpricedTokens)} Token 因模型价格未知未计价
@@ -128,7 +126,7 @@ function TokenCostCard({
         )}
         {cost.cacheWriteInputTokens > 0 && <span>其中 {formatCompactNumber(cost.cacheWriteInputTokens)} 缓存写入 Token 已按对应模型规则计价</span>}
         {cost.longContextRequestCount > 0 && <span>{cost.longContextRequestCount} 次长上下文请求已应用附加价格</span>}
-      </footer>
+      </footer>}
     </article>
   )
 }
@@ -308,7 +306,7 @@ export function OverviewView({ snapshot, navigate }: { snapshot: AppSnapshot; na
         </article>
       </section>
 
-      <section className="token-cost-grid" aria-label="Token 消耗与官方 API 价格估算">
+      <section className="token-cost-grid" aria-label="Token 消耗与成本">
         <TokenCostCard
           title="今日 Token"
           description={`${new Date(tokenCosts.todayStart).toLocaleDateString('zh-CN')} · 本地自然日`}

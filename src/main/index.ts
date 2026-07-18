@@ -1,4 +1,4 @@
-import { app, BrowserWindow, Menu, nativeImage, net, powerMonitor, shell, Tray } from 'electron'
+import { app, BrowserWindow, Menu, nativeImage, net, powerMonitor, session, shell, Tray } from 'electron'
 import electronUpdater from 'electron-updater'
 import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -15,6 +15,7 @@ import { FrpTunnelService } from './tunnel'
 import { registerTunnelApi } from './ipc/tunnel-api'
 import { CodexConversationTitleResolver, CodexSessionRepairService } from './codex'
 import { registerCodexSessionRepairApi } from './ipc/session-repair-api'
+import { BROWSER_SESSION_PARTITION, BrowserImportQueue } from './browser-import-queue'
 
 const { autoUpdater } = electronUpdater
 
@@ -28,6 +29,7 @@ let updateService: UpdateService
 let tunnelService: FrpTunnelService
 let codexConversationTitles: CodexConversationTitleResolver
 let codexSessionRepair: CodexSessionRepairService
+let browserImportQueue: BrowserImportQueue
 let isQuitting = false
 let storeClosed = false
 let shutdownForUpdate = false
@@ -43,7 +45,13 @@ async function bootstrap(): Promise<void> {
 
   store = new AppStore(app.getPath('userData'))
   await store.initialize()
-  outboundTransport = new OutboundTransportManager()
+  const gatewaySettings = store.getSnapshot().gateway
+  outboundTransport = new OutboundTransportManager({
+    outboundNetworkMode: gatewaySettings.outboundNetworkMode ?? 'direct',
+    localGatewayPort: gatewaySettings.port,
+    resolveSystemProxy: (url) => session.defaultSession.resolveProxy(url),
+    onSystemProxyWarning: (message) => console.warn(`[system-proxy] ${message}`)
+  })
   codexConversationTitles = new CodexConversationTitleResolver(app.getPath('home'))
   codexSessionRepair = new CodexSessionRepairService({ codexHome: join(app.getPath('home'), '.codex') })
   await store.refreshRequestConversationTitles((conversationId) => codexConversationTitles.resolve(conversationId))
@@ -108,7 +116,25 @@ async function bootstrap(): Promise<void> {
   })
   await tunnelService.initialize()
 
-  flushGatewayApiState = registerGatewayApi(store, gateway, clientConfig, outboundTransport, backups, updateTrayMenu)
+  browserImportQueue = new BrowserImportQueue(join(app.getPath('temp'), 'stone-plus-browser-imports'))
+  const browserSession = session.fromPartition(BROWSER_SESSION_PARTITION, { cache: true })
+  browserImportQueue.watch(browserSession)
+  browserSession.setPermissionRequestHandler((_webContents, _permission, callback) => callback(false))
+  browserSession.setPermissionCheckHandler(() => false)
+  app.on('web-contents-created', (_event, contents) => {
+    if (contents.getType() !== 'webview' || contents.session !== browserSession) return
+    contents.setWindowOpenHandler(({ url }) => {
+      if (isSafeBrowserUrl(url)) {
+        contents.hostWebContents?.send('stone:browser-open-tab', { url, guestId: contents.id })
+      }
+      return { action: 'deny' }
+    })
+    contents.on('will-navigate', (event, url) => {
+      if (!isSafeBrowserUrl(url)) event.preventDefault()
+    })
+  })
+
+  flushGatewayApiState = registerGatewayApi(store, gateway, clientConfig, outboundTransport, backups, updateTrayMenu, browserImportQueue)
   powerMonitor.on('resume', () => {
     void rebuildGatewayConnections(store, outboundTransport).catch(() => undefined)
   })
@@ -155,6 +181,7 @@ function createWindow(): void {
       sandbox: true,
       nodeIntegration: false,
       webSecurity: true,
+      webviewTag: true,
       spellcheck: false
     }
   })
@@ -162,6 +189,16 @@ function createWindow(): void {
   mainWindow.setMenuBarVisibility(false)
   const rendererTarget = process.env.ELECTRON_RENDERER_URL ?? pathToFileURL(join(__dirname, '../renderer/index.html')).toString()
   mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
+  mainWindow.webContents.on('will-attach-webview', (event, webPreferences, params) => {
+    delete webPreferences.preload
+    webPreferences.nodeIntegration = false
+    webPreferences.nodeIntegrationInWorker = false
+    webPreferences.contextIsolation = true
+    webPreferences.sandbox = true
+    webPreferences.webSecurity = true
+    const partition = params.partition || webPreferences.partition
+    if (!isSafeBrowserUrl(params.src) || partition !== BROWSER_SESSION_PARTITION) event.preventDefault()
+  })
   mainWindow.webContents.on('will-navigate', (event, targetUrl) => {
     const allowed = process.env.ELECTRON_RENDERER_URL
       ? new URL(targetUrl).origin === new URL(rendererTarget).origin
@@ -207,6 +244,15 @@ function stoneIconPath(): string {
   return app.isPackaged
     ? join(process.resourcesPath, 'icon.png')
     : resolve('build/icon.png')
+}
+
+function isSafeBrowserUrl(value: string): boolean {
+  try {
+    const protocol = new URL(value).protocol
+    return protocol === 'https:' || protocol === 'http:'
+  } catch {
+    return false
+  }
 }
 
 function updateTrayMenu(): void {
@@ -273,8 +319,6 @@ async function toggleRouteFromTray(routeId: string): Promise<void> {
 
 function toGatewayConfig(store: AppStore): GatewayConfig {
   const configuration = store.getRuntimeConfiguration()
-  const recentRequestLogs = store.getSnapshot().requestLogs.filter((log) =>
-    log.timestamp >= Date.now() - 30 * 60_000)
   return {
     providers: configuration.providers,
     accounts: configuration.accounts,
@@ -282,7 +326,7 @@ function toGatewayConfig(store: AppStore): GatewayConfig {
     proxies: configuration.proxies,
     routes: configuration.routes,
     settings: configuration.gateway,
-    recentRequestLogs
+    recentRequestLogs: store.getAccountFitnessHistory()
   }
 }
 
@@ -314,6 +358,7 @@ function shutdownServices(): Promise<void> {
       if (backups) await backups.close()
       if (outboundTransport) await outboundTransport.close()
       if (codexConversationTitles) codexConversationTitles.close()
+      if (browserImportQueue) await browserImportQueue.close()
       if (store) await store.close()
     } catch (error: unknown) {
       console.error('Stone could not finish graceful shutdown', error)

@@ -29,6 +29,7 @@ import { serializeDiagnostics } from './diagnostics'
 import { assertTrustedSender } from './trusted-sender'
 import { OutboundTransportManager, probeProxy, resolveEffectiveProxy } from '../proxy'
 import { runNetworkDiagnostics } from '../network-diagnostics'
+import type { BrowserImportQueue } from '../browser-import-queue'
 
 export interface GatewayController {
   start(settings?: GatewaySettings): Promise<void>
@@ -47,7 +48,8 @@ export function registerGatewayApi(
   clientConfig: ClientConfigService,
   outboundTransport: OutboundTransportManager,
   backups?: DatabaseBackupService<PersistedState>,
-  onRuntimeChanged?: () => void
+  onRuntimeChanged?: () => void,
+  browserImports?: BrowserImportQueue
 ): () => Promise<void> {
   const snapshotPublishDelayMs = 1_000
   const accountStateFlushDelayMs = 250
@@ -102,6 +104,12 @@ export function registerGatewayApi(
     }
     return enriched
   }
+  const publishBrowserImports = (state: ReturnType<BrowserImportQueue['getState']>): void => {
+    for (const window of BrowserWindow.getAllWindows()) {
+      if (!window.isDestroyed()) window.webContents.send('stone:browser-import-queue', state)
+    }
+  }
+  const unsubscribeBrowserImports = browserImports?.subscribe(publishBrowserImports)
 
   const scheduleRuntimePublish = (): void => {
     if (scheduledSnapshotPublish) return
@@ -478,6 +486,82 @@ export function registerGatewayApi(
     }
 
   })
+  ipcMain.handle('stone:get-browser-import-queue', (event) => {
+    assertTrustedSender(event)
+    return browserImports?.getState() ?? { items: [], readyCount: 0, totalBytes: 0, revision: 0 }
+  })
+  ipcMain.handle('stone:remove-browser-import-item', (event, id: string) => {
+    assertTrustedSender(event)
+    if (typeof id !== 'string' || !id) throw new Error('无效的挂起文件。')
+    return browserImports?.remove(id) ?? { items: [], readyCount: 0, totalBytes: 0, revision: 0 }
+  })
+  ipcMain.handle('stone:clear-browser-import-queue', (event) => {
+    assertTrustedSender(event)
+    return browserImports?.clear() ?? { items: [], readyCount: 0, totalBytes: 0, revision: 0 }
+  })
+  ipcMain.handle('stone:import-browser-json-queue', async (event, input: Parameters<GatewayApi['importBrowserJsonQueue']>[0]) => {
+    assertTrustedSender(event)
+    if (!browserImports) throw new Error('内置浏览器下载队列尚未初始化。')
+    if (!input || typeof input.providerId !== 'string' || !input.providerId.trim()) {
+      throw new Error('批量导入前请选择 OpenAI Responses Provider。')
+    }
+    if (!Array.isArray(input.itemIds)) throw new Error('请选择需要导入的挂起 JSON。')
+    validateAccountImportProxySelection(input.proxyMode, input.proxyId, store.getRuntimeProxies())
+    const files = browserImports.getReadyItems(input.itemIds)
+    const fileResults: Awaited<ReturnType<GatewayApi['importBrowserJsonQueue']>>['fileResults'] = []
+    const importedAccountIds: string[] = []
+    const createdAccountIds: string[] = []
+    const updatedAccountIds: string[] = []
+    const importedItemIds: string[] = []
+    const warnings: string[] = []
+
+    for (const file of files) {
+      try {
+        const imported = await store.importChatGptAccounts({
+          providerId: input.providerId,
+          content: file.content,
+          proxyMode: input.proxyMode,
+          proxyId: input.proxyId
+        })
+        importedAccountIds.push(...imported.importedAccountIds)
+        createdAccountIds.push(...imported.createdAccountIds)
+        updatedAccountIds.push(...imported.updatedAccountIds)
+        warnings.push(...imported.warnings.map((warning) => `${file.fileName}：${warning}`))
+        importedItemIds.push(file.id)
+        fileResults.push({
+          fileName: file.fileName,
+          status: 'imported',
+          importedAccounts: imported.importedAccountIds.length,
+          createdAccounts: imported.createdAccountIds.length,
+          updatedAccounts: imported.updatedAccountIds.length
+        })
+      } catch (error) {
+        fileResults.push({
+          fileName: file.fileName,
+          status: 'failed',
+          importedAccounts: 0,
+          createdAccounts: 0,
+          updatedAccounts: 0,
+          error: importErrorMessage(error)
+        })
+      }
+    }
+    if (importedItemIds.length) browserImports.removeMany(importedItemIds)
+    publish(refreshRuntime())
+    const uniqueImportedIds = [...new Set(importedAccountIds)]
+    const detectionResults = await detectImportedAccounts(uniqueImportedIds)
+    return {
+      snapshot: store.getSnapshot(),
+      cancelled: false,
+      selectedFiles: files.length,
+      fileResults,
+      importedAccountIds: uniqueImportedIds,
+      createdAccountIds: [...new Set(createdAccountIds)],
+      updatedAccountIds: [...new Set(updatedAccountIds)],
+      detectionResults,
+      warnings: [...new Set(warnings)]
+    }
+  })
   ipcMain.handle('stone:export-chatgpt-accounts', async (event, input: Parameters<GatewayApi['exportChatGptAccounts']>[0]) => {
     assertTrustedSender(event)
     if (!input || !Array.isArray(input.accountIds) || !['cpa', 'sub2api'].includes(input.format)
@@ -599,7 +683,15 @@ export function registerGatewayApi(
     const previousSettings = store.getSnapshot().gateway
     const requiresRestart = wasRunning
       && (previousSettings.host !== settings.host || previousSettings.port !== settings.port)
+    const outboundModeChanged = (previousSettings.outboundNetworkMode ?? 'direct')
+      !== (settings.outboundNetworkMode ?? 'direct')
     await store.updateGateway(settings)
+    const savedGateway = store.getSnapshot().gateway
+    outboundTransport.configureOutboundNetwork(
+      savedGateway.outboundNetworkMode ?? 'direct',
+      savedGateway.port
+    )
+    if (outboundModeChanged && wasRunning) warmGatewayConnections(store, outboundTransport)
     if (backups) {
       await backups.setAutomaticRetention(settings.backupRetention ?? 10)
       if (settings.automaticBackups === false) backups.stopAutomaticBackups()
@@ -638,6 +730,13 @@ export function registerGatewayApi(
     assertTrustedSender(event)
     await rebuildGatewayConnections(store, outboundTransport)
   })
+  ipcMain.handle('stone:detect-system-proxy', async (event) => {
+    assertTrustedSender(event)
+    return outboundTransport.detectSystemProxy([
+      new URL(CHATGPT_CODEX_RESPONSES_URL).origin,
+      'https://api.openai.com'
+    ])
+  })
   ipcMain.handle('stone:run-network-diagnostics', async (event, input: Parameters<GatewayApi['runNetworkDiagnostics']>[0] = {}) => {
     assertTrustedSender(event)
     if (!input || typeof input !== 'object') throw new Error('Network diagnostic options are invalid.')
@@ -652,7 +751,9 @@ export function registerGatewayApi(
       fetchImplementation,
       route: proxy
         ? { kind: 'proxy', name: proxy.name, proxyId: proxy.id }
-        : { kind: 'direct', name: '直连' }
+        : store.getSnapshot().gateway.outboundNetworkMode === 'system'
+          ? { kind: 'system', name: '跟随系统代理' }
+          : { kind: 'direct', name: '直连' }
     })
   })
   ipcMain.handle('stone:check-account', async (event, id: string) => {
@@ -860,6 +961,7 @@ export function registerGatewayApi(
   })
   return async () => {
     closed = true
+    unsubscribeBrowserImports?.()
     for (const timer of quotaProbeTimers.values()) clearTimeout(timer)
     quotaProbeTimers.clear()
     if (scheduledSnapshotPublish) {
@@ -934,8 +1036,6 @@ function assertRouteClient(value: unknown): asserts value is RouteClient {
 
 function toGatewayConfig(store: AppStore): GatewayConfig {
   const configuration = store.getRuntimeConfiguration()
-  const recentRequestLogs = store.getSnapshot().requestLogs.filter((log) =>
-    log.timestamp >= Date.now() - 30 * 60_000)
   return {
     providers: configuration.providers,
     accounts: configuration.accounts,
@@ -943,7 +1043,7 @@ function toGatewayConfig(store: AppStore): GatewayConfig {
     pools: configuration.pools,
     routes: configuration.routes,
     settings: configuration.gateway,
-    recentRequestLogs
+    recentRequestLogs: store.getAccountFitnessHistory()
   }
 }
 
@@ -981,6 +1081,7 @@ export function warmGatewayConnections(store: AppStore, transport: OutboundTrans
 }
 
 export async function rebuildGatewayConnections(store: AppStore, transport: OutboundTransportManager): Promise<void> {
+  transport.invalidateSystemProxyCache()
   const targets = gatewayConnectionTargets(store)
   const grouped = new Map<string, {
     proxy: AppSnapshot['proxies'][number] | undefined

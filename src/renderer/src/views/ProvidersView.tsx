@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   Boxes,
   CheckCircle2,
@@ -48,6 +48,52 @@ import { ProxyManager } from './ProxyManager'
 import { CodexQuotaCompact, CodexQuotaModal } from './CodexQuotaModal'
 
 const HIDE_EXHAUSTED_ACCOUNTS_STORAGE_KEY = 'stone.providers.hide-exhausted-accounts'
+const ACCOUNT_COLUMN_STORAGE_KEY = 'stone:account-column-widths:v1'
+
+type AccountColumnId = 'select' | 'account' | 'status' | 'fitness' | 'credential' | 'concurrency' | 'quota' | 'latency' | 'lastUsed' | 'actions'
+
+interface AccountColumnDefinition {
+  id: AccountColumnId
+  label: string
+  defaultWidth: number
+  minimumWidth: number
+  resizable?: boolean
+}
+
+const ACCOUNT_COLUMNS: AccountColumnDefinition[] = [
+  { id: 'select', label: '选择', defaultWidth: 42, minimumWidth: 38, resizable: false },
+  { id: 'account', label: '账号', defaultWidth: 205, minimumWidth: 125 },
+  { id: 'status', label: '状态', defaultWidth: 185, minimumWidth: 105 },
+  { id: 'fitness', label: '体质', defaultWidth: 190, minimumWidth: 90 },
+  { id: 'credential', label: '凭据', defaultWidth: 160, minimumWidth: 105 },
+  { id: 'concurrency', label: '并发', defaultWidth: 105, minimumWidth: 78 },
+  { id: 'quota', label: '额度', defaultWidth: 130, minimumWidth: 82 },
+  { id: 'latency', label: '延迟', defaultWidth: 90, minimumWidth: 70 },
+  { id: 'lastUsed', label: '最近使用', defaultWidth: 110, minimumWidth: 82 },
+  { id: 'actions', label: '操作', defaultWidth: 150, minimumWidth: 140 },
+]
+
+type AccountColumnWidths = Record<AccountColumnId, number>
+
+function defaultAccountColumnWidths(): AccountColumnWidths {
+  return Object.fromEntries(ACCOUNT_COLUMNS.map((column) => [column.id, column.defaultWidth])) as AccountColumnWidths
+}
+
+function loadAccountColumnWidths(): AccountColumnWidths {
+  const defaults = defaultAccountColumnWidths()
+  try {
+    const stored = JSON.parse(window.localStorage.getItem(ACCOUNT_COLUMN_STORAGE_KEY) ?? '{}') as Record<string, unknown>
+    for (const column of ACCOUNT_COLUMNS) {
+      const width = stored[column.id]
+      if (typeof width === 'number' && Number.isFinite(width)) {
+        defaults[column.id] = Math.max(column.minimumWidth, Math.min(640, Math.round(width)))
+      }
+    }
+  } catch {
+    // Invalid renderer storage falls back to the defaults.
+  }
+  return defaults
+}
 
 function importProxyValue(mode: ChatGptAccountImportProxyMode, proxyId: string): string {
   if (mode === 'preserve') return '__preserve__'
@@ -75,16 +121,55 @@ function accountIsCooling(account: PublicAccount, now = Date.now()): boolean {
 }
 
 function thawCountdown(until: number, now: number): string {
-  const seconds = Math.max(0, Math.ceil((until - now) / 1000))
-  if (seconds < 60) return `${seconds} 秒`
-  const minutes = Math.ceil(seconds / 60)
-  if (minutes < 60) return `${minutes} 分钟`
-  const hours = Math.floor(minutes / 60)
-  const remainderMinutes = minutes % 60
-  if (hours < 24) return remainderMinutes ? `${hours} 小时 ${remainderMinutes} 分` : `${hours} 小时`
-  const days = Math.floor(hours / 24)
-  const remainderHours = hours % 24
-  return remainderHours ? `${days} 天 ${remainderHours} 小时` : `${days} 天`
+  const totalMinutes = Math.max(1, Math.ceil((until - now) / 60_000))
+  const days = Math.floor(totalMinutes / 1_440)
+  const hours = Math.floor(totalMinutes % 1_440 / 60)
+  if (days > 0) return `${days}d${hours}h`
+  const totalHours = Math.floor(totalMinutes / 60)
+  const minutes = totalMinutes % 60
+  if (totalHours > 0) return `${totalHours}h${minutes}m`
+  return `${totalMinutes}m`
+}
+
+function accountRecoveryAt(account: PublicAccount, now: number): number | undefined {
+  const candidates: number[] = []
+  if (account.cooldownUntil !== undefined && account.cooldownUntil > now) candidates.push(account.cooldownUntil)
+
+  const quotaResets = [account.quota?.requests, account.quota?.tokens, account.quota?.inputTokens, account.quota?.outputTokens]
+    .filter((window) => window?.remaining === 0 && window.resetAt !== undefined && window.resetAt > now)
+    .map((window) => window!.resetAt!)
+  if (quotaResets.length) candidates.push(Math.max(...quotaResets))
+
+  if (accountQuotaIsExhausted(account, now) && account.codexQuota) {
+    const windows = [account.codexQuota.fiveHour, account.codexQuota.sevenDay].filter(Boolean)
+    const exhaustedResets = windows
+      .filter((window) => window!.usedPercent >= 100 && window!.resetAt !== undefined && window!.resetAt! > now)
+      .map((window) => window!.resetAt!)
+    if (exhaustedResets.length) candidates.push(Math.max(...exhaustedResets))
+    else {
+      const futureResets = windows
+        .filter((window) => window!.resetAt !== undefined && window!.resetAt! > now)
+        .map((window) => window!.resetAt!)
+      if (futureResets.length) candidates.push(Math.min(...futureResets))
+    }
+  }
+  return candidates.length ? Math.max(...candidates) : undefined
+}
+
+function accountDisplayNames(accounts: readonly PublicAccount[]): Map<string, string> {
+  const bases = accounts.map((account) => ({
+    account,
+    base: Array.from(account.name).slice(0, 8).join('')
+  }))
+  const counts = new Map<string, number>()
+  for (const { base } of bases) counts.set(base, (counts.get(base) ?? 0) + 1)
+  const occurrences = new Map<string, number>()
+  return new Map(bases.map(({ account, base }) => {
+    if ((counts.get(base) ?? 0) <= 1) return [account.id, base]
+    const occurrence = (occurrences.get(base) ?? 0) + 1
+    occurrences.set(base, occurrence)
+    return [account.id, `${base}(${occurrence})`]
+  }))
 }
 
 function AccountFitness({ fitness }: { fitness?: AccountFitnessSnapshot }) {
@@ -93,28 +178,42 @@ function AccountFitness({ fitness }: { fitness?: AccountFitnessSnapshot }) {
     return <div className="fitness-cell"><span className="fitness-score fitness-score--pending">待采样</span><small>智能均衡尚无数据</small></div>
   }
   const tone = fitness.score >= 85 ? 'strong' : fitness.score >= 60 ? 'medium' : 'weak'
-  const details = [
-    fitness.firstTokenMs === undefined ? undefined : `首字 ${durationLabel(fitness.firstTokenMs)}`,
-    fitness.outputTokensPerSecond === undefined ? undefined : `${fitness.outputTokensPerSecond.toFixed(1)} tok/s`,
+  const summary = [
+    fitness.successRate === undefined ? undefined : `长期 ${fitness.successRate.toFixed(1)}%`,
+    fitness.recentSuccessRate === undefined ? undefined : `近期 ${fitness.recentSuccessRate.toFixed(1)}%`,
+    fitness.confidence === undefined ? undefined : `可信度 ${fitness.confidence.toFixed(0)}%`,
     `${fitness.sampleCount} 个样本`
   ].filter(Boolean).join(' · ')
-  return <div className="fitness-cell" title={`相对体质分；当前最佳账号为 100 分。${details ? ` ${details}` : ''}`}>
-    <span className={`fitness-score fitness-score--${tone}`}>{fitness.score} 分</span>
-    <small>{fitness.stale ? '历史样本 · ' : ''}{details}</small>
+  const performance = [
+    fitness.firstTokenMs === undefined ? undefined : `首字 ${durationLabel(fitness.firstTokenMs)}`,
+    fitness.outputTokensPerSecond === undefined ? undefined : `${fitness.outputTokensPerSecond.toFixed(1)} tok/s`,
+  ].filter(Boolean).join(' · ')
+  const components = fitness.components
+    ? `可靠性 ${fitness.components.reliability}、响应 ${fitness.components.responsiveness}、吞吐 ${fitness.components.throughput}、稳定性 ${fitness.components.stability}`
+    : undefined
+  const explanation = [
+    '移动体质分采用绝对评价，不按当前账号排名强制设为 100；结合近 30 天历史、近期 EWMA、长期成功率、响应、吞吐、失败与熔断。',
+    summary,
+    performance,
+    components
+  ].filter(Boolean).join(' ')
+  return <div className="fitness-cell" title={explanation}>
+    <span className={`fitness-score fitness-score--${tone}`}>SP{fitness.score}</span>
+    <small>{fitness.stale ? '历史样本 · ' : ''}{summary}</small>
   </div>
 }
 
 function CooldownCountdown({ account }: { account: PublicAccount }) {
   const [now, setNow] = useState(() => Date.now())
-  const until = account.cooldownUntil
+  const until = accountRecoveryAt(account, now)
   useEffect(() => {
     if (until === undefined || until <= Date.now()) return
-    const timer = window.setInterval(() => setNow(Date.now()), 1_000)
+    const timer = window.setInterval(() => setNow(Date.now()), 30_000)
     return () => window.clearInterval(timer)
   }, [until])
   if (until === undefined || until <= now) return null
   return <span className="row-note row-note--warning" title={`预计解冻：${new Date(until).toLocaleString()}`}>
-    {account.cooldownReason === 'quota' ? '额度' : '冷却'}距解冻 {thawCountdown(until, now)}
+    {account.cooldownReason === 'quota' || accountQuotaIsExhausted(account, now) ? '额度恢复' : '冷却恢复'} {thawCountdown(until, now)}
   </span>
 }
 import { ModelPolicyEditor } from './ModelPolicyEditor'
@@ -355,12 +454,15 @@ export function ProvidersView({
   const [exportAccountIds, setExportAccountIds] = useState<string[]>([])
   const [exportBusy, setExportBusy] = useState(false)
   const [exportNotice, setExportNotice] = useState('')
+  const [accountColumnWidths, setAccountColumnWidths] = useState<AccountColumnWidths>(loadAccountColumnWidths)
+  const resizingAccountColumn = useRef<{ id: AccountColumnId; startX: number; startWidth: number } | null>(null)
   const [hideExhaustedAccounts, setHideExhaustedAccounts] = useState(() =>
     window.localStorage.getItem(HIDE_EXHAUSTED_ACCOUNTS_STORAGE_KEY) === 'true'
   )
 
   const providerById = useMemo(() => new Map(snapshot.providers.map((provider) => [provider.id, provider])), [snapshot.providers])
   const proxyById = useMemo(() => new Map(snapshot.proxies.map((proxy) => [proxy.id, proxy])), [snapshot.proxies])
+  const accountNameById = useMemo(() => accountDisplayNames(snapshot.accounts), [snapshot.accounts])
   const quotaAccount = quotaAccountId ? snapshot.accounts.find((account) => account.id === quotaAccountId) ?? null : null
   const editingAccount = accountDraft.id ? snapshot.accounts.find((account) => account.id === accountDraft.id) : undefined
   const accountModelsBusy = Boolean(accountDraft.id && busyKeys.has(`refresh-account-models-${accountDraft.id}`))
@@ -384,6 +486,73 @@ export function ProvidersView({
     : accountDraft.credential?.trim()
       ? '凭据有未保存的更改，请先保存账号。'
       : undefined
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(ACCOUNT_COLUMN_STORAGE_KEY, JSON.stringify(accountColumnWidths))
+    } catch {
+      // The table remains resizable if renderer storage is unavailable.
+    }
+  }, [accountColumnWidths])
+
+  useEffect(() => {
+    const move = (event: MouseEvent) => {
+      const resize = resizingAccountColumn.current
+      if (!resize) return
+      const definition = ACCOUNT_COLUMNS.find((column) => column.id === resize.id)
+      if (!definition) return
+      const width = Math.max(definition.minimumWidth, Math.min(640, Math.round(resize.startWidth + event.clientX - resize.startX)))
+      setAccountColumnWidths((current) => current[resize.id] === width ? current : { ...current, [resize.id]: width })
+    }
+    const stop = () => {
+      resizingAccountColumn.current = null
+      document.body.classList.remove('account-column-resizing')
+    }
+    window.addEventListener('mousemove', move)
+    window.addEventListener('mouseup', stop)
+    return () => {
+      window.removeEventListener('mousemove', move)
+      window.removeEventListener('mouseup', stop)
+      document.body.classList.remove('account-column-resizing')
+    }
+  }, [])
+
+  const accountTableWidth = ACCOUNT_COLUMNS.reduce((total, column) => total + accountColumnWidths[column.id], 0)
+
+  const beginAccountColumnResize = (event: React.MouseEvent, column: AccountColumnDefinition) => {
+    event.preventDefault()
+    event.stopPropagation()
+    resizingAccountColumn.current = { id: column.id, startX: event.clientX, startWidth: accountColumnWidths[column.id] }
+    document.body.classList.add('account-column-resizing')
+  }
+
+  const resizeAccountColumnByKeyboard = (event: React.KeyboardEvent, column: AccountColumnDefinition) => {
+    if (!['ArrowLeft', 'ArrowRight', 'Home'].includes(event.key)) return
+    event.preventDefault()
+    event.stopPropagation()
+    setAccountColumnWidths((current) => ({
+      ...current,
+      [column.id]: event.key === 'Home'
+        ? column.defaultWidth
+        : Math.max(column.minimumWidth, Math.min(640, current[column.id] + (event.key === 'ArrowLeft' ? -8 : 8)))
+    }))
+  }
+
+  const accountColumnResizer = (column: AccountColumnDefinition) => column.resizable === false ? null : <span
+    aria-label={`调整${column.label}列宽`}
+    aria-orientation="vertical"
+    aria-valuemax={640}
+    aria-valuemin={column.minimumWidth}
+    aria-valuenow={accountColumnWidths[column.id]}
+    className="account-column-resizer"
+    data-account-column-resizer={column.id}
+    role="separator"
+    tabIndex={0}
+    title="拖动调整列宽；双击或按 Home 恢复默认"
+    onDoubleClick={(event) => { event.stopPropagation(); setAccountColumnWidths((current) => ({ ...current, [column.id]: column.defaultWidth })) }}
+    onKeyDown={(event) => resizeAccountColumnByKeyboard(event, column)}
+    onMouseDown={(event) => beginAccountColumnResize(event, column)}
+  />
   const persistedAccountModelState = editingAccount ? JSON.stringify({
     id: editingAccount.id,
     revision: editingAccount.modelsRefreshedAt,
@@ -724,8 +893,12 @@ export function ProvidersView({
                 </div>
               </div>
               {visibleAccounts.length ? <div className="table-wrap">
-              <table className="data-table accounts-table">
-                <thead><tr><th className="account-select-column"><input type="checkbox" aria-label="选择当前显示的全部账号" checked={visibleAccounts.length > 0 && visibleAccounts.every((account) => selectedAccountIds.includes(account.id))} onChange={(event) => toggleVisibleAccounts(event.target.checked)} /></th><th>账号</th><th>状态</th><th>体质</th><th>凭据</th><th>并发</th><th>额度</th><th>延迟</th><th>最近使用</th><th aria-label="操作" /></tr></thead>
+              <table className="data-table accounts-table" style={{ width: accountTableWidth, minWidth: '100%' }}>
+                <colgroup>{ACCOUNT_COLUMNS.map((column) => <col key={column.id} style={{ width: accountColumnWidths[column.id] }} />)}</colgroup>
+                <thead><tr>
+                  <th className="account-select-column account-column-header"><input type="checkbox" aria-label="选择当前显示的全部账号" checked={visibleAccounts.length > 0 && visibleAccounts.every((account) => selectedAccountIds.includes(account.id))} onChange={(event) => toggleVisibleAccounts(event.target.checked)} /></th>
+                  {ACCOUNT_COLUMNS.slice(1).map((column) => <th className="account-column-header" key={column.id} aria-label={column.id === 'actions' ? column.label : undefined}>{column.id === 'actions' ? null : column.label}{accountColumnResizer(column)}</th>)}
+                </tr></thead>
                 <tbody>
                   {visibleAccounts.map((account) => {
                     const provider = providerById.get(account.providerId)
@@ -740,7 +913,7 @@ export function ProvidersView({
                     return (
                       <tr key={account.id}>
                         <td className="account-select-column"><input type="checkbox" aria-label={`选择账号 ${account.name}`} checked={selectedAccountIds.includes(account.id)} onChange={() => toggleSelectedAccount(account.id)} /></td>
-                        <td><div className="provider-cell"><span className="provider-avatar" style={{ '--provider-color': provider?.color ?? '#61736f' } as React.CSSProperties}>{provider?.name.slice(0, 1) ?? '?'}</span><div><strong>{account.name}</strong><span>{provider?.name ?? '供应商已删除'}{account.proxyId ? ` · ${proxyById.get(account.proxyId)?.name ?? '代理已删除'}` : ''} · {modelSummary}</span></div></div></td>
+                        <td><div className="provider-cell"><span className="provider-avatar" style={{ '--provider-color': provider?.color ?? '#61736f' } as React.CSSProperties}>{provider?.name.slice(0, 1) ?? '?'}</span><div><strong title={account.name}>{accountNameById.get(account.id) ?? account.name}</strong><span>{provider?.name ?? '供应商已删除'}{account.proxyId ? ` · ${proxyById.get(account.proxyId)?.name ?? '代理已删除'}` : ''} · {modelSummary}</span></div></div></td>
                         <td><AccountStatusBadge status={account.status} circuitState={account.circuitState} /><CooldownCountdown account={account} />{account.credentialType === 'chatgpt-oauth' && <span className="row-note">ChatGPT OAuth · {account.renewable ? '可续期' : '会话到期即停用'}</span>}{Boolean(account.consecutiveFailures) && <span className="row-note">连续失败 {account.consecutiveFailures}</span>}{account.lastError && <span className="row-note row-note--danger" title={account.lastError}>{account.lastError}</span>}</td>
                         <td><AccountFitness fitness={account.fitness} /></td>
                         <td><span className="mono masked-key">{account.maskedCredential}</span></td>
@@ -836,7 +1009,7 @@ export function ProvidersView({
             {oauthAccounts.map((account) => {
               const provider = providerById.get(account.providerId)
               const selected = exportAccountIds.includes(account.id)
-              return <label className={selected ? 'selected' : ''} key={account.id}><input type="checkbox" checked={selected} onChange={() => toggleExportAccount(account.id)} /><span className="provider-avatar" style={{ '--provider-color': provider?.color ?? '#61736f' } as React.CSSProperties}>{provider?.name.slice(0, 1) ?? '?'}</span><span><strong>{account.name}</strong><small>{provider?.name ?? '供应商已删除'} · {accountIsCooling(account) ? '冷却中' : '非冷却'} · {account.renewable ? '可续期' : 'Access Token only'}</small></span><AccountStatusBadge status={account.status} circuitState={account.circuitState} /></label>
+              return <label className={selected ? 'selected' : ''} key={account.id}><input type="checkbox" checked={selected} onChange={() => toggleExportAccount(account.id)} /><span className="provider-avatar" style={{ '--provider-color': provider?.color ?? '#61736f' } as React.CSSProperties}>{provider?.name.slice(0, 1) ?? '?'}</span><span><strong title={account.name}>{accountNameById.get(account.id) ?? account.name}</strong><small>{provider?.name ?? '供应商已删除'} · {accountIsCooling(account) ? '冷却中' : '非冷却'} · {account.renewable ? '可续期' : 'Access Token only'}</small></span><AccountStatusBadge status={account.status} circuitState={account.circuitState} /></label>
             })}
           </div>
           <FieldError>{errors.accountExport}</FieldError>
