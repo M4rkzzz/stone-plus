@@ -5,7 +5,7 @@
 ## 固定链接
 
 - GitHub 项目：https://github.com/M4rkzzz/stone-plus
-- 中文 README：https://github.com/M4rkzzz/stone-plus/blob/main/README.zh-CN.md
+- 中文 README：https://github.com/M4rkzzz/stone-plus/blob/main/README.md
 - 最新版下载：https://github.com/M4rkzzz/stone-plus/releases/latest
 - `v0.8.0` Release：https://github.com/M4rkzzz/stone-plus/releases/tag/v0.8.0
 - Issues：https://github.com/M4rkzzz/stone-plus/issues
