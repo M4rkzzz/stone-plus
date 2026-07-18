@@ -132,6 +132,7 @@
     "linux": {
       "category": "Development",
       "icon": "build/icons",
+      "executableName": "stone-plus",
       "artifactName": "StonePlus-${version}-linux-${arch}.${ext}",
       "target": [
         "AppImage",
