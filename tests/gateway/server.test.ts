@@ -924,6 +924,123 @@ describe('GatewayServer', () => {
     expect(states[0]).toMatchObject({ accountId: 'first', status: 'active' })
   })
 
+  it('records success when Codex closes after receiving complete custom-tool input', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers[0].protocol = 'openai-responses'
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    const logs: RequestLog[] = []
+    const states: Array<{ accountId: string; status: string }> = []
+    const encoder = new TextEncoder()
+    const upstreamFetch = vi.fn(async () => new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode([
+          'event: response.created',
+          'data: {"type":"response.created","response":{"id":"resp_tool","model":"source-model","status":"in_progress","output":[]}}',
+          '',
+          'event: response.output_item.added',
+          'data: {"type":"response.output_item.added","response_id":"resp_tool","output_index":0,"item":{"id":"ctc_tool","type":"custom_tool_call","call_id":"call_tool","name":"exec","input":""}}',
+          '',
+          'event: response.custom_tool_call_input.delta',
+          'data: {"type":"response.custom_tool_call_input.delta","response_id":"resp_tool","item_id":"ctc_tool","output_index":0,"delta":"Get-ChildItem"}',
+          '',
+          'event: response.custom_tool_call_input.done',
+          'data: {"type":"response.custom_tool_call_input.done","response_id":"resp_tool","item_id":"ctc_tool","output_index":0,"input":"Get-ChildItem"}',
+          '',
+          ''
+        ].join('\n')))
+        setTimeout(() => {
+          try { controller.close() } catch { /* The downstream cancellation already closed it. */ }
+        }, 50)
+      }
+    }), { status: 200, headers: { 'content-type': 'text/event-stream' } }))
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'credential',
+      fetchImplementation: upstreamFetch as typeof fetch,
+      onAccountState: (state) => states.push(state),
+      onLog: (log) => logs.push(log)
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'source-model', input: 'Use the tool', stream: true })
+    })
+    const reader = response.body?.getReader()
+    expect(reader).toBeDefined()
+    const first = await reader!.read()
+    expect(new TextDecoder().decode(first.value)).toContain('response.custom_tool_call_input.done')
+    await reader!.cancel()
+
+    await vi.waitFor(() => expect(logs).toHaveLength(1))
+    expect(logs[0]).toMatchObject({ status: 'success', statusCode: 200 })
+    expect(states).toHaveLength(1)
+    expect(states[0]).toMatchObject({ accountId: 'first', status: 'active' })
+  })
+
+  it('records success when Codex closes after receiving a completed assistant message item', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers[0].protocol = 'openai-responses'
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    const logs: RequestLog[] = []
+    const states: Array<{ accountId: string; status: string }> = []
+    const encoder = new TextEncoder()
+    const upstreamFetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode([
+          'event: response.created',
+          'data: {"type":"response.created","response":{"id":"resp_message","model":"source-model","status":"in_progress","output":[]}}',
+          '',
+          'event: response.output_item.added',
+          'data: {"type":"response.output_item.added","response_id":"resp_message","output_index":0,"item":{"id":"msg_done","type":"message","role":"assistant","status":"in_progress","content":[]}}',
+          '',
+          'event: response.output_text.delta',
+          'data: {"type":"response.output_text.delta","response_id":"resp_message","item_id":"msg_done","output_index":0,"content_index":0,"delta":"Completed"}',
+          '',
+          'event: response.output_item.done',
+          'data: {"type":"response.output_item.done","response_id":"resp_message","output_index":0,"item":{"id":"msg_done","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Completed"}]}}',
+          '',
+          ''
+        ].join('\n')))
+        const signal = init?.signal
+        signal?.addEventListener('abort', () => {
+          try { controller.error(signal.reason) } catch { /* The downstream cancellation already closed it. */ }
+        }, { once: true })
+      }
+    }), { status: 200, headers: { 'content-type': 'text/event-stream' } }))
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'credential',
+      fetchImplementation: upstreamFetch as typeof fetch,
+      onAccountState: (state) => states.push(state),
+      onLog: (log) => logs.push(log)
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'source-model', input: 'Reply', stream: true })
+    })
+    const reader = response.body?.getReader()
+    expect(reader).toBeDefined()
+    const first = await reader!.read()
+    expect(new TextDecoder().decode(first.value)).toContain('response.output_item.done')
+    await reader!.cancel()
+
+    await vi.waitFor(() => expect(logs).toHaveLength(1))
+    expect(logs[0]).toMatchObject({ status: 'success', statusCode: 200 })
+    expect(states).toHaveLength(1)
+    expect(states[0]).toMatchObject({ accountId: 'first', status: 'active' })
+  })
+
   it('records time to first token and the client-provided conversation identity', async () => {
     const port = await freePort()
     let clock = timestamp

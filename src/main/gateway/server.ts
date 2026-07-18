@@ -848,6 +848,13 @@ async function pipeUpstreamResponse(
   const usage: NonNullable<StreamPipeResult['usage']> = {}
   let streamError: string | undefined
   let terminalObserved = false
+  let completedToolCallObserved = false
+  let completedMessageObserved = false
+  const pendingToolCalls = new Set<number>()
+  const logicalCompletionObserved = (): boolean => (
+    terminalObserved
+    || ((completedMessageObserved || completedToolCallObserved) && pendingToolCalls.size === 0)
+  )
   let observationFailed = false
   const observe = (events: CanonicalStreamEvent[], acceptTerminal: boolean): void => {
     for (const event of events) {
@@ -857,7 +864,16 @@ async function pipeUpstreamResponse(
         if (event.totalTokens !== undefined) usage.total_tokens = event.totalTokens
       } else if (event.type === 'error') {
         streamError = redactSensitiveText(event.message, secrets)
-      } else if (acceptTerminal && event.type === 'done') {
+      } else if (event.type === 'tool-call-delta') {
+        pendingToolCalls.add(event.index)
+      } else if (acceptTerminal && event.type === 'tool-call-complete') {
+        completedToolCallObserved = true
+        pendingToolCalls.delete(event.index)
+      } else if (acceptTerminal && event.type === 'message-complete') {
+        completedMessageObserved = true
+      } else if (acceptTerminal && (
+        event.type === 'done' || (event.type === 'stop' && event.reason === 'tool_calls')
+      )) {
         terminalObserved = true
       }
     }
@@ -872,7 +888,7 @@ async function pipeUpstreamResponse(
     }
   }
   const cancelOnClose = (): void => {
-    void reader.cancel()
+    void reader.cancel().catch(() => undefined)
   }
   response.once('close', cancelOnClose)
   try {
@@ -883,21 +899,29 @@ async function pipeUpstreamResponse(
       observeSafely(() => parser.push(value))
       if (response.destroyed) {
         await reader.cancel()
-        return streamPipeResult(terminalObserved, usage, streamError)
+        return streamPipeResult(logicalCompletionObserved(), usage, streamError)
       }
       for (const chunk of redactor.push(value)) {
         if (!response.write(chunk)) await waitForDrain(response)
       }
     }
+    if (response.destroyed && logicalCompletionObserved()) {
+      return streamPipeResult(true, usage, streamError)
+    }
     for (const chunk of redactor.finish()) {
       if (!response.write(chunk)) await waitForDrain(response)
     }
     observeSafely(() => parser.finish(), false)
+  } catch (error) {
+    if (response.destroyed && logicalCompletionObserved()) {
+      return streamPipeResult(true, usage, streamError)
+    }
+    throw error
   } finally {
     response.off('close', cancelOnClose)
     if (!response.writableEnded && !response.destroyed) response.end()
   }
-  return streamPipeResult(terminalObserved || !response.destroyed, usage, streamError)
+  return streamPipeResult(logicalCompletionObserved() || !response.destroyed, usage, streamError)
 }
 
 async function pipeConvertedUpstreamResponse(
@@ -929,8 +953,15 @@ async function pipeConvertedUpstreamResponse(
   const usage: NonNullable<StreamPipeResult['usage']> = {}
   let streamError: string | undefined
   let terminalObserved = false
+  let completedToolCallObserved = false
+  let completedMessageObserved = false
+  const pendingToolCalls = new Set<number>()
+  const logicalCompletionObserved = (): boolean => (
+    terminalObserved
+    || ((completedMessageObserved || completedToolCallObserved) && pendingToolCalls.size === 0)
+  )
   const cancelOnClose = (): void => {
-    void reader.cancel()
+    void reader.cancel().catch(() => undefined)
   }
   const forward = async (events: CanonicalStreamEvent[], acceptTerminal = true): Promise<boolean> => {
     for (const event of events) {
@@ -948,7 +979,16 @@ async function pipeConvertedUpstreamResponse(
         if (safeEvent.totalTokens !== undefined) usage.total_tokens = safeEvent.totalTokens
       } else if (safeEvent.type === 'error') {
         streamError = safeEvent.message
-      } else if (acceptTerminal && safeEvent.type === 'done') {
+      } else if (safeEvent.type === 'tool-call-delta') {
+        pendingToolCalls.add(safeEvent.index)
+      } else if (acceptTerminal && safeEvent.type === 'tool-call-complete') {
+        completedToolCallObserved = true
+        pendingToolCalls.delete(safeEvent.index)
+      } else if (acceptTerminal && safeEvent.type === 'message-complete') {
+        completedMessageObserved = true
+      } else if (acceptTerminal && (
+        safeEvent.type === 'done' || (safeEvent.type === 'stop' && safeEvent.reason === 'tool_calls')
+      )) {
         terminalObserved = true
       }
       if (!await writeStreamChunks(response, encoder.encode(safeEvent))) return false
@@ -964,13 +1004,18 @@ async function pipeConvertedUpstreamResponse(
       if (value.byteLength > 0) onFirstToken?.()
       if (!await forward(parser.push(value))) {
         await reader.cancel()
-        return streamPipeResult(terminalObserved, usage, streamError)
+        return streamPipeResult(logicalCompletionObserved(), usage, streamError)
       }
     }
-    if (!await forward(parser.finish(), false)) return streamPipeResult(terminalObserved, usage, streamError)
-    if (!await writeStreamChunks(response, encoder.finish())) return streamPipeResult(terminalObserved, usage, streamError)
+    if (response.destroyed && logicalCompletionObserved()) {
+      return streamPipeResult(true, usage, streamError)
+    }
+    if (!await forward(parser.finish(), false)) return streamPipeResult(logicalCompletionObserved(), usage, streamError)
+    if (!await writeStreamChunks(response, encoder.finish())) return streamPipeResult(logicalCompletionObserved(), usage, streamError)
   } catch (error) {
-    if (response.destroyed) return { completed: false }
+    if (response.destroyed) {
+      return streamPipeResult(logicalCompletionObserved(), usage, streamError)
+    }
     streamError = error instanceof Error ? error.message : 'Upstream stream failed'
     await forward([
       { type: 'error', message: streamError, errorType: 'upstream_stream_error' },
@@ -982,7 +1027,7 @@ async function pipeConvertedUpstreamResponse(
     if (!response.writableEnded && !response.destroyed) response.end()
   }
 
-  return streamPipeResult(terminalObserved || !response.destroyed, usage, streamError)
+  return streamPipeResult(logicalCompletionObserved() || !response.destroyed, usage, streamError)
 }
 
 function streamPipeResult(

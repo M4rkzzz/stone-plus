@@ -85,6 +85,68 @@ describe('canonical streaming protocol conversion', () => {
     })
   })
 
+  it('marks completed Responses function-call arguments before response.completed', () => {
+    const parser = createCanonicalStreamParser('openai-responses')
+    const events = parser.push(encoder.encode([
+      'event: response.output_item.added',
+      'data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_health","name":"check_health","arguments":""}}',
+      '',
+      'event: response.function_call_arguments.delta',
+      'data: {"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\\"scope\\":\\"p0\\"}"}',
+      '',
+      'event: response.function_call_arguments.done',
+      'data: {"type":"response.function_call_arguments.done","output_index":0,"arguments":"{\\"scope\\":\\"p0\\"}"}',
+      '',
+      ''
+    ].join('\n')))
+
+    expect(events).toContainEqual({ type: 'tool-call-complete', index: 0 })
+    expect(events).not.toContainEqual(expect.objectContaining({ type: 'done' }))
+  })
+
+  it('normalizes completed Responses custom-tool input before response.completed', () => {
+    const parser = createCanonicalStreamParser('openai-responses')
+    const events = parser.push(encoder.encode([
+      'event: response.output_item.added',
+      'data: {"type":"response.output_item.added","output_index":0,"item":{"type":"custom_tool_call","call_id":"call_exec","name":"exec","input":""}}',
+      '',
+      'event: response.custom_tool_call_input.delta',
+      'data: {"type":"response.custom_tool_call_input.delta","output_index":0,"delta":"Get-ChildItem"}',
+      '',
+      'event: response.custom_tool_call_input.done',
+      'data: {"type":"response.custom_tool_call_input.done","output_index":0,"input":"Get-ChildItem"}',
+      '',
+      ''
+    ].join('\n')))
+
+    expect(events).toContainEqual(expect.objectContaining({
+      type: 'tool-call-delta',
+      index: 0,
+      name: 'exec'
+    }))
+    expect(events).toContainEqual({ type: 'tool-call-complete', index: 0 })
+    expect(events).not.toContainEqual(expect.objectContaining({ type: 'done' }))
+  })
+
+  it('marks a completed Responses assistant message before response.completed', () => {
+    const parser = createCanonicalStreamParser('openai-responses')
+    const events = parser.push(encoder.encode([
+      'event: response.output_item.added',
+      'data: {"type":"response.output_item.added","output_index":1,"item":{"id":"msg_health","type":"message","role":"assistant","status":"in_progress","content":[]}}',
+      '',
+      'event: response.output_text.delta',
+      'data: {"type":"response.output_text.delta","output_index":1,"content_index":0,"delta":"Done"}',
+      '',
+      'event: response.output_item.done',
+      'data: {"type":"response.output_item.done","output_index":1,"item":{"id":"msg_health","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Done"}]}}',
+      '',
+      ''
+    ].join('\n')))
+
+    expect(events).toContainEqual({ type: 'message-complete', index: 1 })
+    expect(events).not.toContainEqual(expect.objectContaining({ type: 'done' }))
+  })
+
   it('rejects a Responses stream without a terminal response', () => {
     const collector = createOpenAiResponsesStreamCollector()
     collector.push(encoder.encode('data: {"type":"response.output_text.delta","delta":"partial"}\n\n'))

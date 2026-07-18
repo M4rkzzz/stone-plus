@@ -18,6 +18,10 @@ export type CanonicalStreamEvent =
   | { type: 'start'; id?: string; model?: string; createdAt?: number }
   | { type: 'text-delta'; text: string }
   | { type: 'tool-call-delta'; index: number; id?: string; name?: string; arguments?: string }
+  /** Lifecycle signal used to distinguish a consumable tool call from a partial client abort. */
+  | { type: 'tool-call-complete'; index: number }
+  /** Lifecycle signal emitted when a Responses assistant message output item is complete. */
+  | { type: 'message-complete'; index: number }
   | { type: 'usage'; inputTokens?: number; outputTokens?: number; totalTokens?: number }
   | { type: 'stop'; reason: CanonicalStopReason; rawReason?: string }
   | { type: 'error'; message: string; code?: string; errorType?: string }
@@ -365,6 +369,7 @@ class ProtocolParser implements CanonicalStreamParser {
   private readonly responsesToolIndices = new Map<number, number>()
   private readonly responsesToolMetadataSeen = new Set<number>()
   private readonly responsesArgumentsSeen = new Set<number>()
+  private readonly responsesToolCompleted = new Set<number>()
   private readonly geminiToolIndices = new Map<string, number>()
   private lastUsage = ''
   private usageInputTokens: number | undefined
@@ -508,10 +513,13 @@ class ProtocolParser implements CanonicalStreamParser {
     }
     if (type === 'response.output_item.added') {
       const item = objectValue(payload.item) ?? {}
-      if (stringValue(item.type) === 'function_call') {
+      const itemType = stringValue(item.type)
+      if (itemType === 'function_call' || itemType === 'custom_tool_call') {
         const outputIndex = numberValue(payload.output_index) ?? 0
         const index = this.responseToolIndex(outputIndex)
-        const args = optionalString(item.arguments)
+        const args = itemType === 'custom_tool_call'
+          ? optionalString(item.input)
+          : optionalString(item.arguments)
         this.responsesToolMetadataSeen.add(outputIndex)
         if (args) this.responsesArgumentsSeen.add(outputIndex)
         this.sawToolCall = true
@@ -538,26 +546,68 @@ class ProtocolParser implements CanonicalStreamParser {
       }))
       return
     }
+    if (type === 'response.custom_tool_call_input.delta') {
+      const outputIndex = numberValue(payload.output_index) ?? 0
+      const index = this.responseToolIndex(outputIndex)
+      const input = optionalString(payload.delta)
+      if (input) this.responsesArgumentsSeen.add(outputIndex)
+      this.sawToolCall = true
+      this.events.push(omitUndefinedEvent({
+        type: 'tool-call-delta',
+        index,
+        arguments: input
+      }))
+      return
+    }
     if (type === 'response.function_call_arguments.done') {
       const outputIndex = numberValue(payload.output_index) ?? 0
+      const index = this.responseToolIndex(outputIndex)
       const args = optionalString(payload.arguments)
       if (args && !this.responsesArgumentsSeen.has(outputIndex)) {
         this.responsesArgumentsSeen.add(outputIndex)
         this.events.push({
           type: 'tool-call-delta',
-          index: this.responseToolIndex(outputIndex),
+          index,
           arguments: args
         })
+      }
+      if (!this.responsesToolCompleted.has(outputIndex)) {
+        this.responsesToolCompleted.add(outputIndex)
+        this.events.push({ type: 'tool-call-complete', index })
+      }
+      return
+    }
+    if (type === 'response.custom_tool_call_input.done') {
+      const outputIndex = numberValue(payload.output_index) ?? 0
+      const index = this.responseToolIndex(outputIndex)
+      const input = optionalString(payload.input)
+      if (input && !this.responsesArgumentsSeen.has(outputIndex)) {
+        this.responsesArgumentsSeen.add(outputIndex)
+        this.events.push({ type: 'tool-call-delta', index, arguments: input })
+      }
+      if (!this.responsesToolCompleted.has(outputIndex)) {
+        this.responsesToolCompleted.add(outputIndex)
+        this.events.push({ type: 'tool-call-complete', index })
       }
       return
     }
     if (type === 'response.output_item.done') {
       const outputIndex = numberValue(payload.output_index) ?? 0
       const item = objectValue(payload.item) ?? {}
-      if (stringValue(item.type) !== 'function_call') return
+      if (stringValue(item.type) === 'message') {
+        const status = optionalString(item.status)
+        if (!status || status === 'completed') {
+          this.events.push({ type: 'message-complete', index: outputIndex })
+        }
+        return
+      }
+      const itemType = stringValue(item.type)
+      if (itemType !== 'function_call' && itemType !== 'custom_tool_call') return
       const index = this.responseToolIndex(outputIndex)
       const includeMetadata = !this.responsesToolMetadataSeen.has(outputIndex)
-      const args = optionalString(item.arguments)
+      const args = itemType === 'custom_tool_call'
+        ? optionalString(item.input)
+        : optionalString(item.arguments)
       const includeArguments = Boolean(args) && !this.responsesArgumentsSeen.has(outputIndex)
       if (includeMetadata || includeArguments) {
         this.sawToolCall = true
@@ -571,6 +621,10 @@ class ProtocolParser implements CanonicalStreamParser {
       }
       this.responsesToolMetadataSeen.add(outputIndex)
       if (includeArguments) this.responsesArgumentsSeen.add(outputIndex)
+      if (!this.responsesToolCompleted.has(outputIndex)) {
+        this.responsesToolCompleted.add(outputIndex)
+        this.events.push({ type: 'tool-call-complete', index })
+      }
       return
     }
     if (type === 'response.completed' || type === 'response.incomplete') {
