@@ -23,6 +23,8 @@ await writeFile(outputPath, svg, 'utf8')
 console.log(`Wrote ${outputPath} with ${data.stars.length} stars.`)
 
 async function fetchStarHistory(repo, token) {
+  if (token) return fetchStarHistoryGraphql(repo, token)
+
   const headers = {
     Accept: 'application/vnd.github+json',
     'User-Agent': 'Stone-star-history-generator',
@@ -48,6 +50,54 @@ async function fetchStarHistory(repo, token) {
   }
 
   return { createdAt: metadata.created_at, stars }
+}
+
+async function fetchStarHistoryGraphql(repo, token) {
+  const [owner, name] = repo.split('/')
+  const stars = []
+  let createdAt
+  let cursor = null
+
+  for (;;) {
+    const response = await fetch('https://api.github.com/graphql', {
+      method: 'POST',
+      headers: {
+        Accept: 'application/vnd.github+json',
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+        'User-Agent': 'Stone-star-history-generator',
+        'X-GitHub-Api-Version': '2022-11-28',
+      },
+      body: JSON.stringify({
+        query: `
+          query StarHistory($owner: String!, $name: String!, $cursor: String) {
+            repository(owner: $owner, name: $name) {
+              createdAt
+              stargazers(first: ${PAGE_SIZE}, after: $cursor, orderBy: { field: STARRED_AT, direction: ASC }) {
+                edges { starredAt }
+                pageInfo { hasNextPage endCursor }
+              }
+            }
+          }
+        `,
+        variables: { owner, name, cursor },
+      }),
+    })
+    if (!response.ok) throw new Error(`GitHub GraphQL request failed with status ${response.status}.`)
+    const payload = await response.json()
+    if (payload.errors?.length) throw new Error(`GitHub GraphQL request failed: ${payload.errors[0].message}`)
+    const repositoryData = payload.data?.repository
+    if (!repositoryData) throw new Error(`GitHub repository ${repo} was not found.`)
+    createdAt ??= repositoryData.createdAt
+    for (const edge of repositoryData.stargazers.edges ?? []) {
+      if (typeof edge?.starredAt !== 'string') throw new Error('GitHub did not return a stargazer timestamp.')
+      stars.push(edge.starredAt)
+    }
+    if (!repositoryData.stargazers.pageInfo.hasNextPage) break
+    cursor = repositoryData.stargazers.pageInfo.endCursor
+  }
+
+  return { createdAt, stars }
 }
 
 async function githubJson(path, headers) {
