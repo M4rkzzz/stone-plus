@@ -4,6 +4,7 @@ import {
   ArrowLeft,
   ArrowRight,
   CheckCircle2,
+  ChevronDown,
   CircleAlert,
   Clock3,
   Cloud,
@@ -746,14 +747,15 @@ export function SetupWizardView({
             <PrimaryAction disabled={!aggregatePoolId} busy={false} onClick={() => void selectAggregate()} label="使用此聚合" />
           </WizardSection>}
 
-          {currentStep === 'source-config' && sourceMode === 'oauth-import' && <WizardSection icon={<ShieldCheck />} title="添加 Codex 账号" description="OAuth 与兼容导入共享 Tag、号池和出口设置；Tag 即账号归类，不另建备注字段。">
+          {currentStep === 'source-config' && sourceMode === 'oauth-import' && <WizardSection icon={<ShieldCheck />} title="添加 Codex 账号" description="先完成 OAuth 授权或选择 JSON 文件；账号归类与网络设置可在下方按需展开。">
             <div className="setup-account-method-tabs" role="tablist" aria-label="Codex 账号添加方式">
               <button type="button" role="tab" aria-selected={accountAddMethod === 'oauth'} className={accountAddMethod === 'oauth' ? 'active' : ''} disabled={importConfigurationLocked} onClick={() => void switchAccountAddMethod('oauth')}><ShieldCheck size={18} /><span><strong>OAuth 授权</strong><small>系统浏览器登录，推荐</small></span></button>
               <button type="button" role="tab" aria-selected={accountAddMethod === 'token-json'} className={accountAddMethod === 'token-json' ? 'active' : ''} disabled={importConfigurationLocked} onClick={() => void switchAccountAddMethod('token-json')}><Files size={18} /><span><strong>Token / JSON</strong><small>Sub2API / CPA 兼容导入</small></span></button>
             </div>
 
-            <div className="setup-account-shared">
-              <div className="setup-account-shared__heading"><div><strong>账号归类与网络</strong><span>截图中的“备注”已适配为 Stone+ Tag，授权和导入使用相同设置。</span></div>{importConfigurationLocked && <Badge tone="info">授权期间已锁定</Badge>}</div>
+            <details className="setup-account-shared">
+              <summary><div><strong>账号归类与网络（可选）</strong><span>截图中的“备注”已适配为 Stone+ Tag，授权和导入使用相同设置。</span></div><span className="setup-account-shared__summary-side">{importConfigurationLocked && <Badge tone="info">授权期间已锁定</Badge>}<ChevronDown size={17} /></span></summary>
+              <div className="setup-account-shared__body">
               <div className="setup-form-grid">
                 <label><span><Tag size={13} />账号 Tag（代替备注）</span><select value={tagId ?? ''} disabled={importConfigurationLocked} onChange={(event) => { const value = event.target.value || null; setTagId(value); void move('source-config', { sourceMethod: accountAddMethod, tagId: value }) }}><option value="">未标记</option>{snapshot.accountTags.map((tag) => <option value={tag.id} key={tag.id}>{tag.name}</option>)}</select><small>同一账号仅使用一个 Tag；未标记会清空重复账号原 Tag。</small></label>
                 <label><span>导入后加入号池（可选）</span><select value={poolId ?? ''} disabled={importConfigurationLocked} onChange={(event) => { const value = event.target.value || null; setPoolId(value); void move('source-config', { sourceMethod: accountAddMethod, poolId: value }) }}><option value="">不加入号池</option>{compatiblePools.map((pool) => <option value={pool.id} key={pool.id}>{pool.name} · {pool.members.length} 个成员 · {pool.strategy}</option>)}</select><small>仅列出普通 OpenAI Responses 号池；只加入检测成功账号。</small></label>
@@ -761,7 +763,8 @@ export function SetupWizardView({
                 <label><span>{accountAddMethod === 'oauth' ? 'Token 交换与后续检测出口' : '出口代理'}</span><select value={proxyId} disabled={importConfigurationLocked} onChange={(event) => { const value = event.target.value; setProxyId(value); void move('source-config', { sourceMethod: accountAddMethod, proxyId: value || null }) }}><option value="">Stone 直连 / 全局出口设置</option>{snapshot.proxies.map((proxy) => <option value={proxy.id} key={proxy.id}>{proxy.name} · {proxy.protocol.toUpperCase()}</option>)}</select><small>{accountAddMethod === 'oauth' ? '系统浏览器使用自身网络；此选择只用于 Token 交换、检测和后续上游请求。' : '所选出口用于导入后的账号检测和后续上游请求。'}</small></label>
                 <label><span>账号名称（可选）</span><input value={accountName} disabled={importConfigurationLocked} onChange={(event) => setAccountName(event.target.value)} placeholder="留空则使用账号邮箱" /></label>
               </div>
-            </div>
+              </div>
+            </details>
 
             {accountAddMethod === 'oauth' ? <section className="setup-oauth-flow" role="tabpanel" aria-label="OAuth 授权添加账号">
               {(oauthStage === 'idle' || oauthStage === 'starting') && <div className="setup-oauth-intro"><span><ShieldCheck size={24} /></span><div><h3>{oauthStage === 'starting' ? '正在创建安全授权会话' : '使用 OpenAI OAuth 添加 Codex 账号'}</h3><p>{oauthStage === 'starting' ? '正在准备 PKCE 授权链接和本机回调监听…' : 'Stone+ 会在系统浏览器打开 OpenAI 登录页；授权成功后自动保存、检测，并进入网络出口步骤。'}</p></div>{oauthStage === 'starting' ? <LoaderCircle size={20} className="spin" /> : <button className="button button--primary" type="button" onClick={() => void startWizardOAuth()}><ShieldCheck size={16} />开始 OAuth 授权</button>}</div>}
@@ -779,7 +782,7 @@ export function SetupWizardView({
               {oauthStage === 'success' && <div className="setup-oauth-result setup-oauth-result--success"><CheckCircle2 size={24} /><div><h3>Codex 账号已保存</h3><p>账号、Tag 与号池设置已完成，正在进入网络出口检查。</p></div></div>}
               {oauthStage === 'cancelled' && <div className="setup-oauth-result"><XCircle size={24} /><div><h3>本次授权已取消</h3><p>未保存回调或新账号，可以重新授权或返回上一步。</p></div><button className="button button--secondary" type="button" onClick={() => void startWizardOAuth()}><RefreshCw size={15} />重新授权</button></div>}
             </section> : <section className="setup-token-import" role="tabpanel" aria-label="Token 或 JSON 导入账号">
-              <div className="setup-token-import__heading"><Files size={20} /><div><strong>导入 Sub2API / CPA</strong><span>支持多文件、JSON、逐行 JSON 和 Access Token；完成后立即检测并进入网络出口步骤。</span></div><button className="button button--secondary" disabled={Boolean(busy)} type="button" onClick={() => void importTokenJson(true)}><FileJson2 size={16} />选择多个 JSON</button></div>
+              <div className="setup-token-import__heading"><Files size={20} /><div><strong>导入 Sub2API / CPA</strong><span>支持多文件、JSON、逐行 JSON 和 Access Token；完成后立即检测并进入网络出口步骤。</span></div><button className="button button--primary" disabled={Boolean(busy)} type="button" onClick={() => void importTokenJson(true)}><FileJson2 size={16} />选择多个 JSON</button></div>
               <label className="setup-field"><span>粘贴 JSON / Token</span><textarea className="mono" rows={9} value={importContent} onChange={(event) => setImportContent(event.target.value)} placeholder="粘贴 CPA 对象、Sub2API 导出、数组、逐行 JSON 或 Access Token" /></label>
               <PrimaryAction disabled={!importContent.trim()} busy={busy === 'import'} onClick={() => void importTokenJson(false)} label="导入并检测" />
             </section>}

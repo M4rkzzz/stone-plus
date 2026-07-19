@@ -3,6 +3,7 @@ import {
   Boxes,
   CircleAlert,
   CheckCircle2,
+  ChevronDown,
   Clock3,
   Copy,
   Download,
@@ -1569,7 +1570,7 @@ export function ProvidersView({
       <Modal
         open={chatGptImportOpen}
         title="添加 Codex 账号"
-        description="通过 OpenAI OAuth 授权，或导入 Sub2API / CPA Token 与 JSON；两种方式共享 Tag、号池和出口设置。"
+        description="先完成 OAuth 授权或选择 JSON 文件；Tag、号池和出口代理可在下方按需设置。"
         onClose={() => void closeChatGptAccountDialog()}
         width="large"
         closable={!fileImportBusy && oauthStage !== 'cancelling' && !oauthCommitLocked}
@@ -1579,7 +1580,7 @@ export function ProvidersView({
             ? <><button className="button button--secondary" type="button" disabled={oauthStage === 'cancelling' || oauthCommitLocked} onClick={() => void cancelChatGptOAuth()}>{oauthStage === 'cancelling' || oauthCommitLocked ? <LoaderCircle size={16} className="spin" /> : <XCircle size={16} />}{oauthCommitLocked ? '正在保存（不可取消）' : oauthStage === 'cancelling' ? '正在取消…' : '取消授权'}</button>{oauthStage === 'waiting' ? <button className="button button--primary" type="button" disabled={oauthOpenBusy || !oauthSession} onClick={() => void openOAuthInSystemBrowser()}>{oauthOpenBusy ? <LoaderCircle size={16} className="spin" /> : <ExternalLink size={16} />}{oauthOpenBusy ? '正在打开…' : '打开系统浏览器'}</button> : <button className="button button--primary" type="button" disabled><LoaderCircle size={16} className="spin" />{oauthStage === 'starting' ? '正在创建授权…' : '正在完成授权…'}</button>}</>
             : oauthStage === 'success'
               ? <><button className="button button--secondary" type="button" onClick={() => { clearOAuthUi(); setChatGptImport((current) => ({ ...current, name: '' })) }}><Plus size={16} />继续添加</button><button className="button button--primary" type="button" onClick={() => void closeChatGptAccountDialog()}><CheckCircle2 size={16} />完成</button></>
-              : <><button className="button button--secondary" type="button" onClick={() => void closeChatGptAccountDialog()}>关闭</button><button className="button button--primary" type="button" onClick={() => void startChatGptOAuth()}><ShieldCheck size={16} />{oauthStage === 'error' || oauthStage === 'cancelled' ? '重试授权' : '开始 OAuth 授权'}</button></>}
+              : <button className="button button--secondary" type="button" onClick={() => void closeChatGptAccountDialog()}>关闭</button>}
       >
         <form id="chatgpt-account-import" className="form-grid" onSubmit={(event) => void submitChatGptImport(event)}>
           <div className="account-add-method-tabs field--full" role="tablist" aria-label="Codex 账号添加方式">
@@ -1595,7 +1596,9 @@ export function ProvidersView({
             </button>
           </div>
 
-          <div className="account-add-shared-heading field--full"><div><strong>账号归类与网络</strong><span>以下设置同时应用于 OAuth 授权和 Token / JSON 导入</span></div>{importConfigurationLocked && <Badge tone="info">授权期间已锁定</Badge>}</div>
+          <details className="account-import-options field--full">
+            <summary><div><strong>账号归类与网络（可选）</strong><span>以下设置同时应用于 OAuth 授权和 Token / JSON 导入</span></div><span className="account-import-options__summary-side">{importConfigurationLocked && <Badge tone="info">授权期间已锁定</Badge>}<ChevronDown size={16} /></span></summary>
+            <div className="account-import-options__body">
           <div className="field field--full">
             <span>本批次 Tag</span>
             <div className="tag-choice-grid" role="radiogroup" aria-label="本批次 Tag">
@@ -1642,12 +1645,14 @@ export function ProvidersView({
                   : '本批次所有账号统一使用所选代理；导入后的状态刷新与模型查询也通过该代理。'}</small>
           </label>
           <label className="field field--full"><span>账号名称（可选）</span><input value={chatGptImport.name} disabled={importConfigurationLocked} onChange={(event) => setChatGptImport({ ...chatGptImport, name: event.target.value })} placeholder="留空则使用账号邮箱" /></label>
+            </div>
+          </details>
 
           {accountAddMethod === 'oauth' ? <section className="oauth-account-flow field--full" role="tabpanel" aria-label="OAuth 授权添加账号">
             {oauthStage === 'idle' || oauthStage === 'starting' ? <div className="oauth-account-flow__intro">
               <span className="oauth-account-flow__hero"><ShieldCheck size={25} /></span>
               <div><h3>{oauthStage === 'starting' ? '正在创建安全授权会话' : '使用 OpenAI OAuth 添加 Codex 账号'}</h3><p>{oauthStage === 'starting' ? '正在准备 PKCE 授权链接和本机回调监听…' : '点击开始后将在系统浏览器打开 OpenAI 登录页，授权成功后 Stone+ 会自动接收回调、保存账号并立即检测可用性。'}</p></div>
-              {oauthStage === 'starting' && <LoaderCircle className="spin" size={21} />}
+              {oauthStage === 'starting' ? <LoaderCircle className="spin" size={21} /> : <button className="button button--primary" type="button" onClick={() => void startChatGptOAuth()}><ShieldCheck size={16} />开始 OAuth 授权</button>}
             </div> : null}
 
             {(oauthStage === 'waiting' || oauthStage === 'submitting' || oauthStage === 'exchanging') && oauthSession ? <div className="oauth-account-flow__waiting">
@@ -1679,7 +1684,7 @@ export function ProvidersView({
             <div className="account-file-import">
               <span className="account-file-import__icon"><Files size={20} /></span>
               <div><strong>批量导入 CPA / Sub2API JSON</strong><span>在文件选择器中按 Ctrl 或 Shift 多选；自动补全缺失的 account_id，导入后立即刷新状态并查询可用模型。</span></div>
-              <button className="button button--secondary" type="button" disabled={fileImportBusy} onClick={() => void importChatGptFiles()}>
+              <button className="button button--primary" type="button" disabled={fileImportBusy} onClick={() => void importChatGptFiles()}>
                 {fileImportBusy ? <LoaderCircle size={16} className="spin" /> : <FolderOpen size={16} />}{fileImportBusy ? '正在导入并检测…' : '选择多个 JSON'}
               </button>
             </div>

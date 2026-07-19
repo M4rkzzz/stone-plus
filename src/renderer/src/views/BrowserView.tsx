@@ -4,6 +4,7 @@ import {
   ArrowRight,
   Archive,
   CheckCircle2,
+  ChevronDown,
   Download,
   ExternalLink,
   FileJson,
@@ -382,13 +383,15 @@ export function BrowserView({ snapshot, api }: { snapshot: AppSnapshot; api: Gat
       </div>
     </Modal>
 
-    <Modal open={importOpen} title={`导入 Sub2API / CPA（${selectedReadyIds.length}/${readyItems.length}）`} description="粘贴、文件和 Browser Queue 共用同一套 Tag、号池与出口设置。成功导入的文件会自动从挂起队列移除。" width="large" closable={!busy} onClose={() => setImportOpen(false)} footer={<>
+    <Modal open={importOpen} title={`导入 Sub2API / CPA（${selectedReadyIds.length}/${readyItems.length}）`} description="先确认要导入的 JSON 文件；Tag、号池和出口代理可在文件列表下方按需设置。" width="large" closable={!busy} onClose={() => setImportOpen(false)} footer={<>
       <span className="modal-selection-count">已选 {selectedReadyIds.length} 个，共 {formatBytes(readyItems.filter((item) => selectedReadyIds.includes(item.id)).reduce((total, item) => total + item.sizeBytes, 0))}</span>
       <button type="button" className="button button--secondary" disabled={busy} onClick={() => setImportOpen(false)}>继续下载</button>
       <button type="button" className="button button--primary" disabled={busy || !selectedReadyIds.length || (proxyMode === 'proxy' && !proxyId)} onClick={() => void importSelected()}>{busy ? <RefreshCw size={16} className="spin" /> : <Download size={16} />}{busy ? '正在导入并检测…' : '导入所选 JSON'}</button>
     </>}>
       <div className="browser-import-modal">
-        <div className="form-grid">
+        <details className="browser-import-options">
+          <summary><div><strong>账号归类与网络（可选）</strong><span>为本批次设置 Tag、目标号池与出口代理</span></div><ChevronDown size={16} /></summary>
+          <div className="form-grid browser-import-options__body">
           <label className="field"><span>本批次 Tag</span><select value={tagId ?? ''} onChange={(event) => setTagId(event.target.value || null)}><option value="">未标记（同时清空重复账号的 Tag）</option>{snapshot.accountTags.map((tag) => <option value={tag.id} key={tag.id}>{tag.name}</option>)}</select></label>
           <label className="field"><span>导入后加入号池（可选）</span><select value={poolId ?? ''} onChange={(event) => setPoolId(event.target.value || null)}><option value="">不加入号池</option>{compatiblePools.map((pool) => <option value={pool.id} key={pool.id}>{pool.name} · {pool.members.length} 个成员 · {pool.strategy}</option>)}</select></label>
           <label className="field field--full"><span>批量出口代理</span><select value={proxyValue} onChange={(event) => {
@@ -397,7 +400,8 @@ export function BrowserView({ snapshot, api }: { snapshot: AppSnapshot; api: Gat
             else if (value === '__direct__') { setProxyMode('direct'); setProxyId('') }
             else { setProxyMode('proxy'); setProxyId(value) }
           }}><option value="__preserve__">不指定 / 沿用 JSON 配置</option><option value="__direct__">直连（清除 JSON 代理）</option>{snapshot.proxies.map((proxy) => <option value={proxy.id} key={proxy.id}>{proxy.name} · {proxy.protocol.toUpperCase()} · {proxy.host}:{proxy.port}</option>)}</select><small>{proxyMode === 'proxy' ? '本批账号统一使用所选代理，导入后的状态刷新与模型查询也走该代理。' : proxyMode === 'direct' ? '本批账号全部直连，并清除 JSON 中的代理设置。' : '保留 JSON 内仍有效的 proxyId；没有有效代理时使用直连。'}</small></label>
-        </div>
+          </div>
+        </details>
         {busy && importProgress && <ImportProgress progress={importProgress} />}
         {error && <div className="client-config-message error-banner"><XCircle size={16} /><span>{error}</span></div>}
         <div className="browser-import-list">
