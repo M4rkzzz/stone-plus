@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react'
 import {
+  ArrowUpRight,
   Check,
   CheckCircle2,
   Edit3,
@@ -7,9 +8,12 @@ import {
   LoaderCircle,
   Network,
   Plus,
+  RadioTower,
   Shuffle,
   Trash2,
+  Zap,
 } from 'lucide-react'
+import { supportsFastServiceTier } from '@shared/types'
 import type { AppSnapshot, GatewayApi, ModelPolicy, Pool, PoolInput, PoolStrategy, Protocol } from '@shared/types'
 import type { ActionRunner } from '../App'
 import { buildPoolModelCoverage, effectiveAccountModels, effectivePoolModels, isAccountModelWildcard, isPoolModelWildcard, pruneModelSelection } from '../model-policy'
@@ -32,6 +36,7 @@ const strategyLabels: Record<PoolStrategy, string> = {
   priority: '优先级',
   'round-robin': '轮询',
   'weighted-random': '加权随机',
+  'weighted-round-robin': '平滑加权轮询',
 }
 
 const strategyDescriptions: Record<PoolStrategy, string> = {
@@ -40,9 +45,50 @@ const strategyDescriptions: Record<PoolStrategy, string> = {
   priority: '优先使用数值较小的账号',
   'round-robin': '按固定顺序依次分配请求',
   'weighted-random': '按照账号权重随机分配',
+  'weighted-round-robin': '按权重平滑交替分配请求',
 }
 
 const protocols: Protocol[] = ['anthropic-messages', 'openai-responses', 'openai-chat', 'gemini']
+
+function FastModeControl({
+  sourceName,
+  sourceKind,
+  enabled,
+  supported,
+  busy,
+  onToggle,
+}: {
+  sourceName: string
+  sourceKind: '号池' | '中转站'
+  enabled: boolean
+  supported: boolean
+  busy: boolean
+  onToggle: () => void
+}) {
+  const unsupportedMessage = 'FAST 服务层仅支持 OpenAI Responses 与 OpenAI Chat 协议'
+  return (
+    <div
+      className={`pool-card__fast ${enabled ? 'pool-card__fast--on' : ''} ${!supported ? 'pool-card__fast--unsupported' : ''}`}
+      title={supported ? (enabled ? '已强制所有对话使用 Fast 服务层' : '开启后强制所有对话使用 Fast 服务层') : unsupportedMessage}
+    >
+      <span className="pool-card__fast-label">
+        {busy ? <LoaderCircle aria-hidden="true" className="spin" size={13} /> : <Zap aria-hidden="true" size={13} />}
+        <strong>FAST</strong>
+      </span>
+      <button
+        className={`toggle pool-card__fast-switch ${enabled ? 'toggle--on' : ''}`}
+        type="button"
+        role="switch"
+        aria-label={`${sourceKind} ${sourceName} FAST`}
+        aria-checked={enabled}
+        aria-busy={busy}
+        disabled={!supported || busy}
+        title={supported ? undefined : unsupportedMessage}
+        onClick={onToggle}
+      ><span /></button>
+    </div>
+  )
+}
 
 type PoolDraft = Omit<PoolInput, 'modelPolicy' | 'modelAllowlist' | 'forceFastMode' | 'hedgedRequests' | 'hedgeDelayMs' | 'firstBodyTimeoutMs'> & {
   modelPolicy: ModelPolicy
@@ -56,6 +102,7 @@ type PoolDraft = Omit<PoolInput, 'modelPolicy' | 'modelAllowlist' | 'forceFastMo
 function emptyDraft(): PoolDraft {
   return {
     name: '',
+    kind: 'standard',
     protocol: 'anthropic-messages',
     strategy: 'balanced',
     accountIds: [],
@@ -88,18 +135,45 @@ export function PoolsView({
   const [errors, setErrors] = useState<Record<string, string>>({})
   const [deleteTarget, setDeleteTarget] = useState<Pool | null>(null)
   const [menuOpen, setMenuOpen] = useState<string | null>(null)
+  const [pendingFastModes, setPendingFastModes] = useState<Record<string, boolean>>({})
 
   const accountById = useMemo(() => new Map(snapshot.accounts.map((account) => [account.id, account])), [snapshot.accounts])
   const providerById = useMemo(() => new Map(snapshot.providers.map((provider) => [provider.id, provider])), [snapshot.providers])
+  const poolEligibleAccounts = useMemo(
+    () => snapshot.accounts.filter((account) => providerById.get(account.providerId)?.sourceType !== 'relay'),
+    [providerById, snapshot.accounts],
+  )
   const proxyById = useMemo(() => new Map(snapshot.proxies.map((proxy) => [proxy.id, proxy])), [snapshot.proxies])
+  const relaySources = useMemo(() => snapshot.providers.flatMap((provider) => {
+    if (provider.sourceType !== 'relay') return []
+    const accounts = snapshot.accounts.filter((account) => account.providerId === provider.id)
+    return accounts.length === 1 && accounts[0].credentialType === 'api-key' ? [{ provider, account: accounts[0] }] : []
+  }), [snapshot.accounts, snapshot.providers])
+
+  const setFastMode = async (sourceId: string, enabled: boolean) => {
+    const actionKey = `set-fast-mode:${sourceId}`
+    setPendingFastModes((current) => ({ ...current, [sourceId]: enabled }))
+    try {
+      await runAction(actionKey, () => api.setRouteSourceFastMode({ sourceId, enabled }))
+    } finally {
+      setPendingFastModes((current) => {
+        const next = { ...current }
+        delete next[sourceId]
+        return next
+      })
+    }
+  }
 
   const openPool = (pool?: Pool) => {
     setDraft(pool ? {
       id: pool.id,
       name: pool.name,
+      kind: pool.kind,
       protocol: pool.protocol,
       strategy: pool.strategy,
-      accountIds: pool.members.filter((member) => member.enabled).map((member) => member.accountId),
+      accountIds: pool.members
+        .filter((member) => member.enabled && providerById.get(accountById.get(member.accountId)?.providerId ?? '')?.sourceType !== 'relay')
+        .map((member) => member.accountId),
       modelPolicy: pool.modelPolicy,
       modelAllowlist: [...pool.modelAllowlist],
       stickySessions: pool.stickySessions,
@@ -128,7 +202,10 @@ export function PoolsView({
   }
 
   const coverageForAccounts = (accountIds: string[]) => buildPoolModelCoverage(
-    accountIds.map((accountId) => accountById.get(accountId)).filter((account) => account !== undefined),
+    accountIds.flatMap((accountId) => {
+      const account = accountById.get(accountId)
+      return account && providerById.get(account.providerId)?.sourceType !== 'relay' ? [account] : []
+    }),
     (providerId) => providerById.get(providerId)?.models ?? [],
   )
 
@@ -139,6 +216,19 @@ export function PoolsView({
       accountIds,
       modelAllowlist: pruneModelSelection(current.modelAllowlist, candidates),
     }))
+  }
+
+  const toggleTagMembers = (tagId: string) => {
+    const matchingIds = snapshot.accounts
+      .filter((account) => account.credentialType === 'chatgpt-oauth' && account.tagId === tagId)
+      .filter((account) => providerById.get(account.providerId)?.protocol === draft.protocol)
+      .map((account) => account.id)
+    if (!matchingIds.length) return
+    const selected = new Set(draft.accountIds)
+    const allSelected = matchingIds.every((id) => selected.has(id))
+    if (allSelected) matchingIds.forEach((id) => selected.delete(id))
+    else matchingIds.forEach((id) => selected.add(id))
+    updateMemberIds([...selected])
   }
 
   const draftCoverage = coverageForAccounts(draft.accountIds)
@@ -153,11 +243,11 @@ export function PoolsView({
     <div className="page-stack">
       <PageHeader
         title="号池"
-        description="组合上游账号并定义本地调度策略"
-        actions={<button className="button button--primary" type="button" onClick={() => openPool()} disabled={!snapshot.accounts.length}><Plus size={16} />新建号池</button>}
+        description="组合上游账号、查看中转来源并定义本地调度策略"
+        actions={<button className="button button--primary" type="button" onClick={() => openPool()} disabled={!poolEligibleAccounts.length}><Plus size={16} />新建号池</button>}
       />
 
-      {snapshot.pools.length ? (
+      {snapshot.pools.length || relaySources.length ? (
         <div className="pool-grid">
           {snapshot.pools.map((pool) => {
             const members = pool.members.map((member) => accountById.get(member.accountId)).filter(Boolean)
@@ -172,12 +262,23 @@ export function PoolsView({
             const inFlight = members.reduce((sum, member) => sum + (member?.inFlight ?? 0), 0)
             const capacity = members.reduce((sum, member) => sum + (member?.maxConcurrency ?? 0), 0)
             const routeCount = snapshot.routes.filter((route) => route.poolId === pool.id).length
+            const fastSupported = supportsFastServiceTier(pool.protocol)
+            const fastEnabled = fastSupported && (pendingFastModes[pool.id] ?? pool.forceFastMode ?? false)
+            const fastBusy = busyKeys.has(`set-fast-mode:${pool.id}`)
             return (
               <article className="pool-card" key={pool.id}>
                 <header className="pool-card__header">
                   <div className="pool-icon"><Network size={19} /></div>
                   <div><h2>{pool.name}</h2><span>{protocolLabels[pool.protocol]} · {wildcard ? `兼容通配（已枚举 ${openModels.length}）` : `开放 ${openModels.length} 个模型`}</span></div>
-                  <OverflowMenu open={menuOpen === pool.id} onOpenChange={(open) => setMenuOpen(open ? pool.id : null)} label="号池操作"><button type="button" onClick={() => openPool(pool)}><Edit3 size={15} />编辑</button><button className="danger" type="button" onClick={() => { setDeleteTarget(pool); setMenuOpen(null) }}><Trash2 size={15} />删除</button></OverflowMenu>
+                  <FastModeControl
+                    sourceName={pool.name}
+                    sourceKind="号池"
+                    enabled={fastEnabled}
+                    supported={fastSupported}
+                    busy={fastBusy}
+                    onToggle={() => void setFastMode(pool.id, !fastEnabled)}
+                  />
+                  <OverflowMenu open={menuOpen === pool.id} onOpenChange={(open) => setMenuOpen(open ? pool.id : null)} label="号池操作">{pool.kind === 'standard' ? <><button type="button" onClick={() => openPool(pool)}><Edit3 size={15} />编辑</button><button className="danger" type="button" onClick={() => { setDeleteTarget(pool); setMenuOpen(null) }}><Trash2 size={15} />删除</button></> : <button type="button" onClick={() => { window.location.hash = '#providers'; setMenuOpen(null) }}><Edit3 size={15} />前往中转站管理</button>}</OverflowMenu>
                 </header>
 
                 <div className="pool-card__stats">
@@ -186,7 +287,7 @@ export function PoolsView({
                   <div><span>客户端路由</span><strong>{routeCount}</strong></div>
                 </div>
 
-                <div className="pool-strategy"><Shuffle size={15} /><div><strong>{strategyLabels[pool.strategy]}</strong><span>{strategyDescriptions[pool.strategy]}</span></div></div>
+                <div className="pool-strategy"><Shuffle size={15} /><div><strong>{strategyLabels[pool.strategy]}</strong><span>{strategyDescriptions[pool.strategy]}</span></div>{pool.kind === 'relay-aggregate' && <Badge tone="info">聚合中转</Badge>}</div>
 
                 <div className="model-tags pool-card__models">
                   {openModels.slice(0, 3).map((model) => <span key={model}>{model}</span>)}
@@ -195,7 +296,7 @@ export function PoolsView({
                 </div>
 
                 <div className="pool-members">
-                  <div className="pool-members__heading"><span>账号顺序</span><div className="badge-row">{pool.forceFastMode && <Badge tone="info">Fast On</Badge>}<Badge tone={pool.stickySessions ? 'info' : 'neutral'}>{pool.stickySessions ? `${pool.stickyTtlMinutes} 分钟粘性` : '无会话粘性'}</Badge></div></div>
+                  <div className="pool-members__heading"><span>账号顺序</span><div className="badge-row"><Badge tone={pool.stickySessions ? 'info' : 'neutral'}>{pool.stickySessions ? `${pool.stickyTtlMinutes} 分钟粘性` : '无会话粘性'}</Badge></div></div>
                   {members.map((account, index) => {
                     if (!account) return null
                     const provider = providerById.get(account.providerId)
@@ -210,14 +311,65 @@ export function PoolsView({
                   })}
                 </div>
 
-                <footer className="pool-card__footer"><span>失败重试 {pool.maxRetries} 次 · {pool.proxyId ? `默认出口 ${proxyById.get(pool.proxyId)?.name ?? '代理已删除'}` : '默认直连'}</span><button type="button" className="text-button" onClick={() => openPool(pool)}>编辑配置</button></footer>
+                <footer className="pool-card__footer"><span>失败重试 {pool.maxRetries} 次 · {pool.proxyId ? `默认出口 ${proxyById.get(pool.proxyId)?.name ?? '代理已删除'}` : '默认直连'}</span>{pool.kind === 'standard' ? <button type="button" className="text-button" onClick={() => openPool(pool)}>编辑配置</button> : <button type="button" className="text-button" onClick={() => { window.location.hash = '#providers' }}>前往“账号与中转”管理</button>}</footer>
+              </article>
+            )
+          })}
+          {relaySources.map(({ provider, account }) => {
+            const openModels = effectiveAccountModels(account, provider.models)
+            const wildcard = isAccountModelWildcard(account)
+            const routeCount = snapshot.routes.filter((route) => route.poolId === provider.id).length
+            const fastSupported = supportsFastServiceTier(provider.protocol)
+            const fastEnabled = fastSupported && (pendingFastModes[provider.id] ?? provider.forceFastMode ?? false)
+            const fastBusy = busyKeys.has(`set-fast-mode:${provider.id}`)
+            return (
+              <article className="pool-card pool-card--relay-source" key={`relay-source:${provider.id}`}>
+                <header className="pool-card__header">
+                  <div className="pool-icon pool-icon--relay"><RadioTower size={19} /></div>
+                  <div><h2>{provider.name}</h2><span>{protocolLabels[provider.protocol]} · 独立中转来源</span></div>
+                  <FastModeControl
+                    sourceName={provider.name}
+                    sourceKind="中转站"
+                    enabled={fastEnabled}
+                    supported={fastSupported}
+                    busy={fastBusy}
+                    onToggle={() => void setFastMode(provider.id, !fastEnabled)}
+                  />
+                  <Badge tone="neutral">只读</Badge>
+                </header>
+
+                <div className="pool-card__stats">
+                  <div><span>来源状态</span><strong>{account.status === 'active' ? '可用' : account.status === 'disabled' ? '已停用' : account.status === 'checking' ? '检测中' : '需关注'}</strong></div>
+                  <div><span>当前并发</span><strong>{account.inFlight} / {account.maxConcurrency}</strong></div>
+                  <div><span>客户端路由</span><strong>{routeCount}</strong></div>
+                </div>
+
+                <div className="pool-strategy pool-strategy--relay"><RadioTower size={15} /><div><strong>独立中转站</strong><span>{provider.baseUrl}</span></div><Badge tone="info">来源</Badge></div>
+
+                <div className="model-tags pool-card__models">
+                  {openModels.slice(0, 3).map((model) => <span key={model}>{model}</span>)}
+                  {openModels.length > 3 && <span>+{openModels.length - 3}</span>}
+                  {!openModels.length && <span className="muted">{wildcard ? '兼容通配 · 尚无目录候选' : '未开放模型'}</span>}
+                </div>
+
+                <div className="pool-members">
+                  <div className="pool-members__heading"><span>中转来源</span><Badge tone="neutral">配置只读</Badge></div>
+                  <div className="pool-member">
+                    <span className="pool-member__order">1</span>
+                    <span className="provider-avatar" style={{ '--provider-color': provider.color ?? '#61736f' } as React.CSSProperties}>{provider.name.slice(0, 1)}</span>
+                    <div><strong>{account.name}</strong><span>优先级 {account.priority} · 权重 {account.weight}{account.proxyId ? ` · 代理：${proxyById.get(account.proxyId)?.name ?? '已删除'}` : ''}</span></div>
+                    <AccountStatusBadge status={account.status} circuitState={account.circuitState} />
+                  </div>
+                </div>
+
+                <footer className="pool-card__footer"><span>中转配置在“账号与中转”页面统一管理</span><button type="button" className="text-button" onClick={() => { window.location.hash = '#providers' }}>前往管理<ArrowUpRight size={13} /></button></footer>
               </article>
             )
           })}
         </div>
       ) : (
         <section className="panel">
-          <EmptyState icon={<Layers3 size={25} />} title="尚未建立号池" description={snapshot.accounts.length ? '组合一个或多个账号作为路由目标' : '请先添加供应商账号，再建立号池'} action={snapshot.accounts.length ? <button className="button button--primary" type="button" onClick={() => openPool()}><Plus size={16} />新建号池</button> : undefined} />
+          <EmptyState icon={<Layers3 size={25} />} title="尚未建立号池" description={poolEligibleAccounts.length ? '组合一个或多个账号作为路由目标' : '请先添加账号或官方 API，再建立号池'} action={poolEligibleAccounts.length ? <button className="button button--primary" type="button" onClick={() => openPool()}><Plus size={16} />新建号池</button> : undefined} />
         </section>
       )}
 
@@ -244,7 +396,8 @@ export function PoolsView({
                   const protocol = event.target.value as Protocol
                   const accountIds = draft.accountIds.filter((accountId) => {
                     const account = accountById.get(accountId)
-                    return account ? providerById.get(account.providerId)?.protocol === protocol : false
+                    const provider = account ? providerById.get(account.providerId) : undefined
+                    return provider?.sourceType !== 'relay' && provider?.protocol === protocol
                   })
                   const candidates = coverageForAccounts(accountIds).options.map((option) => option.model)
                   setDraft({
@@ -252,7 +405,7 @@ export function PoolsView({
                     protocol,
                     accountIds,
                     modelAllowlist: pruneModelSelection(draft.modelAllowlist, candidates),
-                    forceFastMode: protocol === 'openai-responses' ? draft.forceFastMode : false,
+                    forceFastMode: supportsFastServiceTier(protocol) ? draft.forceFastMode : false,
                     hedgedRequests: protocol === 'openai-responses' ? draft.hedgedRequests : false,
                   })
                 }}
@@ -281,8 +434,19 @@ export function PoolsView({
             </label>
             <div className="field field--full">
               <span>账号成员</span>
+              {snapshot.accountTags.length > 0 && <div className="pool-tag-quick-select" aria-label="按 Tag 快速选择账号">
+                <span>Tag 快选</span>
+                {snapshot.accountTags.map((tag) => {
+                  const matchingIds = snapshot.accounts
+                    .filter((account) => account.credentialType === 'chatgpt-oauth' && account.tagId === tag.id)
+                    .filter((account) => providerById.get(account.providerId)?.protocol === draft.protocol)
+                    .map((account) => account.id)
+                  const allSelected = matchingIds.length > 0 && matchingIds.every((id) => draft.accountIds.includes(id))
+                  return <button type="button" key={tag.id} disabled={!matchingIds.length} className={allSelected ? 'active' : ''} onClick={() => toggleTagMembers(tag.id)}>{tag.name}<span>{matchingIds.length}</span></button>
+                })}
+              </div>}
               <div className="account-picker">
-                {snapshot.accounts.map((account) => {
+                {poolEligibleAccounts.map((account) => {
                   const selected = draft.accountIds.includes(account.id)
                   const provider = providerById.get(account.providerId)
                   const compatible = provider?.protocol === draft.protocol
@@ -321,14 +485,14 @@ export function PoolsView({
               />
             </div>
             <div className="field field--full inline-settings">
-              <div><strong>Fast On</strong><span>{draft.protocol === 'openai-responses' ? '强制号池内所有对话使用 Fast 服务层' : '仅 OpenAI Responses 协议可用'}</span></div>
+              <div><strong>FAST 服务层</strong><span>{supportsFastServiceTier(draft.protocol) ? '强制号池内所有对话使用 Fast 服务层' : '仅 OpenAI Responses 与 OpenAI Chat 协议可用'}</span></div>
               <button
                 className={`toggle ${draft.forceFastMode ? 'toggle--on' : ''}`}
                 role="switch"
-                aria-label="Fast On"
+                aria-label="FAST 服务层"
                 aria-checked={draft.forceFastMode}
                 type="button"
-                disabled={draft.protocol !== 'openai-responses'}
+                disabled={!supportsFastServiceTier(draft.protocol)}
                 onClick={() => setDraft({ ...draft, forceFastMode: !draft.forceFastMode })}
               ><span /></button>
             </div>

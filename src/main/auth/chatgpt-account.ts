@@ -120,6 +120,7 @@ function parseAccount(value: unknown): { bundle: ChatGptCredentialBundle; repair
   if (!accessToken) throw new Error('ChatGPT account is missing access_token.')
   const claims = jwtClaims(accessToken)
   const auth = objectValue(claims?.['https://api.openai.com/auth'])
+  const profile = objectValue(claims?.['https://api.openai.com/profile'])
   const idToken = firstString(
     object,
     ['id_token'], ['idToken'], ['tokens', 'id_token'], ['tokens', 'idToken'],
@@ -127,6 +128,7 @@ function parseAccount(value: unknown): { bundle: ChatGptCredentialBundle; repair
   )
   const idClaims = idToken ? jwtClaims(idToken) : undefined
   const idAuth = objectValue(idClaims?.['https://api.openai.com/auth'])
+  const idProfile = objectValue(idClaims?.['https://api.openai.com/profile'])
   const explicitAccountId = firstString(
     object,
     ['chatgpt_account_id'], ['chatgptAccountId'], ['account_id'], ['accountId'], ['account', 'id'],
@@ -171,6 +173,9 @@ function parseAccount(value: unknown): { bundle: ChatGptCredentialBundle; repair
     ['email'], ['user', 'email'], ['credentials', 'email'], ['extra', 'email']
   )
     ?? stringValue(claims?.email)
+    ?? stringValue(profile?.email)
+    ?? stringValue(idClaims?.email)
+    ?? stringValue(idProfile?.email)
     ?? emailLike(firstString(object, ['name']))
   const proxyId = firstString(
     object,

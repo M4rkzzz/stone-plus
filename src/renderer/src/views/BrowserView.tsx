@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } fro
 import {
   ArrowLeft,
   ArrowRight,
+  Archive,
   CheckCircle2,
   Download,
   ExternalLink,
@@ -20,6 +21,7 @@ import type {
   AppSnapshot,
   AccountImportProgress,
   BrowserImportQueueState,
+  BrowserJsonCacheState,
   ChatGptAccountImportProxyMode,
   GatewayApi,
 } from '@shared/types'
@@ -30,6 +32,7 @@ const SHORTCUTS_KEY = 'stone.builtin-browser.shortcuts.v1'
 const ZOOM_KEY = 'stone.builtin-browser.zoom.v1'
 const ZOOM_LEVELS = [50, 67, 75, 80, 90, 100, 110, 125, 150, 175, 200]
 const EMPTY_QUEUE: BrowserImportQueueState = { items: [], readyCount: 0, totalBytes: 0, revision: 0 }
+const EMPTY_CACHE: BrowserJsonCacheState = { items: [], totalBytes: 0 }
 
 interface BrowserShortcut {
   id: string
@@ -72,11 +75,14 @@ export function BrowserView({ snapshot, api }: { snapshot: AppSnapshot; api: Gat
   const [shortcutOpen, setShortcutOpen] = useState(false)
   const [shortcutDraft, setShortcutDraft] = useState({ name: '', url: '' })
   const [queue, setQueue] = useState<BrowserImportQueueState>(EMPTY_QUEUE)
+  const [cache, setCache] = useState<BrowserJsonCacheState>(EMPTY_CACHE)
+  const [cacheOpen, setCacheOpen] = useState(false)
+  const [cacheBusyId, setCacheBusyId] = useState<string | null>(null)
+  const [cacheError, setCacheError] = useState('')
   const [importOpen, setImportOpen] = useState(false)
   const [selectedIds, setSelectedIds] = useState<string[]>([])
-  const [providerId, setProviderId] = useState(
-    snapshot.providers.find((provider) => provider.kind === 'openai' && provider.protocol === 'openai-responses')?.id ?? '',
-  )
+  const [tagId, setTagId] = useState<string | null>(null)
+  const [poolId, setPoolId] = useState<string | null>(null)
   const [proxyMode, setProxyMode] = useState<ChatGptAccountImportProxyMode>('preserve')
   const [proxyId, setProxyId] = useState('')
   const [busy, setBusy] = useState(false)
@@ -89,14 +95,23 @@ export function BrowserView({ snapshot, api }: { snapshot: AppSnapshot; api: Gat
 
   const readyItems = useMemo(() => queue.items.filter((item) => item.status === 'ready'), [queue.items])
   const selectedReadyIds = useMemo(() => selectedIds.filter((id) => readyItems.some((item) => item.id === id)), [readyItems, selectedIds])
-  const openAiProviders = useMemo(
-    () => snapshot.providers.filter((provider) => provider.kind === 'openai' && provider.protocol === 'openai-responses'),
-    [snapshot.providers],
+  const compatiblePools = useMemo(
+    () => snapshot.pools.filter((pool) => pool.kind === 'standard' && pool.protocol === 'openai-responses'),
+    [snapshot.pools],
   )
 
   useEffect(() => {
-    void api.getBrowserImportQueue().then(setQueue).catch(() => undefined)
-    return api.onBrowserImportQueue(setQueue)
+    let active = true
+    const refreshCache = () => api.getBrowserJsonCache()
+      .then((next) => { if (active) setCache(next) })
+      .catch(() => undefined)
+    void api.getBrowserImportQueue().then((next) => { if (active) setQueue(next) }).catch(() => undefined)
+    void refreshCache()
+    const unsubscribe = api.onBrowserImportQueue((next) => {
+      if (active) setQueue(next)
+      void refreshCache()
+    })
+    return () => { active = false; unsubscribe() }
   }, [api])
 
   useEffect(() => api.onAccountImportProgress((progress) => {
@@ -180,7 +195,6 @@ export function BrowserView({ snapshot, api }: { snapshot: AppSnapshot; api: Gat
   }
 
   const importSelected = async (): Promise<void> => {
-    if (!providerId) { setError('请选择 OpenAI Responses Provider。'); return }
     if (!selectedReadyIds.length) { setError('请至少选择一个已下载完成的 JSON。'); return }
     const progressId = crypto.randomUUID()
     importProgressId.current = progressId
@@ -190,7 +204,8 @@ export function BrowserView({ snapshot, api }: { snapshot: AppSnapshot; api: Gat
     try {
       const result = await api.importBrowserJsonQueue({
         itemIds: selectedReadyIds,
-        providerId,
+        tagId,
+        poolId,
         proxyMode,
         proxyId: proxyMode === 'proxy' ? proxyId : undefined,
         progressId,
@@ -199,7 +214,7 @@ export function BrowserView({ snapshot, api }: { snapshot: AppSnapshot; api: Gat
       const failed = result.fileResults.filter((item) => item.status === 'failed')
       const modelsRefreshed = result.detectionResults.filter((item) => item.availableModelCount !== undefined).length
       const modelFailures = result.detectionResults.filter((item) => item.modelRefreshError)
-      setNotice(`批量导入完成：文件成功 ${succeeded} 个、失败 ${failed.length} 个；新增 ${result.createdAccountIds.length} 个账号、更新 ${result.updatedAccountIds.length} 个账号；模型刷新成功 ${modelsRefreshed} 个、失败 ${modelFailures.length} 个。${failed[0]?.error ? ` ${failed[0].fileName}：${failed[0].error}` : modelFailures[0]?.modelRefreshError ? ` ${modelFailures[0].accountName}：${modelFailures[0].modelRefreshError}` : ''}`)
+      setNotice(`批量导入完成：文件成功 ${succeeded} 个、失败 ${failed.length} 个；新增 ${result.createdAccountIds.length} 个账号、更新 ${result.updatedAccountIds.length} 个账号；检测成功 ${result.detectionResults.filter((item) => item.ok).length} 个，Tag 覆盖 ${result.assignmentSummary.tagUpdatedAccountCount} 个，加入号池 ${result.assignmentSummary.poolMembersAdded} 个；模型刷新成功 ${modelsRefreshed} 个、失败 ${modelFailures.length} 个。${result.assignmentSummary.poolAppendError ? ` 号池追加失败：${result.assignmentSummary.poolAppendError}。` : ''}${failed[0]?.error ? ` ${failed[0].fileName}：${failed[0].error}` : modelFailures[0]?.modelRefreshError ? ` ${modelFailures[0].accountName}：${modelFailures[0].modelRefreshError}` : ''}`)
       setImportOpen(false)
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : '挂起 JSON 批量导入失败')
@@ -215,6 +230,54 @@ export function BrowserView({ snapshot, api }: { snapshot: AppSnapshot; api: Gat
     setSelectedIds((current) => current.filter((candidate) => candidate !== id))
   }
 
+  const openCache = async (): Promise<void> => {
+    setCacheError('')
+    setCacheOpen(true)
+    try {
+      setCache(await api.getBrowserJsonCache())
+    } catch (cause) {
+      setCacheError(cause instanceof Error ? cause.message : '无法读取下载缓存')
+    }
+  }
+
+  const saveCachedItem = async (id: string): Promise<void> => {
+    setCacheBusyId(id)
+    setCacheError('')
+    try {
+      const result = await api.saveBrowserJsonCacheItem(id)
+      if (!result.cancelled) setNotice('缓存 JSON 已另存。')
+    } catch (cause) {
+      setCacheError(cause instanceof Error ? cause.message : '缓存 JSON 另存失败')
+    } finally {
+      setCacheBusyId(null)
+    }
+  }
+
+  const removeCachedItem = async (id: string): Promise<void> => {
+    setCacheBusyId(id)
+    setCacheError('')
+    try {
+      setCache(await api.removeBrowserJsonCacheItem(id))
+    } catch (cause) {
+      setCacheError(cause instanceof Error ? cause.message : '删除缓存失败')
+    } finally {
+      setCacheBusyId(null)
+    }
+  }
+
+  const clearCache = async (): Promise<void> => {
+    if (!window.confirm('确定清空全部已下载 JSON 缓存吗？此操作不会删除已导入的账号。')) return
+    setCacheBusyId('clear')
+    setCacheError('')
+    try {
+      setCache(await api.clearBrowserJsonCache())
+    } catch (cause) {
+      setCacheError(cause instanceof Error ? cause.message : '清空缓存失败')
+    } finally {
+      setCacheBusyId(null)
+    }
+  }
+
   const proxyValue = proxyMode === 'preserve' ? '__preserve__' : proxyMode === 'direct' ? '__direct__' : proxyId
 
   return <div className="page-stack builtin-browser-page">
@@ -224,8 +287,11 @@ export function BrowserView({ snapshot, api }: { snapshot: AppSnapshot; api: Gat
         <strong>{queue.readyCount ? `已挂起 ${queue.readyCount} 个 JSON` : '暂无挂起 JSON'}</strong>
         <span>{queue.items.some((item) => item.status === 'downloading') ? '仍有文件正在下载；可继续下载，完成后一次导入。' : '在网页中下载 JSON 后会自动加入这里，可稍后统一确认。'}</span>
       </div>
-      {queue.items.length > 0 && <button type="button" className="text-button button--danger-text" disabled={busy} onClick={() => void api.clearBrowserImportQueue().then(setQueue)}>清空</button>}
-      <button type="button" className="button button--primary" disabled={!queue.readyCount || busy} onClick={openImport}><Download size={16} />确认导入</button>
+      <div className="browser-import-banner__actions">
+        <button type="button" className="text-button browser-cache-button" disabled={busy} onClick={() => void openCache()}><Archive size={14} />缓存{cache.items.length ? ` ${cache.items.length}` : ''}</button>
+        {queue.items.length > 0 && <button type="button" className="text-button button--danger-text" disabled={busy} onClick={() => void api.clearBrowserImportQueue().then(setQueue)}>清空</button>}
+        <button type="button" className="button button--primary" disabled={!queue.readyCount || busy} onClick={openImport}><Download size={16} />确认导入</button>
+      </div>
     </section>
 
     {notice && <div className="client-config-notice"><CheckCircle2 size={16} /><span>{notice}</span></div>}
@@ -298,14 +364,33 @@ export function BrowserView({ snapshot, api }: { snapshot: AppSnapshot; api: Gat
       </form>
     </Modal>
 
-    <Modal open={importOpen} title={`批量导入挂起 JSON（${selectedReadyIds.length}/${readyItems.length}）`} description="可选择部分文件，并为本批账号统一指定出口代理。成功导入的文件会自动从挂起队列移除。" width="large" closable={!busy} onClose={() => setImportOpen(false)} footer={<>
+    <Modal open={cacheOpen} title={`下载缓存（${cache.items.length}）`} description="内置浏览器下载过的有效 JSON 会保存在本机缓存，导入或清空挂起队列后仍可另存。" width="large" onClose={() => setCacheOpen(false)} footer={<>
+      <span className="modal-selection-count">共 {formatBytes(cache.totalBytes)}</span>
+      {cache.items.length > 0 && <button type="button" className="button button--secondary button--danger-text" disabled={cacheBusyId !== null} onClick={() => void clearCache()}><Trash2 size={15} />清空缓存</button>}
+      <button type="button" className="button button--secondary" disabled={cacheBusyId !== null} onClick={() => setCacheOpen(false)}>关闭</button>
+    </>}>
+      <div className="browser-cache-modal">
+        {cacheError && <div className="client-config-message error-banner"><XCircle size={16} /><span>{cacheError}</span></div>}
+        {cache.items.length ? <div className="browser-import-list">
+          {cache.items.map((item) => <div className="browser-cache-item" key={item.id}>
+            <FileJson size={18} />
+            <div><strong>{item.fileName}</strong><span>{formatCacheTime(item.receivedAt)} · {formatBytes(item.sizeBytes)}</span></div>
+            <button type="button" className="button button--secondary" disabled={cacheBusyId !== null} onClick={() => void saveCachedItem(item.id)}>{cacheBusyId === item.id ? <LoaderCircle size={15} className="spin" /> : <Download size={15} />}另存为</button>
+            <button type="button" className="icon-button button--danger-text" disabled={cacheBusyId !== null} title="删除缓存" onClick={() => void removeCachedItem(item.id)}><Trash2 size={15} /></button>
+          </div>)}
+        </div> : <div className="browser-cache-empty"><Archive size={24} /><strong>暂无下载缓存</strong><span>在内置浏览器下载有效 JSON 后会自动保留一份。</span></div>}
+      </div>
+    </Modal>
+
+    <Modal open={importOpen} title={`导入 Sub2API / CPA（${selectedReadyIds.length}/${readyItems.length}）`} description="粘贴、文件和 Browser Queue 共用同一套 Tag、号池与出口设置。成功导入的文件会自动从挂起队列移除。" width="large" closable={!busy} onClose={() => setImportOpen(false)} footer={<>
       <span className="modal-selection-count">已选 {selectedReadyIds.length} 个，共 {formatBytes(readyItems.filter((item) => selectedReadyIds.includes(item.id)).reduce((total, item) => total + item.sizeBytes, 0))}</span>
       <button type="button" className="button button--secondary" disabled={busy} onClick={() => setImportOpen(false)}>继续下载</button>
-      <button type="button" className="button button--primary" disabled={busy || !selectedReadyIds.length || !providerId || (proxyMode === 'proxy' && !proxyId)} onClick={() => void importSelected()}>{busy ? <RefreshCw size={16} className="spin" /> : <Download size={16} />}{busy ? '正在导入并检测…' : '导入所选 JSON'}</button>
+      <button type="button" className="button button--primary" disabled={busy || !selectedReadyIds.length || (proxyMode === 'proxy' && !proxyId)} onClick={() => void importSelected()}>{busy ? <RefreshCw size={16} className="spin" /> : <Download size={16} />}{busy ? '正在导入并检测…' : '导入所选 JSON'}</button>
     </>}>
       <div className="browser-import-modal">
         <div className="form-grid">
-          <label className="field field--full"><span>OpenAI Responses Provider</span><select required value={providerId} onChange={(event) => setProviderId(event.target.value)}><option value="">选择 Provider</option>{openAiProviders.map((provider) => <option value={provider.id} key={provider.id}>{provider.name}</option>)}</select><small>导入后的 ChatGPT / Codex 账号归属到该 Provider。</small></label>
+          <label className="field"><span>本批次 Tag</span><select value={tagId ?? ''} onChange={(event) => setTagId(event.target.value || null)}><option value="">未标记（同时清空重复账号的 Tag）</option>{snapshot.accountTags.map((tag) => <option value={tag.id} key={tag.id}>{tag.name}</option>)}</select></label>
+          <label className="field"><span>导入后加入号池（可选）</span><select value={poolId ?? ''} onChange={(event) => setPoolId(event.target.value || null)}><option value="">不加入号池</option>{compatiblePools.map((pool) => <option value={pool.id} key={pool.id}>{pool.name} · {pool.members.length} 个成员 · {pool.strategy}</option>)}</select></label>
           <label className="field field--full"><span>批量出口代理</span><select value={proxyValue} onChange={(event) => {
             const value = event.target.value
             if (value === '__preserve__') { setProxyMode('preserve'); setProxyId('') }
@@ -475,4 +560,14 @@ function formatBytes(value: number): string {
   if (value < 1024) return `${value} B`
   if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`
   return `${(value / 1024 / 1024).toFixed(1)} MB`
+}
+
+function formatCacheTime(value: number): string {
+  return new Date(value).toLocaleString('zh-CN', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  })
 }

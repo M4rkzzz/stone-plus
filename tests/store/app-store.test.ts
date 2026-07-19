@@ -341,6 +341,61 @@ describe('AppStore', () => {
     })).rejects.toThrow(/pool protocol/)
   })
 
+  it('preserves disabled pool members when editing a standard pool', async () => {
+    const store = createStore()
+    await store.initialize()
+    const firstSnapshot = await store.saveAccount({
+      providerId: 'provider-openai', name: 'Enabled member', credential: 'sk-enabled',
+      priority: 1, weight: 1, maxConcurrency: 1, modelAllowlist: []
+    })
+    const firstAccountId = firstSnapshot.accounts.find((account) => account.name === 'Enabled member')!.id
+    const secondSnapshot = await store.saveAccount({
+      providerId: 'provider-openai', name: 'Disabled member', credential: 'sk-disabled',
+      priority: 1, weight: 1, maxConcurrency: 1, modelAllowlist: []
+    })
+    const secondAccountId = secondSnapshot.accounts.find((account) => account.name === 'Disabled member')!.id
+    const saved = await store.savePool({
+      name: 'Editable pool', protocol: 'openai-responses', strategy: 'priority',
+      accountIds: [firstAccountId, secondAccountId], stickySessions: false, stickyTtlMinutes: 30, maxRetries: 1
+    })
+    const pool = saved.pools.find((candidate) => candidate.name === 'Editable pool')!
+    await store.getStateRepository().update((state) => {
+      const member = state.pools.find((candidate) => candidate.id === pool.id)!.members
+        .find((candidate) => candidate.accountId === secondAccountId)!
+      member.enabled = false
+      member.weight = 7
+      member.order = 2
+    })
+
+    const updated = await store.savePool({
+      id: pool.id, name: 'Renamed pool', protocol: pool.protocol, strategy: pool.strategy,
+      accountIds: [firstAccountId], stickySessions: pool.stickySessions,
+      stickyTtlMinutes: pool.stickyTtlMinutes, maxRetries: pool.maxRetries
+    })
+
+    expect(updated.pools.find((candidate) => candidate.id === pool.id)?.members).toContainEqual({
+      accountId: secondAccountId,
+      enabled: false,
+      weight: 7,
+      order: 2
+    })
+  })
+
+  it('rejects relay sources as standard pool members', async () => {
+    const store = createStore()
+    await store.initialize()
+    const relay = await store.saveApiSource({
+      name: 'Relay only', sourceType: 'relay', kind: 'openai-compatible',
+      baseUrl: 'https://relay-only.example/v1', protocol: 'openai-chat', models: ['relay-model'],
+      credential: 'relay-secret', priority: 1, weight: 1, maxConcurrency: 1
+    })
+
+    await expect(store.savePool({
+      name: 'Invalid standard pool', protocol: 'openai-chat', strategy: 'priority',
+      accountIds: [relay.source.accountId], stickySessions: false, stickyTtlMinutes: 30, maxRetries: 1
+    })).rejects.toThrow(/only be members of aggregate relays/)
+  })
+
   it('persists autobalanced as an opt-in pool strategy', async () => {
     const store = createStore()
     await store.initialize()
@@ -532,30 +587,132 @@ describe('AppStore', () => {
     await expect(store.importClientProfile({ format: 'unknown' })).rejects.toThrow(/Unsupported/)
   })
 
-  it('onboards a preset provider and account atomically', async () => {
+  it('saves an API source and its single account atomically', async () => {
     const store = createStore()
     await store.initialize()
     const before = store.getSnapshot()
-    const snapshot = await store.onboardProvider({
-      preset: {
-        name: 'DeepSeek',
-        kind: 'openai-compatible',
-        baseUrl: 'https://api.deepseek.com/v1',
-        protocol: 'openai-chat',
-        models: ['deepseek-chat']
-      },
-      accountName: 'Primary',
-      credential: 'deepseek-secret'
+    const saved = await store.saveApiSource({
+      name: 'DeepSeek',
+      sourceType: 'relay',
+      kind: 'openai-compatible',
+      baseUrl: 'https://api.deepseek.com/v1',
+      protocol: 'openai-chat',
+      models: ['deepseek-chat'],
+      defaultModel: 'deepseek-chat',
+      credential: 'deepseek-secret',
+      priority: 10,
+      weight: 10,
+      maxConcurrency: 4
     })
+    const snapshot = saved.snapshot
     const provider = snapshot.providers.find((candidate) => candidate.name === 'DeepSeek')!
     const account = snapshot.accounts.find((candidate) => candidate.providerId === provider.id)!
-    expect(account).toMatchObject({ name: 'Primary', maskedCredential: '****cret' })
+    expect(account).toMatchObject({ name: 'DeepSeek', maskedCredential: '****cret', credentialType: 'api-key' })
     expect(store.getCredential(store.getRuntimeAccount(account.id)!.credentialId)).toBe('deepseek-secret')
-    await expect(store.onboardProvider({
-      preset: { name: 'Bad', kind: 'openai', baseUrl: 'https://api.openai.com/v1', protocol: 'gemini', models: [] },
-      accountName: 'Never', credential: 'secret'
-    })).rejects.toThrow(/not supported/)
+    await expect(store.saveApiSource({
+      name: 'Bad', sourceType: 'official-api', kind: 'openai', baseUrl: 'https://api.openai.com/v1',
+      protocol: 'gemini', models: [], credential: 'secret', priority: 1, weight: 1, maxConcurrency: 1
+    })).rejects.toThrow(/does not support/)
     expect(store.getSnapshot().providers).toHaveLength(before.providers.length + 1)
+  })
+
+  it('routes directly through an API source using a runtime-only virtual pool', async () => {
+    const store = createStore()
+    await store.initialize()
+    const saved = await store.saveApiSource({
+      name: 'Direct relay',
+      sourceType: 'relay',
+      kind: 'openai-compatible',
+      baseUrl: 'https://relay.example/v1',
+      protocol: 'openai-chat',
+      models: ['relay-model'],
+      credential: 'relay-secret',
+      priority: 3,
+      weight: 4,
+      maxConcurrency: 5
+    })
+    const route = saved.snapshot.routes.find((candidate) => candidate.client === 'codex')!
+    const routed = await store.updateRoute({ ...route, enabled: true, poolId: saved.source.sourceId })
+
+    expect(routed.routes.find((candidate) => candidate.id === route.id)).toMatchObject({
+      enabled: true,
+      poolId: saved.source.sourceId
+    })
+    expect(routed.pools.some((pool) => pool.id === saved.source.sourceId)).toBe(false)
+    expect(store.getRuntimeConfiguration().pools.find((pool) => pool.id === saved.source.sourceId)).toMatchObject({
+      name: 'Direct relay',
+      kind: 'standard',
+      protocol: 'openai-chat',
+      strategy: 'priority',
+      members: [{ accountId: saved.source.accountId, enabled: true, order: 0, weight: 1 }],
+      maxRetries: 0
+    })
+
+    const deleted = await store.deleteApiSource(saved.source.sourceId)
+    expect(deleted.routes.find((candidate) => candidate.id === route.id)).toMatchObject({
+      enabled: false,
+      poolId: '',
+      localToken: route.localToken
+    })
+  })
+
+  it('persists FAST for pools and standalone relays and exposes it through the runtime virtual pool', async () => {
+    const store = createStore()
+    await store.initialize()
+    const saved = await store.saveApiSource({
+      name: 'FAST relay',
+      sourceType: 'relay',
+      kind: 'openai-compatible',
+      baseUrl: 'https://fast-relay.example/v1',
+      protocol: 'openai-chat',
+      models: ['relay-model'],
+      credential: 'relay-secret',
+      priority: 1,
+      weight: 1,
+      maxConcurrency: 2
+    })
+    await store.setRouteSourceFastMode({ sourceId: saved.source.sourceId, enabled: true })
+    const official = await store.saveApiSource({
+      name: 'FAST official API',
+      sourceType: 'official-api',
+      kind: 'openai',
+      baseUrl: 'https://api.openai.com/v1',
+      protocol: 'openai-chat',
+      models: ['gpt-4.1'],
+      credential: 'official-secret',
+      priority: 1,
+      weight: 1,
+      maxConcurrency: 2
+    })
+    const pooled = await store.savePool({
+      name: 'FAST pool',
+      protocol: 'openai-chat',
+      strategy: 'priority',
+      accountIds: [official.source.accountId],
+      stickySessions: false,
+      stickyTtlMinutes: 30,
+      maxRetries: 0
+    })
+    const poolId = pooled.pools.find((pool) => pool.name === 'FAST pool')!.id
+    await store.setRouteSourceFastMode({ sourceId: poolId, enabled: true })
+    const route = store.getSnapshot().routes.find((candidate) => candidate.client === 'codex')!
+    await store.updateRoute({ ...route, enabled: true, poolId: saved.source.sourceId })
+
+    expect(store.getSnapshot().providers.find((provider) => provider.id === saved.source.sourceId)?.forceFastMode).toBe(true)
+    expect(store.getRuntimeConfiguration().pools.find((pool) => pool.id === saved.source.sourceId)?.forceFastMode).toBe(true)
+    expect(store.getSnapshot().pools.find((pool) => pool.id === poolId)?.forceFastMode).toBe(true)
+    await store.close()
+
+    const restarted = createStore()
+    await restarted.initialize()
+    expect(restarted.getSnapshot().providers.find((provider) => provider.id === saved.source.sourceId)?.forceFastMode).toBe(true)
+    expect(restarted.getRuntimeConfiguration().pools.find((pool) => pool.id === saved.source.sourceId)?.forceFastMode).toBe(true)
+    expect(restarted.getSnapshot().pools.find((pool) => pool.id === poolId)?.forceFastMode).toBe(true)
+
+    await expect(restarted.setRouteSourceFastMode({ sourceId: 'provider-anthropic', enabled: true }))
+      .rejects.toThrow(/only for relay sources/)
+    await expect(restarted.setRouteSourceFastMode({ sourceId: 'missing', enabled: true }))
+      .rejects.toThrow(/not found/)
   })
 
   it('imports ChatGPT OAuth sessions as encrypted Codex accounts', async () => {
@@ -581,6 +738,139 @@ describe('AppStore', () => {
     expect(JSON.stringify(imported.snapshot)).not.toContain('acct-team-import')
     expect(store.getChatGptCredential(store.getRuntimeAccount(account.id)!.credentialId)).toMatchObject({ accessToken: 'oauth-access-private', accountId: 'acct-team-import' })
     expect(imported.warnings).toHaveLength(1)
+  })
+
+  it('manages a single account tag assignment and does not recreate deleted defaults', async () => {
+    const store = createStore()
+    await store.initialize()
+    expect(store.getSnapshot().accountTags.map((tag) => tag.name)).toEqual(['K12', 'Plus'])
+
+    const renamed = await store.saveAccountTag({ id: 'tag-k12', name: 'K12 Team' })
+    expect(renamed.accountTags.find((tag) => tag.id === 'tag-k12')?.name).toBe('K12 Team')
+    const withCustom = await store.saveAccountTag({ name: 'Custom' })
+    const customId = withCustom.accountTags.find((tag) => tag.name === 'Custom')!.id
+    const imported = await store.importChatGptAccounts({
+      content: JSON.stringify({
+        access_token: 'tag-access-private',
+        account_id: 'acct-tag-private',
+        expired: new Date(Date.now() + 3_600_000).toISOString()
+      }),
+      tagId: customId,
+      poolId: null
+    })
+    const accountId = imported.importedAccountIds[0]
+    expect(imported.snapshot.accounts.find((account) => account.id === accountId)?.tagId).toBe(customId)
+    expect((await store.setAccountTags({ accountIds: [accountId], tagId: 'tag-plus' })).accounts
+      .find((account) => account.id === accountId)?.tagId).toBe('tag-plus')
+    expect((await store.deleteAccountTag('tag-plus')).accounts.find((account) => account.id === accountId)?.tagId)
+      .toBeUndefined()
+    await store.deleteAccountTag('tag-k12')
+    await store.close()
+
+    const restarted = createStore()
+    await restarted.initialize()
+    expect(restarted.getSnapshot().accountTags.map((tag) => tag.name)).toEqual(['Custom'])
+  })
+
+  it('does not persist a Tag deleted while an OAuth setup step is being resumed', async () => {
+    const store = createStore()
+    await store.initialize()
+    const started = await store.saveSetupWizardProgress({
+      step: 'source-config',
+      sourceType: 'oauth-system',
+      sourceMethod: 'oauth',
+      tagId: 'tag-plus'
+    })
+    expect(started.tagId).toBe('tag-plus')
+
+    await store.deleteAccountTag('tag-plus')
+    const resumed = await store.saveSetupWizardProgress({
+      sessionId: started.sessionId,
+      step: 'network',
+      sourceType: 'oauth-system',
+      sourceMethod: 'oauth',
+      sourceId: 'oauth-account-id',
+      tagId: 'tag-plus'
+    })
+    expect(resumed.tagId).toBeUndefined()
+    expect(resumed.sourceMethod).toBe('oauth')
+    expect(resumed.sourceId).toBe('oauth-account-id')
+  })
+
+  it('starts a fresh wizard session after the current run is discarded', async () => {
+    const store = createStore()
+    await store.initialize()
+    const discarded = await store.saveSetupWizardProgress({
+      step: 'network',
+      sourceType: 'oauth-system',
+      sourceMethod: 'oauth',
+      sourceId: 'oauth-account-id',
+      tagId: 'tag-plus',
+      poolId: 'pool-codex',
+      proxyId: 'proxy-oauth',
+      model: 'gpt-test',
+    })
+
+    await store.discardSetupWizard()
+    expect(store.getSetupWizardState()).toBeNull()
+
+    const restarted = await store.saveSetupWizardProgress({ step: 'scan' })
+    expect(restarted).toMatchObject({ step: 'scan', completed: false, dismissed: false })
+    expect(restarted.sessionId).not.toBe(discarded.sessionId)
+    expect(restarted.sourceType).toBeUndefined()
+    expect(restarted.sourceMethod).toBeUndefined()
+    expect(restarted.sourceId).toBeUndefined()
+    expect(restarted.tagId).toBeUndefined()
+    expect(restarted.poolId).toBeUndefined()
+    expect(restarted.proxyId).toBeUndefined()
+    expect(restarted.model).toBeUndefined()
+  })
+
+  it('overwrites or clears the selected tag on every OAuth reimport', async () => {
+    const store = createStore()
+    await store.initialize()
+    const content = JSON.stringify({
+      access_token: 'tag-overwrite-access',
+      refresh_token: 'tag-overwrite-refresh',
+      account_id: 'acct-tag-overwrite',
+      expired: new Date(Date.now() + 3_600_000).toISOString()
+    })
+    const first = await store.importChatGptAccounts({ content, tagId: 'tag-k12', poolId: null })
+    const accountId = first.importedAccountIds[0]
+    expect(first.snapshot.accounts.find((account) => account.id === accountId)?.tagId).toBe('tag-k12')
+    const cleared = await store.importChatGptAccounts({ content, tagId: null, poolId: null })
+    expect(cleared.snapshot.accounts.find((account) => account.id === accountId)?.tagId).toBeUndefined()
+  })
+
+  it('adds only explicitly detected OAuth accounts to a compatible standard pool idempotently', async () => {
+    const store = createStore()
+    await store.initialize()
+    const first = await store.importChatGptAccounts({
+      content: JSON.stringify({ access_token: 'pool-first', account_id: 'acct-pool-first', expired: new Date(Date.now() + 3_600_000).toISOString() }),
+      tagId: null,
+      poolId: null
+    })
+    const poolSnapshot = await store.savePool({
+      name: 'Imported OAuth pool',
+      protocol: 'openai-responses',
+      strategy: 'balanced',
+      accountIds: first.importedAccountIds,
+      stickySessions: false,
+      stickyTtlMinutes: 30,
+      maxRetries: 1
+    })
+    const poolId = poolSnapshot.pools.find((pool) => pool.name === 'Imported OAuth pool')!.id
+    const second = await store.importChatGptAccounts({
+      content: JSON.stringify({ access_token: 'pool-second', account_id: 'acct-pool-second', expired: new Date(Date.now() + 3_600_000).toISOString() }),
+      tagId: null,
+      poolId
+    })
+    const firstAppend = await store.addDetectedChatGptAccountsToPool(poolId, second.importedAccountIds)
+    expect(firstAppend).toEqual({ added: 1, alreadyPresent: 0 })
+    expect(await store.addDetectedChatGptAccountsToPool(poolId, second.importedAccountIds))
+      .toEqual({ added: 0, alreadyPresent: 1 })
+    expect(store.getSnapshot().pools.find((pool) => pool.id === poolId)?.members.map((member) => member.accountId))
+      .toEqual([...first.importedAccountIds, ...second.importedAccountIds])
   })
 
   it('exports selected ChatGPT accounts as CPA and Sub2API JSON without exposing secrets in snapshots', async () => {
@@ -676,26 +966,22 @@ describe('AppStore', () => {
     expect(new Set(repeated.updatedAccountIds)).toEqual(new Set(importedIds))
     expect(repeated.snapshot.accounts).toHaveLength(2)
 
-    const withSecondProvider = await store.saveProvider({
+    await store.saveProvider({
       name: 'Second OpenAI Responses',
       kind: 'openai',
       baseUrl: 'https://api.openai.com/v1',
       protocol: 'openai-responses',
       models: []
     })
-    const secondProvider = withSecondProvider.providers.find((provider) => provider.name === 'Second OpenAI Responses')!
-    const crossProvider = await store.importChatGptAccounts({
-      providerId: secondProvider.id,
-      content: JSON.stringify(entries[0])
-    })
-    expect(crossProvider.createdAccountIds).toHaveLength(1)
-    expect(crossProvider.updatedAccountIds).toEqual([])
-    expect(crossProvider.snapshot.accounts).toHaveLength(3)
+    const providerIndependent = await store.importChatGptAccounts({ content: JSON.stringify(entries[0]), tagId: null, poolId: null })
+    expect(providerIndependent.createdAccountIds).toEqual([])
+    expect(providerIndependent.updatedAccountIds).toEqual([first.createdAccountIds[0]])
+    expect(providerIndependent.snapshot.accounts).toHaveLength(2)
 
     await store.close()
     const restarted = createStore()
     await restarted.initialize()
-    expect(restarted.getSnapshot().accounts).toHaveLength(3)
+    expect(restarted.getSnapshot().accounts).toHaveLength(2)
   })
 
   it('preserves a v0.8.0 account and pool binding when another workspace member is imported after restart', async () => {
@@ -1816,7 +2102,7 @@ describe('AppStore', () => {
     database.close()
   })
 
-  it('migrates schema four to schema five with proxy and Codex quota storage', async () => {
+  it('migrates schema four through schema six with proxy, quota, and account tag storage', async () => {
     const store = createStore()
     await store.initialize()
     const created = await store.saveAccount({
@@ -1840,7 +2126,7 @@ describe('AppStore', () => {
     await restarted.close()
 
     const database = new DatabaseSync(databasePath)
-    expect(readSchemaVersion(database)).toBe(5)
+    expect(readSchemaVersion(database)).toBe(6)
     expect(database.prepare('SELECT COUNT(*) AS count FROM schema_migrations WHERE version = 5').get())
       .toEqual({ count: 1 })
     expect(database.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = 'proxies'").get())
@@ -1849,6 +2135,11 @@ describe('AppStore', () => {
       .toEqual({ count: 1 })
     expect(database.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'index' AND name = 'account_codex_quota_samples_observed'").get())
       .toEqual({ count: 1 })
+    expect(database.prepare('SELECT COUNT(*) AS count FROM schema_migrations WHERE version = 6').get())
+      .toEqual({ count: 1 })
+    expect(database.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = 'account_tags'").get())
+      .toEqual({ count: 1 })
+    expect(database.prepare('SELECT COUNT(*) AS count FROM account_tags').get()).toEqual({ count: 2 })
     database.close()
   })
 
@@ -1986,6 +2277,7 @@ function downgradeDatabaseToVersionOne(path: string): void {
     DROP TABLE IF EXISTS health_events;
     DROP TABLE IF EXISTS proxies;
     DROP TABLE IF EXISTS account_codex_quota_samples;
+    DROP TABLE IF EXISTS account_tags;
     DELETE FROM schema_migrations WHERE version >= 2;
     PRAGMA user_version = 1;
   `)
@@ -1997,6 +2289,7 @@ function downgradeDatabaseToVersionFour(path: string): void {
   database.exec(`
     DROP TABLE proxies;
     DROP TABLE account_codex_quota_samples;
+    DROP TABLE account_tags;
     DELETE FROM schema_migrations WHERE version >= 5;
     PRAGMA user_version = 4;
   `)

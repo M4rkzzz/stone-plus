@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { registerCodexSessionRepairApi } from '../../src/main/ipc/session-repair-api'
-import type { CodexSessionRepairService } from '../../src/main/codex'
+import type { CodexRepairAndRestartService, CodexSessionRepairService } from '../../src/main/codex'
 
 type InvokeHandler = (event: unknown, ...args: unknown[]) => unknown
 
@@ -29,21 +29,27 @@ describe('Codex session repair IPC', () => {
       preview: vi.fn(async () => ({ targetProvider: 'stone', revision: 'a'.repeat(64) })),
       repair: vi.fn(async () => ({ targetProvider: 'stone', repairedRolloutFiles: 2 })),
     } as unknown as CodexSessionRepairService
-    registerCodexSessionRepairApi(service)
+    const repairAndRestart = {
+      run: vi.fn(async () => ({ chatGptRestarted: true })),
+    } as unknown as CodexRepairAndRestartService
+    registerCodexSessionRepairApi(service, repairAndRestart)
     const event = trustedEvent()
 
     await invoke('stone:inspect-codex-session-repair', event)
     await invoke('stone:preview-codex-session-repair', event, 'stone')
     await invoke('stone:repair-codex-sessions', event, 'stone', 'a'.repeat(64))
+    await invoke('stone:repair-codex-sessions-and-restart-chatgpt', event)
 
     expect(service.inspect).toHaveBeenCalledOnce()
     expect(service.preview).toHaveBeenCalledWith('stone')
     expect(service.repair).toHaveBeenCalledWith('stone', 'a'.repeat(64))
+    expect(repairAndRestart.run).toHaveBeenCalledOnce()
   })
 
   it('rejects calls from an untrusted renderer', async () => {
     const service = { inspect: vi.fn() } as unknown as CodexSessionRepairService
-    registerCodexSessionRepairApi(service)
+    const repairAndRestart = { run: vi.fn() } as unknown as CodexRepairAndRestartService
+    registerCodexSessionRepairApi(service, repairAndRestart)
     const mainFrame = { url: 'https://evil.example/index.html' }
 
     await expect(invoke('stone:inspect-codex-session-repair', { senderFrame: mainFrame, sender: { mainFrame } }))

@@ -1,8 +1,11 @@
 import { ipcMain } from 'electron'
-import type { CodexSessionRepairService } from '../codex'
+import type { CodexRepairAndRestartService, CodexSessionRepairService } from '../codex'
 import { assertTrustedSender } from './trusted-sender'
 
-export function registerCodexSessionRepairApi(service: CodexSessionRepairService): void {
+export function registerCodexSessionRepairApi(
+  service: CodexSessionRepairService,
+  repairAndRestart: CodexRepairAndRestartService,
+): void {
   ipcMain.handle('stone:inspect-codex-session-repair', (event) => {
     assertTrustedSender(event)
     return service.inspect()
@@ -14,5 +17,9 @@ export function registerCodexSessionRepairApi(service: CodexSessionRepairService
   ipcMain.handle('stone:repair-codex-sessions', (event, targetProvider: string, expectedRevision: string) => {
     assertTrustedSender(event)
     return service.repair(targetProvider, expectedRevision)
+  })
+  ipcMain.handle('stone:repair-codex-sessions-and-restart-chatgpt', (event) => {
+    assertTrustedSender(event)
+    return repairAndRestart.run()
   })
 }

@@ -234,7 +234,7 @@ export class UpdateService {
     this.updateState({ status: 'installing', error: undefined })
     try {
       await this.options.prepareToInstall()
-      this.options.updater.quitAndInstall(false, true)
+      this.options.updater.quitAndInstall(true, true)
     } catch (error) {
       this.updateState({ status: 'error', error: updateDownloadErrorMessage(error) })
       throw error

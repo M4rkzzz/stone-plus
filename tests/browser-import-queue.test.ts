@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -13,11 +13,12 @@ afterEach(async () => {
 })
 
 describe('BrowserImportQueue', () => {
-  it('keeps a downloaded JSON in memory and removes the temporary file', async () => {
+  it('keeps a downloaded JSON in memory and in the persistent save-as cache', async () => {
     const root = await mkdtemp(join(tmpdir(), 'stone-browser-import-'))
     temporaryDirectories.push(root)
     const browserSession = new EventEmitter()
-    const queue = new BrowserImportQueue(join(root, 'staging'))
+    const cacheDirectory = join(root, 'cache')
+    const queue = new BrowserImportQueue(join(root, 'staging'), cacheDirectory)
     queue.watch(browserSession as unknown as Session)
     const download = new FakeDownload('accounts.json', 'application/json', 'https://aiprobe.top/download?token=secret')
 
@@ -32,7 +33,17 @@ describe('BrowserImportQueue', () => {
       items: [expect.objectContaining({ fileName: 'accounts.json', sourceUrl: 'https://aiprobe.top/download', status: 'ready' })]
     })
     expect(queue.getReadyItems(queue.getState().items.map((item) => item.id))[0].content).toContain('test-token')
+    const cached = queue.getCacheState().items[0]
+    expect(cached).toMatchObject({ fileName: 'accounts.json', sizeBytes: expect.any(Number) })
+    const savedPath = join(root, 'saved.json')
+    await queue.saveCachedItem(cached.id, savedPath)
+    expect(await readFile(savedPath, 'utf8')).toContain('test-token')
     await queue.close()
+
+    const restarted = new BrowserImportQueue(join(root, 'staging-restarted'), cacheDirectory)
+    expect(restarted.getState().readyCount).toBe(0)
+    expect(restarted.getCacheState().items).toEqual([expect.objectContaining({ fileName: 'accounts.json' })])
+    await restarted.close()
   })
 
   it('marks invalid JSON as failed instead of exposing it for import', async () => {
@@ -50,6 +61,7 @@ describe('BrowserImportQueue', () => {
 
     expect(queue.getState().items[0]).toMatchObject({ status: 'failed', error: '下载内容不是有效 JSON。' })
     expect(() => queue.getReadyItems([queue.getState().items[0].id])).toThrow('尚未下载完成')
+    expect(queue.getCacheState().items).toHaveLength(0)
     await queue.close()
   })
 })

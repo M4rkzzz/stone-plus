@@ -27,7 +27,6 @@ export {
   openAICompatibleAdapter
 }
 export { classifyProviderFailure, parseRetryAfter } from './failure'
-export { getProviderPreset, providerPresets } from './presets'
 export {
   applyChatGptCodexHeaders,
   applyChatGptCodexSearchHeaders,

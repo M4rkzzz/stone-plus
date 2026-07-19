@@ -16,13 +16,16 @@ import {
   Settings,
   Stethoscope,
   Wrench,
+  Waypoints,
   Square,
   X,
 } from 'lucide-react'
 import type { AppSnapshot, AppUpdateState } from '@shared/types'
+import { listRouteSources } from '@shared/route-sources'
 import { getGatewayApi } from './api'
 import { OverviewView } from './views/OverviewView'
 import { ProvidersView } from './views/ProvidersView'
+import { ProxyView } from './views/ProxyView'
 import { PoolsView } from './views/PoolsView'
 import { RoutesView } from './views/RoutesView'
 import { RequestsView } from './views/RequestsView'
@@ -32,36 +35,44 @@ import { TunnelView } from './views/TunnelView'
 import { SessionRepairView } from './views/SessionRepairView'
 import { NetworkTestView } from './views/NetworkTestView'
 import { BrowserView } from './views/BrowserView'
+import { SetupWizardView } from './views/SetupWizardView'
 import { gatewayBaseUrl } from './ui'
 import { StoneMark } from './StoneMark'
+import { summarizeAccountQuota } from './account-quota'
 import {
-  UpdateBanner,
   UpdateDialog,
   type AppUpdateController,
   type UpdateAction,
 } from './UpdateDialog'
 
-export type PageId = 'overview' | 'providers' | 'pools' | 'routes' | 'clients' | 'session-repair' | 'tunnel' | 'browser' | 'diagnostics' | 'requests' | 'settings'
+export type PageId = 'overview' | 'setup' | 'providers' | 'proxies' | 'pools' | 'routes' | 'clients' | 'session-repair' | 'tunnel' | 'browser' | 'diagnostics' | 'requests' | 'settings'
 export type ActionRunner = (key: string, operation: () => Promise<AppSnapshot>) => Promise<boolean>
 
-const navigation: Array<{ id: PageId; label: string; icon: typeof Activity }> = [
+const desktopTunnelSupported = !window.stone || window.stonePlatform === 'win32'
+
+const allNavigation: Array<{ id: PageId; label: string; icon: typeof Activity }> = [
   { id: 'overview', label: '总览', icon: CircleGauge },
-  { id: 'providers', label: '供应商', icon: Boxes },
+  { id: 'providers', label: '账号与中转', icon: Boxes },
+  { id: 'proxies', label: '出口代理', icon: Waypoints },
   { id: 'pools', label: '号池', icon: Network },
   { id: 'routes', label: '路由', icon: RouteIcon },
-  { id: 'clients', label: '客户端', icon: MonitorCog },
+  { id: 'clients', label: '客户端配置', icon: MonitorCog },
   { id: 'session-repair', label: '会话修复', icon: Wrench },
   { id: 'tunnel', label: '内网穿透', icon: Share2 },
   { id: 'browser', label: '内置浏览器', icon: Globe2 },
   { id: 'diagnostics', label: '诊断', icon: Stethoscope },
-  { id: 'requests', label: '请求', icon: Activity },
+  { id: 'requests', label: '请求记录', icon: Activity },
   { id: 'settings', label: '设置', icon: Settings },
 ]
 
+const navigation = allNavigation.filter((item) => desktopTunnelSupported || item.id !== 'tunnel')
+
 function pageFromHash(): PageId {
   const candidate = window.location.hash.slice(1) as PageId
-  return navigation.some((item) => item.id === candidate) ? candidate : 'overview'
+  return candidate === 'setup' || navigation.some((item) => item.id === candidate) ? candidate : 'overview'
 }
+
+const SETUP_AUTO_SHOWN_STORAGE_KEY = 'stone.setup.auto-shown.v1'
 
 function LoadingScreen() {
   return (
@@ -117,20 +128,21 @@ export default function App() {
   }, [acceptUpdateState, api])
 
   useEffect(() => {
-    if (
-      updateState?.status === 'available'
-      && updateState.release
-      && updateState.ignoredVersion !== updateState.release.version
-    ) {
-      setUpdateDialogOpen(true)
-    }
-  }, [updateState])
-
-  useEffect(() => {
     const handleHashChange = () => setPage(pageFromHash())
     window.addEventListener('hashchange', handleHashChange)
     return () => window.removeEventListener('hashchange', handleHashChange)
   }, [])
+
+  useEffect(() => {
+    if (!snapshot || page === 'setup' || window.localStorage.getItem(SETUP_AUTO_SHOWN_STORAGE_KEY) === 'true') return
+    const usableAccounts = snapshot.accounts.filter((account) => account.status !== 'disabled' && account.status !== 'expired')
+    const usableSourceIds = new Set(listRouteSources(snapshot).map((source) => source.id))
+    const hasEnabledRoute = snapshot.routes.some((route) => route.enabled && usableSourceIds.has(route.poolId))
+    if (usableAccounts.length && usableSourceIds.size && hasEnabledRoute) return
+    window.localStorage.setItem(SETUP_AUTO_SHOWN_STORAGE_KEY, 'true')
+    setPage('setup')
+    window.history.replaceState(null, '', '#setup')
+  }, [page, snapshot])
 
   useEffect(() => {
     const rebuildAfterNetworkReturn = () => {
@@ -157,6 +169,23 @@ export default function App() {
       })
     }
   }, [])
+
+  const repairSessionsAndRestartChatGpt = useCallback(async () => {
+    const key = 'chatgpt-repair-restart'
+    setBusyKeys((current) => new Set(current).add(key))
+    setError(null)
+    try {
+      await api.repairCodexSessionsAndRestartChatGpt()
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : '会话修复或 ChatGPT 重启失败')
+    } finally {
+      setBusyKeys((current) => {
+        const next = new Set(current)
+        next.delete(key)
+        return next
+      })
+    }
+  }, [api])
 
   const setActivePage = (id: PageId) => {
     setPage(id)
@@ -211,8 +240,29 @@ export default function App() {
   }, [api, runUpdateStateOperation, updateState?.release?.version])
 
   const downloadUpdate = useCallback(async () => {
-    await runUpdateStateOperation('download', () => api.downloadUpdate())
-  }, [api, runUpdateStateOperation])
+    if (snapshot && snapshot.gatewayStatus.activeRequests > 0) {
+      const confirmed = window.confirm(`当前仍有 ${snapshot.gatewayStatus.activeRequests} 个活跃请求。更新安装会关闭 Stone+ 并中断这些请求，是否继续？`)
+      if (!confirmed) return
+    }
+
+    setUpdateAction('download')
+    setUpdateError(null)
+    try {
+      const next = await api.downloadUpdate()
+      acceptUpdateState(next)
+      if (next.status !== 'downloaded') {
+        setUpdateError(next.error ?? '更新包下载失败，请稍后重试')
+        return
+      }
+
+      setUpdateAction('install')
+      await api.installUpdate()
+    } catch (cause) {
+      setUpdateError(cause instanceof Error ? cause.message : '无法下载或安装应用更新')
+    } finally {
+      setUpdateAction(null)
+    }
+  }, [acceptUpdateState, api, snapshot])
 
   const installUpdate = useCallback(async () => {
     if (snapshot && snapshot.gatewayStatus.activeRequests > 0) {
@@ -270,7 +320,21 @@ export default function App() {
   }
 
   const gatewayBusy = busyKeys.has('gateway-power')
+  const chatGptRepairBusy = busyKeys.has('chatgpt-repair-restart')
   const endpoint = gatewayBaseUrl(snapshot.gatewayStatus.host, snapshot.gatewayStatus.port)
+  const accountQuota = summarizeAccountQuota(snapshot.accounts)
+  const accountQuotaPercent = accountQuota ? Math.round(accountQuota.percent) : undefined
+  const updateReleaseVisible = Boolean(
+    updateState?.release
+    && updateState.ignoredVersion !== updateState.release.version
+    && (
+      updateState.status === 'available'
+      || updateState.status === 'downloading'
+      || updateState.status === 'downloaded'
+      || updateState.status === 'installing'
+      || updateState.status === 'error'
+    )
+  )
 
   return (
     <div className={`app-shell ${sidebarCollapsed ? 'app-shell--collapsed' : ''}`}>
@@ -279,12 +343,36 @@ export default function App() {
         <div className="sidebar__brand">
           <StoneMark />
           <div className="sidebar__brand-text">
-            <strong>Stone+</strong>
+            <div className="sidebar__brand-title">
+              <strong>Stone+</strong>
+              {updateReleaseVisible && (
+                <button
+                  className="brand-update-link"
+                  type="button"
+                  title={`更新到 v${updateState?.release?.version}`}
+                  onClick={() => setUpdateDialogOpen(true)}
+                >
+                  更新
+                </button>
+              )}
+            </div>
             <span>Local Gateway</span>
           </div>
           <button className="icon-button sidebar__mobile-close" type="button" onClick={() => setMobileNavOpen(false)} title="关闭导航">
             <X size={18} />
           </button>
+        </div>
+
+        <div
+          className={`sidebar-quota ${accountQuota ? '' : 'sidebar-quota--empty'}`}
+          title={accountQuota ? `${accountQuota.accountCount} 个可用账号 · 总体剩余额度 ${accountQuotaPercent}%` : '暂无可统计的账号额度'}
+          aria-label={accountQuota ? `总体剩余额度 ${accountQuotaPercent}%` : '总体剩余额度未知'}
+        >
+          <span className="sidebar-quota__label">额度</span>
+          <span className="sidebar-quota__track" aria-hidden="true">
+            <i style={{ width: `${accountQuotaPercent ?? 0}%` }} />
+          </span>
+          <strong>{accountQuotaPercent === undefined ? '—' : `${accountQuotaPercent}%`}</strong>
         </div>
 
         <nav className="sidebar__nav" aria-label="主导航">
@@ -332,6 +420,11 @@ export default function App() {
           </div>
 
           <div className="topbar__right">
+            {(page === 'overview' || page === 'providers') && (
+              <button className="button button--secondary topbar__setup" type="button" onClick={() => setActivePage('setup')}>
+                <Play size={15} />配置向导
+              </button>
+            )}
             {snapshot.gatewayStatus.running && (
               <div className="active-request-indicator" title="当前活跃请求">
                 <Activity size={15} />
@@ -351,6 +444,16 @@ export default function App() {
               {gatewayBusy ? <RefreshCw size={16} className="spin" /> : snapshot.gatewayStatus.running ? <Square size={14} /> : <Play size={16} />}
               {snapshot.gatewayStatus.running ? '停止' : '启动'}
             </button>
+            <button
+              className="topbar__chatgpt-restart"
+              type="button"
+              aria-label="修复会话并重启 ChatGPT"
+              title="修复 Codex 会话并重启 ChatGPT"
+              disabled={chatGptRepairBusy}
+              onClick={() => void repairSessionsAndRestartChatGpt()}
+            >
+              {chatGptRepairBusy ? <RefreshCw size={17} className="spin" /> : <ChatGptMark />}
+            </button>
           </div>
         </header>
 
@@ -361,27 +464,16 @@ export default function App() {
           </div>
         )}
 
-        {updateState && (
-          <UpdateBanner
-            state={updateState}
-            action={updateAction}
-            onOpen={() => setUpdateDialogOpen(true)}
-            onCheck={checkForUpdates}
-            onIgnore={ignoreUpdate}
-            onDownload={downloadUpdate}
-            onInstall={installUpdate}
-            onOpenPage={openUpdatePage}
-          />
-        )}
-
         <main className="page-content" onScroll={revealContentScrollbar}>
           {page === 'overview' && <OverviewView snapshot={snapshot} navigate={setActivePage} />}
+          {page === 'setup' && <SetupWizardView snapshot={snapshot} api={api} onExit={() => setActivePage('overview')} />}
           {page === 'providers' && <ProvidersView snapshot={snapshot} api={api} runAction={runAction} busyKeys={busyKeys} />}
+          {page === 'proxies' && <ProxyView snapshot={snapshot} api={api} runAction={runAction} busyKeys={busyKeys} />}
           {page === 'pools' && <PoolsView snapshot={snapshot} api={api} runAction={runAction} busyKeys={busyKeys} />}
           {page === 'routes' && <RoutesView snapshot={snapshot} api={api} runAction={runAction} busyKeys={busyKeys} />}
           {page === 'clients' && <ClientsView snapshot={snapshot} api={api} />}
           {page === 'session-repair' && <SessionRepairView api={api} />}
-          {page === 'tunnel' && <TunnelView snapshot={snapshot} api={api} />}
+          {desktopTunnelSupported && page === 'tunnel' && <TunnelView snapshot={snapshot} api={api} />}
           {page === 'browser' && <BrowserView snapshot={snapshot} api={api} />}
           {page === 'diagnostics' && <NetworkTestView snapshot={snapshot} api={api} />}
           {page === 'requests' && <RequestsView snapshot={snapshot} api={api} runAction={runAction} busyKeys={busyKeys} />}
@@ -401,5 +493,16 @@ export default function App() {
         onOpenPage={openUpdatePage}
       />
     </div>
+  )
+}
+
+function ChatGptMark() {
+  return (
+    <svg className="chatgpt-mark" viewBox="0 0 24 24" aria-hidden="true">
+      <path
+        fill="currentColor"
+        d="M22.2819 9.8211a5.9847 5.9847 0 0 0-.5157-4.9108 6.0462 6.0462 0 0 0-6.5098-2.9A6.0651 6.0651 0 0 0 4.9807 4.1818a5.9847 5.9847 0 0 0-3.9977 2.9 6.0462 6.0462 0 0 0 .7427 7.0966 5.98 5.98 0 0 0 .511 4.9107 6.051 6.051 0 0 0 6.5146 2.9001A5.9847 5.9847 0 0 0 13.2599 24a6.0557 6.0557 0 0 0 5.7718-4.2058 5.9894 5.9894 0 0 0 3.9977-2.9001 6.0557 6.0557 0 0 0-.7475-7.0729zm-9.022 12.6081a4.4755 4.4755 0 0 1-2.8764-1.0408l.1419-.0804 4.7783-2.7582a.7948.7948 0 0 0 .3927-.6813v-6.7369l2.02 1.1686a.071.071 0 0 1 .038.052v5.5826a4.504 4.504 0 0 1-4.4945 4.4944zm-9.6607-4.1254a4.4708 4.4708 0 0 1-.5346-3.0137l.142.0852 4.783 2.7582a.7712.7712 0 0 0 .7806 0l5.8428-3.3685v2.3324a.0804.0804 0 0 1-.0332.0615L9.74 19.9502a4.4992 4.4992 0 0 1-6.1408-1.6464zM2.3408 7.8956a4.485 4.485 0 0 1 2.3655-1.9728V11.6a.7664.7664 0 0 0 .3879.6765l5.8144 3.3543-2.0201 1.1685a.0757.0757 0 0 1-.071 0l-4.8303-2.7865A4.504 4.504 0 0 1 2.3408 7.872zm16.5963 3.8558L13.1038 8.364 15.1192 7.2a.0757.0757 0 0 1 .071 0l4.8303 2.7913a4.4944 4.4944 0 0 1-.6765 8.1042v-5.6772a.79.79 0 0 0-.407-.667zm2.0107-3.0231l-.142-.0852-4.7735-2.7818a.7759.7759 0 0 0-.7854 0L9.409 9.2297V6.8974a.0662.0662 0 0 1 .0284-.0615l4.8303-2.7866a4.4992 4.4992 0 0 1 6.6802 4.66zM8.3065 12.863l-2.02-1.1638a.0804.0804 0 0 1-.038-.0567V6.0742a4.4992 4.4992 0 0 1 7.3757-3.4537l-.142.0805L8.704 5.459a.7948.7948 0 0 0-.3927.6813zm1.0976-2.3654l2.602-1.4998 2.6069 1.4998v2.9994l-2.5974 1.4997-2.6067-1.4997Z"
+      />
+    </svg>
   )
 }

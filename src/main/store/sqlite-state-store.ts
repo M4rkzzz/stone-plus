@@ -5,7 +5,7 @@ import { backup, DatabaseSync } from 'node:sqlite'
 import { randomUUID } from 'node:crypto'
 import type { CodexQuotaHistoryPoint } from '@shared/types'
 
-const CURRENT_SCHEMA_VERSION = 5
+const CURRENT_SCHEMA_VERSION = 6
 const STATE_INITIALIZED_KEY = 'state_initialized'
 const LEGACY_IMPORT_KEY = 'legacy_json_import'
 
@@ -133,6 +133,28 @@ const migrations: readonly Migration[] = [
           ON account_codex_quota_samples (account_id, observed_at);
       `)
     }
+  },
+  {
+    version: 6,
+    up(database): void {
+      database.exec(`
+        CREATE TABLE IF NOT EXISTS account_tags (
+          id TEXT PRIMARY KEY,
+          ordinal INTEGER NOT NULL UNIQUE,
+          payload TEXT NOT NULL
+        );
+      `)
+      const timestamp = Date.now()
+      const insert = database.prepare('INSERT OR IGNORE INTO account_tags (id, ordinal, payload) VALUES (?, ?, ?)')
+      ;[
+        { id: 'tag-k12', name: 'K12' },
+        { id: 'tag-plus', name: 'Plus' }
+      ].forEach((tag, ordinal) => insert.run(tag.id, ordinal, JSON.stringify({
+        ...tag,
+        createdAt: timestamp,
+        updatedAt: timestamp
+      })))
+    }
   }
 ]
 
@@ -151,6 +173,7 @@ interface SqlitePersistedShape {
   version: number
   providers: Identified[]
   accounts: Identified[]
+  accountTags: Identified[]
   proxies: Identified[]
   pools: Identified[]
   routes: Identified[]
@@ -604,6 +627,7 @@ export class SqliteStateStore<T extends SqlitePersistedShape> {
     try {
       replaceJsonRows(database, 'providers', state.providers)
       replaceJsonRows(database, 'accounts', state.accounts)
+      replaceJsonRows(database, 'account_tags', state.accountTags ?? [])
       replaceJsonRows(database, 'proxies', state.proxies)
       replaceJsonRows(database, 'pools', state.pools)
       replaceJsonRows(database, 'routes', state.routes)
@@ -631,6 +655,9 @@ export class SqliteStateStore<T extends SqlitePersistedShape> {
       version: this.options.initialData.version,
       providers: readJsonRows(database, 'providers'),
       accounts: readJsonRows(database, 'accounts'),
+      accountTags: tableExists(database, 'account_tags')
+        ? readJsonRows(database, 'account_tags')
+        : [],
       proxies: readJsonRows(database, 'proxies'),
       pools: readJsonRows(database, 'pools'),
       routes: readJsonRows(database, 'routes'),
@@ -835,4 +862,4 @@ function tableExists(database: DatabaseSync, table: string): boolean {
   return row?.found === 1
 }
 
-type JsonTable = 'providers' | 'accounts' | 'proxies' | 'pools' | 'routes' | 'request_logs' | 'client_profiles' | 'health_events'
+type JsonTable = 'providers' | 'accounts' | 'account_tags' | 'proxies' | 'pools' | 'routes' | 'request_logs' | 'client_profiles' | 'health_events'

@@ -1,5 +1,10 @@
 export type Protocol = 'anthropic-messages' | 'openai-responses' | 'openai-chat' | 'gemini'
 
+/** Protocols whose OpenAI-compatible request body supports the priority service tier. */
+export function supportsFastServiceTier(protocol: Protocol): boolean {
+  return protocol === 'openai-responses' || protocol === 'openai-chat'
+}
+
 export type ProviderKind =
   | 'anthropic'
   | 'openai'
@@ -7,6 +12,8 @@ export type ProviderKind =
   | 'openai-compatible'
   | 'anthropic-compatible'
   | 'custom'
+
+export type UpstreamSourceType = 'oauth-system' | 'official-api' | 'relay'
 
 export type AccountStatus = 'active' | 'cooldown' | 'disabled' | 'expired' | 'checking'
 export type AccountCircuitState = 'closed' | 'open' | 'half-open'
@@ -187,12 +194,22 @@ export interface ClientConfigRestoreResult {
 export interface ProviderDefinition {
   id: string
   name: string
+  sourceType: UpstreamSourceType
   kind: ProviderKind
   baseUrl: string
   protocol: Protocol
   icon?: string
   color?: string
   models: string[]
+  /** Force the OpenAI priority service tier for this standalone relay source. */
+  forceFastMode?: boolean
+  createdAt: number
+  updatedAt: number
+}
+
+export interface AccountTagDefinition {
+  id: string
+  name: string
   createdAt: number
   updatedAt: number
 }
@@ -207,6 +224,7 @@ export interface Account {
   chatgptAccountId?: string
   credentialExpiresAt?: number
   renewable?: boolean
+  tagId?: string
   status: AccountStatus
   priority: number
   weight: number
@@ -307,13 +325,18 @@ export interface CodexQuotaHistoryPoint {
 export interface PoolMember {
   accountId: string
   enabled: boolean
+  weight?: number
+  order?: number
 }
 
-export type PoolStrategy = 'balanced' | 'autobalanced' | 'priority' | 'round-robin' | 'weighted-random'
+export type PoolKind = 'standard' | 'relay-aggregate'
+
+export type PoolStrategy = 'balanced' | 'autobalanced' | 'priority' | 'round-robin' | 'weighted-random' | 'weighted-round-robin'
 
 export interface Pool {
   id: string
   name: string
+  kind: PoolKind
   protocol: Protocol
   strategy: PoolStrategy
   members: PoolMember[]
@@ -525,6 +548,7 @@ export interface ObservabilitySummary {
 export interface AppSnapshot {
   providers: ProviderDefinition[]
   accounts: PublicAccount[]
+  accountTags: AccountTagDefinition[]
   proxies: PublicProxyDefinition[]
   pools: Pool[]
   routes: Route[]
@@ -547,6 +571,7 @@ export interface AppSnapshot {
 export interface ProviderInput {
   id?: string
   name: string
+  sourceType?: UpstreamSourceType
   kind: ProviderKind
   baseUrl: string
   protocol: Protocol
@@ -564,6 +589,17 @@ export interface AccountInput {
   modelPolicy?: ModelPolicy
   modelAllowlist: string[]
   proxyId?: string
+  tagId?: string | null
+}
+
+export interface AccountTagInput {
+  id?: string
+  name: string
+}
+
+export interface AccountTagAssignmentInput {
+  accountIds: string[]
+  tagId: string | null
 }
 
 export interface ProxyInput {
@@ -578,9 +614,10 @@ export interface ProxyInput {
 }
 
 export interface ChatGptAccountImportInput {
-  providerId: string
   content: string
   name?: string
+  tagId: string | null
+  poolId: string | null
   progressId?: string
   /** Preserve a valid file proxy by default, explicitly clear it, or override the whole batch. */
   proxyMode?: ChatGptAccountImportProxyMode
@@ -596,16 +633,50 @@ export interface ChatGptAccountImportResult {
   updatedAccountIds: string[]
   warnings: string[]
   detectionResults: ChatGptAccountDetectionResult[]
+  assignmentSummary: ChatGptAccountImportAssignmentSummary
+}
+
+export interface ChatGptOAuthStartInput {
+  name?: string
+  tagId: string | null
+  poolId: string | null
+  proxyMode?: ChatGptAccountImportProxyMode
+  proxyId?: string
+}
+
+export interface ChatGptOAuthSessionStart {
+  sessionId: string
+  authorizationUrl: string
+  redirectUri: string
+  expiresAt: number
+  loopbackListening: boolean
+  status: 'waiting'
+}
+
+export interface ChatGptOAuthCallbackInput {
+  sessionId: string
+  callbackUrl: string
+}
+
+export interface ChatGptAccountImportAssignmentSummary {
+  tagId: string | null
+  tagUpdatedAccountCount: number
+  poolId: string | null
+  poolMembersAdded: number
+  poolMembersAlreadyPresent: number
+  poolMembersSkipped: number
+  poolAppendError?: string
 }
 
 export interface ChatGptAccountFileImportInput {
-  providerId: string
+  tagId: string | null
+  poolId: string | null
   proxyMode?: ChatGptAccountImportProxyMode
   proxyId?: string
   progressId?: string
 }
 
-export type AccountImportProgressPhase = 'importing' | 'refreshing' | 'complete'
+export type AccountImportProgressPhase = 'importing' | 'refreshing' | 'assigning' | 'complete'
 
 export interface AccountImportProgress {
   progressId: string
@@ -645,6 +716,7 @@ export interface ChatGptAccountFileImportResult {
   updatedAccountIds: string[]
   detectionResults: ChatGptAccountDetectionResult[]
   warnings: string[]
+  assignmentSummary: ChatGptAccountImportAssignmentSummary
 }
 
 export type BrowserPendingJsonStatus = 'downloading' | 'ready' | 'failed'
@@ -664,6 +736,23 @@ export interface BrowserImportQueueState {
   readyCount: number
   totalBytes: number
   revision: number
+}
+
+export interface BrowserCachedJsonItem {
+  id: string
+  fileName: string
+  receivedAt: number
+  sizeBytes: number
+}
+
+export interface BrowserJsonCacheState {
+  items: BrowserCachedJsonItem[]
+  totalBytes: number
+}
+
+export interface BrowserJsonCacheSaveResult {
+  cancelled: boolean
+  filePath?: string
 }
 
 export interface BrowserOpenTabRequest {
@@ -695,6 +784,7 @@ export interface ChatGptAccountExportResult {
 export interface PoolInput {
   id?: string
   name: string
+  kind?: PoolKind
   protocol: Protocol
   strategy: PoolStrategy
   accountIds: string[]
@@ -710,20 +800,175 @@ export interface PoolInput {
   proxyId?: string
 }
 
-export interface ProviderPreset {
-  id: string
+export interface ApiSourceInput {
+  id?: string
   name: string
+  sourceType: Exclude<UpstreamSourceType, 'oauth-system'>
   kind: ProviderKind
   baseUrl: string
   protocol: Protocol
+  credential?: string
   models: string[]
+  defaultModel?: string
+  priority: number
+  weight: number
+  maxConcurrency: number
+  proxyId?: string
+  unlinkIncompatiblePools?: boolean
 }
 
-export interface ProviderOnboardingInput {
-  presetId: string
-  providerName?: string
-  accountName: string
-  credential: string
+export interface ApiSourceProbeInput {
+  id?: string
+  name: string
+  sourceType: Exclude<UpstreamSourceType, 'oauth-system'>
+  kind: ProviderKind
+  baseUrl: string
+  protocol: Protocol
+  credential?: string
+  model?: string
+  proxyId?: string
+}
+
+export type ApiSourceProbeStageId = 'network' | 'authentication' | 'models' | 'generation'
+export type ApiSourceProbeStageStatus = 'success' | 'warning' | 'error' | 'skipped'
+
+export interface ApiSourceProbeStage {
+  id: ApiSourceProbeStageId
+  status: ApiSourceProbeStageStatus
+  message: string
+  latencyMs?: number
+}
+
+export interface ApiSourceProbeResult {
+  ok: boolean
+  stages: ApiSourceProbeStage[]
+  models: string[]
+  latencyMs?: number
+  error?: string
+  warnings: string[]
+}
+
+export interface AggregateRelayMemberInput {
+  accountId: string
+  order: number
+  weight: number
+}
+
+export interface AggregateRelayInput {
+  id?: string
+  name: string
+  protocol: Protocol
+  strategy: Extract<PoolStrategy, 'priority' | 'round-robin' | 'weighted-round-robin'>
+  members: AggregateRelayMemberInput[]
+  stickySessions: boolean
+  stickyTtlMinutes: number
+  maxRetries: number
+  proxyId?: string
+}
+
+export interface RouteSourceFastModeInput {
+  sourceId: string
+  enabled: boolean
+}
+
+export type SetupWizardStep =
+  | 'scan'
+  | 'source'
+  | 'source-config'
+  | 'network'
+  | 'upstream-test'
+  | 'client'
+  | 'routing'
+  | 'gateway'
+  | 'verify'
+  | 'client-config'
+  | 'complete'
+
+/** Credential-free source selection used only to resume the setup UI. */
+export type SetupSourceMethod =
+  | 'existing'
+  | 'oauth'
+  | 'token-json'
+  | 'official-api'
+  | 'relay'
+  | 'aggregate'
+
+export interface SetupWizardState {
+  sessionId: string
+  step: SetupWizardStep
+  completed: boolean
+  dismissed: boolean
+  sourceType?: UpstreamSourceType
+  sourceMethod?: SetupSourceMethod
+  sourceId?: string
+  /** Local Account Tag resource id only; never OAuth/session material. */
+  tagId?: string
+  poolId?: string
+  routeId?: string
+  client?: RouteClient
+  model?: string
+  proxyId?: string
+  lastError?: string
+  /** Written only by the main process after a successful loopback end-to-end request. */
+  verifiedAt?: number
+  createdAt: number
+  updatedAt: number
+}
+
+export interface SetupWizardProgressInput {
+  sessionId?: string
+  step: SetupWizardStep
+  sourceType?: UpstreamSourceType
+  sourceMethod?: SetupSourceMethod | null
+  sourceId?: string | null
+  tagId?: string | null
+  poolId?: string | null
+  routeId?: string | null
+  client?: RouteClient
+  model?: string
+  proxyId?: string | null
+  lastError?: string
+}
+
+export interface SetupRoutingInput {
+  sessionId: string
+  sourceId: string
+  client: RouteClient
+  model: string
+  aggregatePoolId?: string
+}
+
+export interface SetupRoutingResult {
+  snapshot: AppSnapshot
+  poolId: string
+  routeId: string
+  createdPool: boolean
+}
+
+export interface EnsureGatewayRunningInput {
+  host?: string
+  port?: number
+}
+
+export interface EnsureGatewayRunningResult {
+  snapshot: AppSnapshot
+  host: string
+  port: number
+  changedPort: boolean
+  started: boolean
+}
+
+export interface SetupRouteVerificationInput {
+  client: RouteClient
+  model: string
+}
+
+export interface SetupRouteVerificationResult {
+  ok: boolean
+  latencyMs: number
+  status?: number
+  responsePreview?: string
+  error?: string
 }
 
 export interface ProfileBundle {
@@ -856,6 +1101,18 @@ export interface CodexSessionRepairResult {
   retentionWarning?: string
 }
 
+export interface ChatGptDesktopRestartState {
+  wasRunning: boolean
+  /** AppUserModelId or executable path captured before ChatGPT is closed. */
+  launchTarget: string
+}
+
+export interface CodexSessionRepairRestartResult {
+  repair: CodexSessionRepairResult
+  chatGptWasRunning: boolean
+  chatGptRestarted: boolean
+}
+
 export type NetworkDiagnosticStatus = 'success' | 'warning' | 'error' | 'skipped'
 
 export interface NetworkDiagnosticInput {
@@ -894,13 +1151,26 @@ export interface GatewayApi {
   refreshProviderModels(id: string): Promise<AppSnapshot>
   deleteProvider(id: string): Promise<AppSnapshot>
   saveAccount(input: AccountInput): Promise<AppSnapshot>
+  saveAccountTag(input: AccountTagInput): Promise<AppSnapshot>
+  deleteAccountTag(id: string): Promise<AppSnapshot>
+  setAccountTags(input: AccountTagAssignmentInput): Promise<AppSnapshot>
   refreshAccountModels(id: string): Promise<AppSnapshot>
   testAccountModel(accountId: string, model: string): Promise<AccountModelTestResult>
   importChatGptAccounts(input: ChatGptAccountImportInput): Promise<ChatGptAccountImportResult>
   importChatGptAccountFiles(input: ChatGptAccountFileImportInput): Promise<ChatGptAccountFileImportResult>
+  startChatGptOAuth(input: ChatGptOAuthStartInput): Promise<ChatGptOAuthSessionStart>
+  openChatGptOAuth(sessionId: string): Promise<void>
+  waitChatGptOAuth(sessionId: string): Promise<ChatGptAccountImportResult>
+  submitChatGptOAuthCallback(input: ChatGptOAuthCallbackInput): Promise<void>
+  /** False means token exchange crossed the persistence commit boundary. */
+  cancelChatGptOAuth(sessionId: string): Promise<boolean>
   getBrowserImportQueue(): Promise<BrowserImportQueueState>
   removeBrowserImportItem(id: string): Promise<BrowserImportQueueState>
   clearBrowserImportQueue(): Promise<BrowserImportQueueState>
+  getBrowserJsonCache(): Promise<BrowserJsonCacheState>
+  saveBrowserJsonCacheItem(id: string): Promise<BrowserJsonCacheSaveResult>
+  removeBrowserJsonCacheItem(id: string): Promise<BrowserJsonCacheState>
+  clearBrowserJsonCache(): Promise<BrowserJsonCacheState>
   importBrowserJsonQueue(input: BrowserJsonImportInput): Promise<ChatGptAccountFileImportResult>
   exportChatGptAccounts(input: ChatGptAccountExportInput): Promise<ChatGptAccountExportResult>
   deleteAccount(id: string): Promise<AppSnapshot>
@@ -910,6 +1180,18 @@ export interface GatewayApi {
   checkProxy(id: string): Promise<AppSnapshot>
   savePool(input: PoolInput): Promise<AppSnapshot>
   deletePool(id: string): Promise<AppSnapshot>
+  setRouteSourceFastMode(input: RouteSourceFastModeInput): Promise<AppSnapshot>
+  saveApiSource(input: ApiSourceInput): Promise<AppSnapshot>
+  probeApiSource(input: ApiSourceProbeInput): Promise<ApiSourceProbeResult>
+  deleteApiSource(id: string): Promise<AppSnapshot>
+  saveAggregateRelay(input: AggregateRelayInput): Promise<AppSnapshot>
+  getSetupWizardState(): Promise<SetupWizardState | null>
+  saveSetupWizardProgress(input: SetupWizardProgressInput): Promise<SetupWizardState>
+  discardSetupWizard(): Promise<void>
+  completeSetupWizard(sessionId: string): Promise<void>
+  applySetupRouting(input: SetupRoutingInput): Promise<SetupRoutingResult>
+  ensureGatewayRunning(input?: EnsureGatewayRunningInput): Promise<EnsureGatewayRunningResult>
+  verifySetupRoute(input: SetupRouteVerificationInput): Promise<SetupRouteVerificationResult>
   updateRoute(route: Route): Promise<AppSnapshot>
   updateGateway(settings: GatewaySettings): Promise<AppSnapshot>
   startGateway(): Promise<AppSnapshot>
@@ -922,8 +1204,6 @@ export interface GatewayApi {
   getAccountCodexQuotaHistory(id: string, from?: number, to?: number): Promise<CodexQuotaHistoryPoint[]>
   clearLogs(): Promise<AppSnapshot>
   clearHealthEvents(): Promise<AppSnapshot>
-  listProviderPresets(): Promise<ProviderPreset[]>
-  onboardProvider(input: ProviderOnboardingInput): Promise<AppSnapshot>
   saveClientProfile(input: ClientConfigProfileInput): Promise<AppSnapshot>
   deleteClientProfile(id: string): Promise<AppSnapshot>
   exportClientProfile(id: string): Promise<ProfileBundle>
@@ -956,6 +1236,7 @@ export interface GatewayApi {
   inspectCodexSessionRepair(): Promise<CodexSessionRepairOverview>
   previewCodexSessionRepair(targetProvider: string): Promise<CodexSessionRepairPreview>
   repairCodexSessions(targetProvider: string, expectedRevision: string): Promise<CodexSessionRepairResult>
+  repairCodexSessionsAndRestartChatGpt(): Promise<CodexSessionRepairRestartResult>
   onSnapshot(listener: (snapshot: AppSnapshot) => void): () => void
   onAccountImportProgress(listener: (progress: AccountImportProgress) => void): () => void
   onBrowserImportQueue(listener: (state: BrowserImportQueueState) => void): () => void

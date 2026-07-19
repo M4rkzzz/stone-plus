@@ -2,13 +2,24 @@ import { safeStorage } from 'electron'
 import { createHash, randomUUID } from 'node:crypto'
 import { isAbsolute, join, normalize } from 'node:path'
 import { valid as validSemver } from 'semver'
-import { clientNativeProtocols } from '@shared/types'
+import { clientNativeProtocols, supportsFastServiceTier } from '@shared/types'
 import { summarizeOpenAiTokenCosts } from '@shared/openai-pricing'
+import {
+  appendRuntimeRouteSourcePools,
+  hasRouteSourceIdCollision,
+  isAvailableRouteAccount,
+  resolveRouteSource,
+} from '@shared/route-sources'
 import type {
   Account,
   AccountCodexQuotaSnapshot,
   AccountInput,
   AccountQuotaSnapshot,
+  AccountTagAssignmentInput,
+  AccountTagDefinition,
+  AccountTagInput,
+  AggregateRelayInput,
+  ApiSourceInput,
   AppSnapshot,
   ClientConfigProfile,
   ClientConfigProfileInput,
@@ -22,6 +33,7 @@ import type {
   ModelPolicy,
   Pool,
   PoolInput,
+  PoolMember,
   ProxyDefinition,
   ProxyInput,
   PublicProxyDefinition,
@@ -29,6 +41,11 @@ import type {
   ProviderInput,
   RequestLog,
   Route,
+  RouteSourceFastModeInput,
+  SetupRoutingInput,
+  SetupRoutingResult,
+  SetupWizardProgressInput,
+  SetupWizardState,
   TokenRateSeries
 } from '@shared/types'
 import {
@@ -45,6 +62,15 @@ import {
   parseChatGptAccountImport,
   serializeChatGptCredential
 } from '../auth'
+import { applySetupRoutingDraft } from '../setup/setup-routing'
+import { SetupWizardRepository } from '../setup/setup-state'
+import {
+  deleteApiSourceDraft,
+  saveAggregateRelayDraft,
+  saveApiSourceDraft,
+  setRouteSourceFastModeDraft,
+  type SavedApiSourceDraft,
+} from '../sources/source-state'
 
 const DEFAULT_GATEWAY: GatewaySettings = {
   host: '127.0.0.1',
@@ -74,6 +100,10 @@ const FITNESS_HISTORY_WINDOW_MS = 30 * 24 * 60 * 60_000
 const FITNESS_HISTORY_ROWS_PER_ACCOUNT = 400
 const IGNORED_UPDATE_VERSION_KEY = 'ignored_update_version'
 const OBSERVABILITY_CACHE_TTL_MS = 1_000
+const DEFAULT_ACCOUNT_TAGS: ReadonlyArray<Pick<AccountTagDefinition, 'id' | 'name'>> = [
+  { id: 'tag-k12', name: 'K12' },
+  { id: 'tag-plus', name: 'Plus' }
+]
 
 type AccountCheckPatch = Partial<Pick<Account,
   'status' |
@@ -90,6 +120,7 @@ type AccountCheckPatch = Partial<Pick<Account,
 
 export class AppStore {
   private readonly store: SqliteStateStore<PersistedState>
+  private readonly setupWizard: SetupWizardRepository
   private status: GatewayStatus = { ...DEFAULT_STATUS }
   private requestLogRevision = 0
   private observabilityCache?: {
@@ -111,6 +142,7 @@ export class AppStore {
       initialData: createInitialState(),
       normalize: normalizePersistedState
     })
+    this.setupWizard = new SetupWizardRepository(this.store)
   }
 
   public async initialize(): Promise<void> {
@@ -235,7 +267,10 @@ export class AppStore {
         ...proxy,
         hasPassword: Boolean(_credentialId && state.credentials[_credentialId])
       })),
-      pools: state.pools,
+      pools: appendRuntimeRouteSourcePools(
+        state.routes.map((route) => route.poolId),
+        state,
+      ),
       routes: state.routes,
       gateway: state.gateway
     }))
@@ -253,15 +288,20 @@ export class AppStore {
     const timestamp = Date.now()
     await this.store.update((state) => {
       const existing = input.id ? state.providers.find((provider) => provider.id === input.id) : undefined
+      const sourceType = input.sourceType ?? existing?.sourceType ?? inferProviderSourceType(input.kind, input.baseUrl)
       const provider: ProviderDefinition = {
         id: existing?.id ?? createId(),
         name,
+        sourceType,
         kind: input.kind,
         baseUrl: normalizeUrl(input.baseUrl),
         protocol: input.protocol,
         models: normalizeModels(input.models),
         icon: existing?.icon,
         color: existing?.color,
+        forceFastMode: sourceType === 'relay'
+          && supportsFastServiceTier(input.protocol)
+          && existing?.forceFastMode === true,
         createdAt: existing?.createdAt ?? timestamp,
         updatedAt: timestamp
       }
@@ -280,6 +320,43 @@ export class AppStore {
         throw new Error('Delete the accounts under this provider first.')
       }
       state.providers = state.providers.filter((provider) => provider.id !== id)
+      const timestamp = Date.now()
+      state.routes = state.routes.map((route) => route.poolId === id
+        ? { ...route, enabled: false, poolId: '', updatedAt: timestamp }
+        : route)
+    })
+    return this.getSnapshot()
+  }
+
+  public async saveApiSource(input: ApiSourceInput): Promise<{ snapshot: AppSnapshot; source: SavedApiSourceDraft }> {
+    let saved: SavedApiSourceDraft | undefined
+    await this.store.update((state) => {
+      saved = saveApiSourceDraft(state, input, (credential) => this.encrypt(credential))
+    })
+    if (!saved) throw new Error('API source could not be saved.')
+    return { snapshot: this.getSnapshot(), source: saved }
+  }
+
+  public getApiSourceCredential(sourceId: string): string | undefined {
+    const state = this.store.read()
+    const provider = state.providers.find((candidate) => candidate.id === sourceId)
+    if (!provider || provider.sourceType === 'oauth-system') return undefined
+    const account = state.accounts.find((candidate) => candidate.providerId === sourceId && candidate.credentialType !== 'chatgpt-oauth')
+    if (!account) return undefined
+    const encrypted = state.credentials[account.credentialId]
+    return encrypted ? this.decrypt(encrypted) : undefined
+  }
+
+  public async deleteApiSource(id: string): Promise<AppSnapshot> {
+    await this.store.update((state) => {
+      deleteApiSourceDraft(state, id)
+    })
+    return this.getSnapshot()
+  }
+
+  public async saveAggregateRelay(input: AggregateRelayInput): Promise<AppSnapshot> {
+    await this.store.update((state) => {
+      saveAggregateRelayDraft(state, input)
     })
     return this.getSnapshot()
   }
@@ -346,6 +423,9 @@ export class AppStore {
       if (existing && existing.providerId !== input.providerId && !input.credential?.trim()) {
         throw new Error('Changing an account provider requires a new credential.')
       }
+      if (input.tagId !== undefined && existing?.credentialType !== 'chatgpt-oauth') {
+        throw new Error('Only ChatGPT OAuth accounts can use account tags.')
+      }
       const accountId = existing?.id ?? createId()
       const credentialId = existing?.credentialId ?? createId()
       const credentialChanged = input.credential !== undefined
@@ -388,6 +468,7 @@ export class AppStore {
         chatgptAccountId: existing?.chatgptAccountId,
         credentialExpiresAt: existing?.credentialExpiresAt,
         renewable: existing?.renewable,
+        tagId: input.tagId === undefined ? existing?.tagId : optionalAccountTagId(input.tagId, state.accountTags),
         quotaRemaining: existing?.quotaRemaining,
         quotaUnit: existing?.quotaUnit,
         quota: existing?.quota,
@@ -418,12 +499,65 @@ export class AppStore {
     return this.getSnapshot()
   }
 
+  public async saveAccountTag(input: AccountTagInput): Promise<AppSnapshot> {
+    const name = requiredName(input.name, 'Tag name')
+    if (name.length > 24) throw new Error('Tag name cannot exceed 24 characters.')
+    const timestamp = Date.now()
+    await this.store.update((state) => {
+      const existing = input.id ? state.accountTags.find((tag) => tag.id === input.id) : undefined
+      if (input.id && !existing) throw new Error('Account tag not found.')
+      if (!existing && state.accountTags.length >= 50) throw new Error('No more than 50 account tags can be created.')
+      if (state.accountTags.some((tag) => tag.id !== existing?.id && tag.name.localeCompare(name, undefined, { sensitivity: 'accent' }) === 0)) {
+        throw new Error('An account tag with this name already exists.')
+      }
+      const tag: AccountTagDefinition = {
+        id: existing?.id ?? createId(),
+        name,
+        createdAt: existing?.createdAt ?? timestamp,
+        updatedAt: timestamp
+      }
+      if (existing) replaceById(state.accountTags, tag)
+      else state.accountTags.push(tag)
+    })
+    return this.getSnapshot()
+  }
+
+  public async deleteAccountTag(id: string): Promise<AppSnapshot> {
+    const timestamp = Date.now()
+    await this.store.update((state) => {
+      if (!state.accountTags.some((tag) => tag.id === id)) throw new Error('Account tag not found.')
+      state.accountTags = state.accountTags.filter((tag) => tag.id !== id)
+      for (const account of state.accounts) {
+        if (account.tagId !== id) continue
+        account.tagId = undefined
+        account.updatedAt = timestamp
+      }
+    })
+    return this.getSnapshot()
+  }
+
+  public async setAccountTags(input: AccountTagAssignmentInput): Promise<AppSnapshot> {
+    const accountIds = [...new Set(input.accountIds.filter((id) => typeof id === 'string' && id.trim()))]
+    if (accountIds.length === 0) throw new Error('Select at least one account.')
+    const timestamp = Date.now()
+    await this.store.update((state) => {
+      const missing = accountIds.filter((id) => !state.accounts.some((account) => account.id === id))
+      if (missing.length > 0) throw new Error('One of the selected accounts no longer exists.')
+      if (state.accounts.some((account) => accountIds.includes(account.id) && account.credentialType !== 'chatgpt-oauth')) {
+        throw new Error('Only ChatGPT OAuth accounts can use account tags.')
+      }
+      const tagId = optionalAccountTagId(input.tagId, state.accountTags)
+      const selected = new Set(accountIds)
+      for (const account of state.accounts) {
+        if (!selected.has(account.id) || account.tagId === tagId) continue
+        account.tagId = tagId
+        account.updatedAt = timestamp
+      }
+    })
+    return this.getSnapshot()
+  }
+
   public async importChatGptAccounts(input: ChatGptAccountImportInput) {
-    const provider = this.store.read().providers.find((candidate) => candidate.id === input.providerId)
-    if (!provider) throw new Error('Choose an existing provider before importing ChatGPT accounts.')
-    if (provider.kind !== 'openai' || provider.protocol !== 'openai-responses') {
-      throw new Error('ChatGPT accounts require an OpenAI Responses provider.')
-    }
     const parsed = parseChatGptAccountImport(input.content)
     const importedAccountIds: string[] = []
     const createdAccountIds: string[] = []
@@ -433,11 +567,14 @@ export class AppStore {
     const timestamp = Date.now()
     await this.store.update((state) => {
       const proxySelection = normalizeAccountImportProxySelection(input.proxyMode, input.proxyId, state.proxies)
+      const tagId = optionalAccountTagId(input.tagId ?? null, state.accountTags)
+      validateChatGptImportPoolId(input.poolId ?? null, state.pools)
+      const provider = ensureOAuthSystemProvider(state, timestamp)
       for (const [index, bundle] of parsed.accounts.entries()) {
         let existing: Account | undefined
         let existingBundle: ReturnType<typeof deserializeChatGptCredential> = undefined
         for (const candidate of state.accounts) {
-          if (candidate.providerId !== provider.id || candidate.credentialType !== 'chatgpt-oauth') continue
+          if (candidate.credentialType !== 'chatgpt-oauth') continue
           const encrypted = state.credentials[candidate.credentialId]
           const serialized = encrypted ? this.decrypt(encrypted) : undefined
           const candidateBundle = serialized ? deserializeChatGptCredential(serialized) : undefined
@@ -471,6 +608,7 @@ export class AppStore {
           chatgptAccountId: credentialBundle.accountId,
           credentialExpiresAt: credentialBundle.expiresAt,
           renewable: Boolean(credentialBundle.refreshToken),
+          tagId,
           status: credentialBundle.expiresAt <= timestamp ? 'expired' : 'active',
           priority: existing?.priority ?? 10,
           weight: existing?.weight ?? 10,
@@ -518,6 +656,40 @@ export class AppStore {
       updatedAccountIds,
       warnings
     }
+  }
+
+  public validateChatGptImportAssignments(tagId: string | null | undefined, poolId: string | null | undefined): void {
+    const state = this.store.read()
+    optionalAccountTagId(tagId ?? null, state.accountTags)
+    validateChatGptImportPoolId(poolId ?? null, state.pools)
+  }
+
+  public async addDetectedChatGptAccountsToPool(
+    poolId: string | null | undefined,
+    accountIds: string[]
+  ): Promise<{ added: number; alreadyPresent: number }> {
+    if (!poolId) return { added: 0, alreadyPresent: 0 }
+    const uniqueAccountIds = [...new Set(accountIds.filter((id) => typeof id === 'string' && id.trim()))]
+    let added = 0
+    let alreadyPresent = 0
+    await this.store.update((state) => {
+      const pool = validateChatGptImportPoolId(poolId, state.pools)
+      if (!pool) return
+      const providersById = new Map(state.providers.map((provider) => [provider.id, provider]))
+      for (const accountId of uniqueAccountIds) {
+        const account = state.accounts.find((candidate) => candidate.id === accountId)
+        if (!account || account.credentialType !== 'chatgpt-oauth') continue
+        if (providersById.get(account.providerId)?.protocol !== 'openai-responses') continue
+        if (pool.members.some((member) => member.accountId === accountId)) {
+          alreadyPresent += 1
+          continue
+        }
+        pool.members.push({ accountId, enabled: true })
+        added += 1
+      }
+      if (added > 0) pool.updatedAt = Date.now()
+    })
+    return { added, alreadyPresent }
   }
 
   public async deleteAccount(id: string): Promise<AppSnapshot> {
@@ -603,6 +775,13 @@ export class AppStore {
         if (selectedIdSet.has(account.id)) delete state.credentials[account.credentialId]
       }
       state.accounts = state.accounts.filter((candidate) => !selectedIdSet.has(candidate.id))
+      const orphanedSourceIds = new Set(state.providers
+        .filter((provider) => provider.sourceType === 'official-api' || provider.sourceType === 'relay')
+        .filter((provider) => !state.accounts.some((account) => account.providerId === provider.id))
+        .map((provider) => provider.id))
+      state.routes = state.routes.map((route) => orphanedSourceIds.has(route.poolId)
+        ? { ...route, enabled: false, poolId: '', updatedAt: timestamp }
+        : route)
       reconcilePoolModelAllowlists(state, timestamp)
     })
     await Promise.all(selectedIds.map((id) => this.store.deleteCodexQuotaHistory(id)))
@@ -767,51 +946,6 @@ export class AppStore {
     })
   }
 
-  public async onboardProvider(input: { preset: ProviderInput; accountName: string; credential: string }): Promise<AppSnapshot> {
-    const timestamp = Date.now()
-    const providerId = createId()
-    const credentialId = createId()
-    const credential = input.credential.trim()
-    if (!credential) throw new Error('A provider credential is required.')
-    await this.store.update((state) => {
-      const provider: ProviderDefinition = {
-        id: providerId,
-        name: requiredName(input.preset.name, 'Provider name'),
-        kind: input.preset.kind,
-        baseUrl: normalizeUrl(input.preset.baseUrl),
-        protocol: input.preset.protocol,
-        models: normalizeModels(input.preset.models),
-        createdAt: timestamp,
-        updatedAt: timestamp
-      }
-      if (!getProviderAdapter(provider.kind).capabilities.protocols[provider.protocol]) {
-        throw new Error('The preset provider protocol is not supported.')
-      }
-      state.credentials[credentialId] = this.encrypt(credential)
-      state.providers.push(provider)
-      state.accounts.push({
-        id: createId(),
-        providerId,
-        name: requiredName(input.accountName, 'Account name'),
-        credentialId,
-        maskedCredential: maskCredential(credential),
-        status: 'active',
-        priority: 10,
-        weight: 10,
-        maxConcurrency: 4,
-        inFlight: 0,
-        availableModels: [],
-        modelPolicy: 'all',
-        modelAllowlist: [],
-        circuitState: 'closed',
-        consecutiveFailures: 0,
-        createdAt: timestamp,
-        updatedAt: timestamp
-      })
-    })
-    return this.getSnapshot()
-  }
-
   public async deleteClientProfile(id: string): Promise<AppSnapshot> {
     await this.store.update((state) => {
       const profile = state.clientProfiles.find((candidate) => candidate.id === id)
@@ -826,9 +960,19 @@ export class AppStore {
     const timestamp = Date.now()
     await this.store.update((state) => {
       const existing = input.id ? state.pools.find((pool) => pool.id === input.id) : undefined
+      if (input.kind === 'relay-aggregate' || existing?.kind === 'relay-aggregate') {
+        throw new Error('Aggregate relays must be managed from the relay editor.')
+      }
       const accountIds = [...new Set(input.accountIds)].filter((id) => state.accounts.some((account) => account.id === id))
       if (accountIds.length === 0) {
         throw new Error('Choose at least one account for the pool.')
+      }
+      const relayAccountSelected = accountIds.some((accountId) => {
+        const account = state.accounts.find((candidate) => candidate.id === accountId)
+        return state.providers.find((candidate) => candidate.id === account?.providerId)?.sourceType === 'relay'
+      })
+      if (relayAccountSelected) {
+        throw new Error('Relay sources can only be members of aggregate relays.')
       }
       const incompatible = accountIds.some((accountId) => {
         const account = state.accounts.find((candidate) => candidate.id === accountId)
@@ -843,15 +987,16 @@ export class AppStore {
       const pool: Pool = {
         id: existing?.id ?? createId(),
         name,
+        kind: 'standard',
         protocol: input.protocol,
         strategy: input.strategy,
-        members: accountIds.map((accountId) => ({ accountId, enabled: true })),
+        members: mergeStandardPoolMembers(existing?.members ?? [], accountIds, input.protocol, state.accounts, state.providers),
         modelPolicy,
         modelAllowlist: modelPolicy === 'selected' ? requestedModelAllowlist : [],
         stickySessions: input.stickySessions,
         stickyTtlMinutes: positiveInteger(input.stickyTtlMinutes, 60),
         maxRetries: nonNegativeInteger(input.maxRetries),
-        forceFastMode: input.protocol === 'openai-responses'
+        forceFastMode: supportsFastServiceTier(input.protocol)
           && (input.forceFastMode ?? existing?.forceFastMode) === true,
         hedgedRequests: input.protocol === 'openai-responses'
           && (input.hedgedRequests ?? existing?.hedgedRequests) === true,
@@ -887,14 +1032,28 @@ export class AppStore {
     return this.getSnapshot()
   }
 
+  public async setRouteSourceFastMode(input: RouteSourceFastModeInput): Promise<AppSnapshot> {
+    await this.store.update((state) => {
+      setRouteSourceFastModeDraft(state, input)
+    })
+    return this.getSnapshot()
+  }
+
   public async updateRoute(route: Route): Promise<AppSnapshot> {
     const timestamp = Date.now()
     await this.store.update((state) => {
       if (route.inboundProtocol !== clientNativeProtocols[route.client]) {
         throw new Error(`The ${route.client} route must use its native inbound protocol.`)
       }
-      if (route.enabled && !state.pools.some((pool) => pool.id === route.poolId)) {
-        throw new Error('Choose an existing pool for the route.')
+      if (route.enabled && hasRouteSourceIdCollision(route.poolId, state)) {
+        throw new Error('The selected source id conflicts with an existing pool id.')
+      }
+      const routeSource = resolveRouteSource(route.poolId, state)
+      if (route.enabled && !routeSource) {
+        throw new Error('Choose an existing pool or API source for the route.')
+      }
+      if (route.enabled && routeSource?.provider && !routeSource.accounts.some(isAvailableRouteAccount)) {
+        throw new Error('The selected API source has no available account.')
       }
       if (!route.localToken.trim() && route.enabled) {
         throw new Error('An enabled route requires a local token.')
@@ -914,6 +1073,75 @@ export class AppStore {
       }
     })
     return this.getSnapshot()
+  }
+
+  public getSetupWizardState(): SetupWizardState | null {
+    return this.setupWizard.get()
+  }
+
+  public saveSetupWizardProgress(input: SetupWizardProgressInput): Promise<SetupWizardState> {
+    if (input.tagId && !this.store.select((state) => state.accountTags.some((tag) => tag.id === input.tagId))) {
+      return this.setupWizard.save({ ...input, tagId: null })
+    }
+    return this.setupWizard.save(input)
+  }
+
+  public markSetupWizardVerified(sessionId: string): Promise<SetupWizardState> {
+    return this.setupWizard.markVerified(sessionId)
+  }
+
+  public async discardSetupWizard(): Promise<void> {
+    const wizard = this.setupWizard.get()
+    if (wizard && !wizard.completed) {
+      const timestamp = Date.now()
+      await this.store.update((state) => {
+        const route = wizard.routeId
+          ? state.routes.find((candidate) => candidate.id === wizard.routeId)
+          : wizard.client ? state.routes.find((candidate) => candidate.client === wizard.client) : undefined
+        if (route && wizard.poolId && route.poolId === wizard.poolId) {
+          route.enabled = false
+          route.updatedAt = timestamp
+        }
+        const pool = wizard.poolId ? state.pools.find((candidate) => candidate.id === wizard.poolId) : undefined
+        const createdByWizard = pool
+          && pool.name.startsWith('向导·')
+          && pool.createdAt >= wizard.createdAt
+          && !state.routes.some((candidate) => candidate.enabled && candidate.poolId === pool.id)
+        if (createdByWizard) state.pools = state.pools.filter((candidate) => candidate.id !== pool.id)
+      })
+    }
+    await this.setupWizard.reset()
+  }
+
+  public async completeSetupWizard(sessionId: string): Promise<void> {
+    const wizard = this.setupWizard.get()
+    if (!wizard || wizard.sessionId !== sessionId) throw new Error('配置向导会话不存在或已过期。')
+    if (!wizard.verifiedAt || (wizard.step !== 'client-config' && wizard.step !== 'complete')) {
+      throw new Error('只有端到端真实请求成功后才能完成配置向导。')
+    }
+    await this.setupWizard.complete(sessionId)
+  }
+
+  public async applySetupRouting(input: SetupRoutingInput): Promise<SetupRoutingResult> {
+    const wizard = this.setupWizard.get()
+    if (!wizard || wizard.sessionId !== input.sessionId) {
+      throw new Error('配置向导会话不存在或已过期。')
+    }
+    let result: Omit<SetupRoutingResult, 'snapshot'> | undefined
+    await this.store.update((state) => {
+      result = applySetupRoutingDraft(state, input, { preferredPoolId: wizard.poolId })
+    })
+    if (!result) throw new Error('无法应用向导路由。')
+    await this.setupWizard.save({
+      sessionId: input.sessionId,
+      step: 'gateway',
+      sourceId: input.sourceId,
+      poolId: result.poolId,
+      routeId: result.routeId,
+      client: input.client,
+      model: input.model,
+    })
+    return { ...result, snapshot: this.getSnapshot() }
   }
 
   public async updateGateway(settings: GatewaySettings): Promise<AppSnapshot> {
@@ -1142,6 +1370,7 @@ function createInitialState(): PersistedState {
       {
         id: 'provider-anthropic',
         name: 'Anthropic',
+        sourceType: 'official-api',
         kind: 'anthropic',
         baseUrl: 'https://api.anthropic.com',
         protocol: 'anthropic-messages',
@@ -1153,6 +1382,7 @@ function createInitialState(): PersistedState {
       {
         id: 'provider-openai',
         name: 'OpenAI',
+        sourceType: 'official-api',
         kind: 'openai',
         baseUrl: 'https://api.openai.com/v1',
         protocol: 'openai-responses',
@@ -1164,6 +1394,7 @@ function createInitialState(): PersistedState {
       {
         id: 'provider-google',
         name: 'Google AI Studio',
+        sourceType: 'official-api',
         kind: 'google',
         baseUrl: 'https://generativelanguage.googleapis.com',
         protocol: 'gemini',
@@ -1174,6 +1405,7 @@ function createInitialState(): PersistedState {
       }
     ],
     accounts: [],
+    accountTags: DEFAULT_ACCOUNT_TAGS.map((tag) => ({ ...tag, createdAt: timestamp, updatedAt: timestamp })),
     proxies: [],
     pools: [],
     routes: [
@@ -1225,7 +1457,26 @@ function normalizePersistedState(state: PersistedState): PersistedState {
   const proxies = Array.isArray(state.proxies) ? state.proxies : []
   const proxyIds = new Set(proxies.map((proxy) => proxy.id))
   const defaults = createDefaultClientProfiles(timestamp)
-  const accounts = state.accounts.map((account) => {
+  const accountTags = Array.isArray(state.accountTags)
+    ? normalizePersistedAccountTags(state.accountTags)
+    : DEFAULT_ACCOUNT_TAGS.map((tag) => ({ ...tag, createdAt: timestamp, updatedAt: timestamp }))
+  const accountTagIds = new Set(accountTags.map((tag) => tag.id))
+  let providers: ProviderDefinition[] = state.providers.map((provider) => {
+    const sourceType = isUpstreamSourceType(provider.sourceType)
+      ? provider.sourceType
+      : inferProviderSourceType(provider.kind, provider.baseUrl)
+    return {
+      ...provider,
+      sourceType,
+      forceFastMode: sourceType === 'relay'
+        && supportsFastServiceTier(provider.protocol)
+        && provider.forceFastMode === true
+    }
+  })
+  let accounts: Account[] = state.accounts.map((account) => {
+    const credentialType = account.credentialType === 'chatgpt-oauth' || Boolean(account.chatgptAccountId)
+      ? 'chatgpt-oauth' as const
+      : 'api-key' as const
     const availableModels = normalizeModels(account.availableModels)
     const modelsRefreshedAt = normalizeTimestamp(account.modelsRefreshedAt)
     const persistedAllowlist = normalizeModels(account.modelAllowlist)
@@ -1237,18 +1488,31 @@ function normalizePersistedState(state: PersistedState): PersistedState {
       : []
     return {
       ...account,
+      credentialType,
       availableModels,
       modelsRefreshedAt,
       modelPolicy,
       modelAllowlist,
+      ...(credentialType !== 'chatgpt-oauth' || (account.tagId && !accountTagIds.has(account.tagId)) ? { tagId: undefined } : {}),
       ...(account.proxyId && !proxyIds.has(account.proxyId) ? { proxyId: undefined } : {})
     }
   })
-  const pools = state.pools.map((pool) => {
+  ;({ providers, accounts } = migrateSourceTopology(providers, accounts, timestamp))
+  const pools: Pool[] = state.pools.map((pool): Pool => {
     const persistedAllowlist = normalizeModels(pool.modelAllowlist)
     const modelPolicy = normalizePersistedModelPolicy(pool.modelPolicy, persistedAllowlist)
     return {
       ...pool,
+      kind: pool.kind === 'relay-aggregate' ? 'relay-aggregate' : 'standard',
+      forceFastMode: supportsFastServiceTier(pool.protocol) && pool.forceFastMode === true,
+      members: pool.members.map((member, index) => ({
+        accountId: member.accountId,
+        enabled: member.enabled,
+        ...(positiveOptionalNumber(member.weight) !== undefined ? { weight: positiveOptionalNumber(member.weight) } : {}),
+        ...(nonNegativeOptionalInteger(member.order) !== undefined
+          ? { order: nonNegativeOptionalInteger(member.order) }
+          : pool.kind === 'relay-aggregate' ? { order: index } : {})
+      })),
       modelPolicy,
       modelAllowlist: modelPolicy === 'selected' ? persistedAllowlist : [],
       ...(pool.proxyId && !proxyIds.has(pool.proxyId) ? { proxyId: undefined } : {})
@@ -1257,6 +1521,8 @@ function normalizePersistedState(state: PersistedState): PersistedState {
   const normalized: PersistedState = {
     ...state,
     version: 1,
+    providers,
+    accountTags,
     proxies: proxies.map((proxy) => ({
       ...proxy,
       hasPassword: Boolean(proxy.credentialId && state.credentials[proxy.credentialId]),
@@ -1636,6 +1902,189 @@ function optionalProxyId(value: string | undefined, proxies: ProxyDefinition[]):
   return id
 }
 
+function optionalAccountTagId(
+  value: string | null | undefined,
+  tags: readonly AccountTagDefinition[]
+): string | undefined {
+  const id = value?.trim()
+  if (!id) return undefined
+  if (!tags.some((tag) => tag.id === id)) throw new Error('Choose an existing account tag.')
+  return id
+}
+
+function validateChatGptImportPoolId(value: string | null | undefined, pools: readonly Pool[]): Pool | undefined {
+  const id = value?.trim()
+  if (!id) return undefined
+  const pool = pools.find((candidate) => candidate.id === id)
+  if (!pool) throw new Error('The selected pool no longer exists.')
+  if (pool.kind !== 'standard' || pool.protocol !== 'openai-responses') {
+    throw new Error('Imported ChatGPT accounts can only join a standard OpenAI Responses pool.')
+  }
+  return pool
+}
+
+function ensureOAuthSystemProvider(state: PersistedState, timestamp: number): ProviderDefinition {
+  const existing = state.providers.find((provider) =>
+    provider.sourceType === 'oauth-system'
+    && provider.kind === 'openai'
+    && provider.protocol === 'openai-responses')
+  if (existing) return existing
+  const preferredId = 'provider-chatgpt-oauth'
+  const provider: ProviderDefinition = {
+    id: state.providers.some((candidate) => candidate.id === preferredId) ? createId() : preferredId,
+    name: 'ChatGPT OAuth',
+    sourceType: 'oauth-system',
+    kind: 'openai',
+    baseUrl: 'https://api.openai.com/v1',
+    protocol: 'openai-responses',
+    color: '#10a37f',
+    models: ['gpt-5', 'gpt-5-mini', 'o3'],
+    createdAt: timestamp,
+    updatedAt: timestamp
+  }
+  state.providers.push(provider)
+  return provider
+}
+
+function migrateSourceTopology(
+  sourceProviders: ProviderDefinition[],
+  sourceAccounts: Account[],
+  timestamp: number
+): { providers: ProviderDefinition[]; accounts: Account[] } {
+  const providers = sourceProviders.map((provider) => ({ ...provider }))
+  const accounts = sourceAccounts.map((account) => ({ ...account }))
+  const oauthAccounts = accounts.filter((account) => account.credentialType === 'chatgpt-oauth')
+  let oauthProvider = providers.find((provider) => provider.sourceType === 'oauth-system')
+  if (oauthAccounts.length > 0 && !oauthProvider) {
+    let id = 'provider-chatgpt-oauth'
+    let suffix = 1
+    while (providers.some((provider) => provider.id === id)) id = `provider-chatgpt-oauth-${suffix++}`
+    oauthProvider = {
+      id,
+      name: 'ChatGPT OAuth',
+      sourceType: 'oauth-system',
+      kind: 'openai',
+      baseUrl: 'https://api.openai.com/v1',
+      protocol: 'openai-responses',
+      color: '#10a37f',
+      models: ['gpt-5', 'gpt-5-mini', 'o3'],
+      createdAt: timestamp,
+      updatedAt: timestamp
+    }
+    providers.push(oauthProvider)
+  }
+  if (oauthProvider) {
+    Object.assign(oauthProvider, {
+      name: 'ChatGPT OAuth',
+      sourceType: 'oauth-system',
+      kind: 'openai',
+      baseUrl: 'https://api.openai.com/v1',
+      protocol: 'openai-responses'
+    } satisfies Partial<ProviderDefinition>)
+    for (const account of oauthAccounts) account.providerId = oauthProvider.id
+  }
+
+  // Corrupt/legacy API-key accounts must never remain under the hidden OAuth provider.
+  for (const account of accounts.filter((candidate) => candidate.credentialType !== 'chatgpt-oauth')) {
+    const provider = providers.find((candidate) => candidate.id === account.providerId)
+    if (!provider || provider.sourceType !== 'oauth-system') continue
+    const id = uniqueMigratedProviderId(providers, `${provider.id}--api-${account.id}`)
+    const clone: ProviderDefinition = {
+      ...provider,
+      id,
+      name: account.name || provider.name,
+      sourceType: inferProviderSourceType(provider.kind, provider.baseUrl),
+      createdAt: account.createdAt || timestamp,
+      updatedAt: timestamp
+    }
+    providers.push(clone)
+    account.providerId = clone.id
+  }
+
+  // Legacy Providers allowed multiple keys. Split them into one stable source per account.
+  for (const provider of [...providers]) {
+    if (provider.sourceType === 'oauth-system') continue
+    const members = accounts.filter((account) => account.providerId === provider.id && account.credentialType !== 'chatgpt-oauth')
+    for (const account of members.slice(1)) {
+      const id = uniqueMigratedProviderId(providers, `${provider.id}--account-${account.id}`)
+      providers.push({
+        ...provider,
+        id,
+        name: account.name || provider.name,
+        createdAt: account.createdAt || provider.createdAt,
+        updatedAt: Math.max(provider.updatedAt, account.updatedAt)
+      })
+      account.providerId = id
+    }
+  }
+
+  const referencedProviderIds = new Set(accounts.map((account) => account.providerId))
+  return {
+    providers: providers.filter((provider) => provider.sourceType !== 'oauth-system'
+      || provider.id === oauthProvider?.id
+      || referencedProviderIds.has(provider.id)),
+    accounts
+  }
+}
+
+function uniqueMigratedProviderId(providers: readonly ProviderDefinition[], preferred: string): string {
+  if (!providers.some((provider) => provider.id === preferred)) return preferred
+  let suffix = 1
+  while (providers.some((provider) => provider.id === `${preferred}-${suffix}`)) suffix += 1
+  return `${preferred}-${suffix}`
+}
+
+function inferProviderSourceType(kind: ProviderInput['kind'], baseUrl: string): ProviderDefinition['sourceType'] {
+  try {
+    const hostname = new URL(baseUrl).hostname.toLowerCase()
+    if (
+      (kind === 'openai' && hostname === 'api.openai.com')
+      || (kind === 'anthropic' && hostname === 'api.anthropic.com')
+      || (kind === 'google' && hostname === 'generativelanguage.googleapis.com')
+    ) return 'official-api'
+  } catch {
+    // URL validation happens before this inference is persisted.
+  }
+  return 'relay'
+}
+
+function isUpstreamSourceType(value: unknown): value is ProviderDefinition['sourceType'] {
+  return value === 'oauth-system' || value === 'official-api' || value === 'relay'
+}
+
+function normalizePersistedAccountTags(value: unknown): AccountTagDefinition[] {
+  if (!Array.isArray(value)) return []
+  const tags: AccountTagDefinition[] = []
+  const ids = new Set<string>()
+  const names = new Set<string>()
+  for (const candidate of value) {
+    if (tags.length >= 50) break
+    if (!candidate || typeof candidate !== 'object') continue
+    const tag = candidate as Partial<AccountTagDefinition>
+    const id = typeof tag.id === 'string' ? tag.id.trim() : ''
+    const name = typeof tag.name === 'string' ? tag.name.trim() : ''
+    const normalizedName = name.toLocaleLowerCase()
+    if (!id || !name || name.length > 24 || ids.has(id) || names.has(normalizedName)) continue
+    ids.add(id)
+    names.add(normalizedName)
+    tags.push({
+      id,
+      name,
+      createdAt: normalizeTimestamp(tag.createdAt) ?? Date.now(),
+      updatedAt: normalizeTimestamp(tag.updatedAt) ?? normalizeTimestamp(tag.createdAt) ?? Date.now()
+    })
+  }
+  return tags
+}
+
+function positiveOptionalNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined
+}
+
+function nonNegativeOptionalInteger(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0 ? value : undefined
+}
+
 interface AccountImportProxySelection {
   mode: ChatGptAccountImportProxyMode
   proxyId?: string
@@ -1732,6 +2181,36 @@ function resolvePoolInputModelPolicy(
   }
   if (!modelAllowlistProvided && existing) return existing.modelPolicy
   return 'all'
+}
+
+function mergeStandardPoolMembers(
+  existingMembers: readonly PoolMember[],
+  enabledAccountIds: readonly string[],
+  protocol: ProviderDefinition['protocol'],
+  accounts: readonly Account[],
+  providers: readonly ProviderDefinition[],
+): PoolMember[] {
+  const remainingEnabledIds = new Set(enabledAccountIds)
+  const accountById = new Map(accounts.map((account) => [account.id, account]))
+  const providerById = new Map(providers.map((provider) => [provider.id, provider]))
+  const members: PoolMember[] = []
+
+  for (const existingMember of existingMembers) {
+    if (remainingEnabledIds.delete(existingMember.accountId)) {
+      members.push({ ...existingMember, enabled: true })
+      continue
+    }
+    const account = accountById.get(existingMember.accountId)
+    const provider = account ? providerById.get(account.providerId) : undefined
+    if (!existingMember.enabled && provider?.protocol === protocol && provider.sourceType !== 'relay') {
+      members.push({ ...existingMember, enabled: false })
+    }
+  }
+
+  for (const accountId of enabledAccountIds) {
+    if (remainingEnabledIds.delete(accountId)) members.push({ accountId, enabled: true })
+  }
+  return members
 }
 
 function sameModels(left: readonly string[], right: readonly string[]): boolean {

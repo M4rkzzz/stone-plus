@@ -19,6 +19,7 @@ class FakeUpdater extends EventEmitter {
   isUpdateAvailable = true
   downloadCalls = 0
   quitCalls = 0
+  quitArguments: [boolean | undefined, boolean | undefined] | undefined
   onDownload: (() => void) | undefined
   onQuit: (() => void) | undefined
 
@@ -43,8 +44,9 @@ class FakeUpdater extends EventEmitter {
     return ['update.bin']
   }
 
-  quitAndInstall(): void {
+  quitAndInstall(isSilent?: boolean, isForceRunAfter?: boolean): void {
     this.quitCalls += 1
+    this.quitArguments = [isSilent, isForceRunAfter]
     this.onQuit?.()
   }
 }
@@ -288,6 +290,7 @@ describe('UpdateService', () => {
     await service.installUpdate()
 
     expect(order).toEqual(['shutdown', 'installer'])
+    expect(updater.quitArguments).toEqual([true, true])
     expect(service.getState().status).toBe('installing')
   })
 

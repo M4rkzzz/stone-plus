@@ -20,6 +20,7 @@ import type {
   TokenRatePoint,
   TokenRateSeries
 } from '@shared/types'
+import { resolveRouteSource } from '@shared/route-sources'
 import type { PageId } from '../App'
 import {
   AccountStatusBadge,
@@ -351,13 +352,13 @@ export function OverviewView({ snapshot, navigate }: { snapshot: AppSnapshot; na
           </header>
           <div className="route-summary__list">
             {snapshot.routes.map((route) => {
-              const pool = snapshot.pools.find((item) => item.id === route.poolId)
+              const source = resolveRouteSource(route.poolId, snapshot)
               return (
                 <div className="route-summary__row" key={route.id}>
                   <div className={`client-glyph client-glyph--${route.client}`}>{route.client.slice(0, 1).toUpperCase()}</div>
                   <div className="route-summary__name">
                     <strong>{clientNames[route.client]}</strong>
-                    <span>{pool?.name ?? '未选择号池'}</span>
+                    <span>{source?.summary.name ?? '未选择源'}</span>
                   </div>
                   <Badge tone={route.enabled ? 'success' : 'neutral'}>{route.enabled ? '已启用' : '已停用'}</Badge>
                 </div>

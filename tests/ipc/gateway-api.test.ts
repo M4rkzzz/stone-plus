@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { EventEmitter } from 'node:events'
 import type { Account, AppSnapshot, ProviderDefinition, PublicProxyDefinition, RequestLog } from '../../src/shared/types'
 import type { GatewayController } from '../../src/main/ipc/gateway-api'
 import type { GatewayAccountState } from '../../src/main/gateway'
@@ -6,6 +7,7 @@ import { registerGatewayApi } from '../../src/main/ipc/gateway-api'
 import type { AppStore } from '../../src/main/store/app-store'
 import type { ClientConfigService } from '../../src/main/client-config'
 import type { OutboundTransportManager } from '../../src/main/proxy'
+import type { ChatGptOAuthSessionController } from '../../src/main/auth/chatgpt-oauth-flow'
 
 type InvokeHandler = (event: unknown, ...args: unknown[]) => unknown
 
@@ -13,7 +15,8 @@ const electron = vi.hoisted(() => ({
   handlers: new Map<string, InvokeHandler>(),
   fromWebContents: vi.fn(() => ({})),
   getAllWindows: vi.fn(() => []),
-  showOpenDialog: vi.fn()
+  showOpenDialog: vi.fn(),
+  openExternal: vi.fn()
 }))
 
 vi.mock('electron', () => ({
@@ -35,12 +38,14 @@ vi.mock('electron', () => ({
   },
   Notification: class {
     static isSupported(): boolean { return false }
-  }
+  },
+  shell: { openExternal: electron.openExternal }
 }))
 
 const provider: ProviderDefinition = {
   id: 'provider-openai',
   name: 'OpenAI',
+  sourceType: 'official-api',
   kind: 'openai',
   baseUrl: 'https://api.openai.com/v1',
   protocol: 'openai-responses',
@@ -66,7 +71,7 @@ describe('refresh provider models IPC', () => {
 
     const result = await handler(
       { senderFrame: mainFrame, sender: { mainFrame } },
-      { providerId: provider.id }
+      { tagId: null, poolId: null }
     ) as { cancelled: boolean; selectedFiles: number }
 
     expect(result).toMatchObject({ cancelled: true, selectedFiles: 0 })
@@ -149,6 +154,22 @@ describe('refresh provider models IPC', () => {
     expect(harness.gateway.stop).not.toHaveBeenCalled()
   })
 
+  it('applies a FAST source toggle and refreshes the live gateway configuration', async () => {
+    const harness = createHarness([oauthAccount()], {}, vi.fn())
+    const handler = electron.handlers.get('stone:set-route-source-fast-mode')
+    if (!handler) throw new Error('set-route-source-fast-mode handler was not registered')
+    const mainFrame = { url: 'http://127.0.0.1:5173/index.html' }
+
+    await handler(
+      { senderFrame: mainFrame, sender: { mainFrame } },
+      { sourceId: 'pool-fast', enabled: true }
+    )
+
+    expect(harness.store.setRouteSourceFastMode).toHaveBeenCalledWith({ sourceId: 'pool-fast', enabled: true })
+    expect(harness.gateway.updateConfig).toHaveBeenCalled()
+    expect(harness.runtimeChanged).toHaveBeenCalled()
+  })
+
   it('detects a pasted batch through the final selected account proxy', async () => {
     const oauth = oauthAccount()
     const proxy = testProxy()
@@ -164,14 +185,20 @@ describe('refresh provider models IPC', () => {
     const sender = { mainFrame, send, isDestroyed: () => false }
 
     const result = await handler({ senderFrame: mainFrame, sender }, {
-      providerId: provider.id,
       content: '{"access_token":"redacted-by-mock"}',
+      tagId: 'tag-plus',
+      poolId: 'pool-codex',
       proxyMode: 'proxy',
       proxyId: proxy.id,
       progressId: 'paste-import-progress'
-    }) as { detectionResults: Array<{ ok: boolean; availableModelCount?: number }> }
+    }) as {
+      detectionResults: Array<{ ok: boolean; availableModelCount?: number }>
+      assignmentSummary: { tagId: string | null; poolId: string | null; poolMembersAdded: number }
+    }
 
     expect(result.detectionResults).toEqual([expect.objectContaining({ ok: true, availableModelCount: 2 })])
+    expect(result.assignmentSummary).toMatchObject({ tagId: 'tag-plus', poolId: 'pool-codex', poolMembersAdded: 1 })
+    expect(harness.store.addDetectedChatGptAccountsToPool).toHaveBeenCalledWith('pool-codex', [oauth.id])
     expect(harness.transport.fetchFor).toHaveBeenCalledWith(proxy, undefined)
     expect(harness.store.importChatGptAccounts).toHaveBeenCalledWith(expect.objectContaining({
       proxyMode: 'proxy', proxyId: proxy.id
@@ -190,6 +217,277 @@ describe('refresh provider models IPC', () => {
       ]))
   })
 
+  it('exchanges OAuth through the selected proxy and only returns the sanitized import result', async () => {
+    const oauth = oauthAccount()
+    const proxy = testProxy()
+    const upstreamFetch = vi.fn(async () => new Response(JSON.stringify({
+      rate_limit: { allowed: true, limit_reached: false },
+      models: [{ slug: 'gpt-5.6-sol' }]
+    }), { status: 200, headers: { 'content-type': 'application/json' } }))
+    const harness = createHarness([oauth], { [oauth.credentialId]: oauthCredential() }, upstreamFetch, [proxy])
+    const start = electron.handlers.get('stone:start-chatgpt-oauth')
+    const open = electron.handlers.get('stone:open-chatgpt-oauth')
+    const submit = electron.handlers.get('stone:submit-chatgpt-oauth-callback')
+    const wait = electron.handlers.get('stone:wait-chatgpt-oauth')
+    if (!start || !open || !submit || !wait) throw new Error('OAuth IPC handlers were not registered')
+    const event = rendererEvent(101)
+
+    try {
+      const started = await start(event, {
+        name: 'OAuth imported',
+        tagId: 'tag-plus',
+        poolId: 'pool-deleted-during-oauth',
+        proxyMode: 'proxy',
+        proxyId: proxy.id
+      }) as { sessionId: string; authorizationUrl: string }
+      await open(event, started.sessionId)
+      await submit(event, {
+        sessionId: started.sessionId,
+        callbackUrl: 'http://localhost:1455/auth/callback?code=public-code&state=public-state'
+      })
+      vi.mocked(harness.store.addDetectedChatGptAccountsToPool).mockRejectedValueOnce(new Error('Pool not found.'))
+      const result = await wait(event, started.sessionId) as {
+        assignmentSummary: { tagId: string | null; poolId: string | null; poolAppendError?: string }
+      }
+
+      expect(harness.oauthFlow.open).toHaveBeenCalledWith('oauth-session')
+      expect(harness.oauthFlow.submitCallback).toHaveBeenCalledWith(
+        'oauth-session',
+        expect.stringContaining('code=public-code')
+      )
+      expect(harness.oauthFlow.wait).toHaveBeenCalledWith('oauth-session', expect.any(Function))
+      expect(harness.transport.fetchFor).toHaveBeenCalledWith(proxy, undefined)
+      expect(harness.store.importChatGptAccounts).toHaveBeenCalledWith(expect.objectContaining({
+        name: 'OAuth imported',
+        tagId: 'tag-plus',
+        // Membership happens after detection so deleting a pool does not lose
+        // the freshly exchanged OAuth account.
+        poolId: null,
+        proxyMode: 'proxy',
+        proxyId: proxy.id
+      }))
+      expect(result.assignmentSummary).toMatchObject({
+        tagId: 'tag-plus',
+        poolId: 'pool-deleted-during-oauth',
+        poolAppendError: 'Pool not found.'
+      })
+      expect(JSON.stringify(result)).not.toContain('oauth-access-exchanged-private')
+      expect(JSON.stringify(result)).not.toContain('oauth-refresh-exchanged-private')
+      expect(JSON.stringify(result)).not.toContain('oauth-id-exchanged-private')
+    } finally {
+      await harness.dispose()
+    }
+  })
+
+  it('does not persist exchanged credentials when OAuth is cancelled during token exchange', async () => {
+    const oauth = oauthAccount()
+    const harness = createHarness([oauth], { [oauth.credentialId]: oauthCredential() }, vi.fn())
+    const start = electron.handlers.get('stone:start-chatgpt-oauth')
+    const wait = electron.handlers.get('stone:wait-chatgpt-oauth')
+    const cancel = electron.handlers.get('stone:cancel-chatgpt-oauth')
+    if (!start || !wait || !cancel) throw new Error('OAuth IPC handlers were not registered')
+    const event = rendererEvent(102)
+    let finishExchange: (() => void) | undefined
+    let disposed = false
+    vi.mocked(harness.oauthFlow.wait).mockImplementationOnce(async () => {
+      await new Promise<void>((resolve) => { finishExchange = resolve })
+      return {
+        accessToken: 'cancelled-access-private',
+        refreshToken: 'cancelled-refresh-private',
+        idToken: 'cancelled-id-private',
+        accountId: 'acct-cancelled',
+        expiresAt: Date.now() + 3_600_000
+      }
+    })
+
+    try {
+      const started = await start(event, {
+        tagId: null,
+        poolId: null,
+        proxyMode: 'direct'
+      }) as { sessionId: string }
+      const waiting = Promise.resolve(wait(event, started.sessionId))
+      await vi.waitFor(() => expect(finishExchange).toBeTypeOf('function'))
+      expect(cancel(event, started.sessionId)).toBe(true)
+      const disposing = harness.dispose().then(() => { disposed = true })
+      await Promise.resolve()
+      expect(disposed).toBe(false)
+      finishExchange?.()
+
+      await expect(waiting).rejects.toThrow('OAuth 授权已取消')
+      await disposing
+      expect(disposed).toBe(true)
+      expect(harness.store.importChatGptAccounts).not.toHaveBeenCalled()
+      expect(harness.oauthFlow.cancel).toHaveBeenCalledWith(started.sessionId)
+    } finally {
+      finishExchange?.()
+      if (!disposed) await harness.dispose()
+    }
+  })
+
+  it('binds every OAuth session to its renderer owner and cancels it when that owner exits', async () => {
+    const harness = createHarness([oauthAccount()], {}, vi.fn())
+    const start = electron.handlers.get('stone:start-chatgpt-oauth')
+    const open = electron.handlers.get('stone:open-chatgpt-oauth')
+    const submit = electron.handlers.get('stone:submit-chatgpt-oauth-callback')
+    const wait = electron.handlers.get('stone:wait-chatgpt-oauth')
+    const cancel = electron.handlers.get('stone:cancel-chatgpt-oauth')
+    if (!start || !open || !submit || !wait || !cancel) throw new Error('OAuth IPC handlers were not registered')
+    const owner = rendererEvent(201)
+    const stranger = rendererEvent(202)
+
+    try {
+      const started = await start(owner, { tagId: null, poolId: null, proxyMode: 'direct' }) as { sessionId: string }
+
+      await expect(open(stranger, started.sessionId)).rejects.toThrow('不属于当前窗口')
+      expect(() => submit(stranger, { sessionId: started.sessionId, callbackUrl: 'http://localhost/callback' }))
+        .toThrow('不属于当前窗口')
+      expect(() => wait(stranger, started.sessionId)).toThrow('不属于当前窗口')
+      expect(() => cancel(stranger, started.sessionId)).toThrow('不属于当前窗口')
+      expect(harness.oauthFlow.cancel).not.toHaveBeenCalled()
+
+      owner.sender.crashForTest()
+      expect(harness.oauthFlow.cancel).toHaveBeenCalledWith(started.sessionId)
+      expect(() => wait(owner, started.sessionId)).toThrow('不存在或不属于当前窗口')
+      expect(owner.sender.listenerCount('destroyed')).toBe(0)
+      expect(owner.sender.listenerCount('render-process-gone')).toBe(0)
+    } finally {
+      await harness.dispose()
+    }
+  })
+
+  it('cancels a newly-created flow when its renderer exits while start is binding loopback', async () => {
+    const harness = createHarness([oauthAccount()], {}, vi.fn())
+    const start = electron.handlers.get('stone:start-chatgpt-oauth')
+    if (!start) throw new Error('OAuth start IPC handler was not registered')
+    const owner = rendererEvent(206)
+    let finishStart: (() => void) | undefined
+    vi.mocked(harness.oauthFlow.start).mockImplementationOnce(async () => {
+      await new Promise<void>((resolve) => { finishStart = resolve })
+      return {
+        sessionId: 'oauth-start-race',
+        authorizationUrl: 'https://auth.openai.com/oauth/authorize?state=public',
+        redirectUri: 'http://localhost:1455/auth/callback',
+        expiresAt: Date.now() + 600_000,
+        loopbackListening: true,
+        status: 'waiting'
+      }
+    })
+
+    try {
+      const starting = Promise.resolve(start(owner, { tagId: null, poolId: null, proxyMode: 'direct' }))
+      await vi.waitFor(() => expect(finishStart).toBeTypeOf('function'))
+      owner.sender.crashForTest()
+      finishStart?.()
+
+      await expect(starting).rejects.toThrow('OAuth 授权窗口已经关闭')
+      expect(harness.oauthFlow.cancel).toHaveBeenCalledWith('oauth-start-race')
+      expect(owner.sender.listenerCount('destroyed')).toBe(0)
+      expect(owner.sender.listenerCount('render-process-gone')).toBe(0)
+    } finally {
+      finishStart?.()
+      await harness.dispose()
+    }
+  })
+
+  it('makes cancellation non-destructive after the OAuth persistence commit boundary', async () => {
+    const oauth = oauthAccount()
+    const upstreamFetch = vi.fn(async () => new Response(JSON.stringify({
+      rate_limit: { allowed: true, limit_reached: false },
+      models: [{ slug: 'gpt-5.6-sol' }]
+    }), { status: 200, headers: { 'content-type': 'application/json' } }))
+    const harness = createHarness([oauth], { [oauth.credentialId]: oauthCredential() }, upstreamFetch)
+    const start = electron.handlers.get('stone:start-chatgpt-oauth')
+    const wait = electron.handlers.get('stone:wait-chatgpt-oauth')
+    const cancel = electron.handlers.get('stone:cancel-chatgpt-oauth')
+    if (!start || !wait || !cancel) throw new Error('OAuth IPC handlers were not registered')
+    const owner = rendererEvent(203)
+    const importAccount = vi.mocked(harness.store.importChatGptAccounts)
+    const persist = importAccount.getMockImplementation()
+    if (!persist) throw new Error('Import mock has no implementation')
+    let continueCommit: (() => void) | undefined
+    importAccount.mockImplementationOnce(async (input) => {
+      await new Promise<void>((resolve) => { continueCommit = resolve })
+      return persist(input)
+    })
+    let disposed = false
+
+    try {
+      const started = await start(owner, { tagId: null, poolId: null, proxyMode: 'direct' }) as { sessionId: string }
+      const waiting = Promise.resolve(wait(owner, started.sessionId))
+      await vi.waitFor(() => expect(continueCommit).toBeTypeOf('function'))
+
+      expect(cancel(owner, started.sessionId)).toBe(false)
+      expect(harness.oauthFlow.cancel).not.toHaveBeenCalled()
+      const disposing = harness.dispose().then(() => { disposed = true })
+      await Promise.resolve()
+      expect(disposed).toBe(false)
+
+      continueCommit?.()
+      await expect(waiting).resolves.toMatchObject({ importedAccountIds: [oauth.id] })
+      await disposing
+      expect(disposed).toBe(true)
+      expect(importAccount).toHaveBeenCalledOnce()
+    } finally {
+      continueCommit?.()
+      if (!disposed) await harness.dispose()
+    }
+  })
+
+  it('falls back to an untagged import when the selected Tag is deleted during OAuth', async () => {
+    const oauth = oauthAccount()
+    const upstreamFetch = vi.fn(async () => new Response(JSON.stringify({
+      rate_limit: { allowed: true, limit_reached: false },
+      models: [{ slug: 'gpt-5.6-sol' }]
+    }), { status: 200, headers: { 'content-type': 'application/json' } }))
+    const harness = createHarness([oauth], { [oauth.credentialId]: oauthCredential() }, upstreamFetch)
+    const start = electron.handlers.get('stone:start-chatgpt-oauth')
+    const wait = electron.handlers.get('stone:wait-chatgpt-oauth')
+    if (!start || !wait) throw new Error('OAuth IPC handlers were not registered')
+    const owner = rendererEvent(204)
+
+    try {
+      const started = await start(owner, { tagId: 'tag-plus', poolId: null, proxyMode: 'direct' }) as { sessionId: string }
+      harness.store.getSnapshot().accountTags = []
+      const result = await wait(owner, started.sessionId) as {
+        warnings: string[]
+        assignmentSummary: { tagId: string | null }
+      }
+
+      expect(harness.store.importChatGptAccounts).toHaveBeenCalledWith(expect.objectContaining({ tagId: null }))
+      expect(result.assignmentSummary.tagId).toBeNull()
+      expect(result.warnings).toContain('OAuth 授权期间所选 Tag 已被删除，账号已按“未标记”导入。')
+    } finally {
+      await harness.dispose()
+    }
+  })
+
+  it('resolves the selected proxy lazily and reports deletion before token persistence', async () => {
+    const oauth = oauthAccount()
+    const proxy = testProxy()
+    const harness = createHarness([oauth], { [oauth.credentialId]: oauthCredential() }, vi.fn(), [proxy])
+    const start = electron.handlers.get('stone:start-chatgpt-oauth')
+    const wait = electron.handlers.get('stone:wait-chatgpt-oauth')
+    if (!start || !wait) throw new Error('OAuth IPC handlers were not registered')
+    const owner = rendererEvent(205)
+
+    try {
+      const started = await start(owner, {
+        tagId: null,
+        poolId: null,
+        proxyMode: 'proxy',
+        proxyId: proxy.id
+      }) as { sessionId: string }
+      harness.store.getSnapshot().proxies = []
+
+      await expect(wait(owner, started.sessionId)).rejects.toThrow('选择的出口代理已被删除')
+      expect(harness.transport.fetchFor).not.toHaveBeenCalled()
+      expect(harness.store.importChatGptAccounts).not.toHaveBeenCalled()
+    } finally {
+      await harness.dispose()
+    }
+  })
+
   it('rejects a file batch when its selected proxy was deleted before confirmation', async () => {
     electron.showOpenDialog.mockResolvedValue({ canceled: false, filePaths: ['C:\\accounts\\batch.json'] })
     const harness = createHarness([oauthAccount()], {}, vi.fn(), [])
@@ -198,7 +496,8 @@ describe('refresh provider models IPC', () => {
     const mainFrame = { url: 'http://127.0.0.1:5173/index.html' }
 
     await expect(handler({ senderFrame: mainFrame, sender: { mainFrame } }, {
-      providerId: provider.id,
+      tagId: null,
+      poolId: null,
       proxyMode: 'proxy',
       proxyId: 'proxy-deleted-after-modal-open'
     })).rejects.toThrow('出口代理已被删除')
@@ -569,6 +868,23 @@ describe('refresh provider models IPC', () => {
   })
 })
 
+function rendererEvent(id: number) {
+  const mainFrame = { url: 'http://127.0.0.1:5173/index.html' }
+  let destroyed = false
+  const sender = Object.assign(new EventEmitter(), {
+    id,
+    mainFrame,
+    send: vi.fn(),
+    isDestroyed: () => destroyed,
+    destroyForTest: () => {
+      destroyed = true
+      sender.emit('destroyed')
+    },
+    crashForTest: () => sender.emit('render-process-gone')
+  })
+  return { senderFrame: mainFrame, sender }
+}
+
 function createHarness(
   accounts: Account[],
   credentials: Readonly<Record<string, string>>,
@@ -583,10 +899,13 @@ function createHarness(
   emitAccountState: (state: GatewayAccountState) => void
   emitRuntimeState: () => void
   runtimeChanged: ReturnType<typeof vi.fn>
+  oauthFlow: ChatGptOAuthSessionController
+  dispose: () => Promise<void>
 } {
   const snapshot = {
     providers: [{ ...provider, models: [] }],
     accounts: accounts.map(({ credentialId: _credentialId, chatgptAccountId: _chatgptAccountId, ...account }) => account),
+    accountTags: [{ id: 'tag-plus', name: 'Plus', createdAt: 1, updatedAt: 1 }],
     proxies,
     pools: [],
     routes: [],
@@ -620,6 +939,12 @@ function createHarness(
     getRuntimeAccounts: vi.fn(() => accounts),
     getRuntimeAccount: vi.fn((id: string) => accounts.find((account) => account.id === id)),
     getRuntimeProxies: vi.fn(() => proxies),
+    setRouteSourceFastMode: vi.fn(async () => snapshot),
+    validateChatGptImportAssignments: vi.fn(),
+    addDetectedChatGptAccountsToPool: vi.fn(async (poolId: string | null | undefined, accountIds: string[]) => ({
+      added: poolId ? accountIds.length : 0,
+      alreadyPresent: 0
+    })),
     getAccountModelDiscoveryFingerprint: vi.fn(() => discoveryFingerprint.current),
     getCredential: vi.fn((credentialId: string) => credentials[credentialId]),
     getProxyPassword: vi.fn(() => undefined),
@@ -713,20 +1038,49 @@ function createHarness(
     }))
   } as unknown as OutboundTransportManager
   const runtimeChanged = vi.fn()
+  const oauthFlow = {
+    start: vi.fn(async () => ({
+      sessionId: 'oauth-session',
+      authorizationUrl: 'https://auth.openai.com/oauth/authorize?state=public-state',
+      redirectUri: 'http://localhost:1455/auth/callback',
+      expiresAt: Date.now() + 600_000,
+      loopbackListening: true,
+      status: 'waiting' as const
+    })),
+    open: vi.fn(async () => undefined),
+    submitCallback: vi.fn(),
+    wait: vi.fn(async (_sessionId: string, fetchImplementation?: typeof fetch) => {
+      await fetchImplementation?.('https://auth.openai.com/oauth/token', { method: 'POST' })
+      return {
+        accessToken: 'oauth-access-exchanged-private',
+        refreshToken: 'oauth-refresh-exchanged-private',
+        idToken: 'oauth-id-exchanged-private',
+        accountId: 'acct-team-private',
+        email: 'oauth@example.com',
+        expiresAt: Date.now() + 3_600_000
+      }
+    }),
+    cancel: vi.fn(),
+    dispose: vi.fn()
+  } satisfies ChatGptOAuthSessionController
 
-  registerGatewayApi(
+  const dispose = registerGatewayApi(
     store,
     gateway,
     {} as ClientConfigService,
     transport,
     undefined,
-    runtimeChanged
+    runtimeChanged,
+    undefined,
+    oauthFlow
   )
   return {
     store,
     gateway,
     transport,
     runtimeChanged,
+    oauthFlow,
+    dispose,
     emitLog: (log) => {
       if (!logListener) throw new Error('Gateway log listener was not registered')
       logListener(log)

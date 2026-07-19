@@ -4,6 +4,7 @@ import { createMockApi } from './mockApi'
 declare global {
   interface Window {
     stone?: GatewayApi
+    stonePlatform?: NodeJS.Platform
   }
 }
 

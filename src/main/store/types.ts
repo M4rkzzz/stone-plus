@@ -1,5 +1,6 @@
 import type {
   Account,
+  AccountTagDefinition,
   ClientConfigProfile,
   HealthEvent,
   GatewaySettings,
@@ -14,6 +15,7 @@ export interface PersistedState {
   version: 1
   providers: ProviderDefinition[]
   accounts: Account[]
+  accountTags: AccountTagDefinition[]
   proxies: ProxyDefinition[]
   pools: Pool[]
   routes: Route[]

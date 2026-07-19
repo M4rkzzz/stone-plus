@@ -18,6 +18,7 @@ import type {
   NetworkDiagnosticStatus,
   NetworkDiagnosticTargetResult
 } from '@shared/types'
+import { listRouteSources } from '@shared/route-sources'
 import { Badge, durationLabel, PageHeader } from '../ui'
 
 const statusLabels: Record<NetworkDiagnosticStatus, string> = {
@@ -170,7 +171,8 @@ function buildLocalChecks(snapshot: AppSnapshot, proxyId: string): LocalDiagnost
   const exhaustedAccounts = snapshot.accounts.filter((account) =>
     account.cooldownReason === 'quota' && (account.cooldownUntil === undefined || account.cooldownUntil > now)).length
   const enabledRoutes = snapshot.routes.filter((route) => route.enabled)
-  const invalidRoutes = enabledRoutes.filter((route) => !snapshot.pools.some((pool) => pool.id === route.poolId)).length
+  const availableSourceIds = new Set(listRouteSources(snapshot).map((source) => source.id))
+  const invalidRoutes = enabledRoutes.filter((route) => !availableSourceIds.has(route.poolId)).length
   const emptyPools = snapshot.pools.filter((pool) => !pool.members.some((member) =>
     member.enabled && snapshot.accounts.some((account) => account.id === member.accountId))).length
   const expiringOAuth = snapshot.accounts.filter((account) => account.credentialType === 'chatgpt-oauth'
@@ -191,11 +193,11 @@ function buildLocalChecks(snapshot: AppSnapshot, proxyId: string): LocalDiagnost
       message: `${activeAccounts} 个可用 · ${unavailableAccounts} 个停用/过期 · ${exhaustedAccounts} 个额度冷却`
     },
     {
-      id: 'routing', label: '号池与客户端路由',
+      id: 'routing', label: '源与客户端路由',
       status: invalidRoutes > 0 || emptyPools > 0 ? 'error' : enabledRoutes.length > 0 ? 'success' : 'warning',
       message: invalidRoutes > 0 || emptyPools > 0
-        ? `${invalidRoutes} 条路由缺少号池 · ${emptyPools} 个号池没有启用成员`
-        : `${snapshot.pools.length} 个号池 · ${enabledRoutes.length} 条已启用路由`
+        ? `${invalidRoutes} 条路由缺少可用源 · ${emptyPools} 个号池没有启用成员`
+        : `${snapshot.pools.length} 个号池/聚合中转 · ${enabledRoutes.length} 条已启用路由`
     },
     {
       id: 'oauth', label: 'ChatGPT OAuth 会话',

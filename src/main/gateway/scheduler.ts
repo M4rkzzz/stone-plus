@@ -6,6 +6,12 @@ interface StickyAssignment {
   expiresAt: number
 }
 
+interface SmoothWeightedState {
+  /** Reset the accumulated scores whenever membership/order/weights change. */
+  signature: string
+  current: Map<string, number>
+}
+
 export interface AccountRuntimeHealth {
   accountId: string
   circuitState: AccountCircuitState
@@ -55,6 +61,10 @@ const FITNESS_CONFIDENCE_SAMPLES = 12
 const STICKY_ESCAPE_MINIMUM_SAMPLES = 3
 const STICKY_ESCAPE_MINIMUM_DELTA_MS = 1_000
 const STICKY_ESCAPE_RATIO = 1.5
+// Prefer spreading simultaneously active conversations across accounts without
+// making it a hard constraint. A clearly unhealthy/slow alternative may still
+// lose even when it currently owns fewer conversations.
+const CONCURRENT_STICKY_SESSION_PENALTY = 120
 
 export class NoEligibleAccountError extends Error {
   constructor(message = 'No eligible account is available for this request') {
@@ -85,7 +95,9 @@ export function poolAllowsModel(pool: Pool, accounts: Account[], model: string):
 export class PoolScheduler {
   private readonly active = new Map<string, number>()
   private readonly roundRobinOffsets = new Map<string, number>()
+  private readonly smoothWeighted = new Map<string, SmoothWeightedState>()
   private readonly sticky = new Map<string, StickyAssignment>()
+  private readonly activeStickySessions = new Map<string, Map<string, number>>()
   private readonly health = new Map<string, AccountRuntimeHealth>()
   private readonly performance = new Map<string, AccountPerformanceState>()
 
@@ -156,6 +168,7 @@ export class PoolScheduler {
 
   selectAndAcquire(input: SchedulerSelectionInput): ScheduledAccount {
     const { pool, accounts, model, sessionId } = input
+    if (pool.strategy !== 'weighted-round-robin') this.smoothWeighted.delete(pool.id)
     if (!poolAllowsModel(pool, accounts, model)) throw new ModelNotExposedError()
 
     const candidates = accounts
@@ -165,7 +178,7 @@ export class PoolScheduler {
       throw new NoEligibleAccountError()
     }
 
-    const stickyKey = sessionId ? `${pool.id}:${sessionId}` : undefined
+    const stickyKey = pool.stickySessions && sessionId ? `${pool.id}:${sessionId}` : undefined
     let selected: Account | undefined
     let escapedStickyAccountId: string | undefined
     if (pool.stickySessions && stickyKey) {
@@ -175,7 +188,10 @@ export class PoolScheduler {
         if (
           selected
           && pool.strategy === 'autobalanced'
-          && this.shouldEscapeSticky(selected, candidates)
+          && (
+            this.shouldEscapeSticky(selected, candidates)
+            || this.shouldSpreadConcurrentSticky(stickyKey, selected, candidates)
+          )
         ) {
           escapedStickyAccountId = selected.id
           selected = undefined
@@ -190,9 +206,12 @@ export class PoolScheduler {
       pool,
       escapedStickyAccountId
         ? candidates.filter((account) => account.id !== escapedStickyAccountId)
-        : candidates
+        : candidates,
+      accounts,
+      stickyKey
     )
     this.active.set(selected.id, (this.active.get(selected.id) ?? 0) + 1)
+    if (stickyKey) this.acquireActiveStickySession(stickyKey, selected.id)
 
     if (pool.stickySessions && stickyKey) {
       this.sticky.set(stickyKey, {
@@ -210,6 +229,7 @@ export class PoolScheduler {
         const remaining = Math.max(0, (this.active.get(selected.id) ?? 0) - 1)
         if (remaining === 0) this.active.delete(selected.id)
         else this.active.set(selected.id, remaining)
+        if (stickyKey) this.releaseActiveStickySession(stickyKey, selected.id)
       }
     }
   }
@@ -390,7 +410,9 @@ export class PoolScheduler {
   clear(): void {
     this.active.clear()
     this.roundRobinOffsets.clear()
+    this.smoothWeighted.clear()
     this.sticky.clear()
+    this.activeStickySessions.clear()
     this.health.clear()
     this.performance.clear()
   }
@@ -409,9 +431,11 @@ export class PoolScheduler {
     return this.inFlight(account) < this.concurrencyLimit(account, adaptiveConcurrency)
   }
 
-  private pick(pool: Pool, candidates: Account[]): Account {
+  private pick(pool: Pool, candidates: Account[], configuredAccounts: Account[], stickyKey?: string): Account {
+    const aggregate = isRelayAggregate(pool)
     switch (pool.strategy) {
       case 'priority':
+        if (aggregate) return orderedAggregateCandidates(pool, candidates)[0]
         return [...candidates].sort((a, b) =>
           effectivePriority(a) - effectivePriority(b)
           || this.inFlight(a) - this.inFlight(b))[0]
@@ -425,14 +449,16 @@ export class PoolScheduler {
             || a.id.localeCompare(b.id)
         })[0]
       case 'autobalanced':
-        return this.pickAutoBalanced(candidates)
+        return this.pickAutoBalanced(candidates, stickyKey)
       case 'round-robin': {
-        const ordered = candidates
+        const ordered = aggregate ? orderedAggregateCandidates(pool, candidates) : candidates
         const offset = this.roundRobinOffsets.get(pool.id) ?? 0
         const selected = ordered[offset % ordered.length]
         this.roundRobinOffsets.set(pool.id, (offset + 1) % ordered.length)
         return selected
       }
+      case 'weighted-round-robin':
+        return this.pickSmoothWeighted(pool, candidates, configuredAccounts)
       case 'weighted-random': {
         const total = candidates.reduce((sum, account) => sum + effectiveWeight(account), 0)
         if (total <= 0) return candidates[Math.floor(this.random() * candidates.length)]
@@ -446,11 +472,52 @@ export class PoolScheduler {
     }
   }
 
+  /**
+   * Smooth weighted round robin (the same family of algorithm used by nginx).
+   * Over every complete weight window it produces the exact configured ratio,
+   * while spreading high-weight members across the window instead of serving
+   * them in one burst.
+   */
+  private pickSmoothWeighted(pool: Pool, candidates: Account[], configuredAccounts: Account[]): Account {
+    const aggregate = isRelayAggregate(pool)
+    const ordered = aggregate ? orderedAggregateCandidates(pool, candidates) : candidates
+    const weighted = ordered.map((account) => ({
+      account,
+      weight: aggregate ? aggregateMemberWeight(pool, account.id) : effectiveWeight(account)
+    }))
+    const usable = weighted.some(({ weight }) => weight > 0)
+      ? weighted
+      : weighted.map(({ account }) => ({ account, weight: 1 }))
+    const signature = smoothWeightedSignature(pool, configuredAccounts)
+    let state = this.smoothWeighted.get(pool.id)
+    if (!state || state.signature !== signature) {
+      state = { signature, current: new Map() }
+      this.smoothWeighted.set(pool.id, state)
+    }
+
+    const totalWeight = usable.reduce((sum, { weight }) => sum + weight, 0)
+    let selected = usable[0]
+    let selectedCurrent = Number.NEGATIVE_INFINITY
+    for (const entry of usable) {
+      const current = (state.current.get(entry.account.id) ?? 0) + entry.weight
+      state.current.set(entry.account.id, current)
+      // Keeping the first entry on ties makes the result deterministic. Relay
+      // aggregates are already sorted by member order; standard pools retain
+      // their existing account-array order.
+      if (current > selectedCurrent) {
+        selected = entry
+        selectedCurrent = current
+      }
+    }
+    state.current.set(selected.account.id, selectedCurrent - totalWeight)
+    return selected.account
+  }
+
   private inFlight(account: Account): number {
     return Math.max(0, account.inFlight) + (this.active.get(account.id) ?? 0)
   }
 
-  private pickAutoBalanced(candidates: Account[]): Account {
+  private pickAutoBalanced(candidates: Account[], stickyKey?: string): Account {
     const unmeasured = candidates.filter((account) => !this.hasPerformanceSample(account.id))
     const measured = candidates.filter((account) => this.hasPerformanceSample(account.id))
     if (unmeasured.length > 0 && measured.length > 0 && this.random() < AUTO_BALANCED_EXPLORATION_RATE) {
@@ -458,7 +525,10 @@ export class PoolScheduler {
     }
     const prior = conservativePerformancePrior(measured.map((account) =>
       performanceCost(this.performance.get(account.id), this.now())))
-    const scored = candidates.map((account) => ({ account, cost: this.autoBalancedCost(account, prior) }))
+    const scored = candidates.map((account) => ({
+      account,
+      cost: this.autoBalancedCost(account, prior, stickyKey)
+    }))
     const minimumCost = Math.min(...scored.map(({ cost }) => cost))
     const best = scored.filter(({ cost }) => Math.abs(cost - minimumCost) < 0.001)
     if (best.length > 1) {
@@ -494,14 +564,59 @@ export class PoolScheduler {
     )
   }
 
-  private autoBalancedCost(account: Account, unmeasuredPrior: number): number {
+  private shouldSpreadConcurrentSticky(
+    stickyKey: string,
+    selected: Account,
+    candidates: Account[]
+  ): boolean {
+    const selectedSessionLoad = this.activeStickySessionCount(selected.id, stickyKey)
+    if (selectedSessionLoad <= 0) return false
+    const lowerLoadAlternatives = candidates.filter((account) =>
+      account.id !== selected.id
+      && this.activeStickySessionCount(account.id, stickyKey) < selectedSessionLoad
+    )
+    if (lowerLoadAlternatives.length === 0) return false
+    const measured = candidates.filter((account) => this.hasPerformanceSample(account.id))
+    const prior = conservativePerformancePrior(measured.map((account) =>
+      performanceCost(this.performance.get(account.id), this.now())))
+    const selectedCost = this.autoBalancedCost(selected, prior, stickyKey)
+    return lowerLoadAlternatives.some((account) =>
+      this.autoBalancedCost(account, prior, stickyKey) < selectedCost
+    )
+  }
+
+  private autoBalancedCost(account: Account, unmeasuredPrior: number, stickyKey?: string): number {
     const utilization = this.inFlight(account) / this.concurrencyLimit(account, true)
     const performance = this.performance.get(account.id)
     const performanceEstimate = estimatedPerformanceCost(performance, unmeasuredPrior, this.now())
     return utilization * 1_000
+      + this.activeStickySessionCount(account.id, stickyKey) * CONCURRENT_STICKY_SESSION_PENALTY
       + quotaPressure(account) * 200
       + performanceEstimate * 10
       + account.priority
+  }
+
+  private activeStickySessionCount(accountId: string, excludingStickyKey?: string): number {
+    let count = 0
+    for (const [stickyKey, accounts] of this.activeStickySessions) {
+      if (stickyKey !== excludingStickyKey && (accounts.get(accountId) ?? 0) > 0) count += 1
+    }
+    return count
+  }
+
+  private acquireActiveStickySession(stickyKey: string, accountId: string): void {
+    const accounts = this.activeStickySessions.get(stickyKey) ?? new Map<string, number>()
+    accounts.set(accountId, (accounts.get(accountId) ?? 0) + 1)
+    this.activeStickySessions.set(stickyKey, accounts)
+  }
+
+  private releaseActiveStickySession(stickyKey: string, accountId: string): void {
+    const accounts = this.activeStickySessions.get(stickyKey)
+    if (!accounts) return
+    const remaining = Math.max(0, (accounts.get(accountId) ?? 0) - 1)
+    if (remaining > 0) accounts.set(accountId, remaining)
+    else accounts.delete(accountId)
+    if (accounts.size === 0) this.activeStickySessions.delete(stickyKey)
   }
 
   private hasPerformanceSample(accountId: string): boolean {
@@ -630,6 +745,55 @@ function effectivePriority(account: Account): number {
 
 function effectiveWeight(account: Account): number {
   return Math.max(0, account.weight) * Math.max(0.05, 1 - quotaPressure(account))
+}
+
+function isRelayAggregate(pool: Pool): boolean {
+  return pool.kind === 'relay-aggregate'
+}
+
+function orderedAggregateCandidates(pool: Pool, candidates: Account[]): Account[] {
+  const members = pool.members
+  const memberPosition = new Map(members.map((member, index) => [member.accountId, index]))
+  const memberOrder = new Map(members.map((member, index) => [
+    member.accountId,
+    finiteNumber(member.order, index)
+  ]))
+  return [...candidates].sort((a, b) =>
+    (memberOrder.get(a.id) ?? Number.MAX_SAFE_INTEGER)
+      - (memberOrder.get(b.id) ?? Number.MAX_SAFE_INTEGER)
+    || (memberPosition.get(a.id) ?? Number.MAX_SAFE_INTEGER)
+      - (memberPosition.get(b.id) ?? Number.MAX_SAFE_INTEGER)
+    || a.id.localeCompare(b.id)
+  )
+}
+
+function aggregateMemberWeight(pool: Pool, accountId: string): number {
+  const member = pool.members.find((candidate) => candidate.accountId === accountId)
+  return positiveFiniteNumber(member?.weight, 1)
+}
+
+function smoothWeightedSignature(pool: Pool, configuredAccounts: readonly Account[]): string {
+  if (isRelayAggregate(pool)) {
+    return pool.members
+      .filter((member) => member.enabled)
+      .map((member, index) => [
+        member.accountId,
+        finiteNumber(member.order, index),
+        positiveFiniteNumber(member.weight, 1)
+      ].join(':'))
+      .join('|')
+  }
+  return configuredAccounts
+    .map((account) => `${account.id}:${effectiveWeight(account)}`)
+    .join('|')
+}
+
+function finiteNumber(value: number | undefined, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : fallback
+}
+
+function positiveFiniteNumber(value: number | undefined, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : fallback
 }
 
 function positiveDuration(value: number | undefined, fallback: number): number {

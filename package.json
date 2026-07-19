@@ -1,12 +1,20 @@
 {
   "name": "stone-desktop",
-  "version": "0.8.9",
+  "version": "0.9.0",
   "private": true,
   "description": "Stone+ — Unofficial community fork of Stone",
   "author": {
     "name": "Stone+ Contributors"
   },
   "license": "Apache-2.0",
+  "homepage": "https://github.com/M4rkzzz/stone-plus",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/M4rkzzz/stone-plus.git"
+  },
+  "bugs": {
+    "url": "https://github.com/M4rkzzz/stone-plus/issues"
+  },
   "main": "out/main/index.js",
   "type": "module",
   "scripts": {
@@ -124,7 +132,23 @@
       ]
     },
     "nsis": {
-      "artifactName": "StonePlus-${version}-windows-${arch}-setup.${ext}"
+      "artifactName": "StonePlus-${version}-windows-${arch}-setup.${ext}",
+      "oneClick": false,
+      "perMachine": false,
+      "allowElevation": true,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Stone+",
+      "uninstallDisplayName": "Stone+ ${version}",
+      "runAfterFinish": true,
+      "installerLanguages": [
+        "zh_CN",
+        "en_US"
+      ],
+      "displayLanguageSelector": false,
+      "license": "LICENSE",
+      "include": "build/installer.nsh"
     },
     "portable": {
       "artifactName": "StonePlus-${version}-windows-${arch}-portable.${ext}"

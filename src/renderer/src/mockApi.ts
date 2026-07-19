@@ -1,9 +1,11 @@
 import type {
   AccountInput,
+  AccountTagDefinition,
   AccountImportProgress,
   AppSnapshot,
   AppUpdateState,
   BrowserImportQueueState,
+  BrowserJsonCacheState,
   ClientConfigBackup,
   ClientConfigEditorState,
   ClientConfigFileRole,
@@ -21,12 +23,20 @@ import type {
   RequestLog,
   Route,
   RouteClient,
+  SetupWizardState,
 } from '@shared/types'
+import { supportsFastServiceTier } from '@shared/types'
 import { summarizeOpenAiTokenCosts } from '@shared/openai-pricing'
+import { hasRouteSourceIdCollision, isAvailableRouteAccount, resolveRouteSource } from '@shared/route-sources'
 import { buildPoolModelCoverage, pruneModelSelection } from './model-policy'
 
 const STORAGE_KEY = 'stone.browser-mock.v2'
 const now = Date.now()
+
+const accountTags: AccountTagDefinition[] = [
+  { id: 'tag-k12', name: 'K12', createdAt: now, updatedAt: now },
+  { id: 'tag-plus', name: 'Plus', createdAt: now, updatedAt: now },
+]
 
 const proxies: PublicProxyDefinition[] = [
   {
@@ -49,6 +59,7 @@ const providers: ProviderDefinition[] = [
   {
     id: 'provider-anthropic',
     name: 'Anthropic',
+    sourceType: 'official-api',
     kind: 'anthropic',
     baseUrl: 'https://api.anthropic.com',
     protocol: 'anthropic-messages',
@@ -60,6 +71,7 @@ const providers: ProviderDefinition[] = [
   {
     id: 'provider-openai',
     name: 'OpenAI Platform',
+    sourceType: 'official-api',
     kind: 'openai',
     baseUrl: 'https://api.openai.com/v1',
     protocol: 'openai-responses',
@@ -71,6 +83,7 @@ const providers: ProviderDefinition[] = [
   {
     id: 'provider-openrouter',
     name: 'OpenRouter',
+    sourceType: 'relay',
     kind: 'openai-compatible',
     baseUrl: 'https://openrouter.ai/api/v1',
     protocol: 'openai-chat',
@@ -82,6 +95,7 @@ const providers: ProviderDefinition[] = [
   {
     id: 'provider-google',
     name: 'Google AI Studio',
+    sourceType: 'official-api',
     kind: 'google',
     baseUrl: 'https://generativelanguage.googleapis.com',
     protocol: 'gemini',
@@ -279,6 +293,7 @@ const pools: Pool[] = [
   {
     id: 'pool-claude',
     name: 'Claude 稳定池',
+    kind: 'standard',
     protocol: 'anthropic-messages',
     strategy: 'priority',
     members: [
@@ -296,6 +311,7 @@ const pools: Pool[] = [
   {
     id: 'pool-codex',
     name: 'Codex 主线路',
+    kind: 'standard',
     protocol: 'openai-responses',
     strategy: 'balanced',
     members: [
@@ -313,6 +329,7 @@ const pools: Pool[] = [
   {
     id: 'pool-gemini',
     name: 'Gemini 默认池',
+    kind: 'standard',
     protocol: 'gemini',
     strategy: 'round-robin',
     members: [{ accountId: 'account-google', enabled: true }],
@@ -418,6 +435,7 @@ function clientNamesForMock(client: RequestLog['client']): string {
 const initialSnapshot: AppSnapshot = {
   providers,
   accounts,
+  accountTags,
   proxies,
   pools,
   routes,
@@ -585,6 +603,11 @@ function mockConfigFormat(role: ClientConfigFileRole): 'json' | 'toml' | 'dotenv
 function normalizeLoadedModelPolicies(snapshot: AppSnapshot): AppSnapshot {
   return {
     ...snapshot,
+    accountTags: Array.isArray(snapshot.accountTags) ? snapshot.accountTags : clone(accountTags),
+    providers: snapshot.providers.map((provider) => ({
+      ...provider,
+      sourceType: provider.sourceType ?? (['anthropic', 'openai', 'google'].includes(provider.kind) ? 'official-api' : 'relay'),
+    })),
     accounts: snapshot.accounts.map((account) => ({
       ...account,
       availableModels: Array.isArray(account.availableModels) ? account.availableModels : [],
@@ -593,6 +616,7 @@ function normalizeLoadedModelPolicies(snapshot: AppSnapshot): AppSnapshot {
     })),
     pools: snapshot.pools.map((pool) => ({
       ...pool,
+      kind: pool.kind ?? 'standard',
       modelPolicy: pool.modelPolicy ?? (pool.modelAllowlist?.length ? 'selected' : 'all'),
       modelAllowlist: Array.isArray(pool.modelAllowlist) ? pool.modelAllowlist : [],
     })),
@@ -636,6 +660,13 @@ export function createMockApi(): GatewayApi {
   const updateListeners = new Set<(value: AppUpdateState) => void>()
   const browserImportListeners = new Set<(value: BrowserImportQueueState) => void>()
   let browserImportQueue: BrowserImportQueueState = { items: [], readyCount: 0, totalBytes: 0, revision: 0 }
+  let browserJsonCache: BrowserJsonCacheState = { items: [], totalBytes: 0 }
+  let setupWizardState: Awaited<ReturnType<GatewayApi['getSetupWizardState']>> = null
+  const oauthSessions = new Map<string, {
+    input: Parameters<GatewayApi['startChatGptOAuth']>[0]
+    callbackSubmitted: boolean
+    committing: boolean
+  }>()
   const clientBackups: ClientConfigBackup[] = []
   let updateState: AppUpdateState = {
     revision: 0,
@@ -648,6 +679,38 @@ export function createMockApi(): GatewayApi {
     accountIds.map((accountId) => snapshot.accounts.find((account) => account.id === accountId)).filter((account) => account !== undefined),
     (providerId) => snapshot.providers.find((provider) => provider.id === providerId)?.models ?? [],
   ).options.map((option) => option.model)
+
+  const ensureOAuthProvider = (): ProviderDefinition => {
+    const existing = snapshot.providers.find((provider) => provider.sourceType === 'oauth-system')
+    if (existing) return existing
+    const timestamp = Date.now()
+    const provider: ProviderDefinition = {
+      id: 'provider-chatgpt-oauth',
+      name: 'ChatGPT OAuth',
+      sourceType: 'oauth-system',
+      kind: 'openai',
+      baseUrl: 'https://api.openai.com/v1',
+      protocol: 'openai-responses',
+      models: ['gpt-5', 'gpt-5-mini', 'o3'],
+      color: '#10a37f',
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    }
+    snapshot.providers.push(provider)
+    return provider
+  }
+
+  const assignImportedAccountToPool = (poolId: string | null, accountId: string) => {
+    if (!poolId) return { added: 0, existing: 0 }
+    const pool = snapshot.pools.find((candidate) => candidate.id === poolId)
+    if (!pool || pool.kind !== 'standard' || pool.protocol !== 'openai-responses') {
+      throw new Error('导入账号只能加入标准 OpenAI Responses 号池')
+    }
+    if (pool.members.some((member) => member.accountId === accountId)) return { added: 0, existing: 1 }
+    pool.members.push({ accountId, enabled: true })
+    pool.updatedAt = Date.now()
+    return { added: 1, existing: 0 }
+  }
 
   const reconcileMockPoolModels = () => {
     snapshot.pools = snapshot.pools.map((pool) => pool.modelPolicy === 'selected' ? {
@@ -698,6 +761,7 @@ export function createMockApi(): GatewayApi {
       const existing = input.id ? snapshot.providers.find((provider) => provider.id === input.id) : undefined
       const provider: ProviderDefinition = {
         ...input,
+        sourceType: input.sourceType ?? existing?.sourceType ?? (['anthropic', 'openai', 'google'].includes(input.kind) ? 'official-api' : 'relay'),
         id: existing?.id ?? makeId('provider'),
         createdAt: existing?.createdAt ?? timestamp,
         updatedAt: timestamp,
@@ -744,6 +808,7 @@ export function createMockApi(): GatewayApi {
         credentialType: existing?.credentialType,
         credentialExpiresAt: existing?.credentialExpiresAt,
         renewable: existing?.renewable,
+        tagId: input.tagId === undefined ? existing?.tagId : input.tagId || undefined,
         quota: existing?.quota,
         codexQuota: existing?.codexQuota,
         cooldownUntil: existing?.cooldownUntil,
@@ -761,6 +826,40 @@ export function createMockApi(): GatewayApi {
         ? snapshot.accounts.map((item) => (item.id === existing.id ? account : item))
         : [...snapshot.accounts, account]
       reconcileMockPoolModels()
+      return changed()
+    },
+    async saveAccountTag(input) {
+      const name = input.name.trim()
+      if (!name) throw new Error('请输入标签名称')
+      if (name.length > 24) throw new Error('标签名称不能超过 24 个字符')
+      const existing = input.id ? snapshot.accountTags.find((tag) => tag.id === input.id) : undefined
+      if (input.id && !existing) throw new Error('标签不存在')
+      if (!existing && snapshot.accountTags.length >= 50) throw new Error('最多创建 50 个标签')
+      if (snapshot.accountTags.some((tag) => tag.id !== existing?.id && tag.name.toLocaleLowerCase() === name.toLocaleLowerCase())) {
+        throw new Error('标签名称已存在')
+      }
+      const timestamp = Date.now()
+      const tag = { id: existing?.id ?? makeId('tag'), name, createdAt: existing?.createdAt ?? timestamp, updatedAt: timestamp }
+      snapshot.accountTags = existing
+        ? snapshot.accountTags.map((item) => item.id === existing.id ? tag : item)
+        : [...snapshot.accountTags, tag]
+      return changed()
+    },
+    async deleteAccountTag(id) {
+      if (!snapshot.accountTags.some((tag) => tag.id === id)) throw new Error('标签不存在')
+      snapshot.accountTags = snapshot.accountTags.filter((tag) => tag.id !== id)
+      snapshot.accounts = snapshot.accounts.map((account) => account.tagId === id
+        ? { ...account, tagId: undefined, updatedAt: Date.now() }
+        : account)
+      return changed()
+    },
+    async setAccountTags(input) {
+      const selected = new Set(input.accountIds)
+      if (!selected.size) throw new Error('请至少选择一个账号')
+      if (input.tagId && !snapshot.accountTags.some((tag) => tag.id === input.tagId)) throw new Error('标签不存在')
+      snapshot.accounts = snapshot.accounts.map((account) => selected.has(account.id)
+        ? { ...account, tagId: input.tagId || undefined, updatedAt: Date.now() }
+        : account)
       return changed()
     },
     async refreshAccountModels(id: string) {
@@ -811,13 +910,15 @@ export function createMockApi(): GatewayApi {
       if (selectedProxyId && !snapshot.proxies.some((proxy) => proxy.id === selectedProxyId)) {
         throw new Error(input.proxyMode === 'proxy' ? '选择的出口代理已被删除，请重新选择后再导入。' : '文件代理不存在。')
       }
+      if (input.tagId && !snapshot.accountTags.some((tag) => tag.id === input.tagId)) throw new Error('标签不存在')
+      const provider = ensureOAuthProvider()
       const timestamp = Date.now()
       const account: PublicAccount = {
-        id: makeId('chatgpt'), providerId: input.providerId, name: input.name || parsed.email || 'ChatGPT Team',
+        id: makeId('chatgpt'), providerId: provider.id, name: input.name || parsed.email || 'ChatGPT Team',
         maskedCredential: `chatgpt-****${parsed.account_id?.slice(-4) ?? 'acct'}`,
         credentialType: 'chatgpt-oauth',
         credentialExpiresAt: parsed.expired ? Date.parse(parsed.expired) : timestamp + 3_600_000,
-        renewable: false, status: 'active', priority: 10, weight: 10, maxConcurrency: 4, inFlight: 0,
+        renewable: false, tagId: input.tagId || undefined, status: 'active', priority: 10, weight: 10, maxConcurrency: 4, inFlight: 0,
         availableModels: [], modelPolicy: 'all', modelAllowlist: [], proxyId: selectedProxyId,
         circuitState: 'closed', consecutiveFailures: 0, createdAt: timestamp, updatedAt: timestamp
       }
@@ -828,6 +929,7 @@ export function createMockApi(): GatewayApi {
       await pause(180)
       account.availableModels = ['gpt-5.5', 'gpt-5.5-mini']
       account.modelsRefreshedAt = Date.now()
+      const poolAssignment = assignImportedAccountToPool(input.poolId, account.id)
       const refreshedSnapshot = publish()
       emitImportProgress(input.progressId, { phase: 'refreshing', completed: 1, total: 1, percent: 100, message: '正在刷新状态与查询模型 1/1' })
       emitImportProgress(input.progressId, { phase: 'complete', completed: 1, total: 1, percent: 100, message: '导入、状态刷新与模型查询已完成' })
@@ -837,7 +939,15 @@ export function createMockApi(): GatewayApi {
         createdAccountIds: [account.id],
         updatedAccountIds: [],
         warnings: ['No refresh token'],
-        detectionResults: [{ accountId: account.id, accountName: account.name, ok: true, latencyMs: 820, availableModelCount: 2 }]
+        detectionResults: [{ accountId: account.id, accountName: account.name, ok: true, latencyMs: 820, availableModelCount: 2 }],
+        assignmentSummary: {
+          tagId: input.tagId,
+          tagUpdatedAccountCount: 1,
+          poolId: input.poolId,
+          poolMembersAdded: poolAssignment.added,
+          poolMembersAlreadyPresent: poolAssignment.existing,
+          poolMembersSkipped: 0,
+        }
       }
     },
     async importChatGptAccountFiles(input) {
@@ -849,12 +959,14 @@ export function createMockApi(): GatewayApi {
       if (input.proxyMode === 'proxy' && !snapshot.proxies.some((proxy) => proxy.id === input.proxyId)) {
         throw new Error('选择的出口代理已被删除，请重新选择后再导入。')
       }
+      if (input.tagId && !snapshot.accountTags.some((tag) => tag.id === input.tagId)) throw new Error('标签不存在')
+      const provider = ensureOAuthProvider()
       const accountId = makeId('chatgpt-file')
       const timestamp = Date.now()
       const account: PublicAccount = {
-        id: accountId, providerId: input.providerId, name: 'CPA Plus Account',
+        id: accountId, providerId: provider.id, name: 'CPA Plus Account',
         maskedCredential: 'chatgpt-****demo', credentialType: 'chatgpt-oauth',
-        credentialExpiresAt: timestamp + 3_600_000, renewable: false, status: 'active', priority: 10, weight: 10,
+        credentialExpiresAt: timestamp + 3_600_000, renewable: false, tagId: input.tagId || undefined, status: 'active', priority: 10, weight: 10,
         maxConcurrency: 4, inFlight: 0, latencyMs: 820, availableModels: [], modelPolicy: 'all', modelAllowlist: [],
         proxyId: input.proxyMode === 'proxy' ? input.proxyId : undefined,
         circuitState: 'closed', consecutiveFailures: 0, createdAt: timestamp, updatedAt: timestamp
@@ -865,6 +977,7 @@ export function createMockApi(): GatewayApi {
       await pause(180)
       account.availableModels = ['gpt-5.5', 'gpt-5.5-mini']
       account.modelsRefreshedAt = Date.now()
+      const poolAssignment = assignImportedAccountToPool(input.poolId, account.id)
       publish()
       emitImportProgress(input.progressId, { phase: 'refreshing', completed: 1, total: 1, percent: 100, message: '正在刷新状态与查询模型 1/1' })
       emitImportProgress(input.progressId, { phase: 'complete', completed: 1, total: 1, percent: 100, message: '导入、状态刷新与模型查询已完成' })
@@ -880,8 +993,75 @@ export function createMockApi(): GatewayApi {
         createdAccountIds: [accountId],
         updatedAccountIds: [],
         detectionResults: [{ accountId, accountName: account.name, ok: true, latencyMs: 820, availableModelCount: 2 }],
-        warnings: ['codex-plus-1.json：已从 JWT user_id 自动补全 1 个 CPA 账号的 account_id。']
+        warnings: ['codex-plus-1.json：已从 JWT user_id 自动补全 1 个 CPA 账号的 account_id。'],
+        assignmentSummary: {
+          tagId: input.tagId,
+          tagUpdatedAccountCount: 1,
+          poolId: input.poolId,
+          poolMembersAdded: poolAssignment.added,
+          poolMembersAlreadyPresent: poolAssignment.existing,
+          poolMembersSkipped: 0,
+        }
       }
+    },
+    async startChatGptOAuth(input) {
+      if (input.proxyMode === 'proxy' && !snapshot.proxies.some((proxy) => proxy.id === input.proxyId)) {
+        throw new Error('选择的出口代理已被删除，请重新选择后再授权。')
+      }
+      if (input.tagId && !snapshot.accountTags.some((tag) => tag.id === input.tagId)) throw new Error('标签不存在')
+      const sessionId = makeId('oauth')
+      const redirectUri = 'http://localhost:1455/auth/callback'
+      const expiresAt = Date.now() + 10 * 60_000
+      oauthSessions.set(sessionId, { input: clone(input), callbackSubmitted: false, committing: false })
+      return {
+        sessionId,
+        authorizationUrl: `https://auth.openai.com/oauth/authorize?response_type=code&client_id=stone-mock&redirect_uri=${encodeURIComponent(redirectUri)}&state=${sessionId}`,
+        redirectUri,
+        expiresAt,
+        loopbackListening: true,
+        status: 'waiting' as const,
+      }
+    },
+    async openChatGptOAuth(sessionId) {
+      if (!oauthSessions.has(sessionId)) throw new Error('OAuth 授权会话不存在或已结束。')
+    },
+    async submitChatGptOAuthCallback(input) {
+      const session = oauthSessions.get(input.sessionId)
+      if (!session) throw new Error('OAuth 授权会话不存在或已结束。')
+      if (!input.callbackUrl.trim()) throw new Error('请粘贴完整 OAuth 回调地址。')
+      session.callbackSubmitted = true
+    },
+    async waitChatGptOAuth(sessionId) {
+      const session = oauthSessions.get(sessionId)
+      if (!session) throw new Error('OAuth 授权会话不存在或已结束。')
+      await pause(450)
+      if (oauthSessions.get(sessionId) !== session) throw new Error('OAuth 授权已取消。')
+      session.committing = true
+      const tagWasDeleted = Boolean(session.input.tagId
+        && !snapshot.accountTags.some((tag) => tag.id === session.input.tagId))
+      const result = await this.importChatGptAccounts({
+        content: JSON.stringify({
+          account_id: `acct-${sessionId}`,
+          email: 'oauth.demo@stone.local',
+          expired: new Date(Date.now() + 60 * 60_000).toISOString(),
+        }),
+        name: session.input.name,
+        tagId: tagWasDeleted ? null : session.input.tagId,
+        poolId: session.input.poolId,
+        proxyMode: session.input.proxyMode,
+        proxyId: session.input.proxyId,
+      })
+      oauthSessions.delete(sessionId)
+      return tagWasDeleted ? {
+        ...result,
+        warnings: [...result.warnings, 'OAuth 授权期间所选 Tag 已被删除，账号已按“未标记”导入。']
+      } : result
+    },
+    async cancelChatGptOAuth(sessionId) {
+      const session = oauthSessions.get(sessionId)
+      if (session?.committing) return false
+      oauthSessions.delete(sessionId)
+      return true
     },
     async getBrowserImportQueue() {
       return clone(browserImportQueue)
@@ -901,6 +1081,24 @@ export function createMockApi(): GatewayApi {
       browserImportQueue = { items: [], readyCount: 0, totalBytes: 0, revision: browserImportQueue.revision + 1 }
       for (const listener of browserImportListeners) listener(clone(browserImportQueue))
       return clone(browserImportQueue)
+    },
+    async getBrowserJsonCache() {
+      return clone(browserJsonCache)
+    },
+    async saveBrowserJsonCacheItem(id) {
+      if (!browserJsonCache.items.some((item) => item.id === id)) throw new Error('缓存中的 JSON 已不存在。')
+      return { cancelled: false, filePath: `C:\\Downloads\\${browserJsonCache.items.find((item) => item.id === id)!.fileName}` }
+    },
+    async removeBrowserJsonCacheItem(id) {
+      browserJsonCache = {
+        items: browserJsonCache.items.filter((item) => item.id !== id),
+        totalBytes: browserJsonCache.items.filter((item) => item.id !== id).reduce((total, item) => total + item.sizeBytes, 0)
+      }
+      return clone(browserJsonCache)
+    },
+    async clearBrowserJsonCache() {
+      browserJsonCache = { items: [], totalBytes: 0 }
+      return clone(browserJsonCache)
     },
     async importBrowserJsonQueue(input) {
       if (!input.itemIds.length) throw new Error('请至少选择一个已挂起的 JSON 文件。')
@@ -995,6 +1193,7 @@ export function createMockApi(): GatewayApi {
       const pool: Pool = {
         id: existing?.id ?? makeId('pool'),
         name: input.name,
+        kind: input.kind ?? existing?.kind ?? 'standard',
         protocol: input.protocol,
         strategy: input.strategy,
         members: input.accountIds.map((accountId) => ({ accountId, enabled: true })),
@@ -1003,7 +1202,7 @@ export function createMockApi(): GatewayApi {
         stickySessions: input.stickySessions,
         stickyTtlMinutes: input.stickyTtlMinutes,
         maxRetries: input.maxRetries,
-        forceFastMode: input.protocol === 'openai-responses'
+        forceFastMode: supportsFastServiceTier(input.protocol)
           && (input.forceFastMode ?? existing?.forceFastMode) === true,
         hedgedRequests: input.protocol === 'openai-responses'
           && (input.hedgedRequests ?? existing?.hedgedRequests) === true,
@@ -1025,7 +1224,132 @@ export function createMockApi(): GatewayApi {
       snapshot.pools = snapshot.pools.filter((pool) => pool.id !== id)
       return changed()
     },
+    async setRouteSourceFastMode(input) {
+      const sourceId = typeof input.sourceId === 'string' ? input.sourceId.trim() : ''
+      if (!sourceId) throw new Error('请选择号池或中转站')
+      if (typeof input.enabled !== 'boolean') throw new Error('FAST 状态无效')
+      const pool = snapshot.pools.find((candidate) => candidate.id === sourceId)
+      const provider = snapshot.providers.find((candidate) => candidate.id === sourceId)
+      if (pool && provider) throw new Error('来源 ID 与号池 ID 冲突')
+      if (pool) {
+        if (input.enabled && !supportsFastServiceTier(pool.protocol)) {
+          throw new Error('FAST 仅支持 OpenAI Responses 与 OpenAI Chat')
+        }
+        snapshot.pools = snapshot.pools.map((candidate) => candidate.id === sourceId
+          ? { ...candidate, forceFastMode: input.enabled, updatedAt: Date.now() }
+          : candidate)
+        return changed()
+      }
+      if (!provider) throw new Error('号池或中转站不存在')
+      if (provider.sourceType === 'oauth-system') throw new Error('系统 OAuth 来源不能作为独立 FAST 中转站')
+      if (provider.sourceType !== 'relay') throw new Error('FAST 仅能直接配置中转站来源')
+      if (input.enabled && !supportsFastServiceTier(provider.protocol)) {
+        throw new Error('FAST 仅支持 OpenAI Responses 与 OpenAI Chat')
+      }
+      snapshot.providers = snapshot.providers.map((candidate) => candidate.id === sourceId
+        ? { ...candidate, forceFastMode: input.enabled, updatedAt: Date.now() }
+        : candidate)
+      return changed()
+    },
+    async saveApiSource() {
+      throw new Error('API source mock is not implemented yet.')
+    },
+    async probeApiSource() {
+      return { ok: false, stages: [], models: [], error: 'API source mock is not implemented yet.', warnings: [] }
+    },
+    async deleteApiSource(id: string) {
+      const provider = snapshot.providers.find((candidate) => candidate.id === id)
+      if (!provider || provider.sourceType === 'oauth-system') throw new Error('API 来源不存在')
+      const accountIds = new Set(snapshot.accounts.filter((account) => account.providerId === id).map((account) => account.id))
+      const deletedPoolIds = new Set<string>()
+      snapshot.providers = snapshot.providers.filter((candidate) => candidate.id !== id)
+      snapshot.accounts = snapshot.accounts.filter((account) => !accountIds.has(account.id))
+      snapshot.pools = snapshot.pools.flatMap((pool) => {
+        const members = pool.members.filter((member) => !accountIds.has(member.accountId))
+        if (members.length === pool.members.length) return [pool]
+        if (!members.length || (pool.kind === 'relay-aggregate' && members.length < 2)) {
+          deletedPoolIds.add(pool.id)
+          return []
+        }
+        return [{ ...pool, members, updatedAt: Date.now() }]
+      })
+      snapshot.routes = snapshot.routes.map((route) => route.poolId === id || deletedPoolIds.has(route.poolId)
+        ? { ...route, enabled: false, poolId: '', updatedAt: Date.now() }
+        : route)
+      return changed()
+    },
+    async saveAggregateRelay() {
+      throw new Error('Aggregate relay mock is not implemented yet.')
+    },
+    async getSetupWizardState() {
+      return setupWizardState ? clone(setupWizardState) : null
+    },
+    async saveSetupWizardProgress(input) {
+      const timestamp = Date.now()
+      const current = setupWizardState
+      const next: SetupWizardState = {
+        sessionId: input.sessionId ?? setupWizardState?.sessionId ?? makeId('setup'),
+        step: input.step,
+        completed: current?.completed ?? false,
+        dismissed: false,
+        sourceType: input.sourceType ?? current?.sourceType,
+        sourceMethod: input.sourceMethod === null ? undefined : input.sourceMethod ?? current?.sourceMethod,
+        sourceId: input.sourceId === null ? undefined : input.sourceId ?? current?.sourceId,
+        tagId: input.tagId === null ? undefined : input.tagId ?? current?.tagId,
+        poolId: input.poolId === null ? undefined : input.poolId ?? current?.poolId,
+        routeId: input.routeId === null ? undefined : input.routeId ?? current?.routeId,
+        client: input.client ?? current?.client,
+        model: input.model ?? current?.model,
+        proxyId: input.proxyId === null ? undefined : input.proxyId ?? current?.proxyId,
+        lastError: input.lastError,
+        verifiedAt: current?.completed || input.step === 'client-config' || input.step === 'complete'
+          ? current?.verifiedAt
+          : undefined,
+        createdAt: setupWizardState?.createdAt ?? timestamp,
+        updatedAt: timestamp,
+      }
+      setupWizardState = next
+      return clone(next)
+    },
+    async discardSetupWizard() {
+      setupWizardState = null
+    },
+    async completeSetupWizard() {
+      if (!setupWizardState?.verifiedAt) throw new Error('只有端到端真实请求成功后才能完成配置向导。')
+      setupWizardState = { ...setupWizardState, completed: true, step: 'complete', updatedAt: Date.now() }
+    },
+    async applySetupRouting(input) {
+      const poolId = input.aggregatePoolId
+        ?? snapshot.pools.find((pool) => pool.members.some((member) => member.accountId === input.sourceId))?.id
+        ?? ''
+      const routeId = snapshot.routes.find((route) => route.client === input.client)?.id ?? ''
+      return { snapshot: clone(snapshot), poolId, routeId, createdPool: false }
+    },
+    async ensureGatewayRunning() {
+      return {
+        snapshot: clone(snapshot),
+        host: snapshot.gateway.host,
+        port: snapshot.gateway.port,
+        changedPort: false,
+        started: snapshot.gatewayStatus.running,
+      }
+    },
+    async verifySetupRoute() {
+      if (setupWizardState) {
+        const timestamp = Date.now()
+        setupWizardState = { ...setupWizardState, step: 'client-config', verifiedAt: timestamp, updatedAt: timestamp }
+      }
+      return { ok: true, latencyMs: 120, status: 200, responsePreview: 'OK' }
+    },
     async updateRoute(route: Route) {
+      if (route.enabled && hasRouteSourceIdCollision(route.poolId, snapshot)) {
+        throw new Error('所选源 ID 与号池 ID 冲突')
+      }
+      const source = resolveRouteSource(route.poolId, snapshot)
+      if (route.enabled && !source) throw new Error('请选择现有号池、官方 API 或中转站')
+      if (route.enabled && source?.provider && !source.accounts.some(isAvailableRouteAccount)) {
+        throw new Error('所选 API 来源没有可用账号')
+      }
       snapshot.routes = snapshot.routes.map((item) => (item.id === route.id ? { ...route, updatedAt: Date.now() } : item))
       return changed()
     },
@@ -1134,21 +1458,6 @@ export function createMockApi(): GatewayApi {
     async clearHealthEvents() {
       snapshot.healthEvents = []
       return changed()
-    },
-    async listProviderPresets() {
-      return [
-        { id: 'openai', name: 'OpenAI', kind: 'openai', baseUrl: 'https://api.openai.com/v1', protocol: 'openai-responses', models: ['gpt-5.4', 'gpt-5.3-codex', 'gpt-5-mini'] },
-        { id: 'anthropic', name: 'Anthropic', kind: 'anthropic', baseUrl: 'https://api.anthropic.com', protocol: 'anthropic-messages', models: ['claude-sonnet-4-5'] },
-        { id: 'gemini', name: 'Google Gemini', kind: 'google', baseUrl: 'https://generativelanguage.googleapis.com', protocol: 'gemini', models: ['gemini-2.5-pro'] }
-      ]
-    },
-    async onboardProvider(input) {
-      const presets = await this.listProviderPresets()
-      const preset = presets.find((candidate) => candidate.id === input.presetId)
-      if (!preset) throw new Error('Provider preset not found')
-      await this.saveProvider({ ...preset, name: input.providerName || preset.name })
-      const provider = snapshot.providers.at(-1)!
-      return this.saveAccount({ providerId: provider.id, name: input.accountName, credential: input.credential, priority: 10, weight: 10, maxConcurrency: 4, modelAllowlist: [] })
     },
     async saveClientProfile(input) {
       const existing = snapshot.clientProfiles.find((profile) => profile.id === input.id)
@@ -1301,22 +1610,16 @@ export function createMockApi(): GatewayApi {
         error: undefined,
         progress: undefined,
         release: {
-          version: '0.8.1',
-          tagName: 'v0.8.1',
-          title: 'Stone+ 0.8.1 · 更稳健的本地更新体验',
+          version: '0.9.1',
+          tagName: 'v0.9.1',
+          title: 'Stone+ 0.9.1 · 更顺滑的应用更新体验',
           publishedAt: new Date().toISOString(),
-          url: 'https://github.com/M4rkzzz/stone-plus/releases/tag/v0.8.1',
+          url: 'https://github.com/M4rkzzz/stone-plus/releases/tag/v0.9.1',
           notes: [
-            '本次更新',
-            '',
-            '- 新增 GitHub Releases 在线更新与新版本提醒。',
-            '- 支持忽略版本、查看下载进度和更新后重启。',
-            '- 优化账号、号池与客户端配置体验。',
-            '',
-            '更新方式',
-            '',
-            '- Windows 安装版与 Linux AppImage 支持应用内更新。',
-            '- Portable、deb 与当前 macOS 版本可前往 Releases 手动更新。',
+            '- 品牌标识旁新增绿色“更新”提醒，不再打断当前操作。',
+            '- 点击提醒即可查看本次 Release 的核心亮点。',
+            '- 确认更新后自动下载、校验并覆盖安装。',
+            '- 安装完成后自动重新启动 Stone+。',
           ].join('\n'),
         },
       })
@@ -1407,6 +1710,10 @@ export function createMockApi(): GatewayApi {
         encryptedSourceProviders: ['openai'],
         backupPath: 'C:\\Users\\demo\\.codex\\backups_state\\stone-session-repair\\20260718210000000-demo',
       }
+    },
+    async repairCodexSessionsAndRestartChatGpt() {
+      const repair = await this.repairCodexSessions('stone', 'a'.repeat(64))
+      return { repair, chatGptWasRunning: true, chatGptRestarted: true }
     },
     onSnapshot(listener) {
       listeners.add(listener)

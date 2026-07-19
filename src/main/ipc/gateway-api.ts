@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, Notification, type WebContents } from 'electron'
+import { app, BrowserWindow, dialog, ipcMain, Notification, shell, type WebContents } from 'electron'
 import { randomUUID } from 'node:crypto'
 import { lstat, readFile, writeFile } from 'node:fs/promises'
 import { basename, extname, join } from 'node:path'
@@ -21,7 +21,7 @@ import type {
   RouteClient
 } from '@shared/types'
 import type { GatewayAccountState, GatewayConfig } from '../gateway'
-import { CHATGPT_CODEX_RESPONSES_URL, codexQuotaCooldownUntil, codexQuotaIsExhausted, getProviderAdapter, getProviderPreset, probeChatGptAccount, probeChatGptCodexModel, probeProviderModel, providerPresets, queryChatGptCodexModels, queryChatGptCodexQuota, resolveChatGptCredential, type ProviderFailure } from '../providers'
+import { CHATGPT_CODEX_RESPONSES_URL, codexQuotaCooldownUntil, codexQuotaIsExhausted, getProviderAdapter, probeChatGptAccount, probeChatGptCodexModel, probeProviderModel, queryChatGptCodexModels, queryChatGptCodexQuota, resolveChatGptCredential, type ProviderFailure } from '../providers'
 import { validateAccountImportProxySelection, type AppStore } from '../store/app-store'
 import type { ClientConfigService } from '../client-config'
 import type { DatabaseBackupService } from '../backup'
@@ -31,6 +31,10 @@ import { assertTrustedSender } from './trusted-sender'
 import { OutboundTransportManager, probeProxy, resolveEffectiveProxy } from '../proxy'
 import { runNetworkDiagnostics } from '../network-diagnostics'
 import type { BrowserImportQueue } from '../browser-import-queue'
+import { verifySetupRouteRequest } from '../setup/setup-verification'
+import { probeApiSource as runApiSourceProbe } from '../sources/api-source-service'
+import { ChatGptOAuthFlowManager, type ChatGptOAuthSessionController } from '../auth/chatgpt-oauth-flow'
+import { serializeChatGptCredential } from '../auth'
 
 export interface GatewayController {
   start(settings?: GatewaySettings): Promise<void>
@@ -52,7 +56,10 @@ export function registerGatewayApi(
   outboundTransport: OutboundTransportManager,
   backups?: DatabaseBackupService<PersistedState>,
   onRuntimeChanged?: () => void,
-  browserImports?: BrowserImportQueue
+  browserImports?: BrowserImportQueue,
+  chatGptOAuth: ChatGptOAuthSessionController = new ChatGptOAuthFlowManager({
+    openExternal: (url) => shell.openExternal(url)
+  })
 ): () => Promise<void> {
   const snapshotPublishDelayMs = 1_000
   const liveRuntimePublishIntervalMs = 50
@@ -66,6 +73,57 @@ export function registerGatewayApi(
   const quotaProbeFlights = new Set<string>()
   const lastQuotaProbeAt = new Map<string, number>()
   let closed = false
+  type OAuthStartInput = Parameters<GatewayApi['startChatGptOAuth']>[0]
+  type OAuthImportResult = Awaited<ReturnType<GatewayApi['waitChatGptOAuth']>>
+  interface OAuthImportSession {
+    input: OAuthStartInput
+    owner: WebContents
+    ownerId: number
+    onOwnerGone: () => void
+    cleanupTimer: ReturnType<typeof setTimeout>
+    cancelled: boolean
+    committing: boolean
+    cleaned: boolean
+    completion?: Promise<OAuthImportResult>
+  }
+  const oauthImportSessions = new Map<string, OAuthImportSession>()
+  const oauthCompletionFlights = new Set<Promise<OAuthImportResult>>()
+
+  const cleanupOAuthSession = (
+    sessionId: string,
+    session: OAuthImportSession,
+    options: { cancelFlow: boolean; markCancelled: boolean }
+  ): void => {
+    if (options.markCancelled) session.cancelled = true
+    if (session.cleaned) return
+    session.cleaned = true
+    clearTimeout(session.cleanupTimer)
+    session.owner.removeListener('destroyed', session.onOwnerGone)
+    session.owner.removeListener('render-process-gone', session.onOwnerGone)
+    if (oauthImportSessions.get(sessionId) === session) oauthImportSessions.delete(sessionId)
+    if (options.cancelFlow) chatGptOAuth.cancel(sessionId)
+  }
+
+  const cancelOAuthSession = (sessionId: string, session: OAuthImportSession): boolean => {
+    // Once token exchange has completed, account persistence is the commit
+    // boundary. An ordinary renderer cancellation must not create a valid but
+    // unpersisted refresh token.
+    if (session.committing) return false
+    cleanupOAuthSession(sessionId, session, { cancelFlow: true, markCancelled: true })
+    return true
+  }
+
+  const requireOwnedOAuthSession = (sessionId: unknown, sender: WebContents): {
+    id: string
+    session: OAuthImportSession
+  } => {
+    const id = typeof sessionId === 'string' ? sessionId.trim() : ''
+    const session = oauthImportSessions.get(id)
+    if (!session || session.owner !== sender || session.ownerId !== sender.id) {
+      throw new Error('OAuth 授权会话不存在或不属于当前窗口。')
+    }
+    return { id, session }
+  }
   const withRuntimeMetrics = (snapshot: AppSnapshot): AppSnapshot => {
     const fitness = gateway.getAccountFitness?.() ?? {}
     const inFlight = gateway.getAccountInFlight()
@@ -301,6 +359,124 @@ export function registerGatewayApi(
     })
   }
 
+  const finalizeImportAssignments = async (
+    accountIds: readonly string[],
+    detectionResults: readonly { accountId: string; ok: boolean }[],
+    tagId: string | null | undefined,
+    poolId: string | null | undefined
+  ) => {
+    const uniqueAccountIds = [...new Set(accountIds)]
+    const successfulIds = new Set(detectionResults.filter((result) => result.ok).map((result) => result.accountId))
+    const eligibleIds = uniqueAccountIds.filter((id) => successfulIds.has(id))
+    let poolAssignment = { added: 0, alreadyPresent: 0 }
+    let poolAppendError: string | undefined
+    try {
+      poolAssignment = await store.addDetectedChatGptAccountsToPool(poolId, eligibleIds)
+    } catch (error) {
+      poolAppendError = importErrorMessage(error)
+    }
+    return {
+      tagId: tagId ?? null,
+      tagUpdatedAccountCount: uniqueAccountIds.length,
+      poolId: poolId ?? null,
+      poolMembersAdded: poolAssignment.added,
+      poolMembersAlreadyPresent: poolAssignment.alreadyPresent,
+      poolMembersSkipped: poolId ? uniqueAccountIds.length - eligibleIds.length : 0,
+      ...(poolAppendError ? { poolAppendError } : {})
+    }
+  }
+
+  const completeChatGptOAuth = async (
+    sessionId: string,
+    session: OAuthImportSession
+  ): Promise<OAuthImportResult> => {
+    let lazyTransportFailure: string | undefined
+    const fetchImplementation = (async (request, init) => {
+      if (session.cancelled) throw new Error('OAuth 授权已取消。')
+      // Resolve the selected proxy, its latest revision and its password only
+      // when the token POST is actually dispatched. OAuth can remain open for
+      // minutes and must not retain stale proxy credentials from start().
+      const proxy = session.input.proxyMode === 'proxy'
+        ? store.getSnapshot().proxies.find((candidate) => candidate.id === session.input.proxyId)
+        : undefined
+      if (session.input.proxyMode === 'proxy' && !proxy) {
+        lazyTransportFailure = '选择的出口代理已被删除，请重新开始 OAuth 授权。'
+        throw new Error(lazyTransportFailure)
+      }
+      try {
+        const transport = outboundTransport.fetchFor(
+          proxy,
+          proxy ? store.getProxyPassword(proxy.id) : undefined
+        )
+        return await transport(request, init)
+      } catch (error) {
+        if (error instanceof Error && error.message === 'Proxy authentication is unavailable from the credential vault.') {
+          lazyTransportFailure = error.message
+        }
+        throw error
+      }
+    }) as typeof fetch
+    let bundle: Awaited<ReturnType<ChatGptOAuthSessionController['wait']>>
+    try {
+      bundle = await chatGptOAuth.wait(sessionId, fetchImplementation)
+    } catch (error) {
+      if (session.cancelled) throw new Error('OAuth 授权已取消。')
+      if (lazyTransportFailure) throw new Error(lazyTransportFailure)
+      throw error
+    }
+    if (session.cancelled) throw new Error('OAuth 授权已取消。')
+    // Commit boundary: this assignment runs in the same promise continuation
+    // that receives the token bundle, before another IPC cancellation can run.
+    session.committing = true
+
+    // Pool membership is deliberately finalized after account detection. Do
+    // not pass the selected pool to the store import: the pool can be deleted
+    // while the browser authorization is open, but the account and Tag must
+    // still be persisted in that race.
+    let effectiveTagId = session.input.tagId
+    let tagRaceWarning: string | undefined
+    const tagExists = (tagId: string): boolean => store.getSnapshot().accountTags.some((tag) => tag.id === tagId)
+    if (effectiveTagId && !tagExists(effectiveTagId)) {
+      effectiveTagId = null
+      tagRaceWarning = 'OAuth 授权期间所选 Tag 已被删除，账号已按“未标记”导入。'
+    }
+    const persistAccount = (tagId: string | null) => store.importChatGptAccounts({
+      content: serializeChatGptCredential(bundle),
+      name: session.input.name,
+      tagId,
+      poolId: null,
+      proxyMode: session.input.proxyMode,
+      proxyId: session.input.proxyId
+    })
+    let imported: Awaited<ReturnType<AppStore['importChatGptAccounts']>>
+    try {
+      imported = await persistAccount(effectiveTagId)
+    } catch (error) {
+      // Close the narrow race between the preflight check and the atomic store
+      // update. Only retry when the selected Tag demonstrably disappeared.
+      if (!effectiveTagId || tagExists(effectiveTagId)) throw error
+      effectiveTagId = null
+      tagRaceWarning = 'OAuth 授权期间所选 Tag 已被删除，账号已按“未标记”导入。'
+      imported = await persistAccount(null)
+    }
+    publish(refreshRuntime())
+    const detectionResults = await detectImportedAccounts(imported.importedAccountIds)
+    const assignmentSummary = await finalizeImportAssignments(
+      imported.importedAccountIds,
+      detectionResults,
+      effectiveTagId,
+      session.input.poolId
+    )
+    publish(refreshRuntime())
+    return {
+      ...imported,
+      warnings: tagRaceWarning ? [...imported.warnings, tagRaceWarning] : imported.warnings,
+      detectionResults,
+      assignmentSummary,
+      snapshot: store.getSnapshot()
+    }
+  }
+
   const emitImportProgress = (
     sender: WebContents,
     progressId: unknown,
@@ -448,6 +624,18 @@ export function registerGatewayApi(
       return snapshot
     })
   })
+  ipcMain.handle('stone:save-account-tag', (event, input: Parameters<GatewayApi['saveAccountTag']>[0]) => {
+    assertTrustedSender(event)
+    return mutate(() => store.saveAccountTag(input))
+  })
+  ipcMain.handle('stone:delete-account-tag', (event, id: string) => {
+    assertTrustedSender(event)
+    return mutate(() => store.deleteAccountTag(id))
+  })
+  ipcMain.handle('stone:set-account-tags', (event, input: Parameters<GatewayApi['setAccountTags']>[0]) => {
+    assertTrustedSender(event)
+    return mutate(() => store.setAccountTags(input))
+  })
   ipcMain.handle('stone:refresh-account-models', async (event, id: string) => {
     assertTrustedSender(event)
     const discoveryFingerprint = store.getAccountModelDiscoveryFingerprint(id)
@@ -468,15 +656,111 @@ export function registerGatewayApi(
     const detectionResults = await detectImportedAccounts(imported.importedAccountIds, (completed, total) => {
       emitImportProgress(event.sender, input?.progressId, { phase: 'refreshing', completed, total, percent: 50 + Math.round(completed / Math.max(1, total) * 50), message: `正在刷新状态与查询模型 ${completed}/${total}` })
     })
+    emitImportProgress(event.sender, input?.progressId, { phase: 'assigning', completed: 0, total: 1, percent: 95, message: '正在整理 Tag 与号池成员…' })
+    const assignmentSummary = await finalizeImportAssignments(
+      imported.importedAccountIds,
+      detectionResults,
+      input.tagId,
+      input.poolId
+    )
     publish(refreshRuntime())
     emitImportProgress(event.sender, input?.progressId, { phase: 'complete', completed: imported.importedAccountIds.length, total: imported.importedAccountIds.length, percent: 100, message: '导入、状态刷新与模型查询已完成' })
-    return { ...imported, detectionResults, snapshot: store.getSnapshot() }
+    return { ...imported, detectionResults, assignmentSummary, snapshot: store.getSnapshot() }
+  })
+  ipcMain.handle('stone:start-chatgpt-oauth', async (event, input: Parameters<GatewayApi['startChatGptOAuth']>[0]) => {
+    assertTrustedSender(event)
+    if (!input || typeof input !== 'object') throw new Error('OAuth 授权参数无效。')
+    const normalized: OAuthStartInput = {
+      ...(typeof input.name === 'string' && input.name.trim() ? { name: input.name.trim() } : {}),
+      tagId: input.tagId ?? null,
+      poolId: input.poolId ?? null,
+      // OAuth has no file-provided proxy to preserve. Treat the shared import
+      // control's legacy “preserve” value as an explicit direct selection.
+      proxyMode: input.proxyMode === 'preserve' ? 'direct' : input.proxyMode ?? 'direct',
+      ...(typeof input.proxyId === 'string' && input.proxyId.trim() ? { proxyId: input.proxyId.trim() } : {})
+    }
+    validateAccountImportProxySelection(normalized.proxyMode, normalized.proxyId, store.getRuntimeProxies())
+    store.validateChatGptImportAssignments(normalized.tagId, normalized.poolId)
+    const owner = event.sender
+    let ownerGoneDuringStart = owner.isDestroyed()
+    const markOwnerGone = (): void => { ownerGoneDuringStart = true }
+    owner.once('destroyed', markOwnerGone)
+    owner.once('render-process-gone', markOwnerGone)
+    let started: Awaited<ReturnType<ChatGptOAuthSessionController['start']>>
+    try {
+      started = await chatGptOAuth.start()
+    } finally {
+      owner.removeListener('destroyed', markOwnerGone)
+      owner.removeListener('render-process-gone', markOwnerGone)
+    }
+    if (ownerGoneDuringStart || owner.isDestroyed()) {
+      chatGptOAuth.cancel(started.sessionId)
+      throw new Error('OAuth 授权窗口已经关闭。')
+    }
+    const onOwnerGone = (): void => {
+      const current = oauthImportSessions.get(started.sessionId)
+      if (current) cancelOAuthSession(started.sessionId, current)
+    }
+    const cleanupTimer = setTimeout(() => {
+      const current = oauthImportSessions.get(started.sessionId)
+      if (!current) return
+      cancelOAuthSession(started.sessionId, current)
+    }, Math.max(1, started.expiresAt - Date.now() + 1_000))
+    cleanupTimer.unref?.()
+    const session: OAuthImportSession = {
+      input: normalized,
+      owner,
+      ownerId: owner.id,
+      onOwnerGone,
+      cleanupTimer,
+      cancelled: false,
+      committing: false,
+      cleaned: false
+    }
+    oauthImportSessions.set(started.sessionId, session)
+    owner.once('destroyed', onOwnerGone)
+    owner.once('render-process-gone', onOwnerGone)
+    if (owner.isDestroyed()) {
+      cancelOAuthSession(started.sessionId, session)
+      throw new Error('OAuth 授权窗口已经关闭。')
+    }
+    return started
+  })
+  ipcMain.handle('stone:open-chatgpt-oauth', async (event, sessionId: string) => {
+    assertTrustedSender(event)
+    const owned = requireOwnedOAuthSession(sessionId, event.sender)
+    await chatGptOAuth.open(owned.id)
+  })
+  ipcMain.handle('stone:submit-chatgpt-oauth-callback', (event, input: Parameters<GatewayApi['submitChatGptOAuthCallback']>[0]) => {
+    assertTrustedSender(event)
+    if (!input || typeof input !== 'object') throw new Error('OAuth 回调参数无效。')
+    const owned = requireOwnedOAuthSession(input.sessionId, event.sender)
+    chatGptOAuth.submitCallback(owned.id, input.callbackUrl)
+  })
+  ipcMain.handle('stone:wait-chatgpt-oauth', (event, sessionId: string) => {
+    assertTrustedSender(event)
+    const owned = requireOwnedOAuthSession(sessionId, event.sender)
+    if (!owned.session.completion) {
+      const completion = completeChatGptOAuth(owned.id, owned.session).finally(() => {
+        cleanupOAuthSession(owned.id, owned.session, { cancelFlow: false, markCancelled: true })
+      })
+      owned.session.completion = completion
+      oauthCompletionFlights.add(completion)
+      void completion.then(
+        () => oauthCompletionFlights.delete(completion),
+        () => oauthCompletionFlights.delete(completion)
+      )
+    }
+    return owned.session.completion
+  })
+  ipcMain.handle('stone:cancel-chatgpt-oauth', (event, sessionId: string) => {
+    assertTrustedSender(event)
+    const owned = requireOwnedOAuthSession(sessionId, event.sender)
+    return cancelOAuthSession(owned.id, owned.session)
   })
   ipcMain.handle('stone:import-chatgpt-account-files', async (event, input: Parameters<GatewayApi['importChatGptAccountFiles']>[0]) => {
     assertTrustedSender(event)
-    if (!input || typeof input.providerId !== 'string' || !input.providerId.trim()) {
-      throw new Error('批量导入前请选择 OpenAI Responses Provider。')
-    }
+    if (!input) throw new Error('账号导入参数无效。')
     const owner = BrowserWindow.fromWebContents(event.sender)
     if (!owner) throw new Error('无法打开账号文件选择器。')
     const selection = await dialog.showOpenDialog(owner, {
@@ -489,10 +773,11 @@ export function registerGatewayApi(
       ]
     })
     if (selection.canceled || !selection.filePaths.length) {
-      return emptyFileImportResult(store.getSnapshot())
+      return emptyFileImportResult(store.getSnapshot(), input.tagId, input.poolId)
     }
     emitImportProgress(event.sender, input.progressId, { phase: 'importing', completed: 0, total: selection.filePaths.length, percent: 0, message: `正在导入文件 0/${selection.filePaths.length}` })
     validateAccountImportProxySelection(input.proxyMode, input.proxyId, store.getRuntimeProxies())
+    store.validateChatGptImportAssignments(input.tagId, input.poolId)
     if (selection.filePaths.length > 100) throw new Error('一次最多导入 100 个账号文件。')
 
     const fileResults: Awaited<ReturnType<GatewayApi['importChatGptAccountFiles']>>['fileResults'] = []
@@ -524,10 +809,11 @@ export function registerGatewayApi(
     for (const file of readableFiles) {
       try {
         const imported = await store.importChatGptAccounts({
-          providerId: input.providerId,
           content: file.content,
           proxyMode: input.proxyMode,
-          proxyId: input.proxyId
+          proxyId: input.proxyId,
+          tagId: input.tagId,
+          poolId: input.poolId
         })
         importedAccountIds.push(...imported.importedAccountIds)
         createdAccountIds.push(...imported.createdAccountIds)
@@ -553,6 +839,13 @@ export function registerGatewayApi(
     const detectionResults = await detectImportedAccounts(uniqueImportedIds, (completed, total) => {
       emitImportProgress(event.sender, input.progressId, { phase: 'refreshing', completed, total, percent: 50 + Math.round(completed / Math.max(1, total) * 50), message: `正在刷新状态与查询模型 ${completed}/${total}` })
     })
+    emitImportProgress(event.sender, input.progressId, { phase: 'assigning', completed: 0, total: 1, percent: 95, message: '正在整理 Tag 与号池成员…' })
+    const assignmentSummary = await finalizeImportAssignments(
+      uniqueImportedIds,
+      detectionResults,
+      input.tagId,
+      input.poolId
+    )
     publish(refreshRuntime())
     emitImportProgress(event.sender, input.progressId, { phase: 'complete', completed: uniqueImportedIds.length, total: uniqueImportedIds.length, percent: 100, message: '导入、状态刷新与模型查询已完成' })
     return {
@@ -564,7 +857,8 @@ export function registerGatewayApi(
       createdAccountIds: [...new Set(createdAccountIds)],
       updatedAccountIds: [...new Set(updatedAccountIds)],
       detectionResults,
-      warnings: [...new Set(warnings)]
+      warnings: [...new Set(warnings)],
+      assignmentSummary
     }
 
   })
@@ -581,14 +875,43 @@ export function registerGatewayApi(
     assertTrustedSender(event)
     return browserImports?.clear() ?? { items: [], readyCount: 0, totalBytes: 0, revision: 0 }
   })
+  ipcMain.handle('stone:get-browser-json-cache', (event) => {
+    assertTrustedSender(event)
+    return browserImports?.getCacheState() ?? { items: [], totalBytes: 0 }
+  })
+  ipcMain.handle('stone:save-browser-json-cache-item', async (event, id: string) => {
+    assertTrustedSender(event)
+    if (!browserImports || typeof id !== 'string' || !id) throw new Error('无效的缓存文件。')
+    const item = browserImports.getCachedItem(id)
+    if (!item) throw new Error('缓存中的 JSON 已不存在。')
+    const owner = BrowserWindow.fromWebContents(event.sender)
+    if (!owner) throw new Error('无法打开 JSON 另存为窗口。')
+    const selection = await dialog.showSaveDialog(owner, {
+      title: '另存为下载过的 JSON',
+      buttonLabel: '保存 JSON',
+      defaultPath: item.fileName,
+      filters: [{ name: 'JSON', extensions: ['json'] }]
+    })
+    if (selection.canceled || !selection.filePath) return { cancelled: true }
+    await browserImports.saveCachedItem(id, selection.filePath)
+    return { cancelled: false, filePath: selection.filePath }
+  })
+  ipcMain.handle('stone:remove-browser-json-cache-item', async (event, id: string) => {
+    assertTrustedSender(event)
+    if (!browserImports || typeof id !== 'string' || !id) throw new Error('无效的缓存文件。')
+    return browserImports.removeCachedItem(id)
+  })
+  ipcMain.handle('stone:clear-browser-json-cache', (event) => {
+    assertTrustedSender(event)
+    return browserImports?.clearCache() ?? { items: [], totalBytes: 0 }
+  })
   ipcMain.handle('stone:import-browser-json-queue', async (event, input: Parameters<GatewayApi['importBrowserJsonQueue']>[0]) => {
     assertTrustedSender(event)
     if (!browserImports) throw new Error('内置浏览器下载队列尚未初始化。')
-    if (!input || typeof input.providerId !== 'string' || !input.providerId.trim()) {
-      throw new Error('批量导入前请选择 OpenAI Responses Provider。')
-    }
+    if (!input) throw new Error('账号导入参数无效。')
     if (!Array.isArray(input.itemIds)) throw new Error('请选择需要导入的挂起 JSON。')
     validateAccountImportProxySelection(input.proxyMode, input.proxyId, store.getRuntimeProxies())
+    store.validateChatGptImportAssignments(input.tagId, input.poolId)
     const files = browserImports.getReadyItems(input.itemIds)
     emitImportProgress(event.sender, input.progressId, { phase: 'importing', completed: 0, total: files.length, percent: 0, message: `正在导入文件 0/${files.length}` })
     const fileResults: Awaited<ReturnType<GatewayApi['importBrowserJsonQueue']>>['fileResults'] = []
@@ -602,10 +925,11 @@ export function registerGatewayApi(
     for (const file of files) {
       try {
         const imported = await store.importChatGptAccounts({
-          providerId: input.providerId,
           content: file.content,
           proxyMode: input.proxyMode,
-          proxyId: input.proxyId
+          proxyId: input.proxyId,
+          tagId: input.tagId,
+          poolId: input.poolId
         })
         importedAccountIds.push(...imported.importedAccountIds)
         createdAccountIds.push(...imported.createdAccountIds)
@@ -639,6 +963,13 @@ export function registerGatewayApi(
     const detectionResults = await detectImportedAccounts(uniqueImportedIds, (completed, total) => {
       emitImportProgress(event.sender, input.progressId, { phase: 'refreshing', completed, total, percent: 50 + Math.round(completed / Math.max(1, total) * 50), message: `正在刷新状态与查询模型 ${completed}/${total}` })
     })
+    emitImportProgress(event.sender, input.progressId, { phase: 'assigning', completed: 0, total: 1, percent: 95, message: '正在整理 Tag 与号池成员…' })
+    const assignmentSummary = await finalizeImportAssignments(
+      uniqueImportedIds,
+      detectionResults,
+      input.tagId,
+      input.poolId
+    )
     publish(refreshRuntime())
     emitImportProgress(event.sender, input.progressId, { phase: 'complete', completed: uniqueImportedIds.length, total: uniqueImportedIds.length, percent: 100, message: '导入、状态刷新与模型查询已完成' })
     return {
@@ -650,7 +981,8 @@ export function registerGatewayApi(
       createdAccountIds: [...new Set(createdAccountIds)],
       updatedAccountIds: [...new Set(updatedAccountIds)],
       detectionResults,
-      warnings: [...new Set(warnings)]
+      warnings: [...new Set(warnings)],
+      assignmentSummary
     }
   })
   ipcMain.handle('stone:export-chatgpt-accounts', async (event, input: Parameters<GatewayApi['exportChatGptAccounts']>[0]) => {
@@ -763,6 +1095,156 @@ export function registerGatewayApi(
   ipcMain.handle('stone:delete-pool', (event, id: string) => {
     assertTrustedSender(event)
     return mutate(() => store.deletePool(id))
+  })
+  ipcMain.handle('stone:set-route-source-fast-mode', (event, input: Parameters<GatewayApi['setRouteSourceFastMode']>[0]) => {
+    assertTrustedSender(event)
+    if (!input || typeof input !== 'object') throw new Error('FAST 配置参数无效。')
+    return mutate(() => store.setRouteSourceFastMode(input))
+  })
+  ipcMain.handle('stone:save-api-source', async (event, input: Parameters<GatewayApi['saveApiSource']>[0]) => {
+    assertTrustedSender(event)
+    if (!input || typeof input !== 'object') throw new Error('API 来源参数无效。')
+    const saved = await store.saveApiSource(input)
+    if (saved.source.connectionChanged) gateway.resetAccountHealth(saved.source.accountId)
+    const snapshot = publish(refreshRuntime())
+    if (gateway.getStatus().running) warmGatewayConnections(store, outboundTransport)
+    return snapshot
+  })
+  ipcMain.handle('stone:probe-api-source', async (event, input: Parameters<GatewayApi['probeApiSource']>[0]) => {
+    assertTrustedSender(event)
+    if (!input || typeof input !== 'object') throw new Error('API 来源测试参数无效。')
+    const normalized = normalizeApiSourceProbeInput(input)
+    const existingAccount = input.id
+      ? store.getRuntimeAccounts().find((account) => account.providerId === input.id && account.credentialType !== 'chatgpt-oauth')
+      : undefined
+    const selectedProxyId = typeof normalized.proxyId === 'string' && normalized.proxyId.trim()
+      ? normalized.proxyId.trim()
+      : existingAccount?.proxyId
+    const proxy = selectedProxyId
+      ? store.getSnapshot().proxies.find((candidate) => candidate.id === selectedProxyId)
+      : undefined
+    if (selectedProxyId && !proxy) throw new Error('选择的出口代理已被删除。')
+    const fetchImplementation = outboundTransport.fetchFor(
+      proxy,
+      proxy ? store.getProxyPassword(proxy.id) : undefined
+    )
+    return runApiSourceProbe(normalized, {
+      storedCredential: input.id ? store.getApiSourceCredential(input.id) : undefined,
+      fetchImplementation,
+    })
+  })
+  ipcMain.handle('stone:delete-api-source', (event, id: string) => {
+    assertTrustedSender(event)
+    if (typeof id !== 'string' || !id.trim()) throw new Error('API 来源 ID 无效。')
+    return mutate(() => store.deleteApiSource(id))
+  })
+  ipcMain.handle('stone:save-aggregate-relay', (event, input: Parameters<GatewayApi['saveAggregateRelay']>[0]) => {
+    assertTrustedSender(event)
+    if (!input || typeof input !== 'object') throw new Error('聚合中转参数无效。')
+    return mutate(() => store.saveAggregateRelay(input))
+  })
+  ipcMain.handle('stone:get-setup-wizard-state', (event) => {
+    assertTrustedSender(event)
+    return store.getSetupWizardState()
+  })
+  ipcMain.handle('stone:save-setup-wizard-progress', (event, input: Parameters<GatewayApi['saveSetupWizardProgress']>[0]) => {
+    assertTrustedSender(event)
+    if (!input || typeof input !== 'object') throw new Error('配置向导进度无效。')
+    return store.saveSetupWizardProgress(input)
+  })
+  ipcMain.handle('stone:discard-setup-wizard', async (event) => {
+    assertTrustedSender(event)
+    await store.discardSetupWizard()
+    publish(refreshRuntime())
+  })
+  ipcMain.handle('stone:complete-setup-wizard', async (event, sessionId: string) => {
+    assertTrustedSender(event)
+    if (typeof sessionId !== 'string' || !sessionId.trim()) throw new Error('配置向导会话无效。')
+    await store.completeSetupWizard(sessionId)
+  })
+  ipcMain.handle('stone:apply-setup-routing', async (event, input: Parameters<GatewayApi['applySetupRouting']>[0]) => {
+    assertTrustedSender(event)
+    if (!input || typeof input !== 'object') throw new Error('向导路由参数无效。')
+    const result = await store.applySetupRouting(input)
+    const snapshot = publish(refreshRuntime())
+    return { ...result, snapshot }
+  })
+  ipcMain.handle('stone:ensure-gateway-running', async (event, input: Parameters<GatewayApi['ensureGatewayRunning']>[0] = {}) => {
+    assertTrustedSender(event)
+    if (!input || typeof input !== 'object') throw new Error('网关启动参数无效。')
+    const status = gateway.getStatus()
+    if (status.running) {
+      store.setGatewayStatus(status)
+      return { snapshot: publish(store.getSnapshot()), host: status.host, port: status.port, changedPort: false, started: false }
+    }
+    const current = store.getSnapshot().gateway
+    const host = typeof input.host === 'string' && input.host.trim() ? input.host.trim() : current.host
+    const requestedPort = normalizeSetupPort(input.port ?? current.port)
+    const candidates = [requestedPort, ...Array.from({ length: 19 }, (_, index) => 15722 + index)]
+      .filter((port, index, values) => values.indexOf(port) === index)
+    let lastError: unknown
+    for (const port of candidates) {
+      const settings = { ...current, host, port }
+      gateway.updateConfig(toGatewayConfig(store))
+      try {
+        await gateway.start(settings)
+        await store.updateGateway(settings)
+        outboundTransport.configureOutboundNetwork(settings.outboundNetworkMode ?? 'direct', settings.port)
+        gateway.updateConfig(toGatewayConfig(store))
+        warmGatewayConnections(store, outboundTransport)
+        store.setGatewayStatus(gateway.getStatus())
+        const wizard = store.getSetupWizardState()
+        if (wizard) await store.saveSetupWizardProgress({ sessionId: wizard.sessionId, step: 'verify' })
+        return {
+          snapshot: publish(store.getSnapshot()),
+          host,
+          port,
+          changedPort: port !== requestedPort,
+          started: true,
+        }
+      } catch (error) {
+        lastError = error
+        if (!isAddressInUseError(error)) break
+      }
+    }
+    gateway.updateConfig(toGatewayConfig(store))
+    store.setGatewayStatus(gateway.getStatus())
+    throw lastError instanceof Error ? lastError : new Error('无法启动本地网关。')
+  })
+  ipcMain.handle('stone:verify-setup-route', async (event, input: Parameters<GatewayApi['verifySetupRoute']>[0]) => {
+    assertTrustedSender(event)
+    if (!input || typeof input !== 'object') throw new Error('端到端验证参数无效。')
+    assertRouteClient(input.client)
+    const model = typeof input.model === 'string' ? input.model.trim() : ''
+    if (!model) throw new Error('请选择端到端验证模型。')
+    const snapshot = store.getSnapshot()
+    const route = snapshot.routes.find((candidate) => candidate.client === input.client && candidate.enabled)
+    if (!route) throw new Error('当前客户端路由未启用。')
+    const status = gateway.getStatus()
+    if (!status.running) throw new Error('本地网关尚未运行。')
+    const host = status.host.includes(':') ? `[${status.host}]` : status.host
+    const result = await verifySetupRouteRequest({
+      baseUrl: `http://${host}:${status.port}`,
+      client: input.client,
+      model,
+      token: route.localToken,
+      timeoutMs: Math.max(10_000, snapshot.gateway.requestTimeoutSeconds * 1_000),
+    })
+    const wizard = store.getSetupWizardState()
+    if (wizard) {
+      if (result.ok) {
+        await store.markSetupWizardVerified(wizard.sessionId)
+      } else {
+        await store.saveSetupWizardProgress({
+          sessionId: wizard.sessionId,
+          step: 'verify',
+          client: input.client,
+          model,
+          lastError: result.error,
+        })
+      }
+    }
+    return result
   })
   ipcMain.handle('stone:update-route', (event, route: Route) => {
     assertTrustedSender(event)
@@ -892,20 +1374,6 @@ export function registerGatewayApi(
   ipcMain.handle('stone:clear-health-events', (event) => {
     assertTrustedSender(event)
     return mutate(() => store.clearHealthEvents())
-  })
-  ipcMain.handle('stone:list-provider-presets', (event) => {
-    assertTrustedSender(event)
-    return structuredClone(providerPresets)
-  })
-  ipcMain.handle('stone:onboard-provider', (event, input: Parameters<GatewayApi['onboardProvider']>[0]) => {
-    assertTrustedSender(event)
-    const preset = getProviderPreset(input.presetId)
-    if (!preset) throw new Error('Provider preset not found.')
-    return mutate(() => store.onboardProvider({
-      preset: { ...preset, name: input.providerName?.trim() || preset.name },
-      accountName: input.accountName,
-      credential: input.credential
-    }))
   })
   ipcMain.handle('stone:save-client-profile', (event, input: Parameters<GatewayApi['saveClientProfile']>[0]) => {
     assertTrustedSender(event)
@@ -1052,6 +1520,21 @@ export function registerGatewayApi(
   })
   return async () => {
     closed = true
+    const oauthCompletions = new Set<Promise<unknown>>(oauthCompletionFlights)
+    for (const [sessionId, session] of [...oauthImportSessions]) {
+      session.cancelled = true
+      if (session.completion) oauthCompletions.add(session.completion)
+      if (!session.committing) {
+        cleanupOAuthSession(sessionId, session, { cancelFlow: true, markCancelled: true })
+      }
+    }
+    // A token bundle that crossed the commit boundary must finish encrypted
+    // persistence before the store is closed.
+    await Promise.allSettled([...oauthCompletions])
+    for (const [sessionId, session] of [...oauthImportSessions]) {
+      cleanupOAuthSession(sessionId, session, { cancelFlow: false, markCancelled: true })
+    }
+    chatGptOAuth.dispose()
     unsubscribeRuntimeState()
     unsubscribeBrowserImports?.()
     for (const timer of quotaProbeTimers.values()) clearTimeout(timer)
@@ -1128,6 +1611,45 @@ function assertRouteClient(value: unknown): asserts value is RouteClient {
   if (value !== 'claude' && value !== 'codex' && value !== 'gemini') {
     throw new Error('Unsupported client configuration target.')
   }
+}
+
+function normalizeSetupPort(value: unknown): number {
+  const port = typeof value === 'number' ? value : Number(value)
+  if (!Number.isInteger(port) || port < 1 || port > 65_535) {
+    throw new Error('网关端口必须介于 1 到 65535。')
+  }
+  return port
+}
+
+function isAddressInUseError(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false
+  const candidate = error as { code?: unknown; message?: unknown }
+  return candidate.code === 'EADDRINUSE'
+    || (typeof candidate.message === 'string' && /EADDRINUSE|address already in use|only one usage/i.test(candidate.message))
+}
+
+function normalizeApiSourceProbeInput(
+  input: Parameters<GatewayApi['probeApiSource']>[0]
+): Parameters<GatewayApi['probeApiSource']>[0] {
+  if (input.sourceType !== 'official-api' && input.sourceType !== 'relay') {
+    throw new Error('不支持的 API 来源类型。')
+  }
+  if (input.sourceType === 'relay') return input
+  if (input.kind === 'openai') {
+    if (input.protocol !== 'openai-responses' && input.protocol !== 'openai-chat') {
+      throw new Error('OpenAI 官方 API 仅支持 Responses 或 Chat Completions。')
+    }
+    return { ...input, baseUrl: 'https://api.openai.com/v1' }
+  }
+  if (input.kind === 'anthropic') {
+    if (input.protocol !== 'anthropic-messages') throw new Error('Anthropic 官方 API 仅支持 Messages。')
+    return { ...input, baseUrl: 'https://api.anthropic.com' }
+  }
+  if (input.kind === 'google') {
+    if (input.protocol !== 'gemini') throw new Error('Google 官方 API 仅支持 Gemini。')
+    return { ...input, baseUrl: 'https://generativelanguage.googleapis.com' }
+  }
+  throw new Error('官方 API 仅支持 OpenAI、Anthropic 和 Google Gemini。')
 }
 
 function toGatewayConfig(store: AppStore): GatewayConfig {
@@ -1495,7 +2017,11 @@ function backupIdFromPath(path: string): string {
   return id
 }
 
-function emptyFileImportResult(snapshot: AppSnapshot): Awaited<ReturnType<GatewayApi['importChatGptAccountFiles']>> {
+function emptyFileImportResult(
+  snapshot: AppSnapshot,
+  tagId: string | null | undefined,
+  poolId: string | null | undefined
+): Awaited<ReturnType<GatewayApi['importChatGptAccountFiles']>> {
   return {
     snapshot,
     cancelled: true,
@@ -1505,7 +2031,15 @@ function emptyFileImportResult(snapshot: AppSnapshot): Awaited<ReturnType<Gatewa
     createdAccountIds: [],
     updatedAccountIds: [],
     detectionResults: [],
-    warnings: []
+    warnings: [],
+    assignmentSummary: {
+      tagId: tagId ?? null,
+      tagUpdatedAccountCount: 0,
+      poolId: poolId ?? null,
+      poolMembersAdded: 0,
+      poolMembersAlreadyPresent: 0,
+      poolMembersSkipped: 0
+    }
   }
 }
 

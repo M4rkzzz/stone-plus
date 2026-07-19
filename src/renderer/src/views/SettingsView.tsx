@@ -203,16 +203,16 @@ export function SettingsView({
             <button className="button button--secondary" type="button" disabled={updateBusy || appUpdate?.status === 'downloading'} onClick={() => void update.check()}>
               {update.action === 'check' || appUpdate?.status === 'checking' ? <LoaderCircle size={16} className="spin" /> : <RefreshCw size={16} />}手动检查
             </button>
-            {appUpdate?.release && <button className="button button--secondary" type="button" onClick={update.openDialog}>查看 Release notes</button>}
+            {appUpdate?.release && <button className="button button--secondary" type="button" onClick={update.openDialog}>查看版本亮点</button>}
             {appUpdate?.status === 'available' && !ignoredRelease && <button className="text-button" type="button" disabled={updateBusy} onClick={() => void update.ignore()}>忽略此版本</button>}
             {appUpdate?.status === 'available' && appUpdate.automaticUpdateSupported && (
               <button className="button button--primary" type="button" disabled={updateBusy} onClick={() => void update.download()}>
-                {update.action === 'download' ? <LoaderCircle size={16} className="spin" /> : <Download size={16} />}下载更新
+                {update.action === 'download' || update.action === 'install' ? <LoaderCircle size={16} className="spin" /> : <Download size={16} />}更新并安装
               </button>
             )}
             {appUpdate?.status === 'downloaded' && (
               <button className="button button--primary" type="button" disabled={updateBusy} onClick={() => void update.install()}>
-                {update.action === 'install' ? <LoaderCircle size={16} className="spin" /> : <Rocket size={16} />}更新并重启
+                {update.action === 'install' ? <LoaderCircle size={16} className="spin" /> : <Rocket size={16} />}立即安装并重启
               </button>
             )}
             {appUpdate && (!appUpdate.automaticUpdateSupported || appUpdate.status === 'unsupported') && (

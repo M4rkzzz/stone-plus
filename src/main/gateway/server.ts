@@ -1,5 +1,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { randomUUID } from 'node:crypto'
+import { supportsFastServiceTier } from '../../shared/types'
 import {
   extractProtocolUsage,
   extractRateLimitSignals,
@@ -401,7 +402,7 @@ export class GatewayServer implements GatewayController {
           const outboundBody = codexSearch
             ? convertedBody
             : withStreamingFlag(convertedBody, provider.protocol, streaming)
-          const tieredOutboundBody = !codexSearch && provider.protocol === 'openai-responses'
+          const tieredOutboundBody = !codexSearch && supportsFastServiceTier(provider.protocol)
             ? normalizeOpenAIServiceTier(outboundBody, pool.forceFastMode === true)
             : outboundBody
           const upstreamBody = resolvedCredential.kind === 'chatgpt-oauth' && !codexSearch

@@ -51,7 +51,7 @@ const REQUEST_COLUMNS: RequestColumnDefinition[] = [
   { id: 'client', label: '客户端', defaultWidth: 100, minimumWidth: 84 },
   { id: 'conversation', label: '所属对话', defaultWidth: 240, minimumWidth: 140 },
   { id: 'model', label: '模型', defaultWidth: 135, minimumWidth: 92 },
-  { id: 'account', label: '上游账号', defaultWidth: 145, minimumWidth: 105 },
+  { id: 'account', label: '上游源', defaultWidth: 145, minimumWidth: 105 },
   { id: 'status', label: '状态', defaultWidth: 94, minimumWidth: 78 },
   { id: 'firstToken', label: '首字', defaultWidth: 82, minimumWidth: 68 },
   { id: 'latency', label: '总耗时', defaultWidth: 88, minimumWidth: 72 },

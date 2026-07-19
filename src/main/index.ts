@@ -13,7 +13,12 @@ import { OutboundTransportManager, resolveEffectiveProxy } from './proxy'
 import { UpdateService } from './update'
 import { FrpTunnelService } from './tunnel'
 import { registerTunnelApi } from './ipc/tunnel-api'
-import { CodexConversationTitleResolver, CodexSessionRepairService } from './codex'
+import {
+  CodexConversationTitleResolver,
+  CodexRepairAndRestartService,
+  CodexSessionRepairService,
+  WindowsChatGptDesktopController,
+} from './codex'
 import { registerCodexSessionRepairApi } from './ipc/session-repair-api'
 import { BROWSER_SESSION_PARTITION, BrowserImportQueue } from './browser-import-queue'
 
@@ -29,15 +34,26 @@ let updateService: UpdateService
 let tunnelService: FrpTunnelService
 let codexConversationTitles: CodexConversationTitleResolver
 let codexSessionRepair: CodexSessionRepairService
+let codexRepairAndRestart: CodexRepairAndRestartService
 let browserImportQueue: BrowserImportQueue
 let isQuitting = false
 let storeClosed = false
 let shutdownForUpdate = false
 let shutdownPromise: Promise<void> | undefined
 let flushGatewayApiState: (() => Promise<void>) | undefined
+let focusMainWindowOnReady = false
 
 if (process.env.STONE_USER_DATA_DIR) {
   app.setPath('userData', resolve(process.env.STONE_USER_DATA_DIR))
+}
+
+if (process.platform === 'win32') app.setAppUserModelId('io.github.m4rkzzz.stoneplus')
+const ownsSingleInstanceLock = app.requestSingleInstanceLock()
+if (ownsSingleInstanceLock) {
+  app.on('second-instance', () => {
+    focusMainWindowOnReady = true
+    showMainWindow()
+  })
 }
 
 async function bootstrap(): Promise<void> {
@@ -54,6 +70,10 @@ async function bootstrap(): Promise<void> {
   })
   codexConversationTitles = new CodexConversationTitleResolver(app.getPath('home'))
   codexSessionRepair = new CodexSessionRepairService({ codexHome: join(app.getPath('home'), '.codex') })
+  codexRepairAndRestart = new CodexRepairAndRestartService(
+    codexSessionRepair,
+    new WindowsChatGptDesktopController(),
+  )
   await store.refreshRequestConversationTitles((conversationId) => codexConversationTitles.resolve(conversationId))
   backups = new DatabaseBackupService({
     userDataPath: app.getPath('userData'),
@@ -116,7 +136,10 @@ async function bootstrap(): Promise<void> {
   })
   await tunnelService.initialize()
 
-  browserImportQueue = new BrowserImportQueue(join(app.getPath('temp'), 'stone-plus-browser-imports'))
+  browserImportQueue = new BrowserImportQueue(
+    join(app.getPath('temp'), 'stone-plus-browser-imports'),
+    join(app.getPath('userData'), 'browser-json-cache')
+  )
   const browserSession = session.fromPartition(BROWSER_SESSION_PARTITION, { cache: true })
   browserImportQueue.watch(browserSession)
   browserSession.setPermissionRequestHandler((_webContents, _permission, callback) => callback(false))
@@ -138,7 +161,7 @@ async function bootstrap(): Promise<void> {
   powerMonitor.on('resume', () => {
     void rebuildGatewayConnections(store, outboundTransport).catch(() => undefined)
   })
-  registerCodexSessionRepairApi(codexSessionRepair)
+  registerCodexSessionRepairApi(codexSessionRepair, codexRepairAndRestart)
   registerUpdateApi(updateService)
   registerTunnelApi(tunnelService)
   createWindow()
@@ -160,8 +183,7 @@ async function bootstrap(): Promise<void> {
     if (!mainWindow || mainWindow.isDestroyed()) {
       createWindow()
     } else {
-      mainWindow.show()
-      mainWindow.focus()
+      showMainWindow()
     }
   })
 }
@@ -213,7 +235,10 @@ function createWindow(): void {
       : targetUrl === rendererTarget
     if (!allowed) event.preventDefault()
   })
-  mainWindow.once('ready-to-show', () => mainWindow?.show())
+  mainWindow.once('ready-to-show', () => {
+    mainWindow?.show()
+    if (focusMainWindowOnReady) showMainWindow()
+  })
   mainWindow.on('close', (event) => {
     if (!isQuitting && tray) {
       event.preventDefault()
@@ -236,16 +261,23 @@ function createTray(): void {
   }
 
   tray = new Tray(icon.resize({ width: 18, height: 18 }))
-  tray.setToolTip('Stone local gateway')
+  tray.setToolTip('Stone+ local gateway')
   updateTrayMenu()
   tray.on('click', () => {
     if (mainWindow?.isVisible()) {
       mainWindow.hide()
     } else {
-      mainWindow?.show()
-      mainWindow?.focus()
+      showMainWindow()
     }
   })
+}
+
+function showMainWindow(): void {
+  if (!mainWindow || mainWindow.isDestroyed()) return
+  focusMainWindowOnReady = false
+  if (mainWindow.isMinimized()) mainWindow.restore()
+  mainWindow.show()
+  mainWindow.focus()
 }
 
 function stoneIconPath(): string {
@@ -266,15 +298,12 @@ function isSafeBrowserUrl(value: string): boolean {
 function updateTrayMenu(): void {
   if (!tray) return
   const snapshot = store.getSnapshot()
-  tray.setToolTip(snapshot.gatewayStatus.running ? 'Stone gateway is running' : 'Stone gateway is stopped')
+  tray.setToolTip(snapshot.gatewayStatus.running ? 'Stone+ gateway is running' : 'Stone+ gateway is stopped')
   tray.setContextMenu(
     Menu.buildFromTemplate([
       {
-        label: 'Open Stone',
-        click: () => {
-          mainWindow?.show()
-          mainWindow?.focus()
-        }
+        label: 'Open Stone+',
+        click: () => showMainWindow()
       },
       { type: 'separator' },
       {
@@ -349,10 +378,15 @@ app.on('window-all-closed', () => {
   if (!tray) app.quit()
 })
 
-void bootstrap().catch((error: unknown) => {
-  console.error('Stone failed to start', error)
+if (!ownsSingleInstanceLock) {
+  storeClosed = true
   app.quit()
-})
+} else {
+  void bootstrap().catch((error: unknown) => {
+    console.error('Stone failed to start', error)
+    app.quit()
+  })
+}
 
 function shutdownServices(): Promise<void> {
   if (storeClosed) return Promise.resolve()
@@ -360,6 +394,7 @@ function shutdownServices(): Promise<void> {
   shutdownPromise = (async () => {
     try {
       if (!shutdownForUpdate && updateService) updateService.close()
+      if (codexRepairAndRestart) await codexRepairAndRestart.close()
       if (tunnelService) await tunnelService.close()
       if (gateway) await gateway.stop({ force: true })
       if (flushGatewayApiState) await flushGatewayApiState()

@@ -179,6 +179,30 @@ describe('GatewayServer', () => {
     expect(upstreamFetch).not.toHaveBeenCalled()
   })
 
+  it('forces the OpenAI Chat priority service tier when FAST is enabled', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.pools[0].forceFastMode = true
+    gatewayConfig.accounts[1].status = 'disabled'
+    const upstreamFetch = vi.fn(async () => new Response(JSON.stringify({
+      id: 'chat-fast',
+      choices: [{ index: 0, message: { role: 'assistant', content: 'Fast' }, finish_reason: 'stop' }]
+    }), { status: 200, headers: { 'content-type': 'application/json' } }))
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'credential',
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await post(port, 'local-secret', { service_tier: 'default' })
+    expect(response.status).toBe(200)
+    await response.text()
+    expect(JSON.parse(String(upstreamFetch.mock.calls[0][1]?.body)))
+      .toMatchObject({ service_tier: 'priority' })
+  })
+
   it('normalizes a versioned base URL, retries another account, and releases slots', async () => {
     const port = await freePort()
     const upstreamFetch = vi.fn()

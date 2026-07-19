@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import {
   Check,
   Clipboard,
@@ -14,6 +14,7 @@ import {
   Trash2,
 } from 'lucide-react'
 import { clientNativeProtocols } from '@shared/types'
+import { listRouteSources, resolveRouteSource, type RouteSourceKind } from '@shared/route-sources'
 import type { AppSnapshot, GatewayApi, Route, RouteClient } from '@shared/types'
 import type { ActionRunner } from '../App'
 import { Badge, EmptyState, gatewayBaseUrl, PageHeader, protocolLabels, Toggle } from '../ui'
@@ -61,14 +62,28 @@ function RouteEditor({
   const [mappings, setMappings] = useState<MappingRow[]>([])
   const [showToken, setShowToken] = useState(false)
   const [copied, setCopied] = useState<string | null>(null)
+  const syncedRouteSignature = useRef('')
   const meta = clientMeta[route.client]
+  const routeSignature = JSON.stringify(route)
 
   useEffect(() => {
+    // Snapshot polling creates a new route object even when its persisted data
+    // has not changed. Do not let those refreshes overwrite an in-progress edit.
+    if (syncedRouteSignature.current === routeSignature) return
+    syncedRouteSignature.current = routeSignature
     setDraft(route)
     setMappings(Object.entries(route.modelMap).map(([source, target]) => ({ id: crypto.randomUUID(), source, target })))
-  }, [route])
+  }, [route, routeSignature])
 
-  const pool = snapshot.pools.find((item) => item.id === draft.poolId)
+  const source = resolveRouteSource(draft.poolId, snapshot)
+  const routeSources = listRouteSources(snapshot)
+  const selectedSourceAvailable = routeSources.some((item) => item.id === draft.poolId)
+  const sourceGroups: Array<{ kind: RouteSourceKind; label: string }> = [
+    { kind: 'standard', label: '普通号池' },
+    { kind: 'relay-aggregate', label: '聚合中转' },
+    { kind: 'official-api', label: '官方 API' },
+    { kind: 'relay', label: '中转站' },
+  ]
   const baseUrl = gatewayBaseUrl(snapshot.gateway.host, snapshot.gateway.port)
   const endpoint = `${baseUrl}${routePath(draft)}`
 
@@ -105,10 +120,18 @@ function RouteEditor({
       <div className="route-editor__body">
         <div className="route-fields">
           <label className="field">
-            <span>目标号池</span>
+            <span>源</span>
             <select value={draft.poolId} onChange={(event) => setDraft({ ...draft, poolId: event.target.value })}>
               <option value="">未选择</option>
-              {snapshot.pools.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
+              {draft.poolId && !selectedSourceAvailable && (
+                <option value={draft.poolId} disabled>{source?.summary.name ?? '当前源'} · 已不可用</option>
+              )}
+              {sourceGroups.map((group) => {
+                const options = routeSources.filter((item) => item.kind === group.kind)
+                return options.length ? <optgroup key={group.kind} label={group.label}>
+                  {options.map((item) => <option key={item.id} value={item.id}>{item.name} · {protocolLabels[item.protocol]}</option>)}
+                </optgroup> : null
+              })}
             </select>
           </label>
           <label className="field">
@@ -119,8 +142,8 @@ function RouteEditor({
           </label>
         </div>
 
-        {pool && pool.protocol !== draft.inboundProtocol && (
-          <div className="conversion-line"><RefreshCw size={14} /><span>{protocolLabels[draft.inboundProtocol]}</span><span className="conversion-arrow">→</span><span>{protocolLabels[pool.protocol]}</span><Badge tone="warning">协议转换</Badge></div>
+        {source && source.summary.protocol !== draft.inboundProtocol && (
+          <div className="conversion-line"><RefreshCw size={14} /><span>{protocolLabels[draft.inboundProtocol]}</span><span className="conversion-arrow">→</span><span>{protocolLabels[source.summary.protocol]}</span><Badge tone="warning">协议转换</Badge></div>
         )}
 
         <div className="route-access">
@@ -176,7 +199,7 @@ export function RoutesView({
 }) {
   return (
     <div className="page-stack">
-      <PageHeader title="客户端路由" description="为本机 AI 编程客户端分配号池与协议" />
+      <PageHeader title="客户端路由" description="为本机 AI 编程客户端选择号池、官方 API 或中转站来源" />
       {snapshot.routes.length ? (
         <div className="routes-grid">
           {snapshot.routes.map((route) => <RouteEditor key={route.id} route={route} snapshot={snapshot} api={api} runAction={runAction} busy={busyKeys.has(`save-route-${route.id}`) || busyKeys.has(`toggle-route-${route.id}`)} />)}

@@ -113,6 +113,7 @@ export function UpdateDialog({
   const busy = action !== null || state.status === 'checking' || state.status === 'installing'
   const ignored = Boolean(release && state.ignoredVersion === release.version)
   const error = actionError ?? state.error
+  const highlights = release ? releaseHighlights(release.notes) : []
 
   return (
     <Modal
@@ -137,7 +138,7 @@ export function UpdateDialog({
           )}
           {state.status === 'available' && state.automaticUpdateSupported && (
             <button className="button button--primary" type="button" disabled={busy} onClick={() => void onDownload()}>
-              {action === 'download' ? <LoaderCircle size={16} className="spin" /> : <Download size={16} />}下载更新
+              {action === 'download' || action === 'install' ? <LoaderCircle size={16} className="spin" /> : <Rocket size={16} />}确认更新
             </button>
           )}
           {state.status === 'available' && !state.automaticUpdateSupported && (
@@ -148,7 +149,7 @@ export function UpdateDialog({
           )}
           {state.status === 'downloaded' && (
             <button className="button button--primary" type="button" disabled={busy} onClick={() => void onInstall()}>
-              {action === 'install' ? <LoaderCircle size={16} className="spin" /> : <Rocket size={16} />}更新并重启
+              {action === 'install' ? <LoaderCircle size={16} className="spin" /> : <Rocket size={16} />}立即安装并重启
             </button>
           )}
           {state.status === 'installing' && <button className="button button--primary" type="button" disabled><LoaderCircle size={16} className="spin" />正在重启 Stone+</button>}
@@ -182,12 +183,12 @@ export function UpdateDialog({
         {release ? (
           <section className="update-notes">
             <header>
-              <div><Sparkles size={17} /><strong>Release notes</strong></div>
+              <div><Sparkles size={17} /><strong>版本亮点</strong></div>
               <span>{formatReleaseDate(release.publishedAt)}</span>
             </header>
             <div className="update-notes__body">
-              {release.notes.trim()
-                ? <pre className="update-notes__plain">{release.notes}</pre>
+              {highlights.length
+                ? <div className="update-highlights">{highlights.map((highlight, index) => <div className="update-highlight" key={`${index}-${highlight}`}><span>{index + 1}</span><p>{highlight}</p></div>)}</div>
                 : <p className="muted">此版本没有提供发布说明。</p>}
             </div>
           </section>
@@ -291,4 +292,24 @@ function formatReleaseDate(value: string): string {
   const timestamp = Date.parse(value)
   if (!Number.isFinite(timestamp)) return '发布时间未知'
   return new Intl.DateTimeFormat('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit' }).format(timestamp)
+}
+
+function releaseHighlights(notes: string): string[] {
+  const lines = notes
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+  const bulletLines = lines.filter((line) => /^(?:[-*+]\s+|\d+[.)]\s+)/.test(line))
+  const candidates = bulletLines.length
+    ? bulletLines
+    : lines.filter((line) => !/^#{1,6}\s+/.test(line))
+
+  return [...new Set(candidates
+    .map((line) => line
+      .replace(/^(?:[-*+]\s+|\d+[.)]\s+)/, '')
+      .replace(/\[([^\]]+)]\([^\s)]+(?:\s+"[^"]*")?\)/g, '$1')
+      .replace(/[*_`~]/g, '')
+      .trim())
+    .filter(Boolean))]
+    .slice(0, 10)
 }

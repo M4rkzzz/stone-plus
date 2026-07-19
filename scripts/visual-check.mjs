@@ -5,7 +5,7 @@ import { chromium } from 'playwright-core'
 
 const baseUrl = process.env.STONE_PREVIEW_URL ?? 'http://127.0.0.1:5173'
 const outputDirectory = fileURLToPath(new URL('../.artifacts/visual/', import.meta.url))
-const pages = ['总览', '供应商', '号池', '路由', '客户端', '会话修复', '请求', '设置']
+const pages = ['总览', '供应商', '号池', '路由', '客户端', '会话修复', '请求记录', '设置']
 const modalCases = [
   {
     name: 'account-model-modal',

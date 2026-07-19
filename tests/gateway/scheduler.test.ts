@@ -29,6 +29,7 @@ function pool(overrides: Partial<Pool> = {}): Pool {
   return {
     id: 'pool',
     name: 'Pool',
+    kind: 'standard',
     protocol: 'openai-chat',
     strategy: 'balanced',
     members: [],
@@ -61,6 +62,13 @@ function requestLog(accountId: string, overrides: Partial<RequestLog> = {}): Req
     outputTokens: 200,
     ...overrides
   }
+}
+
+function countByValue(values: readonly string[]): Record<string, number> {
+  return values.reduce<Record<string, number>>((counts, value) => {
+    counts[value] = (counts[value] ?? 0) + 1
+    return counts
+  }, {})
 }
 
 describe('PoolScheduler', () => {
@@ -189,6 +197,137 @@ describe('PoolScheduler', () => {
     })
 
     expect(selected.account.id).toBe('earlier')
+  })
+
+  it('uses aggregate member order as deterministic failover priority', () => {
+    const scheduler = new PoolScheduler(() => timestamp)
+    const aggregate = pool({
+      kind: 'relay-aggregate',
+      strategy: 'priority',
+      members: [
+        { accountId: 'preferred', enabled: true, order: 0 },
+        { accountId: 'fallback', enabled: true, order: 1 }
+      ]
+    })
+    const preferred = account('preferred', { priority: 100 })
+    const fallback = account('fallback', { priority: 0 })
+
+    const first = scheduler.selectAndAcquire({
+      pool: aggregate,
+      // Deliberately reverse input order: aggregate order is authoritative.
+      accounts: [fallback, preferred],
+      model: 'model'
+    })
+    expect(first.account.id).toBe('preferred')
+    first.release()
+
+    scheduler.setCooldown(preferred.id, timestamp + 60_000)
+    const failedOver = scheduler.selectAndAcquire({
+      pool: aggregate,
+      accounts: [fallback, preferred],
+      model: 'model'
+    })
+    expect(failedOver.account.id).toBe('fallback')
+  })
+
+  it('smoothly distributes aggregate traffic by member weight', () => {
+    const scheduler = new PoolScheduler()
+    const aggregate = pool({
+      kind: 'relay-aggregate',
+      strategy: 'weighted-round-robin',
+      members: [
+        { accountId: 'a', enabled: true, order: 0, weight: 5 },
+        { accountId: 'b', enabled: true, order: 1, weight: 1 },
+        { accountId: 'c', enabled: true, order: 2, weight: 1 }
+      ]
+    })
+    const accounts = [account('c', { weight: 100 }), account('b'), account('a')]
+    const selected: string[] = []
+
+    for (let index = 0; index < 7; index += 1) {
+      const scheduled = scheduler.selectAndAcquire({ pool: aggregate, accounts, model: 'model' })
+      selected.push(scheduled.account.id)
+      scheduled.release()
+    }
+
+    expect(selected).toEqual(['a', 'a', 'b', 'a', 'c', 'a', 'a'])
+    expect(countByValue(selected)).toEqual({ a: 5, b: 1, c: 1 })
+  })
+
+  it('uses account weights for smooth weighted standard pools', () => {
+    const scheduler = new PoolScheduler()
+    const weighted = pool({ strategy: 'weighted-round-robin' })
+    const accounts = [account('light', { weight: 1 }), account('heavy', { weight: 3 })]
+    const selected: string[] = []
+
+    for (let index = 0; index < 4; index += 1) {
+      const scheduled = scheduler.selectAndAcquire({ pool: weighted, accounts, model: 'model' })
+      selected.push(scheduled.account.id)
+      scheduled.release()
+    }
+
+    expect(selected).toEqual(['heavy', 'light', 'heavy', 'heavy'])
+  })
+
+  it('keeps weighted aggregate assignments sticky without advancing the shared sequence', () => {
+    const scheduler = new PoolScheduler()
+    const aggregate = pool({
+      kind: 'relay-aggregate',
+      strategy: 'weighted-round-robin',
+      stickySessions: true,
+      members: [
+        { accountId: 'a', enabled: true, order: 0, weight: 1 },
+        { accountId: 'b', enabled: true, order: 1, weight: 3 }
+      ]
+    })
+    const accounts = [account('a'), account('b')]
+
+    const first = scheduler.selectAndAcquire({
+      pool: aggregate, accounts, model: 'model', sessionId: 'sticky'
+    })
+    expect(first.account.id).toBe('b')
+    first.release()
+    const sticky = scheduler.selectAndAcquire({
+      pool: aggregate, accounts, model: 'model', sessionId: 'sticky'
+    })
+    expect(sticky.account.id).toBe('b')
+    sticky.release()
+
+    const nextSequenceEntry = scheduler.selectAndAcquire({ pool: aggregate, accounts, model: 'model' })
+    expect(nextSequenceEntry.account.id).toBe('a')
+  })
+
+  it('preserves smooth weighted progress while a member is temporarily ineligible', () => {
+    let now = timestamp
+    const scheduler = new PoolScheduler(() => now)
+    const weighted = pool({ strategy: 'weighted-round-robin' })
+    const accounts = [account('a', { weight: 1 }), account('b', { weight: 3 })]
+
+    const first = scheduler.selectAndAcquire({ pool: weighted, accounts, model: 'model' })
+    expect(first.account.id).toBe('b')
+    first.release()
+    scheduler.setCooldown('b', now + 1_000)
+    const duringCooldown = scheduler.selectAndAcquire({ pool: weighted, accounts, model: 'model' })
+    expect(duringCooldown.account.id).toBe('a')
+    duringCooldown.release()
+    now += 1_001
+
+    const afterCooldown = scheduler.selectAndAcquire({ pool: weighted, accounts, model: 'model' })
+    expect(afterCooldown.account.id).toBe('a')
+  })
+
+  it('clears smooth weighted state and restarts its deterministic sequence', () => {
+    const scheduler = new PoolScheduler()
+    const weighted = pool({ strategy: 'weighted-round-robin' })
+    const accounts = [account('a', { weight: 1 }), account('b', { weight: 3 })]
+
+    const first = scheduler.selectAndAcquire({ pool: weighted, accounts, model: 'model' })
+    expect(first.account.id).toBe('b')
+    first.release()
+    scheduler.clear()
+    const afterClear = scheduler.selectAndAcquire({ pool: weighted, accounts, model: 'model' })
+
+    expect(afterClear.account.id).toBe('b')
   })
 
   it('keeps balanced scheduling independent from runtime speed samples', () => {
@@ -494,6 +633,67 @@ describe('PoolScheduler', () => {
 
     const second = scheduler.selectAndAcquire({ pool: stickyPool, accounts, model: 'model', sessionId: 'session' })
     expect(second.account.id).toBe('a')
+  })
+
+  it('softly spreads concurrently active sticky conversations across accounts', () => {
+    const scheduler = new PoolScheduler(() => timestamp, () => 0)
+    const accounts = [
+      account('a', { maxConcurrency: 4 }),
+      account('b', { maxConcurrency: 4 })
+    ]
+    const stickyPool = pool({ strategy: 'autobalanced', stickySessions: true })
+
+    // With no overlap, both conversations initially prefer the same best/tied
+    // account and establish independent sticky assignments there.
+    const firstAssignment = scheduler.selectAndAcquire({
+      pool: stickyPool, accounts, model: 'model', sessionId: 'conversation-1'
+    })
+    expect(firstAssignment.account.id).toBe('a')
+    firstAssignment.release()
+    const secondAssignment = scheduler.selectAndAcquire({
+      pool: stickyPool, accounts, model: 'model', sessionId: 'conversation-2'
+    })
+    expect(secondAssignment.account.id).toBe('a')
+    secondAssignment.release()
+
+    const firstActive = scheduler.selectAndAcquire({
+      pool: stickyPool, accounts, model: 'model', sessionId: 'conversation-1'
+    })
+    const secondActive = scheduler.selectAndAcquire({
+      pool: stickyPool, accounts, model: 'model', sessionId: 'conversation-2'
+    })
+
+    expect(firstActive.account.id).toBe('a')
+    expect(secondActive.account.id).toBe('b')
+    firstActive.release()
+    secondActive.release()
+
+    const reassigned = scheduler.selectAndAcquire({
+      pool: stickyPool, accounts, model: 'model', sessionId: 'conversation-2'
+    })
+    expect(reassigned.account.id).toBe('b')
+    reassigned.release()
+  })
+
+  it('does not spread concurrent requests belonging to the same sticky conversation', () => {
+    const scheduler = new PoolScheduler(() => timestamp, () => 0)
+    const accounts = [
+      account('a', { maxConcurrency: 4 }),
+      account('b', { maxConcurrency: 4 })
+    ]
+    const stickyPool = pool({ strategy: 'autobalanced', stickySessions: true })
+
+    const first = scheduler.selectAndAcquire({
+      pool: stickyPool, accounts, model: 'model', sessionId: 'same-conversation'
+    })
+    const parallelTurn = scheduler.selectAndAcquire({
+      pool: stickyPool, accounts, model: 'model', sessionId: 'same-conversation'
+    })
+
+    expect(first.account.id).toBe('a')
+    expect(parallelTurn.account.id).toBe('a')
+    first.release()
+    parallelTurn.release()
   })
 
   it('escapes an obviously slow sticky assignment only for autobalanced pools', () => {
