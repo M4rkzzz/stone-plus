@@ -91,7 +91,7 @@ function renderStarHistory(repo, { createdAt, stars }) {
   const finalPoint = points.at(-1)
   const xTicks = Array.from({ length: 5 }, (_, index) => createdAt + (timeSpan * index) / 4)
   const yTicks = Array.from({ length: 6 }, (_, index) => (yMaximum * index) / 5)
-  const subtitle = `${stars.length} ${stars.length === 1 ? 'star' : 'stars'} - history stored in this repository`
+  const subtitle = `${repo} · 基于 GitHub Stargazer 时间戳自动生成`
   const emptyMessage = stars.length === 0
     ? '<text class="empty" x="480" y="278" text-anchor="middle">Star history starts with the first star</text>'
     : ''
@@ -101,21 +101,22 @@ function renderStarHistory(repo, { createdAt, stars }) {
   <title id="title">${escapeXml(repo)} star history</title>
   <desc id="description">${escapeXml(subtitle)}</desc>
   <style>
-    .title { fill: #f0f6fc; font: 700 24px Inter, "Segoe UI", Arial, sans-serif; }
-    .subtitle, .axis { fill: #8b949e; font: 12px Inter, "Segoe UI", Arial, sans-serif; }
-    .count { fill: #f0f6fc; font: 700 30px Inter, "Segoe UI", Arial, sans-serif; }
-    .label { fill: #8b949e; font: 600 11px Inter, "Segoe UI", Arial, sans-serif; text-transform: uppercase; }
-    .grid { stroke: #30363d; stroke-width: 1; }
-    .line { fill: none; stroke: #3fbf8b; stroke-linecap: round; stroke-linejoin: round; stroke-width: 3; }
-    .area { fill: #238a65; fill-opacity: .2; }
-    .point { fill: #3fbf8b; stroke: #0d1117; stroke-width: 3; }
-    .empty { fill: #8b949e; font: 600 15px Inter, "Segoe UI", Arial, sans-serif; }
+    .title { fill: #18211e; font: 700 24px Inter, "Segoe UI", "Microsoft YaHei", Arial, sans-serif; }
+    .subtitle, .axis { fill: #6d7974; font: 12px Inter, "Segoe UI", "Microsoft YaHei", Arial, sans-serif; }
+    .count { fill: #176b52; font: 750 32px Inter, "Segoe UI", Arial, sans-serif; }
+    .label { fill: #6d7974; font: 650 11px Inter, "Segoe UI", "Microsoft YaHei", Arial, sans-serif; }
+    .grid { stroke: #dfe5e2; stroke-width: 1; }
+    .line { fill: none; stroke: #176b52; stroke-linecap: round; stroke-linejoin: round; stroke-width: 3; }
+    .area { fill: #54a68a; fill-opacity: .18; }
+    .point { fill: #176b52; stroke: #fff; stroke-width: 3; }
+    .empty { fill: #6d7974; font: 600 15px Inter, "Segoe UI", "Microsoft YaHei", Arial, sans-serif; }
   </style>
-  <rect width="960" height="480" rx="10" fill="#0d1117"/>
-  <rect x=".5" y=".5" width="959" height="479" rx="9.5" fill="none" stroke="#30363d"/>
-  <text class="title" x="34" y="45">Stone Star History</text>
+  <rect width="960" height="480" rx="12" fill="#f8faf9"/>
+  <rect x=".5" y=".5" width="959" height="479" rx="11.5" fill="none" stroke="#dfe5e2"/>
+  <text x="34" y="48" fill="#176b52" font-size="25">★</text>
+  <text class="title" x="66" y="45">Stone+ Star 趋势</text>
   <text class="subtitle" x="34" y="68">${escapeXml(subtitle)}</text>
-  <text class="label" x="926" y="33" text-anchor="end">Current</text>
+  <text class="label" x="926" y="33" text-anchor="end">当前 Star</text>
   <text class="count" x="926" y="67" text-anchor="end">${stars.length}</text>
   ${yTicks.map((count) => `<line class="grid" x1="${plot.left}" y1="${formatNumber(y(count))}" x2="${width - plot.right}" y2="${formatNumber(y(count))}"/>`).join('\n  ')}
   ${xTicks.map((timestamp) => `<line class="grid" x1="${formatNumber(x(timestamp))}" y1="${plot.top}" x2="${formatNumber(x(timestamp))}" y2="${height - plot.bottom}"/>`).join('\n  ')}
@@ -149,7 +150,7 @@ function niceMaximum(value) {
 function formatDate(timestamp, span) {
   const date = new Date(timestamp)
   if (span <= 2 * 24 * 60 * 60 * 1000) {
-    return new Intl.DateTimeFormat('en', {
+    return new Intl.DateTimeFormat('zh-CN', {
       month: 'short',
       day: 'numeric',
       hour: '2-digit',
@@ -159,9 +160,9 @@ function formatDate(timestamp, span) {
     }).format(date)
   }
   if (span <= 180 * 24 * 60 * 60 * 1000) {
-    return new Intl.DateTimeFormat('en', { month: 'short', day: 'numeric', timeZone: 'UTC' }).format(date)
+    return new Intl.DateTimeFormat('zh-CN', { month: 'numeric', day: 'numeric', timeZone: 'UTC' }).format(date)
   }
-  return new Intl.DateTimeFormat('en', { year: 'numeric', month: 'short', timeZone: 'UTC' }).format(date)
+  return new Intl.DateTimeFormat('zh-CN', { year: 'numeric', month: 'numeric', timeZone: 'UTC' }).format(date)
 }
 
 function formatCount(value) {

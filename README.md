@@ -328,3 +328,13 @@ npm run dist
 - OAuth/订阅账号能否使用某个模型，最终由上游权限决定；
 - Stone+ 不扫描浏览器 Cookie，也不会未经确认自动读取其他应用的凭据；
 - 当前产品定位是个人本地桌面网关，不是账号共享、转售、团队计费或公共代理平台。
+
+## Star 趋势
+
+<p align="center">
+  <a href="https://github.com/M4rkzzz/stone-plus/stargazers">
+    <img src="docs/star-history.svg" width="100%" alt="Stone+ Star 趋势图">
+  </a>
+</p>
+
+<p align="center"><sub>每天从 GitHub Stargazer 时间戳自动刷新，与当前仓库真实 Star 数据一致。</sub></p>
