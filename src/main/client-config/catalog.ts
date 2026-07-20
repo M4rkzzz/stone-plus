@@ -458,7 +458,7 @@ export function applyClientConfigFieldPatches(
     seen.add(patch.id)
     const definition = definitions.get(patch.id)
     if (!definition) throw new ClientConfigValidationError('Unknown client configuration field')
-    if (definition.readOnly) throw new ClientConfigValidationError('A Stone-managed client configuration field is read-only')
+    if (definition.readOnly) throw new ClientConfigValidationError('A Stone+-managed client configuration field is read-only')
     const value = validateValue(definition, patch.value)
     const values = grouped.get(definition.role) ?? []
     values.push({ definition, value })

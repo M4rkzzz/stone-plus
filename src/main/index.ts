@@ -173,7 +173,7 @@ async function bootstrap(): Promise<void> {
       await gateway.start()
       warmGatewayConnections(store, outboundTransport)
     } catch (error: unknown) {
-      console.error('Stone could not auto-start the gateway', error)
+      console.error('Stone+ could not auto-start the gateway', error)
     } finally {
       store.setGatewayStatus(gateway.getStatus())
     }
@@ -256,7 +256,7 @@ function createWindow(): void {
 function createTray(): void {
   const icon = nativeImage.createFromPath(stoneIconPath())
   if (icon.isEmpty()) {
-    console.warn('Stone tray icon could not be created; continuing without a tray')
+    console.warn('Stone+ tray icon could not be created; continuing without a tray')
     return
   }
 
@@ -338,7 +338,7 @@ async function toggleGatewayFromTray(): Promise<void> {
     store.setGatewayStatus(gateway.getStatus())
     updateTrayMenu()
   } catch (error) {
-    console.error('Stone tray could not toggle gateway', error)
+    console.error('Stone+ tray could not toggle gateway', error)
   }
 }
 
@@ -350,7 +350,7 @@ async function toggleRouteFromTray(routeId: string): Promise<void> {
     gateway.updateConfig(toGatewayConfig(store))
     updateTrayMenu()
   } catch (error) {
-    console.error('Stone tray could not toggle route', error)
+    console.error('Stone+ tray could not toggle route', error)
   }
 }
 
@@ -383,7 +383,7 @@ if (!ownsSingleInstanceLock) {
   app.quit()
 } else {
   void bootstrap().catch((error: unknown) => {
-    console.error('Stone failed to start', error)
+    console.error('Stone+ failed to start', error)
     app.quit()
   })
 }
@@ -404,7 +404,7 @@ function shutdownServices(): Promise<void> {
       if (browserImportQueue) await browserImportQueue.close()
       if (store) await store.close()
     } catch (error: unknown) {
-      console.error('Stone could not finish graceful shutdown', error)
+      console.error('Stone+ could not finish graceful shutdown', error)
     } finally {
       storeClosed = true
     }

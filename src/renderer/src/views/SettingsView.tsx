@@ -96,9 +96,9 @@ export function SettingsView({
   }
 
   const restoreBackup = async (backup: BackupRecordSummary) => {
-    if (!window.confirm(t('恢复会替换当前本地数据并需要重启 Stone，是否继续？', 'Restoring will replace the current local data and requires restarting Stone. Continue?'))) return
+    if (!window.confirm(t('恢复会替换当前本地数据并需要重启 Stone+，是否继续？', 'Restoring will replace the current local data and requires restarting Stone+. Continue?'))) return
     const result = await api.restoreStateBackup(backup.path)
-    setOperationNotice(result.restartRequired ? t('数据已恢复，请退出并重新启动 Stone。', 'Data restored. Quit and restart Stone.') : t('数据已恢复。', 'Data restored.'))
+    setOperationNotice(result.restartRequired ? t('数据已恢复，请退出并重新启动 Stone+。', 'Data restored. Quit and restart Stone+.') : t('数据已恢复。', 'Data restored.'))
   }
 
   const exportDiagnostics = async () => {
@@ -166,7 +166,7 @@ export function SettingsView({
             <div className="field"><span>{t('当前端点', 'Current Endpoint')}</span><code className="settings-endpoint">{currentEndpoint}</code></div>
           </div>
           <SettingRow title={t('应用启动时运行网关', 'Run gateway when the app starts')} control={<Toggle checked={draft.autoStart} onChange={(value) => setDraft({ ...draft, autoStart: value })} label={t('应用启动时运行网关', 'Run gateway when the app starts')} />} />
-          <SettingRow title={t('登录系统时启动 Stone', 'Launch Stone at login')} control={<Toggle checked={Boolean(draft.launchAtLogin)} onChange={(value) => setDraft({ ...draft, launchAtLogin: value })} label={t('登录系统时启动 Stone', 'Launch Stone at login')} />} />
+          <SettingRow title={t('登录系统时启动 Stone+', 'Launch Stone+ at login')} control={<Toggle checked={Boolean(draft.launchAtLogin)} onChange={(value) => setDraft({ ...draft, launchAtLogin: value })} label={t('登录系统时启动 Stone+', 'Launch Stone+ at login')} />} />
           <SettingRow title={t('桌面健康通知', 'Desktop health notifications')} description={t('账号停用、冷却、额度耗尽或恢复时通知', 'Notify when accounts are disabled, cooling down, out of quota, or recovered')} control={<Toggle checked={draft.desktopNotifications !== false} onChange={(value) => setDraft({ ...draft, desktopNotifications: value })} label={t('桌面健康通知', 'Desktop health notifications')} />} />
           <SettingRow
             title={t('适配系统代理', 'Use system proxy')}
@@ -187,7 +187,7 @@ export function SettingsView({
       <section className="settings-section">
         <header><div className="settings-section__icon settings-section__icon--secure"><Archive size={18} /></div><div><h2>{t('备份与恢复', 'Backup & Restore')}</h2></div></header>
         <div className="settings-section__content">
-          <SettingRow title={t('自动备份', 'Automatic backups')} description={t('Stone 启动时创建校验过的本地快照', 'Create a verified local snapshot when Stone starts')} control={<Toggle checked={draft.automaticBackups !== false} onChange={(value) => setDraft({ ...draft, automaticBackups: value })} label={t('自动备份', 'Automatic backups')} />} />
+          <SettingRow title={t('自动备份', 'Automatic backups')} description={t('Stone+ 启动时创建校验过的本地快照', 'Create a verified local snapshot when Stone+ starts')} control={<Toggle checked={draft.automaticBackups !== false} onChange={(value) => setDraft({ ...draft, automaticBackups: value })} label={t('自动备份', 'Automatic backups')} />} />
           <label className="field backup-retention"><span>{t('最多保留备份', 'Maximum backups')}</span><div className="input-suffix"><input type="number" min={1} max={100} value={draft.backupRetention ?? 10} onChange={(event) => setDraft({ ...draft, backupRetention: Number(event.target.value) })} /><span>{t('份', 'files')}</span></div></label>
           <div className="settings-actions"><button className="button button--secondary" type="button" onClick={() => void createBackup()}><Archive size={16} />{t('立即备份', 'Back Up Now')}</button><button className="button button--secondary" type="button" onClick={() => void exportDiagnostics()}><FileDown size={16} />{t('复制诊断报告', 'Copy Diagnostics Report')}</button><button className="button button--secondary" type="button" onClick={() => void api.clearHealthEvents()}><BellRing size={16} />{t('清除健康事件', 'Clear Health Events')}</button></div>
           {operationNotice && <div className="client-config-notice">{operationNotice}</div>}

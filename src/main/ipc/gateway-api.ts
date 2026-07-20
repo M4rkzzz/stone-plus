@@ -282,7 +282,7 @@ export function registerGatewayApi(
       else gateway.resetAccountHealth(accountId)
       publish(refreshRuntime())
     } catch (error) {
-      console.error('Stone could not probe an exhausted ChatGPT account quota', error)
+      console.error('Stone+ could not probe an exhausted ChatGPT account quota', error)
       scheduleQuotaProbe(accountId, Date.now() + 60_000)
     } finally {
       quotaProbeFlights.delete(accountId)
@@ -509,7 +509,7 @@ export function registerGatewayApi(
     void store.appendLog(log).then(() => {
       scheduleRuntimePublish()
     }).catch((error: unknown) => {
-      console.error('Stone could not persist a gateway request log', error)
+      console.error('Stone+ could not persist a gateway request log', error)
     })
   })
 
@@ -592,7 +592,7 @@ export function registerGatewayApi(
     pendingActiveAccountStates.clear()
     await Promise.all(pending.map(async (state) => {
       await persistRoutineAccountState(state).catch((error: unknown) => {
-        console.error('Stone could not persist account health state', error)
+        console.error('Stone+ could not persist account health state', error)
       })
     }))
   }
@@ -608,7 +608,7 @@ export function registerGatewayApi(
     if (routingTransition) {
       pendingActiveAccountStates.delete(state.accountId)
       void persistAccountState(state).catch((error: unknown) => {
-        console.error('Stone could not persist account health state', error)
+        console.error('Stone+ could not persist account health state', error)
       })
       return
     }
@@ -1505,7 +1505,7 @@ export function registerGatewayApi(
       if (wasRunning) {
         gateway.updateConfig(toGatewayConfig(store))
         await gateway.start().catch((restartError: unknown) => {
-          console.error('Stone could not restart the gateway after a failed database restore', restartError)
+          console.error('Stone+ could not restart the gateway after a failed database restore', restartError)
         })
       }
       store.setGatewayStatus(gateway.getStatus())
@@ -2084,7 +2084,7 @@ function healthEventForTransition(
   const wasExhausted = quotaExhausted(before)
   const exhausted = quotaExhausted(after)
   if (!wasExhausted && exhausted) {
-    kind = 'quota-exhausted'; severity = 'warning'; message = '额度已耗尽，Stone 已暂停调度该账号。'
+    kind = 'quota-exhausted'; severity = 'warning'; message = '额度已耗尽，Stone+ 已暂停调度该账号。'
   } else if (wasExhausted && !exhausted) {
     kind = 'quota-restored'; message = '额度窗口已恢复，账号可以重新参与调度。'
   } else if (before && before.status !== 'active' && after.status === 'active') {
@@ -2124,7 +2124,7 @@ function backupIdFromPath(path: string): string {
   if (typeof path !== 'string' || !path) throw new Error('A backup path is required.')
   const id = basename(path)
   const expectedPath = join(app.getPath('userData'), 'backups', id)
-  if (path !== id && path !== expectedPath) throw new Error('Backup path is outside Stone backup storage.')
+  if (path !== id && path !== expectedPath) throw new Error('Backup path is outside Stone+ backup storage.')
   return id
 }
 

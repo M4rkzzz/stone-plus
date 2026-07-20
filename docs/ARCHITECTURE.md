@@ -1,4 +1,4 @@
-# Stone v0.7 架构边界
+# Stone+ v0.7 架构边界
 
 ## 进程模型
 
@@ -63,9 +63,9 @@ Provider Adapter 与协议转换是两个不同边界。前者负责“如何访
 
 ## 凭据生命周期
 
-`CredentialLifecycleResolver` 把凭据解析与厂商授权传输分离。API Key 直接从受保护的 secret reference 读取；可续期 Bearer 在过期前进入刷新窗口，同一 credential 的并发请求共享一个 refresh flight。刷新适配器可以返回轮换后的 Refresh Token，Stone 只在其安全持久化完成后使用新 Access Token。取消、`invalid_grant`、撤销、临时失败和无效响应分别分类，错误与可序列化结果不含 Secret。
+`CredentialLifecycleResolver` 把凭据解析与厂商授权传输分离。API Key 直接从受保护的 secret reference 读取；可续期 Bearer 在过期前进入刷新窗口，同一 credential 的并发请求共享一个 refresh flight。刷新适配器可以返回轮换后的 Refresh Token，Stone+ 只在其安全持久化完成后使用新 Access Token。取消、`invalid_grant`、撤销、临时失败和无效响应分别分类，错误与可序列化结果不含 Secret。
 
-ChatGPT Team / Business 账号通过用户显式导入的 Codex session JSON 接入。Stone 将整个 session bundle 用系统凭据保险库加密，renderer 只看到账号类型、掩码、到期时间和是否可续期；完整 `chatgpt-account-id` 不进入 renderer 快照或诊断报告。实际请求固定发送到 `https://chatgpt.com/backend-api/codex/responses`，携带 Bearer、`chatgpt-account-id` 与 Codex 客户端头，并强制 `store=false`、`stream=true`。存在 Refresh Token 时通过 OpenAI OAuth token endpoint 提前续期并原子轮换，刷新 scope 使用 `openid profile email`；没有 Refresh Token 时按 Access Token 到期时间停止调度。Stone 不自动读取 Codex 登录缓存，也不抓取 Cookie。
+ChatGPT Team / Business 账号通过用户显式导入的 Codex session JSON 接入。Stone+ 将整个 session bundle 用系统凭据保险库加密，renderer 只看到账号类型、掩码、到期时间和是否可续期；完整 `chatgpt-account-id` 不进入 renderer 快照或诊断报告。实际请求固定发送到 `https://chatgpt.com/backend-api/codex/responses`，携带 Bearer、`chatgpt-account-id` 与 Codex 客户端头，并强制 `store=false`、`stream=true`。存在 Refresh Token 时通过 OpenAI OAuth token endpoint 提前续期并原子轮换，刷新 scope 使用 `openid profile email`；没有 Refresh Token 时按 Access Token 到期时间停止调度。Stone+ 不自动读取 Codex 登录缓存，也不抓取 Cookie。
 
 ## 请求生命周期
 
@@ -89,7 +89,7 @@ ChatGPT Team / Business 账号通过用户显式导入的 Codex session JSON 接
 ## 协议与流式转换
 
 Anthropic Messages、OpenAI Responses、OpenAI Chat Completions 和 Gemini 使用统一的非流式请求/响应模型执行互转。
-ChatGPT Codex OAuth 上游始终返回 Responses SSE。当下游请求 `stream=false` 时，Stone 增量解析事件，以 `response.completed` 或 `response.incomplete` 为终止依据，聚合文本、工具调用与用量为普通 Responses JSON，再走现有非流式协议转换；不完整或失败的流不会伪装成成功响应。
+ChatGPT Codex OAuth 上游始终返回 Responses SSE。当下游请求 `stream=false` 时，Stone+ 增量解析事件，以 `response.completed` 或 `response.incomplete` 为终止依据，聚合文本、工具调用与用量为普通 Responses JSON，再走现有非流式协议转换；不完整或失败的流不会伪装成成功响应。
 
 跨协议流式响应先被解析为协议无关事件，再编码为入站协议：
 
@@ -102,7 +102,7 @@ upstream SSE / chunked JSON
 
 解析器接受任意网络分块和拆开的 UTF-8 字节，并处理 SSE、JSON 流与 `[DONE]`。工具调用的 ID、名称和参数按索引增量拼接；用量、停止原因和流内错误会转换成目标协议对应事件。跨协议流中解析出的用量会进入请求日志，流内错误会影响账号健康状态。
 
-当入站与上游协议相同时，Stone 不重编码正文；除跨 chunk 替换当前上游凭据外，直接透传上游字节和关键流式响应头，同时用旁路解析器观察标准终止、错误和用量事件。两条路径都会遵守 Node 响应背压；这样既保留同协议流的原始兼容性，也允许跨协议流逐块转换而不缓存完整响应。流在没有协议终止标记或停止原因时结束会被视为截断，而不是合成正常完成。
+当入站与上游协议相同时，Stone+ 不重编码正文；除跨 chunk 替换当前上游凭据外，直接透传上游字节和关键流式响应头，同时用旁路解析器观察标准终止、错误和用量事件。两条路径都会遵守 Node 响应背压；这样既保留同协议流的原始兼容性，也允许跨协议流逐块转换而不缓存完整响应。流在没有协议终止标记或停止原因时结束会被视为截断，而不是合成正常完成。
 
 ## 错误、重试与熔断
 
@@ -131,11 +131,11 @@ ChatGPT OAuth 账号还会主动查询 `https://chatgpt.com/backend-api/wham/usa
 | Codex | `~/.codex/config.toml`、`~/.codex/auth.json` |
 | Gemini CLI | `~/.gemini/settings.json`、`~/.gemini/.env` |
 
-服务先在内存中生成变更计划，解析失败时不会写文件或创建备份。JSON 与 dotenv 修改保留未知字段、无关行和原换行风格；Codex TOML 使用 `smol-toml` 在修改前后校验，并定点更新 Stone 管理的字段，保留注释、未知配置和其他 section。常用设置通过受限 `fieldId` 局部 patch，完整编辑器只接受受管文件 role，不接受 renderer 提交的任意路径。
+服务先在内存中生成变更计划，解析失败时不会写文件或创建备份。JSON 与 dotenv 修改保留未知字段、无关行和原换行风格；Codex TOML 使用 `smol-toml` 在修改前后校验，并定点更新 Stone+ 管理的字段，保留注释、未知配置和其他 section。常用设置通过受限 `fieldId` 局部 patch，完整编辑器只接受受管文件 role，不接受 renderer 提交的任意路径。
 
 编辑器 revision 使用进程内随机密钥计算 HMAC。保存时如果磁盘内容已被外部 CLI 修改，revision 校验会在备份和写入前拒绝操作。JSON 的敏感键与 `env` / Header 容器、dotenv 的所有值在 IPC 前替换为占位符；Claude 用户状态文件的 OAuth、缓存和项目状态从不进入投影。
 
-每个客户端至少有一个不可删除的默认 Profile，也可以创建指向绝对路径的自定义 Profile。普通预览只返回文件路径、是否变化和 Stone 管理的字段名；完整编辑器按用户操作加载受保护正文。Profile 不存储客户端配置正文。备份保留策略按文件独立计算，应用成功后才清理超出上限的旧备份。
+每个客户端至少有一个不可删除的默认 Profile，也可以创建指向绝对路径的自定义 Profile。普通预览只返回文件路径、是否变化和 Stone+ 管理的字段名；完整编辑器按用户操作加载受保护正文。Profile 不存储客户端配置正文。备份保留策略按文件独立计算，应用成功后才清理超出上限的旧备份。
 
 应用计划时，每个已存在且将变化的文件先创建同目录 `.stone-backup.*` 备份，再通过临时文件和重命名原子替换。多文件写入中途失败会回滚已写文件。恢复操作只接受服务能够枚举到的受管备份，并在覆盖当前文件前再创建一份安全备份。
 

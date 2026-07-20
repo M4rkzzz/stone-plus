@@ -166,10 +166,10 @@ export class UpdateService {
   public async ignoreUpdate(version: string): Promise<AppUpdateState> {
     const normalized = valid(version)
     if (!normalized || !this.state.release || !eq(normalized, this.state.release.version)) {
-      throw new Error('Stone rejected an invalid update version.')
+      throw new Error('Stone+ rejected an invalid update version.')
     }
     if (!gt(normalized, this.state.currentVersion)) {
-      throw new Error('Stone cannot ignore a version that is already installed.')
+      throw new Error('Stone+ cannot ignore a version that is already installed.')
     }
 
     await this.options.preferences.setIgnoredUpdateVersion(normalized)

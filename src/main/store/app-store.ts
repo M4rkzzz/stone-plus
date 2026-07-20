@@ -2376,7 +2376,7 @@ function boundedInteger(value: number, minimum: number, maximum: number, fallbac
 
 function normalizeGatewaySettings(settings: GatewaySettings): GatewaySettings {
   if (settings.host !== '127.0.0.1' && settings.host !== '::1' && settings.host !== 'localhost') {
-    throw new Error('Stone only listens on a local loopback address.')
+    throw new Error('Stone+ only listens on a local loopback address.')
   }
   if (!Number.isInteger(settings.port) || settings.port < 1024 || settings.port > 65535) {
     throw new Error('Gateway port must be between 1024 and 65535.')

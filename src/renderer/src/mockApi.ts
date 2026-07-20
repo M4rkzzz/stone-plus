@@ -434,7 +434,7 @@ const logs: RequestLog[] = [
   return {
     id,
     conversationId: `thread-${id}`,
-    conversationName: client === 'codex' ? `Stone 开发对话 ${id.slice(-2)}` : `${clientNamesForMock(client)} 会话 ${id.slice(-2)}`,
+    conversationName: client === 'codex' ? `Stone+ 开发对话 ${id.slice(-2)}` : `${clientNamesForMock(client)} 会话 ${id.slice(-2)}`,
     timestamp: now - secondsAgo * 1000,
     client,
     protocol,
@@ -589,8 +589,8 @@ const mockPoolNames: Record<string, readonly [string, string]> = {
 
 function localizeMockConversationName(value: string | undefined): string | undefined {
   if (!value) return value
-  const codex = value.match(/^(?:Stone 开发对话|Stone development chat) (.+)$/)
-  if (codex) return `${mockText('Stone 开发对话', 'Stone development chat')} ${codex[1]}`
+  const codex = value.match(/^(?:Stone\+? 开发对话|Stone\+? development chat) (.+)$/)
+  if (codex) return `${mockText('Stone+ 开发对话', 'Stone+ development chat')} ${codex[1]}`
   const session = value.match(/^(Claude|Codex|Gemini) (?:会话|session) (.+)$/)
   if (session) return `${session[1]} ${mockText('会话', 'session')} ${session[2]}`
   return value
@@ -1683,7 +1683,7 @@ export function createMockApi(): GatewayApi {
           ...file,
           existed: client !== 'gemini',
           changed: client === 'gemini',
-          managedFields: [mockText('Stone 管理字段', 'Stone-managed field')],
+          managedFields: [mockText('Stone+ 管理字段', 'Stone+ managed field')],
         })),
       }
     },

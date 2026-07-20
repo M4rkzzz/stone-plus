@@ -1093,7 +1093,7 @@ function ClientSettingRow({
         <div>
           <label htmlFor={`client-control-${safeDomId(field.id)}`}>{field.label}</label>
           {field.advanced && <Badge tone="neutral">{t('高级', 'Advanced')}</Badge>}
-          {field.managedByStone && <Badge tone="info">{t('Stone 管理', 'Stone managed')}</Badge>}
+          {field.managedByStone && <Badge tone="info">{t('Stone+ 管理', 'Stone+ managed')}</Badge>}
           {field.readOnly && <Badge tone="neutral">{t('仅查看', 'Read only')}</Badge>}
           {isRecommended && <Badge tone="success">{t('推荐', 'Recommended')}</Badge>}
         </div>

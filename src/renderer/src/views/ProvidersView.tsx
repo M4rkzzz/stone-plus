@@ -1692,7 +1692,7 @@ export function ProvidersView({
               }}
             >
               {accountAddMethod === 'token-json' && <option value="__preserve__">{t('不指定 / 沿用文件配置', 'Unspecified / Keep file configuration')}</option>}
-              <option value="__direct__">{accountAddMethod === 'oauth' ? t('Stone 直连 / 全局出口设置', 'Stone direct / Global exit setting') : t('直连（清除文件代理）', 'Direct (clear file proxy)')}</option>
+              <option value="__direct__">{accountAddMethod === 'oauth' ? t('Stone+ 直连 / 全局出口设置', 'Stone+ direct / Global exit setting') : t('直连（清除文件代理）', 'Direct (clear file proxy)')}</option>
               {chatGptImport.proxyMode === 'proxy' && chatGptImport.proxyId && !proxyById.has(chatGptImport.proxyId)
                 && <option value={chatGptImport.proxyId} disabled>{t('原选择已删除，请重新选择', 'The previous selection was deleted. Choose another.')}</option>}
               {snapshot.proxies.map((proxy) => <option key={proxy.id} value={proxy.id}>{proxy.name} · {proxySafeSummary(proxy)}</option>)}
