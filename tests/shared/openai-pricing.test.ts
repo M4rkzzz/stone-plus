@@ -3,6 +3,7 @@ import {
   estimateOpenAiTokenCosts,
   localNaturalDayStart,
   resolveOpenAiModelPricing,
+  summarizeAccountCodexQuotaCycleCosts,
   summarizeOpenAiTokenCosts
 } from '../../src/shared/openai-pricing'
 import type { RequestLog } from '../../src/shared/types'
@@ -213,5 +214,25 @@ describe('OpenAI standard API pricing', () => {
     expect(localNaturalDayStart(now)).toBe(start)
     expect(summary.today.totalTokens).toBe(55)
     expect(summary.allTime.totalTokens).toBe(110)
+  })
+
+  it('prices only the selected account logs inside each current quota cycle', () => {
+    const now = 1_800_000_000_000
+    const fiveHourReset = now + 60 * 60 * 1000
+    const sevenDayReset = now + 24 * 60 * 60 * 1000
+    const costs = summarizeAccountCodexQuotaCycleCosts([
+      log('gpt-5.6-sol', { accountId: 'target', timestamp: fiveHourReset - 5 * 60 * 60 * 1000, inputTokens: 1_000_000 }),
+      log('gpt-5.6-sol', { accountId: 'target', timestamp: fiveHourReset - 5 * 60 * 60 * 1000 - 1, inputTokens: 1_000_000 }),
+      log('gpt-5.6-sol', { accountId: 'other', timestamp: now - 1_000, inputTokens: 1_000_000 }),
+      log('gpt-5.6-sol', { accountId: 'target', timestamp: sevenDayReset - 7 * 24 * 60 * 60 * 1000, outputTokens: 1_000_000 }),
+    ], 'target', {
+      fiveHour: { usedPercent: 20, windowSeconds: 5 * 60 * 60, resetAt: fiveHourReset },
+      sevenDay: { usedPercent: 40, windowSeconds: 7 * 24 * 60 * 60, resetAt: sevenDayReset },
+      observedAt: now,
+      source: 'usage-endpoint',
+    }, now)
+
+    expect(costs.fiveHourUsd).toBe(5)
+    expect(costs.sevenDayUsd).toBe(40)
   })
 })

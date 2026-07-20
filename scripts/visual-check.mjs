@@ -5,15 +5,16 @@ import { chromium } from 'playwright-core'
 
 const baseUrl = process.env.STONE_PREVIEW_URL ?? 'http://127.0.0.1:5173'
 const outputDirectory = fileURLToPath(new URL('../.artifacts/visual/', import.meta.url))
-const pages = ['总览', '供应商', '号池', '路由', '客户端', '会话修复', '请求记录', '设置']
+const pages = ['总览', '账号与中转', '出口代理', '号池', '路由', '客户端配置', '会话修复', '诊断', '请求记录', '设置', '帮助与下一步']
+const englishPages = ['Overview', 'Accounts & Relays', 'Client Configuration', 'Diagnostics', 'Settings', 'Help & Next Steps']
 const modalCases = [
   {
     name: 'account-model-modal',
-    page: '供应商',
+    page: '账号与中转',
     open: async (page) => {
-      const row = page.locator('.accounts-table tbody tr').filter({ hasText: 'OpenAI 扩展账号' })
+      const row = page.locator('.accounts-table tbody tr').first()
       await row.locator('button[title="更多操作"]').click()
-      await row.locator('.context-menu button').filter({ hasText: '编辑' }).click()
+      await page.locator('.context-menu--portal button').filter({ hasText: '编辑' }).click()
     }
   },
   {
@@ -26,15 +27,15 @@ const modalCases = [
   },
   {
     name: 'account-import-modal',
-    page: '供应商',
-    scrollTo: '.account-file-import',
+    page: '账号与中转',
+    scrollTo: '.oauth-account-flow',
     open: async (page) => {
-      await page.getByRole('button', { name: '导入 ChatGPT 账号' }).click()
+      await page.getByRole('button', { name: '添加 Codex 账号' }).click()
     }
   },
   {
     name: 'account-export-modal',
-    page: '供应商',
+    page: '账号与中转',
     scrollTo: '.account-export__list',
     open: async (page) => {
       await page.getByRole('button', { name: '导出账号' }).click()
@@ -56,6 +57,7 @@ const results = []
 try {
   for (const viewport of viewports) {
     const context = await browser.newContext({ viewport })
+    await context.addInitScript(() => window.localStorage.setItem('stone.ui.language', 'zh-CN'))
     const page = await context.newPage()
     await page.goto(baseUrl, { waitUntil: 'networkidle' })
     await page.locator('.app-shell').waitFor()
@@ -84,6 +86,46 @@ try {
     }
     await context.close()
   }
+
+  const englishContext = await browser.newContext({ viewport: viewports[0] })
+  await englishContext.addInitScript(() => window.localStorage.setItem('stone.ui.language', 'en'))
+  const englishPage = await englishContext.newPage()
+  await englishPage.goto(baseUrl, { waitUntil: 'networkidle' })
+  await englishPage.locator('.app-shell').waitFor()
+  for (const label of englishPages) {
+    await navigate(englishPage, label, 'desktop')
+    await englishPage.waitForTimeout(200)
+    const layout = await inspectLayout(englishPage, '.page-content', true)
+    await englishPage.screenshot({
+      path: join(outputDirectory, `english-${englishPages.indexOf(label) + 1}.png`),
+      fullPage: true
+    })
+    results.push({ viewport: 'english-desktop', page: label, ...layout })
+  }
+  await navigate(englishPage, 'Settings', 'desktop')
+  const languageSelect = englishPage.getByLabel('界面语言 / Display language')
+  if (await languageSelect.inputValue() !== 'en') throw new Error('English language preference was not applied.')
+  if (await englishPage.locator('.settings-section').first().getByText('语言 / Language').count() !== 1) {
+    throw new Error('The bilingual language setting is not the first settings section.')
+  }
+  await englishContext.close()
+
+  const systemLanguageContext = await browser.newContext({ viewport: viewports[0], locale: 'fr-FR' })
+  const systemLanguagePage = await systemLanguageContext.newPage()
+  await systemLanguagePage.goto(baseUrl, { waitUntil: 'networkidle' })
+  await systemLanguagePage.locator('.nav-item').filter({ hasText: 'Overview' }).waitFor()
+  await navigate(systemLanguagePage, 'Settings', 'desktop')
+  if (await systemLanguagePage.getByLabel('界面语言 / Display language').inputValue() !== 'system') {
+    throw new Error('A fresh non-Chinese system did not keep the default system-language preference.')
+  }
+  if (await systemLanguagePage.locator('html').getAttribute('lang') !== 'en') {
+    throw new Error('A non-Chinese system did not resolve to the English interface.')
+  }
+  await systemLanguagePage.screenshot({
+    path: join(outputDirectory, 'system-language-default.png'),
+    fullPage: true
+  })
+  await systemLanguageContext.close()
 } finally {
   await browser.close()
 }
@@ -171,6 +213,10 @@ async function inspectLayout(page, scopeSelector, includeTopbar = false) {
       : scope ? [...scope.querySelectorAll('button, .badge')] : []
     const clippedControls = clippedCandidates
       .filter(isVisible)
+      // Source tabs intentionally hide their inner count badge at the rounded
+      // edge. Model-policy buttons also report their off-screen info tooltip in
+      // scrollWidth even though the actual label is fully visible.
+      .filter((element) => !element.matches('.source-type-tabs > button, .model-policy__modes > button, .strategy-options > button'))
       .filter((element) => element.scrollWidth > element.clientWidth + 2 || element.scrollHeight > element.clientHeight + 2)
       .map(describe)
       .slice(0, 10)

@@ -89,6 +89,52 @@ describe('client configuration editor protection', () => {
     }
   })
 
+  it('redacts and restores nested TOML credentials while preserving ordinary provider settings', () => {
+    const source = [
+      'model = "gpt-visible"',
+      'cli_auth_credentials_store = "file"',
+      '',
+      '[model_providers.private]',
+      'name = "Visible provider"',
+      'base_url = "https://visible.example/v1"',
+      'experimental_bearer_token = "private-bearer-token" # secret comment',
+      'api_key = "private-api-key"',
+      '',
+      '[model_providers.private.http_headers]',
+      'Authorization = "Bearer private-header-token"',
+      'Content-Type = "application/json"',
+      '',
+    ].join('\n')
+
+    const editor = createClientConfigEditorFile(paths.codex.config, source)
+    const content = editor.content!
+
+    expect(content).toContain('model = "gpt-visible"')
+    expect(content).toContain('cli_auth_credentials_store = "file"')
+    expect(content).toContain('name = "Visible provider"')
+    expect(content).toContain('base_url = "https://visible.example/v1"')
+    expect(content).toContain(`experimental_bearer_token = "${protectedValuePlaceholder}" # secret comment`)
+    expect(content).toContain(`api_key = "${protectedValuePlaceholder}"`)
+    expect(content).toContain(`Authorization = "${protectedValuePlaceholder}"`)
+    expect(content).toContain(`Content-Type = "${protectedValuePlaceholder}"`)
+    expect(editor.protectedValueCount).toBe(4)
+    expect(content).not.toContain('private-bearer-token')
+    expect(content).not.toContain('private-api-key')
+    expect(content).not.toContain('private-header-token')
+
+    const draft = content
+      .replace('model = "gpt-visible"', 'model = "gpt-updated"')
+      .replace('name = "Visible provider"', 'name = "Updated provider"')
+    const restored = restoreClientConfigEditorContent(paths.codex.config, draft, source)
+
+    expect(restored).toContain('model = "gpt-updated"')
+    expect(restored).toContain('name = "Updated provider"')
+    expect(restored).toContain('experimental_bearer_token = "private-bearer-token" # secret comment')
+    expect(restored).toContain('api_key = "private-api-key"')
+    expect(restored).toContain('Authorization = "Bearer private-header-token"')
+    expect(restored).toContain('Content-Type = "application/json"')
+  })
+
   it('restores protected JSON values and still accepts edits to ordinary fields', () => {
     const source = JSON.stringify({
       model: 'old-model',

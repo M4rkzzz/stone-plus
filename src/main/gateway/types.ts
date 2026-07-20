@@ -94,6 +94,8 @@ export interface SchedulerSelectionInput {
   accounts: Account[]
   model: string
   sessionId?: string
+  /** Accounts already proven bad during this request's retry chain. */
+  excludedAccountIds?: readonly string[]
 }
 
 export interface ProtocolRequest {

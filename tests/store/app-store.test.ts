@@ -528,6 +528,42 @@ describe('AppStore', () => {
       .rejects.toThrow(/native inbound protocol/)
   })
 
+  it('atomically switches only the selected client route source', async () => {
+    const store = createStore()
+    await store.initialize()
+    const route = store.getSnapshot().routes.find((candidate) => candidate.client === 'codex')!
+    const seeded = await store.updateRoute({
+      ...route,
+      enabled: false,
+      modelMap: { codex: 'upstream-model' },
+      localToken: 'stable-local-token'
+    })
+    const before = seeded.routes.find((candidate) => candidate.client === 'codex')!
+    const switchedAt = before.updatedAt + 1_000
+    vi.spyOn(Date, 'now').mockReturnValue(switchedAt)
+
+    const switched = await store.setRouteSource('codex', '  relay-source  ')
+    const after = switched.routes.find((candidate) => candidate.client === 'codex')!
+
+    expect(after).toEqual({
+      ...before,
+      poolId: 'relay-source',
+      updatedAt: switchedAt
+    })
+    expect(switched.routes.filter((candidate) => candidate.client !== 'codex'))
+      .toEqual(seeded.routes.filter((candidate) => candidate.client !== 'codex'))
+  })
+
+  it('rejects an empty route source or a client without a route', async () => {
+    const state = { ...legacyJsonState(), routes: [] }
+    await writeFile(join(directory, LEGACY_JSON_FILENAME), `${JSON.stringify(state)}\n`, 'utf8')
+    const store = createStore()
+    await store.initialize()
+
+    await expect(store.setRouteSource('codex', '   ')).rejects.toThrow(/route source/i)
+    await expect(store.setRouteSource('codex', 'relay-source')).rejects.toThrow(/route does not exist/i)
+  })
+
   it('persists custom client profiles and protects the default profiles', async () => {
     const store = createStore()
     await store.initialize()
@@ -2029,6 +2065,62 @@ describe('AppStore', () => {
       unpricedTokens: 0
     })
     expect(snapshot.observability.tokenCosts.allTime.totalCostUsd).toBeCloseTo(3.1062, 10)
+  })
+
+  it('upserts a pending request lifecycle in place and persists only its terminal row', async () => {
+    const store = createStore()
+    await store.initialize()
+    await store.appendLog(requestLog(1, 'ordinal-anchor'))
+    await Promise.all([
+      store.appendLog({
+        ...requestLog(2, 'lifecycle-row'),
+        status: 'streaming',
+        accountId: undefined,
+        accountName: '等待选择',
+        providerName: '等待选择'
+      }),
+      store.appendLog({
+        ...requestLog(3, 'lifecycle-row'),
+        status: 'error',
+        statusCode: 503,
+        failureStage: 'scheduler',
+        error: 'No eligible account'
+      })
+    ])
+
+    expect(store.getSnapshot().requestLogs.map((log) => log.id)).toEqual(['lifecycle-row', 'ordinal-anchor'])
+    expect(store.getSnapshot().requestLogs[0]).toMatchObject({
+      status: 'error', statusCode: 503, failureStage: 'scheduler'
+    })
+    await store.close()
+
+    const database = new DatabaseSync(join(directory, SQLITE_DATABASE_FILENAME), { readOnly: true })
+    const rows = database.prepare('SELECT id, ordinal, payload FROM request_logs ORDER BY ordinal').all() as Array<{
+      id: string
+      ordinal: number
+      payload: string
+    }>
+    database.close()
+    expect(rows.map((row) => row.id)).toEqual(['lifecycle-row', 'ordinal-anchor'])
+    expect(rows.filter((row) => row.id === 'lifecycle-row')).toHaveLength(1)
+    expect(JSON.parse(rows[0].payload)).toMatchObject({ status: 'error', failureStage: 'scheduler' })
+  })
+
+  it('terminates a stale streaming lifecycle when the app restarts', async () => {
+    const store = createStore()
+    await store.initialize()
+    await store.appendLog({ ...requestLog(1, 'stale-lifecycle'), status: 'streaming' })
+    await store.close()
+
+    const restarted = createStore()
+    await restarted.initialize()
+    expect(restarted.getSnapshot().requestLogs).toContainEqual(expect.objectContaining({
+      id: 'stale-lifecycle',
+      status: 'error',
+      statusCode: 499,
+      failureStage: 'client',
+      error: 'Gateway stopped before the request completed'
+    }))
   })
 
   it('coalesces concurrent request-log writes without changing newest-first order', async () => {

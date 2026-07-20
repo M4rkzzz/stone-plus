@@ -1,4 +1,7 @@
 import type {
+  AccountCodexQuotaSnapshot,
+  CodexQuotaCycleCosts,
+  CodexQuotaWindow,
   OpenAiModelPricing,
   OpenAiPricedModelFamily,
   OpenAiTokenCostBreakdown,
@@ -212,4 +215,30 @@ export function summarizeOpenAiTokenCosts(
     today: estimateOpenAiTokenCosts(logs.filter((log) => log.timestamp >= todayStart && log.timestamp < tomorrow.getTime())),
     allTime: estimateOpenAiTokenCosts(logs)
   }
+}
+
+export function summarizeAccountCodexQuotaCycleCosts(
+  logs: readonly RequestLog[],
+  accountId: string,
+  quota: AccountCodexQuotaSnapshot | undefined,
+  now = Date.now()
+): CodexQuotaCycleCosts {
+  const accountLogs = logs.filter((log) => log.accountId === accountId)
+  return {
+    ...(quota?.fiveHour ? { fiveHourUsd: quotaWindowCost(accountLogs, quota.fiveHour, 5 * 60 * 60, now) } : {}),
+    ...(quota?.sevenDay ? { sevenDayUsd: quotaWindowCost(accountLogs, quota.sevenDay, 7 * 24 * 60 * 60, now) } : {})
+  }
+}
+
+function quotaWindowCost(
+  logs: readonly RequestLog[],
+  window: CodexQuotaWindow,
+  fallbackSeconds: number,
+  now: number
+): number {
+  const durationMs = Math.max(1, window.windowSeconds ?? fallbackSeconds) * 1_000
+  const resetAt = window.resetAt
+  const start = resetAt === undefined ? now - durationMs : resetAt - durationMs
+  const end = resetAt === undefined ? now : Math.min(now, resetAt)
+  return estimateOpenAiTokenCosts(logs.filter((log) => log.timestamp >= start && log.timestamp < end)).totalCostUsd
 }

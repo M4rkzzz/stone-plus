@@ -306,6 +306,7 @@ export class SqliteStateStore<T extends SqlitePersistedShape> {
         const insert = database.prepare(`
           INSERT INTO request_logs (id, ordinal, payload)
           VALUES (?, COALESCE((SELECT MIN(ordinal) - 1 FROM request_logs), 0), ?)
+          ON CONFLICT(id) DO UPDATE SET payload = excluded.payload
         `)
         for (const { log: entry } of batch) insert.run(entry.id, JSON.stringify(entry))
         database.prepare(`
@@ -315,8 +316,13 @@ export class SqliteStateStore<T extends SqlitePersistedShape> {
           )
         `).run(retainedRows)
         database.exec('COMMIT')
-        const newestFirst = batch.map((entry) => structuredClone(entry.log)).reverse()
-        const requestLogs = [...newestFirst, ...this.data.requestLogs].slice(0, retainedRows)
+        const requestLogs = this.data.requestLogs.map((entry) => structuredClone(entry))
+        for (const { log } of batch) {
+          const existingIndex = requestLogs.findIndex((entry) => entry.id === log.id)
+          if (existingIndex >= 0) requestLogs[existingIndex] = structuredClone(log)
+          else requestLogs.unshift(structuredClone(log))
+        }
+        requestLogs.splice(retainedRows)
         this.data = { ...this.data, requestLogs }
         for (const entry of batch) entry.resolve()
       } catch (error) {

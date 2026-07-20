@@ -55,6 +55,8 @@ export interface OpenAiResponsesStreamResult {
 export interface OpenAiResponsesStreamCollector {
   /** Accepts arbitrarily split Responses SSE bytes without buffering the wire payload. */
   push(chunk: Uint8Array): void
+  /** Reports that a complete terminal Responses event has already been parsed. */
+  isComplete(): boolean
   /** Finalizes the stream and returns one ordinary Responses API object. */
   finish(): OpenAiResponsesStreamResult
 }
@@ -140,6 +142,10 @@ class ResponsesStreamCollector implements OpenAiResponsesStreamCollector {
     if (this.finished) throw new Error('Cannot append to a finalized Responses stream')
     this.terminalFramer.push(this.decoder.decode(chunk, { stream: true }))
     this.consume(this.parser.push(chunk))
+  }
+
+  isComplete(): boolean {
+    return this.done && this.stopReason !== undefined
   }
 
   finish(): OpenAiResponsesStreamResult {

@@ -13,6 +13,8 @@ const userData = join(artifacts, 'user-data')
 const clientConfigHome = join(artifacts, 'client-config-home')
 const claudeDirectory = join(clientConfigHome, '.claude')
 const claudeSettingsPath = join(claudeDirectory, 'settings.json')
+const codexDirectory = join(clientConfigHome, '.codex')
+const codexConfigPath = join(codexDirectory, 'config.toml')
 const profileDirectory = join(clientConfigHome, 'profiles', 'work-claude')
 const profileSettingsPath = join(profileDirectory, 'settings.json')
 const privateConfigMarker = 'stone-smoke-private-config-marker'
@@ -45,6 +47,8 @@ const electronApp = await electron.launch({
 
 try {
   const window = await electronApp.firstWindow({ timeout: 30_000 })
+  await window.evaluate(() => window.localStorage.setItem('stone.ui.language', 'zh-CN'))
+  await window.reload({ waitUntil: 'domcontentloaded' })
   const pageErrors = []
   window.on('pageerror', (error) => pageErrors.push(error.message))
   window.on('console', (message) => {
@@ -242,7 +246,7 @@ try {
     && await relayFastSwitch.isVisible()
   const relayReadOnlyPoolCardVisible = await relayPoolCard.isVisible()
     && await relayPoolCard.getByText('只读', { exact: true }).isVisible()
-    && await relayPoolCard.getByText('中转配置在“账号与中转”页面统一管理').isVisible()
+    && await relayPoolCard.getByText('配置只读', { exact: true }).isVisible()
 
   await oauthFastSwitch.click()
   await aggregateFastSwitch.click()
@@ -420,10 +424,84 @@ try {
   const restored = await window.evaluate((backupPath) => window.stone.restoreClientConfig(backupPath, 'claude'), backups[0]?.backupPath)
   const restoredClaudeSettings = await readFile(claudeSettingsPath, 'utf8')
   const backupsAfterRestore = await window.evaluate(() => window.stone.listClientConfigBackups('claude'))
+  const manualClientBackup = await window.evaluate(() => window.stone.createClientConfigBackup('claude'))
+  await writeFile(claudeSettingsPath, '{"smoke":"changed-after-manual-backup"}\n')
+  const manualClientRestore = await window.evaluate(() => window.stone.restoreLatestClientConfigBackup('claude'))
+  const manualClientRestoredSettings = await readFile(claudeSettingsPath, 'utf8')
   const claudeRoute = initial.routes.find((route) => route.client === 'claude')
   const expectedGatewayBaseUrl = `http://${initial.gateway.host.includes(':') ? `[${initial.gateway.host}]` : initial.gateway.host}:${initial.gateway.port}`
+  await mkdir(codexDirectory, { recursive: true })
+  await window.evaluate(() => window.stone.repairClientConfig('codex'))
+  await writeFile(codexConfigPath, 'model_provider = [broken\n', 'utf8')
+  const codexRepair = await window.evaluate(() => window.stone.repairClientConfig('codex'))
+  const repairedCodexConfig = await readFile(codexConfigPath, 'utf8')
+  const codexRepairBackups = await window.evaluate(() => window.stone.listClientConfigBackups('codex'))
+  const repairedCodexBackupContent = codexRepair.backups[0]?.backupPath
+    ? await readFile(codexRepair.backups[0].backupPath, 'utf8')
+    : ''
   const started = await window.evaluate(() => window.stone.startGateway())
   const probe = await fetch(`http://${started.gatewayStatus.host}:${started.gatewayStatus.port}/health`)
+  await window.locator('.nav-item').filter({ hasText: '客户端配置' }).click()
+  await window.locator('.client-easy-card').waitFor()
+  await window.getByText('连接配置正常').waitFor()
+  const codexClientTab = window.locator('.client-manager-tabs').getByRole('tab', { name: /Codex/ })
+  const clientUpstreamSelect = window.getByLabel('当前上游')
+  const currentClientSource = await clientUpstreamSelect.inputValue()
+  const switchTargetId = [relayOneProvider.id, relayTwoProvider.id].find((id) => id !== currentClientSource)
+  if (!switchTargetId) throw new Error('No alternate smoke route source was available for the client switch test.')
+  const codexConfigBeforeSourceSwitch = await readFile(codexConfigPath, 'utf8')
+  await clientUpstreamSelect.selectOption(switchTargetId)
+  await window.getByText(/客户端配置文件未改动/).waitFor()
+  await window.waitForTimeout(250)
+  const sourceSwitchSnapshot = await window.evaluate(() => window.stone.getSnapshot())
+  const codexConfigAfterSourceSwitch = await readFile(codexConfigPath, 'utf8')
+  const advancedToggle = window.getByRole('button', { name: /高级设置/ })
+  const advancedHiddenByDefault = await window.locator('.client-manager-workbench').count() === 0
+  await advancedToggle.click()
+  await window.locator('.client-manager-workbench').waitFor()
+  const advancedEditorAvailable = await advancedToggle.getAttribute('aria-expanded') === 'true'
+  await advancedToggle.click()
+  const clientConfigEasyUiWorks = await codexClientTab.getAttribute('aria-selected') === 'true'
+    && await window.getByRole('heading', { name: '客户端配置' }).count() === 0
+    && await window.locator('.client-easy-status__item').count() === 3
+    && await window.getByRole('button', { name: '一键修复连接' }).isVisible()
+    && advancedHiddenByDefault
+    && advancedEditorAvailable
+    && await clientUpstreamSelect.inputValue() === switchTargetId
+  await window.screenshot({ path: join(artifacts, 'client-config-easy.png') })
+  await window.locator('.sidebar-help').click()
+  await window.getByRole('heading', { name: '帮助中心' }).waitFor()
+  await window.locator('.help-assistant').waitFor()
+  const helpChecklistCount = await window.locator('.help-checklist > button').count()
+  const helpSearch = window.getByRole('searchbox', { name: '搜索帮助文档' })
+  await helpSearch.fill('429')
+  await window.locator('.help-results__grid button').filter({ hasText: '常见问题' }).click()
+  const quotaFaq = window.locator('.help-faq-list summary').filter({ hasText: '出现 429 / 配额不足或并发限制？' })
+  await quotaFaq.click()
+  const helpCenterUiWorks = helpChecklistCount === 5
+    && await quotaFaq.locator('..').evaluate((element) => element.hasAttribute('open'))
+    && await window.getByText('增加重试次数不会产生新额度。', { exact: false }).isVisible()
+  await window.screenshot({ path: join(artifacts, 'help-center.png') })
+  await window.evaluate(() => {
+    window.localStorage.setItem('stone.ui.language', 'en')
+    window.location.hash = '#overview'
+  })
+  await window.reload({ waitUntil: 'domcontentloaded' })
+  await window.locator('.nav-item').filter({ hasText: 'Overview' }).waitFor()
+  await window.locator('.nav-item').filter({ hasText: 'Settings' }).click()
+  const languageSelect = window.getByLabel('界面语言 / Display language')
+  const englishUiWorks = await window.getByRole('heading', { name: 'Settings' }).isVisible()
+    && await window.locator('.settings-section').first().getByText('语言 / Language').isVisible()
+    && await languageSelect.inputValue() === 'en'
+    && await window.locator('.nav-item').filter({ hasText: 'Accounts & Relays' }).isVisible()
+    && await window.locator('.nav-item').filter({ hasText: 'Client Configuration' }).isVisible()
+  await languageSelect.selectOption('zh-CN')
+  await window.locator('.nav-item').filter({ hasText: '总览' }).waitFor()
+  const switchedToChinese = await languageSelect.inputValue() === 'zh-CN'
+  await languageSelect.selectOption('en')
+  await window.locator('.nav-item').filter({ hasText: 'Overview' }).waitFor()
+  const languageSwitchWorks = switchedToChinese && await languageSelect.inputValue() === 'en'
+  await window.screenshot({ path: join(artifacts, 'english-settings.png') })
   const stopped = await window.evaluate(() => window.stone.stopGateway())
   await window.screenshot({ path: join(artifacts, 'window.png') })
 
@@ -564,9 +642,26 @@ try {
     clientConfigSafetyBackup: Boolean(restored.safetyBackup)
       && backupsAfterRestore.length === 2
       && backupsAfterRestore.every((backup) => isPathInside(clientConfigHome, backup.backupPath)),
+    clientConfigBackupSet: manualClientBackup.backups.length === 1
+      && manualClientBackup.backups[0]?.groupId === manualClientBackup.groupId
+      && manualClientRestore.groupId === manualClientBackup.groupId
+      && manualClientRestore.restoredFiles.includes(claudeSettingsPath)
+      && manualClientRestoredSettings === restoredClaudeSettings,
+    clientConfigRepairRebuilds: codexRepair.rebuiltRoles.includes('codex-config')
+      && codexRepair.backups.some((backup) => backup.targetPath === codexConfigPath)
+      && codexRepairBackups.some((backup) => backup.backupPath === codexRepair.backups[0]?.backupPath)
+      && repairedCodexBackupContent === 'model_provider = [broken\n'
+      && repairedCodexConfig.includes('model_provider = "stone"')
+      && repairedCodexConfig.includes('[model_providers.stone]'),
+    clientRouteSwitchPreservesConfig: sourceSwitchSnapshot.routes.find((route) => route.client === 'codex')?.poolId === switchTargetId
+      && codexConfigBeforeSourceSwitch === codexConfigAfterSourceSwitch,
+    clientConfigEasyUiWorks,
     gatewayStarted: started.gatewayStatus.running,
     gatewayProbeStatus: probe.status,
     gatewayStopped: !stopped.gatewayStatus.running,
+    helpCenterUiWorks,
+    englishUiWorks,
+    languageSwitchWorks,
     chatGptRepairRestartButtonVisible,
     sessionRepairLoaded,
     pageErrors
@@ -626,9 +721,16 @@ try {
     !result.clientConfigBackupListed ||
     !result.clientConfigRestored ||
     !result.clientConfigSafetyBackup ||
+    !result.clientConfigBackupSet ||
+    !result.clientConfigRepairRebuilds ||
+    !result.clientRouteSwitchPreservesConfig ||
+    !result.clientConfigEasyUiWorks ||
     !result.gatewayStarted ||
     result.gatewayProbeStatus !== 404 ||
     !result.gatewayStopped ||
+    !result.helpCenterUiWorks ||
+    !result.englishUiWorks ||
+    !result.languageSwitchWorks ||
     !result.chatGptRepairRestartButtonVisible ||
     !result.sessionRepairLoaded ||
     result.pageErrors.length > 0

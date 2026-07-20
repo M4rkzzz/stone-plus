@@ -103,6 +103,48 @@ async function post(port: number, token = 'local-secret', body: Record<string, u
   })
 }
 
+function upsertLog(logs: RequestLog[], log: RequestLog): void {
+  const index = logs.findIndex((candidate) => candidate.id === log.id)
+  if (index >= 0) logs[index] = log
+  else logs.unshift(log)
+}
+
+async function postSession(
+  port: number,
+  sessionId: string,
+  body: Record<string, unknown> = {}
+): Promise<Response> {
+  return fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      authorization: 'Bearer local-secret',
+      'content-type': 'application/json',
+      'x-stone-session-id': sessionId
+    },
+    body: JSON.stringify({ model: 'source-model', messages: [{ role: 'user', content: 'Hello' }], ...body })
+  })
+}
+
+function scheduledSseResponse(frames: Array<{ atMs: number; data: string; close?: boolean }>): Response {
+  const encoder = new TextEncoder()
+  const timers: Array<ReturnType<typeof setTimeout>> = []
+  return new Response(new ReadableStream<Uint8Array>({
+    start(controller) {
+      const emit = (frame: { data: string; close?: boolean }) => {
+        controller.enqueue(encoder.encode(frame.data))
+        if (frame.close) controller.close()
+      }
+      for (const frame of frames) {
+        if (frame.atMs <= 0) emit(frame)
+        else timers.push(setTimeout(() => emit(frame), frame.atMs))
+      }
+    },
+    cancel() {
+      timers.forEach((timer) => clearTimeout(timer))
+    }
+  }), { status: 200, headers: { 'content-type': 'text/event-stream' } })
+}
+
 async function getModels(port: number, path = '/v1/models', token = 'local-secret'): Promise<Response> {
   return fetch(`http://127.0.0.1:${port}${path}`, {
     headers: { authorization: `Bearer ${token}` }
@@ -179,6 +221,148 @@ describe('GatewayServer', () => {
     expect(upstreamFetch).not.toHaveBeenCalled()
   })
 
+  it('emits live lifecycle updates and completes the same id without logging payloads or credentials', async () => {
+    const port = await freePort()
+    const events: RequestLog[] = []
+    let resolveUpstream!: (response: Response) => void
+    const upstreamResponse = new Promise<Response>((resolve) => { resolveUpstream = resolve })
+    const gateway = new GatewayServer({
+      config: config(port),
+      credentialResolver: () => 'credential-private-marker',
+      fetchImplementation: vi.fn(() => upstreamResponse) as typeof fetch,
+      onLog: (log) => events.push(log)
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const pendingResponse = post(port, 'local-secret', { messages: [{ role: 'user', content: 'payload-private-marker' }] })
+    await vi.waitFor(() => expect(events.length).toBeGreaterThanOrEqual(1))
+    expect(events[0]).toMatchObject({
+      status: 'streaming',
+      providerName: '等待选择',
+      accountName: '等待选择',
+      model: ''
+    })
+    await vi.waitFor(() => expect(events.at(-1)).toMatchObject({
+      status: 'streaming',
+      progressStage: 'connecting',
+      accountId: 'first',
+      model: 'source-model'
+    }))
+    expect(JSON.stringify(events)).not.toMatch(/payload-private-marker|credential-private-marker|local-secret/)
+
+    resolveUpstream(new Response(JSON.stringify({
+      id: 'completed-lifecycle', model: 'source-model',
+      choices: [{ message: { role: 'assistant', content: 'Done' }, finish_reason: 'stop' }]
+    }), { status: 200, headers: { 'content-type': 'application/json' } }))
+    const response = await pendingResponse
+    expect(response.status).toBe(200)
+    await response.text()
+    await vi.waitFor(() => expect(events.at(-1)?.status).toBe('success'))
+    expect(events.at(-1)).toMatchObject({ id: events[0].id, status: 'success', statusCode: 200, accountId: 'first' })
+  })
+
+  it('completes pre-account failures with the same id and a scheduler stage', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.accounts.forEach((candidate) => { candidate.status = 'disabled' })
+    const events: RequestLog[] = []
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'unused',
+      fetchImplementation: vi.fn() as typeof fetch,
+      onLog: (log) => events.push(log)
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await post(port)
+    expect(response.status).toBe(503)
+    await response.text()
+    await vi.waitFor(() => expect(events.at(-1)?.status).toBe('error'))
+    expect(events.at(-1)).toMatchObject({
+      id: events[0].id,
+      statusCode: 503,
+      failureStage: 'scheduler',
+      accountId: undefined,
+      providerName: '等待选择',
+      accountName: '等待选择'
+    })
+  })
+
+  it('records malformed bodies and unreachable upstreams at their actual failure stages', async () => {
+    const bodyPort = await freePort()
+    const bodyEvents: RequestLog[] = []
+    const bodyGateway = new GatewayServer({
+      config: config(bodyPort), credentialResolver: () => 'unused', fetchImplementation: vi.fn() as typeof fetch,
+      onLog: (log) => bodyEvents.push(log)
+    })
+    runningServers.push(bodyGateway)
+    await bodyGateway.start()
+    const malformed = await fetch(`http://127.0.0.1:${bodyPort}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: '{invalid'
+    })
+    expect(malformed.status).toBe(400)
+    await malformed.text()
+    await vi.waitFor(() => expect(bodyEvents.at(-1)?.status).toBe('error'))
+    expect(bodyEvents.at(-1)).toMatchObject({ id: bodyEvents[0].id, failureStage: 'body', statusCode: 400 })
+
+    const connectPort = await freePort()
+    const connectConfig = config(connectPort)
+    connectConfig.accounts[1].status = 'disabled'
+    connectConfig.pools[0].maxRetries = 0
+    const connectEvents: RequestLog[] = []
+    const connectGateway = new GatewayServer({
+      config: connectConfig,
+      credentialResolver: () => 'credential',
+      fetchImplementation: vi.fn(async () => { throw new TypeError('connect ECONNREFUSED') }) as typeof fetch,
+      onLog: (log) => connectEvents.push(log)
+    })
+    runningServers.push(connectGateway)
+    await connectGateway.start()
+    const unreachable = await post(connectPort)
+    expect(unreachable.status).toBe(502)
+    await unreachable.text()
+    await vi.waitFor(() => expect(connectEvents.at(-1)?.status).toBe('error'))
+    expect(connectEvents.at(-1)).toMatchObject({
+      id: connectEvents[0].id,
+      failureStage: 'connect',
+      statusCode: 502,
+      accountId: 'first'
+    })
+  })
+
+  it('finishes a first-body timeout instead of leaving its pending log streaming', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.accounts[1].status = 'disabled'
+    gatewayConfig.pools[0].maxRetries = 0
+    gatewayConfig.pools[0].firstBodyTimeoutMs = 1_000
+    const events: RequestLog[] = []
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'credential',
+      fetchImplementation: vi.fn(async () => new Response(new ReadableStream<Uint8Array>({
+        pull: () => new Promise<void>(() => undefined)
+      }), { status: 200, headers: { 'content-type': 'text/event-stream' } })) as typeof fetch,
+      onLog: (log) => events.push(log)
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await post(port, 'local-secret', { stream: true })
+    expect(response.status).toBe(504)
+    await response.text()
+    await vi.waitFor(() => expect(events.at(-1)?.status).toBe('error'))
+    expect(events.at(-1)).toMatchObject({
+      id: events[0].id,
+      statusCode: 504,
+      failureStage: 'first-byte'
+    })
+  }, 5_000)
+
   it('forces the OpenAI Chat priority service tier when FAST is enabled', async () => {
     const port = await freePort()
     const gatewayConfig = config(port)
@@ -236,6 +420,81 @@ describe('GatewayServer', () => {
     expect(upstreamFetch).toHaveBeenCalledTimes(3)
     expect(new Headers(upstreamFetch.mock.calls[2][1]?.headers).get('authorization')).toBe('Bearer key-second')
     expect(gateway.getStatus()).toMatchObject({ activeRequests: 0, totalRequests: 2, successRequests: 2 })
+  })
+
+  it.each([502, 504])('evicts a failed sticky assignment after upstream HTTP %s', async (failureStatus) => {
+    const port = await freePort()
+    let now = timestamp
+    const gatewayConfig = config(port)
+    gatewayConfig.pools[0].stickySessions = true
+    gatewayConfig.pools[0].maxRetries = 0
+    const selectedAccountIds: string[] = []
+    const successful = () => new Response(JSON.stringify({
+      id: 'completion',
+      model: 'source-model',
+      choices: [{ message: { role: 'assistant', content: 'Done' }, finish_reason: 'stop' }]
+    }), { status: 200, headers: { 'content-type': 'application/json' } })
+    const upstreamFetch = vi.fn()
+      .mockImplementationOnce(async () => successful())
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: { message: 'upstream unavailable' } }), {
+        status: failureStatus,
+        headers: { 'content-type': 'application/json' }
+      }))
+      .mockImplementation(async () => successful())
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: (selected) => {
+        selectedAccountIds.push(selected.id)
+        return `key-${selected.id}`
+      },
+      fetchImplementation: upstreamFetch as typeof fetch,
+      now: () => now
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    expect((await postSession(port, 'failed-thread')).status).toBe(200)
+    expect((await postSession(port, 'failed-thread')).status).toBe(failureStatus)
+    now += 31_000
+    expect((await postSession(port, 'failed-thread')).status).toBe(200)
+    expect((await postSession(port, 'new-thread')).status).toBe(200)
+
+    expect(selectedAccountIds).toEqual(['first', 'first', 'second', 'first'])
+  })
+
+  it('evicts a sticky assignment after the upstream transport is unreachable', async () => {
+    const port = await freePort()
+    let now = timestamp
+    const gatewayConfig = config(port)
+    gatewayConfig.pools[0].stickySessions = true
+    gatewayConfig.pools[0].maxRetries = 0
+    const selectedAccountIds: string[] = []
+    const successful = () => new Response(JSON.stringify({
+      id: 'completion',
+      model: 'source-model',
+      choices: [{ message: { role: 'assistant', content: 'Done' }, finish_reason: 'stop' }]
+    }), { status: 200, headers: { 'content-type': 'application/json' } })
+    const upstreamFetch = vi.fn()
+      .mockImplementationOnce(async () => successful())
+      .mockRejectedValueOnce(new TypeError('connect ECONNREFUSED'))
+      .mockImplementation(async () => successful())
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: (selected) => {
+        selectedAccountIds.push(selected.id)
+        return `key-${selected.id}`
+      },
+      fetchImplementation: upstreamFetch as typeof fetch,
+      now: () => now
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    expect((await postSession(port, 'network-thread')).status).toBe(200)
+    expect((await postSession(port, 'network-thread')).status).toBe(502)
+    now += 31_000
+    expect((await postSession(port, 'network-thread')).status).toBe(200)
+    expect(selectedAccountIds).toEqual(['first', 'first', 'second'])
   })
 
   it('routes ChatGPT OAuth accounts through the Codex backend with account headers', async () => {
@@ -664,7 +923,7 @@ describe('GatewayServer', () => {
       fetchImplementation: upstreamFetch as typeof fetch,
       now: () => timestamp,
       onAccountState: (state) => states.push(state),
-      onLog: (log) => logs.push(log)
+      onLog: (log) => upsertLog(logs, log)
     })
     runningServers.push(gateway)
     await gateway.start()
@@ -846,6 +1105,48 @@ describe('GatewayServer', () => {
     expect(gateway.getStatus()).toMatchObject({ activeRequests: 0, successRequests: 1 })
   })
 
+  it('releases a completed Responses request even when the upstream transport stays open', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers[0].protocol = 'openai-responses'
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    let upstreamCancelled = false
+    const encoder = new TextEncoder()
+    const upstreamFetch = vi.fn(async () => new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode([
+          'event: response.completed',
+          'data: {"type":"response.completed","response":{"id":"resp_terminal_open","model":"source-model","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}',
+          '',
+          ''
+        ].join('\n')))
+      },
+      cancel() {
+        upstreamCancelled = true
+      }
+    }), { status: 200, headers: { 'content-type': 'text/event-stream' } }))
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'credential',
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'source-model', input: 'Reply', stream: true })
+    })
+    const wire = await response.text()
+
+    expect(wire).toContain('response.completed')
+    await vi.waitFor(() => expect(gateway.getStatus().activeRequests).toBe(0))
+    expect(gateway.getAccountInFlight().first).toBe(0)
+    expect(upstreamCancelled).toBe(true)
+  })
+
   it('forwards the first safe stream chunk without waiting for a later chunk', async () => {
     const port = await freePort()
     const encoder = new TextEncoder()
@@ -894,34 +1195,196 @@ describe('GatewayServer', () => {
     await reader!.read()
   })
 
-  it('fails over before committing response headers when a 200 stream has no body', async () => {
+  it('keeps a same-protocol stream alive beyond the request deadline while chunks keep arriving', async () => {
     const port = await freePort()
-    const gatewayConfig = config(port)
-    gatewayConfig.pools[0].firstBodyTimeoutMs = 1_000
-    const encoder = new TextEncoder()
-    const upstreamFetch = vi.fn()
-      .mockResolvedValueOnce(new Response(new ReadableStream<Uint8Array>({
-        pull: () => new Promise<void>(() => undefined)
-      }), { status: 200, headers: { 'content-type': 'text/event-stream' } }))
-      .mockResolvedValueOnce(new Response(encoder.encode([
-        'data: {"id":"chat-failover","model":"source-model","choices":[{"index":0,"delta":{"content":"Recovered"},"finish_reason":"stop"}]}',
-        '',
-        'data: [DONE]',
-        '',
-        ''
-      ].join('\n')), { status: 200, headers: { 'content-type': 'text/event-stream' } }))
+    const gatewayConfig = config(port, { requestTimeoutSeconds: 1 })
+    const upstreamFetch = vi.fn(async () => scheduledSseResponse([
+      {
+        atMs: 0,
+        data: 'data: {"id":"chat-long","model":"source-model","choices":[{"index":0,"delta":{"content":"A"},"finish_reason":null}]}\n\n'
+      },
+      {
+        atMs: 600,
+        data: 'data: {"id":"chat-long","model":"source-model","choices":[{"index":0,"delta":{"content":"B"},"finish_reason":null}]}\n\n'
+      },
+      {
+        atMs: 1_200,
+        data: 'data: {"id":"chat-long","model":"source-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+        close: true
+      }
+    ]))
     const gateway = new GatewayServer({
       config: gatewayConfig,
-      credentialResolver: (account) => `key-${account.id}`,
+      credentialResolver: () => 'credential',
       fetchImplementation: upstreamFetch as typeof fetch
     })
     runningServers.push(gateway)
     await gateway.start()
 
     const response = await post(port, 'local-secret', { stream: true })
+    const wire = await response.text()
+    expect(response.status).toBe(200)
+    expect(wire).toContain('"A"')
+    expect(wire).toContain('"B"')
+    expect(wire).toContain('[DONE]')
+    expect(gateway.getStatus().successRequests).toBe(1)
+  }, 10_000)
+
+  it('marks a same-protocol stream idle gap as an upstream 504', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port, { requestTimeoutSeconds: 1 })
+    gatewayConfig.accounts[1].status = 'disabled'
+    gatewayConfig.pools[0].maxRetries = 0
+    const states: Array<{ accountId: string; status: string }> = []
+    const logs: RequestLog[] = []
+    const upstreamFetch = vi.fn(async () => scheduledSseResponse([
+      {
+        atMs: 0,
+        data: 'data: {"id":"chat-idle","model":"source-model","choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}\n\n'
+      },
+      { atMs: 1_300, data: 'data: [DONE]\n\n', close: true }
+    ]))
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'credential',
+      fetchImplementation: upstreamFetch as typeof fetch,
+      onAccountState: (state) => states.push(state),
+      onLog: (log) => logs.push(log)
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await post(port, 'local-secret', { stream: true })
+    expect(response.status).toBe(200) // Headers were already committed by the first chunk.
+    expect(await response.text()).toContain('partial')
+    expect(gateway.getStatus().successRequests).toBe(0)
+    expect(states.at(-1)).toMatchObject({ accountId: 'first', status: 'cooldown' })
+    expect([...logs].reverse().find((log) => log.status === 'error')).toMatchObject({
+      statusCode: 504,
+      error: 'Upstream stream produced no data for 1000 ms'
+    })
+  }, 10_000)
+
+  it('keeps a converted stream alive beyond the request deadline while chunks keep arriving', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port, { requestTimeoutSeconds: 1 })
+    gatewayConfig.routes[0].inboundProtocol = 'anthropic-messages'
+    const upstreamFetch = vi.fn(async () => scheduledSseResponse([
+      {
+        atMs: 0,
+        data: 'data: {"id":"chat-converted-long","model":"source-model","choices":[{"index":0,"delta":{"content":"A"},"finish_reason":null}]}\n\n'
+      },
+      {
+        atMs: 600,
+        data: 'data: {"id":"chat-converted-long","model":"source-model","choices":[{"index":0,"delta":{"content":"B"},"finish_reason":null}]}\n\n'
+      },
+      {
+        atMs: 1_200,
+        data: 'data: {"id":"chat-converted-long","model":"source-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+        close: true
+      }
+    ]))
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'credential',
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'source-model', stream: true, max_tokens: 64,
+        messages: [{ role: 'user', content: 'Hello' }]
+      })
+    })
+    const wire = await response.text()
+    expect(response.status).toBe(200)
+    expect(wire).toContain('"text":"A"')
+    expect(wire).toContain('"text":"B"')
+    expect(wire).toContain('message_stop')
+    expect(gateway.getStatus().successRequests).toBe(1)
+  }, 10_000)
+
+  it('emits an explicit idle-timeout error for a converted stream', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port, { requestTimeoutSeconds: 1 })
+    gatewayConfig.routes[0].inboundProtocol = 'anthropic-messages'
+    gatewayConfig.accounts[1].status = 'disabled'
+    gatewayConfig.pools[0].maxRetries = 0
+    const logs: RequestLog[] = []
+    const upstreamFetch = vi.fn(async () => scheduledSseResponse([
+      {
+        atMs: 0,
+        data: 'data: {"id":"chat-converted-idle","model":"source-model","choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}\n\n'
+      },
+      { atMs: 1_300, data: 'data: [DONE]\n\n', close: true }
+    ]))
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'credential',
+      fetchImplementation: upstreamFetch as typeof fetch,
+      onLog: (log) => logs.push(log)
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'source-model', stream: true, max_tokens: 64,
+        messages: [{ role: 'user', content: 'Hello' }]
+      })
+    })
+    const wire = await response.text()
+    expect(response.status).toBe(200)
+    expect(wire).toContain('upstream_stream_idle_timeout')
+    expect(gateway.getStatus().successRequests).toBe(0)
+    expect([...logs].reverse().find((log) => log.status === 'error')).toMatchObject({ statusCode: 504 })
+  }, 10_000)
+
+  it('fails over a sticky request after first-body timeout and keeps the successful reassignment', async () => {
+    const port = await freePort()
+    let now = timestamp
+    const gatewayConfig = config(port)
+    gatewayConfig.pools[0].stickySessions = true
+    gatewayConfig.pools[0].firstBodyTimeoutMs = 1_000
+    const encoder = new TextEncoder()
+    const selectedAccountIds: string[] = []
+    const recoveredStream = () => new Response(encoder.encode([
+      'data: {"id":"chat-failover","model":"source-model","choices":[{"index":0,"delta":{"content":"Recovered"},"finish_reason":"stop"}]}',
+      '',
+      'data: [DONE]',
+      '',
+      ''
+    ].join('\n')), { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    const upstreamFetch = vi.fn()
+      .mockResolvedValueOnce(new Response(new ReadableStream<Uint8Array>({
+        pull: () => new Promise<void>(() => undefined)
+      }), { status: 200, headers: { 'content-type': 'text/event-stream' } }))
+      .mockImplementation(async () => recoveredStream())
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: (selected) => {
+        selectedAccountIds.push(selected.id)
+        return `key-${selected.id}`
+      },
+      fetchImplementation: upstreamFetch as typeof fetch,
+      now: () => now
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await postSession(port, 'timeout-thread', { stream: true })
     expect(response.status).toBe(200)
     expect(await response.text()).toContain('Recovered')
-    expect(upstreamFetch).toHaveBeenCalledTimes(2)
+    now += 31_000
+    expect((await postSession(port, 'timeout-thread', { stream: true })).status).toBe(200)
+    expect((await postSession(port, 'new-thread', { stream: true })).status).toBe(200)
+    expect(selectedAccountIds).toEqual(['first', 'second', 'second', 'first'])
   }, 10_000)
 
   it('ignores empty upstream chunks while waiting for the first response body', async () => {
@@ -949,6 +1412,51 @@ describe('GatewayServer', () => {
     expect(upstreamFetch).toHaveBeenCalledOnce()
   })
 
+  it('evicts a sticky account when a same-protocol upstream stream terminates incomplete', async () => {
+    const port = await freePort()
+    let now = timestamp
+    const gatewayConfig = config(port)
+    gatewayConfig.pools[0].stickySessions = true
+    gatewayConfig.pools[0].maxRetries = 0
+    const selectedAccountIds: string[] = []
+    const success = () => new Response(JSON.stringify({
+      id: 'completion',
+      model: 'source-model',
+      choices: [{ message: { role: 'assistant', content: 'Done' }, finish_reason: 'stop' }]
+    }), { status: 200, headers: { 'content-type': 'application/json' } })
+    const upstreamFetch = vi.fn()
+      .mockImplementationOnce(async () => success())
+      .mockResolvedValueOnce(new Response(
+        'data: {"id":"chat-cut","model":"source-model","choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}\n\n',
+        { status: 200, headers: { 'content-type': 'text/event-stream' } }
+      ))
+      .mockImplementation(async () => success())
+    const states: Array<{ accountId: string; status: string }> = []
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: (selected) => {
+        selectedAccountIds.push(selected.id)
+        return `key-${selected.id}`
+      },
+      fetchImplementation: upstreamFetch as typeof fetch,
+      now: () => now,
+      onAccountState: (state) => states.push(state)
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    expect((await postSession(port, 'cut-thread')).status).toBe(200)
+    const cut = await postSession(port, 'cut-thread', { stream: true })
+    expect(cut.status).toBe(200)
+    expect(await cut.text()).toContain('partial')
+    await vi.waitFor(() => expect(states.at(-1)).toMatchObject({ accountId: 'first', status: 'cooldown' }))
+
+    now += 31_000
+    expect((await postSession(port, 'cut-thread')).status).toBe(200)
+    expect((await postSession(port, 'fresh-thread')).status).toBe(200)
+    expect(selectedAccountIds).toEqual(['first', 'first', 'second', 'first'])
+  })
+
   it('gracefully drains an active stream when the gateway is restarted', async () => {
     const port = await freePort()
     const encoder = new TextEncoder()
@@ -969,7 +1477,7 @@ describe('GatewayServer', () => {
     const logs: RequestLog[] = []
     const gateway = new GatewayServer({
       config: config(port), credentialResolver: () => 'credential',
-      fetchImplementation: upstreamFetch as typeof fetch, onLog: (log) => logs.push(log)
+      fetchImplementation: upstreamFetch as typeof fetch, onLog: (log) => upsertLog(logs, log)
     })
     runningServers.push(gateway)
     await gateway.start()
@@ -1055,8 +1563,10 @@ describe('GatewayServer', () => {
     expect(upstreamFetch).toHaveBeenCalledTimes(2)
   })
 
-  it('logs only 499 without cooldown or failover when the client disconnects', async () => {
+  it('evicts only the unproven sticky session when the client disconnects before first output', async () => {
     const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.pools[0].stickySessions = true
     const states: Array<{ accountId: string; status: string }> = []
     const logs: RequestLog[] = []
     const selectedAccountIds: string[] = []
@@ -1075,14 +1585,14 @@ describe('GatewayServer', () => {
         choices: [{ message: { role: 'assistant', content: 'Done' }, finish_reason: 'stop' }]
       }), { status: 200, headers: { 'content-type': 'application/json' } }))
     const gateway = new GatewayServer({
-      config: config(port),
+      config: gatewayConfig,
       credentialResolver: (selected) => {
         selectedAccountIds.push(selected.id)
         return `key-${selected.id}`
       },
       fetchImplementation: upstreamFetch as typeof fetch,
       onAccountState: (state) => states.push(state),
-      onLog: (log) => logs.push(log)
+      onLog: (log) => upsertLog(logs, log)
     })
     runningServers.push(gateway)
     await gateway.start()
@@ -1090,14 +1600,18 @@ describe('GatewayServer', () => {
     const controller = new AbortController()
     const disconnectedRequest = fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
       method: 'POST',
-      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      headers: {
+        authorization: 'Bearer local-secret',
+        'content-type': 'application/json',
+        'x-stone-session-id': 'cancelled-thread'
+      },
       body: JSON.stringify({ model: 'source-model', messages: [{ role: 'user', content: 'Hello' }] }),
       signal: controller.signal
     }).catch((error: unknown) => error)
     await vi.waitFor(() => expect(upstreamFetch).toHaveBeenCalledOnce())
     controller.abort()
     await disconnectedRequest
-    await vi.waitFor(() => expect(logs).toHaveLength(1))
+    await vi.waitFor(() => expect(logs[0]?.status).toBe('error'))
 
     expect(upstreamFetch).toHaveBeenCalledOnce()
     expect(states).toHaveLength(0)
@@ -1105,11 +1619,80 @@ describe('GatewayServer', () => {
       status: 'error',
       statusCode: 499,
       error: 'Client closed the request',
+      failureStage: 'client',
       failoverCount: 0,
       accountId: 'first'
     })
 
-    const nextResponse = await post(port)
+    const nextResponse = await postSession(port, 'cancelled-thread')
+    expect(nextResponse.status).toBe(200)
+    expect(selectedAccountIds).toEqual(['first', 'second'])
+    expect(upstreamFetch).toHaveBeenCalledTimes(2)
+  })
+
+  it('records an intentional subagent cancellation as a successful 499 without evicting the sticky session', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.pools[0].stickySessions = true
+    const states: Array<{ accountId: string; status: string }> = []
+    const logs: RequestLog[] = []
+    const selectedAccountIds: string[] = []
+    const upstreamFetch = vi.fn()
+      .mockImplementationOnce(async (_input: string | URL | Request, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+        const signal = init?.signal
+        if (signal?.aborted) {
+          reject(signal.reason)
+          return
+        }
+        signal?.addEventListener('abort', () => reject(signal.reason), { once: true })
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        id: 'completion-after-subagent-cancel',
+        model: 'source-model',
+        choices: [{ message: { role: 'assistant', content: 'Done' }, finish_reason: 'stop' }]
+      }), { status: 200, headers: { 'content-type': 'application/json' } }))
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: (selected) => {
+        selectedAccountIds.push(selected.id)
+        return `key-${selected.id}`
+      },
+      fetchImplementation: upstreamFetch as typeof fetch,
+      onAccountState: (state) => states.push(state),
+      onLog: (log) => upsertLog(logs, log)
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const controller = new AbortController()
+    const cancelledRequest = fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer local-secret',
+        'content-type': 'application/json',
+        'x-stone-session-id': 'subagent-thread',
+        'x-openai-subagent': 'true'
+      },
+      body: JSON.stringify({ model: 'source-model', messages: [{ role: 'user', content: 'Hello' }] }),
+      signal: controller.signal
+    }).catch((error: unknown) => error)
+    await vi.waitFor(() => expect(upstreamFetch).toHaveBeenCalledOnce())
+    controller.abort()
+    await cancelledRequest
+    await vi.waitFor(() => expect(logs[0]?.status).toBe('success'))
+
+    expect(states).toHaveLength(0)
+    expect(gateway.getStatus().successRequests).toBe(1)
+    expect(logs[0]).toMatchObject({
+      status: 'success',
+      statusCode: 499,
+      failoverCount: 0,
+      accountId: 'first'
+    })
+    expect(logs[0]?.error).toBeUndefined()
+    expect(logs[0]?.failureStage).toBeUndefined()
+
+    const nextResponse = await postSession(port, 'subagent-thread')
     expect(nextResponse.status).toBe(200)
     expect(selectedAccountIds).toEqual(['first', 'first'])
     expect(upstreamFetch).toHaveBeenCalledTimes(2)
@@ -1139,7 +1722,7 @@ describe('GatewayServer', () => {
       credentialResolver: () => 'credential',
       fetchImplementation: upstreamFetch as typeof fetch,
       onAccountState: (state) => states.push(state),
-      onLog: (log) => logs.push(log)
+      onLog: (log) => upsertLog(logs, log)
     })
     runningServers.push(gateway)
     await gateway.start()
@@ -1155,7 +1738,7 @@ describe('GatewayServer', () => {
     expect(new TextDecoder().decode(first.value)).toContain('[DONE]')
     await reader!.cancel()
 
-    await vi.waitFor(() => expect(logs).toHaveLength(1))
+    await vi.waitFor(() => expect(logs[0]?.status).toBe('success'))
     expect(logs[0]).toMatchObject({ status: 'success', statusCode: 200 })
     expect(states).toHaveLength(1)
     expect(states[0]).toMatchObject({ accountId: 'first', status: 'active' })
@@ -1197,7 +1780,7 @@ describe('GatewayServer', () => {
       credentialResolver: () => 'credential',
       fetchImplementation: upstreamFetch as typeof fetch,
       onAccountState: (state) => states.push(state),
-      onLog: (log) => logs.push(log)
+      onLog: (log) => upsertLog(logs, log)
     })
     runningServers.push(gateway)
     await gateway.start()
@@ -1213,9 +1796,9 @@ describe('GatewayServer', () => {
     expect(new TextDecoder().decode(first.value)).toContain('response.custom_tool_call_input.done')
     await reader!.cancel()
 
-    await vi.waitFor(() => expect(logs).toHaveLength(1))
+    await vi.waitFor(() => expect(logs[0]?.status).toBe('success'))
     expect(logs[0]).toMatchObject({ status: 'success', statusCode: 200 })
-    expect(states).toHaveLength(1)
+    await vi.waitFor(() => expect(states).toHaveLength(1))
     expect(states[0]).toMatchObject({ accountId: 'first', status: 'active' })
   })
 
@@ -1256,7 +1839,7 @@ describe('GatewayServer', () => {
       credentialResolver: () => 'credential',
       fetchImplementation: upstreamFetch as typeof fetch,
       onAccountState: (state) => states.push(state),
-      onLog: (log) => logs.push(log)
+      onLog: (log) => upsertLog(logs, log)
     })
     runningServers.push(gateway)
     await gateway.start()
@@ -1272,9 +1855,9 @@ describe('GatewayServer', () => {
     expect(new TextDecoder().decode(first.value)).toContain('response.output_item.done')
     await reader!.cancel()
 
-    await vi.waitFor(() => expect(logs).toHaveLength(1))
+    await vi.waitFor(() => expect(logs[0]?.status).toBe('success'))
     expect(logs[0]).toMatchObject({ status: 'success', statusCode: 200 })
-    expect(states).toHaveLength(1)
+    await vi.waitFor(() => expect(states).toHaveLength(1))
     expect(states[0]).toMatchObject({ accountId: 'first', status: 'active' })
   })
 
@@ -1296,7 +1879,7 @@ describe('GatewayServer', () => {
           choices: [{ message: { role: 'assistant', content: 'Done' }, finish_reason: 'stop' }]
         }), { status: 200, headers: { 'content-type': 'application/json' } })
       }) as typeof fetch,
-      onLog: (log) => logs.push(log),
+      onLog: (log) => upsertLog(logs, log),
       now: () => clock
     })
     runningServers.push(gateway)
@@ -1350,7 +1933,7 @@ describe('GatewayServer', () => {
       config: config(port),
       credentialResolver: () => 'credential',
       fetchImplementation: upstreamFetch as typeof fetch,
-      onLog: (log) => logs.push(log),
+      onLog: (log) => upsertLog(logs, log),
       conversationTitleResolver: (conversationId) => conversationId === 'thread-stone-feature' ? 'Stone 请求日志功能' : undefined,
       now: () => clock
     })
@@ -1423,7 +2006,7 @@ describe('GatewayServer', () => {
     const gatewayConfig = config(port)
     gatewayConfig.accounts[1].status = 'disabled'
     const states: Array<{ accountId: string; status: string }> = []
-    const logs: Array<{ status: string; error?: string }> = []
+    const logs: RequestLog[] = []
     const credential = 'sk-stream-private'
     const body = `data: {"error":{"message":"overloaded ${credential}","type":"server_error"}}\n\n`
     const splitAt = body.indexOf(credential) + 7
@@ -1443,7 +2026,7 @@ describe('GatewayServer', () => {
       credentialResolver: () => credential,
       fetchImplementation: upstreamFetch as typeof fetch,
       onAccountState: (state) => states.push(state),
-      onLog: (log) => logs.push(log)
+      onLog: (log) => upsertLog(logs, log)
     })
     runningServers.push(gateway)
     await gateway.start()
@@ -1454,9 +2037,9 @@ describe('GatewayServer', () => {
     expect(responseText).not.toContain(credential)
     expect(responseText).toContain('overloaded [REDACTED]')
     expect(gateway.getStatus().successRequests).toBe(0)
-    expect(states).toHaveLength(1)
+    await vi.waitFor(() => expect(states).toHaveLength(1))
     expect(states[0]).toMatchObject({ accountId: 'first', status: 'cooldown' })
-    expect(logs).toHaveLength(1)
+    await vi.waitFor(() => expect(logs[0]?.status).toBe('error'))
     expect(logs[0]).toMatchObject({ status: 'error', error: 'overloaded [REDACTED]' })
   })
 
@@ -1497,7 +2080,7 @@ describe('GatewayServer', () => {
     expect(response.status).toBe(200)
     expect(parsed).toContainEqual(expect.objectContaining({ type: 'error', errorType: 'incomplete_stream' }))
     expect(gateway.getStatus().successRequests).toBe(0)
-    expect(states).toHaveLength(1)
+    await vi.waitFor(() => expect(states).toHaveLength(1))
   })
 
   it('can reset hydrated runtime health after a successful manual account check', async () => {

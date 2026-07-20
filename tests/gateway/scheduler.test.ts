@@ -635,6 +635,100 @@ describe('PoolScheduler', () => {
     expect(second.account.id).toBe('a')
   })
 
+  it('moves only the failed sticky session to another account', () => {
+    const scheduler = new PoolScheduler(() => timestamp)
+    const accounts = [account('a'), account('b')]
+    const stickyPool = pool({ strategy: 'priority', stickySessions: true })
+
+    const failedSession = scheduler.selectAndAcquire({
+      pool: stickyPool, accounts, model: 'model', sessionId: 'failed-session'
+    })
+    expect(failedSession.account.id).toBe('a')
+    failedSession.release()
+    const unrelatedSession = scheduler.selectAndAcquire({
+      pool: stickyPool, accounts, model: 'model', sessionId: 'unrelated-session'
+    })
+    expect(unrelatedSession.account.id).toBe('a')
+    unrelatedSession.release()
+
+    expect(scheduler.recordStickyFailure(stickyPool.id, 'failed-session', 'a')).toBe(true)
+    const reassigned = scheduler.selectAndAcquire({
+      pool: stickyPool, accounts, model: 'model', sessionId: 'failed-session'
+    })
+    expect(reassigned.account.id).toBe('b')
+    reassigned.release()
+
+    const unrelatedAgain = scheduler.selectAndAcquire({
+      pool: stickyPool, accounts, model: 'model', sessionId: 'unrelated-session'
+    })
+    expect(unrelatedAgain.account.id).toBe('a')
+    unrelatedAgain.release()
+
+    const staysReassigned = scheduler.selectAndAcquire({
+      pool: stickyPool, accounts, model: 'model', sessionId: 'failed-session'
+    })
+    expect(staysReassigned.account.id).toBe('b')
+    staysReassigned.release()
+  })
+
+  it('does not let a stale failure evict a newer sticky assignment', () => {
+    const scheduler = new PoolScheduler(() => timestamp)
+    const accounts = [account('a'), account('b')]
+    const stickyPool = pool({ strategy: 'priority', stickySessions: true })
+    const first = scheduler.selectAndAcquire({
+      pool: stickyPool, accounts, model: 'model', sessionId: 'session'
+    })
+    first.release()
+    expect(scheduler.recordStickyFailure(stickyPool.id, 'session', 'a')).toBe(true)
+    const second = scheduler.selectAndAcquire({
+      pool: stickyPool, accounts, model: 'model', sessionId: 'session'
+    })
+    expect(second.account.id).toBe('b')
+    second.release()
+
+    expect(scheduler.recordStickyFailure(stickyPool.id, 'session', 'a')).toBe(false)
+    const stillSecond = scheduler.selectAndAcquire({
+      pool: stickyPool, accounts, model: 'model', sessionId: 'session'
+    })
+    expect(stillSecond.account.id).toBe('b')
+    stillSecond.release()
+  })
+
+  it('clears every existing session pinned to a proven failed account', () => {
+    let now = timestamp
+    const scheduler = new PoolScheduler(() => now)
+    const accounts = [account('a'), account('b')]
+    const stickyPool = pool({ strategy: 'priority', stickySessions: true })
+    for (const sessionId of ['one', 'two']) {
+      const selected = scheduler.selectAndAcquire({ pool: stickyPool, accounts, model: 'model', sessionId })
+      expect(selected.account.id).toBe('a')
+      selected.release()
+    }
+
+    scheduler.recordFailure('a')
+    now += 31_000
+    // The runtime cooldown has elapsed, so choosing b proves the old sticky
+    // assignments were invalidated rather than merely masked by eligibility.
+    for (const sessionId of ['one', 'two']) {
+      const selected = scheduler.selectAndAcquire({ pool: stickyPool, accounts, model: 'model', sessionId })
+      expect(selected.account.id).toBe('b')
+      selected.release()
+    }
+  })
+
+  it('excludes every account already failed by the same retry chain', () => {
+    const scheduler = new PoolScheduler(() => timestamp)
+    const accounts = [account('a'), account('b'), account('c')]
+    const selected = scheduler.selectAndAcquire({
+      pool: pool({ strategy: 'priority' }),
+      accounts,
+      model: 'model',
+      excludedAccountIds: ['a', 'b']
+    })
+    expect(selected.account.id).toBe('c')
+    selected.release()
+  })
+
   it('softly spreads concurrently active sticky conversations across accounts', () => {
     const scheduler = new PoolScheduler(() => timestamp, () => 0)
     const accounts = [

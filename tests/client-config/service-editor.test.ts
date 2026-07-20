@@ -45,6 +45,46 @@ describe('ClientConfigService editor workflow', () => {
     expect(JSON.stringify(snapshot)).not.toContain(authSecret)
   })
 
+  it('does not expose provider credentials in the editor snapshot and restores them when saving', async () => {
+    const bearerSecret = 'provider-bearer-secret-that-must-not-leak'
+    const headerSecret = 'provider-header-secret-that-must-not-leak'
+    const config = [
+      'model = "gpt-existing"',
+      '',
+      '[model_providers.private]',
+      'name = "Private"',
+      `experimental_bearer_token = "${bearerSecret}"`,
+      '',
+      '[model_providers.private.http_headers]',
+      `Authorization = "Bearer ${headerSecret}"`,
+      '',
+    ].join('\n')
+    await mkdir(service.paths.codex.directory, { recursive: true })
+    await writeFile(service.paths.codex.config.path, config)
+
+    const snapshot = await service.editor('codex')
+    const file = snapshot.files.find((candidate) => candidate.role === 'codex-config')!
+    const serialized = JSON.stringify(snapshot)
+    expect(file.protectedValueCount).toBe(2)
+    expect(file.content).toContain(protectedValuePlaceholder)
+    expect(serialized).not.toContain(bearerSecret)
+    expect(serialized).not.toContain(headerSecret)
+
+    const draft = file.content!.replace('model = "gpt-existing"', 'model = "gpt-updated"')
+    await service.applyEditor('codex', {
+      gatewayBaseUrl: 'http://127.0.0.1:15721',
+      token: 'stone-target-token',
+    }, {
+      patches: [],
+      files: [{ role: file.role, revision: file.revision, content: draft }],
+    })
+
+    const saved = await readFile(service.paths.codex.config.path, 'utf8')
+    expect(saved).toContain('model = "gpt-updated"')
+    expect(saved).toContain(`experimental_bearer_token = "${bearerSecret}"`)
+    expect(saved).toContain(`Authorization = "Bearer ${headerSecret}"`)
+  })
+
   it('rejects a stale advanced-editor revision before writing or creating a backup', async () => {
     const original = JSON.stringify({ model: 'original', env: { TOKEN: 'original-token' } }, null, 2) + '\n'
     const externallyChanged = JSON.stringify({ model: 'external-change', env: { TOKEN: 'external-token' } }, null, 2) + '\n'

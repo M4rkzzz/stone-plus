@@ -60,22 +60,46 @@ export type ClientConfigFileRole =
   | 'gemini-env'
 
 export type ClientConfigFileFormat = 'json' | 'toml' | 'dotenv'
-export type ClientConfigFieldValue = string | boolean | string[] | null
-export type ClientConfigFieldControl = 'text' | 'select' | 'toggle' | 'string-list'
+export type ClientConfigFieldValue = string | number | boolean | string[] | null
+export type ClientConfigFieldControl = 'text' | 'number' | 'select' | 'toggle' | 'string-list'
 
 export interface ClientConfigFieldOption {
   value: string
   label: string
+  /** A short, user-facing explanation of the behavior selected by this option. */
+  description?: string
+  /** Marks the generally sensible choice without forcing it onto an existing file. */
+  recommended?: boolean
 }
 
 export interface ClientConfigEditorField {
   id: string
+  /** File containing this value. Useful for linking a form row to the live preview. */
+  role: ClientConfigFileRole
+  /** Exact JSON/TOML path represented by this field. */
+  path: string[]
   section: string
   label: string
+  description: string
   control: ClientConfigFieldControl
   value: ClientConfigFieldValue
   options?: ClientConfigFieldOption[]
   placeholder?: string
+  /** Upstream default. Null means that omitting the key lets the client choose. */
+  defaultValue?: ClientConfigFieldValue
+  /** Suggested value for a guided "recommended settings" action. */
+  recommendedValue?: ClientConfigFieldValue
+  advanced?: boolean
+  /** Discovered values stay visible but are edited only in the complete-file editor. */
+  readOnly?: boolean
+  /** Stone rewrites this connection field when applying a client profile. */
+  managedByStone?: boolean
+  /** The current value is intentionally withheld from the renderer. */
+  sensitive?: boolean
+  source?: 'catalog' | 'discovered'
+  min?: number
+  max?: number
+  step?: number
 }
 
 export interface ClientConfigEditorFile {
@@ -171,8 +195,31 @@ export interface ClientConfigBackup {
   role: ClientConfigFileRole
   targetPath: string
   backupPath: string
+  /** Stable id shared by files captured in the same backup operation. */
+  groupId: string
   createdAt: number
   size: number
+}
+
+export interface ClientConfigBackupSet {
+  client: RouteClient
+  groupId: string
+  createdAt: number
+  backups: ClientConfigBackup[]
+}
+
+export interface ClientConfigBackupCreateResult extends ClientConfigBackupSet {
+  removedBackups: string[]
+  retentionWarning?: string
+}
+
+export interface ClientConfigBackupSetRestoreResult {
+  client: RouteClient
+  groupId: string
+  createdAt: number
+  restoredFiles: string[]
+  sourceBackups: ClientConfigBackup[]
+  safetyBackupSet?: ClientConfigBackupSet
 }
 
 export interface ClientConfigApplyResult {
@@ -181,6 +228,12 @@ export interface ClientConfigApplyResult {
   backups: ClientConfigBackup[]
   removedBackups: string[]
   retentionWarning?: string
+}
+
+/** Result of restoring Stone+ connectivity without replacing valid user settings. */
+export interface ClientConfigRepairResult extends ClientConfigApplyResult {
+  /** Documents that were syntactically unusable and had to be minimally rebuilt. */
+  rebuiltRoles: ClientConfigFileRole[]
 }
 
 export interface ClientConfigRestoreResult {
@@ -320,6 +373,11 @@ export interface CodexQuotaHistoryPoint {
   sevenDayUsedPercent?: number
   sevenDayResetAt?: number
   source: CodexQuotaSource
+}
+
+export interface CodexQuotaCycleCosts {
+  fiveHourUsd?: number
+  sevenDayUsd?: number
 }
 
 export interface PoolMember {
@@ -494,12 +552,18 @@ export interface RequestLog {
   conversationId?: string
   conversationName?: string
   timestamp: number
+  /** Request acceptance time. Present on live rows and new persisted records. */
+  startedAt?: number
   client: RouteClient
   protocol: Protocol
   providerName: string
   accountName: string
   model: string
   status: 'success' | 'error' | 'streaming'
+  /** Fine-grained lifecycle stage for an in-progress request. */
+  progressStage?: 'receiving-body' | 'scheduling' | 'resolving-credential' | 'connecting' | 'waiting-first-byte' | 'streaming' | 'retrying'
+  /** Stage in which a failed request terminated. */
+  failureStage?: 'body' | 'scheduler' | 'credential' | 'connect' | 'first-byte' | 'stream' | 'client'
   statusCode?: number
   latencyMs: number
   /** Time from request acceptance until the complete JSON request body has been read and parsed. */
@@ -521,6 +585,10 @@ export interface RequestLog {
   firstTokenMs?: number
   inputTokens?: number
   outputTokens?: number
+  /** Upstream response bytes observed while a stream is in progress. */
+  streamedBytes?: number
+  /** Upstream response chunks observed while a stream is in progress. */
+  streamedChunks?: number
   error?: string
   cachedInputTokens?: number
   /** Input tokens written into a prompt cache when the upstream reports them separately. */
@@ -871,6 +939,11 @@ export interface RouteSourceFastModeInput {
   enabled: boolean
 }
 
+export interface ClientRouteSourceInput {
+  client: RouteClient
+  sourceId: string
+}
+
 export type SetupWizardStep =
   | 'scan'
   | 'source'
@@ -1145,7 +1218,11 @@ export interface NetworkDiagnosticReport {
   diagnoses: string[]
 }
 
+/** Resolved renderer language used by native dialogs and main-process progress text. */
+export type UiLanguage = 'zh-CN' | 'en'
+
 export interface GatewayApi {
+  setUiLanguage(language: UiLanguage): Promise<void>
   getSnapshot(): Promise<AppSnapshot>
   saveProvider(input: ProviderInput): Promise<AppSnapshot>
   refreshProviderModels(id: string): Promise<AppSnapshot>
@@ -1192,6 +1269,7 @@ export interface GatewayApi {
   applySetupRouting(input: SetupRoutingInput): Promise<SetupRoutingResult>
   ensureGatewayRunning(input?: EnsureGatewayRunningInput): Promise<EnsureGatewayRunningResult>
   verifySetupRoute(input: SetupRouteVerificationInput): Promise<SetupRouteVerificationResult>
+  setClientRouteSource(input: ClientRouteSourceInput): Promise<AppSnapshot>
   updateRoute(route: Route): Promise<AppSnapshot>
   updateGateway(settings: GatewaySettings): Promise<AppSnapshot>
   startGateway(): Promise<AppSnapshot>
@@ -1202,16 +1280,22 @@ export interface GatewayApi {
   checkAccount(id: string): Promise<AppSnapshot>
   refreshAccountCodexQuota(id: string): Promise<AppSnapshot>
   getAccountCodexQuotaHistory(id: string, from?: number, to?: number): Promise<CodexQuotaHistoryPoint[]>
+  getAccountCodexQuotaCycleCosts(id: string): Promise<CodexQuotaCycleCosts>
   clearLogs(): Promise<AppSnapshot>
   clearHealthEvents(): Promise<AppSnapshot>
   saveClientProfile(input: ClientConfigProfileInput): Promise<AppSnapshot>
   deleteClientProfile(id: string): Promise<AppSnapshot>
   exportClientProfile(id: string): Promise<ProfileBundle>
   importClientProfile(bundle: ProfileBundle): Promise<AppSnapshot>
+  chooseClientConfigDirectory(client: RouteClient, currentDirectory?: string): Promise<string | null>
   getClientConfigs(profileId?: string): Promise<ClientConfigStatus[]>
   previewClientConfig(client: RouteClient, profileId?: string): Promise<ClientConfigPreview>
   applyClientConfig(client: RouteClient, profileId?: string): Promise<ClientConfigApplyResult>
+  repairClientConfig(client: RouteClient, profileId?: string): Promise<ClientConfigRepairResult>
   listClientConfigBackups(client: RouteClient, profileId?: string): Promise<ClientConfigBackup[]>
+  createClientConfigBackup(client: RouteClient, profileId?: string): Promise<ClientConfigBackupCreateResult>
+  restoreLatestClientConfigBackup(client: RouteClient, profileId?: string): Promise<ClientConfigBackupSetRestoreResult>
+  restoreClientConfigBackupSet(groupId: string, client: RouteClient, profileId?: string): Promise<ClientConfigBackupSetRestoreResult>
   restoreClientConfig(backupPath: string, client: RouteClient, profileId?: string): Promise<ClientConfigRestoreResult>
   getClientConfigEditor(client: RouteClient, profileId?: string): Promise<ClientConfigEditorState>
   saveClientConfigEditor(input: ClientConfigEditorSaveInput): Promise<ClientConfigApplyResult>

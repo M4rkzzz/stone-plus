@@ -3,7 +3,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { isAbsolute, join, normalize } from 'node:path'
 import { valid as validSemver } from 'semver'
 import { clientNativeProtocols, supportsFastServiceTier } from '@shared/types'
-import { summarizeOpenAiTokenCosts } from '@shared/openai-pricing'
+import { summarizeAccountCodexQuotaCycleCosts, summarizeOpenAiTokenCosts } from '@shared/openai-pricing'
 import {
   appendRuntimeRouteSourcePools,
   hasRouteSourceIdCollision,
@@ -27,6 +27,7 @@ import type {
   ChatGptAccountImportInput,
   ChatGptAccountImportProxyMode,
   CodexQuotaHistoryPoint,
+  CodexQuotaCycleCosts,
   GatewaySettings,
   GatewayStatus,
   HealthEvent,
@@ -41,6 +42,7 @@ import type {
   ProviderInput,
   RequestLog,
   Route,
+  RouteClient,
   RouteSourceFastModeInput,
   SetupRoutingInput,
   SetupRoutingResult,
@@ -147,6 +149,20 @@ export class AppStore {
 
   public async initialize(): Promise<void> {
     await this.store.initialize()
+    if (this.store.select((state) => state.requestLogs.some((log) => log.status === 'streaming'))) {
+      await this.store.update((state) => {
+        state.requestLogs = state.requestLogs.map((log) => log.status === 'streaming'
+          ? {
+              ...log,
+              status: 'error',
+              statusCode: 499,
+              failureStage: 'client',
+              error: 'Gateway stopped before the request completed'
+            }
+          : log)
+      })
+      this.requestLogRevision += 1
+    }
     await this.sanitizePersistedData()
   }
 
@@ -1075,6 +1091,28 @@ export class AppStore {
     return this.getSnapshot()
   }
 
+  /**
+   * Atomically switch a client's upstream route source without replacing the
+   * rest of the route with a potentially stale renderer snapshot.
+   *
+   * Source availability is intentionally validated by the caller so this
+   * narrow mutation can also be reused by trusted setup and repair flows.
+   */
+  public async setRouteSource(client: RouteClient, sourceId: string): Promise<AppSnapshot> {
+    const cleanSourceId = sourceId.trim()
+    if (!cleanSourceId) throw new Error('Choose a route source before switching.')
+    await this.store.update((state) => {
+      const route = state.routes.find((candidate) => candidate.client === client)
+      if (!route) throw new Error(`The ${client} client route does not exist.`)
+      replaceById(state.routes, {
+        ...route,
+        poolId: cleanSourceId,
+        updatedAt: Date.now()
+      })
+    })
+    return this.getSnapshot()
+  }
+
   public getSetupWizardState(): SetupWizardState | null {
     return this.setupWizard.get()
   }
@@ -1185,6 +1223,14 @@ export class AppStore {
     const end = Number.isFinite(to) ? Number(to) : Date.now()
     const start = Number.isFinite(from) ? Number(from) : end - 14 * 24 * 60 * 60 * 1000
     return this.store.readCodexQuotaHistory(accountId, start, end)
+  }
+
+  public getAccountCodexQuotaCycleCosts(accountId: string): CodexQuotaCycleCosts {
+    return this.store.select((state) => {
+      const account = state.accounts.find((candidate) => candidate.id === accountId)
+      if (!account) throw new Error('Account not found.')
+      return summarizeAccountCodexQuotaCycleCosts(state.requestLogs, accountId, account.codexQuota)
+    })
   }
 
   public async appendLog(log: RequestLog): Promise<void> {

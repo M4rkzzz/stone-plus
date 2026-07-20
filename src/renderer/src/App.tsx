@@ -5,6 +5,7 @@ import {
   ChevronLeft,
   CircleGauge,
   Globe2,
+  CircleHelp,
   Menu,
   MonitorCog,
   Network,
@@ -36,6 +37,7 @@ import { SessionRepairView } from './views/SessionRepairView'
 import { NetworkTestView } from './views/NetworkTestView'
 import { BrowserView } from './views/BrowserView'
 import { SetupWizardView } from './views/SetupWizardView'
+import { HelpView } from './views/HelpView'
 import { gatewayBaseUrl } from './ui'
 import { StoneMark } from './StoneMark'
 import { summarizeAccountQuota } from './account-quota'
@@ -44,47 +46,55 @@ import {
   type AppUpdateController,
   type UpdateAction,
 } from './UpdateDialog'
+import { useI18n } from './i18n'
 
-export type PageId = 'overview' | 'setup' | 'providers' | 'proxies' | 'pools' | 'routes' | 'clients' | 'session-repair' | 'tunnel' | 'browser' | 'diagnostics' | 'requests' | 'settings'
+export type PageId = 'overview' | 'setup' | 'providers' | 'proxies' | 'pools' | 'routes' | 'clients' | 'session-repair' | 'tunnel' | 'browser' | 'diagnostics' | 'requests' | 'settings' | 'help'
 export type ActionRunner = (key: string, operation: () => Promise<AppSnapshot>) => Promise<boolean>
+
+function localizedError(cause: unknown, fallback: string, language: 'zh-CN' | 'en'): string {
+  if (!(cause instanceof Error)) return fallback
+  return language === 'en' && /[\u3400-\u9fff]/u.test(cause.message) ? fallback : cause.message
+}
 
 const desktopTunnelSupported = !window.stone || window.stonePlatform === 'win32'
 
-const allNavigation: Array<{ id: PageId; label: string; icon: typeof Activity }> = [
-  { id: 'overview', label: '总览', icon: CircleGauge },
-  { id: 'providers', label: '账号与中转', icon: Boxes },
-  { id: 'proxies', label: '出口代理', icon: Waypoints },
-  { id: 'pools', label: '号池', icon: Network },
-  { id: 'routes', label: '路由', icon: RouteIcon },
-  { id: 'clients', label: '客户端配置', icon: MonitorCog },
-  { id: 'session-repair', label: '会话修复', icon: Wrench },
-  { id: 'tunnel', label: '内网穿透', icon: Share2 },
-  { id: 'browser', label: '内置浏览器', icon: Globe2 },
-  { id: 'diagnostics', label: '诊断', icon: Stethoscope },
-  { id: 'requests', label: '请求记录', icon: Activity },
-  { id: 'settings', label: '设置', icon: Settings },
+const allNavigation: Array<{ id: PageId; label: readonly [string, string]; icon: typeof Activity }> = [
+  { id: 'overview', label: ['总览', 'Overview'], icon: CircleGauge },
+  { id: 'providers', label: ['账号与中转', 'Accounts & Relays'], icon: Boxes },
+  { id: 'proxies', label: ['出口代理', 'Outbound Proxies'], icon: Waypoints },
+  { id: 'pools', label: ['号池', 'Pools'], icon: Network },
+  { id: 'routes', label: ['路由', 'Routes'], icon: RouteIcon },
+  { id: 'clients', label: ['客户端配置', 'Client Configuration'], icon: MonitorCog },
+  { id: 'session-repair', label: ['会话修复', 'Session Repair'], icon: Wrench },
+  { id: 'tunnel', label: ['内网穿透', 'Tunnel'], icon: Share2 },
+  { id: 'browser', label: ['内置浏览器', 'Built-in Browser'], icon: Globe2 },
+  { id: 'diagnostics', label: ['诊断', 'Diagnostics'], icon: Stethoscope },
+  { id: 'requests', label: ['请求记录', 'Request Logs'], icon: Activity },
+  { id: 'settings', label: ['设置', 'Settings'], icon: Settings },
 ]
 
 const navigation = allNavigation.filter((item) => desktopTunnelSupported || item.id !== 'tunnel')
 
 function pageFromHash(): PageId {
   const candidate = window.location.hash.slice(1) as PageId
-  return candidate === 'setup' || navigation.some((item) => item.id === candidate) ? candidate : 'overview'
+  return candidate === 'setup' || candidate === 'help' || navigation.some((item) => item.id === candidate) ? candidate : 'overview'
 }
 
 const SETUP_AUTO_SHOWN_STORAGE_KEY = 'stone.setup.auto-shown.v1'
 
 function LoadingScreen() {
+  const { t } = useI18n()
   return (
     <div className="boot-screen">
       <StoneMark />
       <RefreshCw size={20} className="spin" />
-      <p>正在连接本地网关…</p>
+      <p>{t('正在连接本地网关…', 'Connecting to the local gateway…')}</p>
     </div>
   )
 }
 
 export default function App() {
+  const { t, language } = useI18n()
   const api = useMemo(() => getGatewayApi(), [])
   const [snapshot, setSnapshot] = useState<AppSnapshot | null>(null)
   const [page, setPage] = useState<PageId>(pageFromHash)
@@ -110,9 +120,9 @@ export default function App() {
     try {
       setSnapshot(await api.getSnapshot())
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : '无法连接本地服务')
+      setError(localizedError(cause, t('无法连接本地服务', 'Unable to connect to the local service'), language))
     }
-  }, [api])
+  }, [api, language, t])
 
   useEffect(() => {
     void load()
@@ -123,9 +133,9 @@ export default function App() {
     const unsubscribe = api.onUpdateState(acceptUpdateState)
     void api.getUpdateState()
       .then(acceptUpdateState)
-      .catch((cause: unknown) => setUpdateError(cause instanceof Error ? cause.message : '无法读取应用更新状态'))
+      .catch((cause: unknown) => setUpdateError(localizedError(cause, t('无法读取应用更新状态', 'Unable to read the app update status'), language)))
     return unsubscribe
-  }, [acceptUpdateState, api])
+  }, [acceptUpdateState, api, language, t])
 
   useEffect(() => {
     const handleHashChange = () => setPage(pageFromHash())
@@ -159,7 +169,7 @@ export default function App() {
       setSnapshot(await operation())
       return true
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : '操作失败，请稍后重试')
+      setError(localizedError(cause, t('操作失败，请稍后重试', 'The operation failed. Please try again later.'), language))
       return false
     } finally {
       setBusyKeys((current) => {
@@ -168,7 +178,7 @@ export default function App() {
         return next
       })
     }
-  }, [])
+  }, [language, t])
 
   const repairSessionsAndRestartChatGpt = useCallback(async () => {
     const key = 'chatgpt-repair-restart'
@@ -177,7 +187,7 @@ export default function App() {
     try {
       await api.repairCodexSessionsAndRestartChatGpt()
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : '会话修复或 ChatGPT 重启失败')
+      setError(localizedError(cause, t('会话修复或 ChatGPT 重启失败', 'Session repair or ChatGPT restart failed'), language))
     } finally {
       setBusyKeys((current) => {
         const next = new Set(current)
@@ -185,7 +195,7 @@ export default function App() {
         return next
       })
     }
-  }, [api])
+  }, [api, language, t])
 
   const setActivePage = (id: PageId) => {
     setPage(id)
@@ -218,12 +228,12 @@ export default function App() {
       acceptUpdateState(next)
       return next
     } catch (cause) {
-      setUpdateError(cause instanceof Error ? cause.message : '应用更新操作失败')
+      setUpdateError(localizedError(cause, t('应用更新操作失败', 'The app update operation failed'), language))
       return undefined
     } finally {
       setUpdateAction(null)
     }
-  }, [acceptUpdateState])
+  }, [acceptUpdateState, language, t])
 
   const checkForUpdates = useCallback(async () => {
     const next = await runUpdateStateOperation('check', () => api.checkForUpdates())
@@ -241,7 +251,10 @@ export default function App() {
 
   const downloadUpdate = useCallback(async () => {
     if (snapshot && snapshot.gatewayStatus.activeRequests > 0) {
-      const confirmed = window.confirm(`当前仍有 ${snapshot.gatewayStatus.activeRequests} 个活跃请求。更新安装会关闭 Stone+ 并中断这些请求，是否继续？`)
+      const confirmed = window.confirm(t(
+        `当前仍有 ${snapshot.gatewayStatus.activeRequests} 个活跃请求。更新安装会关闭 Stone+ 并中断这些请求，是否继续？`,
+        `${snapshot.gatewayStatus.activeRequests} active request(s) are still running. Installing the update will close Stone+ and interrupt them. Continue?`,
+      ))
       if (!confirmed) return
     }
 
@@ -251,22 +264,25 @@ export default function App() {
       const next = await api.downloadUpdate()
       acceptUpdateState(next)
       if (next.status !== 'downloaded') {
-        setUpdateError(next.error ?? '更新包下载失败，请稍后重试')
+        setUpdateError(next.error ?? t('更新包下载失败，请稍后重试', 'The update package could not be downloaded. Please try again later.'))
         return
       }
 
       setUpdateAction('install')
       await api.installUpdate()
     } catch (cause) {
-      setUpdateError(cause instanceof Error ? cause.message : '无法下载或安装应用更新')
+      setUpdateError(localizedError(cause, t('无法下载或安装应用更新', 'Unable to download or install the app update'), language))
     } finally {
       setUpdateAction(null)
     }
-  }, [acceptUpdateState, api, snapshot])
+  }, [acceptUpdateState, api, language, snapshot, t])
 
   const installUpdate = useCallback(async () => {
     if (snapshot && snapshot.gatewayStatus.activeRequests > 0) {
-      const confirmed = window.confirm(`当前仍有 ${snapshot.gatewayStatus.activeRequests} 个活跃请求。更新会关闭 Stone 并中断这些请求，是否继续？`)
+      const confirmed = window.confirm(t(
+        `当前仍有 ${snapshot.gatewayStatus.activeRequests} 个活跃请求。更新会关闭 Stone 并中断这些请求，是否继续？`,
+        `${snapshot.gatewayStatus.activeRequests} active request(s) are still running. The update will close Stone and interrupt them. Continue?`,
+      ))
       if (!confirmed) return
     }
     setUpdateAction('install')
@@ -274,10 +290,10 @@ export default function App() {
     try {
       await api.installUpdate()
     } catch (cause) {
-      setUpdateError(cause instanceof Error ? cause.message : '无法安装应用更新')
+      setUpdateError(localizedError(cause, t('无法安装应用更新', 'Unable to install the app update'), language))
       setUpdateAction(null)
     }
-  }, [api, snapshot])
+  }, [api, language, snapshot, t])
 
   const openUpdatePage = useCallback(async () => {
     setUpdateAction('open-page')
@@ -285,11 +301,11 @@ export default function App() {
     try {
       await api.openUpdatePage()
     } catch (cause) {
-      setUpdateError(cause instanceof Error ? cause.message : '无法打开 GitHub Releases')
+      setUpdateError(localizedError(cause, t('无法打开 GitHub Releases', 'Unable to open GitHub Releases'), language))
     } finally {
       setUpdateAction(null)
     }
-  }, [api])
+  }, [api, language, t])
 
   const updateController = useMemo<AppUpdateController>(() => ({
     state: updateState,
@@ -311,7 +327,7 @@ export default function App() {
           <div className="boot-error">
             <span>{error}</span>
             <button className="button button--secondary" type="button" onClick={() => void load()}>
-              <RefreshCw size={16} /> 重试
+              <RefreshCw size={16} /> {t('重试', 'Retry')}
             </button>
           </div>
         )}
@@ -338,7 +354,7 @@ export default function App() {
 
   return (
     <div className={`app-shell ${sidebarCollapsed ? 'app-shell--collapsed' : ''}`}>
-      {mobileNavOpen && <button className="nav-scrim" type="button" aria-label="关闭导航" onClick={() => setMobileNavOpen(false)} />}
+      {mobileNavOpen && <button className="nav-scrim" type="button" aria-label={t('关闭导航', 'Close navigation')} onClick={() => setMobileNavOpen(false)} />}
       <aside className={`sidebar ${mobileNavOpen ? 'sidebar--open' : ''}`}>
         <div className="sidebar__brand">
           <StoneMark />
@@ -349,33 +365,33 @@ export default function App() {
                 <button
                   className="brand-update-link"
                   type="button"
-                  title={`更新到 v${updateState?.release?.version}`}
+                  title={t(`更新到 v${updateState?.release?.version}`, `Update to v${updateState?.release?.version}`)}
                   onClick={() => setUpdateDialogOpen(true)}
                 >
-                  更新
+                  {t('更新', 'Update')}
                 </button>
               )}
             </div>
             <span>Local Gateway</span>
           </div>
-          <button className="icon-button sidebar__mobile-close" type="button" onClick={() => setMobileNavOpen(false)} title="关闭导航">
+          <button className="icon-button sidebar__mobile-close" type="button" onClick={() => setMobileNavOpen(false)} title={t('关闭导航', 'Close navigation')}>
             <X size={18} />
           </button>
         </div>
 
         <div
           className={`sidebar-quota ${accountQuota ? '' : 'sidebar-quota--empty'}`}
-          title={accountQuota ? `${accountQuota.accountCount} 个可用账号 · 总体剩余额度 ${accountQuotaPercent}%` : '暂无可统计的账号额度'}
-          aria-label={accountQuota ? `总体剩余额度 ${accountQuotaPercent}%` : '总体剩余额度未知'}
+          title={accountQuota ? t(`${accountQuota.accountCount} 个可用账号 · 总体剩余额度 ${accountQuotaPercent}%`, `${accountQuota.accountCount} available account(s) · ${accountQuotaPercent}% quota remaining overall`) : t('暂无可统计的账号额度', 'No account quota data available')}
+          aria-label={accountQuota ? t(`总体剩余额度 ${accountQuotaPercent}%`, `${accountQuotaPercent}% quota remaining overall`) : t('总体剩余额度未知', 'Overall remaining quota unknown')}
         >
-          <span className="sidebar-quota__label">额度</span>
+          <span className="sidebar-quota__label">{t('额度', 'Quota')}</span>
           <span className="sidebar-quota__track" aria-hidden="true">
             <i style={{ width: `${accountQuotaPercent ?? 0}%` }} />
           </span>
           <strong>{accountQuotaPercent === undefined ? '—' : `${accountQuotaPercent}%`}</strong>
         </div>
 
-        <nav className="sidebar__nav" aria-label="主导航">
+        <nav className="sidebar__nav" aria-label={t('主导航', 'Main navigation')}>
           {navigation.map((item) => {
             const Icon = item.icon
             return (
@@ -383,11 +399,11 @@ export default function App() {
                 className={`nav-item ${page === item.id ? 'nav-item--active' : ''}`}
                 key={item.id}
                 type="button"
-                title={sidebarCollapsed ? item.label : undefined}
+                title={sidebarCollapsed ? t(item.label[0], item.label[1]) : undefined}
                 onClick={() => setActivePage(item.id)}
               >
                 <Icon size={18} />
-                <span>{item.label}</span>
+                <span>{t(item.label[0], item.label[1])}</span>
                 {item.id === 'requests' && snapshot.gatewayStatus.activeRequests > 0 && (
                   <span className="nav-count">{snapshot.gatewayStatus.activeRequests}</span>
                 )}
@@ -397,9 +413,19 @@ export default function App() {
         </nav>
 
         <div className="sidebar__footer">
-          <button className="sidebar-collapse" type="button" onClick={() => setSidebarCollapsed((value) => !value)} title={sidebarCollapsed ? '展开侧栏' : '收起侧栏'}>
+          <button
+            className={`nav-item sidebar-help ${page === 'help' ? 'nav-item--active' : ''}`}
+            type="button"
+            title={sidebarCollapsed ? t('帮助与下一步', 'Help & Next Steps') : undefined}
+            aria-current={page === 'help' ? 'page' : undefined}
+            onClick={() => setActivePage('help')}
+          >
+            <CircleHelp size={18} />
+            <span>{t('帮助与下一步', 'Help & Next Steps')}</span>
+          </button>
+          <button className="sidebar-collapse" type="button" onClick={() => setSidebarCollapsed((value) => !value)} title={sidebarCollapsed ? t('展开侧栏', 'Expand sidebar') : t('收起侧栏', 'Collapse sidebar')}>
             <ChevronLeft size={17} />
-            <span>{sidebarCollapsed ? '展开侧栏' : '收起侧栏'}</span>
+            <span>{sidebarCollapsed ? t('展开侧栏', 'Expand sidebar') : t('收起侧栏', 'Collapse sidebar')}</span>
           </button>
         </div>
       </aside>
@@ -407,13 +433,13 @@ export default function App() {
       <div className="workspace">
         <header className="topbar">
           <div className="topbar__left">
-            <button className="icon-button topbar__menu" type="button" onClick={() => setMobileNavOpen(true)} title="打开导航">
+            <button className="icon-button topbar__menu" type="button" onClick={() => setMobileNavOpen(true)} title={t('打开导航', 'Open navigation')}>
               <Menu size={19} />
             </button>
             <div className="gateway-state">
               <span className={`status-dot ${snapshot.gatewayStatus.running ? 'status-dot--online status-dot--pulse' : ''}`} />
               <div>
-                <strong>{snapshot.gatewayStatus.running ? '网关运行中' : '网关已停止'}</strong>
+                <strong>{snapshot.gatewayStatus.running ? t('网关运行中', 'Gateway running') : t('网关已停止', 'Gateway stopped')}</strong>
                 <span className="mono">{endpoint}</span>
               </div>
             </div>
@@ -422,13 +448,13 @@ export default function App() {
           <div className="topbar__right">
             {(page === 'overview' || page === 'providers') && (
               <button className="button button--secondary topbar__setup" type="button" onClick={() => setActivePage('setup')}>
-                <Play size={15} />配置向导
+                <Play size={15} />{t('配置向导', 'Setup Wizard')}
               </button>
             )}
             {snapshot.gatewayStatus.running && (
-              <div className="active-request-indicator" title="当前活跃请求">
+              <div className="active-request-indicator" title={t('当前活跃请求', 'Active requests')}>
                 <Activity size={15} />
-                <span>{snapshot.gatewayStatus.activeRequests} 个活跃请求</span>
+                <span>{t(`${snapshot.gatewayStatus.activeRequests} 个活跃请求`, `${snapshot.gatewayStatus.activeRequests} active request(s)`)}</span>
               </div>
             )}
             <button
@@ -442,13 +468,13 @@ export default function App() {
               }
             >
               {gatewayBusy ? <RefreshCw size={16} className="spin" /> : snapshot.gatewayStatus.running ? <Square size={14} /> : <Play size={16} />}
-              {snapshot.gatewayStatus.running ? '停止' : '启动'}
+              {snapshot.gatewayStatus.running ? t('停止', 'Stop') : t('启动', 'Start')}
             </button>
             <button
               className="topbar__chatgpt-restart"
               type="button"
-              aria-label="修复会话并重启 ChatGPT"
-              title="修复 Codex 会话并重启 ChatGPT"
+              aria-label={t('修复会话并重启 ChatGPT', 'Repair sessions and restart ChatGPT')}
+              title={t('修复 Codex 会话并重启 ChatGPT', 'Repair Codex sessions and restart ChatGPT')}
               disabled={chatGptRepairBusy}
               onClick={() => void repairSessionsAndRestartChatGpt()}
             >
@@ -460,7 +486,7 @@ export default function App() {
         {error && (
           <div className="error-banner" role="alert">
             <div><Power size={16} /><span>{error}</span></div>
-            <button type="button" className="icon-button" title="关闭" onClick={() => setError(null)}><X size={16} /></button>
+            <button type="button" className="icon-button" title={t('关闭', 'Close')} onClick={() => setError(null)}><X size={16} /></button>
           </div>
         )}
 
@@ -478,6 +504,7 @@ export default function App() {
           {page === 'diagnostics' && <NetworkTestView snapshot={snapshot} api={api} />}
           {page === 'requests' && <RequestsView snapshot={snapshot} api={api} runAction={runAction} busyKeys={busyKeys} />}
           {page === 'settings' && <SettingsView snapshot={snapshot} api={api} runAction={runAction} busyKeys={busyKeys} update={updateController} />}
+          {page === 'help' && <HelpView snapshot={snapshot} api={api} navigate={setActivePage} />}
         </main>
       </div>
       <UpdateDialog

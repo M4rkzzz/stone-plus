@@ -6,6 +6,11 @@ interface StickyAssignment {
   expiresAt: number
 }
 
+interface StickyFailureAvoidance {
+  accountId: string
+  expiresAt: number
+}
+
 interface SmoothWeightedState {
   /** Reset the accumulated scores whenever membership/order/weights change. */
   signature: string
@@ -97,6 +102,8 @@ export class PoolScheduler {
   private readonly roundRobinOffsets = new Map<string, number>()
   private readonly smoothWeighted = new Map<string, SmoothWeightedState>()
   private readonly sticky = new Map<string, StickyAssignment>()
+  /** One-shot per-session avoidance after its assigned account actually failed. */
+  private readonly stickyFailureAvoidance = new Map<string, StickyFailureAvoidance>()
   private readonly activeStickySessions = new Map<string, Map<string, number>>()
   private readonly health = new Map<string, AccountRuntimeHealth>()
   private readonly performance = new Map<string, AccountPerformanceState>()
@@ -168,12 +175,14 @@ export class PoolScheduler {
 
   selectAndAcquire(input: SchedulerSelectionInput): ScheduledAccount {
     const { pool, accounts, model, sessionId } = input
+    const excludedAccountIds = new Set(input.excludedAccountIds ?? [])
     if (pool.strategy !== 'weighted-round-robin') this.smoothWeighted.delete(pool.id)
     if (!poolAllowsModel(pool, accounts, model)) throw new ModelNotExposedError()
 
     const candidates = accounts
       .filter((account) => accountAllowsModel(account, model))
       .filter((account) => this.isEligible(account, pool.strategy === 'autobalanced'))
+      .filter((account) => !excludedAccountIds.has(account.id))
     if (candidates.length === 0) {
       throw new NoEligibleAccountError()
     }
@@ -181,10 +190,23 @@ export class PoolScheduler {
     const stickyKey = pool.stickySessions && sessionId ? `${pool.id}:${sessionId}` : undefined
     let selected: Account | undefined
     let escapedStickyAccountId: string | undefined
+    let failedStickyAccountId: string | undefined
     if (pool.stickySessions && stickyKey) {
+      const avoidance = this.stickyFailureAvoidance.get(stickyKey)
+      if (avoidance && avoidance.expiresAt > this.now()) {
+        // Prefer another account after a proven failure, but do not turn a
+        // single-account pool into a hard outage once that account is eligible.
+        if (candidates.some((account) => account.id !== avoidance.accountId)) {
+          failedStickyAccountId = avoidance.accountId
+        }
+      } else if (avoidance) {
+        this.stickyFailureAvoidance.delete(stickyKey)
+      }
       const assignment = this.sticky.get(stickyKey)
       if (assignment && assignment.expiresAt > this.now()) {
-        selected = candidates.find((account) => account.id === assignment.accountId)
+        selected = candidates.find((account) => (
+          account.id === assignment.accountId && account.id !== failedStickyAccountId
+        ))
         if (
           selected
           && pool.strategy === 'autobalanced'
@@ -202,11 +224,11 @@ export class PoolScheduler {
       }
     }
 
+    const avoidedAccountIds = new Set([escapedStickyAccountId, failedStickyAccountId].filter(Boolean))
+    const preferredCandidates = candidates.filter((account) => !avoidedAccountIds.has(account.id))
     selected ??= this.pick(
       pool,
-      escapedStickyAccountId
-        ? candidates.filter((account) => account.id !== escapedStickyAccountId)
-        : candidates,
+      preferredCandidates.length > 0 ? preferredCandidates : candidates,
       accounts,
       stickyKey
     )
@@ -214,6 +236,7 @@ export class PoolScheduler {
     if (stickyKey) this.acquireActiveStickySession(stickyKey, selected.id)
 
     if (pool.stickySessions && stickyKey) {
+      this.stickyFailureAvoidance.delete(stickyKey)
       this.sticky.set(stickyKey, {
         accountId: selected.id,
         expiresAt: this.now() + Math.max(1, pool.stickyTtlMinutes) * 60_000
@@ -234,6 +257,26 @@ export class PoolScheduler {
     }
   }
 
+  /**
+   * Drops a session assignment only when it still points at the account whose
+   * upstream attempt actually failed. The compare-and-delete protects a newer
+   * assignment created by another concurrent request for the same session.
+   */
+  recordStickyFailure(poolId: string, sessionId: string | undefined, accountId: string): boolean {
+    if (!sessionId) return false
+    const stickyKey = `${poolId}:${sessionId}`
+    const assignment = this.sticky.get(stickyKey)
+    if (!assignment || assignment.accountId !== accountId) return false
+    this.sticky.delete(stickyKey)
+    if (assignment.expiresAt > this.now()) {
+      this.stickyFailureAvoidance.set(stickyKey, {
+        accountId,
+        expiresAt: assignment.expiresAt
+      })
+    }
+    return true
+  }
+
   setCooldown(accountId: string, until: number): void {
     const existing = this.health.get(accountId)
     this.health.set(accountId, {
@@ -246,6 +289,19 @@ export class PoolScheduler {
   }
 
   recordFailure(accountId: string, options: AccountFailureOptions = {}): AccountRuntimeHealth {
+    // A proven runtime account failure is not session-local. Drop every
+    // assignment that still points at it, while keeping one-shot per-session
+    // avoidance so those conversations prefer a healthy peer next time.
+    for (const [stickyKey, assignment] of this.sticky) {
+      if (assignment.accountId !== accountId) continue
+      this.sticky.delete(stickyKey)
+      if (assignment.expiresAt > this.now()) {
+        this.stickyFailureAvoidance.set(stickyKey, {
+          accountId,
+          expiresAt: assignment.expiresAt
+        })
+      }
+    }
     const existing = this.health.get(accountId)
     const consecutiveFailures = (existing?.consecutiveFailures ?? 0) + 1
     const baseDelayMs = positiveDuration(options.baseDelayMs, 30_000)
@@ -412,6 +468,7 @@ export class PoolScheduler {
     this.roundRobinOffsets.clear()
     this.smoothWeighted.clear()
     this.sticky.clear()
+    this.stickyFailureAvoidance.clear()
     this.activeStickySessions.clear()
     this.health.clear()
     this.performance.clear()

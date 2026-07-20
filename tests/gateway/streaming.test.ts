@@ -87,6 +87,7 @@ describe('canonical streaming protocol conversion', () => {
     collector.push(encoder.encode(
       'data: {"type":"response.completed","response":{"id":"resp_usage","status":"completed","output":[],"usage":{"input_tokens":100,"output_tokens":20,"total_tokens":120,"input_tokens_details":{"cached_tokens":80},"output_tokens_details":{"reasoning_tokens":12}}}}\n\n'
     ))
+    expect(collector.isComplete()).toBe(true)
     const usage = collector.finish().response?.usage as Record<string, unknown>
     expect(usage).toMatchObject({
       input_tokens: 100,
@@ -181,6 +182,7 @@ describe('canonical streaming protocol conversion', () => {
   it('rejects a Responses stream without a terminal response', () => {
     const collector = createOpenAiResponsesStreamCollector()
     collector.push(encoder.encode('data: {"type":"response.output_text.delta","delta":"partial"}\n\n'))
+    expect(collector.isComplete()).toBe(false)
     expect(collector.finish()).toMatchObject({ error: expect.stringContaining('before a stop or done event') })
   })
   it.each([

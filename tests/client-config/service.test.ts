@@ -1,4 +1,5 @@
 import { chmod, mkdtemp, mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
+import { mkdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -164,6 +165,106 @@ describe('ClientConfigService', () => {
     expect(env).toContain('GEMINI_API_KEY="gemini-token"')
     expect(env).toContain('GEMINI_API_KEY_AUTH_MECHANISM="bearer"')
     expect(env).toContain('GOOGLE_GEMINI_BASE_URL="http://localhost:15721"')
+  })
+
+  it('creates and restores coherent multi-file backup sets without merging same-millisecond operations', async () => {
+    await mkdir(service.paths.codex.directory, { recursive: true })
+    await writeFile(service.paths.codex.config.path, 'model = "snapshot-one"\n')
+    await writeFile(service.paths.codex.auth.path, '{"OPENAI_API_KEY":"snapshot-one"}\n')
+
+    const first = await service.createBackupSet('codex')
+    expect(first.backups.map((backup) => backup.role)).toEqual(['codex-config', 'codex-auth'])
+    expect(new Set(first.backups.map((backup) => backup.groupId))).toEqual(new Set([first.groupId]))
+    expect(new Set(first.backups.map((backup) => backup.createdAt))).toEqual(new Set([fixedDate.getTime()]))
+
+    await writeFile(service.paths.codex.config.path, 'model = "snapshot-two"\n')
+    await writeFile(service.paths.codex.auth.path, '{"OPENAI_API_KEY":"snapshot-two"}\n')
+    const second = await service.createBackupSet('codex')
+
+    expect(second.groupId).not.toBe(first.groupId)
+    expect(second.backups.every((backup) => backup.backupPath.endsWith('.1'))).toBe(true)
+    await expect(service.restoreBackupSet('codex', fixedDate.getTime()))
+      .rejects.toThrow('use the exact group id')
+
+    await writeFile(service.paths.codex.config.path, 'model = "current"\n')
+    await writeFile(service.paths.codex.auth.path, '{"OPENAI_API_KEY":"current"}\n')
+    const restored = await service.restoreBackupSet('codex', first.groupId)
+
+    expect(restored.restoredFiles).toEqual([
+      service.paths.codex.config.path,
+      service.paths.codex.auth.path,
+    ])
+    expect(restored.sourceBackups.every((backup) => backup.groupId === first.groupId)).toBe(true)
+    expect(restored.safetyBackupSet?.backups).toHaveLength(2)
+    expect(new Set(restored.safetyBackupSet?.backups.map((backup) => backup.groupId)))
+      .toEqual(new Set([restored.safetyBackupSet?.groupId]))
+    expect(await readFile(service.paths.codex.config.path, 'utf8')).toBe('model = "snapshot-one"\n')
+    expect(await readFile(service.paths.codex.auth.path, 'utf8')).toBe('{"OPENAI_API_KEY":"snapshot-one"}\n')
+  })
+
+  it('serializes concurrent backup requests so their file groups cannot interleave', async () => {
+    await mkdir(service.paths.codex.directory, { recursive: true })
+    await writeFile(service.paths.codex.config.path, 'model = "concurrent"\n')
+    await writeFile(service.paths.codex.auth.path, '{"OPENAI_API_KEY":"concurrent"}\n')
+
+    const [first, second] = await Promise.all([
+      service.createBackupSet('codex'),
+      service.createBackupSet('codex'),
+    ])
+
+    expect(first.groupId).not.toBe(second.groupId)
+    expect(first.backups).toHaveLength(2)
+    expect(second.backups).toHaveLength(2)
+    expect(new Set((await service.listBackups('codex')).map((backup) => backup.groupId)).size).toBe(2)
+  })
+
+  it('restores the latest backup set and reports clearly when no backup exists', async () => {
+    await expect(service.restoreLatestBackupSet('gemini')).rejects.toThrow('No backups are available for gemini')
+    await expect(service.createBackupSet('gemini')).rejects.toThrow('No existing gemini configuration files')
+
+    await mkdir(service.paths.gemini.directory, { recursive: true })
+    await writeFile(service.paths.gemini.settings.path, '{"ui":{"theme":"snapshot"}}\n')
+    await writeFile(service.paths.gemini.env.path, 'KEEP=snapshot\n')
+    const created = await service.createBackupSet('gemini')
+    await writeFile(service.paths.gemini.settings.path, '{"ui":{"theme":"changed"}}\n')
+    await writeFile(service.paths.gemini.env.path, 'KEEP=changed\n')
+
+    const restored = await service.restoreLatestBackupSet('gemini')
+
+    expect(restored.groupId).toBe(created.groupId)
+    expect(await readFile(service.paths.gemini.settings.path, 'utf8')).toBe('{"ui":{"theme":"snapshot"}}\n')
+    expect(await readFile(service.paths.gemini.env.path, 'utf8')).toBe('KEEP=snapshot\n')
+  })
+
+  it('rolls back files already restored when a later file write fails', async () => {
+    let writeSequence = 0
+    const sabotaged = new ClientConfigService({
+      homeDir,
+      platform: process.platform,
+      now: () => fixedDate,
+      randomId: () => {
+        writeSequence += 1
+        if (writeSequence === 2) {
+          rmSync(sabotaged.paths.codex.auth.path, { force: true })
+          mkdirSync(sabotaged.paths.codex.auth.path)
+        }
+        return `restore-${writeSequence}`
+      },
+    })
+    await mkdir(sabotaged.paths.codex.directory, { recursive: true })
+    await writeFile(sabotaged.paths.codex.config.path, 'model = "backup"\n')
+    await writeFile(sabotaged.paths.codex.auth.path, '{"OPENAI_API_KEY":"backup"}\n')
+    const backup = await sabotaged.createBackupSet('codex')
+    await writeFile(sabotaged.paths.codex.config.path, 'model = "before-restore"\n')
+    await writeFile(sabotaged.paths.codex.auth.path, '{"OPENAI_API_KEY":"before-restore"}\n')
+
+    await expect(sabotaged.restoreBackupSet('codex', backup.groupId)).rejects.toBeDefined()
+
+    expect(await readFile(sabotaged.paths.codex.config.path, 'utf8')).toBe('model = "before-restore"\n')
+    const safetyGroups = (await sabotaged.listBackups('codex'))
+      .filter((record) => record.groupId !== backup.groupId)
+    expect(safetyGroups).toHaveLength(2)
+    expect(new Set(safetyGroups.map((record) => record.groupId)).size).toBe(1)
   })
 
   it.skipIf(process.platform === 'win32')('uses private POSIX modes for credential files, temporary replacements, and backups', async () => {

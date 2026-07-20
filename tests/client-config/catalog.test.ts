@@ -27,7 +27,7 @@ describe('client configuration field catalog', () => {
       }, null, 2) + '\n',
     }
 
-    expect(valuesFor('claude', existing)).toEqual({
+    expect(valuesFor('claude', existing)).toMatchObject({
       'claude.model': 'claude-existing',
       'claude.effort': 'medium',
       'claude.permissionMode': 'plan',
@@ -67,13 +67,15 @@ describe('client configuration field catalog', () => {
       ].join('\n'),
     }
 
-    expect(valuesFor('codex', existing)).toEqual({
+    expect(valuesFor('codex', existing)).toMatchObject({
       'codex.model': 'gpt-existing',
       'codex.reasoningEffort': 'high',
       'codex.approvalPolicy': 'on-request',
       'codex.sandboxMode': 'workspace-write',
       'codex.webSearch': 'live',
       'codex.personality': 'friendly',
+      'codex.discovered.future_option': 'keep',
+      'codex.discovered.features/parallel': true,
     })
 
     const patched = applyClientConfigFieldPatches('codex', existing, [
@@ -105,20 +107,19 @@ describe('client configuration field catalog', () => {
       }, null, 2) + '\n',
     }
 
-    expect(valuesFor('gemini', existing)).toEqual({
+    expect(valuesFor('gemini', existing)).toMatchObject({
       'gemini.model': 'gemini-existing',
       'gemini.approvalMode': 'plan',
       'gemini.allowedTools': ['read_file'],
       'gemini.excludedTools': ['shell'],
       'gemini.theme': 'Dracula',
-      'gemini.writeTodos': true,
     })
 
     const patched = applyClientConfigFieldPatches('gemini', existing, [
       { id: 'gemini.model', value: 'gemini-updated' },
       { id: 'gemini.allowedTools', value: [' read_file ', 'write_file'] },
       { id: 'gemini.excludedTools', value: null },
-      { id: 'gemini.writeTodos', value: false },
+      { id: 'gemini.usageStatistics', value: false },
     ])
     const result = JSON.parse(patched['gemini-settings']!)
 
@@ -126,7 +127,8 @@ describe('client configuration field catalog', () => {
     expect(result.tools.allowed).toEqual(['read_file', 'write_file'])
     expect(result.tools).not.toHaveProperty('exclude')
     expect(result.tools.futureOption).toEqual(['keep'])
-    expect(result.useWriteTodos).toBe(false)
+    expect(result.useWriteTodos).toBe(true)
+    expect(result.privacy.usageStatisticsEnabled).toBe(false)
     expect(result.unknownTopLevel).toEqual({ keep: 42 })
   })
 
@@ -145,7 +147,7 @@ describe('client configuration field catalog', () => {
     ])).toThrow('option is invalid')
 
     expect(() => applyClientConfigFieldPatches('gemini', {}, [
-      { id: 'gemini.writeTodos', value: 'yes' },
+      { id: 'gemini.usageStatistics', value: 'yes' },
     ])).toThrow('must be true or false')
 
     expect(() => applyClientConfigFieldPatches('claude', {}, [
@@ -157,5 +159,74 @@ describe('client configuration field catalog', () => {
     }, [
       { id: 'gemini.model', value: 'gemini-updated' },
     ])).toThrow(ClientConfigParseError)
+  })
+
+  it('returns explanatory metadata and patches nested TOML and numeric fields without reformatting neighbors', () => {
+    const existing = {
+      'codex-config': [
+        'model = "gpt-existing" # keep model comment',
+        '',
+        '[features]',
+        'multi_agent = false # keep feature comment',
+        'future_flag = true',
+        '',
+        '[windows]',
+        'sandbox = "unelevated"',
+        '',
+      ].join('\n'),
+    }
+    const editorFields = clientConfigEditorFields('codex', existing)
+    const model = editorFields.find((field) => field.id === 'codex.model')!
+    const discovered = editorFields.find((field) => field.id === 'codex.discovered.features/future_flag')!
+
+    expect(model).toMatchObject({
+      role: 'codex-config',
+      path: ['model'],
+      section: '模型',
+      source: 'catalog',
+    })
+    expect(model.description).toContain('新会话')
+    expect(discovered).toMatchObject({
+      role: 'codex-config',
+      path: ['features', 'future_flag'],
+      value: true,
+      control: 'toggle',
+      readOnly: true,
+      source: 'discovered',
+    })
+
+    const patched = applyClientConfigFieldPatches('codex', existing, [
+      { id: 'codex.feature.multi_agent', value: true },
+      { id: 'codex.windowsSandbox', value: 'elevated' },
+      { id: 'codex.agentsMaxThreads', value: 8 },
+    ])['codex-config']!
+    expect(parseCodexToml(patched)).toMatchObject({
+      features: { multi_agent: true, future_flag: true },
+      windows: { sandbox: 'elevated' },
+      agents: { max_threads: 8 },
+    })
+    expect(patched).toContain('model = "gpt-existing" # keep model comment')
+    expect(patched).toContain('multi_agent = true # keep feature comment')
+  })
+
+  it('masks sensitive discovered TOML values and rejects read-only or out-of-range patches', () => {
+    const editorFields = clientConfigEditorFields('codex', {
+      'codex-config': [
+        '[model_providers.private]',
+        'name = "Private"',
+        'experimental_bearer_token = "do-not-expose"',
+        '',
+      ].join('\n'),
+    })
+    const token = editorFields.find((field) => field.path.join('.') === 'model_providers.private.experimental_bearer_token')!
+    expect(token).toMatchObject({ value: null, sensitive: true, readOnly: true })
+    expect(JSON.stringify(editorFields)).not.toContain('do-not-expose')
+
+    expect(() => applyClientConfigFieldPatches('codex', {}, [
+      { id: 'codex.modelProvider', value: 'other' },
+    ])).toThrow('read-only')
+    expect(() => applyClientConfigFieldPatches('gemini', {}, [
+      { id: 'gemini.maxAttempts', value: 11 },
+    ])).toThrow('above its maximum')
   })
 })

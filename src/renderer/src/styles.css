@@ -367,11 +367,15 @@ html.is-electron .sidebar__brand .brand-mark {
 }
 
 .sidebar__footer {
+  display: grid;
   flex: 0 0 auto;
+  gap: 4px;
   padding: 11px;
   border-top: 1px solid var(--border);
   background: var(--app-chrome);
 }
+
+.sidebar-help { height: 38px; }
 
 .sidebar-collapse {
   display: flex;
@@ -636,14 +640,14 @@ html.is-electron .workspace > .topbar {
   width: min(100%, 1500px);
   min-height: 100%;
   flex-direction: column;
-  gap: 20px;
+  gap: 13px;
   margin: 0 auto;
-  padding: 26px 30px 44px;
+  padding: 20px 30px 36px;
 }
 
 .page-header {
   display: flex;
-  min-height: 42px;
+  min-height: 28px;
   align-items: flex-start;
   justify-content: space-between;
   gap: 20px;
@@ -653,13 +657,6 @@ html.is-electron .workspace > .topbar {
   font-size: 22px;
   font-weight: 700;
   line-height: 28px;
-}
-
-.page-header p {
-  margin-top: 3px;
-  color: var(--muted);
-  font-size: 13px;
-  line-height: 19px;
 }
 
 .page-header__actions {
@@ -869,7 +866,7 @@ html.is-electron .workspace > .topbar {
 
 .panel {
   min-width: 0;
-  padding: 19px;
+  padding: 15px 17px;
 }
 
 .panel--flush {
@@ -989,7 +986,7 @@ html.is-electron .workspace > .topbar {
   align-items: flex-start;
   justify-content: space-between;
   gap: 16px;
-  margin-bottom: 17px;
+  margin-bottom: 12px;
 }
 
 .panel__header h2,
@@ -1203,6 +1200,88 @@ html.is-electron .workspace > .topbar {
 .token-cost-help:focus-visible::after {
   opacity: 1;
   transform: translateY(0);
+}
+
+.info-tip {
+  position: relative;
+  z-index: auto;
+  display: inline-flex;
+  width: 15px;
+  height: 15px;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  margin-left: 4px;
+  border-radius: 50%;
+  color: var(--faint);
+  cursor: help;
+  vertical-align: -2px;
+}
+
+.info-tip:hover,
+.info-tip:focus-visible {
+  z-index: 100;
+  color: var(--accent);
+  outline: none;
+}
+
+.info-tip::after {
+  position: absolute;
+  z-index: 1;
+  top: calc(100% + 7px);
+  left: 0;
+  width: 240px;
+  padding: 8px 9px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  background: #17221e;
+  box-shadow: var(--shadow-md);
+  color: #f4f8f6;
+  content: attr(data-tooltip);
+  font-size: 10px;
+  font-weight: 450;
+  line-height: 1.5;
+  opacity: 0;
+  pointer-events: none;
+  text-align: left;
+  transform: translateY(-3px);
+  transition: opacity 120ms ease, transform 120ms ease;
+  white-space: normal;
+}
+
+.info-tip:hover::after,
+.info-tip:focus-visible::after {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+/* FAST help sits at the right edge of pool cards. Open its tooltip inward so
+   the hidden tooltip never widens the page's scrollable area. */
+.pool-card__fast .info-tip::after {
+  right: 0;
+  left: auto;
+}
+
+.field-label-with-help,
+.setting-row strong,
+.inline-settings strong,
+.strategy-options strong,
+.model-policy__modes strong,
+.aggregate-strategy-grid strong,
+.pool-card__fast-label strong {
+  display: inline-flex;
+  align-items: center;
+}
+
+.field-label-with-help .info-tip,
+.setting-row .info-tip,
+.inline-settings .info-tip,
+.strategy-options .info-tip,
+.model-policy__modes .info-tip,
+.aggregate-strategy-grid .info-tip,
+.pool-card__fast-label .info-tip {
+  color: var(--faint);
+  font-size: inherit;
 }
 
 .token-cost-card__total {
@@ -1523,6 +1602,16 @@ html.is-electron .workspace > .topbar {
   font-size: 14px;
 }
 
+.provider-avatar--brand {
+  background: transparent;
+}
+
+.provider-avatar--brand img {
+  width: 27px;
+  height: 27px;
+  object-fit: contain;
+}
+
 .table-wrap {
   width: 100%;
   min-width: 0;
@@ -1677,11 +1766,11 @@ html.is-electron .workspace > .topbar {
 
 .empty-state {
   display: flex;
-  min-height: 260px;
+  min-height: 200px;
   align-items: center;
   justify-content: center;
   flex-direction: column;
-  padding: 38px 20px;
+  padding: 28px 20px;
   text-align: center;
 }
 
@@ -1697,9 +1786,11 @@ html.is-electron .workspace > .topbar {
 }
 
 .empty-state h3 {
-  margin-top: 12px;
+  margin-top: 10px;
   font-size: 14px;
 }
+
+.empty-state h3 + .button { margin-top: 14px; }
 
 .empty-state p {
   max-width: 360px;
@@ -1746,7 +1837,7 @@ html.is-electron .workspace > .topbar {
 }
 
 .source-type-tabs {
-  height: 42px;
+  height: 38px;
   gap: 2px;
   padding: 4px;
   border-color: #c8d9d3;
@@ -1758,7 +1849,7 @@ html.is-electron .workspace > .topbar {
 .source-type-tabs button {
   position: relative;
   min-width: 92px;
-  height: 32px;
+  height: 28px;
   justify-content: center;
   padding: 0 13px;
   border-radius: 6px;
@@ -2088,7 +2179,7 @@ html.is-electron .workspace > .topbar {
   align-items: flex-start;
   justify-content: space-between;
   gap: 16px;
-  padding: 18px 20px 14px;
+  padding: 14px 16px 12px;
   border-bottom: 1px solid var(--border);
 }
 
@@ -2105,7 +2196,7 @@ html.is-electron .workspace > .topbar {
 
 .modal__body {
   min-height: 0;
-  padding: 19px 20px;
+  padding: 15px 16px;
   overflow-y: auto;
 }
 
@@ -2115,7 +2206,7 @@ html.is-electron .workspace > .topbar {
   flex-wrap: wrap;
   justify-content: flex-end;
   gap: 8px;
-  padding: 12px 20px;
+  padding: 10px 16px;
   border-top: 1px solid var(--border);
   background: var(--surface-subtle);
 }
@@ -2123,7 +2214,7 @@ html.is-electron .workspace > .topbar {
 .form-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 15px;
+  gap: 12px;
 }
 
 .field {
@@ -2720,7 +2811,7 @@ html.is-electron .workspace > .topbar {
 }
 
 .pool-card--relay-source .pool-card__header > .badge { flex: 0 0 auto; }
-.pool-card--relay-source .pool-card__footer .text-button { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
+.pool-card--relay-source .pool-card__footer .text-button { display: inline-flex; align-items: center; gap: 4px; margin-left: auto; white-space: nowrap; }
 
 .pool-members {
   padding: 14px 16px 5px;
@@ -3287,6 +3378,16 @@ html.is-electron .workspace > .topbar {
   font-size: 13px;
 }
 
+.route-client-brand {
+  background: transparent;
+}
+
+.route-client-brand img {
+  width: 26px;
+  height: 26px;
+  object-fit: contain;
+}
+
 .route-editor__state {
   display: flex;
   align-items: center;
@@ -3469,7 +3570,7 @@ html.is-electron .workspace > .topbar {
 
 .request-stats {
   display: flex;
-  min-height: 52px;
+  min-height: 46px;
   align-items: center;
   overflow-x: auto;
   border: 1px solid var(--border);
@@ -3496,11 +3597,11 @@ html.is-electron .workspace > .topbar {
 
 .table-toolbar {
   display: flex;
-  min-height: 54px;
+  min-height: 48px;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding: 9px 13px;
+  padding: 6px 12px;
   border-bottom: 1px solid var(--border);
 }
 
@@ -4276,6 +4377,48 @@ body.account-column-resizing {
   cursor: pointer;
 }
 
+.request-table tbody .request-row--live td {
+  background: #fbfefd;
+}
+
+.request-table tbody .request-row--live td:first-child {
+  box-shadow: inset 2px 0 0 rgb(23 107 82 / 50%);
+}
+
+.request-live-status {
+  display: inline-flex;
+  max-width: 100%;
+  align-items: center;
+  gap: 6px;
+  color: #25658a;
+  font-size: 9px;
+  font-weight: 650;
+  white-space: nowrap;
+}
+
+.request-live-status i {
+  width: 6px;
+  height: 6px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: #3288b8;
+  box-shadow: 0 0 0 0 rgb(50 136 184 / 28%);
+  animation: request-live-pulse 1.4s ease-out infinite;
+}
+
+.request-live-duration,
+.request-live-bytes {
+  color: var(--accent-strong);
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-weight: 650;
+}
+
+@keyframes request-live-pulse {
+  70% { box-shadow: 0 0 0 5px rgb(50 136 184 / 0%); }
+  100% { box-shadow: 0 0 0 0 rgb(50 136 184 / 0%); }
+}
+
 .request-table tbody tr:focus-visible td {
   background: var(--accent-soft);
 }
@@ -4380,7 +4523,7 @@ body.account-column-resizing {
 
 .settings-section {
   display: grid;
-  grid-template-columns: 220px minmax(0, 1fr);
+  grid-template-columns: 190px minmax(0, 1fr);
   padding: 0;
   overflow: hidden;
 }
@@ -4389,15 +4532,15 @@ body.account-column-resizing {
   display: flex;
   align-items: flex-start;
   gap: 10px;
-  padding: 18px;
+  padding: 14px;
   border-right: 1px solid var(--border);
   background: var(--surface-subtle);
 }
 
 .settings-section__icon {
   display: inline-flex;
-  width: 32px;
-  height: 32px;
+  width: 28px;
+  height: 28px;
   flex: 0 0 auto;
   align-items: center;
   justify-content: center;
@@ -4418,12 +4561,12 @@ body.account-column-resizing {
 
 .settings-section__content {
   min-width: 0;
-  padding: 18px 20px;
+  padding: 12px 16px;
 }
 
 .settings-fields {
-  margin-bottom: 8px;
-  padding-bottom: 18px;
+  margin-bottom: 4px;
+  padding-bottom: 12px;
   border-bottom: 1px solid var(--border);
 }
 
@@ -4475,7 +4618,7 @@ body.account-column-resizing {
 }
 
 .setting-row {
-  min-height: 52px;
+  min-height: 40px;
 }
 
 .danger-notice {
@@ -4484,7 +4627,7 @@ body.account-column-resizing {
 
 .log-summary {
   display: flex;
-  min-height: 42px;
+  min-height: 36px;
   align-items: center;
   gap: 8px;
   margin-top: 5px;
@@ -5142,6 +5285,9 @@ html.is-electron .boot-screen { background: var(--app-chrome); }
 .quota-summary__value { display: flex; align-items: baseline; gap: 5px; margin: 12px 0 9px; }
 .quota-summary__value strong { font-size: 27px; font-weight: 690; }
 .quota-summary__value span { color: var(--muted); font-size: 9px; }
+.quota-summary__value b { display: inline-flex; margin-left: auto; align-items: baseline; gap: 5px; color: var(--accent); font-family: var(--font-mono); font-size: 16px; font-weight: 760; }
+.quota-summary__value b span { color: inherit; font: inherit; }
+.quota-summary__value b i { color: var(--muted); font-size: 12px; font-style: normal; font-weight: 540; }
 .quota-summary__track { position: relative; height: 7px; overflow: hidden; border-radius: 4px; background: var(--surface-muted); }
 .quota-summary__track > span { position: absolute; inset: 0 auto 0 0; border-radius: inherit; background: var(--accent); }
 .quota-summary:nth-child(2) .quota-summary__track > span { background: var(--violet); }
@@ -5722,7 +5868,7 @@ html.is-electron .boot-screen { background: var(--app-chrome); }
   .sidebar-collapse { display: none; }
 
   .topbar { padding: 0 15px; }
-  .page-stack { padding: 22px 18px 38px; }
+  .page-stack { padding: 18px 18px 32px; }
   .error-banner { margin-right: 18px; margin-left: 18px; }
   .update-banner { grid-template-columns: auto minmax(0, 1fr); margin-right: 18px; margin-left: 18px; }
   .update-banner__actions { grid-column: 1 / -1; justify-content: flex-start; }
@@ -5781,7 +5927,8 @@ html.is-electron .boot-screen { background: var(--app-chrome); }
   .account-file-import { grid-template-columns: auto minmax(0, 1fr); }
   .account-file-import .button { grid-column: 1 / -1; justify-content: center; }
   .oauth-account-flow__intro { grid-template-columns: 40px minmax(0, 1fr); padding: 14px; }
-  .oauth-account-flow__intro > .spin { grid-column: 2; }
+  .oauth-account-flow__intro > .button,
+  .oauth-account-flow__intro > .spin { grid-column: 2; justify-self: start; }
   .oauth-account-flow__hero,
   .oauth-result-icon { width: 40px; height: 40px; }
   .oauth-account-flow__status-heading { align-items: flex-start; flex-direction: column; }
@@ -5833,7 +5980,7 @@ html.is-electron .boot-screen { background: var(--app-chrome); }
   .filter-group { display: grid; grid-template-columns: auto 1fr 1fr; }
   .filter-group select { width: 100%; min-width: 0; }
   .request-stats > div { min-width: 125px; }
-  .settings-section__content { padding: 15px; }
+  .settings-section__content { padding: 12px; }
   .about-line { flex-wrap: wrap; }
   .client-config-card__meta { align-items: flex-start; flex-direction: column; }
   .client-config-card__footer { flex-wrap: wrap; justify-content: flex-start; }

@@ -31,7 +31,33 @@ import { hasRouteSourceIdCollision, isAvailableRouteAccount, resolveRouteSource 
 import { buildPoolModelCoverage, pruneModelSelection } from './model-policy'
 
 const STORAGE_KEY = 'stone.browser-mock.v2'
+const UI_LANGUAGE_STORAGE_KEY = 'stone.ui.language'
 const now = Date.now()
+
+function mockUsesChinese(): boolean {
+  if (typeof window === 'undefined') return false
+  try {
+    const preference = window.localStorage.getItem(UI_LANGUAGE_STORAGE_KEY)
+    if (preference === 'zh-CN') return true
+    if (preference === 'en') return false
+  } catch {
+    // Fall through to the document or browser locale.
+  }
+  const locale = typeof navigator !== 'undefined'
+    ? navigator.language
+    : typeof document !== 'undefined'
+      ? document.documentElement.lang
+      : ''
+  return /^zh(?:[-_]|$)/i.test(locale)
+}
+
+function mockText(chinese: string, english: string): string {
+  return mockUsesChinese() ? chinese : english
+}
+
+function localizeKnownMockValue(value: string, chinese: string, english: string): string {
+  return value === chinese || value === english ? mockText(chinese, english) : value
+}
 
 const accountTags: AccountTagDefinition[] = [
   { id: 'tag-k12', name: 'K12', createdAt: now, updatedAt: now },
@@ -545,6 +571,100 @@ function summarizeTokenRate(logs: RequestLog[], windowEnd: number, windowMs: num
 }
 
 const clone = <T,>(value: T): T => structuredClone(value)
+
+const mockAccountNames: Record<string, readonly [string, string]> = {
+  'account-anthropic-main': ['Claude 主账号', 'Claude Primary'],
+  'account-anthropic-backup': ['Claude 备用', 'Claude Backup'],
+  'account-openai-main': ['OpenAI 主账号', 'OpenAI Primary'],
+  'account-openai-backup': ['OpenAI 扩展账号', 'OpenAI Additional'],
+  'account-openrouter': ['OpenRouter 日常', 'OpenRouter Daily'],
+  'account-google': ['Gemini 开发', 'Gemini Development'],
+}
+
+const mockPoolNames: Record<string, readonly [string, string]> = {
+  'pool-claude': ['Claude 稳定池', 'Claude Stable Pool'],
+  'pool-codex': ['Codex 主线路', 'Codex Primary Route'],
+  'pool-gemini': ['Gemini 默认池', 'Gemini Default Pool'],
+}
+
+function localizeMockConversationName(value: string | undefined): string | undefined {
+  if (!value) return value
+  const codex = value.match(/^(?:Stone 开发对话|Stone development chat) (.+)$/)
+  if (codex) return `${mockText('Stone 开发对话', 'Stone development chat')} ${codex[1]}`
+  const session = value.match(/^(Claude|Codex|Gemini) (?:会话|session) (.+)$/)
+  if (session) return `${session[1]} ${mockText('会话', 'session')} ${session[2]}`
+  return value
+}
+
+function localizeMockSnapshot(value: AppSnapshot): AppSnapshot {
+  const translated = clone(value)
+  translated.proxies = translated.proxies.map((proxy) => proxy.id === 'proxy-local-socks'
+    ? { ...proxy, name: localizeKnownMockValue(proxy.name, '本地 SOCKS5', 'Local SOCKS5') }
+    : proxy)
+  translated.accounts = translated.accounts.map((account) => {
+    const names = mockAccountNames[account.id]
+    return {
+      ...account,
+      ...(names ? { name: localizeKnownMockValue(account.name, names[0], names[1]) } : {}),
+      lastError: account.lastError
+        ? localizeKnownMockValue(
+          account.lastError,
+          '上游返回 429，等待额度窗口恢复',
+          'Upstream returned 429; waiting for the quota window to recover',
+        )
+        : undefined,
+    }
+  })
+  translated.pools = translated.pools.map((pool) => {
+    const names = mockPoolNames[pool.id]
+    return names ? { ...pool, name: localizeKnownMockValue(pool.name, names[0], names[1]) } : pool
+  })
+  translated.requestLogs = translated.requestLogs.map((log) => {
+    let accountName = log.accountName
+    for (const names of Object.values(mockAccountNames)) {
+      accountName = localizeKnownMockValue(accountName, names[0], names[1])
+    }
+    return {
+      ...log,
+      accountName,
+      conversationName: localizeMockConversationName(log.conversationName),
+      error: log.error
+        ? localizeKnownMockValue(
+          localizeKnownMockValue(log.error, '上游请求频率受限', 'Upstream rate limit exceeded'),
+          '上游连接超时',
+          'Upstream connection timed out',
+        )
+        : undefined,
+    }
+  })
+  translated.clientProfiles = translated.clientProfiles.map((profile) => profile.id.startsWith('default-')
+    ? { ...profile, name: localizeKnownMockValue(profile.name, '默认配置', 'Default Profile') }
+    : profile)
+  translated.vaultBackend = localizeKnownMockValue(
+    translated.vaultBackend,
+    '系统凭据保险库',
+    'System credential vault',
+  )
+  return translated
+}
+
+function localizeMockImportProgress(message: string): string {
+  if (mockUsesChinese() || !/[\u3400-\u9fff]/u.test(message)) return message
+  const replacements: Array<[RegExp, string | ((match: RegExpMatchArray) => string)]> = [
+    [/^正在解析并导入账号…?$/, 'Parsing and importing accounts…'],
+    [/^已导入\s*(\d+)\s*个账号$/, (match) => `Imported ${match[1]} account(s)`],
+    [/^正在刷新状态与查询模型\s*(\d+)\/(\d+)$/, (match) => `Refreshing status and models ${match[1]}/${match[2]}`],
+    [/^正在整理 Tag 与号池成员…?$/, 'Organizing Tags and pool members…'],
+    [/^导入、状态刷新与模型查询已完成$/, 'Import, status refresh, and model lookup complete'],
+    [/^正在导入文件\s*(\d+)\/(\d+)$/, (match) => `Importing files ${match[1]}/${match[2]}`],
+  ]
+  for (const [pattern, replacement] of replacements) {
+    const match = message.match(pattern)
+    if (match) return typeof replacement === 'string' ? replacement : replacement(match)
+  }
+  return 'Processing account import…'
+}
+
 const makeId = (prefix: string) => `${prefix}-${crypto.randomUUID().slice(0, 8)}`
 const pause = (duration = 140) => new Promise((resolve) => window.setTimeout(resolve, duration))
 
@@ -554,7 +674,7 @@ const mockClientFiles: Record<RouteClient, Array<{ role: ClientConfigFileRole; p
     { role: 'claude-mcp', path: '~/.claude.json', containsCredential: true },
   ],
   codex: [
-    { role: 'codex-config', path: '~/.codex/config.toml', containsCredential: false },
+    { role: 'codex-config', path: '~/.codex/config.toml', containsCredential: true },
     { role: 'codex-auth', path: '~/.codex/auth.json', containsCredential: true },
   ],
   gemini: [
@@ -568,29 +688,33 @@ const mockEditorContent: Record<RouteClient, Partial<Record<ClientConfigFileRole
     'claude-settings': '{\n  "model": "claude-sonnet-4-5",\n  "effortLevel": "high",\n  "permissions": {\n    "defaultMode": "default",\n    "allow": ["Read", "Grep"]\n  },\n  "env": {\n    "ANTHROPIC_AUTH_TOKEN": "__STONE_PROTECTED_VALUE__"\n  }\n}\n',
     'claude-mcp': '{\n  "mcpServers": {\n    "filesystem": {\n      "command": "npx",\n      "args": ["-y", "@modelcontextprotocol/server-filesystem"]\n    }\n  }\n}\n',
   },
-  codex: { 'codex-config': 'model = "gpt-5.4"\nmodel_reasoning_effort = "high"\napproval_policy = "on-request"\nsandbox_mode = "workspace-write"\n' },
+  codex: { 'codex-config': 'model_provider = "stone"\nmodel = "gpt-5.6-sol"\nmodel_reasoning_effort = "medium"\nmodel_reasoning_summary = "auto"\nmodel_verbosity = "medium"\npersonality = "pragmatic"\napproval_policy = "on-request"\nsandbox_mode = "workspace-write"\nweb_search = "cached"\ncli_auth_credentials_store = "file"\n\n[features]\nfast_mode = true\nmulti_agent = true\n\n[windows]\nsandbox = "elevated"\n\n[model_providers.stone]\nname = "OpenAI"\nbase_url = "http://127.0.0.1:15720/v1"\nwire_api = "responses"\nrequires_openai_auth = true\n' },
   gemini: { 'gemini-settings': '{\n  "model": { "name": "gemini-2.5-pro" },\n  "general": { "defaultApprovalMode": "default" },\n  "ui": { "theme": "Default" }\n}\n', 'gemini-env': 'GEMINI_API_KEY="__STONE_PROTECTED_VALUE__"\nGOOGLE_GEMINI_BASE_URL="__STONE_PROTECTED_VALUE__"\n' },
 }
 
 const mockEditorFields: Record<RouteClient, ClientConfigEditorState['fields']> = {
   claude: [
-    { id: 'claude.model', section: '模型', label: '默认模型', control: 'text', value: 'claude-sonnet-4-5' },
-    { id: 'claude.effort', section: '模型', label: '推理强度', control: 'select', value: 'high', options: [{ value: 'low', label: '低' }, { value: 'medium', label: '中' }, { value: 'high', label: '高' }, { value: 'xhigh', label: '最高' }] },
-    { id: 'claude.permissionMode', section: '权限', label: '默认权限模式', control: 'select', value: 'default', options: [{ value: 'default', label: '默认' }, { value: 'acceptEdits', label: '自动接受编辑' }, { value: 'plan', label: '计划模式' }] },
-    { id: 'claude.permissionsAllow', section: '权限', label: '允许规则', control: 'string-list', value: ['Read', 'Grep'] },
+    { id: 'claude.model', role: 'claude-settings', path: ['model'], section: '模型', label: '默认模型', description: 'Claude Code 新会话默认使用的模型。', control: 'text', value: 'claude-sonnet-4-5', defaultValue: null },
+    { id: 'claude.effort', role: 'claude-settings', path: ['effortLevel'], section: '模型', label: '推理强度', description: '控制速度与思考深度之间的取舍。', control: 'select', value: 'high', recommendedValue: 'medium', options: [{ value: 'low', label: '低' }, { value: 'medium', label: '中', recommended: true }, { value: 'high', label: '高' }, { value: 'xhigh', label: '最高' }] },
+    { id: 'claude.permissionMode', role: 'claude-settings', path: ['permissions', 'defaultMode'], section: '权限', label: '默认权限模式', description: '决定 Claude Code 在执行工具前如何确认。', control: 'select', value: 'default', recommendedValue: 'default', options: [{ value: 'default', label: '默认', recommended: true }, { value: 'acceptEdits', label: '自动接受编辑' }, { value: 'plan', label: '计划模式' }] },
+    { id: 'claude.permissionsAllow', role: 'claude-settings', path: ['permissions', 'allow'], section: '权限', label: '允许规则', description: '无需确认即可执行的工具规则，每行一项。', control: 'string-list', value: ['Read', 'Grep'], advanced: true },
   ],
   codex: [
-    { id: 'codex.model', section: '模型', label: '默认模型', control: 'text', value: 'gpt-5.4' },
-    { id: 'codex.reasoningEffort', section: '模型', label: '推理强度', control: 'select', value: 'high', options: [{ value: 'low', label: '低' }, { value: 'medium', label: '中' }, { value: 'high', label: '高' }, { value: 'xhigh', label: '最高' }] },
-    { id: 'codex.approvalPolicy', section: '权限', label: '审批策略', control: 'select', value: 'on-request', options: [{ value: 'untrusted', label: '仅可信命令免确认' }, { value: 'on-request', label: '按需确认' }, { value: 'never', label: '从不确认' }] },
-    { id: 'codex.sandboxMode', section: '权限', label: '沙箱模式', control: 'select', value: 'workspace-write', options: [{ value: 'read-only', label: '只读' }, { value: 'workspace-write', label: '工作区可写' }, { value: 'danger-full-access', label: '完全访问' }] },
+    { id: 'codex.model', role: 'codex-config', path: ['model'], section: '模型', label: '默认模型', description: 'Codex 启动新会话时使用的模型。', control: 'text', value: 'gpt-5.6-sol', defaultValue: null },
+    { id: 'codex.reasoningEffort', role: 'codex-config', path: ['model_reasoning_effort'], section: '推理与输出', label: '推理强度', description: '控制速度、用量与思考深度之间的取舍。', control: 'select', value: 'medium', recommendedValue: 'medium', options: [{ value: 'minimal', label: '最小' }, { value: 'low', label: '低' }, { value: 'medium', label: '中', recommended: true }, { value: 'high', label: '高' }, { value: 'xhigh', label: '超高' }] },
+    { id: 'codex.approvalPolicy', role: 'codex-config', path: ['approval_policy'], section: '权限与沙箱', label: '审批策略', description: '决定 Codex 在敏感操作前何时请求确认。', control: 'select', value: 'on-request', recommendedValue: 'on-request', options: [{ value: 'untrusted', label: '仅可信命令免确认' }, { value: 'on-request', label: '按需确认', recommended: true }, { value: 'never', label: '从不确认' }] },
+    { id: 'codex.sandboxMode', role: 'codex-config', path: ['sandbox_mode'], section: '权限与沙箱', label: '沙箱模式', description: '限制工具可读取、写入和访问网络的范围。', control: 'select', value: 'workspace-write', recommendedValue: 'workspace-write', options: [{ value: 'read-only', label: '只读' }, { value: 'workspace-write', label: '工作区可写', recommended: true }, { value: 'danger-full-access', label: '完全访问' }] },
+    { id: 'codex.webSearch', role: 'codex-config', path: ['web_search'], section: '工具与联网', label: '网页搜索', description: '控制网页搜索使用缓存索引还是实时网络。', control: 'select', value: 'cached', recommendedValue: 'cached', options: [{ value: 'disabled', label: '关闭' }, { value: 'cached', label: '缓存索引', recommended: true }, { value: 'indexed', label: '受控联网' }, { value: 'live', label: '实时联网' }] },
+    { id: 'codex.feature.multi_agent', role: 'codex-config', path: ['features', 'multi_agent'], section: '功能开关', label: '多代理协作', description: '启用子代理协作工具。', control: 'toggle', value: true, recommendedValue: true, advanced: true },
+    { id: 'codex.windowsSandbox', role: 'codex-config', path: ['windows', 'sandbox'], section: '权限与沙箱', label: 'Windows 原生沙箱', description: '选择原生 Windows 沙箱实现。', control: 'select', value: 'elevated', recommendedValue: 'elevated', advanced: true, options: [{ value: 'elevated', label: '增强隔离', recommended: true }, { value: 'unelevated', label: '普通隔离' }] },
+    { id: 'codex.discovered.model_providers/stone/base_url', role: 'codex-config', path: ['model_providers', 'stone', 'base_url'], section: '模型供应商（扩展）', label: 'base_url', description: 'Stone+ 本地网关地址；应用路由时自动维护。', control: 'text', value: 'http://127.0.0.1:15720/v1', readOnly: true, managedByStone: true, advanced: true, source: 'discovered' },
   ],
   gemini: [
-    { id: 'gemini.model', section: '模型', label: '默认模型', control: 'text', value: 'gemini-2.5-pro' },
-    { id: 'gemini.approvalMode', section: '权限', label: '默认审批模式', control: 'select', value: 'default', options: [{ value: 'default', label: '默认' }, { value: 'auto_edit', label: '自动编辑' }, { value: 'plan', label: '计划模式' }] },
-    { id: 'gemini.allowedTools', section: '工具', label: '允许工具', control: 'string-list', value: [] },
-    { id: 'gemini.theme', section: '体验', label: '界面主题', control: 'text', value: 'Default' },
-    { id: 'gemini.writeTodos', section: '体验', label: '任务清单工具', control: 'toggle', value: true },
+    { id: 'gemini.model', role: 'gemini-settings', path: ['model', 'name'], section: '模型与会话', label: '默认模型', description: 'Gemini CLI 新会话默认使用的模型。', control: 'text', value: 'gemini-2.5-pro', defaultValue: null },
+    { id: 'gemini.approvalMode', role: 'gemini-settings', path: ['general', 'defaultApprovalMode'], section: '权限', label: '默认审批模式', description: '决定工具调用和文件编辑需要何种确认。', control: 'select', value: 'default', recommendedValue: 'default', options: [{ value: 'default', label: '默认', recommended: true }, { value: 'auto_edit', label: '自动编辑' }, { value: 'plan', label: '计划模式' }] },
+    { id: 'gemini.allowedTools', role: 'gemini-settings', path: ['tools', 'allowed'], section: '工具', label: '允许工具', description: '无需额外限制即可使用的工具名称。', control: 'string-list', value: [], advanced: true },
+    { id: 'gemini.theme', role: 'gemini-settings', path: ['ui', 'theme'], section: '体验', label: '界面主题', description: 'Gemini CLI 终端界面的主题名称。', control: 'text', value: 'Default' },
+    { id: 'gemini.enableAutoUpdate', role: 'gemini-settings', path: ['general', 'enableAutoUpdate'], section: '更新与通知', label: '自动更新', description: '允许 Gemini CLI 自动检查并安装更新。', control: 'toggle', value: true, advanced: true },
   ],
 }
 
@@ -704,7 +828,7 @@ export function createMockApi(): GatewayApi {
     if (!poolId) return { added: 0, existing: 0 }
     const pool = snapshot.pools.find((candidate) => candidate.id === poolId)
     if (!pool || pool.kind !== 'standard' || pool.protocol !== 'openai-responses') {
-      throw new Error('导入账号只能加入标准 OpenAI Responses 号池')
+      throw new Error(mockText('导入账号只能加入标准 OpenAI Responses 号池', 'Imported accounts can only be added to a standard OpenAI Responses pool'))
     }
     if (pool.members.some((member) => member.accountId === accountId)) return { added: 0, existing: 1 }
     pool.members.push({ accountId, enabled: true })
@@ -724,14 +848,14 @@ export function createMockApi(): GatewayApi {
 
   const publish = () => {
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(snapshot))
-    const value = clone(snapshot)
+    const value = localizeMockSnapshot(snapshot)
     listeners.forEach((listener) => listener(value))
     return value
   }
 
   const emitImportProgress = (progressId: string | undefined, progress: Omit<AccountImportProgress, 'progressId'>) => {
     if (!progressId) return
-    const value = { progressId, ...progress }
+    const value = { progressId, ...progress, message: localizeMockImportProgress(progress.message) }
     for (const listener of accountImportProgressListeners) listener(value)
   }
 
@@ -752,9 +876,10 @@ export function createMockApi(): GatewayApi {
   }
 
   return {
+    async setUiLanguage() {},
     async getSnapshot() {
       await pause(280)
-      return clone(snapshot)
+      return localizeMockSnapshot(snapshot)
     },
     async saveProvider(input: ProviderInput) {
       const timestamp = Date.now()
@@ -773,12 +898,12 @@ export function createMockApi(): GatewayApi {
       return changed()
     },
     async refreshProviderModels(id: string) {
-      if (!snapshot.providers.some((provider) => provider.id === id)) throw new Error('供应商不存在')
+      if (!snapshot.providers.some((provider) => provider.id === id)) throw new Error(mockText('供应商不存在', 'Provider not found'))
       return changed()
     },
     async deleteProvider(id: string) {
       if (snapshot.accounts.some((account) => account.providerId === id)) {
-        throw new Error('请先删除该供应商下的账号')
+        throw new Error(mockText('请先删除该供应商下的账号', 'Delete the accounts under this provider first'))
       }
       snapshot.providers = snapshot.providers.filter((provider) => provider.id !== id)
       return changed()
@@ -830,13 +955,13 @@ export function createMockApi(): GatewayApi {
     },
     async saveAccountTag(input) {
       const name = input.name.trim()
-      if (!name) throw new Error('请输入标签名称')
-      if (name.length > 24) throw new Error('标签名称不能超过 24 个字符')
+      if (!name) throw new Error(mockText('请输入标签名称', 'Enter a tag name'))
+      if (name.length > 24) throw new Error(mockText('标签名称不能超过 24 个字符', 'Tag names cannot exceed 24 characters'))
       const existing = input.id ? snapshot.accountTags.find((tag) => tag.id === input.id) : undefined
-      if (input.id && !existing) throw new Error('标签不存在')
-      if (!existing && snapshot.accountTags.length >= 50) throw new Error('最多创建 50 个标签')
+      if (input.id && !existing) throw new Error(mockText('标签不存在', 'Tag not found'))
+      if (!existing && snapshot.accountTags.length >= 50) throw new Error(mockText('最多创建 50 个标签', 'You can create up to 50 tags'))
       if (snapshot.accountTags.some((tag) => tag.id !== existing?.id && tag.name.toLocaleLowerCase() === name.toLocaleLowerCase())) {
-        throw new Error('标签名称已存在')
+        throw new Error(mockText('标签名称已存在', 'That tag name already exists'))
       }
       const timestamp = Date.now()
       const tag = { id: existing?.id ?? makeId('tag'), name, createdAt: existing?.createdAt ?? timestamp, updatedAt: timestamp }
@@ -846,7 +971,7 @@ export function createMockApi(): GatewayApi {
       return changed()
     },
     async deleteAccountTag(id) {
-      if (!snapshot.accountTags.some((tag) => tag.id === id)) throw new Error('标签不存在')
+      if (!snapshot.accountTags.some((tag) => tag.id === id)) throw new Error(mockText('标签不存在', 'Tag not found'))
       snapshot.accountTags = snapshot.accountTags.filter((tag) => tag.id !== id)
       snapshot.accounts = snapshot.accounts.map((account) => account.tagId === id
         ? { ...account, tagId: undefined, updatedAt: Date.now() }
@@ -855,8 +980,8 @@ export function createMockApi(): GatewayApi {
     },
     async setAccountTags(input) {
       const selected = new Set(input.accountIds)
-      if (!selected.size) throw new Error('请至少选择一个账号')
-      if (input.tagId && !snapshot.accountTags.some((tag) => tag.id === input.tagId)) throw new Error('标签不存在')
+      if (!selected.size) throw new Error(mockText('请至少选择一个账号', 'Select at least one account'))
+      if (input.tagId && !snapshot.accountTags.some((tag) => tag.id === input.tagId)) throw new Error(mockText('标签不存在', 'Tag not found'))
       snapshot.accounts = snapshot.accounts.map((account) => selected.has(account.id)
         ? { ...account, tagId: input.tagId || undefined, updatedAt: Date.now() }
         : account)
@@ -864,15 +989,15 @@ export function createMockApi(): GatewayApi {
     },
     async refreshAccountModels(id: string) {
       const account = snapshot.accounts.find((candidate) => candidate.id === id)
-      if (!account) throw new Error('账号不存在')
+      if (!account) throw new Error(mockText('账号不存在', 'Account not found'))
       const provider = snapshot.providers.find((candidate) => candidate.id === account.providerId)
-      if (!provider) throw new Error('账号供应商不存在')
+      if (!provider) throw new Error(mockText('账号供应商不存在', 'The account provider does not exist'))
       const overrides: Record<string, string[]> = {
         'account-openai-main': ['gpt-5.5'],
         'account-openai-backup': ['gpt-5.5', 'gpt-5.5-mini'],
       }
       const availableModels = overrides[id] ?? provider.models
-      if (!availableModels.length) throw new Error('上游返回了空模型列表')
+      if (!availableModels.length) throw new Error(mockText('上游返回了空模型列表', 'The upstream returned an empty model list'))
       snapshot.accounts = snapshot.accounts.map((candidate) => candidate.id === id ? {
         ...candidate,
         availableModels: [...new Set(availableModels)],
@@ -887,8 +1012,8 @@ export function createMockApi(): GatewayApi {
     },
     async testAccountModel(accountId: string, model: string) {
       const account = snapshot.accounts.find((candidate) => candidate.id === accountId)
-      if (!account) throw new Error('账号不存在')
-      if (!model.trim()) throw new Error('模型标识不能为空')
+      if (!account) throw new Error(mockText('账号不存在', 'Account not found'))
+      if (!model.trim()) throw new Error(mockText('模型标识不能为空', 'The model identifier cannot be empty'))
       const startedAt = performance.now()
       await new Promise((resolve) => setTimeout(resolve, 180))
       return {
@@ -908,9 +1033,11 @@ export function createMockApi(): GatewayApi {
           ? undefined
           : parsed.proxy_id ?? parsed.proxyId
       if (selectedProxyId && !snapshot.proxies.some((proxy) => proxy.id === selectedProxyId)) {
-        throw new Error(input.proxyMode === 'proxy' ? '选择的出口代理已被删除，请重新选择后再导入。' : '文件代理不存在。')
+        throw new Error(input.proxyMode === 'proxy'
+          ? mockText('选择的出口代理已被删除，请重新选择后再导入。', 'The selected outbound proxy was deleted. Select another proxy before importing.')
+          : mockText('文件代理不存在。', 'The proxy specified by the file does not exist.'))
       }
-      if (input.tagId && !snapshot.accountTags.some((tag) => tag.id === input.tagId)) throw new Error('标签不存在')
+      if (input.tagId && !snapshot.accountTags.some((tag) => tag.id === input.tagId)) throw new Error(mockText('标签不存在', 'Tag not found'))
       const provider = ensureOAuthProvider()
       const timestamp = Date.now()
       const account: PublicAccount = {
@@ -957,9 +1084,9 @@ export function createMockApi(): GatewayApi {
       await pause(180)
       emitImportProgress(input.progressId, { phase: 'importing', completed: 2, total: 2, percent: 50, message: '正在导入文件 2/2' })
       if (input.proxyMode === 'proxy' && !snapshot.proxies.some((proxy) => proxy.id === input.proxyId)) {
-        throw new Error('选择的出口代理已被删除，请重新选择后再导入。')
+        throw new Error(mockText('选择的出口代理已被删除，请重新选择后再导入。', 'The selected outbound proxy was deleted. Select another proxy before importing.'))
       }
-      if (input.tagId && !snapshot.accountTags.some((tag) => tag.id === input.tagId)) throw new Error('标签不存在')
+      if (input.tagId && !snapshot.accountTags.some((tag) => tag.id === input.tagId)) throw new Error(mockText('标签不存在', 'Tag not found'))
       const provider = ensureOAuthProvider()
       const accountId = makeId('chatgpt-file')
       const timestamp = Date.now()
@@ -982,7 +1109,7 @@ export function createMockApi(): GatewayApi {
       emitImportProgress(input.progressId, { phase: 'refreshing', completed: 1, total: 1, percent: 100, message: '正在刷新状态与查询模型 1/1' })
       emitImportProgress(input.progressId, { phase: 'complete', completed: 1, total: 1, percent: 100, message: '导入、状态刷新与模型查询已完成' })
       return {
-        snapshot: clone(snapshot),
+        snapshot: localizeMockSnapshot(snapshot),
         cancelled: false,
         selectedFiles: 2,
         fileResults: [
@@ -993,7 +1120,10 @@ export function createMockApi(): GatewayApi {
         createdAccountIds: [accountId],
         updatedAccountIds: [],
         detectionResults: [{ accountId, accountName: account.name, ok: true, latencyMs: 820, availableModelCount: 2 }],
-        warnings: ['codex-plus-1.json：已从 JWT user_id 自动补全 1 个 CPA 账号的 account_id。'],
+        warnings: [mockText(
+          'codex-plus-1.json：已从 JWT user_id 自动补全 1 个 CPA 账号的 account_id。',
+          'codex-plus-1.json: Filled in account_id for 1 CPA account from JWT user_id.',
+        )],
         assignmentSummary: {
           tagId: input.tagId,
           tagUpdatedAccountCount: 1,
@@ -1006,9 +1136,9 @@ export function createMockApi(): GatewayApi {
     },
     async startChatGptOAuth(input) {
       if (input.proxyMode === 'proxy' && !snapshot.proxies.some((proxy) => proxy.id === input.proxyId)) {
-        throw new Error('选择的出口代理已被删除，请重新选择后再授权。')
+        throw new Error(mockText('选择的出口代理已被删除，请重新选择后再授权。', 'The selected outbound proxy was deleted. Select another proxy before authorizing.'))
       }
-      if (input.tagId && !snapshot.accountTags.some((tag) => tag.id === input.tagId)) throw new Error('标签不存在')
+      if (input.tagId && !snapshot.accountTags.some((tag) => tag.id === input.tagId)) throw new Error(mockText('标签不存在', 'Tag not found'))
       const sessionId = makeId('oauth')
       const redirectUri = 'http://localhost:1455/auth/callback'
       const expiresAt = Date.now() + 10 * 60_000
@@ -1023,19 +1153,19 @@ export function createMockApi(): GatewayApi {
       }
     },
     async openChatGptOAuth(sessionId) {
-      if (!oauthSessions.has(sessionId)) throw new Error('OAuth 授权会话不存在或已结束。')
+      if (!oauthSessions.has(sessionId)) throw new Error(mockText('OAuth 授权会话不存在或已结束。', 'The OAuth authorization session does not exist or has ended.'))
     },
     async submitChatGptOAuthCallback(input) {
       const session = oauthSessions.get(input.sessionId)
-      if (!session) throw new Error('OAuth 授权会话不存在或已结束。')
-      if (!input.callbackUrl.trim()) throw new Error('请粘贴完整 OAuth 回调地址。')
+      if (!session) throw new Error(mockText('OAuth 授权会话不存在或已结束。', 'The OAuth authorization session does not exist or has ended.'))
+      if (!input.callbackUrl.trim()) throw new Error(mockText('请粘贴完整 OAuth 回调地址。', 'Paste the complete OAuth callback URL.'))
       session.callbackSubmitted = true
     },
     async waitChatGptOAuth(sessionId) {
       const session = oauthSessions.get(sessionId)
-      if (!session) throw new Error('OAuth 授权会话不存在或已结束。')
+      if (!session) throw new Error(mockText('OAuth 授权会话不存在或已结束。', 'The OAuth authorization session does not exist or has ended.'))
       await pause(450)
-      if (oauthSessions.get(sessionId) !== session) throw new Error('OAuth 授权已取消。')
+      if (oauthSessions.get(sessionId) !== session) throw new Error(mockText('OAuth 授权已取消。', 'OAuth authorization was canceled.'))
       session.committing = true
       const tagWasDeleted = Boolean(session.input.tagId
         && !snapshot.accountTags.some((tag) => tag.id === session.input.tagId))
@@ -1054,7 +1184,10 @@ export function createMockApi(): GatewayApi {
       oauthSessions.delete(sessionId)
       return tagWasDeleted ? {
         ...result,
-        warnings: [...result.warnings, 'OAuth 授权期间所选 Tag 已被删除，账号已按“未标记”导入。']
+        warnings: [...result.warnings, mockText(
+          'OAuth 授权期间所选 Tag 已被删除，账号已按“未标记”导入。',
+          'The selected Tag was deleted during OAuth authorization. The account was imported as untagged.',
+        )]
       } : result
     },
     async cancelChatGptOAuth(sessionId) {
@@ -1086,7 +1219,7 @@ export function createMockApi(): GatewayApi {
       return clone(browserJsonCache)
     },
     async saveBrowserJsonCacheItem(id) {
-      if (!browserJsonCache.items.some((item) => item.id === id)) throw new Error('缓存中的 JSON 已不存在。')
+      if (!browserJsonCache.items.some((item) => item.id === id)) throw new Error(mockText('缓存中的 JSON 已不存在。', 'The cached JSON file no longer exists.'))
       return { cancelled: false, filePath: `C:\\Downloads\\${browserJsonCache.items.find((item) => item.id === id)!.fileName}` }
     },
     async removeBrowserJsonCacheItem(id) {
@@ -1101,7 +1234,7 @@ export function createMockApi(): GatewayApi {
       return clone(browserJsonCache)
     },
     async importBrowserJsonQueue(input) {
-      if (!input.itemIds.length) throw new Error('请至少选择一个已挂起的 JSON 文件。')
+      if (!input.itemIds.length) throw new Error(mockText('请至少选择一个已挂起的 JSON 文件。', 'Select at least one queued JSON file.'))
       const selectedFiles = input.itemIds.length
       const result = await this.importChatGptAccountFiles(input)
       browserImportQueue = {
@@ -1165,7 +1298,7 @@ export function createMockApi(): GatewayApi {
     },
     async deleteProxy(id: string) {
       if (snapshot.accounts.some((account) => account.proxyId === id) || snapshot.pools.some((pool) => pool.proxyId === id)) {
-        throw new Error('该代理仍被账号或号池使用')
+        throw new Error(mockText('该代理仍被账号或号池使用', 'This proxy is still used by an account or pool'))
       }
       snapshot.proxies = snapshot.proxies.filter((proxy) => proxy.id !== id)
       return changed()
@@ -1219,32 +1352,32 @@ export function createMockApi(): GatewayApi {
     },
     async deletePool(id: string) {
       if (snapshot.routes.some((route) => route.poolId === id)) {
-        throw new Error('该号池正被客户端路由使用')
+        throw new Error(mockText('该号池正被客户端路由使用', 'This pool is used by a client route'))
       }
       snapshot.pools = snapshot.pools.filter((pool) => pool.id !== id)
       return changed()
     },
     async setRouteSourceFastMode(input) {
       const sourceId = typeof input.sourceId === 'string' ? input.sourceId.trim() : ''
-      if (!sourceId) throw new Error('请选择号池或中转站')
-      if (typeof input.enabled !== 'boolean') throw new Error('FAST 状态无效')
+      if (!sourceId) throw new Error(mockText('请选择号池或中转站', 'Select a pool or relay'))
+      if (typeof input.enabled !== 'boolean') throw new Error(mockText('FAST 状态无效', 'The FAST state is invalid'))
       const pool = snapshot.pools.find((candidate) => candidate.id === sourceId)
       const provider = snapshot.providers.find((candidate) => candidate.id === sourceId)
-      if (pool && provider) throw new Error('来源 ID 与号池 ID 冲突')
+      if (pool && provider) throw new Error(mockText('来源 ID 与号池 ID 冲突', 'The source ID conflicts with a pool ID'))
       if (pool) {
         if (input.enabled && !supportsFastServiceTier(pool.protocol)) {
-          throw new Error('FAST 仅支持 OpenAI Responses 与 OpenAI Chat')
+          throw new Error(mockText('FAST 仅支持 OpenAI Responses 与 OpenAI Chat', 'FAST supports only OpenAI Responses and OpenAI Chat'))
         }
         snapshot.pools = snapshot.pools.map((candidate) => candidate.id === sourceId
           ? { ...candidate, forceFastMode: input.enabled, updatedAt: Date.now() }
           : candidate)
         return changed()
       }
-      if (!provider) throw new Error('号池或中转站不存在')
-      if (provider.sourceType === 'oauth-system') throw new Error('系统 OAuth 来源不能作为独立 FAST 中转站')
-      if (provider.sourceType !== 'relay') throw new Error('FAST 仅能直接配置中转站来源')
+      if (!provider) throw new Error(mockText('号池或中转站不存在', 'The pool or relay does not exist'))
+      if (provider.sourceType === 'oauth-system') throw new Error(mockText('系统 OAuth 来源不能作为独立 FAST 中转站', 'A system OAuth source cannot be used as a standalone FAST relay'))
+      if (provider.sourceType !== 'relay') throw new Error(mockText('FAST 仅能直接配置中转站来源', 'FAST can be configured directly only for relay sources'))
       if (input.enabled && !supportsFastServiceTier(provider.protocol)) {
-        throw new Error('FAST 仅支持 OpenAI Responses 与 OpenAI Chat')
+        throw new Error(mockText('FAST 仅支持 OpenAI Responses 与 OpenAI Chat', 'FAST supports only OpenAI Responses and OpenAI Chat'))
       }
       snapshot.providers = snapshot.providers.map((candidate) => candidate.id === sourceId
         ? { ...candidate, forceFastMode: input.enabled, updatedAt: Date.now() }
@@ -1259,7 +1392,7 @@ export function createMockApi(): GatewayApi {
     },
     async deleteApiSource(id: string) {
       const provider = snapshot.providers.find((candidate) => candidate.id === id)
-      if (!provider || provider.sourceType === 'oauth-system') throw new Error('API 来源不存在')
+      if (!provider || provider.sourceType === 'oauth-system') throw new Error(mockText('API 来源不存在', 'The API source does not exist'))
       const accountIds = new Set(snapshot.accounts.filter((account) => account.providerId === id).map((account) => account.id))
       const deletedPoolIds = new Set<string>()
       snapshot.providers = snapshot.providers.filter((candidate) => candidate.id !== id)
@@ -1315,7 +1448,7 @@ export function createMockApi(): GatewayApi {
       setupWizardState = null
     },
     async completeSetupWizard() {
-      if (!setupWizardState?.verifiedAt) throw new Error('只有端到端真实请求成功后才能完成配置向导。')
+      if (!setupWizardState?.verifiedAt) throw new Error(mockText('只有端到端真实请求成功后才能完成配置向导。', 'The setup wizard can be completed only after a real end-to-end request succeeds.'))
       setupWizardState = { ...setupWizardState, completed: true, step: 'complete', updatedAt: Date.now() }
     },
     async applySetupRouting(input) {
@@ -1323,11 +1456,11 @@ export function createMockApi(): GatewayApi {
         ?? snapshot.pools.find((pool) => pool.members.some((member) => member.accountId === input.sourceId))?.id
         ?? ''
       const routeId = snapshot.routes.find((route) => route.client === input.client)?.id ?? ''
-      return { snapshot: clone(snapshot), poolId, routeId, createdPool: false }
+      return { snapshot: localizeMockSnapshot(snapshot), poolId, routeId, createdPool: false }
     },
     async ensureGatewayRunning() {
       return {
-        snapshot: clone(snapshot),
+        snapshot: localizeMockSnapshot(snapshot),
         host: snapshot.gateway.host,
         port: snapshot.gateway.port,
         changedPort: false,
@@ -1341,14 +1474,33 @@ export function createMockApi(): GatewayApi {
       }
       return { ok: true, latencyMs: 120, status: 200, responsePreview: 'OK' }
     },
+    async setClientRouteSource(input) {
+      if (input.client !== 'claude' && input.client !== 'codex' && input.client !== 'gemini') {
+        throw new Error(mockText('不支持的客户端路由', 'Unsupported client route'))
+      }
+      const sourceId = typeof input.sourceId === 'string' ? input.sourceId.trim() : ''
+      if (!sourceId) throw new Error(mockText('请选择号池、官方 API 或中转站', 'Select a pool, official API, or relay'))
+      if (hasRouteSourceIdCollision(sourceId, snapshot)) throw new Error(mockText('所选来源 ID 与现有号池 ID 冲突', 'The selected source ID conflicts with an existing pool ID'))
+      const source = resolveRouteSource(sourceId, snapshot)
+      if (!source) throw new Error(mockText('所选号池、官方 API 或中转站不存在', 'The selected pool, official API, or relay does not exist'))
+      if (!source.accounts.some(isAvailableRouteAccount)) {
+        throw new Error(mockText('所选来源没有可用账号', 'The selected source has no available accounts'))
+      }
+      const route = snapshot.routes.find((candidate) => candidate.client === input.client)
+      if (!route) throw new Error(mockText('当前客户端路由不存在', 'The current client route does not exist'))
+      snapshot.routes = snapshot.routes.map((candidate) => candidate.id === route.id
+        ? { ...candidate, poolId: sourceId, updatedAt: Date.now() }
+        : candidate)
+      return changed()
+    },
     async updateRoute(route: Route) {
       if (route.enabled && hasRouteSourceIdCollision(route.poolId, snapshot)) {
-        throw new Error('所选源 ID 与号池 ID 冲突')
+        throw new Error(mockText('所选源 ID 与号池 ID 冲突', 'The selected source ID conflicts with a pool ID'))
       }
       const source = resolveRouteSource(route.poolId, snapshot)
-      if (route.enabled && !source) throw new Error('请选择现有号池、官方 API 或中转站')
+      if (route.enabled && !source) throw new Error(mockText('请选择现有号池、官方 API 或中转站', 'Select an existing pool, official API, or relay'))
       if (route.enabled && source?.provider && !source.accounts.some(isAvailableRouteAccount)) {
-        throw new Error('所选 API 来源没有可用账号')
+        throw new Error(mockText('所选 API 来源没有可用账号', 'The selected API source has no available accounts'))
       }
       snapshot.routes = snapshot.routes.map((item) => (item.id === route.id ? { ...route, updatedAt: Date.now() } : item))
       return changed()
@@ -1392,17 +1544,20 @@ export function createMockApi(): GatewayApi {
         finishedAt: Date.now(),
         route: usingProxy
           ? { kind: 'proxy' as const, name: proxy!.name, proxyId: proxy!.id }
-          : { kind: 'direct' as const, name: '直连' },
+          : { kind: 'direct' as const, name: mockText('直连', 'Direct') },
         summary: 'success' as const,
         results: [
-          { id: 'dns-chatgpt', label: 'DNS 解析', target: 'chatgpt.com', kind: 'dns' as const, status: usingProxy ? 'skipped' as const : 'success' as const, latencyMs: usingProxy ? 0 : 18, message: usingProxy ? '代理模式下由代理节点处理域名解析。' : '已解析 2 个地址', addresses: usingProxy ? undefined : ['104.18.32.47', '172.64.155.209'] },
-          { id: 'tls-chatgpt', label: 'TLS 握手', target: 'chatgpt.com:443', kind: 'tls' as const, status: usingProxy ? 'skipped' as const : 'success' as const, latencyMs: usingProxy ? 0 : 96, message: usingProxy ? '代理模式下由代理链路建立目标连接。' : '握手成功 · TLSv1.3' },
-          { id: 'chatgpt-web', label: 'ChatGPT 网站', target: 'chatgpt.com/', kind: 'http' as const, status: 'success' as const, latencyMs: 182, httpStatus: 200, message: '连接成功 · HTTP 200' },
-          { id: 'codex-models', label: 'Codex 模型接口', target: 'chatgpt.com/backend-api/codex/models', kind: 'http' as const, status: 'success' as const, latencyMs: 224, httpStatus: 401, message: '接口可达 · 未携带账号凭据，HTTP 401 属预期响应' },
-          { id: 'codex-usage', label: 'Codex 额度接口', target: 'chatgpt.com/backend-api/wham/usage', kind: 'http' as const, status: 'success' as const, latencyMs: 238, httpStatus: 401, message: '接口可达 · 未携带账号凭据，HTTP 401 属预期响应' },
-          { id: 'openai-auth', label: 'OpenAI OAuth', target: 'auth.openai.com/.well-known/openid-configuration', kind: 'http' as const, status: 'success' as const, latencyMs: 194, httpStatus: 200, message: '连接成功 · HTTP 200' },
+          { id: 'dns-chatgpt', label: mockText('DNS 解析', 'DNS resolution'), target: 'chatgpt.com', kind: 'dns' as const, status: usingProxy ? 'skipped' as const : 'success' as const, latencyMs: usingProxy ? 0 : 18, message: usingProxy ? mockText('代理模式下由代理节点处理域名解析。', 'The proxy resolves domain names in proxy mode.') : mockText('已解析 2 个地址', 'Resolved 2 addresses'), addresses: usingProxy ? undefined : ['104.18.32.47', '172.64.155.209'] },
+          { id: 'tls-chatgpt', label: mockText('TLS 握手', 'TLS handshake'), target: 'chatgpt.com:443', kind: 'tls' as const, status: usingProxy ? 'skipped' as const : 'success' as const, latencyMs: usingProxy ? 0 : 96, message: usingProxy ? mockText('代理模式下由代理链路建立目标连接。', 'The proxy establishes the target connection in proxy mode.') : mockText('握手成功 · TLSv1.3', 'Handshake succeeded · TLSv1.3') },
+          { id: 'chatgpt-web', label: mockText('ChatGPT 网站', 'ChatGPT website'), target: 'chatgpt.com/', kind: 'http' as const, status: 'success' as const, latencyMs: 182, httpStatus: 200, message: mockText('连接成功 · HTTP 200', 'Connected · HTTP 200') },
+          { id: 'codex-models', label: mockText('Codex 模型接口', 'Codex models endpoint'), target: 'chatgpt.com/backend-api/codex/models', kind: 'http' as const, status: 'success' as const, latencyMs: 224, httpStatus: 401, message: mockText('接口可达 · 未携带账号凭据，HTTP 401 属预期响应', 'Endpoint reachable · HTTP 401 is expected without account credentials') },
+          { id: 'codex-usage', label: mockText('Codex 额度接口', 'Codex quota endpoint'), target: 'chatgpt.com/backend-api/wham/usage', kind: 'http' as const, status: 'success' as const, latencyMs: 238, httpStatus: 401, message: mockText('接口可达 · 未携带账号凭据，HTTP 401 属预期响应', 'Endpoint reachable · HTTP 401 is expected without account credentials') },
+          { id: 'openai-auth', label: 'OpenAI OAuth', target: 'auth.openai.com/.well-known/openid-configuration', kind: 'http' as const, status: 'success' as const, latencyMs: 194, httpStatus: 200, message: mockText('连接成功 · HTTP 200', 'Connected · HTTP 200') },
         ],
-        diagnoses: ['基础网络链路正常。若账号请求仍失败，优先检查凭据有效期、账号权限、额度和模型访问资格。']
+        diagnoses: [mockText(
+          '基础网络链路正常。若账号请求仍失败，优先检查凭据有效期、账号权限、额度和模型访问资格。',
+          'The basic network path is healthy. If account requests still fail, check credential expiry, account permissions, quota, and model access first.',
+        )]
       }
     },
     async checkAccount(id: string) {
@@ -1435,7 +1590,7 @@ export function createMockApi(): GatewayApi {
     },
     async getAccountCodexQuotaHistory(id, from, to) {
       const account = snapshot.accounts.find((candidate) => candidate.id === id)
-      if (!account) throw new Error('账号不存在')
+      if (!account) throw new Error(mockText('账号不存在', 'Account not found'))
       const end = to ?? Date.now()
       const start = from ?? end - 14 * 24 * 60 * 60 * 1000
       return Array.from({ length: 56 }, (_, index) => {
@@ -1451,6 +1606,10 @@ export function createMockApi(): GatewayApi {
         }
       })
     },
+    async getAccountCodexQuotaCycleCosts(id) {
+      if (!snapshot.accounts.some((candidate) => candidate.id === id)) throw new Error(mockText('账号不存在', 'Account not found'))
+      return { fiveHourUsd: 12.486, sevenDayUsd: 184.32 }
+    },
     async clearLogs() {
       snapshot.requestLogs = []
       return changed()
@@ -1461,9 +1620,9 @@ export function createMockApi(): GatewayApi {
     },
     async saveClientProfile(input) {
       const existing = snapshot.clientProfiles.find((profile) => profile.id === input.id)
-      if (input.id && !existing) throw new Error('客户端配置 Profile 不存在')
-      if (existing?.isDefault) throw new Error('默认客户端 Profile 不可编辑')
-      if (existing && existing.client !== input.client) throw new Error('已有 Profile 的客户端不可修改')
+      if (input.id && !existing) throw new Error(mockText('客户端配置 Profile 不存在', 'The client configuration profile does not exist'))
+      if (existing?.isDefault) throw new Error(mockText('默认客户端 Profile 不可编辑', 'The default client profile cannot be edited'))
+      if (existing && existing.client !== input.client) throw new Error(mockText('已有 Profile 的客户端不可修改', 'The client of an existing profile cannot be changed'))
       const timestamp = Date.now()
       const profile = {
         id: existing?.id ?? makeId('client-profile'),
@@ -1494,10 +1653,12 @@ export function createMockApi(): GatewayApi {
     async getClientConfigs(profileId) {
       await pause()
       const profile = snapshot.clientProfiles.find((candidate) => candidate.id === profileId)
-      const clients = profile ? [profile.client] : (Object.keys(mockClientFiles) as RouteClient[])
+      const clients = Object.keys(mockClientFiles) as RouteClient[]
       return clients.map((client): ClientConfigStatus => ({
         client,
-        directory: profile?.directory ?? `~/.${client === 'claude' ? 'claude' : client === 'codex' ? 'codex' : 'gemini'}`,
+        directory: profile?.client === client && profile.directory
+          ? profile.directory
+          : `~/.${client === 'claude' ? 'claude' : client === 'codex' ? 'codex' : 'gemini'}`,
         directoryExists: client !== 'gemini',
         configured: client !== 'gemini',
         files: mockClientFiles[client].map((file) => ({
@@ -1510,6 +1671,9 @@ export function createMockApi(): GatewayApi {
         lastBackupAt: clientBackups.find((backup) => backup.client === client)?.createdAt,
       }))
     },
+    async chooseClientConfigDirectory(client) {
+      return `C:\\Users\\Demo\\.${client}-custom`
+    },
     async previewClientConfig(client, profileId) {
       await pause()
       return {
@@ -1518,37 +1682,76 @@ export function createMockApi(): GatewayApi {
         files: mockClientFiles[client].map((file) => ({
           ...file,
           existed: client !== 'gemini',
-          changed: true,
-          managedFields: ['Stone 管理字段'],
+          changed: client === 'gemini',
+          managedFields: [mockText('Stone 管理字段', 'Stone-managed field')],
         })),
       }
     },
     async applyClientConfig(client) {
       await pause()
       const createdAt = Date.now()
+      const groupId = `${createdAt}:0`
       const backups = mockClientFiles[client].filter(() => client !== 'gemini').map((file, index): ClientConfigBackup => ({
         client,
         role: file.role,
         targetPath: file.path,
         backupPath: `${file.path}.stone-backup.${createdAt}.${index}`,
+        groupId,
         createdAt,
         size: 320,
       }))
       clientBackups.unshift(...backups)
       return { client, changedFiles: mockClientFiles[client].map((file) => file.path), backups, removedBackups: [] }
     },
+    async repairClientConfig(client, profileId) {
+      const result = await this.applyClientConfig(client, profileId)
+      return { ...result, rebuiltRoles: [] }
+    },
     async listClientConfigBackups(client) {
       await pause()
       return clone(clientBackups.filter((backup) => backup.client === client))
     },
+    async createClientConfigBackup(client) {
+      await pause()
+      const createdAt = Date.now()
+      const groupId = `${createdAt}:0`
+      const backups = mockClientFiles[client].map((file, index): ClientConfigBackup => ({
+        client,
+        role: file.role,
+        targetPath: file.path,
+        backupPath: `${file.path}.stone-backup.${createdAt}.${index}`,
+        groupId,
+        createdAt,
+        size: 320,
+      }))
+      clientBackups.unshift(...backups)
+      return { client, groupId, createdAt, backups: clone(backups), removedBackups: [] }
+    },
+    async restoreLatestClientConfigBackup(client, profileId) {
+      await pause()
+      const profile = snapshot.clientProfiles.find((candidate) => candidate.id === profileId)
+      if (profileId && !profile) throw new Error(mockText('客户端配置 Profile 不存在', 'The client configuration profile does not exist'))
+      const latest = clientBackups.find((candidate) => candidate.client === client)
+      if (!latest) throw new Error(mockText('暂无可恢复备份', 'No restorable backup is available'))
+      const sourceBackups = clientBackups.filter((candidate) => candidate.client === client && candidate.groupId === latest.groupId)
+      return { client, groupId: latest.groupId, createdAt: latest.createdAt, restoredFiles: sourceBackups.map((item) => item.targetPath), sourceBackups: clone(sourceBackups) }
+    },
+    async restoreClientConfigBackupSet(groupId, client, profileId) {
+      await pause()
+      const profile = snapshot.clientProfiles.find((candidate) => candidate.id === profileId)
+      if (profileId && !profile) throw new Error(mockText('客户端配置 Profile 不存在', 'The client configuration profile does not exist'))
+      const sourceBackups = clientBackups.filter((candidate) => candidate.client === client && candidate.groupId === groupId)
+      if (!sourceBackups.length) throw new Error(mockText('备份组不存在', 'The backup set does not exist'))
+      return { client, groupId, createdAt: sourceBackups[0].createdAt, restoredFiles: sourceBackups.map((item) => item.targetPath), sourceBackups: clone(sourceBackups) }
+    },
     async restoreClientConfig(backupPath, client, profileId) {
       await pause()
       const profile = snapshot.clientProfiles.find((candidate) => candidate.id === profileId)
-      if (profileId && !profile) throw new Error('客户端配置 Profile 不存在')
-      if (profile && profile.client !== client) throw new Error('客户端配置 Profile 与客户端不匹配')
+      if (profileId && !profile) throw new Error(mockText('客户端配置 Profile 不存在', 'The client configuration profile does not exist'))
+      if (profile && profile.client !== client) throw new Error(mockText('客户端配置 Profile 与客户端不匹配', 'The client configuration profile does not match the client'))
       const backup = clientBackups.find((candidate) => candidate.backupPath === backupPath)
-      if (!backup) throw new Error('备份不存在')
-      if (backup.client !== client) throw new Error('备份不属于所选客户端')
+      if (!backup) throw new Error(mockText('备份不存在', 'The backup does not exist'))
+      if (backup.client !== client) throw new Error(mockText('备份不属于所选客户端', 'The backup does not belong to the selected client'))
       return {
         client: backup.client,
         role: backup.role,
@@ -1559,8 +1762,8 @@ export function createMockApi(): GatewayApi {
     async getClientConfigEditor(client, profileId) {
       await pause()
       const profile = snapshot.clientProfiles.find((candidate) => candidate.id === profileId)
-      if (profileId && !profile) throw new Error('客户端配置 Profile 不存在')
-      if (profile && profile.client !== client) throw new Error('客户端配置 Profile 与客户端不匹配')
+      if (profileId && !profile) throw new Error(mockText('客户端配置 Profile 不存在', 'The client configuration profile does not exist'))
+      if (profile && profile.client !== client) throw new Error(mockText('客户端配置 Profile 与客户端不匹配', 'The client configuration profile does not match the client'))
       return {
         client,
         profileId: profile?.id ?? `default-${client}`,
@@ -1612,14 +1815,19 @@ export function createMockApi(): GatewayApi {
         release: {
           version: '0.9.1',
           tagName: 'v0.9.1',
-          title: 'Stone+ 0.9.1 · 更顺滑的应用更新体验',
+          title: mockText('Stone+ 0.9.1 · 更顺滑的应用更新体验', 'Stone+ 0.9.1 · A smoother update experience'),
           publishedAt: new Date().toISOString(),
           url: 'https://github.com/M4rkzzz/stone-plus/releases/tag/v0.9.1',
-          notes: [
+          notes: mockUsesChinese() ? [
             '- 品牌标识旁新增绿色“更新”提醒，不再打断当前操作。',
             '- 点击提醒即可查看本次 Release 的核心亮点。',
             '- 确认更新后自动下载、校验并覆盖安装。',
             '- 安装完成后自动重新启动 Stone+。',
+          ].join('\n') : [
+            '- A green “Update” indicator appears beside the brand without interrupting your work.',
+            '- Select the indicator to view the highlights of this release.',
+            '- After confirmation, Stone+ automatically downloads, verifies, and installs the update.',
+            '- Stone+ restarts automatically after installation.',
           ].join('\n'),
         },
       })

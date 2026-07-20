@@ -24,6 +24,8 @@ import {
   protocolLabels,
   RequestStatusBadge,
 } from '../ui'
+import { useI18n } from '../i18n'
+import { accountDisplayName, conversationDisplayName } from '../system-generated-text'
 
 const clientNames: Record<RouteClient, string> = {
   claude: 'Claude Code',
@@ -31,31 +33,54 @@ const clientNames: Record<RouteClient, string> = {
   gemini: 'Gemini CLI',
 }
 
+const failureStageLabels: Record<NonNullable<RequestLog['failureStage']>, readonly [string, string]> = {
+  body: ['读取请求体', 'Read request body'],
+  scheduler: ['选择账号', 'Select account'],
+  credential: ['解析凭据', 'Resolve credentials'],
+  connect: ['连接上游', 'Connect upstream'],
+  'first-byte': ['等待首包', 'Wait for first byte'],
+  stream: ['流式传输', 'Stream response'],
+  client: ['客户端连接', 'Client connection'],
+}
+
 type RequestColumnId = 'time' | 'client' | 'conversation' | 'model' | 'account' | 'status' | 'firstToken' | 'latency' | 'tokens'
 
 interface RequestColumnDefinition {
   id: RequestColumnId
-  label: string
+  label: readonly [string, string]
   defaultWidth: number
   minimumWidth: number
 }
 
 const REQUEST_COLUMN_STORAGE_KEY = 'stone:request-column-widths:v1'
 const displayedFirstTokenMs = (log: RequestLog): number | undefined => log.upstreamFirstByteMs ?? log.firstTokenMs
+const requestStartedAt = (log: RequestLog): number => log.startedAt ?? log.timestamp
+const liveElapsedMs = (log: RequestLog, now: number): number => log.status === 'streaming'
+  ? Math.max(log.latencyMs, now - requestStartedAt(log))
+  : log.latencyMs
+const liveStageLabels: Record<NonNullable<RequestLog['progressStage']>, readonly [string, string]> = {
+  'receiving-body': ['接收请求', 'Receiving request'],
+  scheduling: ['选择上游', 'Selecting upstream'],
+  'resolving-credential': ['准备凭据', 'Preparing credentials'],
+  connecting: ['连接上游', 'Connecting upstream'],
+  'waiting-first-byte': ['等待首字', 'Waiting for first token'],
+  streaming: ['正在传输', 'Streaming'],
+  retrying: ['切换重试', 'Retrying'],
+}
 const outboundHeadersWaitMs = (log: RequestLog): number | undefined =>
   log.outboundFetchStartMs === undefined || log.upstreamHeadersMs === undefined
     ? undefined
     : Math.max(0, log.upstreamHeadersMs - log.outboundFetchStartMs)
 const REQUEST_COLUMNS: RequestColumnDefinition[] = [
-  { id: 'time', label: '时间', defaultWidth: 94, minimumWidth: 80 },
-  { id: 'client', label: '客户端', defaultWidth: 100, minimumWidth: 84 },
-  { id: 'conversation', label: '所属对话', defaultWidth: 240, minimumWidth: 140 },
-  { id: 'model', label: '模型', defaultWidth: 135, minimumWidth: 92 },
-  { id: 'account', label: '上游源', defaultWidth: 145, minimumWidth: 105 },
-  { id: 'status', label: '状态', defaultWidth: 94, minimumWidth: 78 },
-  { id: 'firstToken', label: '首字', defaultWidth: 82, minimumWidth: 68 },
-  { id: 'latency', label: '总耗时', defaultWidth: 88, minimumWidth: 72 },
-  { id: 'tokens', label: 'Token', defaultWidth: 84, minimumWidth: 68 },
+  { id: 'time', label: ['时间', 'Time'], defaultWidth: 94, minimumWidth: 80 },
+  { id: 'client', label: ['客户端', 'Client'], defaultWidth: 100, minimumWidth: 84 },
+  { id: 'conversation', label: ['所属对话', 'Conversation'], defaultWidth: 240, minimumWidth: 140 },
+  { id: 'model', label: ['模型', 'Model'], defaultWidth: 135, minimumWidth: 92 },
+  { id: 'account', label: ['上游源', 'Upstream'], defaultWidth: 145, minimumWidth: 105 },
+  { id: 'status', label: ['状态', 'Status'], defaultWidth: 94, minimumWidth: 78 },
+  { id: 'firstToken', label: ['首字', 'First Token'], defaultWidth: 82, minimumWidth: 68 },
+  { id: 'latency', label: ['总耗时', 'Total Time'], defaultWidth: 88, minimumWidth: 72 },
+  { id: 'tokens', label: ['Token', 'Tokens'], defaultWidth: 84, minimumWidth: 68 },
 ]
 
 type RequestColumnWidths = Record<RequestColumnId, number>
@@ -89,6 +114,12 @@ function compactConversationId(value: string | undefined): string {
   return value.length > 18 ? `${value.slice(0, 8)}…${value.slice(-6)}` : value
 }
 
+function formatTransferBytes(value: number): string {
+  if (value < 1024) return `${value} B`
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(value < 10 * 1024 ? 1 : 0)} KB`
+  return `${(value / 1024 / 1024).toFixed(1)} MB`
+}
+
 export function RequestsView({
   snapshot,
   api,
@@ -100,6 +131,7 @@ export function RequestsView({
   runAction: ActionRunner
   busyKeys: Set<string>
 }) {
+  const { t, language, locale } = useI18n()
   const [query, setQuery] = useState('')
   const [status, setStatus] = useState<'all' | RequestLog['status']>('all')
   const [client, setClient] = useState<'all' | RouteClient>('all')
@@ -107,6 +139,7 @@ export function RequestsView({
   const [confirmClear, setConfirmClear] = useState(false)
   const [showConversationNames, setShowConversationNames] = useState(false)
   const [columnWidths, setColumnWidths] = useState<RequestColumnWidths>(loadRequestColumnWidths)
+  const [liveNow, setLiveNow] = useState(Date.now())
   const resizingColumn = useRef<{ id: RequestColumnId; startX: number; startWidth: number } | null>(null)
 
   useEffect(() => {
@@ -145,15 +178,29 @@ export function RequestsView({
       if (status !== 'all' && log.status !== status) return false
       if (client !== 'all' && log.client !== client) return false
       if (!normalized) return true
-      return [log.id, log.model, log.providerName, log.accountName, log.conversationId, log.conversationName, log.error]
+      return [log.id, log.model, log.providerName, accountDisplayName(log.accountName, t), log.conversationId, conversationDisplayName(log.conversationName, t), log.error]
         .some((value) => value?.toLowerCase().includes(normalized))
     })
-  }, [client, query, snapshot.requestLogs, status])
+  }, [client, query, snapshot.requestLogs, status, t])
+
+  useEffect(() => {
+    if (!snapshot.requestLogs.some((log) => log.status === 'streaming')) return
+    setLiveNow(Date.now())
+    const timer = window.setInterval(() => setLiveNow(Date.now()), 250)
+    return () => window.clearInterval(timer)
+  }, [snapshot.requestLogs])
+
+  useEffect(() => {
+    if (!selected) return
+    const latest = snapshot.requestLogs.find((log) => log.id === selected.id)
+    if (latest && latest !== selected) setSelected(latest)
+  }, [selected, snapshot.requestLogs])
 
   const successCount = snapshot.requestLogs.filter((log) => log.status === 'success').length
   const errorCount = snapshot.requestLogs.filter((log) => log.status === 'error').length
-  const averageLatency = snapshot.requestLogs.length
-    ? Math.round(snapshot.requestLogs.reduce((total, log) => total + log.latencyMs, 0) / snapshot.requestLogs.length)
+  const completedLogs = snapshot.requestLogs.filter((log) => log.status !== 'streaming')
+  const averageLatency = completedLogs.length
+    ? Math.round(completedLogs.reduce((total, log) => total + log.latencyMs, 0) / completedLogs.length)
     : 0
   const firstTokenLogs = snapshot.requestLogs.filter((log) => displayedFirstTokenMs(log) !== undefined)
   const averageFirstToken = firstTokenLogs.length
@@ -198,29 +245,28 @@ export function RequestsView({
   return (
     <div className="page-stack">
       <PageHeader
-        title="请求日志"
-        description="查看本机请求的路由结果与性能"
+        title={t('请求日志', 'Request Logs')}
         actions={
           <>
-            <button className="button button--secondary" type="button" disabled={!filtered.length} onClick={exportLogs}><Download size={16} />导出</button>
-            <button className="button button--secondary button--danger-text" type="button" disabled={!snapshot.requestLogs.length} onClick={() => setConfirmClear(true)}><Eraser size={16} />清空</button>
+            <button className="button button--secondary" type="button" disabled={!filtered.length} onClick={exportLogs}><Download size={16} />{t('导出', 'Export')}</button>
+            <button className="button button--secondary button--danger-text" type="button" disabled={!snapshot.requestLogs.length} onClick={() => setConfirmClear(true)}><Eraser size={16} />{t('清空', 'Clear')}</button>
           </>
         }
       />
 
-      <section className="request-stats" aria-label="日志统计">
-        <div><Activity size={16} /><span>记录</span><strong>{snapshot.requestLogs.length}</strong></div>
-        <div><CheckCircle2 size={16} /><span>成功</span><strong>{successCount}</strong></div>
-        <div><TriangleAlert size={16} /><span>失败</span><strong>{errorCount}</strong></div>
-        <div><span>平均首字</span><strong>{averageFirstToken ? durationLabel(averageFirstToken) : '—'}</strong></div>
-        <div><span>平均延迟</span><strong>{averageLatency ? durationLabel(averageLatency) : '—'}</strong></div>
-        <div><span>Token</span><strong>{formatCompactNumber(totalTokens)}</strong></div>
+      <section className="request-stats" aria-label={t('日志统计', 'Log statistics')}>
+        <div><Activity size={16} /><span>{t('记录', 'Records')}</span><strong>{snapshot.requestLogs.length}</strong></div>
+        <div><CheckCircle2 size={16} /><span>{t('成功', 'Success')}</span><strong>{successCount}</strong></div>
+        <div><TriangleAlert size={16} /><span>{t('失败', 'Failed')}</span><strong>{errorCount}</strong></div>
+        <div><span>{t('平均首字', 'Average First Token')}</span><strong>{averageFirstToken ? durationLabel(averageFirstToken) : '—'}</strong></div>
+        <div><span>{t('平均延迟', 'Average Latency')}</span><strong>{averageLatency ? durationLabel(averageLatency) : '—'}</strong></div>
+        <div><span>Token</span><strong>{formatCompactNumber(totalTokens, locale)}</strong></div>
       </section>
 
       <section className="panel panel--flush request-log-panel">
         <div className="table-toolbar">
-          <label className="search-input"><Search size={16} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索对话、模型、供应商或请求 ID" /></label>
-          <div className="filter-group"><Filter size={15} /><select value={client} aria-label="筛选客户端" onChange={(event) => setClient(event.target.value as 'all' | RouteClient)}><option value="all">全部客户端</option><option value="claude">Claude Code</option><option value="codex">Codex</option><option value="gemini">Gemini CLI</option></select><select value={status} aria-label="筛选状态" onChange={(event) => setStatus(event.target.value as 'all' | RequestLog['status'])}><option value="all">全部状态</option><option value="success">成功</option><option value="error">失败</option><option value="streaming">传输中</option></select></div>
+          <label className="search-input"><Search size={16} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={t('搜索对话、模型、供应商或请求 ID', 'Search conversations, models, providers, or request IDs')} /></label>
+          <div className="filter-group"><Filter size={15} /><select value={client} aria-label={t('筛选客户端', 'Filter clients')} onChange={(event) => setClient(event.target.value as 'all' | RouteClient)}><option value="all">{t('全部客户端', 'All Clients')}</option><option value="claude">Claude Code</option><option value="codex">Codex</option><option value="gemini">Gemini CLI</option></select><select value={status} aria-label={t('筛选状态', 'Filter status')} onChange={(event) => setStatus(event.target.value as 'all' | RequestLog['status'])}><option value="all">{t('全部状态', 'All Statuses')}</option><option value="success">{t('成功', 'Success')}</option><option value="error">{t('失败', 'Failed')}</option><option value="streaming">{t('传输中', 'Streaming')}</option></select></div>
         </div>
 
         {filtered.length ? (
@@ -231,10 +277,10 @@ export function RequestsView({
                 <thead><tr>{REQUEST_COLUMNS.map((column) => (
                   <th className="request-column-header" key={column.id}>
                     {column.id === 'conversation'
-                      ? <span className="request-column-title"><span>{column.label}</span><button aria-label={showConversationNames ? '隐藏全部对话标题' : '显示全部对话标题'} className="request-conversation-visibility" type="button" title={showConversationNames ? '隐藏全部对话标题' : '显示全部对话标题'} onClick={(event) => { event.stopPropagation(); setShowConversationNames((visible) => !visible) }}>{showConversationNames ? <Eye size={14} /> : <EyeOff size={14} />}</button></span>
-                      : <span>{column.label}</span>}
+                      ? <span className="request-column-title"><span>{t(column.label[0], column.label[1])}</span><button aria-label={showConversationNames ? t('隐藏全部对话标题', 'Hide all conversation titles') : t('显示全部对话标题', 'Show all conversation titles')} className="request-conversation-visibility" type="button" title={showConversationNames ? t('隐藏全部对话标题', 'Hide all conversation titles') : t('显示全部对话标题', 'Show all conversation titles')} onClick={(event) => { event.stopPropagation(); setShowConversationNames((visible) => !visible) }}>{showConversationNames ? <Eye size={14} /> : <EyeOff size={14} />}</button></span>
+                      : <span>{t(column.label[0], column.label[1])}</span>}
                     <span
-                      aria-label={`调整${column.label}列宽`}
+                      aria-label={t(`调整${column.label[0]}列宽`, `Resize ${column.label[1]} column`)}
                       aria-orientation="vertical"
                       aria-valuemax={640}
                       aria-valuemin={column.minimumWidth}
@@ -243,7 +289,7 @@ export function RequestsView({
                       data-column-resizer={column.id}
                       role="separator"
                       tabIndex={0}
-                      title="拖动调整列宽；双击或按 Home 恢复默认"
+                      title={t('拖动调整列宽；双击或按 Home 恢复默认', 'Drag to resize; double-click or press Home to restore the default')}
                       onDoubleClick={(event) => { event.stopPropagation(); setColumnWidths((current) => ({ ...current, [column.id]: column.defaultWidth })) }}
                       onKeyDown={(event) => resizeColumnByKeyboard(event, column)}
                       onMouseDown={(event) => beginColumnResize(event, column)}
@@ -252,64 +298,73 @@ export function RequestsView({
                 ))}</tr></thead>
                 <tbody>
                   {filtered.map((log) => (
-                    <tr key={log.id} tabIndex={0} onClick={() => setSelected(log)} onKeyDown={(event) => event.key === 'Enter' && setSelected(log)}>
-                      <td><div className="table-primary"><strong>{formatDateTime(log.timestamp).split(' ')[1]}</strong><span>{formatDateTime(log.timestamp).split(' ')[0]}</span></div></td>
+                    <tr className={log.status === 'streaming' ? 'request-row--live' : ''} key={log.id} tabIndex={0} onClick={() => setSelected(log)} onKeyDown={(event) => event.key === 'Enter' && setSelected(log)}>
+                      <td><div className="table-primary"><strong>{formatDateTime(requestStartedAt(log), locale).split(' ')[1]}</strong><span>{formatDateTime(requestStartedAt(log), locale).split(' ')[0]}</span></div></td>
                       <td><div className="cell-with-icon"><span className={`client-dot client-dot--${log.client}`} />{clientNames[log.client]}</div></td>
-                      <td><div className={`table-primary request-conversation${showConversationNames ? '' : ' request-conversation--hidden'}`}>{showConversationNames && <strong title={log.conversationName}>{log.conversationName ?? '—'}</strong>}<span className="mono" title={log.conversationId}>{compactConversationId(log.conversationId)}</span></div></td>
+                      <td><div className={`table-primary request-conversation${showConversationNames ? '' : ' request-conversation--hidden'}`}>{showConversationNames && <strong title={conversationDisplayName(log.conversationName, t)}>{conversationDisplayName(log.conversationName, t) ?? '—'}</strong>}<span className="mono" title={log.conversationId}>{compactConversationId(log.conversationId)}</span></div></td>
                       <td><span className="mono table-model">{log.model}</span></td>
-                      <td><div className="table-primary"><strong>{log.providerName}</strong><span>{log.accountName}</span></div></td>
-                      <td><RequestStatusBadge status={log.status} />{log.statusCode && <span className="status-code">{log.statusCode}</span>}</td>
+                      <td><div className="table-primary"><strong>{log.providerName}</strong><span>{accountDisplayName(log.accountName, t)}</span></div></td>
+                      <td>{log.status === 'streaming'
+                        ? <span className="request-live-status"><i aria-hidden="true" /><span>{t(liveStageLabels[log.progressStage ?? 'receiving-body'][0], liveStageLabels[log.progressStage ?? 'receiving-body'][1])}</span></span>
+                        : <><RequestStatusBadge status={log.status} statusCode={log.statusCode} />{log.statusCode && <span className="status-code">{log.statusCode}</span>}</>}</td>
                       <td>{displayedFirstTokenMs(log) !== undefined ? durationLabel(displayedFirstTokenMs(log)!) : '—'}</td>
-                      <td>{durationLabel(log.latencyMs)}</td>
-                      <td>{log.inputTokens !== undefined ? formatCompactNumber((log.inputTokens ?? 0) + (log.outputTokens ?? 0)) : '—'}</td>
+                      <td className={log.status === 'streaming' ? 'request-live-duration' : ''}>{durationLabel(liveElapsedMs(log, liveNow))}</td>
+                      <td>{log.inputTokens !== undefined
+                        ? formatCompactNumber((log.inputTokens ?? 0) + (log.outputTokens ?? 0), locale)
+                        : log.status === 'streaming' && (log.streamedBytes ?? 0) > 0
+                          ? <span className="request-live-bytes" title={t('当前已接收的流数据量，最终 Token 以服务端用量为准', 'Live stream data received; final tokens use the upstream usage report')}>{formatTransferBytes(log.streamedBytes ?? 0)}</span>
+                          : '—'}</td>
                     </tr>
                   ))}
                 </tbody>
               </table>
             </div>
-            <footer className="table-footer"><span>显示 {filtered.length} / {snapshot.requestLogs.length} 条记录</span><span>仅保存在本机</span></footer>
+            <footer className="table-footer"><span>{t(`显示 ${filtered.length} / ${snapshot.requestLogs.length} 条记录`, `Showing ${filtered.length} / ${snapshot.requestLogs.length} records`)}</span><span>{t('仅保存在本机', 'Stored locally only')}</span></footer>
           </>
         ) : (
-          <EmptyState icon={<Activity size={24} />} title={snapshot.requestLogs.length ? '没有匹配的请求' : '暂无请求日志'} description={snapshot.requestLogs.length ? '调整搜索词或筛选条件' : '网关收到请求后会在此显示记录'} action={snapshot.requestLogs.length ? <button className="button button--secondary" type="button" onClick={() => { setQuery(''); setClient('all'); setStatus('all') }}>重置筛选</button> : undefined} />
+          <EmptyState icon={<Activity size={24} />} title={snapshot.requestLogs.length ? t('没有匹配的请求', 'No matching requests') : t('暂无请求日志', 'No request logs')} description={snapshot.requestLogs.length ? t('调整搜索词或筛选条件', 'Adjust the search term or filters') : t('网关收到请求后会在此显示记录', 'Requests will appear here after the gateway receives them')} action={snapshot.requestLogs.length ? <button className="button button--secondary" type="button" onClick={() => { setQuery(''); setClient('all'); setStatus('all') }}>{t('重置筛选', 'Reset Filters')}</button> : undefined} />
         )}
       </section>
 
-      <Modal open={Boolean(selected)} title="请求详情" description={selected ? formatDateTime(selected.timestamp) : undefined} onClose={() => setSelected(null)} width="medium">
+      <Modal open={Boolean(selected)} title={t('请求详情', 'Request Details')} description={selected ? formatDateTime(requestStartedAt(selected), locale) : undefined} onClose={() => setSelected(null)} width="medium">
         {selected && (
           <div className="request-detail">
-            <div className="request-detail__status"><RequestStatusBadge status={selected.status} /><span>{selected.statusCode ?? '—'}</span><strong>{durationLabel(selected.latencyMs)}</strong></div>
+            <div className="request-detail__status"><RequestStatusBadge status={selected.status} statusCode={selected.statusCode} /><span>{selected.statusCode ?? '—'}</span><strong>{durationLabel(liveElapsedMs(selected, liveNow))}</strong></div>
             <div className="request-detail__grid">
-              <DetailItem label="请求 ID" mono>{selected.id}</DetailItem>
-              <DetailItem label="客户端">{clientNames[selected.client]}</DetailItem>
-              <DetailItem label="对话名称">{showConversationNames ? selected.conversationName ?? '—' : '已隐藏'}</DetailItem>
-              <DetailItem label="对话 ID" mono>{selected.conversationId ?? '—'}</DetailItem>
-              <DetailItem label="入站协议">{protocolLabels[selected.protocol]}</DetailItem>
-              <DetailItem label="模型" mono>{selected.model}</DetailItem>
-              <DetailItem label="供应商">{selected.providerName}</DetailItem>
-              <DetailItem label="账号">{selected.accountName}</DetailItem>
-              <DetailItem label="首字时间">{displayedFirstTokenMs(selected) !== undefined ? durationLabel(displayedFirstTokenMs(selected)!) : '—'}</DetailItem>
-              <DetailItem label="可见首字时间">{selected.firstTokenMs !== undefined ? durationLabel(selected.firstTokenMs) : '—'}</DetailItem>
-              <DetailItem label="请求体读取">{selected.bodyReadMs !== undefined ? durationLabel(selected.bodyReadMs) : '—'}</DetailItem>
-              <DetailItem label="账号调度">{selected.schedulerSelectMs !== undefined ? durationLabel(selected.schedulerSelectMs) : '—'}</DetailItem>
-              <DetailItem label="凭据解析">{selected.credentialResolveMs !== undefined ? durationLabel(selected.credentialResolveMs) : '—'}</DetailItem>
-              <DetailItem label="发起上游">{selected.outboundFetchStartMs !== undefined ? durationLabel(selected.outboundFetchStartMs) : '—'}</DetailItem>
-              <DetailItem label="上游等待响应头">{outboundHeadersWaitMs(selected) !== undefined ? durationLabel(outboundHeadersWaitMs(selected)!) : '—'}</DetailItem>
-              <DetailItem label="上游响应头">{selected.upstreamHeadersMs !== undefined ? durationLabel(selected.upstreamHeadersMs) : '—'}</DetailItem>
-              <DetailItem label="客户端首写">{selected.clientFirstWriteMs !== undefined ? durationLabel(selected.clientFirstWriteMs) : '—'}</DetailItem>
-              <DetailItem label="账号可见首字">{selected.accountFirstTokenMs !== undefined ? durationLabel(selected.accountFirstTokenMs) : '—'}</DetailItem>
-              <DetailItem label="总耗时">{durationLabel(selected.latencyMs)}</DetailItem>
-              <DetailItem label="输入 Token">{selected.inputTokens?.toLocaleString('zh-CN') ?? '—'}</DetailItem>
-              <DetailItem label="缓存输入 Token">{selected.cachedInputTokens?.toLocaleString('zh-CN') ?? '—'}</DetailItem>
-              <DetailItem label="推理 Token">{selected.reasoningTokens?.toLocaleString('zh-CN') ?? '—'}</DetailItem>
-              <DetailItem label="输出 Token">{selected.outputTokens?.toLocaleString('zh-CN') ?? '—'}</DetailItem>
+              <DetailItem label={t('请求 ID', 'Request ID')} mono>{selected.id}</DetailItem>
+              <DetailItem label={t('客户端', 'Client')}>{clientNames[selected.client]}</DetailItem>
+              <DetailItem label={t('对话名称', 'Conversation Name')}>{showConversationNames ? conversationDisplayName(selected.conversationName, t) ?? '—' : t('已隐藏', 'Hidden')}</DetailItem>
+              <DetailItem label={t('对话 ID', 'Conversation ID')} mono>{selected.conversationId ?? '—'}</DetailItem>
+              <DetailItem label={t('入站协议', 'Inbound Protocol')}>{protocolLabels[selected.protocol]}</DetailItem>
+              <DetailItem label={t('模型', 'Model')} mono>{selected.model}</DetailItem>
+              <DetailItem label={t('供应商', 'Provider')}>{selected.providerName}</DetailItem>
+              <DetailItem label={t('账号', 'Account')}>{accountDisplayName(selected.accountName, t)}</DetailItem>
+              {selected.status === 'streaming' && <DetailItem label={t('实时阶段', 'Live Stage')}>{t(liveStageLabels[selected.progressStage ?? 'receiving-body'][0], liveStageLabels[selected.progressStage ?? 'receiving-body'][1])}</DetailItem>}
+              {selected.failureStage && <DetailItem label={t('失败阶段', 'Failure Stage')}>{t(failureStageLabels[selected.failureStage][0], failureStageLabels[selected.failureStage][1])}</DetailItem>}
+              <DetailItem label={t('首字时间', 'First Token Time')}>{displayedFirstTokenMs(selected) !== undefined ? durationLabel(displayedFirstTokenMs(selected)!) : '—'}</DetailItem>
+              <DetailItem label={t('可见首字时间', 'Visible First Token Time')}>{selected.firstTokenMs !== undefined ? durationLabel(selected.firstTokenMs) : '—'}</DetailItem>
+              <DetailItem label={t('请求体读取', 'Request Body Read')}>{selected.bodyReadMs !== undefined ? durationLabel(selected.bodyReadMs) : '—'}</DetailItem>
+              <DetailItem label={t('账号调度', 'Account Scheduling')}>{selected.schedulerSelectMs !== undefined ? durationLabel(selected.schedulerSelectMs) : '—'}</DetailItem>
+              <DetailItem label={t('凭据解析', 'Credential Resolution')}>{selected.credentialResolveMs !== undefined ? durationLabel(selected.credentialResolveMs) : '—'}</DetailItem>
+              <DetailItem label={t('发起上游', 'Upstream Request Start')}>{selected.outboundFetchStartMs !== undefined ? durationLabel(selected.outboundFetchStartMs) : '—'}</DetailItem>
+              <DetailItem label={t('上游等待响应头', 'Upstream Headers Wait')}>{outboundHeadersWaitMs(selected) !== undefined ? durationLabel(outboundHeadersWaitMs(selected)!) : '—'}</DetailItem>
+              <DetailItem label={t('上游响应头', 'Upstream Headers')}>{selected.upstreamHeadersMs !== undefined ? durationLabel(selected.upstreamHeadersMs) : '—'}</DetailItem>
+              <DetailItem label={t('客户端首写', 'First Client Write')}>{selected.clientFirstWriteMs !== undefined ? durationLabel(selected.clientFirstWriteMs) : '—'}</DetailItem>
+              <DetailItem label={t('账号可见首字', 'Account-visible First Token')}>{selected.accountFirstTokenMs !== undefined ? durationLabel(selected.accountFirstTokenMs) : '—'}</DetailItem>
+              <DetailItem label={t('总耗时', 'Total Time')}>{durationLabel(liveElapsedMs(selected, liveNow))}</DetailItem>
+              <DetailItem label={t('输入 Token', 'Input Tokens')}>{selected.inputTokens?.toLocaleString(locale) ?? '—'}</DetailItem>
+              <DetailItem label={t('缓存输入 Token', 'Cached Input Tokens')}>{selected.cachedInputTokens?.toLocaleString(locale) ?? '—'}</DetailItem>
+              <DetailItem label={t('推理 Token', 'Reasoning Tokens')}>{selected.reasoningTokens?.toLocaleString(locale) ?? '—'}</DetailItem>
+              <DetailItem label={t('输出 Token', 'Output Tokens')}>{selected.outputTokens?.toLocaleString(locale) ?? '—'}</DetailItem>
+              {selected.status === 'streaming' && <DetailItem label={t('已接收流数据', 'Stream Data Received')}>{formatTransferBytes(selected.streamedBytes ?? 0)}</DetailItem>}
             </div>
-            {selected.error && <div className="request-error"><TriangleAlert size={17} /><div><strong>上游错误</strong><p>{selected.error}</p></div></div>}
-            <div className="privacy-note"><Badge tone="neutral">Payload 未记录</Badge><span>仅记录会话标识和客户端提供的名称，不包含请求与响应正文</span></div>
+            {selected.error && <div className="request-error"><TriangleAlert size={17} /><div><strong>{t('请求失败', 'Request Failed')}</strong><p>{language === 'en' && /[\u3400-\u9fff]/u.test(selected.error) ? 'The upstream request failed.' : selected.error}</p></div></div>}
+            <div className="privacy-note"><Badge tone="neutral">{t('Payload 未记录', 'Payload not recorded')}</Badge><span>{t('仅记录会话标识和客户端提供的名称，不包含请求与响应正文', 'Only conversation identifiers and client-provided names are recorded; request and response bodies are excluded')}</span></div>
           </div>
         )}
       </Modal>
 
-      <ConfirmDialog open={confirmClear} title="清空请求日志" message="确定清空全部本地请求记录吗？导出后也无法从 Stone 中恢复。" confirmLabel="清空日志" busy={busyKeys.has('clear-logs')} onCancel={() => setConfirmClear(false)} onConfirm={() => void clear()} />
+      <ConfirmDialog open={confirmClear} title={t('清空请求日志', 'Clear Request Logs')} message={t('确定清空全部本地请求记录吗？导出后也无法从 Stone 中恢复。', 'Clear all local request records? They cannot be restored from Stone, even after export.')} confirmLabel={t('清空日志', 'Clear Logs')} busy={busyKeys.has('clear-logs')} onCancel={() => setConfirmClear(false)} onConfirm={() => void clear()} />
     </div>
   )
 }

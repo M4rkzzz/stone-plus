@@ -18,15 +18,17 @@ import type {
   CodexSessionRepairTargetSource,
   GatewayApi,
 } from '@shared/types'
+import { localizeBackendError, localizeBackendMessage } from '../backend-message'
+import { useI18n } from '../i18n'
 import { Badge, ConfirmDialog, PageHeader } from '../ui'
 
-const sourceLabels: Record<CodexSessionRepairTargetSource, string> = {
-  config: '配置',
-  rollout: '会话',
-  sqlite: '索引',
-}
-
 export function SessionRepairView({ api }: { api: GatewayApi }) {
+  const { t, language } = useI18n()
+  const sourceLabels: Record<CodexSessionRepairTargetSource, string> = {
+    config: t('配置', 'Config'),
+    rollout: t('会话', 'Sessions'),
+    sqlite: t('索引', 'Index'),
+  }
   const [overview, setOverview] = useState<CodexSessionRepairOverview | null>(null)
   const [preview, setPreview] = useState<CodexSessionRepairPreview | null>(null)
   const [result, setResult] = useState<CodexSessionRepairResult | null>(null)
@@ -47,11 +49,11 @@ export function SessionRepairView({ api }: { api: GatewayApi }) {
       setTargetProvider(provider)
       setPreview(await api.previewCodexSessionRepair(provider))
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : '无法扫描 Codex 会话')
+      setError(localizeBackendError(cause, language, t('无法扫描 Codex 会话', 'Unable to scan Codex sessions')))
     } finally {
       setBusy(null)
     }
-  }, [api, targetProvider])
+  }, [api, language, t, targetProvider])
 
   useEffect(() => {
     void load()
@@ -68,7 +70,7 @@ export function SessionRepairView({ api }: { api: GatewayApi }) {
       setPreview(await api.previewCodexSessionRepair(provider))
     } catch (cause) {
       setPreview(null)
-      setError(cause instanceof Error ? cause.message : '无法预览会话修复')
+      setError(localizeBackendError(cause, language, t('无法预览会话修复', 'Unable to preview session repair')))
     } finally {
       setBusy(null)
     }
@@ -86,7 +88,7 @@ export function SessionRepairView({ api }: { api: GatewayApi }) {
       setOverview(refreshed)
       setPreview(await api.previewCodexSessionRepair(preview.targetProvider))
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : '会话修复失败')
+      setError(localizeBackendError(cause, language, t('会话修复失败', 'Session repair failed')))
     } finally {
       setBusy(null)
     }
@@ -104,11 +106,10 @@ export function SessionRepairView({ api }: { api: GatewayApi }) {
   return (
     <div className="page-stack">
       <PageHeader
-        title="会话修复"
-        description="切换官方账号、API 或 Stone+ provider 后，让 Codex 历史对话重新归属到当前模式"
+        title={t('会话修复', 'Session Repair')}
         actions={
           <button className="button button--secondary" type="button" disabled={running} onClick={() => void load()}>
-            <RefreshCw size={16} className={busy === 'load' ? 'spin' : undefined} />重新扫描
+            <RefreshCw size={16} className={busy === 'load' ? 'spin' : undefined} />{t('重新扫描', 'Scan again')}
           </button>
         }
       />
@@ -118,49 +119,49 @@ export function SessionRepairView({ api }: { api: GatewayApi }) {
         <div className="client-config-notice session-repair-notice">
           <CheckCircle2 size={17} />
           <span>
-            已同步到 <strong>{result.targetProvider}</strong>：修复 {result.repairedRolloutFiles} 个会话文件，更新 {result.sqliteProviderRowsUpdated + result.sqliteUserEventRowsUpdated + result.sqliteCwdRowsUpdated} 行索引。
-            {result.backupPath && <small className="mono">备份：{result.backupPath}</small>}
-            {result.retentionWarning && <small>{result.retentionWarning}</small>}
+            {t('已同步到', 'Synchronized to')} <strong>{result.targetProvider}</strong>{t(`：修复 ${result.repairedRolloutFiles} 个会话文件，更新 ${result.sqliteProviderRowsUpdated + result.sqliteUserEventRowsUpdated + result.sqliteCwdRowsUpdated} 行索引。`, `: repaired ${result.repairedRolloutFiles} session files and updated ${result.sqliteProviderRowsUpdated + result.sqliteUserEventRowsUpdated + result.sqliteCwdRowsUpdated} index rows.`)}
+            {result.backupPath && <small className="mono">{t('备份', 'Backup')}: {result.backupPath}</small>}
+            {result.retentionWarning && <small>{localizeBackendMessage(result.retentionWarning, language, t('旧备份清理失败', 'Old backups could not be cleaned up.'))}</small>}
           </span>
         </div>
       )}
 
       <section className="metrics-grid session-repair-metrics">
         <article className="metric-card">
-          <span className="metric-card__label">当前 provider</span>
+          <span className="metric-card__label">{t('当前 provider', 'Current provider')}</span>
           <strong className="metric-card__uptime mono">{overview?.currentProvider ?? '—'}</strong>
-          <span>来自 ~/.codex/config.toml</span>
+          <span>{t('来自', 'From')} ~/.codex/config.toml</span>
           <div className="metric-card__icon metric-card__icon--green"><Wrench size={18} /></div>
         </article>
         <article className="metric-card">
-          <span className="metric-card__label">本地会话文件</span>
+          <span className="metric-card__label">{t('本地会话文件', 'Local session files')}</span>
           <strong>{totalRollouts}</strong>
-          <span>{overview?.sessionFiles ?? 0} 个活跃 · {overview?.archivedSessionFiles ?? 0} 个归档</span>
+          <span>{t(`${overview?.sessionFiles ?? 0} 个活跃 · ${overview?.archivedSessionFiles ?? 0} 个归档`, `${overview?.sessionFiles ?? 0} active · ${overview?.archivedSessionFiles ?? 0} archived`)}</span>
           <div className="metric-card__icon metric-card__icon--blue"><FileText size={18} /></div>
         </article>
         <article className="metric-card">
-          <span className="metric-card__label">SQLite 线程索引</span>
+          <span className="metric-card__label">{t('SQLite 线程索引', 'SQLite thread index')}</span>
           <strong>{overview?.indexedThreads ?? 0}</strong>
-          <span>{overview?.sqliteDatabases.length ?? 0} 个包含 threads 的数据库</span>
+          <span>{t(`${overview?.sqliteDatabases.length ?? 0} 个包含 threads 的数据库`, `${overview?.sqliteDatabases.length ?? 0} databases containing threads`)}</span>
           <div className="metric-card__icon metric-card__icon--violet"><Database size={18} /></div>
         </article>
         <article className="metric-card">
-          <span className="metric-card__label">预览改动</span>
+          <span className="metric-card__label">{t('预览改动', 'Proposed changes')}</span>
           <strong>{totalChanges}</strong>
-          <span>{preview ? preview.rolloutFilesToUpdate ? '存在需要同步的历史会话' : totalChanges ? '仅需修复索引' : '当前目标已同步' : '等待预览'}</span>
+          <span>{preview ? preview.rolloutFilesToUpdate ? t('存在需要同步的历史会话', 'Historical sessions need synchronization') : totalChanges ? t('仅需修复索引', 'Only the index needs repair') : t('当前目标已同步', 'The selected target is already synchronized') : t('等待预览', 'Waiting for preview')}</span>
           <div className="metric-card__icon metric-card__icon--amber"><History size={18} /></div>
         </article>
       </section>
 
       <section className="panel session-repair-panel">
         <header className="session-repair-panel__header">
-          <div><ShieldCheck size={20} /><div><h2>Provider metadata 同步</h2><p>同步 rollout 的 session_meta 与 SQLite threads 索引；写入前创建完整可恢复备份，并保留原会话时间。</p></div></div>
-          <Badge tone={totalChanges ? 'warning' : 'success'}>{preview ? totalChanges ? '待修复' : '已同步' : '未预览'}</Badge>
+          <div><ShieldCheck size={20} /><div><h2>{t('Provider metadata 同步', 'Provider metadata synchronization')}</h2><p>{t('同步 rollout 的 session_meta 与 SQLite threads 索引；写入前创建完整可恢复备份，并保留原会话时间。', 'Synchronizes rollout session_meta and the SQLite threads index. A complete restorable backup is created before writing, and original session timestamps are preserved.')}</p></div></div>
+          <Badge tone={totalChanges ? 'warning' : 'success'}>{preview ? totalChanges ? t('待修复', 'Repair needed') : t('已同步', 'Synchronized') : t('未预览', 'Not previewed')}</Badge>
         </header>
 
         <div className="session-repair-controls">
           <label className="field">
-            <span>同步目标</span>
+            <span>{t('同步目标', 'Synchronization target')}</span>
             <select
               value={targetProvider}
               disabled={running || !overview?.targets.length}
@@ -172,56 +173,56 @@ export function SessionRepairView({ api }: { api: GatewayApi }) {
             >
               {overview?.targets.map((target) => (
                 <option value={target.id} key={target.id}>
-                  {target.id}（{target.sources.map((source) => sourceLabels[source]).join(' / ')}{target.isCurrentProvider ? ' / 当前' : ''}）
+                  {target.id} ({target.sources.map((source) => sourceLabels[source]).join(' / ')}{target.isCurrentProvider ? t(' / 当前', ' / current') : ''})
                 </option>
               ))}
             </select>
           </label>
           <div className="session-repair-actions">
             <button className="button button--secondary" type="button" disabled={running || !targetProvider} onClick={() => void runPreview()}>
-              {busy === 'preview' ? <LoaderCircle size={16} className="spin" /> : <RefreshCw size={16} />}预览修复
+              {busy === 'preview' ? <LoaderCircle size={16} className="spin" /> : <RefreshCw size={16} />}{t('预览修复', 'Preview repair')}
             </button>
             <button className="button button--primary" type="button" disabled={running || !preview || totalChanges === 0} onClick={() => setConfirmOpen(true)}>
-              {busy === 'repair' ? <LoaderCircle size={16} className="spin" /> : <Wrench size={16} />}立即修复历史会话
+              {busy === 'repair' ? <LoaderCircle size={16} className="spin" /> : <Wrench size={16} />}{t('立即修复历史会话', 'Repair historical sessions now')}
             </button>
           </div>
         </div>
 
         {busy === 'load' && !preview ? (
-          <div className="session-repair-loading"><LoaderCircle size={20} className="spin" /><span>正在扫描 rollout 与 SQLite 索引…</span></div>
+          <div className="session-repair-loading"><LoaderCircle size={20} className="spin" /><span>{t('正在扫描 rollout 与 SQLite 索引…', 'Scanning rollouts and the SQLite index…')}</span></div>
         ) : preview ? (
           <div className="session-repair-preview">
-            <div><span>rollout provider</span><strong>{preview.rolloutFilesToUpdate}</strong><small>个会话文件</small></div>
-            <div><span>SQLite provider</span><strong>{preview.sqliteProviderRowsToUpdate}</strong><small>行线程归属</small></div>
-            <div><span>用户事件索引</span><strong>{preview.sqliteUserEventRowsToUpdate}</strong><small>行可见性标记</small></div>
-            <div><span>工作区索引</span><strong>{preview.sqliteCwdRowsToUpdate}</strong><small>行 cwd 路径</small></div>
+            <div><span>rollout provider</span><strong>{preview.rolloutFilesToUpdate}</strong><small>{t('个会话文件', 'session files')}</small></div>
+            <div><span>SQLite provider</span><strong>{preview.sqliteProviderRowsToUpdate}</strong><small>{t('行线程归属', 'thread-owner rows')}</small></div>
+            <div><span>{t('用户事件索引', 'User-event index')}</span><strong>{preview.sqliteUserEventRowsToUpdate}</strong><small>{t('行可见性标记', 'visibility rows')}</small></div>
+            <div><span>{t('工作区索引', 'Workspace index')}</span><strong>{preview.sqliteCwdRowsToUpdate}</strong><small>{t('行 cwd 路径', 'cwd path rows')}</small></div>
           </div>
         ) : (
-          <div className="session-repair-loading"><RefreshCw size={19} /><span>目标已切换，点击“预览修复”重新计算安全快照。</span></div>
+          <div className="session-repair-loading"><RefreshCw size={19} /><span>{t('目标已切换，点击“预览修复”重新计算安全快照。', 'The target changed. Select “Preview repair” to calculate a new safety snapshot.')}</span></div>
         )}
       </section>
 
       {preview?.encryptedSessionFiles ? (
-        <div className="warning-banner warning-banner--danger"><div><AlertTriangle size={17} /><div><strong>检测到 encrypted_content</strong><span>{preview.encryptedSessionFiles} 个会话来自 {preview.encryptedSourceProviders.join('、')}。修复可恢复列表可见性，但续聊或压缩旧上下文时仍可能要求原账号/provider。</span></div></div></div>
+        <div className="warning-banner warning-banner--danger"><div><AlertTriangle size={17} /><div><strong>{t('检测到 encrypted_content', 'encrypted_content detected')}</strong><span>{t(`${preview.encryptedSessionFiles} 个会话来自 ${preview.encryptedSourceProviders.join('、')}。修复可恢复列表可见性，但续聊或压缩旧上下文时仍可能要求原账号/provider。`, `${preview.encryptedSessionFiles} sessions came from ${preview.encryptedSourceProviders.join(', ')}. Repair can restore list visibility, but continuing or compacting older context may still require the original account/provider.`)}</span></div></div></div>
       ) : null}
       {overview?.skippedFiles.length ? (
-        <div className="warning-banner"><div><AlertTriangle size={17} /><div><strong>有文件被占用</strong><span>{overview.skippedFiles.length} 个 rollout 未进入本次预览；关闭对应 Codex 会话后重新扫描。</span></div></div></div>
+        <div className="warning-banner"><div><AlertTriangle size={17} /><div><strong>{t('有文件被占用', 'Some files are in use')}</strong><span>{t(`${overview.skippedFiles.length} 个 rollout 未进入本次预览；关闭对应 Codex 会话后重新扫描。`, `${overview.skippedFiles.length} rollouts were excluded from this preview. Close the corresponding Codex sessions and scan again.`)}</span></div></div></div>
       ) : null}
 
       <section className="panel session-repair-details">
-        <header><Archive size={18} /><div><strong>数据与备份范围</strong><span className="mono">{overview?.codexHome ?? '~/.codex'}</span></div></header>
+        <header><Archive size={18} /><div><strong>{t('数据与备份范围', 'Data and backup scope')}</strong><span className="mono">{overview?.codexHome ?? '~/.codex'}</span></div></header>
         <ul>
-          <li>只改写 JSONL 中 <code>session_meta.payload.model_provider</code>，不会修改对话正文。</li>
-          <li>SQLite 更新使用事务与原值校验，不覆盖预览后新产生的线程变化。</li>
-          <li>备份保存在 <code>~/.codex/backups_state/stone-session-repair</code>，自动保留最近 5 次。</li>
+          <li>{t('只改写 JSONL 中', 'Only')} <code>session_meta.payload.model_provider</code> {t('，不会修改对话正文。', 'in JSONL is rewritten; conversation content is never modified.')}</li>
+          <li>{t('SQLite 更新使用事务与原值校验，不覆盖预览后新产生的线程变化。', 'SQLite updates use transactions and original-value checks, so thread changes created after the preview are not overwritten.')}</li>
+          <li>{t('备份保存在', 'Backups are stored in')} <code>~/.codex/backups_state/stone-session-repair</code>{t('，自动保留最近 5 次。', '; the five most recent backups are retained automatically.')}</li>
         </ul>
       </section>
 
       <ConfirmDialog
         open={confirmOpen}
-        title="修复 Codex 历史会话"
-        message={`将 ${preview?.rolloutFilesToUpdate ?? 0} 个会话文件及 ${preview ? preview.sqliteProviderRowsToUpdate + preview.sqliteUserEventRowsToUpdate + preview.sqliteCwdRowsToUpdate : 0} 行索引同步到 ${preview?.targetProvider ?? targetProvider}。Stone+ 会先创建备份，是否继续？`}
-        confirmLabel="创建备份并修复"
+        title={t('修复 Codex 历史会话', 'Repair Codex session history')}
+        message={t(`将 ${preview?.rolloutFilesToUpdate ?? 0} 个会话文件及 ${preview ? preview.sqliteProviderRowsToUpdate + preview.sqliteUserEventRowsToUpdate + preview.sqliteCwdRowsToUpdate : 0} 行索引同步到 ${preview?.targetProvider ?? targetProvider}。Stone+ 会先创建备份，是否继续？`, `Synchronize ${preview?.rolloutFilesToUpdate ?? 0} session files and ${preview ? preview.sqliteProviderRowsToUpdate + preview.sqliteUserEventRowsToUpdate + preview.sqliteCwdRowsToUpdate : 0} index rows to ${preview?.targetProvider ?? targetProvider}. Stone+ creates a backup first. Continue?`)}
+        confirmLabel={t('创建备份并修复', 'Create backup and repair')}
         busy={busy === 'repair'}
         onCancel={() => setConfirmOpen(false)}
         onConfirm={() => void repair()}

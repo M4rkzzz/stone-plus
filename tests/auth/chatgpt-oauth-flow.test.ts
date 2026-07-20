@@ -164,6 +164,23 @@ describe('ChatGPT OAuth PKCE flow', () => {
     await expect(waiting).resolves.toMatchObject({ accountId: 'acct-loopback' })
   })
 
+  it('renders the loopback completion page in the selected English UI language', async () => {
+    const now = 1_800_000_000_000
+    const manager = new ChatGptOAuthFlowManager({ ports: [0], now: () => now })
+    managers.push(manager)
+    const started = await manager.start('en')
+    const state = new URL(started.authorizationUrl).searchParams.get('state') ?? ''
+    const waiting = manager.wait(started.sessionId, successfulExchange(now))
+
+    const response = await fetch(`${started.redirectUri}?code=english-code&state=${encodeURIComponent(state)}`)
+    const html = await response.text()
+
+    expect(response.status).toBe(200)
+    expect(html).toContain('OAuth authorization was received')
+    expect(html).not.toMatch(/[\u3400-\u9fff]/u)
+    await expect(waiting).resolves.toMatchObject({ accountId: 'acct-loopback' })
+  })
+
   it('cancels through the loopback endpoint and rejects an attached waiter', async () => {
     const manager = new ChatGptOAuthFlowManager({ ports: [0] })
     managers.push(manager)

@@ -1,15 +1,27 @@
 import { createHmac, randomBytes } from 'node:crypto'
 import type { ClientConfigEditorFile } from '@shared/types'
 import { parseJsonObject, stringifyJsonObject, type JsonObject } from './json-format'
-import { parseCodexToml } from './toml-format'
+import { parseCodexToml, patchCodexTomlPaths, type TomlValue } from './toml-format'
 import type { ClientConfigFilePath } from './types'
 import { ClientConfigValidationError } from './types'
 
 export const protectedValuePlaceholder = '__STONE_PROTECTED_VALUE__'
 const dotenvAssignment = /^(\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)(?:\s*=\s*))(.*)$/
 const sensitiveKey = /(?:token|secret|password|credential|api[_-]?key|authorization|cookie)/i
-const sensitiveContainer = /^(?:env|headers?|httpHeaders|envHttpHeaders|requestHeaders)$/i
+const sensitiveContainer = /^(?:env|headers?|http[_-]?headers?|env[_-]?http[_-]?headers?|request[_-]?headers?)$/i
+const knownNonSecretKeys = new Set([
+  'cli_auth_credentials_store',
+  'mcp_oauth_credentials_store',
+  'env_key',
+])
 const revisionKey = randomBytes(32)
+
+export function isSensitiveConfigPath(path: readonly string[]): boolean {
+  return path.some((part) => (
+    sensitiveContainer.test(part)
+    || (!knownNonSecretKeys.has(part) && sensitiveKey.test(part))
+  ))
+}
 
 export function createClientConfigEditorFile(
   file: ClientConfigFilePath,
@@ -48,7 +60,7 @@ export function createClientConfigEditorFile(
     ? protectJsonDocument(initial, file.role)
     : file.format === 'dotenv'
       ? protectDotenv(initial)
-      : { content: initial, count: 0 }
+      : protectTomlDocument(initial)
   return {
     role: file.role,
     path: file.path,
@@ -75,8 +87,7 @@ export function restoreClientConfigEditorContent(
   if (file.role === 'claude-mcp') return restoreClaudeMcp(draft, original)
   if (file.format === 'json') return restoreJsonDocument(draft, original, file.role)
   if (file.format === 'dotenv') return restoreDotenv(draft, original)
-  parseCodexToml(draft)
-  return draft
+  return restoreTomlDocument(draft, original)
 }
 
 export function revisionOf(source: string | undefined): string {
@@ -85,6 +96,77 @@ export function revisionOf(source: string | undefined): string {
 
 function defaultContent(format: ClientConfigFilePath['format']): string {
   return format === 'json' ? '{}\n' : ''
+}
+
+function isTomlValue(value: unknown): value is TomlValue {
+  return typeof value === 'string'
+    || typeof value === 'boolean'
+    || (typeof value === 'number' && Number.isFinite(value))
+    || (Array.isArray(value) && value.every((item) => typeof item === 'string'))
+}
+
+function collectSensitiveTomlPaths(
+  value: unknown,
+  path: string[] = [],
+  result: string[][] = [],
+): string[][] {
+  if (isTomlValue(value)) {
+    if (path.length && isSensitiveConfigPath(path)) result.push(path)
+    return result
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return result
+  for (const [key, child] of Object.entries(value)) collectSensitiveTomlPaths(child, [...path, key], result)
+  return result
+}
+
+function collectTomlPlaceholderPaths(
+  value: unknown,
+  path: string[] = [],
+  result: string[][] = [],
+): string[][] {
+  if (value === protectedValuePlaceholder) {
+    result.push(path)
+    return result
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return result
+  for (const [key, child] of Object.entries(value)) collectTomlPlaceholderPaths(child, [...path, key], result)
+  return result
+}
+
+function tomlValueAt(root: Record<string, unknown>, path: readonly string[]): unknown {
+  let current: unknown = root
+  for (const part of path) {
+    if (!current || typeof current !== 'object' || Array.isArray(current)) return undefined
+    current = (current as Record<string, unknown>)[part]
+  }
+  return current
+}
+
+function protectTomlDocument(content: string): { content: string; count: number } {
+  const root = parseCodexToml(content)
+  const protectedPaths = collectSensitiveTomlPaths(root)
+  if (!protectedPaths.length) return { content, count: 0 }
+  return {
+    content: patchCodexTomlPaths(content, protectedPaths.map((path) => ({
+      path,
+      value: protectedValuePlaceholder,
+    }))).content,
+    count: protectedPaths.length,
+  }
+}
+
+function restoreTomlDocument(draft: string, original: string): string {
+  const draftRoot = parseCodexToml(draft)
+  const originalRoot = parseCodexToml(original)
+  const placeholderPaths = collectTomlPlaceholderPaths(draftRoot)
+  if (!placeholderPaths.length) return draft
+  return patchCodexTomlPaths(draft, placeholderPaths.map((path) => {
+    const value = tomlValueAt(originalRoot, path)
+    if (!isTomlValue(value)) {
+      throw new ClientConfigValidationError('A protected value in codex-config no longer exists')
+    }
+    return { path, value }
+  })).content
 }
 
 function projectClaudeMcp(source: string | undefined): string {

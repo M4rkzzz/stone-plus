@@ -1,6 +1,7 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
 import { createServer, type Server, type ServerResponse } from 'node:http'
 import type { AddressInfo } from 'node:net'
+import type { UiLanguage } from '@shared/types'
 import { parseChatGptAccountImport, type ChatGptCredentialBundle } from './chatgpt-account'
 
 export const CHATGPT_OAUTH_ISSUER = 'https://auth.openai.com'
@@ -37,7 +38,7 @@ export interface ChatGptOAuthFlowOptions {
 }
 
 export interface ChatGptOAuthSessionController {
-  start(): Promise<ChatGptOAuthSessionStart>
+  start(language?: UiLanguage): Promise<ChatGptOAuthSessionStart>
   open(sessionId: string): Promise<void>
   submitCallback(sessionId: string, callbackUrl: string): void
   wait(sessionId: string, fetchImplementation?: typeof fetch): Promise<ChatGptCredentialBundle>
@@ -64,6 +65,7 @@ interface OAuthSession {
   timer?: ReturnType<typeof setTimeout>
   exchange?: Promise<ChatGptCredentialBundle>
   cancelled: boolean
+  language: UiLanguage
 }
 
 /**
@@ -96,7 +98,7 @@ export class ChatGptOAuthFlowManager {
     this.openExternal = options.openExternal
   }
 
-  async start(): Promise<ChatGptOAuthSessionStart> {
+  async start(language: UiLanguage = 'zh-CN'): Promise<ChatGptOAuthSessionStart> {
     this.pruneSessions()
     while (this.sessions.size >= MAX_ACTIVE_SESSIONS) {
       const oldest = this.sessions.keys().next().value as string | undefined
@@ -112,7 +114,7 @@ export class ChatGptOAuthFlowManager {
     // A user may close the dialog before wait() attaches. Keep rejection handled.
     void callback.promise.catch(() => undefined)
 
-    const binding = await this.bindLoopback(sessionId)
+    const binding = await this.bindLoopback(sessionId, language)
     const port = binding.port ?? this.ports[0] ?? CHATGPT_OAUTH_PORTS[0]
     const redirectUri = `http://localhost:${port}${CHATGPT_OAUTH_CALLBACK_PATH}`
     const authorizationUrl = buildAuthorizationUrl({
@@ -134,6 +136,7 @@ export class ChatGptOAuthFlowManager {
       callback,
       server: binding.server,
       cancelled: false,
+      language,
     }
     session.timer = setTimeout(() => this.expire(sessionId), this.sessionTtlMs)
     session.timer.unref?.()
@@ -187,10 +190,11 @@ export class ChatGptOAuthFlowManager {
 
   private async bindLoopback(
     sessionId: string,
+    language: UiLanguage,
   ): Promise<{ server?: Server; port?: number }> {
     for (const requestedPort of this.ports) {
       const server = createServer((request, response) => {
-        this.handleLoopbackRequest(sessionId, request.url ?? '/', response)
+        this.handleLoopbackRequest(sessionId, language, request.url ?? '/', response)
       })
       const bound = await listen(server, requestedPort)
       if (!bound) continue
@@ -202,6 +206,7 @@ export class ChatGptOAuthFlowManager {
 
   private handleLoopbackRequest(
     sessionId: string,
+    language: UiLanguage,
     requestUrl: string,
     response: ServerResponse,
   ): void {
@@ -211,14 +216,14 @@ export class ChatGptOAuthFlowManager {
       sendHtml(
         response,
         409,
-        'OAuth 授权会话尚未就绪或已经结束。',
+        oauthBrowserMessage(language, 'OAuth 授权会话尚未就绪或已经结束。'),
         path === CHATGPT_OAUTH_CALLBACK_PATH ? '/error' : undefined,
       )
       return
     }
     if (path === '/cancel') {
       this.cancel(sessionId)
-      sendHtml(response, 200, 'OAuth 授权已取消，可以关闭此页面。')
+      sendHtml(response, 200, oauthBrowserMessage(session.language, 'OAuth 授权已取消，可以关闭此页面。'))
       return
     }
     if (path !== CHATGPT_OAUTH_CALLBACK_PATH) {
@@ -227,9 +232,9 @@ export class ChatGptOAuthFlowManager {
     }
     try {
       this.acceptCallback(session, requestUrl)
-      sendHtml(response, 200, 'OAuth 授权已接收，请返回 Stone+ 完成账号检测。', '/success')
+      sendHtml(response, 200, oauthBrowserMessage(session.language, 'OAuth 授权已接收，请返回 Stone+ 完成账号检测。'), '/success')
     } catch (error) {
-      sendHtml(response, 400, safeErrorMessage(error), '/error')
+      sendHtml(response, 400, oauthBrowserMessage(session.language, safeErrorMessage(error)), '/error')
     }
   }
 
@@ -488,6 +493,27 @@ function oauthCallbackErrorMessage(code: string): string {
 
 function safeErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message.slice(0, 240) : 'OAuth 授权失败。'
+}
+
+const oauthBrowserEnglish = new Map<string, string>([
+  ['OAuth 授权会话尚未就绪或已经结束。', 'The OAuth session is not ready or has already ended.'],
+  ['OAuth 授权已取消，可以关闭此页面。', 'OAuth authorization was cancelled. You can close this page.'],
+  ['OAuth 授权已接收，请返回 Stone+ 完成账号检测。', 'OAuth authorization was received. Return to Stone+ to finish the account check.'],
+  ['OAuth 授权已取消。', 'OAuth authorization was cancelled.'],
+  ['OAuth 授权会话已过期，请重新开始。', 'The OAuth session expired. Start again in Stone+.'],
+  ['OAuth 回调地址来源不正确。', 'The OAuth callback origin is invalid.'],
+  ['回调地址路径不正确。', 'The OAuth callback path is invalid.'],
+  ['OAuth 回调 state 校验失败。', 'OAuth callback state validation failed.'],
+  ['OAuth 回调缺少授权码。', 'The OAuth callback is missing an authorization code.'],
+  ['OpenAI OAuth 授权已取消或被拒绝。', 'OpenAI OAuth authorization was cancelled or denied.'],
+  ['OpenAI 要求重新登录后再授权。', 'OpenAI requires you to sign in again before authorizing.'],
+  ['OpenAI OAuth 授权未完成，请重新开始。', 'OpenAI OAuth authorization did not complete. Start again in Stone+.'],
+  ['OAuth 授权失败。', 'OAuth authorization failed.'],
+])
+
+function oauthBrowserMessage(language: UiLanguage, message: string): string {
+  if (language === 'zh-CN' || !/[\u3400-\u9fff]/u.test(message)) return message
+  return oauthBrowserEnglish.get(message) ?? 'OAuth authorization could not be completed. Return to Stone+ and try again.'
 }
 
 function cleanToken(value: unknown): string {

@@ -46,7 +46,8 @@ export function resolveClientConfigPaths(options: ClientConfigPathOptions): Reso
     },
     codex: {
       directory: codexDirectory,
-      config: file('codex', 'codex-config', 'toml', pathApi.join(codexDirectory, 'config.toml'), false),
+      // Custom providers may embed bearer tokens or API keys directly in config.toml.
+      config: file('codex', 'codex-config', 'toml', pathApi.join(codexDirectory, 'config.toml'), true),
       auth: file('codex', 'codex-auth', 'json', pathApi.join(codexDirectory, 'auth.json'), true),
     },
     gemini: {

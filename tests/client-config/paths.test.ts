@@ -8,6 +8,7 @@ describe('resolveClientConfigPaths', () => {
 
     expect(linux.claude.settings.path).toBe('/home/alice/.claude/settings.json')
     expect(linux.codex.config.path).toBe('/home/alice/.codex/config.toml')
+    expect(linux.codex.config.containsCredential).toBe(true)
     expect(linux.codex.auth.path).toBe('/home/alice/.codex/auth.json')
     expect(linux.gemini.settings.path).toBe('/home/alice/.gemini/settings.json')
     expect(linux.gemini.env.path).toBe('/home/alice/.gemini/.env')

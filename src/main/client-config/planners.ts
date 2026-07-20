@@ -1,16 +1,17 @@
-import { mutateDotenv } from './dotenv-format'
-import { mutateJsonObject, objectField, type TextMutation } from './json-format'
-import { planCodexToml } from './toml-format'
+import { mutateDotenv, validateDotenv } from './dotenv-format'
+import { mutateJsonObject, objectField, type JsonObject, type TextMutation } from './json-format'
+import { planCodexToml, repairCodexToml } from './toml-format'
 import type {
   ClientConfigFilePath,
   ClientConfigPlan,
+  ClientConfigRepairPlan,
   ClientConnectionTarget,
   ExistingClientConfig,
   PlannedFileMutation,
   ResolvedClientConfigPaths,
   SupportedClient,
 } from './types'
-import { ClientConfigValidationError } from './types'
+import { ClientConfigParseError, ClientConfigValidationError } from './types'
 
 function normalizedTarget(target: ClientConnectionTarget): ClientConnectionTarget {
   if (!target.token.trim()) throw new ClientConfigValidationError('A non-empty local access token is required')
@@ -136,4 +137,135 @@ export function planClientConfig(
   if (client === 'claude') return planClaudeConfig(paths.claude, existing, target)
   if (client === 'codex') return planCodexConfig(paths.codex, existing, target)
   return planGeminiConfig(paths.gemini, existing, target)
+}
+
+const repairableRoles: Readonly<Record<SupportedClient, ReadonlySet<ClientConfigFilePath['role']>>> = {
+  claude: new Set(['claude-settings']),
+  codex: new Set(['codex-config', 'codex-auth']),
+  gemini: new Set(['gemini-settings', 'gemini-env']),
+}
+
+function repairObjectField(parent: JsonObject, key: string): JsonObject {
+  const current = parent[key]
+  if (typeof current === 'object' && current !== null && !Array.isArray(current)) {
+    return current as JsonObject
+  }
+  const replacement: JsonObject = {}
+  parent[key] = replacement
+  return replacement
+}
+
+function prepareJsonConnectionShape(
+  source: string | undefined,
+  role: ClientConfigFilePath['role'],
+  prepare: (root: JsonObject) => void,
+): string | undefined {
+  if (source === undefined) return undefined
+  return mutateJsonObject(source, role, prepare).content
+}
+
+/**
+ * Plan a conservative connection repair.
+ *
+ * Valid documents go through the normal structural mutators, preserving every
+ * user-owned model, MCP, plugin, project and unknown setting. Only a document
+ * that cannot be parsed (or whose required object shape is unusable) is replaced
+ * by the planner's minimal valid document.
+ */
+export function planClientConfigRepair(
+  client: SupportedClient,
+  paths: ResolvedClientConfigPaths,
+  existing: ExistingClientConfig,
+  target: ClientConnectionTarget,
+): ClientConfigRepairPlan {
+  const repairInput: ExistingClientConfig = { ...existing }
+  const rebuiltRoles: ClientConfigFilePath['role'][] = []
+  const repairable = repairableRoles[client]
+
+  if (client === 'codex' && repairInput['codex-config'] !== undefined) {
+    try {
+      const desired = normalizedTarget(target)
+      repairInput['codex-config'] = repairCodexToml(
+        repairInput['codex-config'],
+        `${desired.gatewayBaseUrl}/v1`,
+      ).content
+    } catch (error) {
+      if (!(error instanceof ClientConfigParseError)) throw error
+      delete repairInput['codex-config']
+      rebuiltRoles.push('codex-config')
+    }
+  }
+
+  // A valid JSON object with a scalar where a connection container belongs is
+  // still recoverable without throwing away sibling settings. Normalize only
+  // that owned path before the standard planner fills in Stone+ values.
+  if (client === 'claude' && repairInput['claude-settings'] !== undefined) {
+    try {
+      repairInput['claude-settings'] = prepareJsonConnectionShape(
+        repairInput['claude-settings'],
+        'claude-settings',
+        (root) => { repairObjectField(root, 'env') },
+      )
+    } catch (error) {
+      if (!(error instanceof ClientConfigParseError)) throw error
+      delete repairInput['claude-settings']
+      rebuiltRoles.push('claude-settings')
+    }
+  }
+
+  if (client === 'gemini' && repairInput['gemini-settings'] !== undefined) {
+    try {
+      repairInput['gemini-settings'] = prepareJsonConnectionShape(
+        repairInput['gemini-settings'],
+        'gemini-settings',
+        (root) => {
+          const security = repairObjectField(root, 'security')
+          repairObjectField(security, 'auth')
+        },
+      )
+    } catch (error) {
+      if (!(error instanceof ClientConfigParseError)) throw error
+      delete repairInput['gemini-settings']
+      rebuiltRoles.push('gemini-settings')
+    }
+  }
+
+  if (client === 'gemini' && repairInput['gemini-env'] !== undefined) {
+    try {
+      validateDotenv(repairInput['gemini-env'], 'gemini-env')
+    } catch (error) {
+      if (!(error instanceof ClientConfigParseError)) throw error
+      delete repairInput['gemini-env']
+      rebuiltRoles.push('gemini-env')
+    }
+  }
+
+  // More than one managed document may be damaged. Remove one bad source per
+  // iteration, then re-plan so every other valid document is still preserved.
+  for (let attempt = 0; attempt <= repairable.size; attempt += 1) {
+    try {
+      const plan = planClientConfig(client, paths, repairInput, target)
+      return {
+        ...plan,
+        files: plan.files.map((file) => ({
+          ...file,
+          existed: existing[file.role] !== undefined,
+          changed: file.content !== existing[file.role],
+        })),
+        rebuiltRoles,
+      }
+    } catch (error) {
+      if (
+        !(error instanceof ClientConfigParseError)
+        || !repairable.has(error.role)
+        || repairInput[error.role] === undefined
+      ) {
+        throw error
+      }
+      delete repairInput[error.role]
+      rebuiltRoles.push(error.role)
+    }
+  }
+
+  throw new ClientConfigValidationError(`Unable to repair ${client} configuration`)
 }

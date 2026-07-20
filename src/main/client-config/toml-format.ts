@@ -1,8 +1,8 @@
-import { parse, TomlError } from 'smol-toml'
+import { parse, stringify, TomlError } from 'smol-toml'
 import type { TextMutation } from './json-format'
 import { ClientConfigParseError } from './types'
 
-type TomlValue = string | boolean | number | string[]
+export type TomlValue = string | boolean | number | string[]
 
 interface TomlAssignment {
   key: string
@@ -37,6 +37,22 @@ export function parseCodexToml(content: string): Record<string, unknown> {
       : 'invalid TOML'
     throw new ClientConfigParseError('codex-config', detail)
   }
+}
+
+/** Locate an exact TOML assignment, including quoted tables and dotted keys. */
+export function locateCodexTomlPath(
+  content: string,
+  path: readonly string[],
+): { startLine: number; endLine: number } | undefined {
+  if (!path.length) return undefined
+  try {
+    parseCodexToml(content)
+  } catch {
+    return undefined
+  }
+  const lines = content.split(/\r?\n/)
+  const statement = locatedAssignments(lines).find((candidate) => samePath(candidate.absolutePath, [...path]))
+  return statement ? { startLine: statement.start + 1, endLine: statement.end + 1 } : undefined
 }
 
 function findProbePath(value: unknown, path: string[] = []): string[] | undefined {
@@ -189,6 +205,61 @@ function samePath(left: string[] | undefined, right: string[]): boolean {
   return left?.length === right.length && left.every((part, index) => part === right[index])
 }
 
+interface LocatedAssignment extends TomlStatement {
+  absolutePath: string[]
+}
+
+function locatedAssignments(lines: string[]): LocatedAssignment[] {
+  let tablePath: string[] = []
+  const result: LocatedAssignment[] = []
+  for (const statement of analyzeStatements(lines)) {
+    if (statement.kind === 'header' && statement.path) {
+      tablePath = statement.path
+      continue
+    }
+    if (statement.kind === 'assignment' && statement.path) {
+      result.push({ ...statement, absolutePath: [...tablePath, ...statement.path] })
+    }
+  }
+  return result
+}
+
+function tomlKeyPart(value: string): string {
+  return /^[A-Za-z0-9_-]+$/.test(value) ? value : JSON.stringify(value)
+}
+
+function setTopLevelPath(lines: string[], path: string[], value: TomlValue): void {
+  const statements = analyzeStatements(lines)
+  const firstHeader = statements.find((statement) => statement.kind === 'header')?.start ?? lines.length
+  const separator = firstHeader < lines.length && firstHeader > 0 && lines[firstHeader - 1] !== '' ? [''] : []
+  lines.splice(firstHeader, 0, `${path.map(tomlKeyPart).join('.')} = ${tomlValue(value)}`, ...separator)
+}
+
+function setPath(lines: string[], path: string[], value: TomlValue): void {
+  const existing = locatedAssignments(lines).find((statement) => samePath(statement.absolutePath, path))
+  if (existing) {
+    lines.splice(existing.start, existing.end - existing.start + 1, replaceValue(lines[existing.start], value))
+    return
+  }
+  if (path.length === 1) {
+    setTopLevel(lines, { key: path[0], value })
+    return
+  }
+  const parent = path.slice(0, -1)
+  if (sectionBounds(lines, parent)) {
+    setSection(lines, parent, [{ key: path.at(-1)!, value }])
+    return
+  }
+  // A dotted root assignment remains valid alongside later child tables and avoids
+  // redefining a table that another dotted assignment has already created.
+  setTopLevelPath(lines, path, value)
+}
+
+function removePath(lines: string[], path: string[]): void {
+  const existing = locatedAssignments(lines).find((statement) => samePath(statement.absolutePath, path))
+  if (existing) lines.splice(existing.start, existing.end - existing.start + 1)
+}
+
 function replaceValue(line: string, value: TomlValue): string {
   const equalsIndex = assignmentEqualsIndex(line)
   if (equalsIndex < 0) return line
@@ -236,17 +307,6 @@ function setTopLevel(lines: string[], assignment: TomlAssignment): void {
 
   const separator = firstHeader < lines.length && firstHeader > 0 && lines[firstHeader - 1] !== '' ? [''] : []
   lines.splice(firstHeader, 0, `${assignment.key} = ${tomlValue(assignment.value)}`, ...separator)
-}
-
-function removeTopLevel(lines: string[], key: string): void {
-  const statements = analyzeStatements(lines)
-  const firstHeader = statements.find((statement) => statement.kind === 'header')?.start ?? lines.length
-  const existing = statements.find((statement) => (
-    statement.kind === 'assignment'
-    && statement.start < firstHeader
-    && samePath(statement.path, [key])
-  ))
-  if (existing) lines.splice(existing.start, existing.end - existing.start + 1)
 }
 
 function sectionBounds(lines: string[], name: string[]): { start: number, end: number } | undefined {
@@ -329,9 +389,69 @@ export function planCodexToml(content: string | undefined, baseUrl: string): Tex
   return { content: next, changed: next !== content }
 }
 
+/**
+ * Repair the Stone provider even when a syntactically valid document used an
+ * incompatible TOML shape for one of Stone+'s owned paths. The normal
+ * format-preserving patch is always preferred. Re-serialization is a fallback
+ * only for that structural conflict and retains all unrelated parsed values.
+ * A genuinely malformed TOML document still throws so the service can back it
+ * up and rebuild a minimal document.
+ */
+export function repairCodexToml(content: string | undefined, baseUrl: string): TextMutation {
+  try {
+    return planCodexToml(content, baseUrl)
+  } catch (patchError) {
+    const source = content ?? ''
+    // This second parse deliberately distinguishes invalid syntax from a valid
+    // document whose managed fields merely have an incompatible value shape.
+    const root = parseCodexToml(source)
+    root.model_provider = 'stone'
+    root.cli_auth_credentials_store = 'file'
+
+    const providers = tomlObject(root.model_providers) ?? {}
+    root.model_providers = providers
+    const stone = tomlObject(providers.stone) ?? {}
+    providers.stone = stone
+    stone.name = 'OpenAI'
+    stone.base_url = baseUrl
+    stone.wire_api = 'responses'
+    stone.requires_openai_auth = true
+    delete stone.env_key
+
+    try {
+      let next = stringify(root)
+      if (source.includes('\r\n')) next = next.replace(/\n/g, '\r\n')
+      if (content !== undefined && !/\r?\n$/.test(source)) next = next.replace(/\r?\n$/, '')
+      parseCodexToml(next)
+      return { content: next, changed: next !== content }
+    } catch (error) {
+      // Preserve the original, redacted parse/patch failure contract rather
+      // than leaking arbitrary values through a serializer exception.
+      if (patchError instanceof ClientConfigParseError) throw patchError
+      throw error
+    }
+  }
+}
+
+function tomlObject(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined
+}
+
 export function patchCodexTomlTopLevel(
   content: string | undefined,
   patches: Readonly<Record<string, TomlValue | null>>,
+): TextMutation {
+  return patchCodexTomlPaths(content, Object.entries(patches).map(([key, value]) => ({
+    path: [key],
+    value,
+  })))
+}
+
+export function patchCodexTomlPaths(
+  content: string | undefined,
+  patches: ReadonlyArray<{ path: string[]; value: TomlValue | null }>,
 ): TextMutation {
   const source = content ?? ''
   parseCodexToml(source)
@@ -339,9 +459,14 @@ export function patchCodexTomlTopLevel(
   const trailingNewline = content === undefined || /\r?\n$/.test(source)
   const lines = source === '' ? [] : source.split(/\r?\n/)
   if (lines.at(-1) === '') lines.pop()
-  for (const [key, value] of Object.entries(patches)) {
-    if (value === null) removeTopLevel(lines, key)
-    else setTopLevel(lines, { key, value })
+  const submitted = new Set<string>()
+  for (const patch of patches) {
+    if (!patch.path.length) throw new ClientConfigParseError('codex-config', 'an empty setting path cannot be patched')
+    const identity = JSON.stringify(patch.path)
+    if (submitted.has(identity)) throw new ClientConfigParseError('codex-config', 'a setting path was patched more than once')
+    submitted.add(identity)
+    if (patch.value === null) removePath(lines, patch.path)
+    else setPath(lines, patch.path, patch.value)
   }
   let next = lines.join(eol)
   if (trailingNewline && next !== '') next += eol

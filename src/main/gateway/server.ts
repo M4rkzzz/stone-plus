@@ -240,6 +240,7 @@ export class GatewayServer implements GatewayController {
       this.writeJson(response, 404, { error: { message: 'Route not found', type: 'not_found_error' } })
       return
     }
+    const subagentRequest = enabledHeader(request.headers['x-openai-subagent'])
 
     this.totalRequests += 1
     this.activeRequests += 1
@@ -255,6 +256,9 @@ export class GatewayServer implements GatewayController {
     response.once('close', abortForClientDisconnect)
     let selectedAccount: Account | undefined
     let logRoute: Route | undefined
+    let requestLogId: string | undefined
+    let requestLogFinished = false
+    let failureStage: NonNullable<RequestLog['failureStage']> = 'body'
     let model = ''
     let failoverCount = 0
     let conversationId: string | undefined
@@ -268,14 +272,26 @@ export class GatewayServer implements GatewayController {
     let upstreamFirstByteAt: number | undefined
     let clientFirstWriteAt: number | undefined
     let successfulAttemptStarted: number | undefined
+    let liveUsage: NormalizedTokenUsage | undefined
+    let streamedBytes = 0
+    let streamedChunks = 0
+    let lastProgressLogAt = 0
+    let progressStage: NonNullable<RequestLog['progressStage']> = 'receiving-body'
     const markFirstToken = (): void => {
-      firstTokenAt ??= this.now()
+      if (firstTokenAt !== undefined) return
+      firstTokenAt = this.now()
+      emitProgressLog('streaming')
     }
     const markUpstreamFirstByte = (): void => {
-      upstreamFirstByteAt ??= this.now()
+      if (upstreamFirstByteAt !== undefined) return
+      upstreamFirstByteAt = this.now()
+      failureStage = 'stream'
+      emitProgressLog('streaming')
     }
     const markClientFirstWrite = (): void => {
-      clientFirstWriteAt ??= this.now()
+      if (clientFirstWriteAt !== undefined) return
+      clientFirstWriteAt = this.now()
+      emitProgressLog('streaming')
     }
     const phaseTimings = () => ({
       bodyReadMs,
@@ -283,8 +299,95 @@ export class GatewayServer implements GatewayController {
       credentialResolveMs,
       outboundFetchStartMs
     })
+    const emitProgressLog = (stage: NonNullable<RequestLog['progressStage']>, force = true): void => {
+      if (!requestLogId || !logRoute || requestLogFinished) return
+      progressStage = stage
+      const current = this.now()
+      if (!force && current - lastProgressLogAt < 750) return
+      lastProgressLogAt = current
+      this.emitLog(this.makeLog({
+        id: requestLogId,
+        route: logRoute,
+        account: selectedAccount,
+        model,
+        started,
+        finished: current,
+        conversationId,
+        conversationName,
+        firstTokenAt,
+        status: 'streaming',
+        progressStage,
+        usage: liveUsage,
+        failoverCount,
+        ...phaseTimings(),
+        upstreamHeadersAt,
+        upstreamFirstByteAt,
+        clientFirstWriteAt,
+        streamedBytes,
+        streamedChunks
+      }))
+    }
+    const recordStreamChunk = (byteLength: number): void => {
+      streamedBytes += Math.max(0, byteLength)
+      streamedChunks += 1
+      emitProgressLog('streaming', false)
+    }
+    const recordStreamUsage = (usage: NormalizedTokenUsage): void => {
+      liveUsage = { ...liveUsage, ...usage }
+      emitProgressLog('streaming')
+    }
+    const finishRequestLog = (input: {
+      account?: Account
+      finished?: number
+      status: 'success' | 'error'
+      statusCode: number
+      error?: string
+      usage?: NormalizedTokenUsage
+      accountFirstTokenMs?: number
+      recordPerformance?: boolean
+    }): RequestLog | undefined => {
+      if (!requestLogId || !logRoute || requestLogFinished) return undefined
+      requestLogFinished = true
+      const log = this.makeLog({
+        id: requestLogId,
+        route: logRoute,
+        account: input.account ?? selectedAccount,
+        model,
+        started,
+        finished: input.finished,
+        conversationId,
+        conversationName,
+        firstTokenAt,
+        status: input.status,
+        statusCode: input.statusCode,
+        error: input.error,
+        usage: input.usage ?? liveUsage,
+        failoverCount,
+        failureStage: input.status === 'error' ? failureStage : undefined,
+        ...phaseTimings(),
+        upstreamHeadersAt,
+        upstreamFirstByteAt,
+        clientFirstWriteAt,
+        accountFirstTokenMs: input.accountFirstTokenMs,
+        streamedBytes,
+        streamedChunks
+      })
+      if (input.status === 'success' && input.recordPerformance !== false) this.recordAccountPerformance(log)
+      this.emitLog(log)
+      return log
+    }
     try {
       logRoute = this.authenticate(request, incoming.protocol)
+      requestLogId = randomUUID()
+      this.emitLog(this.makeLog({
+        id: requestLogId,
+        route: logRoute,
+        model: '',
+        started,
+        finished: started,
+        status: 'streaming',
+        progressStage: 'receiving-body'
+      }))
       const body = await readJsonBody(request)
       bodyReadMs = Math.max(0, this.now() - started)
       model = getRequestModel(incoming.protocol, body, pathname)
@@ -294,6 +397,7 @@ export class GatewayServer implements GatewayController {
         throw new GatewayHttpError(400, 'A search session id is required')
       }
 
+      failureStage = 'scheduler'
       const pool = this.config.pools.find((candidate) => candidate.id === logRoute?.poolId)
       if (!pool) throw new GatewayHttpError(503, 'The matched route has no available pool')
       const providerAccounts = this.config.accounts.filter((account) =>
@@ -303,10 +407,14 @@ export class GatewayServer implements GatewayController {
       conversationId = sessionId
       conversationName = getConversationName(request, body)
       const resolveConversationNameForLog = async (): Promise<string | undefined> => {
-        conversationName ??= await this.resolveConversationName(sessionId)
+        if (!conversationName && sessionId) {
+          conversationName = await settleWithin(this.resolveConversationName(sessionId), 250)
+            ?? fallbackConversationName(sessionId)
+        }
         return conversationName
       }
       const targetModel = logRoute.modelMap[model] ?? model
+      emitProgressLog('scheduling')
       const streaming = !codexSearch && (body.stream === true || incoming.geminiMethod === 'streamGenerateContent')
       const responsesLite = incoming.protocol === 'openai-responses' && isChatGptCodexResponsesLiteBody(body)
       const schedulingPool = sessionId && (codexSearch || responsesLite)
@@ -314,10 +422,12 @@ export class GatewayServer implements GatewayController {
         : pool
       const retryLimit = Number.isFinite(pool.maxRetries) ? Math.max(0, Math.floor(pool.maxRetries)) : 0
       let lastRetryableError: GatewayHttpError | undefined
+      const failedAccountIds = new Set<string>()
 
       for (let attempt = 0; attempt <= retryLimit; attempt += 1) {
         let release: (() => void) | undefined
         let attemptedAccount: Account | undefined
+        let upstreamDeadline: AbortDeadline | undefined
         const attemptStarted = this.now()
         firstTokenAt = undefined
         schedulerSelectMs = undefined
@@ -335,7 +445,8 @@ export class GatewayServer implements GatewayController {
               pool: schedulingPool,
               accounts: providerAccounts,
               model: targetModel,
-              sessionId
+              sessionId,
+              excludedAccountIds: [...failedAccountIds]
             })
           } catch (error) {
             if (error instanceof NoEligibleAccountError && lastRetryableError) throw lastRetryableError
@@ -346,8 +457,10 @@ export class GatewayServer implements GatewayController {
           const account = scheduled.account
           attemptedAccount = account
           selectedAccount = account
+          failureStage = 'credential'
           release = this.runtimeTrackedRelease(scheduled.release, runtimeGeneration)
           this.emitRuntimeState()
+          emitProgressLog('resolving-credential')
 
           const provider = this.config.providers.find((candidate) => candidate.id === account.providerId)
           if (!provider) throw new GatewayHttpError(503, 'The selected account has no provider', 'account_unavailable')
@@ -373,6 +486,7 @@ export class GatewayServer implements GatewayController {
             ? { secret: resolvedValue, kind: 'api-key' as const }
             : resolvedValue
           const credential = resolvedCredential.secret
+          emitProgressLog('connecting')
 
           const upstreamHeaders = new Headers()
           if (resolvedCredential.kind === 'chatgpt-oauth') {
@@ -419,15 +533,18 @@ export class GatewayServer implements GatewayController {
                 model: targetModel,
                 stream: streaming
               })
+            const requestTimeoutMs = Math.max(1, this.config.settings.requestTimeoutSeconds) * 1000
+            upstreamDeadline = createAbortDeadline(requestTimeoutMs)
             const upstreamInit: RequestInit = {
               method: 'POST',
               headers: upstreamHeaders,
               body: JSON.stringify(upstreamBody),
               signal: AbortSignal.any([
                 clientAbortController.signal,
-                AbortSignal.timeout(Math.max(1, this.config.settings.requestTimeoutSeconds) * 1000)
+                upstreamDeadline.signal
               ])
             }
+            failureStage = 'connect'
             outboundFetchStartMs = Math.max(0, this.now() - started)
             upstreamResponse = await fetchWithOptionalHedge(
               outboundFetch,
@@ -438,6 +555,8 @@ export class GatewayServer implements GatewayController {
                 : undefined
             )
             upstreamHeadersAt = this.now()
+            failureStage = 'first-byte'
+            emitProgressLog('waiting-first-byte')
           } catch (error) {
             throw gatewayErrorFromProviderFailure(adapter.classifyFailure({ error, now: this.now() }))
           }
@@ -470,6 +589,14 @@ export class GatewayServer implements GatewayController {
             )
           }
 
+          // The absolute deadline remains active while a non-2xx response body
+          // is decoded. A successful stream switches to reset-on-chunk idle
+          // timeouts only after its response headers have been accepted.
+          if (streaming) {
+            upstreamDeadline?.clear()
+            upstreamDeadline = undefined
+          }
+
           if (codexSearch) {
             const payload = sanitizeUpstreamPayload(
               await readUpstreamJson(upstreamResponse),
@@ -484,25 +611,14 @@ export class GatewayServer implements GatewayController {
             release = undefined
             this.successRequests += 1
             await resolveConversationNameForLog()
-            const log = this.makeLog({
-              route: logRoute,
+            finishRequestLog({
               account,
-              model,
-              started,
               finished: completedAt,
-              conversationId,
-              conversationName,
-              firstTokenAt,
               status: 'success',
               statusCode: upstreamResponse.status,
-              failoverCount,
-              ...phaseTimings(),
-              upstreamHeadersAt,
-              upstreamFirstByteAt,
-              clientFirstWriteAt,
-              accountFirstTokenMs: firstTokenAt === undefined ? undefined : Math.max(0, firstTokenAt - attemptStarted)
+              accountFirstTokenMs: firstTokenAt === undefined ? undefined : Math.max(0, firstTokenAt - attemptStarted),
+              recordPerformance: false
             })
-            this.emitLog(log)
             return
           }
 
@@ -512,9 +628,12 @@ export class GatewayServer implements GatewayController {
                 MIN_FIRST_BODY_TIMEOUT_MS,
                 pool.firstBodyTimeoutMs ?? Math.floor(this.config.settings.requestTimeoutSeconds * 250)
               )),
+              idleTimeoutMs: Math.max(1, this.config.settings.requestTimeoutSeconds) * 1000,
               onFirstByte: markUpstreamFirstByte,
               onFirstToken: markFirstToken,
-              onClientWrite: markClientFirstWrite
+              onClientWrite: markClientFirstWrite,
+              onChunk: recordStreamChunk,
+              onUsage: recordStreamUsage
             }
             const streamResult = incoming.protocol === provider.protocol
               ? await pipeUpstreamResponse(upstreamResponse, response, provider.protocol, sensitiveValues(resolvedCredential), streamTiming)
@@ -527,14 +646,19 @@ export class GatewayServer implements GatewayController {
                 sensitiveValues(resolvedCredential),
                 streamTiming
               )
-            if (!streamResult.completed) {
-              throw gatewayErrorFromProviderFailure(adapter.classifyFailure({
-                error: new DOMException('Client disconnected', 'AbortError'),
-                now: this.now()
-              }))
-            }
+            if (streamResult.failure) throw streamResult.failure
             if (streamResult.error) {
               throw new GatewayHttpError(502, streamResult.error, 'upstream_stream_error')
+            }
+            if (!streamResult.completed) {
+              if (clientAbortController.signal.aborted || response.destroyed) {
+                throw new GatewayHttpError(499, 'Client closed the request', 'client_closed')
+              }
+              throw new GatewayHttpError(
+                502,
+                'Upstream stream ended before a terminal event',
+                'upstream_stream_error'
+              )
             }
             const completedAt = this.now()
             this.reportAccountSuccess(account, attemptStarted, headerSignals)
@@ -542,27 +666,14 @@ export class GatewayServer implements GatewayController {
             release = undefined
             this.successRequests += 1
             await resolveConversationNameForLog()
-            const log = this.makeLog({
-              route: logRoute,
+            finishRequestLog({
               account,
-              model,
-              started,
               finished: completedAt,
-              conversationId,
-              conversationName,
-              firstTokenAt,
               status: 'success',
               statusCode: upstreamResponse.status,
               usage: normalizeLogUsage(streamResult.usage),
-              failoverCount,
-              ...phaseTimings(),
-              upstreamHeadersAt,
-              upstreamFirstByteAt,
-              clientFirstWriteAt,
               accountFirstTokenMs: firstTokenAt === undefined ? undefined : Math.max(0, firstTokenAt - attemptStarted)
             })
-            this.recordAccountPerformance(log)
-            this.emitLog(log)
             return
           }
 
@@ -594,24 +705,33 @@ export class GatewayServer implements GatewayController {
           release = undefined
           this.successRequests += 1
           await resolveConversationNameForLog()
-          const log = this.makeLog({
-            route: logRoute, account, model, started, finished: completedAt, conversationId, conversationName,
-            firstTokenAt, status: 'success', statusCode: 200, usage, failoverCount,
-            ...phaseTimings(),
-            upstreamHeadersAt, upstreamFirstByteAt, clientFirstWriteAt,
+          finishRequestLog({
+            account, finished: completedAt, status: 'success', statusCode: 200, usage,
             accountFirstTokenMs: firstTokenAt === undefined ? undefined : Math.max(0, firstTokenAt - attemptStarted)
           })
-          this.recordAccountPerformance(log)
-          this.emitLog(log)
           return
         } catch (error) {
           if (clientAbortController.signal.aborted) {
+            failureStage = 'client'
+            // No client-visible output means this session never proved that
+            // the tentative assignment works. Move only this session next
+            // time, without penalizing the account globally.
+            if (!subagentRequest && attemptedAccount && clientFirstWriteAt === undefined) {
+              this.scheduler.recordStickyFailure(schedulingPool.id, sessionId, attemptedAccount.id)
+            }
             throw new GatewayHttpError(499, 'Client closed the request', 'client_closed')
           }
           const gatewayError = normalizeError(error)
           const retryable = isRetryable(gatewayError)
           const accountAction = gatewayError.providerFailure?.accountAction
-          if (attemptedAccount && (retryable || accountAction === 'disable' || accountAction === 'cooldown')) {
+          const provenAccountFailure = retryable
+            || accountAction === 'disable'
+            || accountAction === 'cooldown'
+            || gatewayError.statusCode === 502
+            || gatewayError.statusCode === 504
+          if (attemptedAccount && provenAccountFailure) {
+            failedAccountIds.add(attemptedAccount.id)
+            this.scheduler.recordStickyFailure(schedulingPool.id, sessionId, attemptedAccount.id)
             const failureNow = this.now()
             const actualResetAt = quotaSignalCooldownUntil(gatewayError.quotaSignals, failureNow)
             const retryAfterMs = Math.max(
@@ -640,7 +760,9 @@ export class GatewayServer implements GatewayController {
           if (!canRetry) throw gatewayError
           lastRetryableError = gatewayError
           failoverCount += 1
+          emitProgressLog('retrying')
         } finally {
+          upstreamDeadline?.clear()
           release?.()
         }
       }
@@ -648,23 +770,37 @@ export class GatewayServer implements GatewayController {
       const gatewayError = clientAbortController.signal.aborted
         ? new GatewayHttpError(499, 'Client closed the request', 'client_closed')
         : normalizeError(error)
+      const successfulSubagentCancellation = clientAbortController.signal.aborted && subagentRequest
+      if (clientAbortController.signal.aborted) failureStage = 'client'
       this.writeJson(
         response,
         gatewayError.statusCode,
         gatewayError.responseBody ?? { error: { message: gatewayError.message, type: gatewayError.type } }
       )
-      if (logRoute && selectedAccount) {
-        conversationName ??= await this.resolveConversationName(conversationId)
-        this.emitLog(this.makeLog({
-          route: logRoute, account: selectedAccount, model, started, conversationId, conversationName, firstTokenAt,
-          status: 'error', statusCode: gatewayError.statusCode, error: gatewayError.message, failoverCount,
-          ...phaseTimings(),
-          upstreamHeadersAt, upstreamFirstByteAt, clientFirstWriteAt,
-          accountFirstTokenMs: firstTokenAt === undefined || successfulAttemptStarted === undefined
-            ? undefined : Math.max(0, firstTokenAt - successfulAttemptStarted)
-        }))
-      }
+      if (!conversationName && conversationId) conversationName = fallbackConversationName(conversationId)
+      const finishedLog = finishRequestLog({
+        status: successfulSubagentCancellation ? 'success' : 'error',
+        statusCode: gatewayError.statusCode,
+        error: successfulSubagentCancellation ? undefined : gatewayError.message,
+        accountFirstTokenMs: firstTokenAt === undefined || successfulAttemptStarted === undefined
+          ? undefined : Math.max(0, firstTokenAt - successfulAttemptStarted),
+        recordPerformance: !successfulSubagentCancellation
+      })
+      if (finishedLog && successfulSubagentCancellation) this.successRequests += 1
     } finally {
+      if (requestLogId && !requestLogFinished) {
+        const successfulSubagentCancellation = clientAbortController.signal.aborted && subagentRequest
+        if (clientAbortController.signal.aborted) failureStage = 'client'
+        const finishedLog = finishRequestLog({
+          status: successfulSubagentCancellation ? 'success' : 'error',
+          statusCode: clientAbortController.signal.aborted ? 499 : 500,
+          error: successfulSubagentCancellation
+            ? undefined
+            : clientAbortController.signal.aborted ? 'Client closed the request' : 'Gateway request ended unexpectedly',
+          recordPerformance: !successfulSubagentCancellation
+        })
+        if (finishedLog && successfulSubagentCancellation) this.successRequests += 1
+      }
       request.off('aborted', abortForClientDisconnect)
       response.off('close', abortForClientDisconnect)
       if (runtimeGeneration === this.runtimeGeneration) {
@@ -757,8 +893,9 @@ export class GatewayServer implements GatewayController {
   }
 
   private makeLog(input: {
+    id?: string
     route: Route
-    account: Account
+    account?: Account
     model: string
     started: number
     finished?: number
@@ -774,26 +911,34 @@ export class GatewayServer implements GatewayController {
     clientFirstWriteAt?: number
     accountFirstTokenMs?: number
     status: RequestLog['status']
+    progressStage?: RequestLog['progressStage']
     statusCode?: number
     error?: string
+    failureStage?: RequestLog['failureStage']
     usage?: NormalizedTokenUsage
     failoverCount?: number
+    streamedBytes?: number
+    streamedChunks?: number
   }): RequestLog {
-    const providerName = this.config.providers.find((provider) => provider.id === input.account.providerId)?.name ?? 'Unknown provider'
+    const providerName = input.account
+      ? this.config.providers.find((provider) => provider.id === input.account?.providerId)?.name ?? 'Unknown provider'
+      : '等待选择'
     const usage = input.usage
     const finished = input.finished ?? this.now()
     return {
-      id: randomUUID(),
-      accountId: input.account.id,
+      id: input.id ?? randomUUID(),
+      accountId: input.account?.id,
       conversationId: input.conversationId,
       conversationName: input.conversationName,
       timestamp: finished,
+      startedAt: input.started,
       client: input.route.client,
       protocol: input.route.inboundProtocol,
       providerName,
-      accountName: input.account.name,
+      accountName: input.account?.name ?? '等待选择',
       model: input.model,
       status: input.status,
+      progressStage: input.status === 'streaming' ? input.progressStage : undefined,
       statusCode: input.statusCode,
       latencyMs: Math.max(0, finished - input.started),
       bodyReadMs: input.bodyReadMs,
@@ -807,10 +952,13 @@ export class GatewayServer implements GatewayController {
       firstTokenMs: input.firstTokenAt === undefined ? undefined : Math.max(0, input.firstTokenAt - input.started),
       inputTokens: usage?.inputTokens,
       outputTokens: usage?.outputTokens,
+      streamedBytes: input.streamedBytes,
+      streamedChunks: input.streamedChunks,
       cachedInputTokens: usage?.cachedInputTokens,
       reasoningTokens: usage?.reasoningTokens,
       failoverCount: input.failoverCount,
-      error: input.error
+      error: input.error,
+      failureStage: input.failureStage
     }
   }
 
@@ -1050,6 +1198,10 @@ async function collectOpenAiResponsesUpstream(
     const { done, value } = await reader.read()
     if (done) break
     collector.push(value)
+    if (collector.isComplete()) {
+      await reader.cancel().catch(() => undefined)
+      break
+    }
   }
   return collector.finish()
 }
@@ -1134,13 +1286,37 @@ interface StreamPipeResult {
     reasoning_tokens?: number
   }
   error?: string
+  failure?: GatewayHttpError
 }
 
 interface StreamTimingCallbacks {
   firstBodyTimeoutMs: number
+  idleTimeoutMs: number
   onFirstByte?: () => void
   onFirstToken?: () => void
   onClientWrite?: () => void
+  onChunk?: (byteLength: number) => void
+  onUsage?: (usage: NormalizedTokenUsage) => void
+}
+
+interface AbortDeadline {
+  signal: AbortSignal
+  clear(): void
+}
+
+function createAbortDeadline(timeoutMs: number): AbortDeadline {
+  const controller = new AbortController()
+  let timer: ReturnType<typeof setTimeout> | undefined = setTimeout(() => {
+    timer = undefined
+    controller.abort(new DOMException('Upstream request timed out', 'TimeoutError'))
+  }, timeoutMs)
+  return {
+    signal: controller.signal,
+    clear: () => {
+      if (timer !== undefined) clearTimeout(timer)
+      timer = undefined
+    }
+  }
 }
 
 async function pipeUpstreamResponse(
@@ -1159,11 +1335,13 @@ async function pipeUpstreamResponse(
   const usage: NonNullable<StreamPipeResult['usage']> = {}
   let streamError: string | undefined
   let terminalObserved = false
+  let stopObserved = false
   let completedToolCallObserved = false
   let completedMessageObserved = false
   const pendingToolCalls = new Set<number>()
   const logicalCompletionObserved = (): boolean => (
     terminalObserved
+    || stopObserved
     || ((completedMessageObserved || completedToolCallObserved) && pendingToolCalls.size === 0)
   )
   let observationFailed = false
@@ -1175,6 +1353,8 @@ async function pipeUpstreamResponse(
         if (event.totalTokens !== undefined) usage.total_tokens = event.totalTokens
         if (event.cachedInputTokens !== undefined) usage.cached_input_tokens = event.cachedInputTokens
         if (event.reasoningTokens !== undefined) usage.reasoning_tokens = event.reasoningTokens
+        const normalizedUsage = normalizeLogUsage(usage)
+        if (normalizedUsage) timing.onUsage?.(normalizedUsage)
       } else if (event.type === 'error') {
         streamError = redactSensitiveText(event.message, secrets)
       } else if (event.type === 'tool-call-delta') {
@@ -1184,10 +1364,13 @@ async function pipeUpstreamResponse(
         pendingToolCalls.delete(event.index)
       } else if (acceptTerminal && event.type === 'message-complete') {
         completedMessageObserved = true
-      } else if (acceptTerminal && (
-        event.type === 'done' || (event.type === 'stop' && event.reason === 'tool_calls')
-      )) {
+      } else if (acceptTerminal && event.type === 'done') {
         terminalObserved = true
+      } else if (acceptTerminal && event.type === 'stop') {
+        stopObserved = true
+        // Keep reading ordinary completions for trailing usage/[DONE]. A fully
+        // materialized tool call can be handed back immediately.
+        if (event.reason === 'tool_calls') terminalObserved = true
       }
       if (meaningfulStreamEvent(event)) timing.onFirstToken?.()
     }
@@ -1217,6 +1400,7 @@ async function pipeUpstreamResponse(
     response.setHeader('x-accel-buffering', upstream.headers.get('x-accel-buffering') ?? 'no')
     response.flushHeaders()
     const consume = async (value: Uint8Array): Promise<boolean> => {
+      timing.onChunk?.(value.byteLength)
       const events = parser.push(value)
       observeSafely(() => events)
       if (response.destroyed) return false
@@ -1230,12 +1414,20 @@ async function pipeUpstreamResponse(
       await reader.cancel()
       return streamPipeResult(logicalCompletionObserved(), usage, streamError)
     }
-    for (;;) {
-      const { done, value } = await reader.read()
-      if (done) break
-      if (!await consume(value)) {
-        await reader.cancel()
-        return streamPipeResult(logicalCompletionObserved(), usage, streamError)
+    if (terminalObserved) {
+      await reader.cancel().catch(() => undefined)
+    } else {
+      for (;;) {
+        const { done, value } = await readIdleStreamChunk(reader, timing.idleTimeoutMs)
+        if (done) break
+        if (!await consume(value)) {
+          await reader.cancel()
+          return streamPipeResult(logicalCompletionObserved(), usage, streamError)
+        }
+        if (terminalObserved) {
+          await reader.cancel().catch(() => undefined)
+          break
+        }
       }
     }
     if (response.destroyed && logicalCompletionObserved()) {
@@ -1255,7 +1447,7 @@ async function pipeUpstreamResponse(
     response.off('close', cancelOnClose)
     if (response.headersSent && !response.writableEnded && !response.destroyed) response.end()
   }
-  return streamPipeResult(logicalCompletionObserved() || !response.destroyed, usage, streamError)
+  return streamPipeResult(logicalCompletionObserved(), usage, streamError)
 }
 
 async function pipeConvertedUpstreamResponse(
@@ -1275,12 +1467,15 @@ async function pipeConvertedUpstreamResponse(
   const reader = upstream.body.getReader()
   const usage: NonNullable<StreamPipeResult['usage']> = {}
   let streamError: string | undefined
+  let streamFailure: GatewayHttpError | undefined
   let terminalObserved = false
+  let stopObserved = false
   let completedToolCallObserved = false
   let completedMessageObserved = false
   const pendingToolCalls = new Set<number>()
   const logicalCompletionObserved = (): boolean => (
     terminalObserved
+    || stopObserved
     || ((completedMessageObserved || completedToolCallObserved) && pendingToolCalls.size === 0)
   )
   const cancelOnClose = (): void => {
@@ -1302,6 +1497,8 @@ async function pipeConvertedUpstreamResponse(
         if (safeEvent.totalTokens !== undefined) usage.total_tokens = safeEvent.totalTokens
         if (safeEvent.cachedInputTokens !== undefined) usage.cached_input_tokens = safeEvent.cachedInputTokens
         if (safeEvent.reasoningTokens !== undefined) usage.reasoning_tokens = safeEvent.reasoningTokens
+        const normalizedUsage = normalizeLogUsage(usage)
+        if (normalizedUsage) timing.onUsage?.(normalizedUsage)
       } else if (safeEvent.type === 'error') {
         streamError = safeEvent.message
       } else if (safeEvent.type === 'tool-call-delta') {
@@ -1311,10 +1508,11 @@ async function pipeConvertedUpstreamResponse(
         pendingToolCalls.delete(safeEvent.index)
       } else if (acceptTerminal && safeEvent.type === 'message-complete') {
         completedMessageObserved = true
-      } else if (acceptTerminal && (
-        safeEvent.type === 'done' || (safeEvent.type === 'stop' && safeEvent.reason === 'tool_calls')
-      )) {
+      } else if (acceptTerminal && safeEvent.type === 'done') {
         terminalObserved = true
+      } else if (acceptTerminal && safeEvent.type === 'stop') {
+        stopObserved = true
+        if (safeEvent.reason === 'tool_calls') terminalObserved = true
       }
       if (meaningfulStreamEvent(safeEvent)) timing.onFirstToken?.()
       if (!await writeStreamChunks(response, encoder.encode(safeEvent), timing.onClientWrite)) return false
@@ -1329,6 +1527,7 @@ async function pipeConvertedUpstreamResponse(
       throw new GatewayHttpError(502, 'Upstream stream ended before its first body chunk', 'upstream_stream_error')
     }
     timing.onFirstByte?.()
+    timing.onChunk?.(first.value.byteLength)
     response.statusCode = upstream.status
     response.setHeader('content-type', 'text/event-stream; charset=utf-8')
     response.setHeader('cache-control', 'no-cache')
@@ -1338,12 +1537,21 @@ async function pipeConvertedUpstreamResponse(
       await reader.cancel()
       return streamPipeResult(logicalCompletionObserved(), usage, streamError)
     }
-    for (;;) {
-      const { done, value } = await reader.read()
-      if (done) break
-      if (!await forward(parser.push(value))) {
-        await reader.cancel()
-        return streamPipeResult(logicalCompletionObserved(), usage, streamError)
+    if (terminalObserved) {
+      await reader.cancel().catch(() => undefined)
+    } else {
+      for (;;) {
+        const { done, value } = await readIdleStreamChunk(reader, timing.idleTimeoutMs)
+        if (done) break
+        timing.onChunk?.(value.byteLength)
+        if (!await forward(parser.push(value))) {
+          await reader.cancel()
+          return streamPipeResult(logicalCompletionObserved(), usage, streamError)
+        }
+        if (terminalObserved) {
+          await reader.cancel().catch(() => undefined)
+          break
+        }
       }
     }
     if (response.destroyed && logicalCompletionObserved()) {
@@ -1359,8 +1567,9 @@ async function pipeConvertedUpstreamResponse(
     // failover. Do not turn it into an implicit HTTP 200 error stream.
     if (!response.headersSent) throw error
     streamError = error instanceof Error ? error.message : 'Upstream stream failed'
+    streamFailure = error instanceof GatewayHttpError ? error : undefined
     await forward([
-      { type: 'error', message: streamError, errorType: 'upstream_stream_error' },
+      { type: 'error', message: streamError, errorType: streamFailure?.type ?? 'upstream_stream_error' },
       { type: 'done' }
     ])
     await writeStreamChunks(response, encoder.finish(), timing.onClientWrite)
@@ -1369,18 +1578,20 @@ async function pipeConvertedUpstreamResponse(
     if (response.headersSent && !response.writableEnded && !response.destroyed) response.end()
   }
 
-  return streamPipeResult(logicalCompletionObserved() || !response.destroyed, usage, streamError)
+  return streamPipeResult(logicalCompletionObserved(), usage, streamError, streamFailure)
 }
 
 function streamPipeResult(
   completed: boolean,
   usage: NonNullable<StreamPipeResult['usage']>,
-  error?: string
+  error?: string,
+  failure?: GatewayHttpError
 ): StreamPipeResult {
   return {
     completed,
     ...(Object.keys(usage).length > 0 ? { usage } : {}),
-    ...(error ? { error } : {})
+    ...(error ? { error } : {}),
+    ...(failure ? { failure } : {})
   }
 }
 
@@ -1411,6 +1622,32 @@ async function readFirstStreamChunk(
         'upstream_first_body_timeout'
       )), timeoutMs)
     })
+    for (;;) {
+      const result = await Promise.race([reader.read(), timeout])
+      if (result.done || (result.value?.byteLength ?? 0) > 0) return result
+    }
+  } catch (error) {
+    void reader.cancel().catch(() => undefined)
+    throw error
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
+async function readIdleStreamChunk(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  timeoutMs: number
+): Promise<ReadableStreamReadResult<Uint8Array>> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    const timeout = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(new GatewayHttpError(
+        504,
+        `Upstream stream produced no data for ${timeoutMs} ms`,
+        'upstream_stream_idle_timeout'
+      )), timeoutMs)
+    })
+    // Empty chunks are transport noise and must not reset the idle deadline.
     for (;;) {
       const result = await Promise.race([reader.read(), timeout])
       if (result.done || (result.value?.byteLength ?? 0) > 0) return result
@@ -1472,6 +1709,13 @@ function getSessionId(request: IncomingMessage, body: JsonObject): string | unde
     body.id
   ]
   return candidates.find((value): value is string => typeof value === 'string' && Boolean(value.trim()))?.trim()
+}
+
+function enabledHeader(value: string | string[] | undefined): boolean {
+  const first = Array.isArray(value) ? value[0] : value
+  if (typeof first !== 'string') return false
+  const normalized = first.trim().toLowerCase()
+  return Boolean(normalized) && !['0', 'false', 'no', 'off'].includes(normalized)
 }
 
 function getConversationName(request: IncomingMessage, body: JsonObject): string | undefined {

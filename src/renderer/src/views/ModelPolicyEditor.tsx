@@ -1,7 +1,9 @@
 import { useMemo, useState } from 'react'
 import { AlertTriangle, Check, CheckCircle2, LoaderCircle, Play, RefreshCw, Search, XCircle } from 'lucide-react'
 import type { AccountModelTestResult, ModelPolicy } from '@shared/types'
-import { Badge, relativeTime } from '../ui'
+import { localizeBackendError, localizeBackendMessage } from '../backend-message'
+import { useI18n } from '../i18n'
+import { Badge, InfoTip, relativeTime } from '../ui'
 import { normalizeModelNames } from '../model-policy'
 import { modelTestCompleted, modelTestFailed, modelTestTitle, type ModelTestState } from '../model-test-state'
 
@@ -26,8 +28,8 @@ export function ModelPolicyEditor({
   refreshDisabledReason,
   refreshedAt,
   catalogNotice,
-  emptyMessage = '尚无可用模型。',
-  emptySelectionMessage = '当前明确不开放任何模型。',
+  emptyMessage,
+  emptySelectionMessage,
 }: {
   title: string
   description: string
@@ -46,6 +48,7 @@ export function ModelPolicyEditor({
   emptyMessage?: string
   emptySelectionMessage?: string
 }) {
+  const { t, language, locale } = useI18n()
   const [query, setQuery] = useState('')
   const [manualModel, setManualModel] = useState('')
   const [testStates, setTestStates] = useState<Record<string, ModelTestState>>({})
@@ -69,9 +72,17 @@ export function ModelPolicyEditor({
     setTestStates((current) => ({ ...current, [normalizedModel]: { status: 'testing' } }))
     try {
       const result = await onTestModel(normalizedModel)
-      setTestStates((current) => ({ ...current, [normalizedModel]: modelTestCompleted(result) }))
+      const completed = modelTestCompleted(result, t('模型未返回有效响应', 'The model did not return a valid response.'))
+      const localized = completed.status === 'failure'
+        ? { ...completed, message: localizeBackendMessage(completed.message, language, t('模型未返回有效响应', 'The model did not return a valid response.')) }
+        : completed
+      setTestStates((current) => ({ ...current, [normalizedModel]: localized }))
     } catch (cause) {
-      setTestStates((current) => ({ ...current, [normalizedModel]: modelTestFailed(cause) }))
+      const fallback = t('模型测试失败', 'Model test failed.')
+      setTestStates((current) => ({
+        ...current,
+        [normalizedModel]: modelTestFailed(new Error(localizeBackendError(cause, language, fallback)), fallback),
+      }))
     }
   }
 
@@ -89,25 +100,25 @@ export function ModelPolicyEditor({
             className="button button--secondary model-policy__refresh"
             type="button"
             disabled={refreshing || Boolean(refreshDisabledReason)}
-            title={refreshDisabledReason ?? '使用此账号刷新可用模型'}
+            title={refreshDisabledReason ?? t('使用此账号刷新可用模型', 'Refresh available models using this account')}
             onClick={onRefresh}
           >
             {refreshing ? <LoaderCircle size={15} className="spin" /> : <RefreshCw size={15} />}
-            {refreshing ? '正在拉取' : '刷新可用模型'}
+            {refreshing ? t('正在拉取', 'Refreshing') : t('刷新可用模型', 'Refresh models')}
           </button>
         )}
       </div>
 
       <div className="model-policy__meta">
-        <Badge tone={policy === 'all' ? 'info' : 'neutral'}>{policy === 'all' ? '全部开放' : `指定开放 ${selectedModels.length}`}</Badge>
-        <span>{options.length} 个候选模型</span>
-        {refreshedAt !== undefined && <span>更新于 {relativeTime(refreshedAt)}</span>}
+        <Badge tone={policy === 'all' ? 'info' : 'neutral'}>{policy === 'all' ? t('全部开放', 'All models') : t(`指定开放 ${selectedModels.length}`, `${selectedModels.length} selected`)}</Badge>
+        <span>{t(`${options.length} 个候选模型`, `${options.length} candidate ${options.length === 1 ? 'model' : 'models'}`)}</span>
+        {refreshedAt !== undefined && <span>{t('更新于', 'Updated')} {relativeTime(refreshedAt, locale)}</span>}
         {refreshDisabledReason && <span>{refreshDisabledReason}</span>}
       </div>
 
       {catalogNotice && <div className="model-policy__notice"><AlertTriangle size={15} /><span>{catalogNotice}</span></div>}
 
-      <div className="model-policy__modes" role="radiogroup" aria-label={`${title}策略`}>
+      <div className="model-policy__modes" role="radiogroup" aria-label={t(`${title}策略`, `${title} policy`)}>
         <button
           type="button"
           role="radio"
@@ -116,7 +127,7 @@ export function ModelPolicyEditor({
           onClick={() => onPolicyChange('all')}
         >
           <span className="radio-mark">{policy === 'all' && <Check size={13} />}</span>
-          <span><strong>全部开放</strong><small>目录更新后自动包含新增模型</small></span>
+          <span><strong>{t('全部开放', 'Allow all')}<InfoTip text={t('目录更新后自动包含新增模型。', 'Automatically include new models when the catalog is updated.')} focusable={false} /></strong></span>
         </button>
         <button
           type="button"
@@ -126,21 +137,21 @@ export function ModelPolicyEditor({
           onClick={() => onPolicyChange('selected')}
         >
           <span className="radio-mark">{policy === 'selected' && <Check size={13} />}</span>
-          <span><strong>指定开放</strong><small>只开放下方明确勾选的模型</small></span>
+          <span><strong>{t('指定开放', 'Allow selected')}<InfoTip text={t('只开放下方明确勾选的模型。', 'Allow only the models explicitly selected below.')} focusable={false} /></strong></span>
         </button>
       </div>
 
       {options.length > 0 && (
         <div className="model-policy__toolbar">
-          <label className="model-policy__search"><Search size={15} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索模型" /></label>
-          {policy === 'selected' && <><button className="text-button" type="button" onClick={() => onSelectedModelsChange(options.map((option) => option.model))}>全选</button><button className="text-button" type="button" onClick={() => onSelectedModelsChange([])}>清空</button></>}
+          <label className="model-policy__search"><Search size={15} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={t('搜索模型', 'Search models')} /></label>
+          {policy === 'selected' && <><button className="text-button" type="button" onClick={() => onSelectedModelsChange(options.map((option) => option.model))}>{t('全选', 'Select all')}</button><button className="text-button" type="button" onClick={() => onSelectedModelsChange([])}>{t('清空', 'Clear')}</button></>}
         </div>
       )}
 
       {onTestModel && (
         <div className="model-policy__manual-test">
           <label>
-            <span>测试其他模型</span>
+            <span>{t('测试其他模型', 'Test another model')}</span>
             <input
               className="mono"
               value={manualModel}
@@ -150,27 +161,27 @@ export function ModelPolicyEditor({
                 event.preventDefault()
                 void testModel(manualModel)
               }}
-              placeholder="例如 gpt-5.6-sol"
+              placeholder={t('例如 gpt-5.6-sol', 'e.g. gpt-5.6-sol')}
             />
           </label>
           <button
             className="button button--secondary"
             type="button"
-            title={testDisabledReason ?? (manualModel.trim() ? modelTestTitle(manualModel.trim(), manualTestState) : '输入完整的模型标识')}
+            title={testDisabledReason ?? (manualModel.trim() ? modelTestTitle(manualModel.trim(), manualTestState, language) : t('输入完整的模型标识', 'Enter a complete model identifier'))}
             disabled={!manualModel.trim() || Boolean(testDisabledReason) || manualTestState?.status === 'testing'}
             onClick={() => void testModel(manualModel)}
           >
             {manualTestState?.status === 'testing' ? <LoaderCircle size={15} className="spin" /> : <Play size={15} />}
-            测试
+            {t('测试', 'Test')}
           </button>
           {manualTestState && manualTestState.status !== 'testing' && (
             <span
               className={`model-policy__manual-result is-${manualTestState.status}`}
-              title={modelTestTitle(manualModel.trim(), manualTestState)}
+              title={modelTestTitle(manualModel.trim(), manualTestState, language)}
             >
               {manualTestState.status === 'success'
-                ? <><CheckCircle2 size={14} />可用 · {manualTestState.latencyMs} ms</>
-                : <><XCircle size={14} />不可用 · {manualTestState.message}</>}
+                ? <><CheckCircle2 size={14} />{t('可用', 'Available')} · {manualTestState.latencyMs} ms</>
+                : <><XCircle size={14} />{t('不可用', 'Unavailable')} · {localizeBackendMessage(manualTestState.message, language, t('模型测试失败', 'Model test failed.'))}</>}
             </span>
           )}
         </div>
@@ -192,17 +203,17 @@ export function ModelPolicyEditor({
               >
                 <span className="checkbox-mark">{checked && <Check size={13} />}</span>
                 <code title={option.model}>{option.model}</code>
-                {hasCoverage && <Badge tone={fullCoverage ? 'success' : 'warning'}>支持 {option.supportCount}/{option.totalAccounts}</Badge>}
+                {hasCoverage && <Badge tone={fullCoverage ? 'success' : 'warning'}>{t('支持', 'Supported by')} {option.supportCount}/{option.totalAccounts}</Badge>}
               </button>
               {onTestModel && (
                 <div className={`model-picker__test-result${testState ? ` is-${testState.status}` : ''}`}>
                   {testState?.status === 'success' && <span>{testState.latencyMs} ms</span>}
-                  {testState?.status === 'failure' && <span>不可用</span>}
+                  {testState?.status === 'failure' && <span>{t('不可用', 'Unavailable')}</span>}
                   <button
                     className="icon-button model-picker__test"
                     type="button"
-                    title={testDisabledReason ?? modelTestTitle(option.model, testState)}
-                    aria-label={testDisabledReason ?? modelTestTitle(option.model, testState)}
+                    title={testDisabledReason ?? modelTestTitle(option.model, testState, language)}
+                    aria-label={testDisabledReason ?? modelTestTitle(option.model, testState, language)}
                     disabled={Boolean(testDisabledReason) || testState?.status === 'testing'}
                     onClick={() => void testModel(option.model)}
                   >
@@ -219,10 +230,10 @@ export function ModelPolicyEditor({
             </div>
           )
         })}
-        {!filtered.length && <div className="model-picker__empty">{options.length ? '没有匹配的模型。' : emptyMessage}</div>}
+        {!filtered.length && <div className="model-picker__empty">{options.length ? t('没有匹配的模型。', 'No matching models.') : (emptyMessage ?? t('尚无可用模型。', 'No models available yet.'))}</div>}
       </div>
 
-      {policy === 'selected' && selectedModels.length === 0 && <div className="model-policy__empty-selection">{emptySelectionMessage}</div>}
+      {policy === 'selected' && selectedModels.length === 0 && <div className="model-policy__empty-selection">{emptySelectionMessage ?? t('当前明确不开放任何模型。', 'No models are explicitly allowed.')}</div>}
     </section>
   )
 }

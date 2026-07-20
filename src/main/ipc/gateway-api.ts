@@ -3,6 +3,11 @@ import { randomUUID } from 'node:crypto'
 import { lstat, readFile, writeFile } from 'node:fs/promises'
 import { basename, extname, join } from 'node:path'
 import { clientNativeProtocols } from '@shared/types'
+import {
+  hasRouteSourceIdCollision,
+  isAvailableRouteAccount,
+  resolveRouteSource
+} from '@shared/route-sources'
 import type {
   AccountFitnessSnapshot,
   AccountImportProgress,
@@ -18,7 +23,8 @@ import type {
   GatewayStatus,
   RequestLog,
   Route,
-  RouteClient
+  RouteClient,
+  UiLanguage
 } from '@shared/types'
 import type { GatewayAccountState, GatewayConfig } from '../gateway'
 import { CHATGPT_CODEX_RESPONSES_URL, codexQuotaCooldownUntil, codexQuotaIsExhausted, getProviderAdapter, probeChatGptAccount, probeChatGptCodexModel, probeProviderModel, queryChatGptCodexModels, queryChatGptCodexQuota, resolveChatGptCredential, type ProviderFailure } from '../providers'
@@ -73,6 +79,19 @@ export function registerGatewayApi(
   const quotaProbeFlights = new Set<string>()
   const lastQuotaProbeAt = new Map<string, number>()
   let closed = false
+  let rendererLanguage: UiLanguage | undefined
+  const resolvedNativeLanguage = (): UiLanguage => {
+    if (rendererLanguage) return rendererLanguage
+    try {
+      const locale = typeof app.getLocale === 'function' ? app.getLocale() : 'zh-CN'
+      return /^zh(?:[-_]|$)/i.test(locale) ? 'zh-CN' : 'en'
+    } catch {
+      return 'zh-CN'
+    }
+  }
+  const nativeText = (chinese: string, english: string): string => {
+    return resolvedNativeLanguage() === 'zh-CN' ? chinese : english
+  }
   type OAuthStartInput = Parameters<GatewayApi['startChatGptOAuth']>[0]
   type OAuthImportResult = Awaited<ReturnType<GatewayApi['waitChatGptOAuth']>>
   interface OAuthImportSession {
@@ -524,7 +543,18 @@ export function registerGatewayApi(
       await store.appendHealthEvent(event)
       const snapshot = store.getSnapshot()
       if (snapshot.gateway.desktopNotifications && Notification.isSupported()) {
-        new Notification({ title: `Stone · ${account.name}`, body: event.message }).show()
+        const body = resolvedNativeLanguage() === 'zh-CN' || !/[\u3400-\u9fff]/u.test(event.message)
+          ? event.message
+          : event.kind === 'quota-exhausted'
+            ? 'Quota is exhausted. Stone+ paused scheduling for this account.'
+            : event.kind === 'quota-restored'
+              ? 'The quota window recovered. This account can be scheduled again.'
+              : event.kind === 'account-recovered'
+                ? 'The account health status recovered.'
+                : event.kind === 'account-disabled'
+                  ? 'The upstream rejected and disabled this account.'
+                  : 'The account entered cooldown after consecutive failures.'
+        new Notification({ title: `Stone+ · ${account.name}`, body }).show()
       }
     }
     // Routine success telemetry (latency/lastUsedAt) must not rebuild the whole
@@ -598,6 +628,11 @@ export function registerGatewayApi(
     }
   }
 
+  ipcMain.handle('stone:set-ui-language', (event, language: UiLanguage) => {
+    assertTrustedSender(event)
+    if (language !== 'zh-CN' && language !== 'en') throw new Error('Invalid UI language.')
+    rendererLanguage = language
+  })
   ipcMain.handle('stone:get-snapshot', (event) => {
     assertTrustedSender(event)
     store.setGatewayStatus(gateway.getStatus())
@@ -648,15 +683,15 @@ export function registerGatewayApi(
   })
   ipcMain.handle('stone:import-chatgpt-accounts', async (event, input: Parameters<GatewayApi['importChatGptAccounts']>[0]) => {
     assertTrustedSender(event)
-    emitImportProgress(event.sender, input?.progressId, { phase: 'importing', completed: 0, total: 1, percent: 0, message: '正在解析并导入账号…' })
+    emitImportProgress(event.sender, input?.progressId, { phase: 'importing', completed: 0, total: 1, percent: 0, message: nativeText('正在解析并导入账号…', 'Parsing and importing accounts…') })
     const imported = await store.importChatGptAccounts(input)
-    emitImportProgress(event.sender, input?.progressId, { phase: 'importing', completed: 1, total: 1, percent: 50, message: `已导入 ${imported.importedAccountIds.length} 个账号` })
+    emitImportProgress(event.sender, input?.progressId, { phase: 'importing', completed: 1, total: 1, percent: 50, message: nativeText(`已导入 ${imported.importedAccountIds.length} 个账号`, `Imported ${imported.importedAccountIds.length} account(s)`) })
     publish(refreshRuntime())
-    emitImportProgress(event.sender, input?.progressId, { phase: 'refreshing', completed: 0, total: imported.importedAccountIds.length, percent: 50, message: `正在刷新状态与查询模型 0/${imported.importedAccountIds.length}` })
+    emitImportProgress(event.sender, input?.progressId, { phase: 'refreshing', completed: 0, total: imported.importedAccountIds.length, percent: 50, message: nativeText(`正在刷新状态与查询模型 0/${imported.importedAccountIds.length}`, `Refreshing status and models 0/${imported.importedAccountIds.length}`) })
     const detectionResults = await detectImportedAccounts(imported.importedAccountIds, (completed, total) => {
-      emitImportProgress(event.sender, input?.progressId, { phase: 'refreshing', completed, total, percent: 50 + Math.round(completed / Math.max(1, total) * 50), message: `正在刷新状态与查询模型 ${completed}/${total}` })
+      emitImportProgress(event.sender, input?.progressId, { phase: 'refreshing', completed, total, percent: 50 + Math.round(completed / Math.max(1, total) * 50), message: nativeText(`正在刷新状态与查询模型 ${completed}/${total}`, `Refreshing status and models ${completed}/${total}`) })
     })
-    emitImportProgress(event.sender, input?.progressId, { phase: 'assigning', completed: 0, total: 1, percent: 95, message: '正在整理 Tag 与号池成员…' })
+    emitImportProgress(event.sender, input?.progressId, { phase: 'assigning', completed: 0, total: 1, percent: 95, message: nativeText('正在整理 Tag 与号池成员…', 'Organizing Tags and pool members…') })
     const assignmentSummary = await finalizeImportAssignments(
       imported.importedAccountIds,
       detectionResults,
@@ -664,7 +699,7 @@ export function registerGatewayApi(
       input.poolId
     )
     publish(refreshRuntime())
-    emitImportProgress(event.sender, input?.progressId, { phase: 'complete', completed: imported.importedAccountIds.length, total: imported.importedAccountIds.length, percent: 100, message: '导入、状态刷新与模型查询已完成' })
+    emitImportProgress(event.sender, input?.progressId, { phase: 'complete', completed: imported.importedAccountIds.length, total: imported.importedAccountIds.length, percent: 100, message: nativeText('导入、状态刷新与模型查询已完成', 'Import, status refresh, and model lookup complete') })
     return { ...imported, detectionResults, assignmentSummary, snapshot: store.getSnapshot() }
   })
   ipcMain.handle('stone:start-chatgpt-oauth', async (event, input: Parameters<GatewayApi['startChatGptOAuth']>[0]) => {
@@ -688,7 +723,7 @@ export function registerGatewayApi(
     owner.once('render-process-gone', markOwnerGone)
     let started: Awaited<ReturnType<ChatGptOAuthSessionController['start']>>
     try {
-      started = await chatGptOAuth.start()
+      started = await chatGptOAuth.start(resolvedNativeLanguage())
     } finally {
       owner.removeListener('destroyed', markOwnerGone)
       owner.removeListener('render-process-gone', markOwnerGone)
@@ -760,12 +795,12 @@ export function registerGatewayApi(
   })
   ipcMain.handle('stone:import-chatgpt-account-files', async (event, input: Parameters<GatewayApi['importChatGptAccountFiles']>[0]) => {
     assertTrustedSender(event)
-    if (!input) throw new Error('账号导入参数无效。')
+    if (!input) throw new Error(nativeText('账号导入参数无效。', 'The account import parameters are invalid.'))
     const owner = BrowserWindow.fromWebContents(event.sender)
-    if (!owner) throw new Error('无法打开账号文件选择器。')
+    if (!owner) throw new Error(nativeText('无法打开账号文件选择器。', 'Unable to open the account file picker.'))
     const selection = await dialog.showOpenDialog(owner, {
-      title: '选择 CPA / Sub2API 账号 JSON',
-      buttonLabel: '导入并检测',
+      title: nativeText('选择 CPA / Sub2API 账号 JSON', 'Select CPA / Sub2API account JSON files'),
+      buttonLabel: nativeText('导入并检测', 'Import and check'),
       properties: ['openFile', 'multiSelections'],
       filters: [
         { name: 'CPA / Sub2API JSON', extensions: ['json', 'txt'] },
@@ -775,10 +810,10 @@ export function registerGatewayApi(
     if (selection.canceled || !selection.filePaths.length) {
       return emptyFileImportResult(store.getSnapshot(), input.tagId, input.poolId)
     }
-    emitImportProgress(event.sender, input.progressId, { phase: 'importing', completed: 0, total: selection.filePaths.length, percent: 0, message: `正在导入文件 0/${selection.filePaths.length}` })
+    emitImportProgress(event.sender, input.progressId, { phase: 'importing', completed: 0, total: selection.filePaths.length, percent: 0, message: nativeText(`正在导入文件 0/${selection.filePaths.length}`, `Importing files 0/${selection.filePaths.length}`) })
     validateAccountImportProxySelection(input.proxyMode, input.proxyId, store.getRuntimeProxies())
     store.validateChatGptImportAssignments(input.tagId, input.poolId)
-    if (selection.filePaths.length > 100) throw new Error('一次最多导入 100 个账号文件。')
+    if (selection.filePaths.length > 100) throw new Error(nativeText('一次最多导入 100 个账号文件。', 'You can import up to 100 account files at a time.'))
 
     const fileResults: Awaited<ReturnType<GatewayApi['importChatGptAccountFiles']>>['fileResults'] = []
     const readableFiles: Array<{ fileName: string; content: string }> = []
@@ -786,17 +821,17 @@ export function registerGatewayApi(
     for (const path of selection.filePaths) {
       const fileName = basename(path)
       try {
-        if (!['.json', '.txt'].includes(extname(fileName).toLowerCase())) throw new Error('只支持 .json 或 .txt 文件。')
+        if (!['.json', '.txt'].includes(extname(fileName).toLowerCase())) throw new Error(nativeText('只支持 .json 或 .txt 文件。', 'Only .json and .txt files are supported.'))
         const info = await lstat(path)
-        if (!info.isFile() || info.isSymbolicLink()) throw new Error('所选路径不是普通账号文件。')
-        if (info.size > 4 * 1024 * 1024) throw new Error('单个账号文件不能超过 4 MB。')
+        if (!info.isFile() || info.isSymbolicLink()) throw new Error(nativeText('所选路径不是普通账号文件。', 'The selected path is not a regular account file.'))
+        if (info.size > 4 * 1024 * 1024) throw new Error(nativeText('单个账号文件不能超过 4 MB。', 'Each account file must be no larger than 4 MB.'))
         totalBytes += info.size
         readableFiles.push({ fileName, content: await readFile(path, 'utf8') })
       } catch (error) {
         fileResults.push({ fileName, status: 'failed', importedAccounts: 0, createdAccounts: 0, updatedAccounts: 0, error: importErrorMessage(error) })
       }
     }
-    if (totalBytes > 32 * 1024 * 1024) throw new Error('本次所选账号文件总大小不能超过 32 MB。')
+    if (totalBytes > 32 * 1024 * 1024) throw new Error(nativeText('本次所选账号文件总大小不能超过 32 MB。', 'The selected account files must total no more than 32 MB.'))
 
     const importedAccountIds: string[] = []
     const createdAccountIds: string[] = []
@@ -804,7 +839,7 @@ export function registerGatewayApi(
     const warnings: string[] = []
     let processedFiles = fileResults.length
     if (processedFiles > 0) {
-      emitImportProgress(event.sender, input.progressId, { phase: 'importing', completed: processedFiles, total: selection.filePaths.length, percent: Math.round(processedFiles / selection.filePaths.length * 50), message: `正在导入文件 ${processedFiles}/${selection.filePaths.length}` })
+      emitImportProgress(event.sender, input.progressId, { phase: 'importing', completed: processedFiles, total: selection.filePaths.length, percent: Math.round(processedFiles / selection.filePaths.length * 50), message: nativeText(`正在导入文件 ${processedFiles}/${selection.filePaths.length}`, `Importing files ${processedFiles}/${selection.filePaths.length}`) })
     }
     for (const file of readableFiles) {
       try {
@@ -830,16 +865,16 @@ export function registerGatewayApi(
         fileResults.push({ fileName: file.fileName, status: 'failed', importedAccounts: 0, createdAccounts: 0, updatedAccounts: 0, error: importErrorMessage(error) })
       }
       processedFiles += 1
-      emitImportProgress(event.sender, input.progressId, { phase: 'importing', completed: processedFiles, total: selection.filePaths.length, percent: Math.round(processedFiles / selection.filePaths.length * 50), message: `正在导入文件 ${processedFiles}/${selection.filePaths.length}` })
+      emitImportProgress(event.sender, input.progressId, { phase: 'importing', completed: processedFiles, total: selection.filePaths.length, percent: Math.round(processedFiles / selection.filePaths.length * 50), message: nativeText(`正在导入文件 ${processedFiles}/${selection.filePaths.length}`, `Importing files ${processedFiles}/${selection.filePaths.length}`) })
     }
     publish(refreshRuntime())
 
     const uniqueImportedIds = [...new Set(importedAccountIds)]
-    emitImportProgress(event.sender, input.progressId, { phase: 'refreshing', completed: 0, total: uniqueImportedIds.length, percent: 50, message: `正在刷新状态与查询模型 0/${uniqueImportedIds.length}` })
+    emitImportProgress(event.sender, input.progressId, { phase: 'refreshing', completed: 0, total: uniqueImportedIds.length, percent: 50, message: nativeText(`正在刷新状态与查询模型 0/${uniqueImportedIds.length}`, `Refreshing status and models 0/${uniqueImportedIds.length}`) })
     const detectionResults = await detectImportedAccounts(uniqueImportedIds, (completed, total) => {
-      emitImportProgress(event.sender, input.progressId, { phase: 'refreshing', completed, total, percent: 50 + Math.round(completed / Math.max(1, total) * 50), message: `正在刷新状态与查询模型 ${completed}/${total}` })
+      emitImportProgress(event.sender, input.progressId, { phase: 'refreshing', completed, total, percent: 50 + Math.round(completed / Math.max(1, total) * 50), message: nativeText(`正在刷新状态与查询模型 ${completed}/${total}`, `Refreshing status and models ${completed}/${total}`) })
     })
-    emitImportProgress(event.sender, input.progressId, { phase: 'assigning', completed: 0, total: 1, percent: 95, message: '正在整理 Tag 与号池成员…' })
+    emitImportProgress(event.sender, input.progressId, { phase: 'assigning', completed: 0, total: 1, percent: 95, message: nativeText('正在整理 Tag 与号池成员…', 'Organizing Tags and pool members…') })
     const assignmentSummary = await finalizeImportAssignments(
       uniqueImportedIds,
       detectionResults,
@@ -847,7 +882,7 @@ export function registerGatewayApi(
       input.poolId
     )
     publish(refreshRuntime())
-    emitImportProgress(event.sender, input.progressId, { phase: 'complete', completed: uniqueImportedIds.length, total: uniqueImportedIds.length, percent: 100, message: '导入、状态刷新与模型查询已完成' })
+    emitImportProgress(event.sender, input.progressId, { phase: 'complete', completed: uniqueImportedIds.length, total: uniqueImportedIds.length, percent: 100, message: nativeText('导入、状态刷新与模型查询已完成', 'Import, status refresh, and model lookup complete') })
     return {
       snapshot: store.getSnapshot(),
       cancelled: false,
@@ -881,14 +916,14 @@ export function registerGatewayApi(
   })
   ipcMain.handle('stone:save-browser-json-cache-item', async (event, id: string) => {
     assertTrustedSender(event)
-    if (!browserImports || typeof id !== 'string' || !id) throw new Error('无效的缓存文件。')
+    if (!browserImports || typeof id !== 'string' || !id) throw new Error(nativeText('无效的缓存文件。', 'The cached file is invalid.'))
     const item = browserImports.getCachedItem(id)
-    if (!item) throw new Error('缓存中的 JSON 已不存在。')
+    if (!item) throw new Error(nativeText('缓存中的 JSON 已不存在。', 'The cached JSON file no longer exists.'))
     const owner = BrowserWindow.fromWebContents(event.sender)
-    if (!owner) throw new Error('无法打开 JSON 另存为窗口。')
+    if (!owner) throw new Error(nativeText('无法打开 JSON 另存为窗口。', 'Unable to open the Save JSON dialog.'))
     const selection = await dialog.showSaveDialog(owner, {
-      title: '另存为下载过的 JSON',
-      buttonLabel: '保存 JSON',
+      title: nativeText('另存为下载过的 JSON', 'Save downloaded JSON as'),
+      buttonLabel: nativeText('保存 JSON', 'Save JSON'),
       defaultPath: item.fileName,
       filters: [{ name: 'JSON', extensions: ['json'] }]
     })
@@ -913,7 +948,7 @@ export function registerGatewayApi(
     validateAccountImportProxySelection(input.proxyMode, input.proxyId, store.getRuntimeProxies())
     store.validateChatGptImportAssignments(input.tagId, input.poolId)
     const files = browserImports.getReadyItems(input.itemIds)
-    emitImportProgress(event.sender, input.progressId, { phase: 'importing', completed: 0, total: files.length, percent: 0, message: `正在导入文件 0/${files.length}` })
+    emitImportProgress(event.sender, input.progressId, { phase: 'importing', completed: 0, total: files.length, percent: 0, message: nativeText(`正在导入文件 0/${files.length}`, `Importing files 0/${files.length}`) })
     const fileResults: Awaited<ReturnType<GatewayApi['importBrowserJsonQueue']>>['fileResults'] = []
     const importedAccountIds: string[] = []
     const createdAccountIds: string[] = []
@@ -954,16 +989,16 @@ export function registerGatewayApi(
         })
       }
       processedFiles += 1
-      emitImportProgress(event.sender, input.progressId, { phase: 'importing', completed: processedFiles, total: files.length, percent: Math.round(processedFiles / Math.max(1, files.length) * 50), message: `正在导入文件 ${processedFiles}/${files.length}` })
+      emitImportProgress(event.sender, input.progressId, { phase: 'importing', completed: processedFiles, total: files.length, percent: Math.round(processedFiles / Math.max(1, files.length) * 50), message: nativeText(`正在导入文件 ${processedFiles}/${files.length}`, `Importing files ${processedFiles}/${files.length}`) })
     }
     if (importedItemIds.length) browserImports.removeMany(importedItemIds)
     publish(refreshRuntime())
     const uniqueImportedIds = [...new Set(importedAccountIds)]
-    emitImportProgress(event.sender, input.progressId, { phase: 'refreshing', completed: 0, total: uniqueImportedIds.length, percent: 50, message: `正在刷新状态与查询模型 0/${uniqueImportedIds.length}` })
+    emitImportProgress(event.sender, input.progressId, { phase: 'refreshing', completed: 0, total: uniqueImportedIds.length, percent: 50, message: nativeText(`正在刷新状态与查询模型 0/${uniqueImportedIds.length}`, `Refreshing status and models 0/${uniqueImportedIds.length}`) })
     const detectionResults = await detectImportedAccounts(uniqueImportedIds, (completed, total) => {
-      emitImportProgress(event.sender, input.progressId, { phase: 'refreshing', completed, total, percent: 50 + Math.round(completed / Math.max(1, total) * 50), message: `正在刷新状态与查询模型 ${completed}/${total}` })
+      emitImportProgress(event.sender, input.progressId, { phase: 'refreshing', completed, total, percent: 50 + Math.round(completed / Math.max(1, total) * 50), message: nativeText(`正在刷新状态与查询模型 ${completed}/${total}`, `Refreshing status and models ${completed}/${total}`) })
     })
-    emitImportProgress(event.sender, input.progressId, { phase: 'assigning', completed: 0, total: 1, percent: 95, message: '正在整理 Tag 与号池成员…' })
+    emitImportProgress(event.sender, input.progressId, { phase: 'assigning', completed: 0, total: 1, percent: 95, message: nativeText('正在整理 Tag 与号池成员…', 'Organizing Tags and pool members…') })
     const assignmentSummary = await finalizeImportAssignments(
       uniqueImportedIds,
       detectionResults,
@@ -971,7 +1006,7 @@ export function registerGatewayApi(
       input.poolId
     )
     publish(refreshRuntime())
-    emitImportProgress(event.sender, input.progressId, { phase: 'complete', completed: uniqueImportedIds.length, total: uniqueImportedIds.length, percent: 100, message: '导入、状态刷新与模型查询已完成' })
+    emitImportProgress(event.sender, input.progressId, { phase: 'complete', completed: uniqueImportedIds.length, total: uniqueImportedIds.length, percent: 100, message: nativeText('导入、状态刷新与模型查询已完成', 'Import, status refresh, and model lookup complete') })
     return {
       snapshot: store.getSnapshot(),
       cancelled: false,
@@ -989,19 +1024,22 @@ export function registerGatewayApi(
     assertTrustedSender(event)
     if (!input || !Array.isArray(input.accountIds) || !['cpa', 'sub2api'].includes(input.format)
       || !['merged', 'separate'].includes(input.mode)) {
-      throw new Error('账号导出参数无效。')
+      throw new Error(nativeText('账号导出参数无效。', 'The account export parameters are invalid.'))
     }
     const accountIds = [...new Set(input.accountIds)]
-    if (!accountIds.length) throw new Error('请至少选择一个账号。')
-    if (accountIds.length > 500) throw new Error('一次最多导出 500 个账号。')
+    if (!accountIds.length) throw new Error(nativeText('请至少选择一个账号。', 'Select at least one account.'))
+    if (accountIds.length > 500) throw new Error(nativeText('一次最多导出 500 个账号。', 'You can export up to 500 accounts at a time.'))
     const owner = BrowserWindow.fromWebContents(event.sender)
-    if (!owner) throw new Error('无法打开账号导出文件选择器。')
+    if (!owner) throw new Error(nativeText('无法打开账号导出文件选择器。', 'Unable to open the account export file picker.'))
     const date = new Date().toISOString().slice(0, 10)
     if (input.mode === 'merged') {
       const exported = store.exportChatGptAccounts(accountIds, input.format)
       const selection = await dialog.showSaveDialog(owner, {
-        title: `合并导出 ${input.format === 'cpa' ? 'CPA' : 'Sub2API'} 账号 JSON`,
-        buttonLabel: '保存账号 JSON',
+        title: nativeText(
+          `合并导出 ${input.format === 'cpa' ? 'CPA' : 'Sub2API'} 账号 JSON`,
+          `Export merged ${input.format === 'cpa' ? 'CPA' : 'Sub2API'} account JSON`,
+        ),
+        buttonLabel: nativeText('保存账号 JSON', 'Save account JSON'),
         defaultPath: `stoneplus-${input.format}-accounts-${date}.json`,
         filters: [{ name: 'JSON', extensions: ['json'] }]
       })
@@ -1018,8 +1056,11 @@ export function registerGatewayApi(
     }
 
     const selection = await dialog.showOpenDialog(owner, {
-      title: `选择分别导出 ${input.format === 'cpa' ? 'CPA' : 'Sub2API'} JSON 的目录`,
-      buttonLabel: '导出到此目录',
+      title: nativeText(
+        `选择分别导出 ${input.format === 'cpa' ? 'CPA' : 'Sub2API'} JSON 的目录`,
+        `Select a folder for separate ${input.format === 'cpa' ? 'CPA' : 'Sub2API'} JSON files`,
+      ),
+      buttonLabel: nativeText('导出到此目录', 'Export to this folder'),
       properties: ['openDirectory', 'createDirectory']
     })
     const directoryPath = selection.filePaths[0]
@@ -1031,7 +1072,7 @@ export function registerGatewayApi(
     const batchId = randomUUID().slice(0, 8)
     const files = accountIds.map((accountId, index) => {
       const account = accountById.get(accountId)
-      if (!account) throw new Error('所选账号中有账号已不存在。')
+      if (!account) throw new Error(nativeText('所选账号中有账号已不存在。', 'One of the selected accounts no longer exists.'))
       const exported = store.exportChatGptAccounts([accountId], input.format)
       const prefix = String(index + 1).padStart(3, '0')
       return {
@@ -1250,6 +1291,27 @@ export function registerGatewayApi(
     assertTrustedSender(event)
     return mutate(() => store.updateRoute(route))
   })
+  ipcMain.handle('stone:set-client-route-source', (
+    event,
+    input: Parameters<GatewayApi['setClientRouteSource']>[0]
+  ) => {
+    assertTrustedSender(event)
+    if (!input || typeof input !== 'object') throw new Error('路由来源参数无效。')
+    assertRouteClient(input.client)
+    const sourceId = typeof input.sourceId === 'string' ? input.sourceId.trim() : ''
+    if (!sourceId) throw new Error('请选择号池、官方 API 或中转站。')
+
+    const snapshot = store.getSnapshot()
+    if (hasRouteSourceIdCollision(sourceId, snapshot)) {
+      throw new Error('所选来源 ID 与现有号池 ID 冲突。')
+    }
+    const source = resolveRouteSource(sourceId, snapshot)
+    if (!source) throw new Error('所选号池、官方 API 或中转站不存在。')
+    if (!source.accounts.some(isAvailableRouteAccount)) {
+      throw new Error('所选来源没有可用账号。')
+    }
+    return mutate(() => store.setRouteSource(input.client, sourceId))
+  })
   ipcMain.handle('stone:update-gateway', async (event, settings: GatewaySettings) => {
     assertTrustedSender(event)
     const wasRunning = gateway.getStatus().running
@@ -1367,6 +1429,10 @@ export function registerGatewayApi(
     if (!store.getSnapshot().accounts.some((account) => account.id === id)) throw new Error('Account not found.')
     return store.getAccountCodexQuotaHistory(id, from, to)
   })
+  ipcMain.handle('stone:get-account-codex-quota-cycle-costs', (event, id: string) => {
+    assertTrustedSender(event)
+    return store.getAccountCodexQuotaCycleCosts(id)
+  })
   ipcMain.handle('stone:clear-logs', (event) => {
     assertTrustedSender(event)
     return mutate(() => store.clearLogs())
@@ -1452,6 +1518,19 @@ export function registerGatewayApi(
     const profile = resolveClientProfile(store, profileId)
     return summarizeClientConfigs(scopedClientConfig(clientConfig, profile))
   })
+  ipcMain.handle('stone:choose-client-config-directory', async (event, client: RouteClient, currentDirectory?: string) => {
+    assertTrustedSender(event)
+    assertRouteClient(client)
+    const owner = BrowserWindow.fromWebContents(event.sender)
+    if (!owner) throw new Error(nativeText('无法打开目录选择器。', 'Unable to open the folder picker.'))
+    const selection = await dialog.showOpenDialog(owner, {
+      title: nativeText(`选择 ${client} 配置目录`, `Select the ${client} configuration folder`),
+      buttonLabel: nativeText('选择此目录', 'Select this folder'),
+      ...(currentDirectory?.trim() ? { defaultPath: currentDirectory.trim() } : {}),
+      properties: ['openDirectory', 'createDirectory'],
+    })
+    return selection.canceled ? null : selection.filePaths[0] ?? null
+  })
   ipcMain.handle('stone:preview-client-config', async (event, client: RouteClient, profileId?: string) => {
     assertTrustedSender(event)
     assertRouteClient(client)
@@ -1480,11 +1559,43 @@ export function registerGatewayApi(
       { backupRetention: profile?.backupRetention ?? 10 }
     )
   })
+  ipcMain.handle('stone:repair-client-config', async (event, client: RouteClient, profileId?: string) => {
+    assertTrustedSender(event)
+    assertRouteClient(client)
+    const profile = resolveClientProfile(store, profileId, client)
+    return scopedClientConfig(clientConfig, profile).repair(
+      client,
+      clientConnectionTarget(store, client),
+      { backupRetention: profile?.backupRetention ?? 10 }
+    )
+  })
   ipcMain.handle('stone:list-client-config-backups', (event, client: RouteClient, profileId?: string) => {
     assertTrustedSender(event)
     assertRouteClient(client)
     const profile = resolveClientProfile(store, profileId, client)
     return scopedClientConfig(clientConfig, profile).listBackups(client)
+  })
+  ipcMain.handle('stone:create-client-config-backup', (event, client: RouteClient, profileId?: string) => {
+    assertTrustedSender(event)
+    assertRouteClient(client)
+    const profile = resolveClientProfile(store, profileId, client)
+    return scopedClientConfig(clientConfig, profile).createBackupSet(
+      client,
+      profile?.backupRetention ?? 10,
+    )
+  })
+  ipcMain.handle('stone:restore-latest-client-config-backup', (event, client: RouteClient, profileId?: string) => {
+    assertTrustedSender(event)
+    assertRouteClient(client)
+    const profile = resolveClientProfile(store, profileId, client)
+    return scopedClientConfig(clientConfig, profile).restoreLatestBackupSet(client)
+  })
+  ipcMain.handle('stone:restore-client-config-backup-set', (event, groupId: string, client: RouteClient, profileId?: string) => {
+    assertTrustedSender(event)
+    if (typeof groupId !== 'string' || !groupId.trim()) throw new Error('A client backup group id is required.')
+    assertRouteClient(client)
+    const profile = resolveClientProfile(store, profileId, client)
+    return scopedClientConfig(clientConfig, profile).restoreBackupSet(client, groupId)
   })
   ipcMain.handle('stone:restore-client-config', (event, backupPath: string, client: RouteClient, profileId?: string) => {
     assertTrustedSender(event)

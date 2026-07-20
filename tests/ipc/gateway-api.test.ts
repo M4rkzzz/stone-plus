@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { EventEmitter } from 'node:events'
-import type { Account, AppSnapshot, ProviderDefinition, PublicProxyDefinition, RequestLog } from '../../src/shared/types'
+import type { Account, AppSnapshot, ProviderDefinition, PublicProxyDefinition, RequestLog, RouteClient } from '../../src/shared/types'
 import type { GatewayController } from '../../src/main/ipc/gateway-api'
 import type { GatewayAccountState } from '../../src/main/gateway'
 import { registerGatewayApi } from '../../src/main/ipc/gateway-api'
@@ -15,6 +15,7 @@ const electron = vi.hoisted(() => ({
   handlers: new Map<string, InvokeHandler>(),
   fromWebContents: vi.fn(() => ({})),
   getAllWindows: vi.fn(() => []),
+  getLocale: vi.fn(() => 'zh-CN'),
   showOpenDialog: vi.fn(),
   openExternal: vi.fn()
 }))
@@ -23,6 +24,7 @@ vi.mock('electron', () => ({
   app: {
     getPath: vi.fn(() => 'C:\\Stone'),
     getVersion: vi.fn(() => '0.7.0'),
+    getLocale: electron.getLocale,
     getLoginItemSettings: vi.fn(() => ({ openAtLogin: false })),
     setLoginItemSettings: vi.fn()
   },
@@ -59,10 +61,12 @@ describe('refresh provider models IPC', () => {
     electron.handlers.clear()
     electron.showOpenDialog.mockReset()
     electron.fromWebContents.mockReturnValue({})
+    electron.getLocale.mockReturnValue('zh-CN')
     vi.stubEnv('ELECTRON_RENDERER_URL', 'http://127.0.0.1:5173')
   })
 
   it('opens a multi-file picker for CPA and Sub2API account JSON imports', async () => {
+    electron.getLocale.mockReturnValue('en-US')
     electron.showOpenDialog.mockResolvedValue({ canceled: true, filePaths: [] })
     const harness = createHarness([oauthAccount()], {}, vi.fn())
     const handler = electron.handlers.get('stone:import-chatgpt-account-files')
@@ -77,11 +81,32 @@ describe('refresh provider models IPC', () => {
     expect(result).toMatchObject({ cancelled: true, selectedFiles: 0 })
     expect(electron.showOpenDialog).toHaveBeenCalledOnce()
     expect(electron.showOpenDialog.mock.calls[0][1]).toMatchObject({
+      title: 'Select CPA / Sub2API account JSON files',
+      buttonLabel: 'Import and check',
       properties: ['openFile', 'multiSelections'],
       filters: expect.arrayContaining([expect.objectContaining({ extensions: ['json', 'txt'] })])
     })
     expect(harness.store.getSnapshot).toHaveBeenCalled()
     expect(harness.store.importChatGptAccounts).not.toHaveBeenCalled()
+  })
+
+  it('uses the renderer language override for native dialogs', async () => {
+    electron.getLocale.mockReturnValue('zh-CN')
+    electron.showOpenDialog.mockResolvedValue({ canceled: true, filePaths: [] })
+    createHarness([oauthAccount()], {}, vi.fn())
+    const setLanguage = electron.handlers.get('stone:set-ui-language')
+    const importFiles = electron.handlers.get('stone:import-chatgpt-account-files')
+    if (!setLanguage || !importFiles) throw new Error('language and import handlers were not registered')
+    const mainFrame = { url: 'http://127.0.0.1:5173/index.html' }
+    const event = { senderFrame: mainFrame, sender: { mainFrame } }
+
+    await setLanguage(event, 'en')
+    await importFiles(event, { tagId: null, poolId: null })
+
+    expect(electron.showOpenDialog.mock.calls[0][1]).toMatchObject({
+      title: 'Select CPA / Sub2API account JSON files',
+      buttonLabel: 'Import and check',
+    })
   })
 
   it('runs fixed network diagnostics through the selected Stone proxy', async () => {
@@ -119,6 +144,67 @@ describe('refresh provider models IPC', () => {
       'https://chatgpt.com',
       'https://api.openai.com'
     ])
+  })
+
+  it('repairs client configuration through its selected profile directory', async () => {
+    const repair = vi.fn(async () => ({
+      client: 'codex' as const,
+      rebuiltRoles: ['codex-config' as const],
+      changedFiles: ['D:\\profiles\\relay-b\\config.toml'],
+      backups: [],
+      removedBackups: []
+    }))
+    const scoped = { repair }
+    const clientConfig = {
+      withOverrides: vi.fn(() => scoped)
+    } as unknown as ClientConfigService
+    const harness = createHarness(
+      [oauthAccount()],
+      {},
+      vi.fn(),
+      [],
+      { current: 'discovery-fingerprint' },
+      clientConfig
+    )
+    const snapshot = harness.store.getSnapshot()
+    snapshot.clientProfiles.push({
+      id: 'profile-relay-b',
+      name: 'Relay B',
+      client: 'codex',
+      directory: 'D:\\profiles\\relay-b',
+      backupRetention: 7,
+      isDefault: false,
+      createdAt: 1,
+      updatedAt: 1
+    })
+    snapshot.routes.push({
+      id: 'route-codex',
+      client: 'codex',
+      enabled: true,
+      poolId: 'pool-codex',
+      inboundProtocol: 'openai-responses',
+      modelMap: {},
+      localToken: 'local-repair-token',
+      createdAt: 1,
+      updatedAt: 1
+    })
+    const handler = electron.handlers.get('stone:repair-client-config')
+    if (!handler) throw new Error('repair-client-config handler was not registered')
+    const mainFrame = { url: 'http://127.0.0.1:5173/index.html' }
+
+    const result = await handler(
+      { senderFrame: mainFrame, sender: { mainFrame } },
+      'codex',
+      'profile-relay-b'
+    )
+
+    expect(clientConfig.withOverrides).toHaveBeenCalledWith({ codexDirectory: 'D:\\profiles\\relay-b' })
+    expect(repair).toHaveBeenCalledWith(
+      'codex',
+      { gatewayBaseUrl: 'http://127.0.0.1:15721', token: 'local-repair-token' },
+      { backupRetention: 7 }
+    )
+    expect(result).toMatchObject({ rebuiltRoles: ['codex-config'] })
   })
 
   it('overlays live account concurrency without persisting it in the store snapshot', async () => {
@@ -170,7 +256,99 @@ describe('refresh provider models IPC', () => {
     expect(harness.runtimeChanged).toHaveBeenCalled()
   })
 
+  it('switches a client route source atomically and refreshes the live gateway', async () => {
+    const account = apiKeyAccount()
+    const harness = createHarness([account], { [account.credentialId]: 'sk-private' }, vi.fn())
+    const snapshot = harness.store.getSnapshot()
+    snapshot.routes.push({
+      id: 'route-codex',
+      client: 'codex',
+      enabled: true,
+      poolId: 'previous-source',
+      inboundProtocol: 'openai-responses',
+      modelMap: { alias: 'upstream-model' },
+      localToken: 'stable-local-token',
+      createdAt: 1,
+      updatedAt: 1
+    })
+    const handler = electron.handlers.get('stone:set-client-route-source')
+    if (!handler) throw new Error('set-client-route-source handler was not registered')
+    const mainFrame = { url: 'http://127.0.0.1:5173/index.html' }
+
+    await handler(
+      { senderFrame: mainFrame, sender: { mainFrame } },
+      { client: 'codex', sourceId: `  ${provider.id}  ` }
+    )
+
+    expect(harness.store.setRouteSource).toHaveBeenCalledWith('codex', provider.id)
+    expect(snapshot.routes[0]).toMatchObject({
+      poolId: provider.id,
+      modelMap: { alias: 'upstream-model' },
+      localToken: 'stable-local-token'
+    })
+    expect(harness.gateway.updateConfig).toHaveBeenCalled()
+    expect(harness.runtimeChanged).toHaveBeenCalled()
+  })
+
+  it('rejects missing, colliding, and unavailable client route sources before mutation', async () => {
+    const account = { ...apiKeyAccount(), status: 'disabled' as const }
+    const harness = createHarness([account], { [account.credentialId]: 'sk-private' }, vi.fn())
+    const snapshot = harness.store.getSnapshot()
+    snapshot.routes.push({
+      id: 'route-codex', client: 'codex', enabled: true, poolId: 'previous-source',
+      inboundProtocol: 'openai-responses', modelMap: {}, localToken: 'stable-local-token',
+      createdAt: 1, updatedAt: 1
+    })
+    const handler = electron.handlers.get('stone:set-client-route-source')
+    if (!handler) throw new Error('set-client-route-source handler was not registered')
+    const mainFrame = { url: 'http://127.0.0.1:5173/index.html' }
+    const event = { senderFrame: mainFrame, sender: { mainFrame } }
+
+    expect(() => handler(event, { client: 'codex', sourceId: 'missing-source' }))
+      .toThrow(/不存在/)
+    expect(() => handler(event, { client: 'codex', sourceId: provider.id }))
+      .toThrow(/没有可用账号/)
+
+    snapshot.pools.push({
+      id: 'unavailable-pool',
+      name: 'Unavailable pool',
+      kind: 'standard',
+      protocol: 'openai-responses',
+      strategy: 'priority',
+      members: [{ accountId: account.id, enabled: true, order: 0, weight: 1 }],
+      modelPolicy: 'all',
+      modelAllowlist: [],
+      stickySessions: false,
+      stickyTtlMinutes: 30,
+      maxRetries: 0,
+      createdAt: 1,
+      updatedAt: 1
+    })
+    expect(() => handler(event, { client: 'codex', sourceId: 'unavailable-pool' }))
+      .toThrow(/没有可用账号/)
+
+    snapshot.pools.push({
+      id: provider.id,
+      name: 'Colliding pool',
+      kind: 'standard',
+      protocol: 'openai-responses',
+      strategy: 'priority',
+      members: [{ accountId: account.id, enabled: true, order: 0, weight: 1 }],
+      modelPolicy: 'all',
+      modelAllowlist: [],
+      stickySessions: false,
+      stickyTtlMinutes: 30,
+      maxRetries: 0,
+      createdAt: 1,
+      updatedAt: 1
+    })
+    expect(() => handler(event, { client: 'codex', sourceId: provider.id }))
+      .toThrow(/冲突/)
+    expect(harness.store.setRouteSource).not.toHaveBeenCalled()
+  })
+
   it('detects a pasted batch through the final selected account proxy', async () => {
+    electron.getLocale.mockReturnValue('en-US')
     const oauth = oauthAccount()
     const proxy = testProxy()
     const upstreamFetch = vi.fn(async () => new Response(JSON.stringify({
@@ -208,13 +386,15 @@ describe('refresh provider models IPC', () => {
       ['gpt-5.6-sol', 'gpt-5.6-terra'],
       expect.any(String)
     )
-    expect(send.mock.calls.filter(([channel]) => channel === 'stone:account-import-progress').map(([, progress]) => progress))
+    const progressEvents = send.mock.calls.filter(([channel]) => channel === 'stone:account-import-progress').map(([, progress]) => progress)
+    expect(progressEvents)
       .toEqual(expect.arrayContaining([
         expect.objectContaining({ progressId: 'paste-import-progress', phase: 'importing', percent: 0 }),
         expect.objectContaining({ progressId: 'paste-import-progress', phase: 'importing', percent: 50 }),
         expect.objectContaining({ progressId: 'paste-import-progress', phase: 'refreshing', percent: 100 }),
         expect.objectContaining({ progressId: 'paste-import-progress', phase: 'complete', percent: 100 })
       ]))
+    expect(progressEvents.every((progress) => !/[\u3400-\u9fff]/u.test(progress.message))).toBe(true)
   })
 
   it('exchanges OAuth through the selected proxy and only returns the sanitized import result', async () => {
@@ -274,6 +454,22 @@ describe('refresh provider models IPC', () => {
       expect(JSON.stringify(result)).not.toContain('oauth-access-exchanged-private')
       expect(JSON.stringify(result)).not.toContain('oauth-refresh-exchanged-private')
       expect(JSON.stringify(result)).not.toContain('oauth-id-exchanged-private')
+    } finally {
+      await harness.dispose()
+    }
+  })
+
+  it('passes the selected renderer language to the OAuth loopback flow', async () => {
+    const harness = createHarness([oauthAccount()], {}, vi.fn())
+    const setLanguage = electron.handlers.get('stone:set-ui-language')
+    const start = electron.handlers.get('stone:start-chatgpt-oauth')
+    if (!setLanguage || !start) throw new Error('language and OAuth handlers were not registered')
+    const event = rendererEvent(109)
+
+    try {
+      await setLanguage(event, 'en')
+      await start(event, { name: '', tagId: null, poolId: null })
+      expect(harness.oauthFlow.start).toHaveBeenCalledWith('en')
     } finally {
       await harness.dispose()
     }
@@ -890,7 +1086,8 @@ function createHarness(
   credentials: Readonly<Record<string, string>>,
   upstreamFetch: ReturnType<typeof vi.fn>,
   proxies: PublicProxyDefinition[] = [],
-  discoveryFingerprint: { current: string } = { current: 'discovery-fingerprint' }
+  discoveryFingerprint: { current: string } = { current: 'discovery-fingerprint' },
+  clientConfigService: ClientConfigService = {} as ClientConfigService
 ): {
   store: AppStore
   gateway: GatewayController
@@ -940,6 +1137,14 @@ function createHarness(
     getRuntimeAccount: vi.fn((id: string) => accounts.find((account) => account.id === id)),
     getRuntimeProxies: vi.fn(() => proxies),
     setRouteSourceFastMode: vi.fn(async () => snapshot),
+    setRouteSource: vi.fn(async (client: RouteClient, sourceId: string) => {
+      const route = snapshot.routes.find((candidate) => candidate.client === client)
+      if (!route) throw new Error('Client route does not exist')
+      snapshot.routes = snapshot.routes.map((candidate) => candidate.id === route.id
+        ? { ...candidate, poolId: sourceId, updatedAt: Date.now() }
+        : candidate)
+      return snapshot
+    }),
     validateChatGptImportAssignments: vi.fn(),
     addDetectedChatGptAccountsToPool: vi.fn(async (poolId: string | null | undefined, accountIds: string[]) => ({
       added: poolId ? accountIds.length : 0,
@@ -1067,7 +1272,7 @@ function createHarness(
   const dispose = registerGatewayApi(
     store,
     gateway,
-    {} as ClientConfigService,
+    clientConfigService,
     transport,
     undefined,
     runtimeChanged,
