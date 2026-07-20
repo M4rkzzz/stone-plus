@@ -87,6 +87,9 @@ pnpm-debug.log*
 /temp/
 /crashpad/
 
+# Local promotion metrics, automation state and unpublished drafts
+/.promo/
+
 # IDE and editor state
 /.idea/
 /.vscode/
