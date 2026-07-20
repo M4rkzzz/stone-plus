@@ -19,7 +19,7 @@
   <text class="title" x="66" y="45">Stone+ Star 趋势</text>
   <text class="subtitle" x="34" y="68">M4rkzzz/stone-plus · 基于 GitHub Stargazer 时间戳自动生成</text>
   <text class="label" x="926" y="33" text-anchor="end">当前 Star</text>
-  <text class="count" x="926" y="67" text-anchor="end">11</text>
+  <text class="count" x="926" y="67" text-anchor="end">27</text>
   <line class="grid" x1="74" y1="422" x2="926" y2="422"/>
   <line class="grid" x1="74" y1="358.4" x2="926" y2="358.4"/>
   <line class="grid" x1="74" y1="294.8" x2="926" y2="294.8"/>
@@ -32,18 +32,18 @@
   <line class="grid" x1="713" y1="104" x2="713" y2="422"/>
   <line class="grid" x1="926" y1="104" x2="926" y2="422"/>
   <text class="axis" x="62" y="426" text-anchor="end">0</text>
-  <text class="axis" x="62" y="362.4" text-anchor="end">4</text>
-  <text class="axis" x="62" y="298.8" text-anchor="end">8</text>
-  <text class="axis" x="62" y="235.2" text-anchor="end">12</text>
-  <text class="axis" x="62" y="171.6" text-anchor="end">16</text>
-  <text class="axis" x="62" y="108" text-anchor="end">20</text>
-  <text class="axis" x="74" y="452" text-anchor="middle">7月18日 10:13</text>
-  <text class="axis" x="287" y="452" text-anchor="middle">7月18日 16:13</text>
-  <text class="axis" x="500" y="452" text-anchor="middle">7月18日 22:13</text>
-  <text class="axis" x="713" y="452" text-anchor="middle">7月19日 04:13</text>
-  <text class="axis" x="926" y="452" text-anchor="middle">7月19日 10:13</text>
-  <path class="area" d="M 74 422 H 125.99 V 406.1 H 162.82 V 390.2 H 182.42 V 374.3 H 191.88 V 358.4 H 208.52 V 342.5 H 634.42 V 326.6 H 642.8 V 310.7 H 726.97 V 294.8 H 862.64 V 278.9 H 882.72 V 263 H 903.03 V 247.1 H 926 V 422 H 74 Z"/>
-  <path class="line" d="M 74 422 H 125.99 V 406.1 H 162.82 V 390.2 H 182.42 V 374.3 H 191.88 V 358.4 H 208.52 V 342.5 H 634.42 V 326.6 H 642.8 V 310.7 H 726.97 V 294.8 H 862.64 V 278.9 H 882.72 V 263 H 903.03 V 247.1 H 926"/>
-  <circle class="point" cx="903.03" cy="247.1" r="5"/>
+  <text class="axis" x="62" y="362.4" text-anchor="end">10</text>
+  <text class="axis" x="62" y="298.8" text-anchor="end">20</text>
+  <text class="axis" x="62" y="235.2" text-anchor="end">30</text>
+  <text class="axis" x="62" y="171.6" text-anchor="end">40</text>
+  <text class="axis" x="62" y="108" text-anchor="end">50</text>
+  <text class="axis" x="74" y="452" text-anchor="middle">7/18</text>
+  <text class="axis" x="287" y="452" text-anchor="middle">7/18</text>
+  <text class="axis" x="500" y="452" text-anchor="middle">7/19</text>
+  <text class="axis" x="713" y="452" text-anchor="middle">7/19</text>
+  <text class="axis" x="926" y="452" text-anchor="middle">7/20</text>
+  <path class="area" d="M 74 422 H 99.37 V 415.64 H 117.34 V 409.28 H 126.91 V 402.92 H 131.53 V 396.56 H 139.64 V 390.2 H 347.49 V 383.84 H 351.58 V 377.48 H 392.65 V 371.12 H 458.86 V 364.76 H 468.66 V 358.4 H 478.57 V 352.04 H 525.42 V 345.68 H 564.88 V 339.32 H 605.05 V 332.96 H 652.78 V 326.6 H 693.85 V 320.24 H 743.12 V 313.88 H 777.96 V 307.52 H 809.16 V 301.16 H 810.75 V 294.8 H 832.43 V 288.44 H 850.98 V 282.08 H 877.33 V 275.72 H 888.79 V 269.36 H 894.35 V 263 H 917.3 V 256.64 H 926 V 250.28 H 926 V 422 H 74 Z"/>
+  <path class="line" d="M 74 422 H 99.37 V 415.64 H 117.34 V 409.28 H 126.91 V 402.92 H 131.53 V 396.56 H 139.64 V 390.2 H 347.49 V 383.84 H 351.58 V 377.48 H 392.65 V 371.12 H 458.86 V 364.76 H 468.66 V 358.4 H 478.57 V 352.04 H 525.42 V 345.68 H 564.88 V 339.32 H 605.05 V 332.96 H 652.78 V 326.6 H 693.85 V 320.24 H 743.12 V 313.88 H 777.96 V 307.52 H 809.16 V 301.16 H 810.75 V 294.8 H 832.43 V 288.44 H 850.98 V 282.08 H 877.33 V 275.72 H 888.79 V 269.36 H 894.35 V 263 H 917.3 V 256.64 H 926 V 250.28 H 926"/>
+  <circle class="point" cx="926" cy="250.28" r="5"/>
   
 </svg>
