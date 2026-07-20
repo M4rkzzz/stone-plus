@@ -279,7 +279,7 @@ describe('ClientConfigService', () => {
       token: 'private-token',
     })
 
-    expect((await stat(service.paths.codex.config.path)).mode & 0o777).toBe(0o644)
+    expect((await stat(service.paths.codex.config.path)).mode & 0o777).toBe(0o600)
     expect((await stat(service.paths.codex.auth.path)).mode & 0o777).toBe(0o600)
     for (const backup of result.backups) {
       expect((await stat(backup.backupPath)).mode & 0o777).toBe(0o600)
