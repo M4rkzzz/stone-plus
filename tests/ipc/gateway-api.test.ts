@@ -712,7 +712,7 @@ describe('refresh provider models IPC', () => {
       const harness = createHarness([oauthAccount()], {}, vi.fn())
       const log = {
         id: 'log', timestamp: Date.now(), client: 'codex', protocol: 'openai-responses',
-        providerName: 'OpenAI', accountName: 'Account', model: 'gpt', status: 'success', latencyMs: 10
+        providerName: 'OpenAI', accountName: 'Account', model: 'gpt', status: 'streaming', latencyMs: 10
       } satisfies RequestLog
       harness.emitLog(log)
       harness.emitLog({ ...log, id: 'log-2' })
@@ -761,7 +761,7 @@ describe('refresh provider models IPC', () => {
     }
   })
 
-  it('does not push routine telemetry snapshots to a hidden window', async () => {
+  it('suppresses hidden live telemetry but always publishes the terminal request snapshot', async () => {
     vi.useFakeTimers()
     const send = vi.fn()
     electron.getAllWindows.mockReturnValue([{
@@ -772,16 +772,59 @@ describe('refresh provider models IPC', () => {
     }])
     try {
       const harness = createHarness([oauthAccount()], {}, vi.fn())
-      harness.emitLog({
-        id: 'hidden-log', timestamp: Date.now(), client: 'codex', protocol: 'openai-responses',
-        providerName: 'OpenAI', accountName: 'Account', model: 'gpt', status: 'success', latencyMs: 10
+      const appendLog = vi.mocked(harness.store.appendLog)
+      appendLog.mockImplementation(async (log) => {
+        const snapshot = harness.store.getSnapshot()
+        const index = snapshot.requestLogs.findIndex((candidate) => candidate.id === log.id)
+        if (index >= 0) snapshot.requestLogs[index] = log
+        else snapshot.requestLogs.unshift(log)
       })
+      const liveLog = {
+        id: 'hidden-log', timestamp: Date.now(), startedAt: Date.now(), client: 'codex', protocol: 'openai-responses',
+        providerName: 'OpenAI', accountName: 'Account', model: 'gpt', status: 'streaming', latencyMs: 10
+      } satisfies RequestLog
+      harness.emitLog(liveLog)
       await vi.advanceTimersByTimeAsync(1_000)
       expect(send).not.toHaveBeenCalled()
+
+      harness.emitLog({ ...liveLog, timestamp: Date.now() + 20, status: 'success', statusCode: 200, latencyMs: 30 })
+      await Promise.resolve()
+      await Promise.resolve()
+
+      expect(send).toHaveBeenCalledOnce()
+      expect(send.mock.calls[0][1].requestLogs).toContainEqual(expect.objectContaining({
+        id: 'hidden-log', status: 'success', statusCode: 200
+      }))
     } finally {
       electron.getAllWindows.mockReturnValue([])
       vi.useRealTimers()
     }
+  })
+
+  it('reconciles orphaned live logs only after pending terminal writes settle', async () => {
+    const harness = createHarness([oauthAccount()], {}, vi.fn())
+    const appendLog = vi.mocked(harness.store.appendLog)
+    const finalize = vi.mocked(harness.store.finalizeOrphanedStreamingLogs)
+    appendLog.mockImplementation(async () => undefined)
+    finalize.mockResolvedValue(true)
+
+    harness.emitLog({
+      id: 'possibly-orphaned',
+      timestamp: Date.now(),
+      startedAt: Date.now(),
+      client: 'codex',
+      protocol: 'openai-responses',
+      providerName: 'OpenAI',
+      accountName: 'Account',
+      model: 'gpt',
+      status: 'success',
+      statusCode: 200,
+      latencyMs: 10
+    })
+    harness.emitRuntimeState()
+
+    await vi.waitFor(() => expect(finalize).toHaveBeenCalledOnce())
+    expect(appendLog.mock.invocationCallOrder[0]).toBeLessThan(finalize.mock.invocationCallOrder[0])
   })
 
   it('coalesces routine active account telemetry without refreshing gateway config', async () => {
@@ -1255,6 +1298,7 @@ function createHarness(
       return snapshot
     }),
     appendLog: vi.fn(async () => undefined),
+    finalizeOrphanedStreamingLogs: vi.fn(async () => false),
     updateAccountRuntimeState: vi.fn(async (id: string, patch: Partial<Account>) => {
       const runtimeAccount = accounts.find((account) => account.id === id)
       if (runtimeAccount) Object.assign(runtimeAccount, patch)

@@ -38,6 +38,17 @@ export interface CanonicalStreamParser {
   push(chunk: Uint8Array): CanonicalStreamEvent[]
   /** Flushes UTF-8/framing state and emits a final `done` when needed. */
   finish(): CanonicalStreamEvent[]
+  /** Exact upstream Responses protocol state; generic canonical `done` is intentionally excluded. */
+  getProtocolState(): CanonicalProtocolState
+}
+
+export type ResponsesTerminalEvent = 'response.completed' | 'response.incomplete' | 'response.failed'
+
+export interface CanonicalProtocolState {
+  responsesEventCount: number
+  responsesTerminalEvent?: ResponsesTerminalEvent
+  responsesLastEventType?: string
+  responsesLastSequenceNumber?: number
 }
 
 export interface CanonicalStreamEncoder {
@@ -395,6 +406,10 @@ class ProtocolParser implements CanonicalStreamParser {
   private usageTotalTokens: number | undefined
   private usageCachedInputTokens: number | undefined
   private usageReasoningTokens: number | undefined
+  private responsesEventCount = 0
+  private responsesTerminalEvent: ResponsesTerminalEvent | undefined
+  private responsesLastEventType: string | undefined
+  private responsesLastSequenceNumber: number | undefined
 
   constructor(private readonly protocol: Protocol) {
     if (protocol !== 'gemini') this.framing = 'sse'
@@ -426,6 +441,15 @@ class ProtocolParser implements CanonicalStreamParser {
     return this.drainEvents()
   }
 
+  getProtocolState(): CanonicalProtocolState {
+    return {
+      responsesEventCount: this.responsesEventCount,
+      responsesTerminalEvent: this.responsesTerminalEvent,
+      responsesLastEventType: this.responsesLastEventType,
+      responsesLastSequenceNumber: this.responsesLastSequenceNumber
+    }
+  }
+
   private consumeText(text: string): void {
     if (!text) return
     if (!this.framing) {
@@ -452,6 +476,10 @@ class ProtocolParser implements CanonicalStreamParser {
 
   private handleSse(eventName: string | undefined, data: string): void {
     if (data.trim() === '[DONE]') {
+      if (this.protocol === 'openai-responses') {
+        this.responsesLastEventType = '[DONE]'
+        return
+      }
       this.emitDone()
       return
     }
@@ -516,6 +544,15 @@ class ProtocolParser implements CanonicalStreamParser {
 
   private handleOpenAiResponses(eventName: string | undefined, payload: JsonObject): void {
     const type = stringValue(payload.type, eventName ?? '')
+    if (type) {
+      this.responsesEventCount += 1
+      this.responsesLastEventType = type
+      const sequenceNumber = numberValue(payload.sequence_number)
+      if (sequenceNumber !== undefined) this.responsesLastSequenceNumber = sequenceNumber
+      if (type === 'response.completed' || type === 'response.incomplete' || type === 'response.failed') {
+        this.responsesTerminalEvent = type
+      }
+    }
     if (type === 'error' || type === 'response.error') {
       this.emitErrorObject(payload.error ?? payload)
       return

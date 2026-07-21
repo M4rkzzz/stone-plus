@@ -1082,6 +1082,37 @@ describe('PoolScheduler', () => {
     expect(selected.account.id).toBe('healthy')
   })
 
+  it('counts only healthy model-compatible peers as usable alternatives without treating capacity as health', () => {
+    const scheduler = new PoolScheduler(() => timestamp)
+    const selected = account('selected')
+    const busy = account('busy', { inFlight: 1, maxConcurrency: 1 })
+    const disabled = account('disabled', { status: 'disabled' })
+    const exhausted = account('exhausted', {
+      quota: { requests: { limit: 100, remaining: 0, resetAt: timestamp + 60_000 }, observedAt: timestamp }
+    })
+    const codexExhausted = account('codex-exhausted', {
+      codexQuota: {
+        observedAt: timestamp,
+        source: 'response-headers',
+        fiveHour: { usedPercent: 100, resetAt: timestamp + 60_000 }
+      }
+    })
+    const incompatible = account('incompatible', {
+      modelPolicy: 'selected',
+      modelAllowlist: ['different-model']
+    })
+
+    expect(scheduler.hasUsableAlternative([selected, busy], 'model', selected.id)).toBe(true)
+    expect(scheduler.hasUsableAlternative(
+      [selected, disabled, exhausted, codexExhausted, incompatible],
+      'model',
+      selected.id
+    )).toBe(false)
+
+    scheduler.recordFailure(busy.id)
+    expect(scheduler.hasUsableAlternative([selected, busy], 'model', selected.id)).toBe(false)
+  })
+
   it('returns an exhausted account after its quota window resets', () => {
     let now = timestamp
     const scheduler = new PoolScheduler(() => now)

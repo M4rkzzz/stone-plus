@@ -1,4 +1,5 @@
 import type { Account, AccountCircuitState, AccountFitnessSnapshot, Pool, RequestLog } from '../../shared/types'
+import { codexQuotaIsExhausted } from '../providers/quota'
 import type { ScheduledAccount, SchedulerSelectionInput } from './types'
 
 interface StickyAssignment {
@@ -258,6 +259,20 @@ export class PoolScheduler {
   }
 
   /**
+   * Reports whether a failed source still has a genuinely usable peer for the
+   * same model. Capacity is intentionally ignored: an account serving another
+   * request is still a routing alternative and must not make a multi-source
+   * pool masquerade as a singleton.
+   */
+  hasUsableAlternative(accounts: Account[], model: string, accountId: string): boolean {
+    return accounts.some((account) => (
+      account.id !== accountId
+      && accountAllowsModel(account, model)
+      && this.isAvailable(account)
+    ))
+  }
+
+  /**
    * Drops a session assignment only when it still points at the account whose
    * upstream attempt actually failed. The compare-and-delete protects a newer
    * assignment created by another concurrent request for the same session.
@@ -475,6 +490,11 @@ export class PoolScheduler {
   }
 
   private isEligible(account: Account, adaptiveConcurrency: boolean): boolean {
+    if (!this.isAvailable(account)) return false
+    return this.inFlight(account) < this.concurrencyLimit(account, adaptiveConcurrency)
+  }
+
+  private isAvailable(account: Account): boolean {
     const now = this.now()
     const health = this.health.get(account.id)
     if (health?.circuitState === 'open' && (health.cooldownUntil ?? 0) <= now) {
@@ -485,7 +505,7 @@ export class PoolScheduler {
     if (account.status === 'cooldown' && account.cooldownUntil === undefined) return false
     if (quotaExhausted(account, now)) return false
     if (cooldownUntil > now || (health?.circuitState === 'half-open' && this.inFlight(account) > 0)) return false
-    return this.inFlight(account) < this.concurrencyLimit(account, adaptiveConcurrency)
+    return true
   }
 
   private pick(pool: Pool, candidates: Account[], configuredAccounts: Account[], stickyKey?: string): Account {
@@ -785,8 +805,9 @@ function quotaWindows(account: Account) {
 }
 
 function quotaExhausted(account: Account, now: number): boolean {
-  return quotaWindows(account).some((window) =>
-    window?.remaining === 0 && (window.resetAt === undefined || window.resetAt > now))
+  return codexQuotaIsExhausted(account.codexQuota, now)
+    || quotaWindows(account).some((window) =>
+      window?.remaining === 0 && (window.resetAt === undefined || window.resetAt > now))
 }
 
 function quotaPressure(account: Account): number {

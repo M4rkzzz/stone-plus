@@ -130,6 +130,19 @@ export default function App() {
   }, [api, load])
 
   useEffect(() => {
+    const refreshVisibleSnapshot = () => {
+      if (document.visibilityState === 'hidden') return
+      void load()
+    }
+    window.addEventListener('focus', refreshVisibleSnapshot)
+    document.addEventListener('visibilitychange', refreshVisibleSnapshot)
+    return () => {
+      window.removeEventListener('focus', refreshVisibleSnapshot)
+      document.removeEventListener('visibilitychange', refreshVisibleSnapshot)
+    }
+  }, [load])
+
+  useEffect(() => {
     const unsubscribe = api.onUpdateState(acceptUpdateState)
     void api.getUpdateState()
       .then(acceptUpdateState)

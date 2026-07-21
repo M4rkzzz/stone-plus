@@ -1241,6 +1241,31 @@ export class AppStore {
     this.requestLogRevision += 1
   }
 
+  public async finalizeOrphanedStreamingLogs(now = Date.now()): Promise<boolean> {
+    if (!this.store.select((state) => state.requestLogs.some((log) => log.status === 'streaming'))) {
+      return false
+    }
+    let changed = false
+    await this.store.update((state) => {
+      state.requestLogs = state.requestLogs.map((log) => {
+        if (log.status !== 'streaming') return log
+        changed = true
+        return {
+          ...log,
+          timestamp: now,
+          status: 'error',
+          statusCode: 499,
+          progressStage: undefined,
+          failureStage: 'client',
+          latencyMs: Math.max(0, now - (log.startedAt ?? log.timestamp)),
+          error: 'Gateway request ended without a final log'
+        }
+      })
+    })
+    if (changed) this.requestLogRevision += 1
+    return changed
+  }
+
   public async refreshRequestConversationTitles(resolve: (conversationId: string) => string | undefined): Promise<void> {
     await this.store.update((state) => {
       state.requestLogs = state.requestLogs.map((log) => {

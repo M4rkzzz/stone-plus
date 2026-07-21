@@ -2123,6 +2123,30 @@ describe('AppStore', () => {
     }))
   })
 
+  it('reconciles an orphaned streaming lifecycle after the gateway becomes idle', async () => {
+    const store = createStore()
+    await store.initialize()
+    await store.appendLog({
+      ...requestLog(1, 'orphaned-lifecycle'),
+      status: 'streaming',
+      startedAt: 1_000,
+      progressStage: 'streaming'
+    })
+
+    expect(await store.finalizeOrphanedStreamingLogs(4_000)).toBe(true)
+    expect(await store.finalizeOrphanedStreamingLogs(5_000)).toBe(false)
+    expect(store.getSnapshot().requestLogs).toContainEqual(expect.objectContaining({
+      id: 'orphaned-lifecycle',
+      timestamp: 4_000,
+      status: 'error',
+      statusCode: 499,
+      latencyMs: 3_000,
+      progressStage: undefined,
+      failureStage: 'client',
+      error: 'Gateway request ended without a final log'
+    }))
+  })
+
   it('coalesces concurrent request-log writes without changing newest-first order', async () => {
     const store = createStore()
     await store.initialize()

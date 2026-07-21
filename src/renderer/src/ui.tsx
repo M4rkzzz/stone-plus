@@ -42,8 +42,15 @@ export function AccountStatusBadge({ status, circuitState }: { status: AccountSt
   )
 }
 
-export function RequestStatusBadge({ status, statusCode }: { status: RequestLog['status']; statusCode?: number }) {
+export function RequestStatusBadge({ status, statusCode, requestKind }: {
+  status: RequestLog['status']
+  statusCode?: number
+  requestKind?: RequestLog['requestKind']
+}) {
   const { t } = useI18n()
+  if (status === 'success' && requestKind === 'compaction') {
+    return <Badge tone="info">{t('压缩', 'Compaction')}</Badge>
+  }
   const tone = status === 'success' ? statusCode === 499 ? 'warning' : 'success' : status === 'streaming' ? 'info' : 'danger'
   return <Badge tone={tone}>{t(requestStatusLabelsZh[status], requestStatusLabelsEn[status])}</Badge>
 }

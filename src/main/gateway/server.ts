@@ -46,7 +46,8 @@ import {
   createCanonicalStreamParser,
   createOpenAiResponsesStreamCollector,
   type CanonicalStreamEvent,
-  type StreamEncodingOptions
+  type StreamEncodingOptions,
+  type ResponsesTerminalEvent
 } from './streaming'
 import type {
   CredentialResolver,
@@ -76,7 +77,10 @@ const HEDGE_ERROR_GRACE_MS = 750
 // terminal frame. Keep a bounded grace window so ordinary Chat retains [DONE]
 // and Responses can receive response.completed without reviving indefinite
 // half-open streams. The configured idle timeout still wins when it is lower.
-const LOGICAL_COMPLETION_DRAIN_MS = 2_000
+const TRAILING_FRAME_DRAIN_MS = 2_000
+const RESPONSES_TERMINAL_IDLE_TIMEOUT_MS = 30_000
+const MAX_REQUEST_BODY_IDLE_TIMEOUT_MS = 15_000
+const CLIENT_WRITE_DRAIN_TIMEOUT_MS = 10_000
 const MAX_COMPACT_V2_STREAM_BYTES = 10 * 1024 * 1024
 const STANDARD_REQUEST_BODY_LIMIT_BYTES = 10 * 1024 * 1024
 const CODEX_REQUEST_BODY_LIMIT_BYTES = 64 * 1024 * 1024
@@ -294,6 +298,9 @@ export class GatewayServer implements GatewayController {
       return
     }
     const subagentRequest = enabledHeader(request.headers['x-openai-subagent'])
+    let requestKind: NonNullable<RequestLog['requestKind']> = incoming.operation === 'codex-compact'
+      ? 'compaction'
+      : incoming.operation === 'codex-search' ? 'search' : 'generation'
 
     this.totalRequests += 1
     this.activeRequests += 1
@@ -328,6 +335,7 @@ export class GatewayServer implements GatewayController {
     let liveUsage: NormalizedTokenUsage | undefined
     let streamedBytes = 0
     let streamedChunks = 0
+    let streamDiagnostics: StreamTerminationDiagnostics | undefined
     let lastProgressLogAt = 0
     let progressStage: NonNullable<RequestLog['progressStage']> = 'receiving-body'
     let releaseLargeRequestBody: (() => void) | undefined
@@ -361,6 +369,7 @@ export class GatewayServer implements GatewayController {
       lastProgressLogAt = current
       this.emitLog(this.makeLog({
         id: requestLogId,
+        requestKind,
         route: logRoute,
         account: selectedAccount,
         model,
@@ -378,7 +387,8 @@ export class GatewayServer implements GatewayController {
         upstreamFirstByteAt,
         clientFirstWriteAt,
         streamedBytes,
-        streamedChunks
+        streamedChunks,
+        ...streamDiagnostics
       }))
     }
     const recordStreamChunk = (byteLength: number): void => {
@@ -404,6 +414,7 @@ export class GatewayServer implements GatewayController {
       requestLogFinished = true
       const log = this.makeLog({
         id: requestLogId,
+        requestKind,
         route: logRoute,
         account: input.account ?? selectedAccount,
         model,
@@ -424,7 +435,8 @@ export class GatewayServer implements GatewayController {
         clientFirstWriteAt,
         accountFirstTokenMs: input.accountFirstTokenMs,
         streamedBytes,
-        streamedChunks
+        streamedChunks,
+        ...streamDiagnostics
       })
       if (input.status === 'success' && input.recordPerformance !== false) this.recordAccountPerformance(log)
       this.emitLog(log)
@@ -435,6 +447,7 @@ export class GatewayServer implements GatewayController {
       requestLogId = randomUUID()
       this.emitLog(this.makeLog({
         id: requestLogId,
+        requestKind,
         route: logRoute,
         model: '',
         started,
@@ -447,6 +460,10 @@ export class GatewayServer implements GatewayController {
         hardLimitBytes: bodyPolicy.hardLimitBytes,
         largeThresholdBytes: bodyPolicy.largeThresholdBytes,
         signal: clientAbortController.signal,
+        idleTimeoutMs: Math.min(
+          MAX_REQUEST_BODY_IDLE_TIMEOUT_MS,
+          Math.max(1, this.config.settings.requestTimeoutSeconds) * 1_000
+        ),
         acquireLargeBody: bodyPolicy.largeThresholdBytes === undefined
           ? undefined
           : (byteLength) => this.largeRequestBodies.acquire(byteLength, clientAbortController.signal)
@@ -475,6 +492,7 @@ export class GatewayServer implements GatewayController {
       const codexCompactV2 = incoming.operation === 'generate'
         && incoming.protocol === 'openai-responses'
         && isCodexCompactV2Body(body)
+      if (codexCompactV2) requestKind = 'compaction'
       const codexOpaqueCompactHistory = incoming.operation === 'generate'
         && incoming.protocol === 'openai-responses'
         && hasCodexOpaqueCompactHistory(body)
@@ -524,6 +542,7 @@ export class GatewayServer implements GatewayController {
         let release: (() => void) | undefined
         let attemptedAccount: Account | undefined
         let upstreamDeadline: AbortDeadline | undefined
+        let attemptSignal: AbortSignal | undefined
         const attemptStarted = this.now()
         firstTokenAt = undefined
         schedulerSelectMs = undefined
@@ -577,7 +596,16 @@ export class GatewayServer implements GatewayController {
           const credentialResolveStarted = this.now()
           let resolvedValue: Awaited<ReturnType<CredentialResolver>>
           try {
-            resolvedValue = await this.credentialResolver(account, outboundFetch, clientAbortController.signal)
+            const responseStartTimeoutMs = Math.max(1, responseStartDeadlineAt - this.now())
+            upstreamDeadline = createAbortDeadline(responseStartTimeoutMs)
+            attemptSignal = AbortSignal.any([
+              clientAbortController.signal,
+              upstreamDeadline.signal
+            ])
+            resolvedValue = await awaitWithAbortSignal(
+              Promise.resolve(this.credentialResolver(account, outboundFetch, attemptSignal)),
+              attemptSignal
+            )
           } finally {
             credentialResolveMs = Math.max(0, this.now() - credentialResolveStarted)
           }
@@ -650,33 +678,36 @@ export class GatewayServer implements GatewayController {
                   model: targetModel,
                   stream: upstreamStreaming
                 }), codexCompact && !compactFallback)
-            const responseStartTimeoutMs = Math.max(1, responseStartDeadlineAt - this.now())
-            upstreamDeadline = createAbortDeadline(responseStartTimeoutMs)
+            if (!attemptSignal) throw new GatewayHttpError(504, 'Upstream request timed out', 'timeout_error')
             const upstreamInit: RequestInit = {
               method: 'POST',
               headers: upstreamHeaders,
               body: JSON.stringify(upstreamBody),
-              signal: AbortSignal.any([
-                clientAbortController.signal,
-                upstreamDeadline.signal
-              ])
+              signal: attemptSignal
             }
             failureStage = 'connect'
             outboundFetchStartMs = Math.max(0, this.now() - started)
-            upstreamResponse = await fetchWithOptionalHedge(
-              outboundFetch,
-              upstreamUrl,
-              upstreamInit,
-              streaming && !codexSearch && !requiresNativeCompact && pool.hedgedRequests === true
-                && parsedBody.byteLength <= HEDGE_REQUEST_BODY_LIMIT_BYTES
-                ? Math.max(250, Math.min(15_000, pool.hedgeDelayMs ?? 2_500))
-                : undefined
+            upstreamResponse = await awaitWithAbortSignal(
+              fetchWithOptionalHedge(
+                outboundFetch,
+                upstreamUrl,
+                upstreamInit,
+                streaming && !codexSearch && !requiresNativeCompact && pool.hedgedRequests === true
+                  && parsedBody.byteLength <= HEDGE_REQUEST_BODY_LIMIT_BYTES
+                  ? Math.max(250, Math.min(15_000, pool.hedgeDelayMs ?? 2_500))
+                  : undefined
+              ),
+              attemptSignal
             )
             upstreamHeadersAt = this.now()
             failureStage = 'first-byte'
             emitProgressLog('waiting-first-byte')
           } catch (error) {
             throw gatewayErrorFromProviderFailure(adapter.classifyFailure({ error, now: this.now() }))
+          }
+          const responseBodySignal = attemptSignal
+          if (!responseBodySignal) {
+            throw new GatewayHttpError(504, 'Upstream request timed out', 'timeout_error')
           }
 
           const headerSignals = extractRateLimitSignals(
@@ -686,7 +717,7 @@ export class GatewayServer implements GatewayController {
           )
 
           if (!upstreamResponse.ok) {
-            const payload = await readUpstreamJson(upstreamResponse)
+            const payload = await awaitWithAbortSignal(readUpstreamJson(upstreamResponse), responseBodySignal)
             const safePayload = sanitizeUpstreamPayload(payload, sensitiveValues(resolvedCredential))
             const providerFailure = resolvedCredential.kind === 'chatgpt-oauth'
               ? classifyChatGptCodexFailure(upstreamResponse.status, upstreamResponse.headers, this.now())
@@ -717,10 +748,9 @@ export class GatewayServer implements GatewayController {
 
           if (codexSearch) {
             const payload = sanitizeUpstreamPayload(
-              await readUpstreamJson(upstreamResponse),
+              await awaitWithAbortSignal(readUpstreamJson(upstreamResponse), responseBodySignal),
               sensitiveValues(resolvedCredential)
             )
-            markFirstToken()
             markClientFirstWrite()
             this.writeJson(response, upstreamResponse.status, payload)
             const completedAt = this.now()
@@ -744,7 +774,10 @@ export class GatewayServer implements GatewayController {
             let payload: JsonObject
             let compactUsage: NormalizedTokenUsage | undefined
             if (compactFallback) {
-              const fallbackResponse = await readUpstreamJson(upstreamResponse)
+              const fallbackResponse = await awaitWithAbortSignal(
+                readUpstreamJson(upstreamResponse),
+                responseBodySignal
+              )
               const summary = responseOutputText(fallbackResponse)
               if (!summary) {
                 throw new GatewayHttpError(
@@ -756,7 +789,7 @@ export class GatewayServer implements GatewayController {
               payload = compactReplacementPayload(summary, body.input)
               compactUsage = extractProtocolUsage('openai-responses', fallbackResponse)
             } else {
-              payload = await readUpstreamJson(upstreamResponse)
+              payload = await awaitWithAbortSignal(readUpstreamJson(upstreamResponse), responseBodySignal)
               if (!isValidCompactReplacementHistory(payload.output)) {
                 throw new GatewayHttpError(
                   502,
@@ -767,7 +800,6 @@ export class GatewayServer implements GatewayController {
               compactUsage = extractProtocolUsage('openai-responses', payload)
             }
             if (!compactFallback) copyResponsesResponseHeaders(upstreamResponse.headers, response)
-            markFirstToken()
             markClientFirstWrite()
             this.writeJson(response, 200, payload)
             const completedAt = this.now()
@@ -799,7 +831,6 @@ export class GatewayServer implements GatewayController {
               onChunk: recordStreamChunk
             })
             copyResponsesResponseHeaders(upstreamResponse.headers, response)
-            markFirstToken()
             const written = await writeBufferedResponsesStream(
               upstreamResponse,
               response,
@@ -863,8 +894,9 @@ export class GatewayServer implements GatewayController {
                 incoming.protocol,
                 { id: randomUUID(), model },
                 sensitiveValues(resolvedCredential),
-                streamTiming
-              )
+                  streamTiming
+                )
+            streamDiagnostics = streamResult.diagnostics
             if (streamResult.failure) throw streamResult.failure
             if (streamResult.error) {
               throw new GatewayHttpError(502, streamResult.error, 'upstream_stream_error')
@@ -898,9 +930,12 @@ export class GatewayServer implements GatewayController {
 
           let payload: JsonObject
           if (resolvedCredential.kind === 'chatgpt-oauth') {
-            const streamResult = await collectOpenAiResponsesUpstream(
-              upstreamResponse,
-              { id: randomUUID(), model, now: this.now }
+            const streamResult = await awaitWithAbortSignal(
+              collectOpenAiResponsesUpstream(
+                upstreamResponse,
+                { id: randomUUID(), model, now: this.now }
+              ),
+              responseBodySignal
             )
             if (streamResult.error || !streamResult.response) {
               throw new GatewayHttpError(
@@ -911,11 +946,10 @@ export class GatewayServer implements GatewayController {
             }
             payload = streamResult.response
           } else {
-            payload = await readUpstreamJson(upstreamResponse)
+            payload = await awaitWithAbortSignal(readUpstreamJson(upstreamResponse), responseBodySignal)
           }
           const result = convertResponse(provider.protocol, incoming.protocol, payload, model, this.now)
           const usage = extractProtocolUsage(provider.protocol, payload)
-          markFirstToken()
           markClientFirstWrite()
           this.writeJson(response, 200, result)
           const completedAt = this.now()
@@ -949,35 +983,51 @@ export class GatewayServer implements GatewayController {
             || gatewayError.statusCode === 502
             || gatewayError.statusCode === 504
           if (attemptedAccount && provenAccountFailure) {
-            failedAccountIds.add(attemptedAccount.id)
-            this.scheduler.recordStickyFailure(schedulingPool.id, sessionId, attemptedAccount.id)
             const failureNow = this.now()
             const actualResetAt = quotaSignalCooldownUntil(gatewayError.quotaSignals, failureNow)
-            const retryAfterMs = Math.max(
-              gatewayError.providerFailure?.retryAfterMs ?? 0,
-              actualResetAt === undefined ? 0 : Math.max(0, actualResetAt - failureNow)
+            const hardAccountFailure = accountAction === 'disable'
+              || gatewayError.providerFailure?.category === 'rate_limit'
+              || actualResetAt !== undefined
+            const hasUsableAlternative = this.scheduler.hasUsableAlternative(
+              schedulingAccounts,
+              targetModel,
+              attemptedAccount.id
             )
-            const health = this.scheduler.recordFailure(attemptedAccount.id, {
-              retryAfterMs,
-              maxConcurrency: attemptedAccount.maxConcurrency
-            })
-            this.emitAccountState({
-              accountId: attemptedAccount.id,
-              status: accountAction === 'disable' ? 'disabled' : 'cooldown',
-              circuitState: health.circuitState,
-              consecutiveFailures: health.consecutiveFailures,
-              cooldownUntil: accountAction === 'disable' ? undefined : health.cooldownUntil,
-              cooldownReason: accountAction === 'disable'
-                ? undefined
-                : gatewayError.providerFailure?.category === 'rate_limit' ? 'quota' : 'failure',
-              lastError: gatewayError.message,
-              lastUsedAt: this.now(),
-              ...gatewayError.quotaSignals
-            })
+            // Keep the final usable source routable after ordinary transport,
+            // timeout, 5xx, or incomplete-stream failures. With no peer to
+            // fail over to, opening its circuit only converts one failed
+            // request into a pool-wide outage. Hard credential/quota signals
+            // still disable or cool the source to avoid retry storms.
+            if (hardAccountFailure || hasUsableAlternative) {
+              failedAccountIds.add(attemptedAccount.id)
+              this.scheduler.recordStickyFailure(schedulingPool.id, sessionId, attemptedAccount.id)
+              const retryAfterMs = Math.max(
+                gatewayError.providerFailure?.retryAfterMs ?? 0,
+                actualResetAt === undefined ? 0 : Math.max(0, actualResetAt - failureNow)
+              )
+              const health = this.scheduler.recordFailure(attemptedAccount.id, {
+                retryAfterMs,
+                maxConcurrency: attemptedAccount.maxConcurrency
+              })
+              this.emitAccountState({
+                accountId: attemptedAccount.id,
+                status: accountAction === 'disable' ? 'disabled' : 'cooldown',
+                circuitState: health.circuitState,
+                consecutiveFailures: health.consecutiveFailures,
+                cooldownUntil: accountAction === 'disable' ? undefined : health.cooldownUntil,
+                cooldownReason: accountAction === 'disable'
+                  ? undefined
+                  : gatewayError.providerFailure?.category === 'rate_limit' ? 'quota' : 'failure',
+                lastError: gatewayError.message,
+                lastUsedAt: this.now(),
+                ...gatewayError.quotaSignals
+              })
+            }
           }
           const canRetry = attempt < retryLimit
             && !response.headersSent
             && retryable
+            && attemptedAccount !== undefined
             && this.now() < responseStartDeadlineAt
           if (!canRetry) throw gatewayError
           lastRetryableError = gatewayError
@@ -993,13 +1043,18 @@ export class GatewayServer implements GatewayController {
       // Once the parser has positively identified a body-limit violation, a
       // client closing after receiving the early rejection must not relabel
       // that deterministic 413 as another misleading 499.
-      const gatewayError = normalizedError.statusCode === 413
+      const deterministicBodyFailure = normalizedError.statusCode === 413
+        || normalizedError.type === 'request_body_timeout'
+      const gatewayError = deterministicBodyFailure
         ? normalizedError
         : clientAbortController.signal.aborted
           ? new GatewayHttpError(499, 'Client closed the request', 'client_closed')
           : normalizedError
       const successfulSubagentCancellation = clientAbortController.signal.aborted && subagentRequest
-      if (clientAbortController.signal.aborted && gatewayError.statusCode !== 413) failureStage = 'client'
+      if (clientAbortController.signal.aborted && !deterministicBodyFailure) failureStage = 'client'
+      if (gatewayError.type === 'request_body_timeout' && !response.headersSent) {
+        response.setHeader('connection', 'close')
+      }
       this.writeJson(
         response,
         gatewayError.statusCode,
@@ -1124,6 +1179,7 @@ export class GatewayServer implements GatewayController {
 
   private makeLog(input: {
     id?: string
+    requestKind?: RequestLog['requestKind']
     route: Route
     account?: Account
     model: string
@@ -1149,6 +1205,11 @@ export class GatewayServer implements GatewayController {
     failoverCount?: number
     streamedBytes?: number
     streamedChunks?: number
+    streamEndReason?: RequestLog['streamEndReason']
+    streamTerminalEvent?: RequestLog['streamTerminalEvent']
+    streamLastEventType?: string
+    streamLastSequenceNumber?: number
+    terminalWaitMs?: number
   }): RequestLog {
     const providerName = input.account
       ? this.config.providers.find((provider) => provider.id === input.account?.providerId)?.name ?? 'Unknown provider'
@@ -1157,6 +1218,7 @@ export class GatewayServer implements GatewayController {
     const finished = input.finished ?? this.now()
     return {
       id: input.id ?? randomUUID(),
+      requestKind: input.requestKind,
       accountId: input.account?.id,
       conversationId: input.conversationId,
       conversationName: input.conversationName,
@@ -1184,6 +1246,11 @@ export class GatewayServer implements GatewayController {
       outputTokens: usage?.outputTokens,
       streamedBytes: input.streamedBytes,
       streamedChunks: input.streamedChunks,
+      streamEndReason: input.streamEndReason,
+      streamTerminalEvent: input.streamTerminalEvent,
+      streamLastEventType: input.streamLastEventType,
+      streamLastSequenceNumber: input.streamLastSequenceNumber,
+      terminalWaitMs: input.terminalWaitMs,
       cachedInputTokens: usage?.cachedInputTokens,
       reasoningTokens: usage?.reasoningTokens,
       failoverCount: input.failoverCount,
@@ -1389,6 +1456,7 @@ interface RequestBodyPolicy {
 
 interface ReadJsonBodyOptions extends RequestBodyPolicy {
   signal: AbortSignal
+  idleTimeoutMs: number
   acquireLargeBody?: (byteLength: number) => Promise<() => void>
 }
 
@@ -1443,7 +1511,21 @@ async function readJsonBody(
     let size = 0
     let offset = 0
     const iterator = request.iterator({ destroyOnReturn: false })
-    for await (const chunk of iterator) {
+    for (;;) {
+      let result: IteratorResult<Buffer>
+      try {
+        result = await awaitRequestBodyChunk(iterator.next(), options.signal, options.idleTimeoutMs)
+      } catch (error) {
+        if (error instanceof GatewayHttpError && error.type === 'request_body_timeout') {
+          // Stop owning the iterator and drain any late bytes so a half-written
+          // local request cannot retain a live request-log row indefinitely.
+          void iterator.return?.().catch(() => undefined)
+          request.resume()
+        }
+        throw error
+      }
+      if (result.done) break
+      const chunk = result.value
       const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
       const nextSize = size + buffer.length
       if (nextSize > options.hardLimitBytes) {
@@ -1486,6 +1568,35 @@ async function readJsonBody(
   } catch (error) {
     releaseLargeBody?.()
     throw error
+  }
+}
+
+async function awaitRequestBodyChunk<T>(
+  read: Promise<IteratorResult<T>>,
+  signal: AbortSignal,
+  timeoutMs: number
+): Promise<IteratorResult<T>> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let abortListener: (() => void) | undefined
+  try {
+    if (signal.aborted) throw abortSignalReason(signal)
+    return await Promise.race([
+      read,
+      new Promise<never>((_resolve, reject) => {
+        abortListener = () => reject(abortSignalReason(signal))
+        signal.addEventListener('abort', abortListener, { once: true })
+      }),
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new GatewayHttpError(
+          408,
+          `Client request body produced no data for ${timeoutMs} ms`,
+          'request_body_timeout'
+        )), timeoutMs)
+      })
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+    if (abortListener) signal.removeEventListener('abort', abortListener)
   }
 }
 
@@ -2141,6 +2252,14 @@ async function settleWithin<T>(promise: Promise<T>, timeoutMs: number): Promise<
   }
 }
 
+interface StreamTerminationDiagnostics {
+  streamEndReason?: RequestLog['streamEndReason']
+  streamTerminalEvent?: ResponsesTerminalEvent
+  streamLastEventType?: string
+  streamLastSequenceNumber?: number
+  terminalWaitMs?: number
+}
+
 interface StreamPipeResult {
   completed: boolean
   usage?: {
@@ -2152,6 +2271,7 @@ interface StreamPipeResult {
   }
   error?: string
   failure?: GatewayHttpError
+  diagnostics?: StreamTerminationDiagnostics
 }
 
 interface StreamTimingCallbacks {
@@ -2184,6 +2304,22 @@ function createAbortDeadline(timeoutMs: number): AbortDeadline {
   }
 }
 
+async function awaitWithAbortSignal<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  let abortListener: (() => void) | undefined
+  try {
+    if (signal.aborted) throw abortSignalReason(signal)
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        abortListener = () => reject(abortSignalReason(signal))
+        signal.addEventListener('abort', abortListener, { once: true })
+      })
+    ])
+  } finally {
+    if (abortListener) signal.removeEventListener('abort', abortListener)
+  }
+}
+
 async function pipeUpstreamResponse(
   upstream: Response,
   response: ServerResponse,
@@ -2206,6 +2342,9 @@ async function pipeUpstreamResponse(
   let completedToolCallObserved = false
   let completedMessageObserved = false
   let completionDrainDeadline: number | undefined
+  let terminalWaitStartedAt: number | undefined
+  let responsesEventCount = 0
+  const diagnostics: StreamTerminationDiagnostics = {}
   const pendingToolCalls = new Set<number>()
   const logicalCompletionObserved = (): boolean => (
     terminalObserved
@@ -2216,8 +2355,36 @@ async function pipeUpstreamResponse(
   // output_item.done frame proves that an item is complete, but it does not
   // complete the response/turn and must never be exposed as a clean EOF.
   const protocolCompletionObserved = (): boolean => (
-    protocol === 'openai-responses' ? terminalObserved : logicalCompletionObserved()
+    protocol === 'openai-responses'
+      ? parser.getProtocolState().responsesTerminalEvent !== undefined
+      : logicalCompletionObserved()
   )
+  const transportTerminalObserved = (): boolean => (
+    protocol === 'openai-responses' ? protocolCompletionObserved() : terminalObserved
+  )
+  const syncResponsesState = (): void => {
+    if (protocol !== 'openai-responses') return
+    const state = parser.getProtocolState()
+    const hasNewSemanticEvent = state.responsesEventCount > responsesEventCount
+    responsesEventCount = state.responsesEventCount
+    diagnostics.streamTerminalEvent = state.responsesTerminalEvent
+    diagnostics.streamLastEventType = state.responsesLastEventType
+    diagnostics.streamLastSequenceNumber = state.responsesLastSequenceNumber
+    if (state.responsesTerminalEvent) {
+      diagnostics.streamEndReason = state.responsesTerminalEvent === 'response.failed'
+        ? 'explicit-error'
+        : 'protocol-terminal'
+      if (terminalWaitStartedAt !== undefined) {
+        diagnostics.terminalWaitMs = Math.max(0, Date.now() - terminalWaitStartedAt)
+      }
+      return
+    }
+    if (logicalCompletionObserved()) {
+      const now = Date.now()
+      terminalWaitStartedAt ??= now
+      if (hasNewSemanticEvent) completionDrainDeadline = now + RESPONSES_TERMINAL_IDLE_TIMEOUT_MS
+    }
+  }
   let observationFailed = false
   const observe = (events: CanonicalStreamEvent[], acceptTerminal: boolean): void => {
     for (const event of events) {
@@ -2253,6 +2420,7 @@ async function pipeUpstreamResponse(
     if (observationFailed) return
     try {
       observe(operation(), acceptTerminal)
+      syncResponsesState()
     } catch (error) {
       observationFailed = true
       streamError = error instanceof Error ? error.message : 'Unable to inspect upstream stream'
@@ -2286,10 +2454,13 @@ async function pipeUpstreamResponse(
     }
     if (!await consume(first.value)) {
       cancelStreamReader(reader)
-      return streamPipeResult(protocolCompletionObserved(), usage, streamError)
+      diagnostics.streamEndReason = 'client-closed'
+      return streamPipeResult(protocolCompletionObserved(), usage, streamError, undefined, diagnostics)
     }
-    if (logicalCompletionObserved()) completionDrainDeadline = Date.now() + LOGICAL_COMPLETION_DRAIN_MS
-    if (terminalObserved) {
+    if (protocol !== 'openai-responses' && logicalCompletionObserved()) {
+      completionDrainDeadline = Date.now() + TRAILING_FRAME_DRAIN_MS
+    }
+    if (transportTerminalObserved()) {
       cancelStreamReader(reader)
     } else {
       for (;;) {
@@ -2298,6 +2469,17 @@ async function pipeUpstreamResponse(
           : completionDrainDeadline - Date.now()
         if (completionDrainRemaining !== undefined && completionDrainRemaining <= 0) {
           cancelStreamReader(reader)
+          if (protocol === 'openai-responses') {
+            diagnostics.streamEndReason = 'terminal-timeout'
+            diagnostics.terminalWaitMs = terminalWaitStartedAt === undefined
+              ? undefined
+              : Math.max(0, Date.now() - terminalWaitStartedAt)
+            throw new GatewayHttpError(
+              504,
+              `Upstream Responses stream produced no terminal event for ${RESPONSES_TERMINAL_IDLE_TIMEOUT_MS} ms`,
+              'upstream_response_terminal_timeout'
+            )
+          }
           break
         }
         let next: ReadableStreamReadResult<Uint8Array>
@@ -2311,27 +2493,54 @@ async function pipeUpstreamResponse(
         } catch (error) {
           if (completionDrainDeadline !== undefined && isStreamIdleTimeout(error)) {
             cancelStreamReader(reader)
+            if (protocol === 'openai-responses' && completionDrainRemaining !== undefined
+              && completionDrainRemaining <= timing.idleTimeoutMs) {
+              diagnostics.streamEndReason = 'terminal-timeout'
+              diagnostics.terminalWaitMs = terminalWaitStartedAt === undefined
+                ? undefined
+                : Math.max(0, Date.now() - terminalWaitStartedAt)
+              throw new GatewayHttpError(
+                504,
+                `Upstream Responses stream produced no terminal event for ${RESPONSES_TERMINAL_IDLE_TIMEOUT_MS} ms`,
+                'upstream_response_terminal_timeout'
+              )
+            }
+            if (protocol === 'openai-responses') {
+              diagnostics.streamEndReason = 'stream-idle-timeout'
+              throw error
+            }
             break
           }
           throw error
         }
         const { done, value } = next
-        if (done) break
+        if (done) {
+          diagnostics.streamEndReason = 'upstream-eof'
+          break
+        }
         if (!await consume(value)) {
           cancelStreamReader(reader)
-          return streamPipeResult(protocolCompletionObserved(), usage, streamError)
+          diagnostics.streamEndReason = 'client-closed'
+          return streamPipeResult(protocolCompletionObserved(), usage, streamError, undefined, diagnostics)
         }
-        if (completionDrainDeadline === undefined && logicalCompletionObserved()) {
-          completionDrainDeadline = Date.now() + LOGICAL_COMPLETION_DRAIN_MS
+        if (protocol !== 'openai-responses' && completionDrainDeadline === undefined && logicalCompletionObserved()) {
+          completionDrainDeadline = Date.now() + TRAILING_FRAME_DRAIN_MS
         }
-        if (terminalObserved) {
+        if (transportTerminalObserved()) {
           cancelStreamReader(reader)
           break
         }
       }
     }
-    if (response.destroyed && logicalCompletionObserved()) {
-      return streamPipeResult(true, usage, streamError)
+    if (response.destroyed) {
+      diagnostics.streamEndReason = 'client-closed'
+      return streamPipeResult(
+        protocol === 'openai-responses' ? protocolCompletionObserved() : logicalCompletionObserved(),
+        usage,
+        streamError,
+        undefined,
+        diagnostics
+      )
     }
     for (const chunk of redactor.finish()) {
       if (chunk.byteLength > 0) timing.onClientWrite?.()
@@ -2339,21 +2548,12 @@ async function pipeUpstreamResponse(
     }
     const explicitUpstreamStreamError = streamError
     if (!protocolCompletionObserved()) observeSafely(() => parser.finish(), false)
-    if (
-      protocol === 'openai-responses'
-      && logicalCompletionObserved()
-      && !protocolCompletionObserved()
-      && completionDrainDeadline !== undefined
-    ) {
-      const drainRemaining = completionDrainDeadline - Date.now()
-      if (drainRemaining > 0 && await responseClosedWithin(response, drainRemaining)) {
-        return streamPipeResult(true, usage, streamError)
-      }
-    }
     if (explicitUpstreamStreamError && !protocolCompletionObserved()) {
+      diagnostics.streamEndReason ??= 'explicit-error'
       streamError = explicitUpstreamStreamError
       streamFailure = new GatewayHttpError(502, explicitUpstreamStreamError, 'upstream_stream_error')
     } else if (!protocolCompletionObserved()) {
+      diagnostics.streamEndReason ??= 'upstream-eof'
       streamFailure = new GatewayHttpError(
         502,
         'Upstream stream ended before a terminal event',
@@ -2363,8 +2563,20 @@ async function pipeUpstreamResponse(
       await writeProtocolStreamFailure(response, protocol, options, streamFailure, timing.onClientWrite)
     }
   } catch (error) {
-    if (response.destroyed && logicalCompletionObserved()) {
-      return streamPipeResult(true, usage, streamError)
+    if (error instanceof GatewayHttpError && error.type === 'client_write_timeout') {
+      diagnostics.streamEndReason = 'client-closed'
+      response.destroy()
+      throw error
+    }
+    if (response.destroyed) {
+      diagnostics.streamEndReason = 'client-closed'
+      return streamPipeResult(
+        protocol === 'openai-responses' ? protocolCompletionObserved() : logicalCompletionObserved(),
+        usage,
+        streamError,
+        undefined,
+        diagnostics
+      )
     }
     // Before the response is committed, preserve the HTTP error/failover path.
     // Once streaming has started, finish the protocol with an explicit error
@@ -2373,12 +2585,16 @@ async function pipeUpstreamResponse(
     if (!response.headersSent || response.destroyed) throw error
     streamFailure = streamFailureFrom(error, secrets)
     streamError = streamFailure.message
+    diagnostics.streamEndReason ??= isStreamIdleTimeout(error) ? 'stream-idle-timeout' : 'explicit-error'
     await writeProtocolStreamFailure(response, protocol, options, streamFailure, timing.onClientWrite)
   } finally {
+    if (terminalWaitStartedAt !== undefined && diagnostics.terminalWaitMs === undefined) {
+      diagnostics.terminalWaitMs = Math.max(0, Date.now() - terminalWaitStartedAt)
+    }
     response.off('close', cancelOnClose)
     if (response.headersSent && !response.writableEnded && !response.destroyed) response.end()
   }
-  return streamPipeResult(protocolCompletionObserved(), usage, streamError, streamFailure)
+  return streamPipeResult(protocolCompletionObserved(), usage, streamError, streamFailure, diagnostics)
 }
 
 async function pipeConvertedUpstreamResponse(
@@ -2404,12 +2620,46 @@ async function pipeConvertedUpstreamResponse(
   let completedToolCallObserved = false
   let completedMessageObserved = false
   let completionDrainDeadline: number | undefined
+  let terminalWaitStartedAt: number | undefined
+  let responsesEventCount = 0
+  const diagnostics: StreamTerminationDiagnostics = {}
   const pendingToolCalls = new Set<number>()
   const logicalCompletionObserved = (): boolean => (
     terminalObserved
     || stopObserved
     || ((completedMessageObserved || completedToolCallObserved) && pendingToolCalls.size === 0)
   )
+  const protocolCompletionObserved = (): boolean => (
+    from === 'openai-responses'
+      ? parser.getProtocolState().responsesTerminalEvent !== undefined
+      : logicalCompletionObserved()
+  )
+  const transportTerminalObserved = (): boolean => (
+    from === 'openai-responses' ? protocolCompletionObserved() : terminalObserved
+  )
+  const syncResponsesState = (): void => {
+    if (from !== 'openai-responses') return
+    const state = parser.getProtocolState()
+    const hasNewSemanticEvent = state.responsesEventCount > responsesEventCount
+    responsesEventCount = state.responsesEventCount
+    diagnostics.streamTerminalEvent = state.responsesTerminalEvent
+    diagnostics.streamLastEventType = state.responsesLastEventType
+    diagnostics.streamLastSequenceNumber = state.responsesLastSequenceNumber
+    if (state.responsesTerminalEvent) {
+      diagnostics.streamEndReason = state.responsesTerminalEvent === 'response.failed'
+        ? 'explicit-error'
+        : 'protocol-terminal'
+      if (terminalWaitStartedAt !== undefined) {
+        diagnostics.terminalWaitMs = Math.max(0, Date.now() - terminalWaitStartedAt)
+      }
+      return
+    }
+    if (logicalCompletionObserved()) {
+      const now = Date.now()
+      terminalWaitStartedAt ??= now
+      if (hasNewSemanticEvent) completionDrainDeadline = now + RESPONSES_TERMINAL_IDLE_TIMEOUT_MS
+    }
+  }
   const cancelOnClose = (): void => {
     void reader.cancel().catch(() => undefined)
   }
@@ -2449,6 +2699,7 @@ async function pipeConvertedUpstreamResponse(
       if (meaningfulStreamEvent(safeEvent)) timing.onFirstToken?.()
       if (!await writeStreamChunks(response, encoder.encode(safeEvent), timing.onClientWrite)) return false
     }
+    syncResponsesState()
     return true
   }
 
@@ -2467,10 +2718,13 @@ async function pipeConvertedUpstreamResponse(
     response.flushHeaders()
     if (!await forward(parser.push(first.value))) {
       cancelStreamReader(reader)
-      return streamPipeResult(logicalCompletionObserved(), usage, streamError)
+      diagnostics.streamEndReason = 'client-closed'
+      return streamPipeResult(protocolCompletionObserved(), usage, streamError, undefined, diagnostics)
     }
-    if (logicalCompletionObserved()) completionDrainDeadline = Date.now() + LOGICAL_COMPLETION_DRAIN_MS
-    if (terminalObserved) {
+    if (from !== 'openai-responses' && logicalCompletionObserved()) {
+      completionDrainDeadline = Date.now() + TRAILING_FRAME_DRAIN_MS
+    }
+    if (transportTerminalObserved()) {
       cancelStreamReader(reader)
     } else {
       for (;;) {
@@ -2479,6 +2733,17 @@ async function pipeConvertedUpstreamResponse(
           : completionDrainDeadline - Date.now()
         if (completionDrainRemaining !== undefined && completionDrainRemaining <= 0) {
           cancelStreamReader(reader)
+          if (from === 'openai-responses') {
+            diagnostics.streamEndReason = 'terminal-timeout'
+            diagnostics.terminalWaitMs = terminalWaitStartedAt === undefined
+              ? undefined
+              : Math.max(0, Date.now() - terminalWaitStartedAt)
+            throw new GatewayHttpError(
+              504,
+              `Upstream Responses stream produced no terminal event for ${RESPONSES_TERMINAL_IDLE_TIMEOUT_MS} ms`,
+              'upstream_response_terminal_timeout'
+            )
+          }
           break
         }
         let next: ReadableStreamReadResult<Uint8Array>
@@ -2492,66 +2757,118 @@ async function pipeConvertedUpstreamResponse(
         } catch (error) {
           if (completionDrainDeadline !== undefined && isStreamIdleTimeout(error)) {
             cancelStreamReader(reader)
+            if (from === 'openai-responses' && completionDrainRemaining !== undefined
+              && completionDrainRemaining <= timing.idleTimeoutMs) {
+              diagnostics.streamEndReason = 'terminal-timeout'
+              diagnostics.terminalWaitMs = terminalWaitStartedAt === undefined
+                ? undefined
+                : Math.max(0, Date.now() - terminalWaitStartedAt)
+              throw new GatewayHttpError(
+                504,
+                `Upstream Responses stream produced no terminal event for ${RESPONSES_TERMINAL_IDLE_TIMEOUT_MS} ms`,
+                'upstream_response_terminal_timeout'
+              )
+            }
+            if (from === 'openai-responses') {
+              diagnostics.streamEndReason = 'stream-idle-timeout'
+              throw error
+            }
             break
           }
           throw error
         }
         const { done, value } = next
-        if (done) break
+        if (done) {
+          diagnostics.streamEndReason = 'upstream-eof'
+          break
+        }
         timing.onChunk?.(value.byteLength)
         if (!await forward(parser.push(value))) {
           cancelStreamReader(reader)
-          return streamPipeResult(logicalCompletionObserved(), usage, streamError)
+          diagnostics.streamEndReason = 'client-closed'
+          return streamPipeResult(protocolCompletionObserved(), usage, streamError, undefined, diagnostics)
         }
-        if (completionDrainDeadline === undefined && logicalCompletionObserved()) {
-          completionDrainDeadline = Date.now() + LOGICAL_COMPLETION_DRAIN_MS
+        if (from !== 'openai-responses' && completionDrainDeadline === undefined && logicalCompletionObserved()) {
+          completionDrainDeadline = Date.now() + TRAILING_FRAME_DRAIN_MS
         }
-        if (terminalObserved) {
+        if (transportTerminalObserved()) {
           cancelStreamReader(reader)
           break
         }
       }
     }
-    if (response.destroyed && logicalCompletionObserved()) {
-      return streamPipeResult(true, usage, streamError)
-    }
-    if (!logicalCompletionObserved() && !await forward(parser.finish(), false)) {
-      return streamPipeResult(logicalCompletionObserved(), usage, streamError)
-    }
-    if (!await writeStreamChunks(response, encoder.finish(), timing.onClientWrite)) return streamPipeResult(logicalCompletionObserved(), usage, streamError)
-  } catch (error) {
     if (response.destroyed) {
-      return streamPipeResult(logicalCompletionObserved(), usage, streamError)
+      diagnostics.streamEndReason = 'client-closed'
+      return streamPipeResult(protocolCompletionObserved(), usage, streamError, undefined, diagnostics)
+    }
+    if (!protocolCompletionObserved()) {
+      const finishEvents = parser.finish()
+      for (const event of finishEvents) {
+        if (event.type === 'error' && !streamError) streamError = redactSensitiveText(event.message, secrets)
+      }
+      syncResponsesState()
+      if (from === 'openai-responses') {
+        diagnostics.streamEndReason ??= streamError ? 'explicit-error' : 'upstream-eof'
+        throw new GatewayHttpError(
+          502,
+          streamError ?? 'Upstream stream ended before a terminal event',
+          'upstream_stream_error'
+        )
+      }
+      if (!await forward(finishEvents, false)) {
+        diagnostics.streamEndReason = 'client-closed'
+        return streamPipeResult(protocolCompletionObserved(), usage, streamError, undefined, diagnostics)
+      }
+    }
+    if (!await writeStreamChunks(response, encoder.finish(), timing.onClientWrite)) {
+      diagnostics.streamEndReason = 'client-closed'
+      return streamPipeResult(protocolCompletionObserved(), usage, streamError, undefined, diagnostics)
+    }
+  } catch (error) {
+    if (error instanceof GatewayHttpError && error.type === 'client_write_timeout') {
+      diagnostics.streamEndReason = 'client-closed'
+      response.destroy()
+      throw error
+    }
+    if (response.destroyed) {
+      diagnostics.streamEndReason = 'client-closed'
+      return streamPipeResult(protocolCompletionObserved(), usage, streamError, undefined, diagnostics)
     }
     // A failure before headers/body are committed is still eligible for account
     // failover. Do not turn it into an implicit HTTP 200 error stream.
     if (!response.headersSent) throw error
     streamError = error instanceof Error ? error.message : 'Upstream stream failed'
     streamFailure = error instanceof GatewayHttpError ? error : undefined
+    diagnostics.streamEndReason ??= isStreamIdleTimeout(error) ? 'stream-idle-timeout' : 'explicit-error'
     await forward([
       { type: 'error', message: streamError, errorType: streamFailure?.type ?? 'upstream_stream_error' },
       { type: 'done' }
     ])
     await writeStreamChunks(response, encoder.finish(), timing.onClientWrite)
   } finally {
+    if (terminalWaitStartedAt !== undefined && diagnostics.terminalWaitMs === undefined) {
+      diagnostics.terminalWaitMs = Math.max(0, Date.now() - terminalWaitStartedAt)
+    }
     response.off('close', cancelOnClose)
     if (response.headersSent && !response.writableEnded && !response.destroyed) response.end()
   }
 
-  return streamPipeResult(logicalCompletionObserved(), usage, streamError, streamFailure)
+  return streamPipeResult(protocolCompletionObserved(), usage, streamError, streamFailure, diagnostics)
 }
 
 function streamPipeResult(
   completed: boolean,
   usage: NonNullable<StreamPipeResult['usage']>,
   error?: string,
-  failure?: GatewayHttpError
+  failure?: GatewayHttpError,
+  diagnostics?: StreamTerminationDiagnostics
 ): StreamPipeResult {
   return {
     completed,
     ...(Object.keys(usage).length > 0 ? { usage } : {}),
     ...(error ? { error } : {}),
-    ...(failure ? { failure } : {})
+    ...(failure ? { failure } : {}),
+    ...(diagnostics && Object.values(diagnostics).some((value) => value !== undefined) ? { diagnostics } : {})
   }
 }
 
@@ -2673,7 +2990,17 @@ function meaningfulStreamEvent(event: CanonicalStreamEvent): boolean {
 async function waitForDrain(response: ServerResponse): Promise<void> {
   if (response.destroyed) return
   await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      cleanup()
+      reject(new GatewayHttpError(
+        499,
+        'Client stopped reading the streamed response',
+        'client_write_timeout'
+      ))
+    }, CLIENT_WRITE_DRAIN_TIMEOUT_MS)
+    timer.unref?.()
     const cleanup = (): void => {
+      clearTimeout(timer)
       response.off('drain', onDrain)
       response.off('close', onClose)
       response.off('error', onError)
@@ -2693,23 +3020,6 @@ async function waitForDrain(response: ServerResponse): Promise<void> {
     response.once('drain', onDrain)
     response.once('close', onClose)
     response.once('error', onError)
-  })
-}
-
-async function responseClosedWithin(response: ServerResponse, timeoutMs: number): Promise<boolean> {
-  if (response.destroyed) return true
-  return await new Promise<boolean>((resolve) => {
-    let settled = false
-    const finish = (closed: boolean): void => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      response.off('close', onClose)
-      resolve(closed)
-    }
-    const onClose = (): void => finish(true)
-    const timer = setTimeout(() => finish(false), Math.max(1, timeoutMs))
-    response.once('close', onClose)
   })
 }
 

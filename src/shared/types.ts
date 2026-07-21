@@ -548,6 +548,8 @@ export interface GatewayStatus {
 
 export interface RequestLog {
   id: string
+  /** Logical request purpose. Compaction is buffered and has no first-token metric. */
+  requestKind?: 'generation' | 'search' | 'compaction'
   accountId?: string
   conversationId?: string
   conversationName?: string
@@ -589,6 +591,16 @@ export interface RequestLog {
   streamedBytes?: number
   /** Upstream response chunks observed while a stream is in progress. */
   streamedChunks?: number
+  /** Protocol-level reason the streaming attempt ended. */
+  streamEndReason?: 'protocol-terminal' | 'upstream-eof' | 'terminal-timeout' | 'stream-idle-timeout' | 'client-closed' | 'explicit-error'
+  /** Exact terminal event observed from an upstream Responses stream. */
+  streamTerminalEvent?: 'response.completed' | 'response.incomplete' | 'response.failed'
+  /** Last valid upstream Responses event type, or the non-standard `[DONE]` sentinel. */
+  streamLastEventType?: string
+  /** Last upstream Responses sequence number observed. */
+  streamLastSequenceNumber?: number
+  /** Total time from the first completed output item until stream termination. */
+  terminalWaitMs?: number
   error?: string
   cachedInputTokens?: number
   /** Input tokens written into a prompt cache when the upstream reports them separately. */

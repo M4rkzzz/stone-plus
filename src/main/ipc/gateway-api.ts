@@ -81,6 +81,8 @@ export function registerGatewayApi(
   let automaticCooldownRefreshTriggered = false
   let automaticCooldownRefreshFlight: Promise<void> | undefined
   let evaluateAutomaticCooldownRefresh = (): void => undefined
+  const pendingRequestLogWrites = new Set<Promise<void>>()
+  let orphanedLogReconciliationScheduled = false
   let closed = false
   let rendererLanguage: UiLanguage | undefined
   const resolvedNativeLanguage = (): UiLanguage => {
@@ -232,7 +234,24 @@ export function registerGatewayApi(
     scheduledLiveRuntimePublish.unref?.()
   }
 
-  const unsubscribeRuntimeState = gateway.onRuntimeState(scheduleLiveRuntimePublish)
+  const scheduleOrphanedLogReconciliation = (): void => {
+    if (closed || orphanedLogReconciliationScheduled || gateway.getStatus().activeRequests !== 0) return
+    orphanedLogReconciliationScheduled = true
+    const pendingLogs = [...pendingRequestLogWrites]
+    void Promise.allSettled(pendingLogs).then(async () => {
+      orphanedLogReconciliationScheduled = false
+      if (closed || gateway.getStatus().activeRequests !== 0) return
+      if (await store.finalizeOrphanedStreamingLogs()) publishRoutine(store.getSnapshot())
+    }).catch((error: unknown) => {
+      orphanedLogReconciliationScheduled = false
+      console.error('Stone+ could not reconcile an orphaned gateway request log', error)
+    })
+  }
+
+  const unsubscribeRuntimeState = gateway.onRuntimeState(() => {
+    scheduleLiveRuntimePublish()
+    scheduleOrphanedLogReconciliation()
+  })
 
   const refreshRuntime = (): AppSnapshot => {
     gateway.updateConfig(toGatewayConfig(store))
@@ -549,10 +568,22 @@ export function registerGatewayApi(
   }
 
   gateway.onLog((log) => {
-    void store.appendLog(log).then(() => {
-      scheduleRuntimePublish()
-    }).catch((error: unknown) => {
+    const write = store.appendLog(log).catch((error: unknown) => {
       console.error('Stone+ could not persist a gateway request log', error)
+    })
+    pendingRequestLogWrites.add(write)
+    void write.finally(() => {
+      pendingRequestLogWrites.delete(write)
+      if (log.status === 'streaming') {
+        scheduleRuntimePublish()
+        return
+      }
+      // Terminal request state is durable application state, not disposable
+      // live telemetry. Hidden/minimized renderers must receive it as well;
+      // otherwise they retain a stale streaming row and keep its local elapsed
+      // clock running after the backend request has already completed.
+      store.setGatewayStatus(gateway.getStatus())
+      publish(store.getSnapshot(), { runtimeChanged: false })
     })
   })
 
@@ -1676,6 +1707,7 @@ export function registerGatewayApi(
   })
   return async () => {
     closed = true
+    await Promise.allSettled([...pendingRequestLogWrites])
     if (automaticCooldownRefreshFlight) {
       await Promise.allSettled([automaticCooldownRefreshFlight])
     }

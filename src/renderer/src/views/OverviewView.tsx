@@ -492,7 +492,7 @@ export function OverviewView({ snapshot, navigate }: { snapshot: AppSnapshot; na
                     <td><div className="cell-with-icon"><span className={`client-dot client-dot--${log.client}`} /><span>{clientNames[log.client]}</span></div></td>
                     <td><span className="mono table-model">{log.model}</span></td>
                     <td><div className="table-primary"><strong>{log.providerName}</strong><span>{accountDisplayName(log.accountName, t)}</span></div></td>
-                    <td><RequestStatusBadge status={log.status} statusCode={log.statusCode} /></td>
+                    <td><RequestStatusBadge status={log.status} statusCode={log.statusCode} requestKind={log.requestKind} /></td>
                     <td>{durationLabel(log.latencyMs)}</td>
                     <td>{relativeTime(log.timestamp, locale)}</td>
                   </tr>

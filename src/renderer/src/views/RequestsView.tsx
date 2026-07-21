@@ -53,7 +53,9 @@ interface RequestColumnDefinition {
 }
 
 const REQUEST_COLUMN_STORAGE_KEY = 'stone:request-column-widths:v1'
-const displayedFirstTokenMs = (log: RequestLog): number | undefined => log.upstreamFirstByteMs ?? log.firstTokenMs
+const displayedFirstTokenMs = (log: RequestLog): number | undefined => log.requestKind === 'compaction'
+  ? undefined
+  : log.upstreamFirstByteMs ?? log.firstTokenMs
 const requestStartedAt = (log: RequestLog): number => log.startedAt ?? log.timestamp
 const liveElapsedMs = (log: RequestLog, now: number): number => log.status === 'streaming'
   ? Math.max(log.latencyMs, now - requestStartedAt(log))
@@ -306,7 +308,7 @@ export function RequestsView({
                       <td><div className="table-primary"><strong>{log.providerName}</strong><span>{accountDisplayName(log.accountName, t)}</span></div></td>
                       <td>{log.status === 'streaming'
                         ? <span className="request-live-status"><i aria-hidden="true" /><span>{t(liveStageLabels[log.progressStage ?? 'receiving-body'][0], liveStageLabels[log.progressStage ?? 'receiving-body'][1])}</span></span>
-                        : <><RequestStatusBadge status={log.status} statusCode={log.statusCode} />{log.statusCode && <span className="status-code">{log.statusCode}</span>}</>}</td>
+                        : <><RequestStatusBadge status={log.status} statusCode={log.statusCode} requestKind={log.requestKind} />{log.statusCode && <span className="status-code">{log.statusCode}</span>}</>}</td>
                       <td>{displayedFirstTokenMs(log) !== undefined ? durationLabel(displayedFirstTokenMs(log)!) : '—'}</td>
                       <td className={log.status === 'streaming' ? 'request-live-duration' : ''}>{durationLabel(liveElapsedMs(log, liveNow))}</td>
                       <td>{log.inputTokens !== undefined
@@ -329,7 +331,7 @@ export function RequestsView({
       <Modal open={Boolean(selected)} title={t('请求详情', 'Request Details')} description={selected ? formatDateTime(requestStartedAt(selected), locale) : undefined} onClose={() => setSelected(null)} width="medium">
         {selected && (
           <div className="request-detail">
-            <div className="request-detail__status"><RequestStatusBadge status={selected.status} statusCode={selected.statusCode} /><span>{selected.statusCode ?? '—'}</span><strong>{durationLabel(liveElapsedMs(selected, liveNow))}</strong></div>
+            <div className="request-detail__status"><RequestStatusBadge status={selected.status} statusCode={selected.statusCode} requestKind={selected.requestKind} /><span>{selected.statusCode ?? '—'}</span><strong>{durationLabel(liveElapsedMs(selected, liveNow))}</strong></div>
             <div className="request-detail__grid">
               <DetailItem label={t('请求 ID', 'Request ID')} mono>{selected.id}</DetailItem>
               <DetailItem label={t('客户端', 'Client')}>{clientNames[selected.client]}</DetailItem>

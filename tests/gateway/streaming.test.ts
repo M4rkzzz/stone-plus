@@ -307,6 +307,55 @@ describe('canonical streaming protocol conversion', () => {
     ])
   })
 
+  it('tracks exact Responses terminal metadata across CRLF fragments and event-name fallback', () => {
+    const parser = createCanonicalStreamParser('openai-responses')
+    const wire = [
+      'event: response.output_item.done\r\n',
+      'data: {"sequence_number":41,"output_index":0,"item":{"type":"message","status":"completed"}}\r\n\r\n',
+      'event: response.completed\r\n',
+      'data: {"sequence_number":42,"response":{"status":"completed","output":[]}}\r\n\r\n'
+    ].join('')
+    const events = byteChunks(wire, 3).flatMap((chunk) => parser.push(chunk))
+
+    expect(events).toContainEqual({ type: 'message-complete', index: 0 })
+    expect(parser.getProtocolState()).toEqual({
+      responsesEventCount: 2,
+      responsesTerminalEvent: 'response.completed',
+      responsesLastEventType: 'response.completed',
+      responsesLastSequenceNumber: 42
+    })
+  })
+
+  it.each([
+    ['response.completed', 'response.completed'],
+    ['response.incomplete', 'response.incomplete'],
+    ['response.failed', 'response.failed']
+  ] as const)('recognizes %s as an exact Responses terminal event', (eventType, expected) => {
+    const parser = createCanonicalStreamParser('openai-responses')
+    parser.push(encoder.encode(`event: ${eventType}\ndata: {"type":"${eventType}","sequence_number":7,"response":{"output":[]}}\n\n`))
+    expect(parser.getProtocolState().responsesTerminalEvent).toBe(expected)
+  })
+
+  it('does not treat output_item.done or the non-standard [DONE] sentinel as Responses completion', () => {
+    const parser = createCanonicalStreamParser('openai-responses')
+    const events = parser.push(encoder.encode([
+      'event: response.output_item.done',
+      'data: {"type":"response.output_item.done","sequence_number":9,"output_index":0,"item":{"type":"message","status":"completed"}}',
+      '',
+      'data: [DONE]',
+      '',
+      ''
+    ].join('\n')))
+
+    expect(events).not.toContainEqual({ type: 'done' })
+    expect(parser.getProtocolState()).toEqual({
+      responsesEventCount: 1,
+      responsesTerminalEvent: undefined,
+      responsesLastEventType: '[DONE]',
+      responsesLastSequenceNumber: 9
+    })
+  })
+
   it('transcodes a recorded Anthropic stream to OpenAI Chat', async () => {
     const output = await transcode('anthropic-messages', 'openai-chat', anthropicRecording)
     const summary = summarize(parseChunks('openai-chat', byteChunks(output, 7)))
