@@ -58,6 +58,7 @@ describe('Codex planning', () => {
     expect(result.content).toContain('model_provider = "stone"')
     expect(result.content).toContain('model = "gpt-5"')
     expect(result.content).toContain('[features]\nweb_search = true')
+    expect(result.content).toContain('remote_compaction_v2 = false')
     expect(result.content).toContain('name = "OpenAI" # provider label')
     expect(result.content).toContain('base_url = "http://127.0.0.1:15721/v1"')
     expect(result.content).toContain('custom_timeout = 42 # unknown provider option')
@@ -66,6 +67,50 @@ describe('Codex planning', () => {
     expect(result.content).toContain('requires_openai_auth = true')
     expect(result.content).not.toContain('env_key =')
     expect(planCodexToml(result.content, 'http://127.0.0.1:15721/v1').changed).toBe(false)
+  })
+
+  it('disables only Remote Compaction V2 while retaining unrelated Codex features', () => {
+    const source = [
+      '[features]',
+      'remote_compaction_v2 = true # Stone routes compact through Legacy',
+      'multi_agent = true',
+      '',
+    ].join('\n')
+
+    const result = planCodexToml(source, 'http://127.0.0.1:15721/v1')
+
+    expect(result.content).toContain('remote_compaction_v2 = false # Stone routes compact through Legacy')
+    expect(result.content).toContain('multi_agent = true')
+    expect(result.content).toContain('name = "OpenAI"')
+  })
+
+  it('patches an inline features table without creating a conflicting dotted key', () => {
+    const source = 'model = "gpt-5"\r\nfeatures = { multi_agent = true, remote_compaction_v2 = true } # keep inline\r\n# no trailing newline'
+
+    const result = planCodexToml(source, 'http://127.0.0.1:15721/v1')
+
+    expect(result.content).toContain('features = { multi_agent = true, remote_compaction_v2 = false } # keep inline')
+    expect(result.content).not.toContain('features.remote_compaction_v2')
+    expect(result.content).toContain('# keep inline\r\n# no trailing newline')
+    expect(result.content.replace(/\r\n/g, '')).not.toContain('\n')
+    expect(result.content.endsWith('\r\n')).toBe(false)
+    expect(planCodexToml(result.content, 'http://127.0.0.1:15721/v1')).toMatchObject({ changed: false })
+  })
+
+  it('adds the compact feature to quoted inline and quoted table forms while preserving their values', () => {
+    const inline = planCodexToml(
+      '"features" = { multi_agent = true, web_search = false }\n',
+      'http://127.0.0.1:15721/v1',
+    )
+    const table = planCodexToml(
+      '["features"]\n"multi_agent" = true\n',
+      'http://127.0.0.1:15721/v1',
+    )
+
+    expect(inline.content).toContain('"features" = { multi_agent = true, web_search = false, remote_compaction_v2 = false }')
+    expect(table.content).toContain('["features"]\n"multi_agent" = true\nremote_compaction_v2 = false')
+    expect(planCodexToml(inline.content, 'http://127.0.0.1:15721/v1').changed).toBe(false)
+    expect(planCodexToml(table.content, 'http://127.0.0.1:15721/v1').changed).toBe(false)
   })
 
   it('validates the entire TOML document before applying a format-preserving patch', () => {

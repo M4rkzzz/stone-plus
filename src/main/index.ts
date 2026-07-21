@@ -23,6 +23,7 @@ import { registerCodexSessionRepairApi } from './ipc/session-repair-api'
 import { BROWSER_SESSION_PARTITION, BrowserImportQueue } from './browser-import-queue'
 
 const { autoUpdater } = electronUpdater
+const WINDOWS_APP_USER_MODEL_ID = 'io.github.m4rkzzz.stoneplus'
 
 let mainWindow: BrowserWindow | undefined
 let tray: Tray | undefined
@@ -47,7 +48,7 @@ if (process.env.STONE_USER_DATA_DIR) {
   app.setPath('userData', resolve(process.env.STONE_USER_DATA_DIR))
 }
 
-if (process.platform === 'win32') app.setAppUserModelId('io.github.m4rkzzz.stoneplus')
+if (process.platform === 'win32') app.setAppUserModelId(WINDOWS_APP_USER_MODEL_ID)
 const ownsSingleInstanceLock = app.requestSingleInstanceLock()
 if (ownsSingleInstanceLock) {
   app.on('second-instance', () => {
@@ -189,6 +190,7 @@ async function bootstrap(): Promise<void> {
 }
 
 function createWindow(): void {
+  const iconPath = stoneIconPath()
   mainWindow = new BrowserWindow({
     width: 1360,
     height: 900,
@@ -196,7 +198,7 @@ function createWindow(): void {
     minHeight: 680,
     show: false,
     backgroundColor: '#f9fbfa',
-    icon: stoneIconPath(),
+    icon: iconPath,
     titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'hidden',
     ...(process.platform === 'darwin' ? {} : {
       titleBarOverlay: {
@@ -215,6 +217,18 @@ function createWindow(): void {
       spellcheck: false
     }
   })
+
+  // Windows taskbar grouping can fall back to Electron's executable icon when
+  // a PNG window icon is used. Reapply the packaged multi-size ICO explicitly.
+  if (process.platform === 'win32') {
+    const windowIcon = nativeImage.createFromPath(iconPath)
+    if (!windowIcon.isEmpty()) mainWindow.setIcon(windowIcon)
+    mainWindow.setAppDetails({
+      appId: WINDOWS_APP_USER_MODEL_ID,
+      appIconPath: iconPath,
+      appIconIndex: 0
+    })
+  }
 
   mainWindow.setMenuBarVisibility(false)
   const rendererTarget = process.env.ELECTRON_RENDERER_URL ?? pathToFileURL(join(__dirname, '../renderer/index.html')).toString()
@@ -281,9 +295,10 @@ function showMainWindow(): void {
 }
 
 function stoneIconPath(): string {
+  const filename = process.platform === 'win32' ? 'icon.ico' : 'icon.png'
   return app.isPackaged
-    ? join(process.resourcesPath, 'icon.png')
-    : resolve('build/icon.png')
+    ? join(process.resourcesPath, filename)
+    : resolve('build', filename)
 }
 
 function isSafeBrowserUrl(value: string): boolean {

@@ -464,7 +464,7 @@ try {
   const clientConfigEasyUiWorks = await codexClientTab.getAttribute('aria-selected') === 'true'
     && await window.getByRole('heading', { name: '客户端配置' }).count() === 0
     && await window.locator('.client-easy-status__item').count() === 3
-    && await window.getByRole('button', { name: '一键修复连接' }).isVisible()
+    && await window.getByRole('button', { name: /一键(?:修复)?连接/ }).isVisible()
     && advancedHiddenByDefault
     && advancedEditorAvailable
     && await clientUpstreamSelect.inputValue() === switchTargetId

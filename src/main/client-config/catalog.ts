@@ -619,6 +619,7 @@ function discoveredDescription(path: string[], sensitive: boolean): string {
 function isStoneManagedPath(path: string[]): boolean {
   return pathIdentity(path) === pathIdentity(['model_provider'])
     || pathIdentity(path) === pathIdentity(['cli_auth_credentials_store'])
+    || pathIdentity(path) === pathIdentity(['features', 'remote_compaction_v2'])
     || (path[0] === 'model_providers' && path[1] === 'stone')
 }
 

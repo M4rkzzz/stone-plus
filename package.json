@@ -1,6 +1,6 @@
 {
   "name": "stone-desktop",
-  "version": "0.9.2",
+  "version": "0.9.3",
   "private": true,
   "description": "Stone+ — Unofficial community fork of Stone",
   "author": {
@@ -117,6 +117,10 @@
     "win": {
       "icon": "build/icon.ico",
       "extraResources": [
+        {
+          "from": "build/icon.ico",
+          "to": "icon.ico"
+        },
         {
           "from": "build/frp/frpc.exe",
           "to": "frp/frpc.exe"

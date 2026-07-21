@@ -806,6 +806,59 @@ describe('refresh provider models IPC', () => {
     }
   })
 
+  it('refreshes all non-quota accounts once when they are collectively cooling down', async () => {
+    const first = apiKeyAccount()
+    const second = {
+      ...apiKeyAccount(),
+      id: 'account-api-key-2',
+      name: 'OpenAI API key 2',
+      credentialId: 'credential-api-key-2'
+    }
+    const exhausted = {
+      ...oauthAccount(),
+      id: 'account-quota-exhausted',
+      credentialId: 'credential-quota-exhausted',
+      status: 'cooldown' as const,
+      circuitState: 'open' as const,
+      cooldownReason: 'quota' as const,
+      cooldownUntil: Date.now() + 60_000
+    }
+    const upstreamFetch = vi.fn(async () => new Response(null, { status: 503 }))
+    const harness = createHarness(
+      [first, second, exhausted],
+      {
+        [first.credentialId]: 'sk-first',
+        [second.credentialId]: 'sk-second',
+        [exhausted.credentialId]: oauthCredential()
+      },
+      upstreamFetch
+    )
+    const cooldownState = (accountId: string): GatewayAccountState => ({
+      accountId,
+      status: 'cooldown',
+      circuitState: 'open',
+      consecutiveFailures: 1,
+      cooldownReason: 'failure',
+      cooldownUntil: Date.now() + 30_000,
+      lastError: 'Temporary upstream failure'
+    })
+
+    harness.emitAccountState(cooldownState(first.id))
+    harness.emitAccountState(cooldownState(second.id))
+
+    await vi.waitFor(() => expect(upstreamFetch).toHaveBeenCalledTimes(2))
+    expect(harness.store.setAccountCheckResult).toHaveBeenCalledWith(first.id, expect.objectContaining({ status: 'checking' }))
+    expect(harness.store.setAccountCheckResult).toHaveBeenCalledWith(second.id, expect.objectContaining({ status: 'checking' }))
+    expect(harness.store.setAccountCheckResult).not.toHaveBeenCalledWith(exhausted.id, expect.anything())
+
+    // Failed automatic probes leave the group cooled, but must not create a
+    // self-sustaining retry loop or repeat on duplicate cooldown telemetry.
+    harness.emitAccountState(cooldownState(first.id))
+    harness.emitAccountState(cooldownState(second.id))
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    expect(upstreamFetch).toHaveBeenCalledTimes(2)
+  })
+
   it('cools an exhausted OAuth account until the reset reported by the usage probe', async () => {
     const oauth = oauthAccount()
     const resetAfterSeconds = 3_600

@@ -90,6 +90,7 @@ export function planCodexConfig(
       mutation(paths.config, configSource, config, [
         'model_provider',
         'cli_auth_credentials_store',
+        'features.remote_compaction_v2',
         'model_providers.stone',
       ]),
       mutation(paths.auth, authSource, auth, ['auth_mode', 'OPENAI_API_KEY']),

@@ -78,6 +78,9 @@ export function registerGatewayApi(
   const quotaProbeTimers = new Map<string, ReturnType<typeof setTimeout>>()
   const quotaProbeFlights = new Set<string>()
   const lastQuotaProbeAt = new Map<string, number>()
+  let automaticCooldownRefreshTriggered = false
+  let automaticCooldownRefreshFlight: Promise<void> | undefined
+  let evaluateAutomaticCooldownRefresh = (): void => undefined
   let closed = false
   let rendererLanguage: UiLanguage | undefined
   const resolvedNativeLanguage = (): UiLanguage => {
@@ -325,7 +328,9 @@ export function registerGatewayApi(
       })
       if (exhausted && cooldownUntil !== undefined) scheduleQuotaProbe(id, cooldownUntil + 1_000)
       else gateway.resetAccountHealth(id)
-      return { snapshot: publish(refreshRuntime()), ok: !exhausted, latencyMs: result.latencyMs,
+      const snapshot = publish(refreshRuntime())
+      evaluateAutomaticCooldownRefresh()
+      return { snapshot, ok: !exhausted, latencyMs: result.latencyMs,
         ...(exhausted ? { error: 'ChatGPT Codex 额度已耗尽。' } : {}) }
     } catch (error: unknown) {
       const failure = error instanceof AccountProbeError ? error.failure : undefined
@@ -340,8 +345,46 @@ export function registerGatewayApi(
         cooldownReason: shouldCooldown ? 'failure' : previous?.cooldownReason,
         lastError: errorMessage
       })
-      return { snapshot: publish(refreshRuntime()), ok: false, error: errorMessage }
+      const snapshot = publish(refreshRuntime())
+      evaluateAutomaticCooldownRefresh()
+      return { snapshot, ok: false, error: errorMessage }
     }
+  }
+
+  evaluateAutomaticCooldownRefresh = (): void => {
+    if (closed) return
+    const candidates = store.getRuntimeAccounts().filter((account) => (
+      account.status !== 'disabled'
+      && account.status !== 'expired'
+      && account.cooldownReason !== 'quota'
+      && !quotaExhausted(account)
+    ))
+    const allCooling = candidates.length > 0
+      && candidates.every((account) => account.status === 'cooldown')
+    if (!allCooling) {
+      // Checking is a transient state created by this refresh. Only a proven
+      // active account rearms the next collective-cooldown episode.
+      if (!automaticCooldownRefreshFlight && candidates.some((account) => account.status === 'active')) {
+        automaticCooldownRefreshTriggered = false
+      }
+      return
+    }
+    if (automaticCooldownRefreshTriggered || automaticCooldownRefreshFlight) return
+
+    automaticCooldownRefreshTriggered = true
+    const accountIds = candidates.map((account) => account.id)
+    const flight = (async (): Promise<void> => {
+      await mapConcurrent(accountIds, 3, async (accountId) => {
+        await probeAndPersistAccount(accountId)
+      })
+    })()
+    automaticCooldownRefreshFlight = flight
+    void flight.catch((error: unknown) => {
+      console.error('Stone+ could not automatically refresh collectively cooled accounts', error)
+    }).finally(() => {
+      if (automaticCooldownRefreshFlight === flight) automaticCooldownRefreshFlight = undefined
+      evaluateAutomaticCooldownRefresh()
+    })
   }
 
   const detectImportedAccounts = async (
@@ -568,6 +611,7 @@ export function registerGatewayApi(
     } else {
       scheduleRuntimePublish()
     }
+    evaluateAutomaticCooldownRefresh()
   }
 
   const persistRoutineAccountState = async (state: GatewayAccountState): Promise<void> => {
@@ -627,6 +671,7 @@ export function registerGatewayApi(
       scheduleQuotaProbe(account.id, resetAt ? resetAt + 1_000 : Date.now() + 1_000)
     }
   }
+  evaluateAutomaticCooldownRefresh()
 
   ipcMain.handle('stone:set-ui-language', (event, language: UiLanguage) => {
     assertTrustedSender(event)
@@ -1631,6 +1676,9 @@ export function registerGatewayApi(
   })
   return async () => {
     closed = true
+    if (automaticCooldownRefreshFlight) {
+      await Promise.allSettled([automaticCooldownRefreshFlight])
+    }
     const oauthCompletions = new Set<Promise<unknown>>(oauthCompletionFlights)
     for (const [sessionId, session] of [...oauthImportSessions]) {
       session.cancelled = true

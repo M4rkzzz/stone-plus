@@ -1072,7 +1072,12 @@ class ProtocolEncoder implements CanonicalStreamEncoder {
     }
     if (event.type === 'error') {
       this.failed = true
-      this.frames.push(responsesSse('error', canonicalError(event)))
+      const error = canonicalError(event)
+      const { type: errorType, ...details } = error
+      this.frames.push(responsesSse('error', omitUndefined({
+        ...details,
+        error_type: errorType
+      })))
       return
     }
     if (event.type === 'done' && !this.done) {
@@ -1585,7 +1590,9 @@ function sseFrame(data: unknown): string {
 }
 
 function responsesSse(type: string, data: JsonObject): string {
-  return `event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`
+  // The SSE event name and payload type are one protocol discriminator.
+  // Never let a provider-specific error classification overwrite it.
+  return `event: ${type}\ndata: ${JSON.stringify({ ...data, type })}\n\n`
 }
 
 function anthropicSse(event: string, data: JsonObject): string {

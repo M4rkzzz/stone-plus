@@ -235,6 +235,103 @@ function setTopLevelPath(lines: string[], path: string[], value: TomlValue): voi
   lines.splice(firstHeader, 0, `${path.map(tomlKeyPart).join('.')} = ${tomlValue(value)}`, ...separator)
 }
 
+function inlineTableValueBounds(statement: string): { open: number; close: number } | undefined {
+  const equalsIndex = assignmentEqualsIndex(statement)
+  if (equalsIndex < 0) return undefined
+  const open = statement.indexOf('{', equalsIndex + 1)
+  if (open < 0 || statement.slice(equalsIndex + 1, open).trim()) return undefined
+  let quote: 'basic' | 'literal' | undefined
+  let escaped = false
+  let depth = 0
+  for (let index = open; index < statement.length; index += 1) {
+    const character = statement[index]
+    if (quote === 'basic' && escaped) {
+      escaped = false
+      continue
+    }
+    if (quote === 'basic' && character === '\\') {
+      escaped = true
+      continue
+    }
+    if (character === '"' && quote !== 'literal') {
+      quote = quote === 'basic' ? undefined : 'basic'
+      continue
+    }
+    if (character === "'" && quote !== 'basic') {
+      quote = quote === 'literal' ? undefined : 'literal'
+      continue
+    }
+    if (quote !== undefined) continue
+    if (character === '{') depth += 1
+    else if (character === '}' && --depth === 0) return { open, close: index }
+  }
+  return undefined
+}
+
+function inlineTableChildRange(inner: string, key: string): { start: number; end: number } | undefined {
+  let quote: 'basic' | 'literal' | undefined
+  let escaped = false
+  let depth = 0
+  let start = 0
+  const consider = (end: number) => samePath(assignmentPath(inner.slice(start, end)), [key])
+    ? { start, end }
+    : undefined
+  for (let index = 0; index < inner.length; index += 1) {
+    const character = inner[index]
+    if (quote === 'basic' && escaped) {
+      escaped = false
+      continue
+    }
+    if (quote === 'basic' && character === '\\') {
+      escaped = true
+      continue
+    }
+    if (character === '"' && quote !== 'literal') {
+      quote = quote === 'basic' ? undefined : 'basic'
+      continue
+    }
+    if (character === "'" && quote !== 'basic') {
+      quote = quote === 'literal' ? undefined : 'literal'
+      continue
+    }
+    if (quote !== undefined) continue
+    if (character === '[' || character === '{') depth += 1
+    else if (character === ']' || character === '}') depth -= 1
+    else if (character === ',' && depth === 0) {
+      const range = consider(index)
+      if (range) return range
+      start = index + 1
+    }
+  }
+  return consider(inner.length)
+}
+
+function setInlineTableChild(lines: string[], parent: string, key: string, value: TomlValue): boolean {
+  const assignment = locatedAssignments(lines)
+    .find((statement) => samePath(statement.absolutePath, [parent]))
+  if (!assignment) return false
+  const statement = lines.slice(assignment.start, assignment.end + 1).join('\n')
+  const bounds = inlineTableValueBounds(statement)
+  if (!bounds) return false
+  const inner = statement.slice(bounds.open + 1, bounds.close)
+  const child = inlineTableChildRange(inner, key)
+  let nextInner: string
+  if (child) {
+    const segment = inner.slice(child.start, child.end)
+    nextInner = inner.slice(0, child.start) + replaceValue(segment, value) + inner.slice(child.end)
+  } else {
+    const trailingWhitespace = inner.match(/\s*$/)?.[0] ?? ''
+    const body = inner.slice(0, inner.length - trailingWhitespace.length)
+    const separator = body.trim() && !body.trimEnd().endsWith(',') ? ', ' : body.trim() ? ' ' : ''
+    nextInner = `${body}${separator}${tomlKeyPart(key)} = ${tomlValue(value)}${trailingWhitespace}`
+  }
+  const nextStatement = statement.slice(0, bounds.open + 1)
+    + nextInner
+    + statement.slice(bounds.close)
+  lines.splice(assignment.start, assignment.end - assignment.start + 1, ...nextStatement.split('\n'))
+  return true
+}
+
 function setPath(lines: string[], path: string[], value: TomlValue): void {
   const existing = locatedAssignments(lines).find((statement) => samePath(statement.absolutePath, path))
   if (existing) {
@@ -245,6 +342,7 @@ function setPath(lines: string[], path: string[], value: TomlValue): void {
     setTopLevel(lines, { key: path[0], value })
     return
   }
+  if (path.length === 2 && setInlineTableChild(lines, path[0], path[1], value)) return
   const parent = path.slice(0, -1)
   if (sectionBounds(lines, parent)) {
     setSection(lines, parent, [{ key: path.at(-1)!, value }])
@@ -376,6 +474,10 @@ export function planCodexToml(content: string | undefined, baseUrl: string): Tex
 
   setTopLevel(lines, { key: 'model_provider', value: 'stone' })
   setTopLevel(lines, { key: 'cli_auth_credentials_store', value: 'file' })
+  // Stone+ implements the portable Legacy compact endpoint for relay pools.
+  // V2 requires an opaque native compaction item and cannot be safely
+  // synthesized by a transparent gateway.
+  setPath(lines, ['features', 'remote_compaction_v2'], false)
   setSection(lines, ['model_providers', 'stone'], [
     { key: 'name', value: 'OpenAI' },
     { key: 'base_url', value: baseUrl },
@@ -407,6 +509,10 @@ export function repairCodexToml(content: string | undefined, baseUrl: string): T
     const root = parseCodexToml(source)
     root.model_provider = 'stone'
     root.cli_auth_credentials_store = 'file'
+
+    const features = tomlObject(root.features) ?? {}
+    root.features = features
+    features.remote_compaction_v2 = false
 
     const providers = tomlObject(root.model_providers) ?? {}
     root.model_providers = providers
