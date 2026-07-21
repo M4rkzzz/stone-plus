@@ -19,7 +19,7 @@
   <text class="title" x="66" y="45">Stone+ Star 趋势</text>
   <text class="subtitle" x="34" y="68">M4rkzzz/stone-plus · 基于 GitHub Stargazer 时间戳自动生成</text>
   <text class="label" x="926" y="33" text-anchor="end">当前 Star</text>
-  <text class="count" x="926" y="67" text-anchor="end">28</text>
+  <text class="count" x="926" y="67" text-anchor="end">34</text>
   <line class="grid" x1="74" y1="422" x2="926" y2="422"/>
   <line class="grid" x1="74" y1="358.4" x2="926" y2="358.4"/>
   <line class="grid" x1="74" y1="294.8" x2="926" y2="294.8"/>
@@ -38,12 +38,12 @@
   <text class="axis" x="62" y="171.6" text-anchor="end">40</text>
   <text class="axis" x="62" y="108" text-anchor="end">50</text>
   <text class="axis" x="74" y="452" text-anchor="middle">7/18</text>
-  <text class="axis" x="287" y="452" text-anchor="middle">7/18</text>
+  <text class="axis" x="287" y="452" text-anchor="middle">7/19</text>
   <text class="axis" x="500" y="452" text-anchor="middle">7/19</text>
   <text class="axis" x="713" y="452" text-anchor="middle">7/20</text>
-  <text class="axis" x="926" y="452" text-anchor="middle">7/20</text>
-  <path class="area" d="M 74 422 H 98.52 V 415.64 H 115.89 V 409.28 H 125.13 V 402.92 H 129.59 V 396.56 H 137.43 V 390.2 H 338.28 V 383.84 H 342.23 V 377.48 H 381.93 V 371.12 H 445.91 V 364.76 H 455.37 V 358.4 H 464.95 V 352.04 H 510.23 V 345.68 H 548.36 V 339.32 H 587.18 V 332.96 H 633.3 V 326.6 H 672.99 V 320.24 H 720.59 V 313.88 H 754.27 V 307.52 H 784.41 V 301.16 H 785.95 V 294.8 H 806.9 V 288.44 H 824.82 V 282.08 H 850.29 V 275.72 H 861.37 V 269.36 H 866.74 V 263 H 888.92 V 256.64 H 897.32 V 250.28 H 926 V 243.92 H 926 V 422 H 74 Z"/>
-  <path class="line" d="M 74 422 H 98.52 V 415.64 H 115.89 V 409.28 H 125.13 V 402.92 H 129.59 V 396.56 H 137.43 V 390.2 H 338.28 V 383.84 H 342.23 V 377.48 H 381.93 V 371.12 H 445.91 V 364.76 H 455.37 V 358.4 H 464.95 V 352.04 H 510.23 V 345.68 H 548.36 V 339.32 H 587.18 V 332.96 H 633.3 V 326.6 H 672.99 V 320.24 H 720.59 V 313.88 H 754.27 V 307.52 H 784.41 V 301.16 H 785.95 V 294.8 H 806.9 V 288.44 H 824.82 V 282.08 H 850.29 V 275.72 H 861.37 V 269.36 H 866.74 V 263 H 888.92 V 256.64 H 897.32 V 250.28 H 926 V 243.92 H 926"/>
-  <circle class="point" cx="926" cy="243.92" r="5"/>
+  <text class="axis" x="926" y="452" text-anchor="middle">7/21</text>
+  <path class="area" d="M 74 422 H 93.63 V 415.64 H 107.54 V 409.28 H 114.94 V 402.92 H 118.51 V 396.56 H 124.79 V 390.2 H 285.6 V 383.84 H 288.76 V 377.48 H 320.54 V 371.12 H 371.77 V 364.76 H 379.35 V 358.4 H 387.02 V 352.04 H 423.27 V 345.68 H 453.8 V 339.32 H 484.88 V 332.96 H 521.81 V 326.6 H 553.59 V 320.24 H 591.7 V 313.88 H 618.66 V 307.52 H 642.8 V 301.16 H 644.03 V 294.8 H 660.8 V 288.44 H 675.15 V 282.08 H 695.54 V 275.72 H 704.41 V 269.36 H 708.72 V 263 H 726.47 V 256.64 H 733.2 V 250.28 H 756.16 V 243.92 H 763.21 V 237.56 H 823.25 V 231.2 H 828.84 V 224.84 H 840.42 V 218.48 H 867.9 V 212.12 H 926 V 205.76 H 926 V 422 H 74 Z"/>
+  <path class="line" d="M 74 422 H 93.63 V 415.64 H 107.54 V 409.28 H 114.94 V 402.92 H 118.51 V 396.56 H 124.79 V 390.2 H 285.6 V 383.84 H 288.76 V 377.48 H 320.54 V 371.12 H 371.77 V 364.76 H 379.35 V 358.4 H 387.02 V 352.04 H 423.27 V 345.68 H 453.8 V 339.32 H 484.88 V 332.96 H 521.81 V 326.6 H 553.59 V 320.24 H 591.7 V 313.88 H 618.66 V 307.52 H 642.8 V 301.16 H 644.03 V 294.8 H 660.8 V 288.44 H 675.15 V 282.08 H 695.54 V 275.72 H 704.41 V 269.36 H 708.72 V 263 H 726.47 V 256.64 H 733.2 V 250.28 H 756.16 V 243.92 H 763.21 V 237.56 H 823.25 V 231.2 H 828.84 V 224.84 H 840.42 V 218.48 H 867.9 V 212.12 H 926 V 205.76 H 926"/>
+  <circle class="point" cx="926" cy="205.76" r="5"/>
   
 </svg>
