@@ -4,7 +4,7 @@
 
 <h1 align="center">Stone+</h1>
 
-<p align="center"><strong>把多个 AI 账号、API 与编程客户端，收进一个本地智能网关</strong></p>
+<p align="center"><strong>Stone+（Stone Plus / stone-plus / StonePlus）：把多个 AI 账号、API 与编程客户端，收进一个本地智能网关</strong></p>
 
 <p align="center">
   <a href="README.en.md">English</a> · <strong>简体中文</strong>
@@ -36,7 +36,7 @@
 
 ## Stone+ 是什么？
 
-Stone+ 是 [Stone](https://github.com/EasyCode-Obsidian/Stone) 的社区功能增强版。它运行在你的电脑上，在 **Codex、Claude Code、Gemini CLI** 与多个上游账号/API 之间充当一个本地控制平面：
+Stone+（也可搜索 **Stone Plus**、**stone-plus** 或 **StonePlus**）是 [Stone](https://github.com/EasyCode-Obsidian/Stone) 的社区功能增强版。它运行在你的电脑上，在 **Codex、Claude Code、Gemini CLI** 与多个上游账号/API 之间充当一个本地控制平面：
 
 - 客户端只连接 `http://127.0.0.1:15721`；
 - Stone+ 按模型、额度、健康、并发、会话粘性与历史表现选择账号；
