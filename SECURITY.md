@@ -1,8 +1,8 @@
 # Security Policy / 安全政策
 
-StonePlus is a local-first desktop gateway. Security reports are taken seriously because the application handles upstream credentials, local route tokens, proxy authentication, and client configuration files.
+Stone+ is a local-first desktop gateway. Security reports are taken seriously because the application handles upstream credentials, local route tokens, proxy authentication, and client configuration files.
 
-StonePlus 是一个本地优先的桌面网关。由于应用会处理上游凭据、本地路由 Token、代理认证信息和客户端配置文件，我们会认真对待安全问题。
+Stone+ 是一个本地优先的桌面网关。由于应用会处理上游凭据、本地路由 Token、代理认证信息和客户端配置文件，我们会认真对待安全问题。
 
 ## Supported Versions / 支持版本
 
@@ -18,16 +18,16 @@ Security fixes are normally made against the latest stable release. A report abo
 
 ## Local Security Model / 本地安全模型
 
-- Upstream credentials and proxy passwords are encrypted with Electron `safeStorage`, backed by the operating system credential store. StonePlus refuses to save new credentials when secure storage is unavailable instead of silently falling back to plaintext.
+- Upstream credentials and proxy passwords are encrypted with Electron `safeStorage`, backed by the operating system credential store. Stone+ refuses to save new credentials when secure storage is unavailable instead of silently falling back to plaintext.
 - Stored upstream credentials are not returned from the main process to the renderer. The regular UI receives masks and non-secret status metadata.
-- StonePlus listens only on loopback addresses. Every enabled client route requires a local route token, which is visible in the UI because the local client must use it.
-- Request logs contain routing metadata, status, latency, and token counts. StonePlus does not intentionally persist prompts or model responses. Known credential values and sensitive error fields are redacted before errors are returned or stored.
+- Stone+ listens only on loopback addresses. Every enabled client route requires a local route token, which is visible in the UI because the local client must use it.
+- Request logs contain routing metadata, status, latency, and token counts. Stone+ does not intentionally persist prompts or model responses. Known credential values and sensitive error fields are redacted before errors are returned or stored.
 - The local SQLite database and its backups can contain account names, provider and proxy metadata, request metadata, route tokens, and encrypted credential blobs. Treat them as sensitive even though credential values are encrypted.
 - Diagnostic reports are designed to omit credentials and account identity, but users should still review every report, screenshot, and log before sharing it.
 
-- 上游凭据和代理密码使用 Electron `safeStorage` 加密，并由操作系统凭据存储提供保护。安全存储不可用时，StonePlus 会拒绝保存新凭据，而不会静默降级为明文。
+- 上游凭据和代理密码使用 Electron `safeStorage` 加密，并由操作系统凭据存储提供保护。安全存储不可用时，Stone+ 会拒绝保存新凭据，而不会静默降级为明文。
 - 已保存的上游凭据不会由 main process 返回 renderer；常规界面只接收掩码和非敏感状态元数据。
-- StonePlus 仅监听回环地址。每条启用的客户端路由都需要本地路由 Token；该 Token 会显示在 UI 中，因为本机客户端需要使用它。
+- Stone+ 仅监听回环地址。每条启用的客户端路由都需要本地路由 Token；该 Token 会显示在 UI 中，因为本机客户端需要使用它。
 - 请求日志只记录路由元数据、状态、延迟和 Token 计数，不会主动持久化提示词或模型回复。已知凭据和敏感错误字段会在返回或保存前脱敏。
 - 本地 SQLite 数据库及其备份可能包含账号名称、供应商与代理元数据、请求元数据、路由 Token 和加密后的凭据数据。即使凭据已加密，也应把这些文件视为敏感材料。
 - 诊断报告会尽量排除凭据和账号身份，但分享前仍应人工检查每一份报告、截图和日志。
@@ -37,16 +37,16 @@ Security fixes are normally made against the latest stable release. A report abo
 Do not attach or paste any of the following into a public Issue, Discussion, pull request, screenshot, or chat:
 
 - API keys, access tokens, refresh tokens, ID tokens, authorization headers, cookies, or ChatGPT/Codex session JSON.
-- Full ChatGPT account IDs, proxy passwords, proxy URLs containing credentials, or StonePlus local route tokens.
-- `stone-state.sqlite3`, SQLite `-wal` / `-shm` files, StonePlus database backups, or migrated state files.
+- Full ChatGPT account IDs, proxy passwords, proxy URLs containing credentials, or Stone+ local route tokens.
+- `stone-state.sqlite3`, SQLite `-wal` / `-shm` files, Stone+ database backups, or migrated state files.
 - `.env`, `auth.json`, client credential files, signing certificates, private keys, or unredacted client configuration.
 - Prompts, model responses, account email addresses, private provider URLs, local paths, or public egress IP addresses unless they are essential and safely anonymized.
 
 请勿在公开 Issue、Discussion、Pull Request、截图或聊天中附加或粘贴以下内容：
 
 - API Key、Access Token、Refresh Token、ID Token、认证 Header、Cookie 或 ChatGPT/Codex session JSON。
-- 完整 ChatGPT account ID、代理密码、含凭据的代理 URL 或 StonePlus 本地路由 Token。
-- `stone-state.sqlite3`、SQLite `-wal` / `-shm` 文件、StonePlus 数据库备份或迁移后的状态文件。
+- 完整 ChatGPT account ID、代理密码、含凭据的代理 URL 或 Stone+ 本地路由 Token。
+- `stone-state.sqlite3`、SQLite `-wal` / `-shm` 文件、Stone+ 数据库备份或迁移后的状态文件。
 - `.env`、`auth.json`、客户端凭据文件、签名证书、私钥或未脱敏的客户端配置。
 - 提示词、模型回复、账号邮箱、私有供应商 URL、本机路径或公网出口 IP，除非确有必要且已经安全匿名化。
 
@@ -78,14 +78,14 @@ If Private Vulnerability Reporting is unavailable, open a public Issue only to a
 
 ## What to Include / 报告内容
 
-- StonePlus version, operating system, CPU architecture, and installation type.
+- Stone+ version, operating system, CPU architecture, and installation type.
 - Affected feature and realistic security impact.
 - Reproduction steps with dummy credentials and the minimum required configuration.
 - Whether the issue requires local access, a malicious upstream, or user interaction.
 - Redacted evidence and, when possible, a suggested mitigation.
 - Whether the issue is already public or has been reported elsewhere.
 
-- StonePlus 版本、操作系统、CPU 架构和安装形式。
+- Stone+ 版本、操作系统、CPU 架构和安装形式。
 - 受影响功能及实际安全影响。
 - 使用虚拟凭据和最小配置的复现步骤。
 - 问题是否需要本机访问、恶意上游或用户交互。

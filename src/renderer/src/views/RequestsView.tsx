@@ -366,7 +366,7 @@ export function RequestsView({
         )}
       </Modal>
 
-      <ConfirmDialog open={confirmClear} title={t('清空请求日志', 'Clear Request Logs')} message={t('确定清空全部本地请求记录吗？导出后也无法从 StonePlus 中恢复。', 'Clear all local request records? They cannot be restored from StonePlus, even after export.')} confirmLabel={t('清空日志', 'Clear Logs')} busy={busyKeys.has('clear-logs')} onCancel={() => setConfirmClear(false)} onConfirm={() => void clear()} />
+      <ConfirmDialog open={confirmClear} title={t('清空请求日志', 'Clear Request Logs')} message={t('确定清空全部本地请求记录吗？导出后也无法从 Stone+ 中恢复。', 'Clear all local request records? They cannot be restored from Stone+, even after export.')} confirmLabel={t('清空日志', 'Clear Logs')} busy={busyKeys.has('clear-logs')} onCancel={() => setConfirmClear(false)} onConfirm={() => void clear()} />
     </div>
   )
 }

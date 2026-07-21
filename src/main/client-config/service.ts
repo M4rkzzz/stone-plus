@@ -143,7 +143,7 @@ export class ClientConfigService {
       if (!file) throw new ClientConfigValidationError('A client configuration file does not belong to the selected client')
       const source = existing[file.role]
       if (draft.revision !== revisionOf(source)) {
-        throw new ClientConfigValidationError('Client configuration changed outside StonePlus. Reload it before saving.')
+        throw new ClientConfigValidationError('Client configuration changed outside Stone+. Reload it before saving.')
       }
       edited[file.role] = restoreClientConfigEditorContent(file, draft.content, source)
     }
@@ -180,7 +180,7 @@ export class ClientConfigService {
   }
 
   /**
-   * Repair only StonePlus's connection fields. Syntactically valid user settings
+   * Repair only Stone+'s connection fields. Syntactically valid user settings
    * are preserved; an unusable managed document is backed up transactionally
    * and rebuilt from the minimal planner output.
    */

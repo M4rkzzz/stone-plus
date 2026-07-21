@@ -135,9 +135,9 @@ const englishFieldMetadata: Readonly<Record<string, EnglishFieldMetadata>> = Obj
 
   ['codex.model', 'Default model', 'The model Codex uses for new conversations. Leave blank to follow the client recommendation.', 'Use the client-recommended model'],
   ['codex.reviewModel', 'Code review model', 'The model used specifically for /review. Leave blank to use the current conversation model.', 'Use the current model'],
-  ['codex.modelProvider', 'Model provider', 'StonePlus fixes this value to stone so requests are sent through the local gateway.'],
-  ['codex.credentialsStore', 'Credential storage', 'StonePlus routing uses a protected auth.json file, so applying the configuration fixes this value to file.'],
-  ['codex.serviceTier', 'Service tier', 'Select a response tier supported by the model provider. Leave blank when the StonePlus upstream does not support one.'],
+  ['codex.modelProvider', 'Model provider', 'Stone+ fixes this value to stone so requests are sent through the local gateway.'],
+  ['codex.credentialsStore', 'Credential storage', 'Stone+ routing uses a protected auth.json file, so applying the configuration fixes this value to file.'],
+  ['codex.serviceTier', 'Service tier', 'Select a response tier supported by the model provider. Leave blank when the Stone+ upstream does not support one.'],
   ['codex.reasoningEffort', 'Reasoning effort', 'Balances speed, usage, and reasoning depth for models that support reasoning.'],
   ['codex.planReasoningEffort', 'Plan mode reasoning effort', 'Overrides the normal reasoning effort only while Plan mode is active.'],
   ['codex.reasoningSummary', 'Reasoning summary', 'Controls whether a reasoning summary is shown and how detailed it should be.'],
@@ -204,7 +204,7 @@ const englishSections: Readonly<Record<string, string>> = Object.freeze({
   '体验': 'Experience',
   '更新与通知': 'Updates & notifications',
   '模型': 'Models',
-  'StonePlus 连接': 'StonePlus connection',
+  'Stone+ 连接': 'Stone+ connection',
   '推理与输出': 'Reasoning & output',
   '上下文与压缩': 'Context & compaction',
   '指令': 'Instructions',
@@ -317,7 +317,7 @@ export function localizeClientConfigEditorField(
   const label = metadata?.label ?? humanizeConfigKey(field.path.at(-1) ?? field.id)
   const description = metadata?.description ?? (field.sensitive
     ? `${path} contains a credential or sensitive connection value. Its current value is hidden; use the protected full-file editor to preserve or replace it.`
-    : `${path} is an existing client setting not yet included in the StonePlus catalog. StonePlus preserves it unchanged; use the full-file editor to modify it.`)
+    : `${path} is an existing client setting not yet included in the Stone+ catalog. Stone+ preserves it unchanged; use the full-file editor to modify it.`)
   return {
     ...field,
     section: englishSections[field.section] ?? (field.source === 'discovered' ? 'Existing extended settings' : 'Client settings'),

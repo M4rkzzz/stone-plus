@@ -43,7 +43,7 @@
   代理等可选设置后置折叠，并修复窄窗口中 OAuth 主按钮被裁切的问题。
 - 将“客户端配置”重构为 Codex 默认打开的超级易用页：日常只显示当前上游、连接健康状态、
   一键修复和恢复入口；标题说明、空白与大面积编辑器全部移除或收进高级设置。
-- 客户端切换反代时只原子更新 StonePlus 内部路由，不再改写 `config.toml`、`settings.json`
+- 客户端切换反代时只原子更新 Stone+ 内部路由，不再改写 `config.toml`、`settings.json`
   或 `.env`；有效配置只修复必要连接字段，损坏文件会先备份原文再重建最小可用配置。
 - 高级设置保留三客户端 Profile 快切、40 余项字段解释、脱敏实时预览、源码编辑、格式校验、
   手动整组备份与整组恢复；多文件恢复前会再做安全快照，避免相关文件版本错配。
@@ -140,11 +140,11 @@
 
 ## 0.8.6
 
-- Fixed session repair exhausting memory and terminating StonePlus when Codex history
+- Fixed session repair exhausting memory and terminating Stone+ when Codex history
   contains multiple gigabytes of rollout files; previews now scan bounded metadata.
 - Added Codex historical-session repair with provider discovery, dry-run counts,
   stale-preview protection, automatic rollout/SQLite backups, transactional index
-  updates, rollback, encrypted-content guidance, and a dedicated StonePlus UI.
+  updates, rollback, encrypted-content guidance, and a dedicated Stone+ UI.
 - Added native multi-file CPA and Sub2API JSON account imports, automatic recovery
   of missing CPA `account_id` values from JWT claims, and immediate concurrent
   account health checks after import.
@@ -159,7 +159,7 @@
 - Added an optional `autobalanced` strategy that prefers accounts with better EWMA
   TTFT/output speed without changing the existing `balanced` behavior.
 - Kept update checks working when GitHub's anonymous REST API is rate limited by
-  falling back to the trusted latest-release redirect, and completed StonePlus branding
+  falling back to the trusted latest-release redirect, and completed Stone+ branding
   across the application-update UI.
 
 ## 0.8.4
@@ -169,7 +169,7 @@
 - A close before the terminal event remains a real 499 and still does not cool
   down the account or trigger failover.
 
-## 0.8.3 — StonePlus initial release
+## 0.8.3 — Stone+ initial release
 
 - Added embedded FRP tunnel management and copyable remote endpoint/token.
 - Added pool-level Fast On priority routing for OpenAI Responses-compatible pools.

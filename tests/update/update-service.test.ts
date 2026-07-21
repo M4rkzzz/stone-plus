@@ -113,7 +113,7 @@ function createHarness(options: HarnessOptions = {}) {
 function releasePayload(version = '0.8.1', overrides: Record<string, unknown> = {}) {
   return {
     tag_name: `v${version}`,
-    name: `StonePlus v${version}`,
+    name: `Stone+ v${version}`,
     body: '## Changes\n\n- Safer updates',
     html_url: `https://github.com/M4rkzzz/stone-plus/releases/tag/v${version}`,
     published_at: '2026-07-13T00:00:00Z',
@@ -149,7 +149,7 @@ describe('UpdateService', () => {
     expect(state.release).toEqual({
       version: '0.8.1',
       tagName: 'v0.8.1',
-      title: 'StonePlus v0.8.1',
+      title: 'Stone+ v0.8.1',
       notes: '## Changes\n\n- Safer updates',
       publishedAt: '2026-07-13T00:00:00Z',
       url: 'https://github.com/M4rkzzz/stone-plus/releases/tag/v0.8.1'
@@ -335,7 +335,7 @@ describe('GitHub release parsing', () => {
     await expect(fetchLatestRelease(fetchImplementation, '0.8.4')).resolves.toEqual({
       version: '0.8.5',
       tagName: 'v0.8.5',
-      title: 'StonePlus v0.8.5',
+      title: 'Stone+ v0.8.5',
       notes: '完整更新说明请打开 GitHub Release 查看。',
       publishedAt: '',
       url: 'https://github.com/M4rkzzz/stone-plus/releases/tag/v0.8.5'

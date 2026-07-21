@@ -396,7 +396,7 @@ function ApiSourceForm({
         </select>
       </label>
       <label className="field field--full">
-        <span className="field-label-with-help">{t('基础地址', 'Base URL')}{draft.sourceType === 'official-api' && <InfoTip text={t('官方 API 地址由 StonePlus 锁定，避免误接到第三方中转端点。', 'StonePlus locks official API URLs to prevent accidental routing through a third-party relay.')} />}</span>
+        <span className="field-label-with-help">{t('基础地址', 'Base URL')}{draft.sourceType === 'official-api' && <InfoTip text={t('官方 API 地址由 Stone+ 锁定，避免误接到第三方中转端点。', 'Stone+ locks official API URLs to prevent accidental routing through a third-party relay.')} />}</span>
         <input className="mono" disabled={draft.sourceType === 'official-api'} value={draft.baseUrl} onChange={(event) => setDraft({ ...draft, baseUrl: event.target.value })} placeholder="https://api.example.com/v1" />
         <FieldError>{errors.baseUrl}</FieldError>
       </label>
@@ -1692,19 +1692,19 @@ export function ProvidersView({
               }}
             >
               {accountAddMethod === 'token-json' && <option value="__preserve__">{t('不指定 / 沿用文件配置', 'Unspecified / Keep file configuration')}</option>}
-              <option value="__direct__">{accountAddMethod === 'oauth' ? t('StonePlus 直连 / 全局出口设置', 'StonePlus direct / Global exit setting') : t('直连（清除文件代理）', 'Direct (clear file proxy)')}</option>
+              <option value="__direct__">{accountAddMethod === 'oauth' ? t('Stone+ 直连 / 全局出口设置', 'Stone+ direct / Global exit setting') : t('直连（清除文件代理）', 'Direct (clear file proxy)')}</option>
               {chatGptImport.proxyMode === 'proxy' && chatGptImport.proxyId && !proxyById.has(chatGptImport.proxyId)
                 && <option value={chatGptImport.proxyId} disabled>{t('原选择已删除，请重新选择', 'The previous selection was deleted. Choose another.')}</option>}
               {snapshot.proxies.map((proxy) => <option key={proxy.id} value={proxy.id}>{proxy.name} · {proxySafeSummary(proxy)}</option>)}
             </select>
             <small>{chatGptImport.proxyMode === 'preserve'
-              ? t('保留文件中仍然存在的 proxyId；未配置或已失效时使用 StonePlus 全局出口设置。', 'Keep a proxyId from the file if it still exists; otherwise use the StonePlus global exit setting.')
+              ? t('保留文件中仍然存在的 proxyId；未配置或已失效时使用 Stone+ 全局出口设置。', 'Keep a proxyId from the file if it still exists; otherwise use the Stone+ global exit setting.')
               : chatGptImport.proxyMode === 'direct'
                 ? accountAddMethod === 'oauth'
-                  ? t('系统浏览器登录使用浏览器自身网络；StonePlus 仅对 Token 交换与后续检测使用此选项，并仍受 StonePlus 全局出口设置影响。', 'The system browser uses its own network. StonePlus applies this option only to token exchange and later checks, still subject to the global exit setting.')
-                  : t('本批次账号移除文件代理；后续请求仍受 StonePlus 全局出口设置影响。', 'Remove file proxies from accounts in this batch. Later requests still use the StonePlus global exit setting.')
+                  ? t('系统浏览器登录使用浏览器自身网络；Stone+ 仅对 Token 交换与后续检测使用此选项，并仍受 Stone+ 全局出口设置影响。', 'The system browser uses its own network. Stone+ applies this option only to token exchange and later checks, still subject to the global exit setting.')
+                  : t('本批次账号移除文件代理；后续请求仍受 Stone+ 全局出口设置影响。', 'Remove file proxies from accounts in this batch. Later requests still use the Stone+ global exit setting.')
                 : accountAddMethod === 'oauth'
-                  ? t('系统浏览器登录使用浏览器自身网络；StonePlus 仅在 Token 交换与后续检测时使用所选代理。', 'The system browser uses its own network. StonePlus uses the selected proxy only for token exchange and later checks.')
+                  ? t('系统浏览器登录使用浏览器自身网络；Stone+ 仅在 Token 交换与后续检测时使用所选代理。', 'The system browser uses its own network. Stone+ uses the selected proxy only for token exchange and later checks.')
                   : t('本批次所有账号统一使用所选代理；导入后的状态刷新与模型查询也通过该代理。', 'All accounts in this batch use the selected proxy, including post-import status refreshes and model queries.')}</small>
           </label>
           <label className="field field--full"><span>{t('账号名称（可选）', 'Account name (optional)')}</span><input value={chatGptImport.name} disabled={importConfigurationLocked} onChange={(event) => setChatGptImport({ ...chatGptImport, name: event.target.value })} placeholder={t('留空则使用账号邮箱', 'Leave blank to use the account email')} /></label>
@@ -1714,7 +1714,7 @@ export function ProvidersView({
           {accountAddMethod === 'oauth' ? <section className="oauth-account-flow field--full" role="tabpanel" aria-label={t('OAuth 授权添加账号', 'Add account using OAuth')}>
             {oauthStage === 'idle' || oauthStage === 'starting' ? <div className="oauth-account-flow__intro">
               <span className="oauth-account-flow__hero"><ShieldCheck size={25} /></span>
-              <div><h3>{oauthStage === 'starting' ? t('正在创建安全授权会话', 'Creating a secure authorization session') : t('使用 OpenAI OAuth 添加 Codex 账号', 'Add a Codex account with OpenAI OAuth')}</h3><p>{oauthStage === 'starting' ? t('正在准备 PKCE 授权链接和本机回调监听…', 'Preparing the PKCE authorization link and local callback listener…') : t('点击开始后将在系统浏览器打开 OpenAI 登录页，授权成功后 StonePlus 会自动接收回调、保存账号并立即检测可用性。', 'Starting opens the OpenAI sign-in page in your system browser. After authorization, StonePlus receives the callback, saves the account, and checks availability.')}</p></div>
+              <div><h3>{oauthStage === 'starting' ? t('正在创建安全授权会话', 'Creating a secure authorization session') : t('使用 OpenAI OAuth 添加 Codex 账号', 'Add a Codex account with OpenAI OAuth')}</h3><p>{oauthStage === 'starting' ? t('正在准备 PKCE 授权链接和本机回调监听…', 'Preparing the PKCE authorization link and local callback listener…') : t('点击开始后将在系统浏览器打开 OpenAI 登录页，授权成功后 Stone+ 会自动接收回调、保存账号并立即检测可用性。', 'Starting opens the OpenAI sign-in page in your system browser. After authorization, Stone+ receives the callback, saves the account, and checks availability.')}</p></div>
               {oauthStage === 'starting' ? <LoaderCircle className="spin" size={21} /> : <button className="button button--primary" type="button" onClick={() => void startChatGptOAuth()}><ShieldCheck size={16} />{t('开始 OAuth 授权', 'Start OAuth authorization')}</button>}
             </div> : null}
 

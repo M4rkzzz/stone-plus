@@ -230,7 +230,7 @@ export interface ClientConfigApplyResult {
   retentionWarning?: string
 }
 
-/** Result of restoring StonePlus connectivity without replacing valid user settings. */
+/** Result of restoring Stone+ connectivity without replacing valid user settings. */
 export interface ClientConfigRepairResult extends ClientConfigApplyResult {
   /** Documents that were syntactically unusable and had to be minimally rebuilt. */
   rebuiltRoles: ClientConfigFileRole[]

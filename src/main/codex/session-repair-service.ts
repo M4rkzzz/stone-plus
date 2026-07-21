@@ -14,7 +14,7 @@ import { atomicWriteFile } from '../client-config/filesystem'
 
 const DEFAULT_PROVIDER = 'openai'
 const BACKUP_KEEP_COUNT = 5
-const BACKUP_MARKER = 'StonePlus session repair'
+const BACKUP_MARKER = 'Stone+ session repair'
 const PROVIDER_PATTERN = /^[A-Za-z0-9_.-]+$/
 const SQLITE_EXTENSIONS = new Set(['.db', '.sqlite', '.sqlite3'])
 const ROLLOUT_SCAN_BYTES = 1024 * 1024

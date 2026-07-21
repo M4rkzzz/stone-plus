@@ -1,10 +1,10 @@
 <p align="center">
-  <img src="build/icon.svg" width="104" alt="StonePlus 图标">
+  <img src="build/icon.svg" width="104" alt="Stone+ 图标">
 </p>
 
-<h1 align="center">StonePlus</h1>
+<h1 align="center">Stone+</h1>
 
-<p align="center"><strong>StonePlus（原视觉名 Stone+，仓库 stone-plus）：把多个 AI 账号、API 与编程客户端，收进一个本地智能网关</strong></p>
+<p align="center"><strong>Stone+（Stone Plus / stone-plus / StonePlus）：把多个 AI 账号、API 与编程客户端，收进一个本地智能网关</strong></p>
 
 <p align="center">
   <a href="README.en.md">English</a> · <strong>简体中文</strong>
@@ -31,51 +31,51 @@
 </p>
 
 <p align="center">
-  <img src="docs/media/stone-demo.gif" width="100%" alt="StonePlus 动态功能演示">
+  <img src="docs/media/stone-demo.gif" width="100%" alt="Stone+ 动态功能演示">
 </p>
 
-## StonePlus 是什么？
+## Stone+ 是什么？
 
-StonePlus（也可搜索 **Stone+**、**Stone Plus** 或 **stone-plus**）是 [Stone](https://github.com/EasyCode-Obsidian/Stone) 的社区功能增强版。它运行在你的电脑上，在 **Codex、Claude Code、Gemini CLI** 与多个上游账号/API 之间充当一个本地控制平面：
+Stone+（也可搜索 **Stone Plus**、**stone-plus** 或 **StonePlus**）是 [Stone](https://github.com/EasyCode-Obsidian/Stone) 的社区功能增强版。它运行在你的电脑上，在 **Codex、Claude Code、Gemini CLI** 与多个上游账号/API 之间充当一个本地控制平面：
 
 - 客户端只连接 `http://127.0.0.1:15721`；
-- StonePlus 按模型、额度、健康、并发、会话粘性与历史表现选择账号；
+- Stone+ 按模型、额度、健康、并发、会话粘性与历史表现选择账号；
 - 上游失败、冷却或额度耗尽时，按规则切换到其他可用来源；
 - OpenAI Responses、Chat Completions、Anthropic Messages 与 Gemini 请求可以互相转换；
 - 凭据、路由、统计和客户端配置全部保存在本机。
 
-> 如果你有多个 Codex/ChatGPT 订阅、官方 API、兼容中转站，或者同时使用多种编程客户端，StonePlus 可以把分散的配置变成一个可观察、可调度、可恢复的本地入口。
+> 如果你有多个 Codex/ChatGPT 订阅、官方 API、兼容中转站，或者同时使用多种编程客户端，Stone+ 可以把分散的配置变成一个可观察、可调度、可恢复的本地入口。
 
 ## 为什么值得用？
 
-| 你遇到的问题 | StonePlus 的处理方式 |
+| 你遇到的问题 | Stone+ 的处理方式 |
 | --- | --- |
 | 多个账号需要反复切换 | 号池自动调度，冷却、额度耗尽和故障账号会暂时退出候选 |
 | 同时开多个对话容易挤在一个账号 | 会话粘性保证上下文稳定，多活跃对话会软分流到不同健康账号 |
 | 客户端协议与上游协议不一致 | 在 OpenAI、Anthropic、Gemini 协议间转换普通请求、流式事件、工具调用和用量 |
 | 导入大量 CPA / Sub2API JSON 很繁琐 | 批量导入、Tag、出口代理、状态刷新、额度探测和模型查询一步完成 |
 | 不知道慢在本地、代理还是上游 | 一键检查 DNS、TLS、ChatGPT、Codex、OAuth、系统代理、账号、号池和路由 |
-| 切换反代时把客户端配置改坏 | 客户端文件固定连接 StonePlus；换上游只切内部路由，异常时可一键备份并修复 |
+| 切换反代时把客户端配置改坏 | 客户端文件固定连接 Stone+；换上游只切内部路由，异常时可一键备份并修复 |
 | 希望数据留在自己电脑 | SQLite + 操作系统安全存储，无远程控制服务，不记录请求/响应正文 |
 
 ## 界面预览
 
 ### 总览：一眼看清网关、账号与请求
 
-![StonePlus 总览](docs/screenshots/overview.png)
+![Stone+ 总览](docs/screenshots/overview.png)
 
 | 账号、额度与历史体质 | 号池、模型与调度策略 |
 | --- | --- |
-| ![StonePlus 账号与中转](docs/screenshots/accounts.png) | ![StonePlus 号池](docs/screenshots/pools.png) |
+| ![Stone+ 账号与中转](docs/screenshots/accounts.png) | ![Stone+ 号池](docs/screenshots/pools.png) |
 | 新手向导与 OAuth | 多客户端路由 |
-| ![StonePlus 新手向导](docs/screenshots/setup-wizard.png) | ![StonePlus 路由](docs/screenshots/routes.png) |
+| ![Stone+ 新手向导](docs/screenshots/setup-wizard.png) | ![Stone+ 路由](docs/screenshots/routes.png) |
 | 内置浏览器与 JSON 队列 | 一键网络诊断 |
-| ![StonePlus 内置浏览器](docs/screenshots/browser.png) | ![StonePlus 网络诊断](docs/screenshots/diagnostics.png) |
+| ![Stone+ 内置浏览器](docs/screenshots/browser.png) | ![Stone+ 网络诊断](docs/screenshots/diagnostics.png) |
 
 <details>
 <summary><strong>查看应用内更新弹窗</strong></summary>
 
-![StonePlus 在线更新](docs/screenshots/online-update.png)
+![Stone+ 在线更新](docs/screenshots/online-update.png)
 
 </details>
 
@@ -132,7 +132,7 @@ StonePlus（也可搜索 **Stone+**、**Stone Plus** 或 **stone-plus**）是 [S
 
 ### 5. 低延迟流式数据面
 
-StonePlus 针对长连接与流式输出做了专门优化：
+Stone+ 针对长连接与流式输出做了专门优化：
 
 - HTTP/2 协商、连接复用、keepalive、预热主通道与按负载扩展的备用通道；
 - 收到上游流后尽早发送 SSE 响应头和首个可见片段；
@@ -165,7 +165,7 @@ StonePlus 针对长连接与流式输出做了专门优化：
 
 ```mermaid
 flowchart LR
-  C1["Codex"] --> G["StonePlus 本地网关"]
+  C1["Codex"] --> G["Stone+ 本地网关"]
   C2["Claude Code"] --> G
   C3["Gemini CLI"] --> G
 
@@ -216,7 +216,7 @@ flowchart TD
 | Gemini CLI | Gemini generateContent | Gemini、OpenAI、Anthropic（经转换） |
 | 通用 OpenAI 客户端 | Responses / Chat Completions | 账号池、官方 API、兼容中转与聚合中转 |
 
-协议层覆盖普通与流式文本、工具调用、停止原因和 Token 用量。不同厂商能力并不完全对等，StonePlus 会保留能可靠转换的字段，并在不支持时返回明确错误。
+协议层覆盖普通与流式文本、工具调用、停止原因和 Token 用量。不同厂商能力并不完全对等，Stone+ 会保留能可靠转换的字段，并在不支持时返回明确错误。
 
 ### 本地数据与安全边界
 
@@ -225,10 +225,10 @@ flowchart TD
 | API Key、OAuth Token、代理密码 | Electron `safeStorage`，由 Windows DPAPI、macOS Keychain 或 Linux Secret Service 保护 |
 | 账号、号池、路由、统计 | 本地 SQLite 状态库 |
 | 请求日志 | 保存状态、耗时、Token 与调度信息；不保存请求/响应正文 |
-| 客户端配置 | 切换上游只改 StonePlus 内部路由；一键修复连接前自动备份，损坏文件可安全重建 |
+| 客户端配置 | 切换上游只改 Stone+ 内部路由；一键修复连接前自动备份，损坏文件可安全重建 |
 | 诊断导出 | 输出经过脱敏的状态和错误摘要，不导出真实凭据 |
 
-StonePlus 默认只监听回环地址，不提供云端控制台、公共账号服务或远程凭据托管。
+Stone+ 默认只监听回环地址，不提供云端控制台、公共账号服务或远程凭据托管。
 
 ## 三分钟开始使用
 
@@ -268,7 +268,7 @@ sudo apt install ./StonePlus-*-linux-*.deb
 5. 让向导创建号池与路由并启动本地网关；
 6. 运行端到端验证，一键修复并接好客户端配置。
 
-之后客户端只需要连接 StonePlus。如果已经有完整配置，也可以跳过向导，直接在“账号与中转 → 号池 → 路由 → 客户端配置”中精细调整。
+之后客户端只需要连接 Stone+。如果已经有完整配置，也可以跳过向导，直接在“账号与中转 → 号池 → 路由 → 客户端配置”中精细调整。
 
 ## 功能地图
 
@@ -288,7 +288,7 @@ sudo apt install ./StonePlus-*-linux-*.deb
 
 ## 相比原版 Stone 的主要增强
 
-StonePlus 保留上游 Stone 的本地网关、协议转换、号池、路由和客户端配置基础，并重点扩展：
+Stone+ 保留上游 Stone 的本地网关、协议转换、号池、路由和客户端配置基础，并重点扩展：
 
 - 高并发流式性能、连接预热和首正文故障切换；
 - 历史 SP 体质分、自适应并发、额度解冻探测和智能均衡；
@@ -326,14 +326,14 @@ npm run dist
 - 仅导入你本人拥有或已获授权使用的账号、Token 与 API Key；
 - 模型测试和向导验证会发送真实的小请求，可能消耗额度或产生上游费用；
 - OAuth/订阅账号能否使用某个模型，最终由上游权限决定；
-- StonePlus 不扫描浏览器 Cookie，也不会未经确认自动读取其他应用的凭据；
+- Stone+ 不扫描浏览器 Cookie，也不会未经确认自动读取其他应用的凭据；
 - 当前产品定位是个人本地桌面网关，不是账号共享、转售、团队计费或公共代理平台。
 
 ## Star 趋势
 
 <p align="center">
   <a href="https://github.com/M4rkzzz/stone-plus/stargazers">
-    <img src="docs/star-history.svg" width="100%" alt="StonePlus Star 趋势图">
+    <img src="docs/star-history.svg" width="100%" alt="Stone+ Star 趋势图">
   </a>
 </p>
 

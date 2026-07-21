@@ -63,7 +63,7 @@ export function NetworkTestView({ snapshot, api }: { snapshot: AppSnapshot; api:
     <section className="panel network-test-controls">
       <div className="network-test-route">
         <span className="network-test-route__icon"><Route size={19} /></span>
-        <div><strong>{t('测试网络出口', 'Network route to test')}</strong><span>{t('使用 StonePlus 实际出站链路，不会发送账号凭据', 'Uses StonePlus’s actual outbound route without sending account credentials')}</span></div>
+        <div><strong>{t('测试网络出口', 'Network route to test')}</strong><span>{t('使用 Stone+ 实际出站链路，不会发送账号凭据', 'Uses Stone+’s actual outbound route without sending account credentials')}</span></div>
         <select aria-label={t('测试网络出口', 'Network route to test')} value={proxyId} disabled={running} onChange={(event) => setProxyId(event.target.value)}>
           <option value="">{t('直连（系统网络）', 'Direct (system network)')}</option>
           {snapshot.proxies.map((proxy) => <option value={proxy.id} key={proxy.id}>{proxy.name} · {proxy.protocol.toUpperCase()}</option>)}
@@ -195,7 +195,7 @@ function buildLocalChecks(snapshot: AppSnapshot, proxyId: string, language: UiLa
       status: snapshot.gatewayStatus.running ? 'success' : 'warning',
       message: snapshot.gatewayStatus.running
         ? t(`运行中 · ${snapshot.gatewayStatus.host}:${snapshot.gatewayStatus.port} · ${snapshot.gatewayStatus.activeRequests} 个活跃请求`, `Running · ${snapshot.gatewayStatus.host}:${snapshot.gatewayStatus.port} · ${snapshot.gatewayStatus.activeRequests} active requests`)
-        : t('当前未启动；网络诊断仍可运行，但客户端暂时无法通过 StonePlus 请求。', 'Not running. Diagnostics remain available, but clients cannot currently send requests through StonePlus.')
+        : t('当前未启动；网络诊断仍可运行，但客户端暂时无法通过 Stone+ 请求。', 'Not running. Diagnostics remain available, but clients cannot currently send requests through Stone+.')
     },
     {
       id: 'accounts', label: t('上游账号', 'Upstream accounts'),

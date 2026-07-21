@@ -89,7 +89,7 @@ export function evaluateHelpReadiness(
       label: t('网关正在运行', 'Gateway running'),
       description: snapshot.gatewayStatus.running
         ? t(`网关正在 ${snapshot.gatewayStatus.host}:${snapshot.gatewayStatus.port} 监听。`, `The gateway is listening on ${snapshot.gatewayStatus.host}:${snapshot.gatewayStatus.port}.`)
-        : t('启动本地网关，让客户端可以连接 StonePlus。', 'Start the local gateway so clients can connect to StonePlus.'),
+        : t('启动本地网关，让客户端可以连接 Stone+。', 'Start the local gateway so clients can connect to Stone+.'),
       complete: snapshot.gatewayStatus.running,
       page: 'settings',
       actionLabel: t('启动网关', 'Start gateway'),
@@ -98,8 +98,8 @@ export function evaluateHelpReadiness(
       id: 'client',
       label: t('客户端已配置', 'Client configured'),
       description: configuredClient
-        ? t('至少一个已启用路由对应的客户端已连接 StonePlus。', 'At least one client with an enabled route is connected to StonePlus.')
-        : t('将启用路由对应的 Claude Code、Codex 或 Gemini CLI 连接到 StonePlus。', 'Connect Claude Code, Codex, or Gemini CLI for an enabled route to StonePlus.'),
+        ? t('至少一个已启用路由对应的客户端已连接 Stone+。', 'At least one client with an enabled route is connected to Stone+.')
+        : t('将启用路由对应的 Claude Code、Codex 或 Gemini CLI 连接到 Stone+。', 'Connect Claude Code, Codex, or Gemini CLI for an enabled route to Stone+.'),
       complete: configuredClient,
       page: 'clients',
       actionLabel: t('配置客户端', 'Configure client'),

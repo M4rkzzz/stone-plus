@@ -130,13 +130,13 @@ const fields: readonly FieldDefinition[] = Object.freeze([
     control: 'text', placeholder: '沿用当前模型', defaultValue: null, advanced: true,
   },
   {
-    id: 'codex.modelProvider', client: 'codex', role: 'codex-config', path: ['model_provider'], section: 'StonePlus 连接',
-    label: '模型供应商', description: 'StonePlus 应用配置时固定为 stone，以便请求进入本地网关。',
+    id: 'codex.modelProvider', client: 'codex', role: 'codex-config', path: ['model_provider'], section: 'Stone+ 连接',
+    label: '模型供应商', description: 'Stone+ 应用配置时固定为 stone，以便请求进入本地网关。',
     control: 'text', readOnly: true, managedByStone: true, advanced: true,
   },
   {
-    id: 'codex.credentialsStore', client: 'codex', role: 'codex-config', path: ['cli_auth_credentials_store'], section: 'StonePlus 连接',
-    label: '认证存储', description: 'StonePlus 路由使用受保护的 auth.json，因此应用配置时固定为 file。',
+    id: 'codex.credentialsStore', client: 'codex', role: 'codex-config', path: ['cli_auth_credentials_store'], section: 'Stone+ 连接',
+    label: '认证存储', description: 'Stone+ 路由使用受保护的 auth.json，因此应用配置时固定为 file。',
     control: 'select', options: [
       option('file', '文件', '由受保护的 auth.json 保存认证'),
       option('keyring', '系统密钥环', '使用操作系统凭据存储'),
@@ -145,7 +145,7 @@ const fields: readonly FieldDefinition[] = Object.freeze([
   },
   {
     id: 'codex.serviceTier', client: 'codex', role: 'codex-config', path: ['service_tier'], section: '模型',
-    label: '服务档位', description: '选择模型供应商支持的响应档位；StonePlus 上游不支持时应留空。',
+    label: '服务档位', description: '选择模型供应商支持的响应档位；Stone+ 上游不支持时应留空。',
     control: 'select', options: [
       option('fast', 'Fast', '更低延迟的快速档位'), option('flex', 'Flex', '更灵活的后台处理档位'),
     ], defaultValue: null, advanced: true,
@@ -458,7 +458,7 @@ export function applyClientConfigFieldPatches(
     seen.add(patch.id)
     const definition = definitions.get(patch.id)
     if (!definition) throw new ClientConfigValidationError('Unknown client configuration field')
-    if (definition.readOnly) throw new ClientConfigValidationError('A StonePlus-managed client configuration field is read-only')
+    if (definition.readOnly) throw new ClientConfigValidationError('A Stone+-managed client configuration field is read-only')
     const value = validateValue(definition, patch.value)
     const values = grouped.get(definition.role) ?? []
     values.push({ definition, value })
@@ -612,8 +612,8 @@ function discoveredDescription(path: string[], sensitive: boolean): string {
     tui: 'Codex 终端界面的高级设置',
     shell_environment_policy: '传递给命令的环境变量策略',
   }
-  const meaning = descriptions[path[0]] ?? 'StonePlus 尚未收录的当前 Codex 配置'
-  return `${fullPath}：${meaning}。StonePlus 会原样保留，可在完整文件编辑器中修改。`
+  const meaning = descriptions[path[0]] ?? 'Stone+ 尚未收录的当前 Codex 配置'
+  return `${fullPath}：${meaning}。Stone+ 会原样保留，可在完整文件编辑器中修改。`
 }
 
 function isStoneManagedPath(path: string[]): boolean {

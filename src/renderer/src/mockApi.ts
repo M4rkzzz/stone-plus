@@ -434,7 +434,7 @@ const logs: RequestLog[] = [
   return {
     id,
     conversationId: `thread-${id}`,
-    conversationName: client === 'codex' ? `StonePlus 开发对话 ${id.slice(-2)}` : `${clientNamesForMock(client)} 会话 ${id.slice(-2)}`,
+    conversationName: client === 'codex' ? `Stone+ 开发对话 ${id.slice(-2)}` : `${clientNamesForMock(client)} 会话 ${id.slice(-2)}`,
     timestamp: now - secondsAgo * 1000,
     client,
     protocol,
@@ -590,7 +590,7 @@ const mockPoolNames: Record<string, readonly [string, string]> = {
 function localizeMockConversationName(value: string | undefined): string | undefined {
   if (!value) return value
   const codex = value.match(/^(?:Stone\+? 开发对话|Stone\+? development chat) (.+)$/)
-  if (codex) return `${mockText('StonePlus 开发对话', 'StonePlus development chat')} ${codex[1]}`
+  if (codex) return `${mockText('Stone+ 开发对话', 'Stone+ development chat')} ${codex[1]}`
   const session = value.match(/^(Claude|Codex|Gemini) (?:会话|session) (.+)$/)
   if (session) return `${session[1]} ${mockText('会话', 'session')} ${session[2]}`
   return value
@@ -707,7 +707,7 @@ const mockEditorFields: Record<RouteClient, ClientConfigEditorState['fields']> =
     { id: 'codex.webSearch', role: 'codex-config', path: ['web_search'], section: '工具与联网', label: '网页搜索', description: '控制网页搜索使用缓存索引还是实时网络。', control: 'select', value: 'cached', recommendedValue: 'cached', options: [{ value: 'disabled', label: '关闭' }, { value: 'cached', label: '缓存索引', recommended: true }, { value: 'indexed', label: '受控联网' }, { value: 'live', label: '实时联网' }] },
     { id: 'codex.feature.multi_agent', role: 'codex-config', path: ['features', 'multi_agent'], section: '功能开关', label: '多代理协作', description: '启用子代理协作工具。', control: 'toggle', value: true, recommendedValue: true, advanced: true },
     { id: 'codex.windowsSandbox', role: 'codex-config', path: ['windows', 'sandbox'], section: '权限与沙箱', label: 'Windows 原生沙箱', description: '选择原生 Windows 沙箱实现。', control: 'select', value: 'elevated', recommendedValue: 'elevated', advanced: true, options: [{ value: 'elevated', label: '增强隔离', recommended: true }, { value: 'unelevated', label: '普通隔离' }] },
-    { id: 'codex.discovered.model_providers/stone/base_url', role: 'codex-config', path: ['model_providers', 'stone', 'base_url'], section: '模型供应商（扩展）', label: 'base_url', description: 'StonePlus 本地网关地址；应用路由时自动维护。', control: 'text', value: 'http://127.0.0.1:15720/v1', readOnly: true, managedByStone: true, advanced: true, source: 'discovered' },
+    { id: 'codex.discovered.model_providers/stone/base_url', role: 'codex-config', path: ['model_providers', 'stone', 'base_url'], section: '模型供应商（扩展）', label: 'base_url', description: 'Stone+ 本地网关地址；应用路由时自动维护。', control: 'text', value: 'http://127.0.0.1:15720/v1', readOnly: true, managedByStone: true, advanced: true, source: 'discovered' },
   ],
   gemini: [
     { id: 'gemini.model', role: 'gemini-settings', path: ['model', 'name'], section: '模型与会话', label: '默认模型', description: 'Gemini CLI 新会话默认使用的模型。', control: 'text', value: 'gemini-2.5-pro', defaultValue: null },
@@ -1683,7 +1683,7 @@ export function createMockApi(): GatewayApi {
           ...file,
           existed: client !== 'gemini',
           changed: client === 'gemini',
-          managedFields: [mockText('StonePlus 管理字段', 'StonePlus managed field')],
+          managedFields: [mockText('Stone+ 管理字段', 'Stone+ managed field')],
         })),
       }
     },
@@ -1815,19 +1815,19 @@ export function createMockApi(): GatewayApi {
         release: {
           version: '0.9.1',
           tagName: 'v0.9.1',
-          title: mockText('StonePlus 0.9.1 · 更顺滑的应用更新体验', 'StonePlus 0.9.1 · A smoother update experience'),
+          title: mockText('Stone+ 0.9.1 · 更顺滑的应用更新体验', 'Stone+ 0.9.1 · A smoother update experience'),
           publishedAt: new Date().toISOString(),
           url: 'https://github.com/M4rkzzz/stone-plus/releases/tag/v0.9.1',
           notes: mockUsesChinese() ? [
             '- 品牌标识旁新增绿色“更新”提醒，不再打断当前操作。',
             '- 点击提醒即可查看本次 Release 的核心亮点。',
             '- 确认更新后自动下载、校验并覆盖安装。',
-            '- 安装完成后自动重新启动 StonePlus。',
+            '- 安装完成后自动重新启动 Stone+。',
           ].join('\n') : [
             '- A green “Update” indicator appears beside the brand without interrupting your work.',
             '- Select the indicator to view the highlights of this release.',
-            '- After confirmation, StonePlus automatically downloads, verifies, and installs the update.',
-            '- StonePlus restarts automatically after installation.',
+            '- After confirmation, Stone+ automatically downloads, verifies, and installs the update.',
+            '- Stone+ restarts automatically after installation.',
           ].join('\n'),
         },
       })

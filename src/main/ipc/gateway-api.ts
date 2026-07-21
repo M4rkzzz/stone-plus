@@ -244,7 +244,7 @@ export function registerGatewayApi(
       if (await store.finalizeOrphanedStreamingLogs()) publishRoutine(store.getSnapshot())
     }).catch((error: unknown) => {
       orphanedLogReconciliationScheduled = false
-      console.error('StonePlus could not reconcile an orphaned gateway request log', error)
+      console.error('Stone+ could not reconcile an orphaned gateway request log', error)
     })
   }
 
@@ -304,7 +304,7 @@ export function registerGatewayApi(
       else gateway.resetAccountHealth(accountId)
       publish(refreshRuntime())
     } catch (error) {
-      console.error('StonePlus could not probe an exhausted ChatGPT account quota', error)
+      console.error('Stone+ could not probe an exhausted ChatGPT account quota', error)
       scheduleQuotaProbe(accountId, Date.now() + 60_000)
     } finally {
       quotaProbeFlights.delete(accountId)
@@ -399,7 +399,7 @@ export function registerGatewayApi(
     })()
     automaticCooldownRefreshFlight = flight
     void flight.catch((error: unknown) => {
-      console.error('StonePlus could not automatically refresh collectively cooled accounts', error)
+      console.error('Stone+ could not automatically refresh collectively cooled accounts', error)
     }).finally(() => {
       if (automaticCooldownRefreshFlight === flight) automaticCooldownRefreshFlight = undefined
       evaluateAutomaticCooldownRefresh()
@@ -569,7 +569,7 @@ export function registerGatewayApi(
 
   gateway.onLog((log) => {
     const write = store.appendLog(log).catch((error: unknown) => {
-      console.error('StonePlus could not persist a gateway request log', error)
+      console.error('Stone+ could not persist a gateway request log', error)
     })
     pendingRequestLogWrites.add(write)
     void write.finally(() => {
@@ -620,7 +620,7 @@ export function registerGatewayApi(
         const body = resolvedNativeLanguage() === 'zh-CN' || !/[\u3400-\u9fff]/u.test(event.message)
           ? event.message
           : event.kind === 'quota-exhausted'
-            ? 'Quota is exhausted. StonePlus paused scheduling for this account.'
+            ? 'Quota is exhausted. Stone+ paused scheduling for this account.'
             : event.kind === 'quota-restored'
               ? 'The quota window recovered. This account can be scheduled again.'
               : event.kind === 'account-recovered'
@@ -628,7 +628,7 @@ export function registerGatewayApi(
                 : event.kind === 'account-disabled'
                   ? 'The upstream rejected and disabled this account.'
                   : 'The account entered cooldown after consecutive failures.'
-        new Notification({ title: `StonePlus · ${account.name}`, body }).show()
+        new Notification({ title: `Stone+ · ${account.name}`, body }).show()
       }
     }
     // Routine success telemetry (latency/lastUsedAt) must not rebuild the whole
@@ -667,7 +667,7 @@ export function registerGatewayApi(
     pendingActiveAccountStates.clear()
     await Promise.all(pending.map(async (state) => {
       await persistRoutineAccountState(state).catch((error: unknown) => {
-        console.error('StonePlus could not persist account health state', error)
+        console.error('Stone+ could not persist account health state', error)
       })
     }))
   }
@@ -683,7 +683,7 @@ export function registerGatewayApi(
     if (routingTransition) {
       pendingActiveAccountStates.delete(state.accountId)
       void persistAccountState(state).catch((error: unknown) => {
-        console.error('StonePlus could not persist account health state', error)
+        console.error('Stone+ could not persist account health state', error)
       })
       return
     }
@@ -1581,7 +1581,7 @@ export function registerGatewayApi(
       if (wasRunning) {
         gateway.updateConfig(toGatewayConfig(store))
         await gateway.start().catch((restartError: unknown) => {
-          console.error('StonePlus could not restart the gateway after a failed database restore', restartError)
+          console.error('Stone+ could not restart the gateway after a failed database restore', restartError)
         })
       }
       store.setGatewayStatus(gateway.getStatus())
@@ -2164,7 +2164,7 @@ function healthEventForTransition(
   const wasExhausted = quotaExhausted(before)
   const exhausted = quotaExhausted(after)
   if (!wasExhausted && exhausted) {
-    kind = 'quota-exhausted'; severity = 'warning'; message = '额度已耗尽，StonePlus 已暂停调度该账号。'
+    kind = 'quota-exhausted'; severity = 'warning'; message = '额度已耗尽，Stone+ 已暂停调度该账号。'
   } else if (wasExhausted && !exhausted) {
     kind = 'quota-restored'; message = '额度窗口已恢复，账号可以重新参与调度。'
   } else if (before && before.status !== 'active' && after.status === 'active') {
@@ -2204,7 +2204,7 @@ function backupIdFromPath(path: string): string {
   if (typeof path !== 'string' || !path) throw new Error('A backup path is required.')
   const id = basename(path)
   const expectedPath = join(app.getPath('userData'), 'backups', id)
-  if (path !== id && path !== expectedPath) throw new Error('Backup path is outside StonePlus backup storage.')
+  if (path !== id && path !== expectedPath) throw new Error('Backup path is outside Stone+ backup storage.')
   return id
 }
 

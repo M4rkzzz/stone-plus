@@ -58,7 +58,7 @@ export class DatabaseBackupService<T> {
     this.now = options.now ?? Date.now
     this.randomId = options.randomId ?? randomUUID
     this.onAutomaticBackupError = options.onAutomaticBackupError ?? ((error) => {
-      console.error('StonePlus automatic database backup failed', error)
+      console.error('Stone+ automatic database backup failed', error)
     })
   }
 
@@ -250,8 +250,8 @@ export class DatabaseBackupService<T> {
         ...(schemaVersion > SQLITE_SCHEMA_VERSION
           ? [`Database schema ${schemaVersion} is newer than supported schema ${SQLITE_SCHEMA_VERSION}`]
           : []),
-        ...(missingTables.length > 0 ? [`Missing StonePlus tables: ${missingTables.join(', ')}`] : []),
-        ...(initialized?.value !== '1' ? ['StonePlus database initialization marker is missing'] : [])
+        ...(missingTables.length > 0 ? [`Missing Stone+ tables: ${missingTables.join(', ')}`] : []),
+        ...(initialized?.value !== '1' ? ['Stone+ database initialization marker is missing'] : [])
       ]
       return {
         ...fallback,

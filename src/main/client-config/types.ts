@@ -121,7 +121,7 @@ export interface ApplyClientConfigResult {
 }
 
 /**
- * Result of repairing the small set of fields StonePlus owns in a client config.
+ * Result of repairing the small set of fields Stone+ owns in a client config.
  *
  * `rebuiltRoles` is deliberately role-only: callers can explain which document
  * was syntactically unusable without ever receiving credential-bearing content.

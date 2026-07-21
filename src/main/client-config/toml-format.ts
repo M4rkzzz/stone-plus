@@ -474,7 +474,7 @@ export function planCodexToml(content: string | undefined, baseUrl: string): Tex
 
   setTopLevel(lines, { key: 'model_provider', value: 'stone' })
   setTopLevel(lines, { key: 'cli_auth_credentials_store', value: 'file' })
-  // StonePlus implements the portable Legacy compact endpoint for relay pools.
+  // Stone+ implements the portable Legacy compact endpoint for relay pools.
   // V2 requires an opaque native compaction item and cannot be safely
   // synthesized by a transparent gateway.
   setPath(lines, ['features', 'remote_compaction_v2'], false)
@@ -493,7 +493,7 @@ export function planCodexToml(content: string | undefined, baseUrl: string): Tex
 
 /**
  * Repair the Stone provider even when a syntactically valid document used an
- * incompatible TOML shape for one of StonePlus's owned paths. The normal
+ * incompatible TOML shape for one of Stone+'s owned paths. The normal
  * format-preserving patch is always preferred. Re-serialization is a fallback
  * only for that structural conflict and retains all unrelated parsed values.
  * A genuinely malformed TOML document still throws so the service can back it
