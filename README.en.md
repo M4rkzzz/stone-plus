@@ -2,9 +2,9 @@
   <img src="build/icon.svg" width="96" alt="Stone+ logo">
 </p>
 
-<h1 align="center">Stone+</h1>
+<h1 align="center">StonePlus</h1>
 
-<p align="center"><strong>Stone+ (Stone Plus / stone-plus / StonePlus) — a local AI gateway for coding clients</strong></p>
+<p align="center"><strong>StonePlus (the app retains the Stone+ brand) — a local AI gateway for coding clients</strong></p>
 
 <p align="center">
   <strong>English</strong> | <a href="README.md">简体中文</a>
@@ -29,7 +29,7 @@
   <a href="SECURITY.md">Security</a>
 </p>
 
-Stone+ — also searchable as **Stone Plus**, **stone-plus**, or **StonePlus** — is built on [upstream Stone](https://github.com/EasyCode-Obsidian/Stone) and adds practical features for faster routing, smarter scheduling, request diagnostics, Codex session repair, account import, and FRP tunneling. It remains an independent, unofficial community fork. Add your providers, decide which models each account can expose, combine compatible accounts into pools, and connect Claude Code, Codex, or Gemini CLI through one local gateway.
+StonePlus — shown as **Stone+** inside the app and also searchable as **Stone Plus** or **stone-plus** — is built on [upstream Stone](https://github.com/EasyCode-Obsidian/Stone) and adds practical features for faster routing, smarter scheduling, request diagnostics, Codex session repair, account import, and FRP tunneling. It remains an independent, unofficial community fork. Add your providers, decide which models each account can expose, combine compatible accounts into pools, and connect Claude Code, Codex, or Gemini CLI through one local gateway.
 
 Stone+ selects an available account according to its model support, quota, health, and pool policy. It can also translate between OpenAI, Anthropic, and Gemini protocols, so a client and its upstream pool do not need to use the same API format.
 

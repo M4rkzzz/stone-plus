@@ -1,6 +1,6 @@
 # Third-Party Notices
 
-Stone+ is licensed under the Apache License, Version 2.0. Third-party
+The StonePlus project, whose desktop application currently retains the Stone+ product name, is licensed under the Apache License, Version 2.0. Third-party
 components remain under their respective licenses; the Stone license does not
 replace or modify those terms.
 

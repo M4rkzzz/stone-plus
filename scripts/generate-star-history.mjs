@@ -164,7 +164,7 @@ function renderStarHistory(repo, { createdAt, stars }) {
   <rect width="960" height="480" rx="12" fill="#f8faf9"/>
   <rect x=".5" y=".5" width="959" height="479" rx="11.5" fill="none" stroke="#dfe5e2"/>
   <text x="34" y="48" fill="#176b52" font-size="25">★</text>
-  <text class="title" x="66" y="45">Stone+ Star 趋势</text>
+  <text class="title" x="66" y="45">StonePlus Star 趋势</text>
   <text class="subtitle" x="34" y="68">${escapeXml(subtitle)}</text>
   <text class="label" x="926" y="33" text-anchor="end">当前 Star</text>
   <text class="count" x="926" y="67" text-anchor="end">${stars.length}</text>

@@ -1,8 +1,8 @@
 # Security Policy / 安全政策
 
-Stone+ is a local-first desktop gateway. Security reports are taken seriously because the application handles upstream credentials, local route tokens, proxy authentication, and client configuration files.
+StonePlus is the project name; its Stone+ application is a local-first desktop gateway. Security reports are taken seriously because the application handles upstream credentials, local route tokens, proxy authentication, and client configuration files.
 
-Stone+ 是一个本地优先的桌面网关。由于应用会处理上游凭据、本地路由 Token、代理认证信息和客户端配置文件，我们会认真对待安全问题。
+StonePlus 是项目名称；其 Stone+ 应用是一个本地优先的桌面网关。由于应用会处理上游凭据、本地路由 Token、代理认证信息和客户端配置文件，我们会认真对待安全问题。
 
 ## Supported Versions / 支持版本
 
