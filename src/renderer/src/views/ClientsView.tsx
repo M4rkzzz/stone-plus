@@ -367,8 +367,8 @@ export function ClientsView({
     if (!result) return
     setNotice(result.rebuiltRoles.length
       ? t(
-        `${meta.name} 已从损坏文件重建，并恢复 Stone+ 连接`,
-        `${meta.name} was rebuilt from the damaged files and reconnected to Stone+`,
+        `${meta.name} 已从损坏文件重建，并恢复 StonePlus 连接`,
+        `${meta.name} was rebuilt from the damaged files and reconnected to StonePlus`,
       )
       : t(
         `${meta.name} 已修复连接且保留其他设置`,
@@ -419,7 +419,7 @@ export function ClientsView({
       return api.repairClientConfig(activeClient, activeProfileId)
     })
     if (!result) return
-    setNotice(t(`${meta.name} 已连接到 Stone+`, `${meta.name} is connected to Stone+`))
+    setNotice(t(`${meta.name} 已连接到 StonePlus`, `${meta.name} is connected to StonePlus`))
     await loadWorkspace(activeClient, activeProfileId)
   }
 
@@ -666,7 +666,7 @@ export function ClientsView({
 
           <div className="client-easy-gateway">
             <span>{t('客户端固定连接', 'Fixed client connection')}</span>
-            <strong>{t('Stone+ 本地网关', 'Stone+ local gateway')}</strong>
+            <strong>{t('StonePlus 本地网关', 'StonePlus local gateway')}</strong>
             <code>{gatewayAddress}</code>
           </div>
         </div>
@@ -721,7 +721,7 @@ export function ClientsView({
                 : t('客户端仍在使用旧连接配置', 'The client is still using an old connection configuration')}</strong>
               <small>{configHealth === 'invalid'
                 ? t('不用手工找错，下面的一键修复会先保存原文件再恢复连接。', 'One-click repair saves the original file before restoring the connection, so you do not need to find the error manually.')
-                : t('点击一键修复即可改回 Stone+；模型、MCP 和其他设置会保留。', 'Use one-click repair to reconnect to Stone+. Models, MCP, and other settings are preserved.')}</small>
+                : t('点击一键修复即可改回 StonePlus；模型、MCP 和其他设置会保留。', 'Use one-click repair to reconnect to StonePlus. Models, MCP, and other settings are preserved.')}</small>
             </span>
           </div>
         )}
@@ -757,7 +757,7 @@ export function ClientsView({
               disabled={Boolean(busy) || isDirty || !route?.localToken || !routeCompatible}
               title={!route?.localToken || !routeCompatible
                 ? t('请先修复内部路由', 'Repair the internal route first')
-                : t('备份原文件后只修复 Stone+ 连接项', 'Back up the original files, then repair only the Stone+ connection settings')}
+                : t('备份原文件后只修复 StonePlus 连接项', 'Back up the original files, then repair only the StonePlus connection settings')}
               onClick={() => void repairConnection()}
             >
               {busy === `repair-${activeClient}` ? <LoaderCircle size={16} className="spin" /> : <FileCode2 size={16} />}
@@ -1022,7 +1022,7 @@ export function ClientsView({
       <Modal
         open={profileBundleMode === 'import' && profileBundle !== '__closed__'}
         title={t('导入目录定义', 'Import directory definition')}
-        description={t('粘贴 Stone+ 导出的目录定义 JSON；不会导入配置正文或 Token。', 'Paste a directory definition JSON exported by Stone+. Configuration contents and tokens are not imported.')}
+        description={t('粘贴 StonePlus 导出的目录定义 JSON；不会导入配置正文或 Token。', 'Paste a directory definition JSON exported by StonePlus. Configuration contents and tokens are not imported.')}
         onClose={() => setProfileBundle('__closed__')}
         width="large"
         footer={<><button className="button button--secondary" type="button" onClick={() => setProfileBundle('__closed__')}>{t('取消', 'Cancel')}</button><button className="button button--primary" type="button" disabled={!profileBundle.trim() || profileBundle === '__closed__'} onClick={() => void importProfile()}><Upload size={16} />{t('导入', 'Import')}</button></>}
@@ -1093,7 +1093,7 @@ function ClientSettingRow({
         <div>
           <label htmlFor={`client-control-${safeDomId(field.id)}`}>{field.label}</label>
           {field.advanced && <Badge tone="neutral">{t('高级', 'Advanced')}</Badge>}
-          {field.managedByStone && <Badge tone="info">{t('Stone+ 管理', 'Stone+ managed')}</Badge>}
+          {field.managedByStone && <Badge tone="info">{t('StonePlus 管理', 'StonePlus managed')}</Badge>}
           {field.readOnly && <Badge tone="neutral">{t('仅查看', 'Read only')}</Badge>}
           {isRecommended && <Badge tone="success">{t('推荐', 'Recommended')}</Badge>}
         </div>

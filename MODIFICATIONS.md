@@ -1,11 +1,11 @@
-# Stone+ Modifications
+# StonePlus Modifications
 
-Stone+ is an unofficial community fork of
+StonePlus is an unofficial community fork of
 [Stone](https://github.com/EasyCode-Obsidian/Stone), distributed under the
 Apache License, Version 2.0. It is not affiliated with or endorsed by the
 upstream Stone maintainers.
 
-The first Stone+ release, `v0.8.3`, is based on upstream Stone `v0.8.2`
+The first StonePlus release, `v0.8.3`, is based on upstream Stone `v0.8.2`
 (`4077f2f`) and includes the following material changes:
 
 - embedded FRP client management for exposing a configured local gateway;

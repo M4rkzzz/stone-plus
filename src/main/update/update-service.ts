@@ -54,7 +54,7 @@ export class UpdateService {
       options.environment ?? process.env
     )
     const currentVersion = valid(options.currentVersion)
-    if (!currentVersion) throw new Error('Stone+ has an invalid application version.')
+    if (!currentVersion) throw new Error('StonePlus has an invalid application version.')
 
     this.state = {
       revision: 0,
@@ -166,10 +166,10 @@ export class UpdateService {
   public async ignoreUpdate(version: string): Promise<AppUpdateState> {
     const normalized = valid(version)
     if (!normalized || !this.state.release || !eq(normalized, this.state.release.version)) {
-      throw new Error('Stone+ rejected an invalid update version.')
+      throw new Error('StonePlus rejected an invalid update version.')
     }
     if (!gt(normalized, this.state.currentVersion)) {
-      throw new Error('Stone+ cannot ignore a version that is already installed.')
+      throw new Error('StonePlus cannot ignore a version that is already installed.')
     }
 
     await this.options.preferences.setIgnoredUpdateVersion(normalized)
@@ -378,7 +378,7 @@ export async function fetchLatestRelease(
     : ''
   const title = typeof release.name === 'string' && release.name.trim()
     ? release.name.trim().slice(0, 200)
-    : `Stone+ v${version}`
+    : `StonePlus v${version}`
   const notes = typeof release.body === 'string' && release.body.trim()
     ? release.body.slice(0, MAX_RELEASE_NOTES_LENGTH)
     : '此版本没有提供更新说明。'
@@ -422,7 +422,7 @@ async function fetchLatestReleaseFromPage(
   return {
     version,
     tagName,
-    title: `Stone+ v${version}`,
+    title: `StonePlus v${version}`,
     notes: '完整更新说明请打开 GitHub Release 查看。',
     publishedAt: '',
     url
@@ -476,7 +476,7 @@ function assertTrustedReleaseUrl(value: string): void {
     throw new Error('GitHub release URL was invalid.')
   }
   if (url.protocol !== 'https:' || url.hostname !== 'github.com' || !url.pathname.startsWith(RELEASE_PATH_PREFIX)) {
-    throw new Error('Stone+ rejected an untrusted update URL.')
+    throw new Error('StonePlus rejected an untrusted update URL.')
   }
 }
 

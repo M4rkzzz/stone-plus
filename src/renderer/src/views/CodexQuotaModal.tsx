@@ -92,7 +92,7 @@ export function CodexQuotaModal({
           <QuotaSummary label={t('5 小时额度', '5-hour quota')} window={quota?.fiveHour} stale={stale} costUsd={cycleCosts.fiveHourUsd} />
           <QuotaSummary label={t(`${longQuotaPeriod}额度`, `${longQuotaPeriod} quota`)} window={quota?.sevenDay} stale={stale} costUsd={cycleCosts.sevenDayUsd} />
         </div>
-        {quota?.limitReached && <div className="warning-banner"><Clock3 size={17} /><div><strong>{t('上游已标记额度耗尽', 'Upstream reports that the quota is exhausted')}</strong><span>{t('Stone+ 会按实际 429 重置时间冷却账号', 'Stone+ cools the account down until the reset time reported by the actual 429 response.')}</span></div></div>}
+        {quota?.limitReached && <div className="warning-banner"><Clock3 size={17} /><div><strong>{t('上游已标记额度耗尽', 'Upstream reports that the quota is exhausted')}</strong><span>{t('StonePlus 会按实际 429 重置时间冷却账号', 'StonePlus cools the account down until the reset time reported by the actual 429 response.')}</span></div></div>}
         <QuotaTrend
           label={t('5 小时额度 · 最近 24 小时', '5-hour quota · Last 24 hours')}
           points={history.filter((point) => point.observedAt >= Date.now() - 24 * 60 * 60 * 1000)}

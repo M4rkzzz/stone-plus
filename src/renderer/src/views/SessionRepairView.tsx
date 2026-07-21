@@ -221,7 +221,7 @@ export function SessionRepairView({ api }: { api: GatewayApi }) {
       <ConfirmDialog
         open={confirmOpen}
         title={t('修复 Codex 历史会话', 'Repair Codex session history')}
-        message={t(`将 ${preview?.rolloutFilesToUpdate ?? 0} 个会话文件及 ${preview ? preview.sqliteProviderRowsToUpdate + preview.sqliteUserEventRowsToUpdate + preview.sqliteCwdRowsToUpdate : 0} 行索引同步到 ${preview?.targetProvider ?? targetProvider}。Stone+ 会先创建备份，是否继续？`, `Synchronize ${preview?.rolloutFilesToUpdate ?? 0} session files and ${preview ? preview.sqliteProviderRowsToUpdate + preview.sqliteUserEventRowsToUpdate + preview.sqliteCwdRowsToUpdate : 0} index rows to ${preview?.targetProvider ?? targetProvider}. Stone+ creates a backup first. Continue?`)}
+        message={t(`将 ${preview?.rolloutFilesToUpdate ?? 0} 个会话文件及 ${preview ? preview.sqliteProviderRowsToUpdate + preview.sqliteUserEventRowsToUpdate + preview.sqliteCwdRowsToUpdate : 0} 行索引同步到 ${preview?.targetProvider ?? targetProvider}。StonePlus 会先创建备份，是否继续？`, `Synchronize ${preview?.rolloutFilesToUpdate ?? 0} session files and ${preview ? preview.sqliteProviderRowsToUpdate + preview.sqliteUserEventRowsToUpdate + preview.sqliteCwdRowsToUpdate : 0} index rows to ${preview?.targetProvider ?? targetProvider}. StonePlus creates a backup first. Continue?`)}
         confirmLabel={t('创建备份并修复', 'Create backup and repair')}
         busy={busy === 'repair'}
         onCancel={() => setConfirmOpen(false)}

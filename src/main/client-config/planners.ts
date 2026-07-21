@@ -199,7 +199,7 @@ export function planClientConfigRepair(
 
   // A valid JSON object with a scalar where a connection container belongs is
   // still recoverable without throwing away sibling settings. Normalize only
-  // that owned path before the standard planner fills in Stone+ values.
+  // that owned path before the standard planner fills in StonePlus values.
   if (client === 'claude' && repairInput['claude-settings'] !== undefined) {
     try {
       repairInput['claude-settings'] = prepareJsonConnectionShape(

@@ -265,8 +265,8 @@ export default function App() {
   const downloadUpdate = useCallback(async () => {
     if (snapshot && snapshot.gatewayStatus.activeRequests > 0) {
       const confirmed = window.confirm(t(
-        `当前仍有 ${snapshot.gatewayStatus.activeRequests} 个活跃请求。更新安装会关闭 Stone+ 并中断这些请求，是否继续？`,
-        `${snapshot.gatewayStatus.activeRequests} active request(s) are still running. Installing the update will close Stone+ and interrupt them. Continue?`,
+        `当前仍有 ${snapshot.gatewayStatus.activeRequests} 个活跃请求。更新安装会关闭 StonePlus 并中断这些请求，是否继续？`,
+        `${snapshot.gatewayStatus.activeRequests} active request(s) are still running. Installing the update will close StonePlus and interrupt them. Continue?`,
       ))
       if (!confirmed) return
     }
@@ -293,8 +293,8 @@ export default function App() {
   const installUpdate = useCallback(async () => {
     if (snapshot && snapshot.gatewayStatus.activeRequests > 0) {
       const confirmed = window.confirm(t(
-        `当前仍有 ${snapshot.gatewayStatus.activeRequests} 个活跃请求。更新会关闭 Stone+ 并中断这些请求，是否继续？`,
-        `${snapshot.gatewayStatus.activeRequests} active request(s) are still running. The update will close Stone+ and interrupt them. Continue?`,
+        `当前仍有 ${snapshot.gatewayStatus.activeRequests} 个活跃请求。更新会关闭 StonePlus 并中断这些请求，是否继续？`,
+        `${snapshot.gatewayStatus.activeRequests} active request(s) are still running. The update will close StonePlus and interrupt them. Continue?`,
       ))
       if (!confirmed) return
     }
@@ -373,7 +373,7 @@ export default function App() {
           <StoneMark />
           <div className="sidebar__brand-text">
             <div className="sidebar__brand-title">
-              <strong>Stone+</strong>
+              <strong>StonePlus</strong>
               {updateReleaseVisible && (
                 <button
                   className="brand-update-link"

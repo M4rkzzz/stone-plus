@@ -1,4 +1,4 @@
-"""Generate the Stone+ GitHub social preview from repository brand assets.
+"""Generate the StonePlus GitHub social preview from repository brand assets.
 
 Requires Pillow and writes docs/media/social-preview.png at 1280x640.
 """
@@ -58,7 +58,7 @@ def main() -> None:
     canvas = Image.new("RGB", (WIDTH, HEIGHT), "#091512")
     pixels = canvas.load()
 
-    # Subtle vertical gradient in Stone+'s deep green palette.
+    # Subtle vertical gradient in StonePlus's deep green palette.
     for y in range(HEIGHT):
         blend = y / (HEIGHT - 1)
         for x in range(WIDTH):
@@ -79,7 +79,7 @@ def main() -> None:
     icon = fit_inside(icon, (62, 62))
     canvas.paste(icon, (70, 54), icon)
 
-    draw.text((150, 56), "Stone+", font=font("bold", 34), fill="#f7fbf9")
+    draw.text((150, 56), "StonePlus", font=font("bold", 34), fill="#f7fbf9")
     draw.text((151, 98), "LOCAL-FIRST AI GATEWAY", font=font("bold", 13), fill="#65c9a6")
 
     draw.text((70, 170), "One local gateway.", font=font("bold", 48), fill="#f8fbfa")

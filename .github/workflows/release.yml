@@ -289,7 +289,7 @@ jobs:
               --draft
               --repo "$GITHUB_REPOSITORY"
               --target "$GITHUB_SHA"
-              --title "Stone+ ${RELEASE_TAG}"
+              --title "StonePlus ${RELEASE_TAG}"
               --generate-notes
               --notes $'> [!WARNING]\n> macOS artifacts are ad-hoc signed and are not Apple-notarized. Windows artifacts are unsigned. Linux credential storage requires a Secret Service-compatible keyring; AppImage may require FUSE 2.'
             )

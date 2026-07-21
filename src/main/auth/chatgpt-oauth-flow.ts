@@ -232,7 +232,7 @@ export class ChatGptOAuthFlowManager {
     }
     try {
       this.acceptCallback(session, requestUrl)
-      sendHtml(response, 200, oauthBrowserMessage(session.language, 'OAuth 授权已接收，请返回 Stone+ 完成账号检测。'), '/success')
+      sendHtml(response, 200, oauthBrowserMessage(session.language, 'OAuth 授权已接收，请返回 StonePlus 完成账号检测。'), '/success')
     } catch (error) {
       sendHtml(response, 400, oauthBrowserMessage(session.language, safeErrorMessage(error)), '/error')
     }
@@ -466,7 +466,7 @@ function sendHtml(
   const cleanHistory = cleanPath
     ? `<script nonce="${nonce}">history.replaceState(null,'','${cleanPath}')</script>`
     : ''
-  const body = `<!doctype html><meta charset="utf-8">${cleanHistory}<title>Stone+ OAuth</title><style nonce="${nonce}">body{font:16px system-ui;margin:48px;color:#18352b}main{max-width:620px;margin:auto;padding:28px;border:1px solid #d9e5e0;border-radius:14px}h1{font-size:22px}</style><main><h1>Stone+ Codex OAuth</h1><p>${escapeHtml(message)}</p></main>`
+  const body = `<!doctype html><meta charset="utf-8">${cleanHistory}<title>StonePlus OAuth</title><style nonce="${nonce}">body{font:16px system-ui;margin:48px;color:#18352b}main{max-width:620px;margin:auto;padding:28px;border:1px solid #d9e5e0;border-radius:14px}h1{font-size:22px}</style><main><h1>StonePlus Codex OAuth</h1><p>${escapeHtml(message)}</p></main>`
   response.writeHead(status, {
     'content-type': 'text/html; charset=utf-8',
     'cache-control': 'no-store',
@@ -498,22 +498,22 @@ function safeErrorMessage(error: unknown): string {
 const oauthBrowserEnglish = new Map<string, string>([
   ['OAuth 授权会话尚未就绪或已经结束。', 'The OAuth session is not ready or has already ended.'],
   ['OAuth 授权已取消，可以关闭此页面。', 'OAuth authorization was cancelled. You can close this page.'],
-  ['OAuth 授权已接收，请返回 Stone+ 完成账号检测。', 'OAuth authorization was received. Return to Stone+ to finish the account check.'],
+  ['OAuth 授权已接收，请返回 StonePlus 完成账号检测。', 'OAuth authorization was received. Return to StonePlus to finish the account check.'],
   ['OAuth 授权已取消。', 'OAuth authorization was cancelled.'],
-  ['OAuth 授权会话已过期，请重新开始。', 'The OAuth session expired. Start again in Stone+.'],
+  ['OAuth 授权会话已过期，请重新开始。', 'The OAuth session expired. Start again in StonePlus.'],
   ['OAuth 回调地址来源不正确。', 'The OAuth callback origin is invalid.'],
   ['回调地址路径不正确。', 'The OAuth callback path is invalid.'],
   ['OAuth 回调 state 校验失败。', 'OAuth callback state validation failed.'],
   ['OAuth 回调缺少授权码。', 'The OAuth callback is missing an authorization code.'],
   ['OpenAI OAuth 授权已取消或被拒绝。', 'OpenAI OAuth authorization was cancelled or denied.'],
   ['OpenAI 要求重新登录后再授权。', 'OpenAI requires you to sign in again before authorizing.'],
-  ['OpenAI OAuth 授权未完成，请重新开始。', 'OpenAI OAuth authorization did not complete. Start again in Stone+.'],
+  ['OpenAI OAuth 授权未完成，请重新开始。', 'OpenAI OAuth authorization did not complete. Start again in StonePlus.'],
   ['OAuth 授权失败。', 'OAuth authorization failed.'],
 ])
 
 function oauthBrowserMessage(language: UiLanguage, message: string): string {
   if (language === 'zh-CN' || !/[\u3400-\u9fff]/u.test(message)) return message
-  return oauthBrowserEnglish.get(message) ?? 'OAuth authorization could not be completed. Return to Stone+ and try again.'
+  return oauthBrowserEnglish.get(message) ?? 'OAuth authorization could not be completed. Return to StonePlus and try again.'
 }
 
 function cleanToken(value: unknown): string {

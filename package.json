@@ -2,9 +2,9 @@
   "name": "stone-desktop",
   "version": "0.9.4",
   "private": true,
-  "description": "Stone+ — Unofficial community fork of Stone",
+  "description": "StonePlus — Local-first AI gateway for coding clients",
   "author": {
-    "name": "Stone+ Contributors"
+    "name": "StonePlus Contributors"
   },
   "license": "Apache-2.0",
   "homepage": "https://github.com/M4rkzzz/stone-plus",
@@ -69,7 +69,7 @@
   },
   "build": {
     "appId": "io.github.m4rkzzz.stoneplus",
-    "productName": "Stone+",
+    "productName": "StonePlus",
     "publish": {
       "provider": "github",
       "owner": "M4rkzzz",
@@ -143,8 +143,8 @@
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
-      "shortcutName": "Stone+",
-      "uninstallDisplayName": "Stone+ ${version}",
+      "shortcutName": "StonePlus",
+      "uninstallDisplayName": "StonePlus ${version}",
       "runAfterFinish": true,
       "installerLanguages": [
         "zh_CN",

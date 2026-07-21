@@ -96,9 +96,9 @@ export function SettingsView({
   }
 
   const restoreBackup = async (backup: BackupRecordSummary) => {
-    if (!window.confirm(t('恢复会替换当前本地数据并需要重启 Stone+，是否继续？', 'Restoring will replace the current local data and requires restarting Stone+. Continue?'))) return
+    if (!window.confirm(t('恢复会替换当前本地数据并需要重启 StonePlus，是否继续？', 'Restoring will replace the current local data and requires restarting StonePlus. Continue?'))) return
     const result = await api.restoreStateBackup(backup.path)
-    setOperationNotice(result.restartRequired ? t('数据已恢复，请退出并重新启动 Stone+。', 'Data restored. Quit and restart Stone+.') : t('数据已恢复。', 'Data restored.'))
+    setOperationNotice(result.restartRequired ? t('数据已恢复，请退出并重新启动 StonePlus。', 'Data restored. Quit and restart StonePlus.') : t('数据已恢复。', 'Data restored.'))
   }
 
   const exportDiagnostics = async () => {
@@ -166,7 +166,7 @@ export function SettingsView({
             <div className="field"><span>{t('当前端点', 'Current Endpoint')}</span><code className="settings-endpoint">{currentEndpoint}</code></div>
           </div>
           <SettingRow title={t('应用启动时运行网关', 'Run gateway when the app starts')} control={<Toggle checked={draft.autoStart} onChange={(value) => setDraft({ ...draft, autoStart: value })} label={t('应用启动时运行网关', 'Run gateway when the app starts')} />} />
-          <SettingRow title={t('登录系统时启动 Stone+', 'Launch Stone+ at login')} control={<Toggle checked={Boolean(draft.launchAtLogin)} onChange={(value) => setDraft({ ...draft, launchAtLogin: value })} label={t('登录系统时启动 Stone+', 'Launch Stone+ at login')} />} />
+          <SettingRow title={t('登录系统时启动 StonePlus', 'Launch StonePlus at login')} control={<Toggle checked={Boolean(draft.launchAtLogin)} onChange={(value) => setDraft({ ...draft, launchAtLogin: value })} label={t('登录系统时启动 StonePlus', 'Launch StonePlus at login')} />} />
           <SettingRow title={t('桌面健康通知', 'Desktop health notifications')} description={t('账号停用、冷却、额度耗尽或恢复时通知', 'Notify when accounts are disabled, cooling down, out of quota, or recovered')} control={<Toggle checked={draft.desktopNotifications !== false} onChange={(value) => setDraft({ ...draft, desktopNotifications: value })} label={t('桌面健康通知', 'Desktop health notifications')} />} />
           <SettingRow
             title={t('适配系统代理', 'Use system proxy')}
@@ -187,7 +187,7 @@ export function SettingsView({
       <section className="settings-section">
         <header><div className="settings-section__icon settings-section__icon--secure"><Archive size={18} /></div><div><h2>{t('备份与恢复', 'Backup & Restore')}</h2></div></header>
         <div className="settings-section__content">
-          <SettingRow title={t('自动备份', 'Automatic backups')} description={t('Stone+ 启动时创建校验过的本地快照', 'Create a verified local snapshot when Stone+ starts')} control={<Toggle checked={draft.automaticBackups !== false} onChange={(value) => setDraft({ ...draft, automaticBackups: value })} label={t('自动备份', 'Automatic backups')} />} />
+          <SettingRow title={t('自动备份', 'Automatic backups')} description={t('StonePlus 启动时创建校验过的本地快照', 'Create a verified local snapshot when StonePlus starts')} control={<Toggle checked={draft.automaticBackups !== false} onChange={(value) => setDraft({ ...draft, automaticBackups: value })} label={t('自动备份', 'Automatic backups')} />} />
           <label className="field backup-retention"><span>{t('最多保留备份', 'Maximum backups')}</span><div className="input-suffix"><input type="number" min={1} max={100} value={draft.backupRetention ?? 10} onChange={(event) => setDraft({ ...draft, backupRetention: Number(event.target.value) })} /><span>{t('份', 'files')}</span></div></label>
           <div className="settings-actions"><button className="button button--secondary" type="button" onClick={() => void createBackup()}><Archive size={16} />{t('立即备份', 'Back Up Now')}</button><button className="button button--secondary" type="button" onClick={() => void exportDiagnostics()}><FileDown size={16} />{t('复制诊断报告', 'Copy Diagnostics Report')}</button><button className="button button--secondary" type="button" onClick={() => void api.clearHealthEvents()}><BellRing size={16} />{t('清除健康事件', 'Clear Health Events')}</button></div>
           {operationNotice && <div className="client-config-notice">{operationNotice}</div>}
@@ -210,7 +210,7 @@ export function SettingsView({
             <div>
               <span className="update-settings-status__icon">{appUpdate?.status === 'checking' || appUpdate?.status === 'downloading' || appUpdate?.status === 'installing' ? <LoaderCircle size={19} className="spin" /> : appUpdate?.status === 'downloaded' || appUpdate?.status === 'up-to-date' ? <CheckCircle2 size={19} /> : <Sparkles size={19} />}</span>
               <div>
-                <strong>{appUpdate?.release ? `Stone+ ${appUpdate.release.version}` : `Stone+ ${appUpdate?.currentVersion ?? __APP_VERSION__}`}</strong>
+                <strong>{appUpdate?.release ? `StonePlus ${appUpdate.release.version}` : `StonePlus ${appUpdate?.currentVersion ?? __APP_VERSION__}`}</strong>
                 <span>{updateSettingsDescription(appUpdate, language)}</span>
               </div>
             </div>
@@ -255,7 +255,7 @@ export function SettingsView({
         </div>
       </section>
 
-      <section className="about-line"><StoneMark small /><div><strong>Stone+</strong><span>{__APP_VERSION__} · Unofficial community fork</span></div><Badge tone={appUpdate ? statusTone(appUpdate) : 'neutral'}>{appUpdate ? statusLabel(appUpdate, language) : 'GitHub Releases'}</Badge></section>
+      <section className="about-line"><StoneMark small /><div><strong>StonePlus</strong><span>{__APP_VERSION__} · Unofficial community fork</span></div><Badge tone={appUpdate ? statusTone(appUpdate) : 'neutral'}>{appUpdate ? statusLabel(appUpdate, language) : 'GitHub Releases'}</Badge></section>
     </form>
   )
 }
@@ -265,10 +265,10 @@ function updateSettingsDescription(update: AppUpdateController['state'], languag
   if (update.status === 'unsupported') return translate(language, '当前安装形式不支持应用内自动更新。', 'This installation does not support automatic in-app updates.')
   if (update.status === 'idle') return translate(language, '手动检查 GitHub Releases 中的最新版本。', 'Check GitHub Releases for the latest version manually.')
   if (update.status === 'checking') return translate(language, '正在获取最新版本与发布说明。', 'Fetching the latest version and release notes.')
-  if (update.status === 'up-to-date') return translate(language, '当前安装的 Stone+ 已是最新版本。', 'The installed Stone+ version is up to date.')
+  if (update.status === 'up-to-date') return translate(language, '当前安装的 StonePlus 已是最新版本。', 'The installed StonePlus version is up to date.')
   if (update.status === 'available') return update.ignoredVersion === update.release?.version ? translate(language, '此版本已忽略，仍可手动查看或下载。', 'This version is ignored, but you can still view or download it manually.') : translate(language, '新版本已发布，可查看说明后下载。', 'A new version is available. Review the notes before downloading.')
   if (update.status === 'downloading') return translate(language, '安装包正在后台下载。', 'The installer is downloading in the background.')
-  if (update.status === 'downloaded') return translate(language, '安装包已就绪，重启 Stone+ 即可完成更新。', 'The installer is ready. Restart Stone+ to complete the update.')
-  if (update.status === 'installing') return translate(language, 'Stone+ 正在关闭并安装新版本。', 'Stone+ is closing and installing the new version.')
+  if (update.status === 'downloaded') return translate(language, '安装包已就绪，重启 StonePlus 即可完成更新。', 'The installer is ready. Restart StonePlus to complete the update.')
+  if (update.status === 'installing') return translate(language, 'StonePlus 正在关闭并安装新版本。', 'StonePlus is closing and installing the new version.')
   return translate(language, '更新操作失败，当前版本仍可继续使用。', 'The update failed. You can continue using the current version.')
 }

@@ -129,7 +129,7 @@ export function UpdateDialog({
   return (
     <Modal
       open={open}
-      title={release?.title || (state.status === 'up-to-date' ? t('Stone+ 已是最新版本', 'Stone+ is up to date') : t('Stone+ 应用更新', 'Stone+ App Update'))}
+      title={release?.title || (state.status === 'up-to-date' ? t('StonePlus 已是最新版本', 'StonePlus is up to date') : t('StonePlus 应用更新', 'StonePlus App Update'))}
       description={release ? `v${state.currentVersion} → v${release.version}` : t(`当前版本 v${state.currentVersion}`, `Current version v${state.currentVersion}`)}
       width="large"
       closable={state.status !== 'installing'}
@@ -163,7 +163,7 @@ export function UpdateDialog({
               {action === 'install' ? <LoaderCircle size={16} className="spin" /> : <Rocket size={16} />}{t('立即安装并重启', 'Install & Restart Now')}
             </button>
           )}
-          {state.status === 'installing' && <button className="button button--primary" type="button" disabled><LoaderCircle size={16} className="spin" />{t('正在重启 Stone+', 'Restarting Stone+')}</button>}
+          {state.status === 'installing' && <button className="button button--primary" type="button" disabled><LoaderCircle size={16} className="spin" />{t('正在重启 StonePlus', 'Restarting StonePlus')}</button>}
           {state.status === 'error' && release && state.automaticUpdateSupported && (
             <button className="button button--primary" type="button" disabled={busy} onClick={() => void onDownload()}><RefreshCw size={16} />{t('重新下载', 'Download Again')}</button>
           )}
@@ -204,7 +204,7 @@ export function UpdateDialog({
             </div>
           </section>
         ) : (
-          <div className="update-dialog__empty">{state.status === 'up-to-date' ? <CheckCircle2 size={28} /> : <RefreshCw size={26} />}<span>{state.status === 'up-to-date' ? t('当前安装的 Stone+ 已是最新版本。', 'The installed Stone+ version is up to date.') : t('手动检查后会在这里显示版本信息和发布说明。', 'Version information and release notes will appear here after a manual check.')}</span></div>
+          <div className="update-dialog__empty">{state.status === 'up-to-date' ? <CheckCircle2 size={28} /> : <RefreshCw size={26} />}<span>{state.status === 'up-to-date' ? t('当前安装的 StonePlus 已是最新版本。', 'The installed StonePlus version is up to date.') : t('手动检查后会在这里显示版本信息和发布说明。', 'Version information and release notes will appear here after a manual check.')}</span></div>
         )}
       </div>
     </Modal>
@@ -260,11 +260,11 @@ function updateIcon(state: AppUpdateState) {
 }
 
 function bannerTitle(state: AppUpdateState, language: UiLanguage): string {
-  if (state.status === 'downloading') return translate(language, `正在下载 Stone+ ${state.release?.version}`, `Downloading Stone+ ${state.release?.version}`)
-  if (state.status === 'downloaded') return translate(language, `Stone+ ${state.release?.version} 已准备就绪`, `Stone+ ${state.release?.version} is ready`)
-  if (state.status === 'installing') return translate(language, 'Stone+ 正在安装更新', 'Stone+ is installing the update')
-  if (state.status === 'error') return translate(language, 'Stone+ 更新遇到问题', 'Stone+ encountered an update problem')
-  return translate(language, `发现 Stone+ ${state.release?.version}`, `Stone+ ${state.release?.version} is available`)
+  if (state.status === 'downloading') return translate(language, `正在下载 StonePlus ${state.release?.version}`, `Downloading StonePlus ${state.release?.version}`)
+  if (state.status === 'downloaded') return translate(language, `StonePlus ${state.release?.version} 已准备就绪`, `StonePlus ${state.release?.version} is ready`)
+  if (state.status === 'installing') return translate(language, 'StonePlus 正在安装更新', 'StonePlus is installing the update')
+  if (state.status === 'error') return translate(language, 'StonePlus 更新遇到问题', 'StonePlus encountered an update problem')
+  return translate(language, `发现 StonePlus ${state.release?.version}`, `StonePlus ${state.release?.version} is available`)
 }
 
 function bannerDescription(state: AppUpdateState, language: UiLanguage): string {
@@ -278,8 +278,8 @@ function bannerDescription(state: AppUpdateState, language: UiLanguage): string 
 }
 
 function statusTitle(state: AppUpdateState): string {
-  if (state.release) return `Stone+ ${state.release.version}`
-  return `Stone+ ${state.currentVersion}`
+  if (state.release) return `StonePlus ${state.release.version}`
+  return `StonePlus ${state.currentVersion}`
 }
 
 function statusDescription(state: AppUpdateState, language: UiLanguage): string {
@@ -291,7 +291,7 @@ function statusDescription(state: AppUpdateState, language: UiLanguage): string 
   if (state.status === 'available') return translate(language, '新版本已发布，可查看说明并选择安装。', 'A new version is available. Review the notes and choose whether to install it.')
   if (state.status === 'downloading') return translate(language, '安装包正在后台下载。', 'The installer is downloading in the background.')
   if (state.status === 'downloaded') return translate(language, '安装包已完成校验，可以更新并重启。', 'The installer has been verified and is ready to update and restart.')
-  if (state.status === 'installing') return translate(language, 'Stone+ 将在安装完成后重新启动。', 'Stone+ will restart after installation completes.')
+  if (state.status === 'installing') return translate(language, 'StonePlus 将在安装完成后重新启动。', 'StonePlus will restart after installation completes.')
   if (state.status === 'error') return translate(language, '更新操作未完成，现有版本仍可继续使用。', 'The update did not complete. You can continue using the current version.')
   return translate(language, '手动检查 GitHub Releases 中的最新版本。', 'Check GitHub Releases for the latest version manually.')
 }

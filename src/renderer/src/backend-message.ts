@@ -120,7 +120,7 @@ const backendMessageEnglish = new Map<string, string>([
   ['Codex 会话数据已在预览后发生变化；为避免覆盖新内容，本次修复已中止，请重新预览。', 'Codex session data changed after the preview. Repair was stopped to avoid overwriting newer content; preview again.'],
   ['Provider ID 只能包含字母、数字、点、下划线和连字符。', 'Provider IDs may contain only letters, numbers, dots, underscores, and hyphens.'],
   ['会话修复快捷重启目前仅支持 Windows ChatGPT。', 'Quick restart after session repair currently supports only ChatGPT for Windows.'],
-  ['Stone+ 正在退出，无法启动会话修复。', 'Stone+ is exiting, so session repair cannot start.'],
+  ['StonePlus 正在退出，无法启动会话修复。', 'StonePlus is exiting, so session repair cannot start.'],
   ['会话修复与 ChatGPT 重启正在进行。', 'Session repair and ChatGPT restart are already in progress.'],
   ['未找到可用于会话修复的 provider。', 'No provider is available for session repair.'],
 ])

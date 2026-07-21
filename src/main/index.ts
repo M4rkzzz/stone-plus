@@ -47,6 +47,11 @@ let focusMainWindowOnReady = false
 
 if (process.env.STONE_USER_DATA_DIR) {
   app.setPath('userData', resolve(process.env.STONE_USER_DATA_DIR))
+} else {
+  // Keep the existing Stone+ data directory after the public product name changes
+  // to StonePlus. Accounts, settings, request history, backups and browser JSON
+  // cache therefore survive an in-place update on every desktop platform.
+  app.setPath('userData', join(app.getPath('appData'), 'Stone+'))
 }
 
 if (process.platform === 'win32') app.setAppUserModelId(windowsAppUserModelId())
@@ -175,7 +180,7 @@ async function bootstrap(): Promise<void> {
       await gateway.start()
       warmGatewayConnections(store, outboundTransport)
     } catch (error: unknown) {
-      console.error('Stone+ could not auto-start the gateway', error)
+      console.error('StonePlus could not auto-start the gateway', error)
     } finally {
       store.setGatewayStatus(gateway.getStatus())
     }
@@ -271,12 +276,12 @@ function createWindow(): void {
 function createTray(): void {
   const icon = nativeImage.createFromPath(stoneIconPath())
   if (icon.isEmpty()) {
-    console.warn('Stone+ tray icon could not be created; continuing without a tray')
+    console.warn('StonePlus tray icon could not be created; continuing without a tray')
     return
   }
 
   tray = new Tray(icon.resize({ width: 18, height: 18 }))
-  tray.setToolTip('Stone+ local gateway')
+  tray.setToolTip('StonePlus local gateway')
   updateTrayMenu()
   tray.on('click', () => {
     if (mainWindow?.isVisible()) {
@@ -305,7 +310,7 @@ function stoneIconPath(): string {
 function windowsAppUserModelId(): string {
   // Development runs use Electron's executable and may leave an Electron.lnk
   // shortcut behind. Sharing the production ID lets Explorer associate that
-  // shortcut's default Electron icon with the installed Stone+ taskbar group.
+  // shortcut's default Electron icon with the installed StonePlus taskbar group.
   return app.isPackaged ? WINDOWS_APP_USER_MODEL_ID : WINDOWS_DEV_APP_USER_MODEL_ID
 }
 
@@ -321,11 +326,11 @@ function isSafeBrowserUrl(value: string): boolean {
 function updateTrayMenu(): void {
   if (!tray) return
   const snapshot = store.getSnapshot()
-  tray.setToolTip(snapshot.gatewayStatus.running ? 'Stone+ gateway is running' : 'Stone+ gateway is stopped')
+  tray.setToolTip(snapshot.gatewayStatus.running ? 'StonePlus gateway is running' : 'StonePlus gateway is stopped')
   tray.setContextMenu(
     Menu.buildFromTemplate([
       {
-        label: 'Open Stone+',
+        label: 'Open StonePlus',
         click: () => showMainWindow()
       },
       { type: 'separator' },
@@ -361,7 +366,7 @@ async function toggleGatewayFromTray(): Promise<void> {
     store.setGatewayStatus(gateway.getStatus())
     updateTrayMenu()
   } catch (error) {
-    console.error('Stone+ tray could not toggle gateway', error)
+    console.error('StonePlus tray could not toggle gateway', error)
   }
 }
 
@@ -373,7 +378,7 @@ async function toggleRouteFromTray(routeId: string): Promise<void> {
     gateway.updateConfig(toGatewayConfig(store))
     updateTrayMenu()
   } catch (error) {
-    console.error('Stone+ tray could not toggle route', error)
+    console.error('StonePlus tray could not toggle route', error)
   }
 }
 
@@ -406,7 +411,7 @@ if (!ownsSingleInstanceLock) {
   app.quit()
 } else {
   void bootstrap().catch((error: unknown) => {
-    console.error('Stone+ failed to start', error)
+    console.error('StonePlus failed to start', error)
     app.quit()
   })
 }
@@ -427,7 +432,7 @@ function shutdownServices(): Promise<void> {
       if (browserImportQueue) await browserImportQueue.close()
       if (store) await store.close()
     } catch (error: unknown) {
-      console.error('Stone+ could not finish graceful shutdown', error)
+      console.error('StonePlus could not finish graceful shutdown', error)
     } finally {
       storeClosed = true
     }

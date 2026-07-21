@@ -1,6 +1,6 @@
 # Third-Party Notices
 
-Stone+ is licensed under the Apache License, Version 2.0. Third-party
+StonePlus is licensed under the Apache License, Version 2.0. Third-party
 components remain under their respective licenses; the Stone license does not
 replace or modify those terms.
 
@@ -55,7 +55,7 @@ The complete OFL text is retained in each Fontsource package.
 
 ## FRP
 
-Stone+'s Windows package includes the `frpc` v0.69.0 executable from the FRP project,
+StonePlus's Windows package includes the `frpc` v0.69.0 executable from the FRP project,
 Copyright 2015 fatedier, licensed under the Apache License, Version 2.0.
 The corresponding license text is distributed as `frp/LICENSE.frp.txt`.
 Project: https://github.com/fatedier/frp
@@ -66,7 +66,7 @@ release archive. The source archive is verified before extraction against SHA-25
 
 ## Electron And Chromium
 
-Stone+ is distributed with Electron, which includes Chromium, Node.js,
+StonePlus is distributed with Electron, which includes Chromium, Node.js,
 and other third-party components. Electron's MIT license is distributed as
 `LICENSE.electron.txt`; Chromium and embedded component notices are distributed
 as `LICENSES.chromium.html`. These files are generated and included by the

@@ -1,5 +1,5 @@
 name: Bug report / Bug 报告
-description: Report a reproducible Stone+ problem without exposing credentials / 报告可复现问题，请勿暴露凭据
+description: Report a reproducible StonePlus problem without exposing credentials / 报告可复现问题，请勿暴露凭据
 title: "[Bug]: "
 labels:
   - bug
@@ -7,16 +7,16 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thanks for helping improve Stone+. Before submitting, remove all API keys, tokens, passwords, cookies, session JSON, account IDs, route tokens, private URLs, database files, prompts, and model responses.
+        Thanks for helping improve StonePlus. Before submitting, remove all API keys, tokens, passwords, cookies, session JSON, account IDs, route tokens, private URLs, database files, prompts, and model responses.
 
-        感谢帮助改进 Stone+。提交前，请移除所有 API Key、Token、密码、Cookie、session JSON、account ID、路由 Token、私有 URL、数据库文件、提示词和模型回复。
+        感谢帮助改进 StonePlus。提交前，请移除所有 API Key、Token、密码、Cookie、session JSON、account ID、路由 Token、私有 URL、数据库文件、提示词和模型回复。
 
         **Security vulnerabilities must not be reported here. Use [GitHub Private Vulnerability Reporting](https://github.com/M4rkzzz/stone-plus/security/advisories/new). / 安全漏洞请使用 GitHub 私密漏洞报告，禁止在此公开细节。**
 
   - type: input
     id: stone-version
     attributes:
-      label: Stone+ version / Stone+ 版本
+      label: StonePlus version / StonePlus 版本
       description: Find it in Settings or the application About row / 可在设置页底部查看
       placeholder: "0.8.1"
     validations:
@@ -70,10 +70,10 @@ body:
     id: summary
     attributes:
       label: Actual and expected behavior / 实际与预期行为
-      description: Describe what Stone+ displayed, what you expected, and when it started / 描述 Stone+ 的实际表现、预期结果及开始出现的时间
+      description: Describe what StonePlus displayed, what you expected, and when it started / 描述 StonePlus 的实际表现、预期结果及开始出现的时间
       placeholder: |
-        Actual / 实际：After clicking ..., Stone+ shows ...
-        Expected / 预期：Stone+ should ...
+        Actual / 实际：After clicking ..., StonePlus shows ...
+        Expected / 预期：StonePlus should ...
     validations:
       required: true
 
@@ -94,7 +94,7 @@ body:
     id: diagnostics
     attributes:
       label: Redacted diagnostics / 已脱敏诊断信息
-      description: Paste only the Settings > Copy diagnostic report output or a short, reviewed log excerpt. Never upload a Stone+ database or backup. / 仅粘贴“设置 > 复制诊断报告”的输出或经过检查的短日志片段，禁止上传 Stone+ 数据库或备份。
+      description: Paste only the Settings > Copy diagnostic report output or a short, reviewed log excerpt. Never upload a StonePlus database or backup. / 仅粘贴“设置 > 复制诊断报告”的输出或经过检查的短日志片段，禁止上传 StonePlus 数据库或备份。
       render: shell
       placeholder: "Paste reviewed and redacted diagnostics here. / 在此粘贴已检查并脱敏的诊断信息。"
 
@@ -113,7 +113,7 @@ body:
           required: true
         - label: I removed API keys, tokens, passwords, cookies, session JSON, account IDs, route tokens, private URLs, and personal information. / 我已移除 Key、Token、密码、Cookie、session JSON、account ID、路由 Token、私有 URL 和个人信息。
           required: true
-        - label: I did not attach a Stone+ database, backup, credential file, prompt, or model response. / 我没有附加 Stone+ 数据库、备份、凭据文件、提示词或模型回复。
+        - label: I did not attach a StonePlus database, backup, credential file, prompt, or model response. / 我没有附加 StonePlus 数据库、备份、凭据文件、提示词或模型回复。
           required: true
         - label: This is not a security vulnerability. / 这不是安全漏洞。
           required: true

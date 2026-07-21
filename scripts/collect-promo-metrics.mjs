@@ -540,7 +540,7 @@ function parseArguments(argumentsList) {
 }
 
 function printHelp() {
-  console.log(`Collect Stone+ GitHub promotion metrics.
+  console.log(`Collect StonePlus GitHub promotion metrics.
 
 Usage:
   node scripts/collect-promo-metrics.mjs [options]

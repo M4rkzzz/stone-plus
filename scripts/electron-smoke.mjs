@@ -328,7 +328,7 @@ try {
     && await window.getByRole('tabpanel', { name: 'OAuth 授权添加账号' }).isVisible()
     && (await setupPoolSelect.locator('option').allTextContents()).some((label) => label.includes('Smoke OAuth Pool'))
     && (await setupProxySelect.locator('option').allTextContents()).some((label) => label.includes('Smoke SOCKS5 Proxy'))
-    && await window.getByText('截图中的“备注”已适配为 Stone+ Tag，授权和导入使用相同设置。').isVisible()
+    && await window.getByText('截图中的“备注”已适配为 StonePlus Tag，授权和导入使用相同设置。').isVisible()
   await setupTokenJsonTab.click()
   await window.getByRole('tabpanel', { name: 'Token 或 JSON 导入账号' }).waitFor()
   const setupTokenJsonUiWorks = await setupTokenJsonTab.getAttribute('aria-selected') === 'true'
@@ -669,7 +669,7 @@ try {
   console.log(JSON.stringify(result, null, 2))
 
   if (
-    result.title !== 'Stone+' ||
+    result.title !== 'StonePlus' ||
     result.providers < 1 ||
     result.routes !== 3 ||
     result.credentialsExposed ||

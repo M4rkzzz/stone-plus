@@ -4,7 +4,7 @@ import { ClientConfigParseError, type ClientConfigFileRole } from './types'
 const assignmentPattern = /^(\s*)(export\s+)?([A-Za-z_][A-Za-z0-9_]*)(\s*=\s*)(.*)$/
 
 /**
- * Validate the dotenv grammar that Stone+ can safely preserve and patch.
+ * Validate the dotenv grammar that StonePlus can safely preserve and patch.
  * Blank lines, comments, exported assignments and multiline quoted values are
  * accepted. A non-assignment line is treated as damage instead of being copied
  * into a freshly repaired client configuration.

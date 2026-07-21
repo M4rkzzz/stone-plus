@@ -272,7 +272,7 @@ function requestActivity(logs: AppSnapshot['requestLogs']): number[] {
 
 function healthEventMessage(event: HealthEvent, language: UiLanguage): string {
   if (language === 'zh-CN' || !/[\u3400-\u9fff]/u.test(event.message)) return event.message
-  if (event.kind === 'quota-exhausted') return 'Quota exhausted; Stone+ paused scheduling for this account.'
+  if (event.kind === 'quota-exhausted') return 'Quota exhausted; StonePlus paused scheduling for this account.'
   if (event.kind === 'quota-restored') return 'The quota window has recovered and the account can be scheduled again.'
   if (event.kind === 'account-recovered') return 'The account has returned to a healthy state.'
   if (event.kind === 'account-disabled' && event.message === '账号已被上游拒绝并停用。') return 'The upstream rejected and disabled this account.'

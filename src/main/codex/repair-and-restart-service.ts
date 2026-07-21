@@ -97,7 +97,7 @@ export class CodexRepairAndRestartService {
   ) {}
 
   run(): Promise<CodexSessionRepairRestartResult> {
-    if (this.closing) return Promise.reject(new Error('Stone+ 正在退出，无法启动会话修复。'))
+    if (this.closing) return Promise.reject(new Error('StonePlus 正在退出，无法启动会话修复。'))
     if (this.active) return Promise.reject(new Error('会话修复与 ChatGPT 重启正在进行。'))
     this.active = true
     const operation = this.execute()

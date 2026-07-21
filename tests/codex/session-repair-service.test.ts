@@ -27,7 +27,7 @@ async function createFixture() {
     'model_provider = "stone"',
     '',
     '[model_providers.stone]',
-    'name = "Stone+"',
+    'name = "StonePlus"',
     '',
   ].join('\n'))
   await writeFile(join(codexHome, '.codex-global-state.json'), JSON.stringify({
@@ -133,7 +133,7 @@ describe('CodexSessionRepairService', () => {
     expect((await stat(activeRollout)).mtimeMs).toBeCloseTo(originalMtime.getTime(), -2)
     expect(await readFile(join(result.backupPath!, 'rollouts', 'sessions', '2026', '07', '18', 'rollout-2026-07-18T12-00-00-thread-one.jsonl'), 'utf8')).toBe(activeLines)
     expect(JSON.parse(await readFile(join(result.backupPath!, 'metadata.json'), 'utf8'))).toMatchObject({
-      managedBy: 'Stone+ session repair',
+      managedBy: 'StonePlus session repair',
       targetProvider: 'stone',
     })
 
