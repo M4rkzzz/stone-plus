@@ -69,6 +69,16 @@ export interface GatewayRuntimeStateUpdate {
   gatewayStatus?: boolean
   accountIds?: readonly string[]
   allAccounts?: boolean
+  /**
+   * Static model/capability matching succeeded, but every matching source was
+   * unavailable at scheduling time. The desktop layer may use this narrow set
+   * to re-probe stale disabled/cooldown state without scanning unrelated
+   * accounts or treating concurrency saturation as an account failure.
+   */
+  noEligibleAccounts?: {
+    poolId: string
+    accountIds: readonly string[]
+  }
 }
 
 export type GatewayRuntimeStateHandler = (update: GatewayRuntimeStateUpdate) => void

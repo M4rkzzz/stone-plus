@@ -94,6 +94,7 @@ export function registerGatewayApi(
   const runtimeDeltaPublishIntervalMs = 50
   const accountStateFlushDelayMs = 250
   const requestLogCheckpointIntervalMs = 10_000
+  const noEligibleProbeCooldownMs = 30_000
   let scheduledRuntimeDeltaPublish: ReturnType<typeof setTimeout> | undefined
   let scheduledRequestLogCheckpoint: ReturnType<typeof setTimeout> | undefined
   let lastRuntimeDeltaPublishAt: number | undefined
@@ -117,7 +118,11 @@ export function registerGatewayApi(
   const apiSourceCapabilityProbeOwners = new Map<string, symbol>()
   let automaticCooldownRefreshTriggered = false
   let automaticCooldownRefreshFlight: Promise<void> | undefined
+  const noEligibleProbeFlights = new Map<string, Promise<void>>()
+  const noEligibleProbeLastStartedAt = new Map<string, number>()
+  const noEligibleRefreshFlights = new Set<Promise<void>>()
   let evaluateAutomaticCooldownRefresh = (): void => undefined
+  let refreshNoEligibleAccounts = (_accountIds: readonly string[]): void => undefined
   let gatewayLifecycleTail: Promise<void> = Promise.resolve()
   const enqueueGatewayLifecycle = <T>(operation: () => Promise<T>): Promise<T> => {
     const result = gatewayLifecycleTail.then(operation, operation)
@@ -383,6 +388,9 @@ export function registerGatewayApi(
   }
 
   const unsubscribeRuntimeState = gateway.onRuntimeState((update = { gatewayStatus: true, allAccounts: true }) => {
+    if (update.noEligibleAccounts?.accountIds.length) {
+      refreshNoEligibleAccounts(update.noEligibleAccounts.accountIds)
+    }
     if (update.allAccounts) {
       scheduleRuntimeDelta({ gatewayStatus: update.gatewayStatus === true, allAccounts: true })
     } else if (update.accountIds?.length) {
@@ -657,6 +665,47 @@ export function registerGatewayApi(
     }).finally(() => {
       if (automaticCooldownRefreshFlight === flight) automaticCooldownRefreshFlight = undefined
       evaluateAutomaticCooldownRefresh()
+    })
+  }
+
+  refreshNoEligibleAccounts = (accountIds: readonly string[]): void => {
+    if (closed) return
+    const now = Date.now()
+    const candidates = [...new Set(accountIds)].filter((accountId) => {
+      const account = store.getRuntimeAccount(accountId)
+      if (!account || account.status === 'expired' || account.status === 'checking') return false
+      // Active sources can be absent only because of concurrency or an
+      // in-memory circuit decision. Neither is evidence that a credential
+      // probe is useful. Known quota cooldowns have their own reset timer.
+      if (account.status === 'disabled') return true
+      if (account.status !== 'cooldown') return false
+      return account.cooldownReason !== 'quota' && !quotaExhausted(account)
+    }).filter((accountId) => {
+      const lastStartedAt = noEligibleProbeLastStartedAt.get(accountId)
+      return !noEligibleProbeFlights.has(accountId)
+        && (lastStartedAt === undefined || now - lastStartedAt >= noEligibleProbeCooldownMs)
+    })
+    if (candidates.length === 0) return
+
+    const refreshFlight = mapConcurrent(candidates, 3, async (accountId) => {
+      const existing = noEligibleProbeFlights.get(accountId)
+      if (existing) return existing
+      noEligibleProbeLastStartedAt.set(accountId, Date.now())
+      const probeFlight = probeAndPersistAccount(accountId).then(() => undefined)
+      noEligibleProbeFlights.set(accountId, probeFlight)
+      try {
+        await probeFlight
+      } finally {
+        if (noEligibleProbeFlights.get(accountId) === probeFlight) {
+          noEligibleProbeFlights.delete(accountId)
+        }
+      }
+    }).then(() => undefined)
+    noEligibleRefreshFlights.add(refreshFlight)
+    void refreshFlight.catch((error: unknown) => {
+      console.error('Stone+ could not refresh accounts after a zero-candidate schedule', error)
+    }).finally(() => {
+      noEligibleRefreshFlights.delete(refreshFlight)
     })
   }
 
@@ -2388,6 +2437,10 @@ export function registerGatewayApi(
     if (automaticCooldownRefreshFlight) {
       await Promise.allSettled([automaticCooldownRefreshFlight])
     }
+    await Promise.allSettled([...noEligibleRefreshFlights, ...noEligibleProbeFlights.values()])
+    noEligibleRefreshFlights.clear()
+    noEligibleProbeFlights.clear()
+    noEligibleProbeLastStartedAt.clear()
     if (ownsOutboundReloadCoordinator) await outboundReloadCoordinator.close()
     else await outboundReloadCoordinator.settle()
     const oauthCompletions = new Set<Promise<unknown>>(oauthCompletionFlights)

@@ -4,7 +4,7 @@ import { EventEmitter } from 'node:events'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { Account, GatewaySettings, Pool, ProviderDefinition, RequestLog, Route } from '../../src/shared/types'
 import { createCanonicalStreamParser, GatewayServer } from '../../src/main/gateway'
-import type { GatewayConfig } from '../../src/main/gateway'
+import type { GatewayConfig, GatewayRuntimeStateUpdate } from '../../src/main/gateway'
 
 const timestamp = 1_700_000_000_000
 const runningServers: GatewayServer[] = []
@@ -316,6 +316,35 @@ afterEach(async () => {
 })
 
 describe('GatewayServer', () => {
+  it('reports the statically matching accounts when scheduling has zero runtime candidates', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.accounts.forEach((candidate) => {
+      candidate.status = 'disabled'
+    })
+    const runtimeUpdates: GatewayRuntimeStateUpdate[] = []
+    const upstreamFetch = vi.fn()
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'credential',
+      fetchImplementation: upstreamFetch as typeof fetch,
+    })
+    gateway.onRuntimeState((update) => runtimeUpdates.push(update))
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await post(port)
+    expect(response.status).toBe(503)
+    await response.text()
+    expect(upstreamFetch).not.toHaveBeenCalled()
+    expect(runtimeUpdates).toContainEqual(expect.objectContaining({
+      noEligibleAccounts: {
+        poolId: 'pool',
+        accountIds: ['first', 'second'],
+      },
+    }))
+  })
+
   it('captures replay payloads only when enabled and exposes a content-redacted template', async () => {
     const port = await freePort()
     const gatewayConfig = config(port, { logPayloads: true })

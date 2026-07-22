@@ -906,7 +906,22 @@ export class GatewayServer implements GatewayController {
               requiredCapabilities
             })
           } catch (error) {
-            if (error instanceof NoEligibleAccountError && lastRetryableError) throw lastRetryableError
+            if (error instanceof NoEligibleAccountError) {
+              // Report only the statically compatible source set. The desktop
+              // layer filters this down to recoverable disabled/failure-cooled
+              // accounts and applies per-account single-flight throttling, so
+              // retry exhaustion can recover a stale sibling without turning
+              // repeated 503s into a probe storm.
+              if (error.accountIds.length > 0) {
+                this.emitRuntimeState({
+                  noEligibleAccounts: {
+                    poolId: pool.id,
+                    accountIds: error.accountIds,
+                  },
+                })
+              }
+              if (lastRetryableError) throw lastRetryableError
+            }
             throw error
           } finally {
             schedulerSelectMs = Math.max(0, this.now() - schedulerSelectStarted)
