@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import type { SetupSourceMethod, SetupWizardProgressInput, SetupWizardState, SetupWizardStep } from '@shared/types'
+import type { Protocol, SetupSourceMethod, SetupWizardProgressInput, SetupWizardRoutingRollback, SetupWizardState, SetupWizardStep } from '@shared/types'
 
 export const SETUP_WIZARD_METADATA_KEY = 'setup_wizard_state_v1'
 
@@ -70,12 +70,14 @@ export class SetupWizardRepository {
       poolId: updatedIdentifier(input.poolId, existing?.poolId),
       routeId: updatedIdentifier(input.routeId, existing?.routeId),
       client: input.client ?? existing?.client,
+      profileId: updatedIdentifier(input.profileId, existing?.profileId),
       model: cleanIdentifier(input.model ?? existing?.model),
       proxyId: updatedIdentifier(input.proxyId, existing?.proxyId),
       lastError: sanitizeMessage(input.lastError),
       verifiedAt: existing?.completed || input.step === 'client-config' || input.step === 'complete'
         ? existing?.verifiedAt
         : undefined,
+      routingRollbacks: existing?.routingRollbacks,
       createdAt: existing?.createdAt ?? timestamp,
       updatedAt: timestamp,
     }
@@ -133,6 +135,35 @@ export class SetupWizardRepository {
     return state
   }
 
+  async recordRoutingMutation(sessionId: string, input: {
+    routeId: string
+    routeCreated: boolean
+    expectedUpdatedAt: number
+    createdPoolId?: string
+    previous?: SetupWizardRoutingRollback['previous']
+  }): Promise<SetupWizardState> {
+    const existing = this.get()
+    if (!existing || existing.sessionId !== sessionId) throw new Error('配置向导会话不存在或已过期。')
+    const rollbacks = [...(existing.routingRollbacks ?? [])]
+    const index = rollbacks.findIndex((item) => item.routeId === input.routeId)
+    const current = index >= 0 ? rollbacks[index] : undefined
+    const rollback: SetupWizardRoutingRollback = {
+      routeId: input.routeId,
+      routeCreated: current?.routeCreated ?? input.routeCreated,
+      expectedUpdatedAt: input.expectedUpdatedAt,
+      createdPoolIds: [...new Set([
+        ...(current?.createdPoolIds ?? []),
+        ...(input.createdPoolId ? [input.createdPoolId] : []),
+      ])],
+      previous: current?.previous ?? input.previous,
+    }
+    if (index >= 0) rollbacks[index] = rollback
+    else rollbacks.push(rollback)
+    const state = { ...existing, routingRollbacks: rollbacks.slice(-3), updatedAt: this.now() }
+    await this.persist(state)
+    return state
+  }
+
   async reset(): Promise<void> {
     await this.metadata.removeAppMetadata(SETUP_WIZARD_METADATA_KEY)
   }
@@ -171,13 +202,53 @@ function normalizeSetupState(value: unknown): SetupWizardState | null {
     poolId: cleanIdentifier(input.poolId),
     routeId: cleanIdentifier(input.routeId),
     client,
+    profileId: cleanIdentifier(input.profileId),
     model: cleanIdentifier(input.model),
     proxyId: cleanIdentifier(input.proxyId),
     lastError: sanitizeMessage(input.lastError),
     verifiedAt: finiteTimestamp(input.verifiedAt),
+    routingRollbacks: normalizeRoutingRollbacks(input.routingRollbacks),
     createdAt,
     updatedAt,
   }
+}
+
+function normalizeRoutingRollbacks(value: unknown): SetupWizardRoutingRollback[] | undefined {
+  if (!Array.isArray(value)) return undefined
+  const protocols = new Set<Protocol>(['openai-responses', 'openai-chat', 'anthropic-messages', 'gemini'])
+  const result: SetupWizardRoutingRollback[] = []
+  for (const candidate of value.slice(-3)) {
+    if (!candidate || typeof candidate !== 'object') continue
+    const input = candidate as Partial<SetupWizardRoutingRollback>
+    const routeId = cleanIdentifier(input.routeId)
+    const expectedUpdatedAt = finiteTimestamp(input.expectedUpdatedAt)
+    if (!routeId || expectedUpdatedAt === undefined) continue
+    const previous = input.previous && typeof input.previous === 'object'
+      && typeof input.previous.poolId === 'string'
+      && typeof input.previous.enabled === 'boolean'
+      && protocols.has(input.previous.inboundProtocol)
+      && input.previous.modelMap && typeof input.previous.modelMap === 'object'
+      ? {
+          poolId: input.previous.poolId.slice(0, 256),
+          enabled: input.previous.enabled,
+          highConcurrencyMode: input.previous.highConcurrencyMode === true,
+          inboundProtocol: input.previous.inboundProtocol,
+          modelMap: Object.fromEntries(Object.entries(input.previous.modelMap)
+            .filter(([key, model]) => key.length <= 256 && typeof model === 'string' && model.length <= 256)
+            .slice(0, 256)) as Record<string, string>,
+        }
+      : undefined
+    result.push({
+      routeId,
+      routeCreated: input.routeCreated === true,
+      expectedUpdatedAt,
+      createdPoolIds: Array.isArray(input.createdPoolIds)
+        ? input.createdPoolIds.map(cleanIdentifier).filter((id): id is string => Boolean(id)).slice(0, 8)
+        : [],
+      previous,
+    })
+  }
+  return result.length ? result : undefined
 }
 
 function cleanIdentifier(value: unknown): string | undefined {

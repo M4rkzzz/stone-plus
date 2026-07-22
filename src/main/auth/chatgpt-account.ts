@@ -98,6 +98,7 @@ function parseValues(content: string): { values: unknown[]; sub2Api: boolean; sk
         const account = objectValue(value)
         return stringValue(account?.platform)?.toLowerCase() === 'openai'
           && stringValue(account?.type)?.toLowerCase() === 'oauth'
+          && !isAgentIdentityImportValue(account)
       })
       return { values, sub2Api: true, skippedAccounts: object.accounts.length - values.length }
     }
@@ -107,6 +108,17 @@ function parseValues(content: string): { values: unknown[]; sub2Api: boolean; sk
       try { return JSON.parse(line) as unknown } catch { return line }
     }), sub2Api: false, skippedAccounts: 0 }
   }
+}
+
+function isAgentIdentityImportValue(account: Record<string, unknown> | undefined): boolean {
+  if (!account) return false
+  const credentials = objectValue(account.credentials)
+  const mode = stringValue(credentials?.auth_mode) ?? stringValue(credentials?.authMode)
+  return mode?.toLowerCase() === 'agentidentity'
+    || typeof credentials?.agent_identity === 'string'
+    || typeof credentials?.agentIdentity === 'string'
+    || Boolean(objectValue(credentials?.agent_identity) ?? objectValue(credentials?.agentIdentity))
+    || Boolean(stringValue(credentials?.agent_runtime_id) ?? stringValue(credentials?.agentRuntimeId))
 }
 
 function parseAccount(value: unknown): { bundle: ChatGptCredentialBundle; repairedAccountId: boolean; proxyId?: string } {

@@ -55,13 +55,14 @@ try {
     if (message.type() === 'error') pageErrors.push(message.text())
   })
   await window.locator('.app-shell').waitFor({ timeout: 30_000 })
-  const chatGptRepairRestartButton = window.getByRole('button', { name: '修复会话并重启 ChatGPT' })
+  const chatGptRepairRestartButton = window.getByRole('button', { name: '关闭 Codex、修复会话、重新开启' })
   const chatGptRepairRestartButtonVisible = await chatGptRepairRestartButton.isVisible()
     && await chatGptRepairRestartButton.locator('.chatgpt-mark').isVisible()
   await window.locator('.nav-item').filter({ hasText: '会话修复' }).click()
   await window.getByRole('heading', { name: '会话修复' }).waitFor({ timeout: 30_000 })
-  await window.locator('.session-repair-loading').waitFor({ state: 'hidden', timeout: 30_000 })
-  const sessionRepairLoaded = await window.locator('.session-repair-panel').isVisible()
+  const providerRepairPanel = window.locator('.session-repair-panel:not(.session-index-cleanup-panel)')
+  await providerRepairPanel.waitFor({ state: 'visible', timeout: 30_000 })
+  const sessionRepairLoaded = await providerRepairPanel.isVisible()
 
   const bootSnapshot = await window.evaluate(() => window.stone.getSnapshot())
   const initial = await window.evaluate(({ settings, port }) => window.stone.updateGateway({
@@ -156,7 +157,9 @@ try {
     sessionId, sourceId, client: 'codex', model: 'gpt-smoke'
   }), { sessionId: wizard.sessionId, sourceId: relayOneAccount?.id })
   const setupGateway = await window.evaluate((port) => window.stone.ensureGatewayRunning({ host: '127.0.0.1', port }), gatewayPort)
-  const setupVerification = await window.evaluate(() => window.stone.verifySetupRoute({ client: 'codex', model: 'gpt-smoke' }))
+  const setupVerification = await window.evaluate(({ sessionId, routeId }) => window.stone.verifySetupRoute({
+    sessionId, routeId, client: 'codex', model: 'gpt-smoke'
+  }), { sessionId: wizard.sessionId, routeId: setupRouting.routeId })
   await window.evaluate(async (sessionId) => {
     await window.stone.saveSetupWizardProgress({ sessionId, step: 'client-config' })
     await window.stone.completeSetupWizard(sessionId)
@@ -172,7 +175,7 @@ try {
   const tokenJsonAddTab = accountAddDialog.getByRole('tab', { name: /Token \/ JSON/ })
   await accountAddDialog.locator('.account-import-options > summary').click()
   const accountAddTag = accountAddDialog.getByRole('radio', { name: 'K12', exact: true })
-  const oauthProxySelect = accountAddDialog.locator('label').filter({ hasText: '出口代理' }).locator('select')
+  const oauthProxySelect = accountAddDialog.locator('label').filter({ hasText: '代理' }).locator('select')
   const oauthProxyOptions = await oauthProxySelect.locator('option').allTextContents()
   await accountAddTag.click()
   const oauthAccountAddUiWorks = await oauthAddTab.getAttribute('aria-selected') === 'true'
@@ -321,7 +324,7 @@ try {
   await window.locator('.setup-account-shared > summary').click()
   const setupTagSelect = window.locator('label').filter({ hasText: '账号 Tag（代替备注）' }).locator('select')
   const setupPoolSelect = window.locator('label').filter({ hasText: '导入后加入号池' }).locator('select')
-  const setupProxySelect = window.locator('label').filter({ hasText: 'Token 交换与后续检测出口' }).locator('select')
+  const setupProxySelect = window.locator('label').filter({ hasText: 'Token 交换与后续检测代理' }).locator('select')
   await setupTagSelect.selectOption(k12Tag.id)
   await window.waitForFunction((tagId) => window.stone.getSetupWizardState().then((state) => state?.tagId === tagId), k12Tag.id)
   const setupOauthUiWorks = await setupOauthTab.getAttribute('aria-selected') === 'true'
@@ -455,6 +458,14 @@ try {
   await window.waitForTimeout(250)
   const sourceSwitchSnapshot = await window.evaluate(() => window.stone.getSnapshot())
   const codexConfigAfterSourceSwitch = await readFile(codexConfigPath, 'utf8')
+  const agentLimitSetting = window.locator('[data-testid="codex-agent-limit-setting"]')
+  const agentLimitInput = agentLimitSetting.locator('#client-codex-agent-limit')
+  await agentLimitInput.fill('5')
+  await agentLimitSetting.getByRole('button', { name: '保存' }).click()
+  await window.getByText(/子代理上限已设为 5/).waitFor()
+  const codexConfigAfterAgentLimitSave = await readFile(codexConfigPath, 'utf8')
+  const clientAgentLimitSaved = await agentLimitInput.inputValue() === '5'
+    && /(?:^|\n)(?:agents\.)?max_threads = 5(?:\r?\n|$)/.test(codexConfigAfterAgentLimitSave)
   const advancedToggle = window.getByRole('button', { name: /高级设置/ })
   const advancedHiddenByDefault = await window.locator('.client-manager-workbench').count() === 0
   await advancedToggle.click()
@@ -465,6 +476,7 @@ try {
     && await window.getByRole('heading', { name: '客户端配置' }).count() === 0
     && await window.locator('.client-easy-status__item').count() === 3
     && await window.getByRole('button', { name: /一键(?:修复)?连接/ }).isVisible()
+    && await window.getByRole('button', { name: '恢复官方登录' }).isVisible()
     && advancedHiddenByDefault
     && advancedEditorAvailable
     && await clientUpstreamSelect.inputValue() === switchTargetId
@@ -655,6 +667,7 @@ try {
       && repairedCodexConfig.includes('[model_providers.stone]'),
     clientRouteSwitchPreservesConfig: sourceSwitchSnapshot.routes.find((route) => route.client === 'codex')?.poolId === switchTargetId
       && codexConfigBeforeSourceSwitch === codexConfigAfterSourceSwitch,
+    clientAgentLimitSaved,
     clientConfigEasyUiWorks,
     gatewayStarted: started.gatewayStatus.running,
     gatewayProbeStatus: probe.status,
@@ -724,6 +737,7 @@ try {
     !result.clientConfigBackupSet ||
     !result.clientConfigRepairRebuilds ||
     !result.clientRouteSwitchPreservesConfig ||
+    !result.clientAgentLimitSaved ||
     !result.clientConfigEasyUiWorks ||
     !result.gatewayStarted ||
     result.gatewayProbeStatus !== 404 ||

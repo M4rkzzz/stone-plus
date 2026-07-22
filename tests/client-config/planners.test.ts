@@ -4,6 +4,8 @@ import {
   ClientConfigValidationError,
   planClaudeConfig,
   planCodexConfig,
+  planCodexOfficialLoginConfig,
+  planCodexOfficialLoginToml,
   planCodexToml,
   planGeminiConfig,
   resolveClientConfigPaths,
@@ -172,6 +174,78 @@ describe('Codex planning', () => {
       auth_mode: 'apikey',
       OPENAI_API_KEY: target.token,
     })
+  })
+
+  it('restores official login while preserving cached ChatGPT tokens and unrelated settings', () => {
+    const source = [
+      'model = "gpt-5.6"',
+      'model_provider = "stone"',
+      'cli_auth_credentials_store = "file"',
+      '',
+      '[features]',
+      'multi_agent = true',
+      'remote_compaction_v2 = false',
+      '',
+      '[model_providers.stone]',
+      'base_url = "http://127.0.0.1:15721/v1"',
+      'wire_api = "responses"',
+      'custom_timeout = 42',
+      '',
+      '[model_providers.stone.http_headers]',
+      'x_keep = "remove-with-stone"',
+      '',
+      '[model_providers.custom]',
+      'base_url = "https://keep.example/v1"',
+      '',
+    ].join('\r\n')
+    const authSource = JSON.stringify({
+      auth_mode: 'apikey',
+      OPENAI_API_KEY: target.token,
+      tokens: { access_token: 'official-access', refresh_token: 'official-refresh' },
+      unknown: { keep: true },
+    }, null, 2) + '\n'
+
+    const plan = planCodexOfficialLoginConfig(paths.codex, {
+      'codex-config': source,
+      'codex-auth': authSource,
+    })
+    const config = plan.files.find((file) => file.role === 'codex-config')!
+    const auth = plan.files.find((file) => file.role === 'codex-auth')!
+
+    expect(config.content).toContain('model_provider = "openai"')
+    expect(config.content).toContain('model = "gpt-5.6"')
+    expect(config.content).toContain('multi_agent = true')
+    expect(config.content).toContain('[model_providers.custom]')
+    expect(config.content).toContain('https://keep.example/v1')
+    expect(config.content).not.toContain('cli_auth_credentials_store')
+    expect(config.content).not.toContain('remote_compaction_v2')
+    expect(config.content).not.toContain('model_providers.stone')
+    expect(config.content).not.toContain('remove-with-stone')
+    expect(config.content.replace(/\r\n/g, '')).not.toContain('\n')
+    expect(config.content.endsWith('\r\n')).toBe(true)
+    expect(JSON.parse(auth.content)).toEqual({
+      auth_mode: 'chatgpt',
+      tokens: { access_token: 'official-access', refresh_token: 'official-refresh' },
+      unknown: { keep: true },
+    })
+
+    const second = planCodexOfficialLoginConfig(paths.codex, {
+      'codex-config': config.content,
+      'codex-auth': auth.content,
+    })
+    expect(second.files.every((file) => !file.changed)).toBe(true)
+  })
+
+  it('removes inline Stone overrides and does not create an empty auth file', () => {
+    const source = 'features = { multi_agent = true, remote_compaction_v2 = false }\nmodel_providers = { stone = { base_url = "http://localhost/v1" }, custom = { base_url = "https://keep.example" } }\n'
+    const result = planCodexOfficialLoginToml(source)
+    const plan = planCodexOfficialLoginConfig(paths.codex, { 'codex-config': source })
+
+    expect(result.content).toContain('model_provider = "openai"')
+    expect(result.content).toContain('features = { multi_agent = true }')
+    expect(result.content).toContain('model_providers = { custom = { base_url = "https://keep.example" } }')
+    expect(result.content).not.toContain('stone =')
+    expect(plan.files.map((file) => file.role)).toEqual(['codex-config'])
   })
 })
 

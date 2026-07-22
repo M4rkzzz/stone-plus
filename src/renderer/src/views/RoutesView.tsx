@@ -5,6 +5,7 @@ import {
   Copy,
   Eye,
   EyeOff,
+  Gauge,
   KeyRound,
   LoaderCircle,
   Plus,
@@ -15,7 +16,7 @@ import {
 } from 'lucide-react'
 import { clientNativeProtocols } from '@shared/types'
 import { listRouteSources, resolveRouteSource, type RouteSourceKind } from '@shared/route-sources'
-import type { AppSnapshot, GatewayApi, Route, RouteClient } from '@shared/types'
+import type { AppSnapshot, GatewayApi, Route, RouteClient, RoutePreviewIssue, RoutePreviewResult } from '@shared/types'
 import type { ActionRunner } from '../App'
 import { clientBrandMeta as clientMeta } from '../brand-icons'
 import { useI18n } from '../i18n'
@@ -42,6 +43,23 @@ function clientEnvironment(route: Route, baseUrl: string) {
   return `GOOGLE_GEMINI_BASE_URL=${baseUrl}\nGEMINI_API_KEY=${route.localToken}`
 }
 
+function previewIssueText(
+  item: RoutePreviewIssue,
+  preview: RoutePreviewResult,
+  t: (zh: string, en: string) => string,
+): string {
+  if (item.code === 'route-disabled') return t('路由当前处于停用状态。', 'The route is currently disabled.')
+  if (item.code === 'invalid-inbound-protocol') return t('入站协议与客户端原生协议不一致。', 'The inbound protocol does not match the client native protocol.')
+  if (item.code === 'source-missing') return t('目标来源不存在或配置不完整。', 'The target source is missing or incomplete.')
+  if (item.code === 'source-unavailable') return t('来源没有可参与调度的账号。', 'The source has no account eligible for scheduling.')
+  if (item.code === 'protocol-conversion') return t(`将转换为 ${preview.sourceProtocol ?? '上游协议'}。`, `The request will be converted to ${preview.sourceProtocol ?? 'the upstream protocol'}.`)
+  if (item.code === 'model-mapped') return t(`模型将映射为 ${preview.upstreamModel ?? ''}。`, `The model will be mapped to ${preview.upstreamModel ?? ''}.`)
+  if (item.code === 'model-unavailable') return t(`没有成员声明支持 ${preview.upstreamModel ?? '该模型'}。`, `No member declares support for ${preview.upstreamModel ?? 'this model'}.`)
+  if (item.code === 'capability-unsupported') return t(`来源不支持 ${item.capability ?? '所需能力'}。`, `The source does not support ${item.capability ?? 'the required capability'}.`)
+  if (item.code === 'capability-unknown') return t(`尚未确认 ${item.capability ?? '所需能力'}。`, `${item.capability ?? 'The required capability'} has not been confirmed.`)
+  return item.message
+}
+
 function RouteEditor({
   route,
   snapshot,
@@ -60,6 +78,9 @@ function RouteEditor({
   const [mappings, setMappings] = useState<MappingRow[]>([])
   const [showToken, setShowToken] = useState(false)
   const [copied, setCopied] = useState<string | null>(null)
+  const [previewModel, setPreviewModel] = useState('')
+  const [preview, setPreview] = useState<RoutePreviewResult | null>(null)
+  const [previewBusy, setPreviewBusy] = useState(false)
   const syncedRouteSignature = useRef('')
   const meta = clientMeta[route.client]
   const routeSignature = JSON.stringify(route)
@@ -94,6 +115,19 @@ function RouteEditor({
   const save = async () => {
     const modelMap = Object.fromEntries(mappings.filter((row) => row.source.trim() && row.target.trim()).map((row) => [row.source.trim(), row.target.trim()]))
     await runAction(`save-route-${route.id}`, () => api.updateRoute({ ...draft, modelMap }))
+  }
+
+  const runPreview = async () => {
+    setPreviewBusy(true)
+    try {
+      const modelMap = Object.fromEntries(mappings.filter((row) => row.source.trim() && row.target.trim()).map((row) => [row.source.trim(), row.target.trim()]))
+      setPreview(await api.previewRoute({
+        route: { ...draft, modelMap },
+        requestedModel: previewModel.trim() || undefined,
+      }))
+    } finally {
+      setPreviewBusy(false)
+    }
   }
 
   const toggleEnabled = async (enabled: boolean) => {
@@ -144,6 +178,24 @@ function RouteEditor({
           <div className="conversion-line"><RefreshCw size={14} /><span>{protocolLabels[draft.inboundProtocol]}</span><span className="conversion-arrow">→</span><span>{protocolLabels[source.summary.protocol]}</span><Badge tone="warning">{t('协议转换', 'Protocol conversion')}</Badge></div>
         )}
 
+        <div className={`route-performance-option ${draft.highConcurrencyMode ? 'route-performance-option--active' : ''}`}>
+          <Gauge size={17} />
+          <div>
+            <strong>{t('高并发模式', 'High-concurrency mode')}</strong>
+            <span>{t(
+              '暂停进度明细、回放和对冲等非必要活动，优先保障高并发首字速度',
+              'Pause detailed progress, replay, and hedging to prioritize first-token latency at high concurrency'
+            )}</span>
+          </div>
+          <Toggle
+            checked={draft.highConcurrencyMode === true}
+            onChange={(value) => setDraft({ ...draft, highConcurrencyMode: value })}
+            label={draft.highConcurrencyMode
+              ? t(`关闭 ${meta.name} 高并发模式`, `Disable high-concurrency mode for ${meta.name}`)
+              : t(`开启 ${meta.name} 高并发模式`, `Enable high-concurrency mode for ${meta.name}`)}
+          />
+        </div>
+
         <div className="route-access">
           <div className="route-access__heading"><span>{t('本地端点', 'Local endpoint')}</span><button type="button" className="icon-button" title={t('复制端点', 'Copy endpoint')} onClick={() => void copyText('endpoint', endpoint)}>{copied === 'endpoint' ? <Check size={16} /> : <Copy size={16} />}</button></div>
           <code>{endpoint}</code>
@@ -169,6 +221,14 @@ function RouteEditor({
             </div>
           )}
         </div>
+
+        <details className="client-config route-preview">
+          <summary><RouteIcon size={15} />{t('静态路由预演', 'Static route preview')}</summary>
+          <div className="route-preview__body">
+            <div className="route-preview__controls"><input className="mono" value={previewModel} onChange={(event) => { setPreviewModel(event.target.value); setPreview(null) }} placeholder={t('请求模型（可选）', 'Requested model (optional)')} /><button className="button button--secondary" type="button" disabled={previewBusy} onClick={() => void runPreview()}>{previewBusy ? <LoaderCircle size={15} className="spin" /> : <Eye size={15} />}{t('预演', 'Preview')}</button></div>
+            {preview && <div className="route-preview__result"><Badge tone={preview.status === 'ready' ? 'success' : preview.status === 'blocked' ? 'danger' : 'warning'}>{preview.status === 'ready' ? t('可路由', 'Ready') : preview.status === 'blocked' ? t('已阻止', 'Blocked') : t('需注意', 'Attention')}</Badge><span>{t(`${preview.eligibleAccountCount} 个可用成员`, `${preview.eligibleAccountCount} eligible account(s)`)}</span>{preview.upstreamModel && <code>{preview.requestedModel && preview.requestedModel !== preview.upstreamModel ? `${preview.requestedModel} → ${preview.upstreamModel}` : preview.upstreamModel}</code>}{preview.issues.map((item) => <small key={`${item.code}-${item.capability ?? ''}`}>{item.severity === 'error' ? '✕' : item.severity === 'warning' ? '!' : '·'} {previewIssueText(item, preview, t)}</small>)}</div>}
+          </div>
+        </details>
 
         <details className="client-config">
           <summary><KeyRound size={15} />{t('客户端环境变量', 'Client environment variables')}</summary>

@@ -5,6 +5,7 @@ import {
   extractProtocolUsage,
   extractRateLimitSignals,
   getProviderAdapter,
+  applyChatGptAgentIdentityHeaders,
   applyChatGptCodexHeaders,
   applyChatGptCodexSearchHeaders,
   CHATGPT_CODEX_RESPONSES_URL,
@@ -18,6 +19,7 @@ import {
   type NormalizedQuotaSignals,
   type ProviderFailure
 } from '../providers'
+import { isInvalidAgentIdentityTaskResponse } from '../auth'
 import type {
   Account,
   AccountCodexQuotaSnapshot,
@@ -28,9 +30,11 @@ import type {
   Protocol,
   ProviderDefinition,
   RequestLog,
-  Route
+  Route,
+  UpstreamCapabilityRequirement
 } from '../../shared/types'
 import {
+  analyzeProtocolConversion,
   convertRequest,
   convertResponse,
   getRequestModel,
@@ -49,6 +53,8 @@ import {
   type StreamEncodingOptions,
   type ResponsesTerminalEvent
 } from './streaming'
+import { ResponsesWebSocketAdapter, type ResponsesWebSocketDispatchInput } from './responses-websocket'
+import { RequestReplayStore } from './request-replay'
 import type {
   CredentialResolver,
   GatewayAccountState,
@@ -70,15 +76,33 @@ interface IncomingRoute {
   geminiMethod?: 'generateContent' | 'streamGenerateContent'
 }
 
+interface GatewayConfigIndex {
+  providersById: ReadonlyMap<string, ProviderDefinition>
+  poolsById: ReadonlyMap<string, Pool>
+  accountsById: ReadonlyMap<string, Account>
+  accountsByPoolId: ReadonlyMap<string, Account[]>
+  poolIdsByAccountId: ReadonlyMap<string, readonly string[]>
+  enabledRoutesByProtocol: ReadonlyMap<Protocol, readonly Route[]>
+  enabledNonGeminiRoutes: readonly Route[]
+  smartAccounts: readonly Account[]
+}
+
 const MIN_FIRST_BODY_TIMEOUT_MS = 1_000
 const MAX_FIRST_BODY_TIMEOUT_MS = 12_000
 const HEDGE_ERROR_GRACE_MS = 750
+// Exhausted headers without a trustworthy reset must still stop a request
+// stampede, while remaining short enough to probe again promptly.
+const QUOTA_EXHAUSTED_RECHECK_MS = 30_000
 // Proxies may split the logical final item/finish_reason from the protocol
 // terminal frame. Keep a bounded grace window so ordinary Chat retains [DONE]
 // and Responses can receive response.completed without reviving indefinite
 // half-open streams. The configured idle timeout still wins when it is lower.
 const TRAILING_FRAME_DRAIN_MS = 2_000
 const RESPONSES_TERMINAL_IDLE_TIMEOUT_MS = 30_000
+// A Responses connection can remain physically alive by emitting SSE comments
+// or lifecycle heartbeats after the model has stopped doing useful work. Track
+// protocol progress separately, but use the user's stream-idle setting as the
+// production boundary so the documented 5–600 second control remains truthful.
 const MAX_REQUEST_BODY_IDLE_TIMEOUT_MS = 15_000
 const CLIENT_WRITE_DRAIN_TIMEOUT_MS = 10_000
 const MAX_COMPACT_V2_STREAM_BYTES = 10 * 1024 * 1024
@@ -129,10 +153,69 @@ const RESPONSES_PASSTHROUGH_HEADERS = Object.freeze([
   'x-request-id'
 ] as const)
 
+function buildGatewayConfigIndex(config: GatewayConfig): GatewayConfigIndex {
+  const providersById = new Map<string, ProviderDefinition>()
+  for (const provider of config.providers) {
+    if (!providersById.has(provider.id)) providersById.set(provider.id, provider)
+  }
+  const poolsById = new Map<string, Pool>()
+  const accountsById = new Map<string, Account>()
+  for (const pool of config.pools) {
+    if (!poolsById.has(pool.id)) poolsById.set(pool.id, pool)
+  }
+  for (const account of config.accounts) {
+    if (!accountsById.has(account.id)) accountsById.set(account.id, account)
+  }
+
+  const accountsByPoolId = new Map<string, Account[]>()
+  const poolIdsByAccountId = new Map<string, string[]>()
+  const smartAccountIds = new Set<string>()
+  for (const pool of config.pools) {
+    const enabledMemberIds = new Set(
+      pool.members.filter((member) => member.enabled).map((member) => member.accountId)
+    )
+    accountsByPoolId.set(
+      pool.id,
+      config.accounts.filter((account) => enabledMemberIds.has(account.id))
+    )
+    for (const accountId of enabledMemberIds) {
+      const poolIds = poolIdsByAccountId.get(accountId) ?? []
+      poolIds.push(pool.id)
+      poolIdsByAccountId.set(accountId, poolIds)
+    }
+    if (pool.strategy === 'autobalanced') {
+      for (const accountId of enabledMemberIds) smartAccountIds.add(accountId)
+    }
+  }
+
+  const enabledRoutesByProtocol = new Map<Protocol, Route[]>()
+  const enabledNonGeminiRoutes: Route[] = []
+  for (const route of config.routes) {
+    if (!route.enabled) continue
+    const routes = enabledRoutesByProtocol.get(route.inboundProtocol) ?? []
+    routes.push(route)
+    enabledRoutesByProtocol.set(route.inboundProtocol, routes)
+    if (route.inboundProtocol !== 'gemini') enabledNonGeminiRoutes.push(route)
+  }
+
+  return {
+    providersById,
+    poolsById,
+    accountsById,
+    accountsByPoolId,
+    poolIdsByAccountId,
+    enabledRoutesByProtocol,
+    enabledNonGeminiRoutes,
+    smartAccounts: config.accounts.filter((account) => smartAccountIds.has(account.id))
+  }
+}
+
 export class GatewayServer implements GatewayController {
   private config: GatewayConfig
+  private configIndex: GatewayConfigIndex
   private credentialResolver: CredentialResolver
   private readonly fetchImplementation: typeof fetch
+  private readonly loopbackFetchImplementation: typeof fetch
   private readonly outboundFetchResolver?: OutboundFetchResolver
   private readonly conversationTitleResolver?: ConversationTitleResolver
   private readonly scheduler: PoolScheduler
@@ -140,8 +223,13 @@ export class GatewayServer implements GatewayController {
   private readonly logListeners = new Set<GatewayLogHandler>()
   private readonly accountStateListeners = new Set<GatewayAccountStateHandler>()
   private readonly runtimeStateListeners = new Set<GatewayRuntimeStateHandler>()
+  private readonly requestReplays: RequestReplayStore
+  private requestReplayCaptureEnabled: boolean
+  private requestReplayGeneration = 0
   private readonly now: () => number
+  private readonly responsesProgressIdleTimeoutMs: number
   private server?: Server
+  private responsesWebSocket?: ResponsesWebSocketAdapter
   private startedAt?: number
   private activeRequests = 0
   private runtimeGeneration = 0
@@ -150,23 +238,35 @@ export class GatewayServer implements GatewayController {
 
   constructor(options: GatewayServerOptions) {
     this.config = options.config
+    this.configIndex = buildGatewayConfigIndex(options.config)
     this.credentialResolver = options.credentialResolver
     this.fetchImplementation = options.fetchImplementation ?? fetch
+    this.loopbackFetchImplementation = options.loopbackFetchImplementation ?? fetch
     this.outboundFetchResolver = options.outboundFetchResolver
     this.conversationTitleResolver = options.conversationTitleResolver
     this.now = options.now ?? (() => Date.now())
+    this.responsesProgressIdleTimeoutMs = Math.max(
+      1,
+      options.responsesProgressIdleTimeoutMs ?? Number.POSITIVE_INFINITY
+    )
+    this.requestReplays = new RequestReplayStore({ now: this.now })
+    this.requestReplayCaptureEnabled = options.config.settings.logPayloads === true
     this.scheduler = new PoolScheduler(this.now, options.random)
-    this.scheduler.hydrate(this.config.accounts)
+    this.scheduler.hydrate(this.config.accounts, this.config.pools)
     this.scheduler.hydratePerformance(this.config.recentRequestLogs ?? [])
     if (options.onLog) this.logListeners.add(options.onLog)
     if (options.onAccountState) this.accountStateListeners.add(options.onAccountState)
   }
 
   async start(settings?: GatewaySettings, credentialResolver?: CredentialResolver): Promise<void> {
-    if (settings) this.config = { ...this.config, settings }
+    if (settings) {
+      this.updateRequestReplayCaptureSetting(settings.logPayloads === true)
+      this.config = { ...this.config, settings }
+      this.configIndex = buildGatewayConfigIndex(this.config)
+    }
     if (credentialResolver) this.credentialResolver = credentialResolver
     if (this.server) return
-    this.scheduler.hydrate(this.config.accounts)
+    this.scheduler.hydrate(this.config.accounts, this.config.pools)
     this.scheduler.hydratePerformance(this.config.recentRequestLogs ?? [])
 
     const { host, port } = this.config.settings
@@ -175,6 +275,20 @@ export class GatewayServer implements GatewayController {
     }
     this.server = createServer((request, response) => {
       void this.handle(request, response)
+    })
+    this.responsesWebSocket = new ResponsesWebSocketAdapter({
+      server: this.server,
+      enabled: () => this.config.settings.responsesWebSocketEnabled === true,
+      authenticate: (request) => {
+        try {
+          this.authenticate(request, 'openai-responses')
+          return { ok: true }
+        } catch (error) {
+          const normalized = normalizeError(error)
+          return { ok: false, statusCode: normalized.statusCode, message: normalized.message }
+        }
+      },
+      dispatch: (input) => this.dispatchResponsesWebSocket(input),
     })
     // Codex clients frequently submit consecutive turns. Keep their local
     // connection alive so FRP and cross-network users do not pay another TCP
@@ -186,13 +300,15 @@ export class GatewayServer implements GatewayController {
       if (!server) return reject(new Error('Gateway server was not created'))
       const onError = (error: Error): void => {
         server.off('listening', onListening)
+        this.responsesWebSocket?.close()
+        this.responsesWebSocket = undefined
         this.server = undefined
         reject(error)
       }
       const onListening = (): void => {
         server.off('error', onError)
         this.startedAt = this.now()
-        this.emitRuntimeState()
+        this.emitRuntimeState({ gatewayStatus: true, allAccounts: true })
         resolve()
       }
       server.once('error', onError)
@@ -204,6 +320,8 @@ export class GatewayServer implements GatewayController {
   async stop(options: { force?: boolean; drainTimeoutMs?: number } = {}): Promise<void> {
     const server = this.server
     if (!server) return
+    this.responsesWebSocket?.close()
+    this.responsesWebSocket = undefined
     server.closeIdleConnections()
     const closed = new Promise<void>((resolve, reject) => {
       server.close((error) => error ? reject(error) : resolve())
@@ -229,7 +347,7 @@ export class GatewayServer implements GatewayController {
     this.runtimeGeneration += 1
     this.activeRequests = 0
     this.scheduler.clear()
-    this.emitRuntimeState()
+    this.emitRuntimeState({ gatewayStatus: true, allAccounts: true })
   }
 
   getStatus(): GatewayStatus {
@@ -245,27 +363,118 @@ export class GatewayServer implements GatewayController {
   }
 
   updateConfig(config: GatewayConfig): void {
+    const websocketWasEnabled = this.config.settings.responsesWebSocketEnabled === true
+    this.updateRequestReplayCaptureSetting(config.settings.logPayloads === true)
     this.config = config
-    this.scheduler.hydrate(config.accounts)
+    if (websocketWasEnabled && config.settings.responsesWebSocketEnabled !== true) {
+      this.responsesWebSocket?.closeClients()
+    }
+    // Callers may deliberately mutate and resubmit the same config object.
+    // Rebuild on every explicit version handoff rather than relying solely on
+    // referential equality, then reuse the index for every request in that version.
+    this.configIndex = buildGatewayConfigIndex(config)
+    this.scheduler.hydrate(config.accounts, config.pools)
     this.scheduler.hydratePerformance(config.recentRequestLogs ?? [])
   }
 
+  updateRuntimeAccounts(accounts: readonly Account[]): void {
+    if (accounts.length === 0) return
+    const updates = new Map(accounts.map((account) => [account.id, account]))
+    let changed = false
+    const nextAccounts = this.config.accounts.map((account) => {
+      const replacement = updates.get(account.id)
+      if (!replacement || replacement === account) return account
+      changed = true
+      return replacement
+    })
+    if (!changed) return
+    this.config = { ...this.config, accounts: nextAccounts }
+    // Runtime quota/health observations cannot change routing topology. Patch
+    // only the account-bearing index views instead of rebuilding provider,
+    // route and pool indexes (and rescanning every account for every pool) on
+    // responses that carry rate-limit headers.
+    const accountsById = new Map(this.configIndex.accountsById)
+    const accountsByPoolId = new Map(this.configIndex.accountsByPoolId)
+    const touchedPoolIds = new Set<string>()
+    for (const [accountId, replacement] of updates) {
+      if (!accountsById.has(accountId)) continue
+      accountsById.set(accountId, replacement)
+      for (const poolId of this.configIndex.poolIdsByAccountId.get(accountId) ?? []) {
+        touchedPoolIds.add(poolId)
+      }
+    }
+    for (const poolId of touchedPoolIds) {
+      const members = accountsByPoolId.get(poolId)
+      if (!members) continue
+      accountsByPoolId.set(poolId, members.map((account) => updates.get(account.id) ?? account))
+    }
+    this.configIndex = {
+      ...this.configIndex,
+      accountsById,
+      accountsByPoolId,
+      smartAccounts: this.configIndex.smartAccounts.map((account) => updates.get(account.id) ?? account)
+    }
+  }
+
   resetAccountHealth(accountId: string): void {
-    this.scheduler.recordSuccess(accountId)
+    this.scheduler.resetHealth(accountId)
   }
 
-  getAccountFitness(): ReturnType<PoolScheduler['getFitness']> {
-    const smartAccountIds = new Set(this.config.pools
-      .filter((pool) => pool.strategy === 'autobalanced')
-      .flatMap((pool) => pool.members.filter((member) => member.enabled).map((member) => member.accountId)))
-    return this.scheduler.getFitness(this.config.accounts.filter((account) => smartAccountIds.has(account.id)))
+  getAccountFitness(accountIds?: readonly string[]): ReturnType<PoolScheduler['getFitness']> {
+    if (!accountIds) return this.scheduler.getFitness(this.configIndex.smartAccounts)
+    const requested = new Set(accountIds)
+    return this.scheduler.getFitness(this.configIndex.smartAccounts.filter((account) => requested.has(account.id)))
   }
 
-  getAccountInFlight(): Record<string, number> {
-    return Object.fromEntries(this.config.accounts.map((account) => [
+  getAccountInFlight(accountIds?: readonly string[]): Record<string, number> {
+    const accounts = accountIds
+      ? accountIds.flatMap((id) => {
+          const account = this.configIndex.accountsById.get(id)
+          return account ? [account] : []
+        })
+      : [...this.configIndex.accountsById.values()]
+    return Object.fromEntries(accounts.map((account) => [
       account.id,
       this.scheduler.getInFlight(account)
     ]))
+  }
+
+  getRequestReplayTemplate(id: string) {
+    return this.requestReplays.get(id)
+  }
+
+  async replayRequest(id: string) {
+    const routeId = this.requestReplays.routeId(id)
+    if (!routeId) throw new Error('Replay payload is unavailable or has expired')
+    const route = this.config.routes.find((candidate) => candidate.id === routeId)
+    if (!route?.enabled || !route.localToken) throw new Error('The original local route is no longer enabled')
+    if (!this.server) throw new Error('Start the Stone+ gateway before replaying a request')
+    const host = this.config.settings.host === '::1' ? '[::1]' : this.config.settings.host
+    return await this.requestReplays.replay({
+      id,
+      baseUrl: `http://${host}:${this.config.settings.port}`,
+      localToken: route.localToken,
+      fetchImplementation: this.loopbackFetchImplementation,
+      signal: AbortSignal.timeout(Math.max(5, this.config.settings.requestTimeoutSeconds) * 1_000)
+    })
+  }
+
+  clearRequestReplays(): void {
+    // Invalidate requests that authenticated before the clear but are still
+    // reading their body. They must not repopulate a store the user just
+    // explicitly cleared.
+    this.requestReplayGeneration += 1
+    this.requestReplays.clear()
+  }
+
+  private updateRequestReplayCaptureSetting(enabled: boolean): void {
+    if (enabled === this.requestReplayCaptureEnabled) return
+    this.requestReplayCaptureEnabled = enabled
+    // Treat every capture-policy transition as a new generation. Besides
+    // closing the disable race, this stops requests that began while capture
+    // was disabled from becoming capturable if it is re-enabled mid-upload.
+    this.requestReplayGeneration += 1
+    if (!enabled) this.requestReplays.clear()
   }
 
   onLog(listener: GatewayLogHandler): () => void {
@@ -286,18 +495,25 @@ export class GatewayServer implements GatewayController {
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
     request.socket.setNoDelay(true)
     const started = this.now()
-    const pathname = new URL(request.url ?? '/', 'http://localhost').pathname
+    // Pin one immutable index/config pair for the whole request. A settings
+    // update can rebuild the next request's index without making this request
+    // mix old routes with new providers halfway through a retry chain.
+    const requestConfig = this.config
+    const requestIndex = this.configIndex
+    const requestReplayGeneration = this.requestReplayGeneration
+    const requestReplayCaptureEnabled = this.requestReplayCaptureEnabled
+    const pathname = requestPathname(request.url)
     const modelListKind = request.method === 'GET' ? classifyModelListRoute(pathname) : undefined
     if (modelListKind) {
-      this.handleModelList(request, response, modelListKind)
+      await this.handleModelList(request, response, modelListKind, requestIndex)
       return
     }
     const incoming = request.method === 'POST' ? classifyIncomingRoute(pathname) : undefined
     if (!incoming) {
-      this.writeJson(response, 404, { error: { message: 'Route not found', type: 'not_found_error' } })
+      await this.writeJson(response, 404, { error: { message: 'Route not found', type: 'not_found_error' } })
       return
     }
-    const subagentRequest = enabledHeader(request.headers['x-openai-subagent'])
+    const subagentRequest = isCodexSubagentRequest(request)
     let requestKind: NonNullable<RequestLog['requestKind']> = incoming.operation === 'codex-compact'
       ? 'compaction'
       : incoming.operation === 'codex-search' ? 'search' : 'generation'
@@ -305,7 +521,7 @@ export class GatewayServer implements GatewayController {
     this.totalRequests += 1
     this.activeRequests += 1
     const runtimeGeneration = this.runtimeGeneration
-    this.emitRuntimeState()
+    this.emitRuntimeState({ gatewayStatus: true })
     const clientAbortController = new AbortController()
     const abortForClientDisconnect = (): void => {
       if (!clientAbortController.signal.aborted && !response.writableEnded) {
@@ -316,8 +532,10 @@ export class GatewayServer implements GatewayController {
     response.once('close', abortForClientDisconnect)
     let selectedAccount: Account | undefined
     let logRoute: Route | undefined
+    let highConcurrencyMode = false
     let requestLogId: string | undefined
     let requestLogFinished = false
+    let terminalRequestLog: RequestLog | undefined
     let failureStage: NonNullable<RequestLog['failureStage']> = 'body'
     let model = ''
     let failoverCount = 0
@@ -338,22 +556,40 @@ export class GatewayServer implements GatewayController {
     let streamDiagnostics: StreamTerminationDiagnostics | undefined
     let lastProgressLogAt = 0
     let progressStage: NonNullable<RequestLog['progressStage']> = 'receiving-body'
+    let scheduledProgressLog: ReturnType<typeof setImmediate> | undefined
+    let scheduledProgressStage: NonNullable<RequestLog['progressStage']> | undefined
+    let scheduledProgressForce = false
+    let highConcurrencyStreamProgressScheduled = false
     let releaseLargeRequestBody: (() => void) | undefined
+    const convertedBodies = new Map<string, JsonObject>()
+    const serializedBodies = new Map<string, string>()
+    let body: JsonObject = {}
+    let requestBodyByteLength = 0
+    const releaseCommittedRequestBody = (): void => {
+      // A committed stream cannot fail over to another account. Drop the
+      // request-side copies at that exact boundary so a large Codex turn does
+      // not retain the shared parsing budget for the entire generation.
+      convertedBodies.clear()
+      serializedBodies.clear()
+      body = {}
+      releaseLargeRequestBody?.()
+      releaseLargeRequestBody = undefined
+    }
     const markFirstToken = (): void => {
       if (firstTokenAt !== undefined) return
       firstTokenAt = this.now()
-      emitProgressLog('streaming')
+      scheduleProgressLog('streaming')
     }
     const markUpstreamFirstByte = (): void => {
       if (upstreamFirstByteAt !== undefined) return
       upstreamFirstByteAt = this.now()
       failureStage = 'stream'
-      emitProgressLog('streaming')
+      scheduleProgressLog('streaming')
     }
     const markClientFirstWrite = (): void => {
       if (clientFirstWriteAt !== undefined) return
       clientFirstWriteAt = this.now()
-      emitProgressLog('streaming')
+      scheduleProgressLog('streaming')
     }
     const phaseTimings = () => ({
       bodyReadMs,
@@ -361,7 +597,7 @@ export class GatewayServer implements GatewayController {
       credentialResolveMs,
       outboundFetchStartMs
     })
-    const emitProgressLog = (stage: NonNullable<RequestLog['progressStage']>, force = true): void => {
+    const emitProgressLogNow = (stage: NonNullable<RequestLog['progressStage']>, force = true): void => {
       if (!requestLogId || !logRoute || requestLogFinished) return
       progressStage = stage
       const current = this.now()
@@ -372,6 +608,9 @@ export class GatewayServer implements GatewayController {
         requestKind,
         route: logRoute,
         account: selectedAccount,
+        providerName: selectedAccount
+          ? requestIndex.providersById.get(selectedAccount.providerId)?.name
+          : undefined,
         model,
         started,
         finished: current,
@@ -391,14 +630,54 @@ export class GatewayServer implements GatewayController {
         ...streamDiagnostics
       }))
     }
+    const cancelScheduledProgressLog = (): void => {
+      if (scheduledProgressLog) clearImmediate(scheduledProgressLog)
+      scheduledProgressLog = undefined
+      scheduledProgressStage = undefined
+      scheduledProgressForce = false
+    }
+    const scheduleProgressLog = (
+      stage: NonNullable<RequestLog['progressStage']>,
+      force = true
+    ): void => {
+      if (!requestLogId || !logRoute || requestLogFinished) return
+      if (highConcurrencyMode) {
+        // High-concurrency routes retain one initial lifecycle row, one update
+        // after the first downstream byte, and the authoritative terminal row.
+        // All body/scheduler/credential timings and usage continue to be
+        // collected in memory for the terminal record; only UI/control-plane
+        // churn is suppressed.
+        if (stage !== 'streaming' || clientFirstWriteAt === undefined
+          || highConcurrencyStreamProgressScheduled) return
+        highConcurrencyStreamProgressScheduled = true
+      }
+      progressStage = stage
+      const current = this.now()
+      if (!force && current - lastProgressLogAt < 750) return
+      scheduledProgressStage = stage
+      scheduledProgressForce ||= force
+      if (scheduledProgressLog) return
+      scheduledProgressLog = setImmediate(() => {
+        scheduledProgressLog = undefined
+        const pendingStage = scheduledProgressStage
+        const pendingForce = scheduledProgressForce
+        scheduledProgressStage = undefined
+        scheduledProgressForce = false
+        if (pendingStage) emitProgressLogNow(pendingStage, pendingForce)
+      })
+      scheduledProgressLog.unref?.()
+    }
     const recordStreamChunk = (byteLength: number): void => {
       streamedBytes += Math.max(0, byteLength)
       streamedChunks += 1
-      emitProgressLog('streaming', false)
+      scheduleProgressLog('streaming', false)
     }
     const recordStreamUsage = (usage: NormalizedTokenUsage): void => {
       liveUsage = { ...liveUsage, ...usage }
-      emitProgressLog('streaming')
+      // Some providers repeat cumulative usage on many stream frames. Keep the
+      // latest counters in memory, but share the ordinary progress throttle so
+      // telemetry can never turn into one durable write per token chunk.
+      scheduleProgressLog('streaming', false)
     }
     const finishRequestLog = (input: {
       account?: Account
@@ -411,12 +690,16 @@ export class GatewayServer implements GatewayController {
       recordPerformance?: boolean
     }): RequestLog | undefined => {
       if (!requestLogId || !logRoute || requestLogFinished) return undefined
+      cancelScheduledProgressLog()
       requestLogFinished = true
       const log = this.makeLog({
         id: requestLogId,
         requestKind,
         route: logRoute,
         account: input.account ?? selectedAccount,
+        providerName: (input.account ?? selectedAccount)
+          ? requestIndex.providersById.get((input.account ?? selectedAccount)!.providerId)?.name
+          : undefined,
         model,
         started,
         finished: input.finished,
@@ -439,11 +722,16 @@ export class GatewayServer implements GatewayController {
         ...streamDiagnostics
       })
       if (input.status === 'success' && input.recordPerformance !== false) this.recordAccountPerformance(log)
+      terminalRequestLog = log
       this.emitLog(log)
       return log
     }
     try {
-      logRoute = this.authenticate(request, incoming.protocol)
+      logRoute = this.authenticate(request, incoming.protocol, requestIndex)
+      // Route objects can be mutated and handed back through updateConfig.
+      // Pin this request's control-plane policy immediately after auth so a
+      // settings edit only affects requests authenticated afterwards.
+      highConcurrencyMode = logRoute.highConcurrencyMode === true
       requestLogId = randomUUID()
       this.emitLog(this.makeLog({
         id: requestLogId,
@@ -456,20 +744,41 @@ export class GatewayServer implements GatewayController {
         progressStage: 'receiving-body'
       }))
       const bodyPolicy = requestBodyPolicy(logRoute, incoming)
-      const parsedBody = await readJsonBody(request, {
+      let parsedBody: ReadJsonBodyResult | undefined = await readJsonBody(request, {
         hardLimitBytes: bodyPolicy.hardLimitBytes,
         largeThresholdBytes: bodyPolicy.largeThresholdBytes,
         signal: clientAbortController.signal,
         idleTimeoutMs: Math.min(
           MAX_REQUEST_BODY_IDLE_TIMEOUT_MS,
-          Math.max(1, this.config.settings.requestTimeoutSeconds) * 1_000
+           Math.max(1, requestConfig.settings.requestTimeoutSeconds) * 1_000
         ),
         acquireLargeBody: bodyPolicy.largeThresholdBytes === undefined
           ? undefined
           : (byteLength) => this.largeRequestBodies.acquire(byteLength, clientAbortController.signal)
       })
       releaseLargeRequestBody = parsedBody.releaseLargeBody
-      const body = parsedBody.value
+      body = parsedBody.value
+      requestBodyByteLength = parsedBody.byteLength
+      // Do not let the result wrapper retain a second reference after a stream
+      // has formally committed and clears the mutable `body` holder below.
+      parsedBody = undefined
+      if (!highConcurrencyMode
+        && requestReplayCaptureEnabled
+        && this.requestReplayCaptureEnabled
+        && requestReplayGeneration === this.requestReplayGeneration
+        && !request.headers['x-stone-replay-of']) {
+        this.requestReplays.capture({
+          id: requestLogId,
+          path: request.url ?? pathname,
+          routeId: logRoute.id,
+          body,
+          headers: Object.fromEntries(Object.entries(request.headers).map(([key, value]) => [
+            key,
+            Array.isArray(value) ? value.join(', ') : value
+          ])),
+          createdAt: started
+        })
+      }
       const bodyReadyAt = this.now()
       bodyReadMs = Math.max(0, bodyReadyAt - started)
       model = getRequestModel(incoming.protocol, body, pathname)
@@ -484,65 +793,96 @@ export class GatewayServer implements GatewayController {
       }
 
       failureStage = 'scheduler'
-      const pool = this.config.pools.find((candidate) => candidate.id === logRoute?.poolId)
+      const pool = requestIndex.poolsById.get(logRoute?.poolId ?? '')
       if (!pool) throw new GatewayHttpError(503, 'The matched route has no available pool')
-      const providerAccounts = this.config.accounts.filter((account) =>
-        pool.members.some((member) => member.accountId === account.id && member.enabled)
-      )
+      if (incoming.operation === 'generate') {
+        const conversion = analyzeProtocolConversion(incoming.protocol, pool.protocol, body)
+        if (!conversion.supported) {
+          const first = conversion.issues[0]
+          throw new GatewayHttpError(
+            422,
+            `Request cannot be converted without data loss at ${first.path}: ${first.reason}`,
+            'unsupported_conversion',
+            { error: { message: first.reason, type: 'unsupported_conversion', param: first.path }, issues: conversion.issues }
+          )
+        }
+      }
+      const providerAccounts = requestIndex.accountsByPoolId.get(pool.id) ?? []
       const codexCompactV2 = incoming.operation === 'generate'
         && incoming.protocol === 'openai-responses'
         && isCodexCompactV2Body(body)
       if (codexCompactV2) requestKind = 'compaction'
-      const codexOpaqueCompactHistory = incoming.operation === 'generate'
-        && incoming.protocol === 'openai-responses'
+      const codexOpaqueCompactHistory = incoming.protocol === 'openai-responses'
         && hasCodexOpaqueCompactHistory(body)
-      const requiresNativeCompact = codexCompactV2 || codexOpaqueCompactHistory
-      const schedulingAccounts = requiresNativeCompact
-        ? providerAccounts.filter((account) => accountSupportsNativeCompact(
-            account,
-            this.config.providers.find((candidate) => candidate.id === account.providerId)
-          ))
+      const compactSensitive = codexCompactV2 || codexOpaqueCompactHistory
+      const schedulingAccounts = compactSensitive
+        ? providerAccounts.filter((account) => {
+            const provider = requestIndex.providersById.get(account.providerId)
+            return (!codexCompactV2 || accountSupportsNativeCompact(account, provider))
+              && (!codexOpaqueCompactHistory || accountSupportsOpaqueCompactHistory(account, provider))
+          })
         : providerAccounts
-      if (requiresNativeCompact && schedulingAccounts.length === 0) {
+      if (compactSensitive && schedulingAccounts.length === 0) {
         throw new GatewayHttpError(
           422,
           codexCompactV2
-            ? 'Remote compaction V2 requires a ChatGPT OAuth or official OpenAI source; use Legacy compact fallback for relay-only routes'
-            : 'Opaque compaction history requires the ChatGPT OAuth or official OpenAI source that created it',
+            ? 'Remote compaction requires a provider with native OpenAI Responses compact support; configure a native source or disable remote_compaction_v2 so Codex uses standalone fallback'
+            : 'Opaque compaction history requires a provider configured to pass through encrypted OpenAI Responses compaction items',
           'remote_compaction_unsupported'
         )
       }
       const sessionId = getSessionId(request, body)
       conversationId = sessionId
       conversationName = getConversationName(request, body)
-      const resolveConversationNameForLog = async (): Promise<string | undefined> => {
-        if (!conversationName && sessionId) {
-          conversationName = await settleWithin(this.resolveConversationName(sessionId), 250)
-            ?? fallbackConversationName(sessionId)
+      if (!conversationName && sessionId) {
+        // Title discovery is observability-only. Start it eagerly, but never
+        // retain an account slot, a large request-body permit, or active request
+        // bookkeeping while waiting for the external title store.
+        conversationName = fallbackConversationName(sessionId)
+        if (!highConcurrencyMode) {
+          void this.resolveConversationName(sessionId)
+            .then((resolved) => {
+              if (!resolved || resolved === conversationName) return
+              conversationName = resolved
+              if (terminalRequestLog) {
+                terminalRequestLog = { ...terminalRequestLog, conversationName: resolved }
+                this.emitLog(terminalRequestLog)
+              }
+            })
+            .catch(() => undefined)
         }
-        return conversationName
       }
       const targetModel = logRoute.modelMap[model] ?? model
-      emitProgressLog('scheduling')
+      scheduleProgressLog('scheduling')
       const streaming = !codexSearch && !codexCompact
         && (body.stream === true || incoming.geminiMethod === 'streamGenerateContent')
+      const requiredCapabilities = requiredUpstreamCapabilities(body, streaming)
+      const firstBodyTimeoutMs = Math.min(MAX_FIRST_BODY_TIMEOUT_MS, Math.max(
+        MIN_FIRST_BODY_TIMEOUT_MS,
+        pool.firstBodyTimeoutMs ?? Math.floor(requestConfig.settings.requestTimeoutSeconds * 250)
+      ))
+      const streamIdleTimeoutMs = Math.max(1, requestConfig.settings.requestTimeoutSeconds) * 1_000
+      const responsesProgressIdleTimeoutMs = Math.min(
+        streamIdleTimeoutMs,
+        this.responsesProgressIdleTimeoutMs
+      )
       const responsesLite = incoming.protocol === 'openai-responses' && isChatGptCodexResponsesLiteBody(body)
-      const schedulingPool = sessionId && (codexSearch || codexCompact || requiresNativeCompact || responsesLite)
+      const schedulingPool = sessionId && (codexSearch || codexCompact || compactSensitive || responsesLite)
         ? { ...pool, stickySessions: true }
         : pool
       const retryLimit = Number.isFinite(pool.maxRetries) ? Math.max(0, Math.floor(pool.maxRetries)) : 0
       // Retries share one response-start budget. A failed attempt must not reset
       // the clock and multiply a 120-second timeout by maxRetries + 1.
       const responseStartDeadlineAt = bodyReadyAt
-        + Math.max(1, this.config.settings.requestTimeoutSeconds) * 1000
+         + Math.max(1, requestConfig.settings.requestTimeoutSeconds) * 1000
       let lastRetryableError: GatewayHttpError | undefined
       const failedAccountIds = new Set<string>()
-
       for (let attempt = 0; attempt <= retryLimit; attempt += 1) {
         let release: (() => void) | undefined
         let attemptedAccount: Account | undefined
         let upstreamDeadline: AbortDeadline | undefined
         let attemptSignal: AbortSignal | undefined
+        let attemptActive = true
         const attemptStarted = this.now()
         firstTokenAt = undefined
         schedulerSelectMs = undefined
@@ -561,7 +901,9 @@ export class GatewayServer implements GatewayController {
               accounts: schedulingAccounts,
               model: targetModel,
               sessionId,
-              excludedAccountIds: [...failedAccountIds]
+              excludedAccountIds: [...failedAccountIds],
+              providers: requestConfig.providers,
+              requiredCapabilities
             })
           } catch (error) {
             if (error instanceof NoEligibleAccountError && lastRetryableError) throw lastRetryableError
@@ -570,14 +912,21 @@ export class GatewayServer implements GatewayController {
             schedulerSelectMs = Math.max(0, this.now() - schedulerSelectStarted)
           }
           const account = scheduled.account
+          const selectedHealthRevision = scheduled.healthRevision
           attemptedAccount = account
           selectedAccount = account
           failureStage = 'credential'
-          release = this.runtimeTrackedRelease(scheduled.release, runtimeGeneration)
-          this.emitRuntimeState()
-          emitProgressLog('resolving-credential')
+          release = this.runtimeTrackedRelease(
+            scheduled.release,
+            runtimeGeneration,
+            account.id
+          )
+          if (!highConcurrencyMode) {
+            this.emitRuntimeState({ accountIds: [account.id] })
+          }
+          scheduleProgressLog('resolving-credential')
 
-          const provider = this.config.providers.find((candidate) => candidate.id === account.providerId)
+          const provider = requestIndex.providersById.get(account.providerId)
           if (!provider) throw new GatewayHttpError(503, 'The selected account has no provider', 'account_unavailable')
           const adapter = getProviderAdapter(provider.kind)
           if ((codexSearch || codexCompact) && provider.protocol !== 'openai-responses') {
@@ -589,10 +938,16 @@ export class GatewayServer implements GatewayController {
               'unsupported_conversion'
             )
           }
-          const convertedBody = codexSearch || codexCompact
-            ? { ...body, model: targetModel }
-            : convertRequest(incoming.protocol, provider.protocol, body, targetModel).body
-          const outboundFetch = this.outboundFetchResolver?.(account, pool) ?? this.fetchImplementation
+          const convertedBodyKey = `${provider.protocol}\0${targetModel}`
+          let convertedBody = convertedBodies.get(convertedBodyKey)
+          if (!convertedBody) {
+            convertedBody = codexSearch || codexCompact
+              ? { ...body, model: targetModel }
+              : convertRequest(incoming.protocol, provider.protocol, body, targetModel).body
+            convertedBodies.set(convertedBodyKey, convertedBody)
+          }
+          const outboundFetch = this.outboundFetchResolver?.(account, pool, requestConfig.proxies ?? [])
+            ?? this.fetchImplementation
           const credentialResolveStarted = this.now()
           let resolvedValue: Awaited<ReturnType<CredentialResolver>>
           try {
@@ -612,29 +967,40 @@ export class GatewayServer implements GatewayController {
           if (!resolvedValue) {
             throw new GatewayHttpError(503, 'The selected account credential is unavailable', 'account_unavailable')
           }
-          const resolvedCredential = typeof resolvedValue === 'string'
+          let resolvedCredential = typeof resolvedValue === 'string'
             ? { secret: resolvedValue, kind: 'api-key' as const }
             : resolvedValue
           const credential = resolvedCredential.secret
           const compactFallback = codexCompact
             && !supportsNativeCompact(provider, resolvedCredential.kind)
           const upstreamStreaming = streaming
-          emitProgressLog('connecting')
+          scheduleProgressLog('connecting')
 
           const upstreamHeaders = new Headers()
-          if (resolvedCredential.kind === 'chatgpt-oauth') {
+          if (isChatGptCodexCredentialKind(resolvedCredential.kind)) {
             if (provider.protocol !== 'openai-responses' || !resolvedCredential.accountId) {
               throw new GatewayHttpError(503, 'ChatGPT account requires an OpenAI Responses provider', 'account_unavailable')
             }
-            const credentialBundle = {
-              accessToken: credential,
-              accountId: resolvedCredential.accountId,
-              expiresAt: account.credentialExpiresAt ?? Number.MAX_SAFE_INTEGER
-            }
-            if (codexSearch) {
-              applyChatGptCodexSearchHeaders(upstreamHeaders, credentialBundle, request.headers)
+            if (resolvedCredential.kind === 'chatgpt-agent-identity') {
+              applyChatGptAgentIdentityHeaders(
+                upstreamHeaders,
+                credential,
+                resolvedCredential.accountId,
+                resolvedCredential.fedramp,
+                request.headers,
+                codexSearch || codexCompact ? 'json' : 'stream'
+              )
             } else {
-              applyChatGptCodexHeaders(upstreamHeaders, credentialBundle, request.headers)
+              const credentialBundle = {
+                accessToken: credential,
+                accountId: resolvedCredential.accountId,
+                expiresAt: account.credentialExpiresAt ?? Number.MAX_SAFE_INTEGER
+              }
+              if (codexSearch) {
+                applyChatGptCodexSearchHeaders(upstreamHeaders, credentialBundle, request.headers)
+              } else {
+                applyChatGptCodexHeaders(upstreamHeaders, credentialBundle, request.headers)
+              }
             }
             if (codexCompact) upstreamHeaders.set('accept', 'application/json')
             if (sessionId && !upstreamHeaders.has('session-id')) upstreamHeaders.set('session-id', sessionId)
@@ -647,10 +1013,20 @@ export class GatewayServer implements GatewayController {
               hasBody: true
             })
           }
-          const nativeResponses = incoming.protocol === 'openai-responses'
+          const nativeCompactResponses = incoming.protocol === 'openai-responses'
             && provider.protocol === 'openai-responses'
             && supportsNativeCompact(provider, resolvedCredential.kind)
-          if (codexCompact || nativeResponses) copyCompactRequestHeaders(request, upstreamHeaders)
+          const compactResponsePassthrough = nativeCompactResponses
+            || (codexOpaqueCompactHistory
+              && incoming.protocol === 'openai-responses'
+              && provider.protocol === 'openai-responses'
+              && supportsOpaqueCompactHistory(provider, resolvedCredential.kind))
+          // Legacy compact fallback is an ordinary text-summary request. Do not
+          // leak compact state metadata into that unrelated endpoint. Native
+          // compact and opaque passthrough still need the continuity headers.
+          if ((codexCompact && !compactFallback) || compactResponsePassthrough) {
+            copyCompactRequestHeaders(request, upstreamHeaders)
+          }
           const outboundBody = codexSearch || codexCompact
             ? convertedBody
             : withStreamingFlag(convertedBody, provider.protocol, streaming)
@@ -660,48 +1036,67 @@ export class GatewayServer implements GatewayController {
           const tieredOutboundBody = !codexSearch && !codexCompact && supportsFastServiceTier(provider.protocol)
             ? normalizeOpenAIServiceTier(outboundBody, pool.forceFastMode === true)
             : compactFallbackBody
-          const upstreamBody = resolvedCredential.kind === 'chatgpt-oauth' && !codexSearch && !codexCompact
+          const upstreamBody = isChatGptCodexCredentialKind(resolvedCredential.kind) && !codexSearch && !codexCompact
             ? withChatGptCodexBody(tieredOutboundBody)
             : tieredOutboundBody
+          const serializedBodyKey = `${provider.protocol}\0${targetModel}\0${resolvedCredential.kind}`
+            + `\0${compactFallback ? 'compact-fallback' : 'native'}`
+            + `\0${pool.forceFastMode === true ? 'fast' : 'standard'}`
+          let serializedUpstreamBody = serializedBodies.get(serializedBodyKey)
+          if (serializedUpstreamBody === undefined) {
+            serializedUpstreamBody = JSON.stringify(upstreamBody)
+            serializedBodies.set(serializedBodyKey, serializedUpstreamBody)
+          }
+          const upstreamUrl = isChatGptCodexCredentialKind(resolvedCredential.kind)
+            ? codexSearch
+              ? CHATGPT_CODEX_SEARCH_URL
+              : codexCompact && !compactFallback
+                ? CHATGPT_CODEX_COMPACT_URL
+                : CHATGPT_CODEX_RESPONSES_URL
+            : compactUpstreamUrl(adapter.buildEndpoint({
+                baseUrl: provider.baseUrl,
+                protocol: provider.protocol,
+                operation: codexSearch ? 'search' : 'generate',
+                model: targetModel,
+                stream: upstreamStreaming
+              }), codexCompact && !compactFallback)
           let upstreamResponse: Response
           try {
-            const upstreamUrl = resolvedCredential.kind === 'chatgpt-oauth'
-              ? codexSearch
-                ? CHATGPT_CODEX_SEARCH_URL
-                : codexCompact && !compactFallback
-                  ? CHATGPT_CODEX_COMPACT_URL
-                  : CHATGPT_CODEX_RESPONSES_URL
-              : compactUpstreamUrl(adapter.buildEndpoint({
-                  baseUrl: provider.baseUrl,
-                  protocol: provider.protocol,
-                  operation: codexSearch ? 'search' : 'generate',
-                  model: targetModel,
-                  stream: upstreamStreaming
-                }), codexCompact && !compactFallback)
             if (!attemptSignal) throw new GatewayHttpError(504, 'Upstream request timed out', 'timeout_error')
             const upstreamInit: RequestInit = {
               method: 'POST',
               headers: upstreamHeaders,
-              body: JSON.stringify(upstreamBody),
+              body: serializedUpstreamBody,
               signal: attemptSignal
             }
             failureStage = 'connect'
             outboundFetchStartMs = Math.max(0, this.now() - started)
-            upstreamResponse = await awaitWithAbortSignal(
+            const fetched = await awaitWithAbortSignal(
               fetchWithOptionalHedge(
                 outboundFetch,
                 upstreamUrl,
                 upstreamInit,
-                streaming && !codexSearch && !requiresNativeCompact && pool.hedgedRequests === true
-                  && parsedBody.byteLength <= HEDGE_REQUEST_BODY_LIMIT_BYTES
+                streaming && !codexSearch && !compactSensitive
+                  && !highConcurrencyMode
+                  && pool.hedgedRequests === true
+                  && requestBodyByteLength <= HEDGE_REQUEST_BODY_LIMIT_BYTES
                   ? Math.max(250, Math.min(15_000, pool.hedgeDelayMs ?? 2_500))
-                  : undefined
+                  : undefined,
+                firstBodyTimeoutMs,
+                this.now,
+                (headersAt) => {
+                  if (!attemptActive) return
+                  if (upstreamHeadersAt === undefined) upstreamHeadersAt = headersAt
+                  if (failureStage !== 'first-byte') {
+                    failureStage = 'first-byte'
+                    scheduleProgressLog('waiting-first-byte')
+                  }
+                }
               ),
               attemptSignal
             )
-            upstreamHeadersAt = this.now()
-            failureStage = 'first-byte'
-            emitProgressLog('waiting-first-byte')
+            upstreamResponse = fetched.response
+            upstreamHeadersAt = fetched.headersAt
           } catch (error) {
             throw gatewayErrorFromProviderFailure(adapter.classifyFailure({ error, now: this.now() }))
           }
@@ -710,16 +1105,55 @@ export class GatewayServer implements GatewayController {
             throw new GatewayHttpError(504, 'Upstream request timed out', 'timeout_error')
           }
 
-          const headerSignals = extractRateLimitSignals(
+          let headerObservedAt = this.now()
+          let headerSignals = extractRateLimitSignals(
             upstreamResponse.headers,
             provider.protocol,
-            this.now()
+            headerObservedAt
           )
+          // Headers are authoritative before the response body completes. Put
+          // an exhausted account behind a scheduler cooldown immediately so
+          // concurrent requests cannot pile onto it; this does not mark the
+          // current request successful or alter its body/stream handling.
+          this.applyExhaustedQuotaHeaders(account, headerSignals, headerObservedAt)
+
+          let errorPayload: JsonObject | undefined
+          if (!upstreamResponse.ok) {
+            errorPayload = await readUpstreamJson(upstreamResponse, responseBodySignal)
+            if (
+              resolvedCredential.kind === 'chatgpt-agent-identity'
+              && resolvedCredential.recoverInvalidTask
+              && isInvalidAgentIdentityTaskResponse(upstreamResponse.status, errorPayload)
+            ) {
+              // Task invalidation is account-local and safe to retry exactly
+              // once before scheduler failover. Persisting the replacement is
+              // handled by the main-process credential resolver.
+              resolvedCredential = await resolvedCredential.recoverInvalidTask()
+              upstreamHeaders.set('authorization', resolvedCredential.secret)
+              upstreamResponse = await awaitWithAbortSignal(
+                outboundFetch(upstreamUrl, {
+                  method: 'POST', headers: upstreamHeaders,
+                  body: serializedUpstreamBody, signal: responseBodySignal
+                }),
+                responseBodySignal
+              )
+              headerObservedAt = this.now()
+              headerSignals = extractRateLimitSignals(
+                upstreamResponse.headers,
+                provider.protocol,
+                headerObservedAt
+              )
+              this.applyExhaustedQuotaHeaders(account, headerSignals, headerObservedAt)
+              errorPayload = upstreamResponse.ok
+                ? undefined
+                : await readUpstreamJson(upstreamResponse, responseBodySignal)
+            }
+          }
 
           if (!upstreamResponse.ok) {
-            const payload = await awaitWithAbortSignal(readUpstreamJson(upstreamResponse), responseBodySignal)
+            const payload = errorPayload ?? {}
             const safePayload = sanitizeUpstreamPayload(payload, sensitiveValues(resolvedCredential))
-            const providerFailure = resolvedCredential.kind === 'chatgpt-oauth'
+            const providerFailure = isChatGptCodexCredentialKind(resolvedCredential.kind)
               ? classifyChatGptCodexFailure(upstreamResponse.status, upstreamResponse.headers, this.now())
               : adapter.classifyFailure({
                   statusCode: upstreamResponse.status,
@@ -728,9 +1162,9 @@ export class GatewayServer implements GatewayController {
                 })
             throw new GatewayHttpError(
               upstreamResponse.status,
-              resolvedCredential.kind === 'chatgpt-oauth' ? providerFailure.message : upstreamErrorMessage(safePayload),
+              isChatGptCodexCredentialKind(resolvedCredential.kind) ? providerFailure.message : upstreamErrorMessage(safePayload),
               `provider_${providerFailure.category}`,
-              resolvedCredential.kind === 'chatgpt-oauth'
+              isChatGptCodexCredentialKind(resolvedCredential.kind)
                 ? { error: { message: providerFailure.message, type: `provider_${providerFailure.category}` } }
                 : safePayload,
               providerFailure,
@@ -739,26 +1173,31 @@ export class GatewayServer implements GatewayController {
           }
 
           // The absolute deadline remains active while a non-2xx response body
-          // is decoded. A successful stream switches to reset-on-chunk idle
-          // timeouts only after its response headers have been accepted.
-          if (streaming) {
+          // is decoded. Any successful upstream SSE body switches to the
+          // transport/protocol idle guards after its headers are accepted.
+          // ChatGPT OAuth always uses SSE upstream even when the downstream
+          // caller requested a buffered JSON response.
+          const upstreamResponseIsStream = streaming
+            || codexCompactV2
+            || (isChatGptCodexCredentialKind(resolvedCredential.kind) && !codexSearch && !codexCompact)
+          if (upstreamResponseIsStream) {
             upstreamDeadline?.clear()
             upstreamDeadline = undefined
           }
 
           if (codexSearch) {
             const payload = sanitizeUpstreamPayload(
-              await awaitWithAbortSignal(readUpstreamJson(upstreamResponse), responseBodySignal),
+              await readUpstreamJson(upstreamResponse, responseBodySignal),
               sensitiveValues(resolvedCredential)
             )
-            markClientFirstWrite()
-            this.writeJson(response, upstreamResponse.status, payload)
-            const completedAt = this.now()
-            this.reportAccountSuccess(account, attemptStarted, headerSignals)
+            this.reportAccountSuccess(account, attemptStarted, headerSignals, selectedHealthRevision)
             release?.()
             release = undefined
+            releaseCommittedRequestBody()
+            const written = await this.writeJson(response, upstreamResponse.status, payload, markClientFirstWrite)
+            if (!written) throw new GatewayHttpError(499, 'Client closed the request', 'client_closed')
+            const completedAt = this.now()
             this.successRequests += 1
-            await resolveConversationNameForLog()
             finishRequestLog({
               account,
               finished: completedAt,
@@ -774,10 +1213,7 @@ export class GatewayServer implements GatewayController {
             let payload: JsonObject
             let compactUsage: NormalizedTokenUsage | undefined
             if (compactFallback) {
-              const fallbackResponse = await awaitWithAbortSignal(
-                readUpstreamJson(upstreamResponse),
-                responseBodySignal
-              )
+              const fallbackResponse = await readUpstreamJson(upstreamResponse, responseBodySignal)
               const summary = responseOutputText(fallbackResponse)
               if (!summary) {
                 throw new GatewayHttpError(
@@ -789,7 +1225,7 @@ export class GatewayServer implements GatewayController {
               payload = compactReplacementPayload(summary, body.input)
               compactUsage = extractProtocolUsage('openai-responses', fallbackResponse)
             } else {
-              payload = await awaitWithAbortSignal(readUpstreamJson(upstreamResponse), responseBodySignal)
+              payload = await readUpstreamJson(upstreamResponse, responseBodySignal)
               if (!isValidCompactReplacementHistory(payload.output)) {
                 throw new GatewayHttpError(
                   502,
@@ -800,14 +1236,14 @@ export class GatewayServer implements GatewayController {
               compactUsage = extractProtocolUsage('openai-responses', payload)
             }
             if (!compactFallback) copyResponsesResponseHeaders(upstreamResponse.headers, response)
-            markClientFirstWrite()
-            this.writeJson(response, 200, payload)
-            const completedAt = this.now()
-            this.reportAccountSuccess(account, attemptStarted, headerSignals)
+            this.reportAccountSuccess(account, attemptStarted, headerSignals, selectedHealthRevision)
             release?.()
             release = undefined
+            releaseCommittedRequestBody()
+            const written = await this.writeJson(response, 200, payload, markClientFirstWrite)
+            if (!written) throw new GatewayHttpError(499, 'Client closed the request', 'client_closed')
+            const completedAt = this.now()
             this.successRequests += 1
-            await resolveConversationNameForLog()
             finishRequestLog({
               account,
               finished: completedAt,
@@ -822,15 +1258,18 @@ export class GatewayServer implements GatewayController {
 
           if (codexCompactV2) {
             const compactStream = await collectCodexCompactV2Upstream(upstreamResponse, {
-              firstBodyTimeoutMs: Math.min(MAX_FIRST_BODY_TIMEOUT_MS, Math.max(
-                MIN_FIRST_BODY_TIMEOUT_MS,
-                pool.firstBodyTimeoutMs ?? Math.floor(this.config.settings.requestTimeoutSeconds * 250)
-              )),
-              idleTimeoutMs: Math.max(1, this.config.settings.requestTimeoutSeconds) * 1000,
+              firstBodyTimeoutMs,
+              idleTimeoutMs: streamIdleTimeoutMs,
+              progressIdleTimeoutMs: responsesProgressIdleTimeoutMs,
+              signal: clientAbortController.signal,
               onFirstByte: markUpstreamFirstByte,
               onChunk: recordStreamChunk
             })
             copyResponsesResponseHeaders(upstreamResponse.headers, response)
+            this.reportAccountSuccess(account, attemptStarted, headerSignals, selectedHealthRevision)
+            release?.()
+            release = undefined
+            releaseCommittedRequestBody()
             const written = await writeBufferedResponsesStream(
               upstreamResponse,
               response,
@@ -840,11 +1279,7 @@ export class GatewayServer implements GatewayController {
             )
             if (!written) throw new GatewayHttpError(499, 'Client closed the request', 'client_closed')
             const completedAt = this.now()
-            this.reportAccountSuccess(account, attemptStarted, headerSignals)
-            release?.()
-            release = undefined
             this.successRequests += 1
-            await resolveConversationNameForLog()
             finishRequestLog({
               account,
               finished: completedAt,
@@ -857,26 +1292,21 @@ export class GatewayServer implements GatewayController {
             return
           }
 
-          if (
-            incoming.protocol === 'openai-responses'
-            && provider.protocol === 'openai-responses'
-            && nativeResponses
-          ) {
-            copyResponsesResponseHeaders(upstreamResponse.headers, response)
-          }
-
           if (streaming) {
             const streamTiming = {
-              firstBodyTimeoutMs: Math.min(MAX_FIRST_BODY_TIMEOUT_MS, Math.max(
-                MIN_FIRST_BODY_TIMEOUT_MS,
-                pool.firstBodyTimeoutMs ?? Math.floor(this.config.settings.requestTimeoutSeconds * 250)
-              )),
-              idleTimeoutMs: Math.max(1, this.config.settings.requestTimeoutSeconds) * 1000,
+              firstBodyTimeoutMs,
+              idleTimeoutMs: streamIdleTimeoutMs,
+              responsesProgressIdleTimeoutMs,
+              signal: clientAbortController.signal,
               onFirstByte: markUpstreamFirstByte,
               onFirstToken: markFirstToken,
               onClientWrite: markClientFirstWrite,
               onChunk: recordStreamChunk,
-              onUsage: recordStreamUsage
+              onUsage: recordStreamUsage,
+              onBeforeResponseCommit: compactResponsePassthrough
+                ? () => copyResponsesResponseHeaders(upstreamResponse.headers, response)
+                : undefined,
+              onResponseCommit: releaseCommittedRequestBody
             }
             const streamResult = incoming.protocol === provider.protocol
               ? await pipeUpstreamResponse(
@@ -912,11 +1342,10 @@ export class GatewayServer implements GatewayController {
               )
             }
             const completedAt = this.now()
-            this.reportAccountSuccess(account, attemptStarted, headerSignals)
+            this.reportAccountSuccess(account, attemptStarted, headerSignals, selectedHealthRevision)
             release?.()
             release = undefined
             this.successRequests += 1
-            await resolveConversationNameForLog()
             finishRequestLog({
               account,
               finished: completedAt,
@@ -929,13 +1358,15 @@ export class GatewayServer implements GatewayController {
           }
 
           let payload: JsonObject
-          if (resolvedCredential.kind === 'chatgpt-oauth') {
-            const streamResult = await awaitWithAbortSignal(
-              collectOpenAiResponsesUpstream(
-                upstreamResponse,
-                { id: randomUUID(), model, now: this.now }
-              ),
-              responseBodySignal
+          let reusableResponseBytes: Buffer | undefined
+          if (isChatGptCodexCredentialKind(resolvedCredential.kind)) {
+            const streamResult = await collectOpenAiResponsesUpstream(
+              upstreamResponse,
+              { id: randomUUID(), model, now: this.now },
+              responseBodySignal,
+              firstBodyTimeoutMs,
+              streamIdleTimeoutMs,
+              responsesProgressIdleTimeoutMs
             )
             if (streamResult.error || !streamResult.response) {
               throw new GatewayHttpError(
@@ -945,19 +1376,37 @@ export class GatewayServer implements GatewayController {
               )
             }
             payload = streamResult.response
+          } else if (provider.protocol === incoming.protocol) {
+            // Preserve the exact upstream bytes only for the identity path,
+            // where they can be forwarded without a second serialization. A
+            // converted response does not need that extra Buffer/concat copy;
+            // parse it through the lean text reader instead.
+            const parsed = await readUpstreamJsonWithBytes(upstreamResponse, responseBodySignal)
+            payload = parsed.payload
+            reusableResponseBytes = parsed.rawJson
           } else {
-            payload = await awaitWithAbortSignal(readUpstreamJson(upstreamResponse), responseBodySignal)
+            payload = await readUpstreamJson(upstreamResponse, responseBodySignal)
           }
-          const result = convertResponse(provider.protocol, incoming.protocol, payload, model, this.now)
+          // Same-protocol JSON can be sent byte-for-byte. Avoid a second
+          // protocol walk/allocating a converted object when the wire shape is
+          // already exactly what the client requested.
+          const result = reusableResponseBytes
+            ? payload
+            : convertResponse(provider.protocol, incoming.protocol, payload, model, this.now)
           const usage = extractProtocolUsage(provider.protocol, payload)
-          markClientFirstWrite()
-          this.writeJson(response, 200, result)
-          const completedAt = this.now()
-          this.reportAccountSuccess(account, attemptStarted, headerSignals)
+          if (compactResponsePassthrough) {
+            copyResponsesResponseHeaders(upstreamResponse.headers, response)
+          }
+          this.reportAccountSuccess(account, attemptStarted, headerSignals, selectedHealthRevision)
           release?.()
           release = undefined
+          releaseCommittedRequestBody()
+          const written = reusableResponseBytes
+            ? await this.writeJsonBytes(response, 200, reusableResponseBytes, markClientFirstWrite)
+            : await this.writeJson(response, 200, result, markClientFirstWrite)
+          if (!written) throw new GatewayHttpError(499, 'Client closed the request', 'client_closed')
+          const completedAt = this.now()
           this.successRequests += 1
-          await resolveConversationNameForLog()
           finishRequestLog({
             account, finished: completedAt, status: 'success', statusCode: 200, usage,
             accountFirstTokenMs: firstTokenAt === undefined ? undefined : Math.max(0, firstTokenAt - attemptStarted)
@@ -985,13 +1434,19 @@ export class GatewayServer implements GatewayController {
           if (attemptedAccount && provenAccountFailure) {
             const failureNow = this.now()
             const actualResetAt = quotaSignalCooldownUntil(gatewayError.quotaSignals, failureNow)
+            const quotaExhausted = codexQuotaIsExhausted(gatewayError.quotaSignals?.codexQuota, failureNow)
+              || genericQuotaExhausted(gatewayError.quotaSignals?.quota, failureNow)
             const hardAccountFailure = accountAction === 'disable'
               || gatewayError.providerFailure?.category === 'rate_limit'
-              || actualResetAt !== undefined
+              || quotaExhausted
             const hasUsableAlternative = this.scheduler.hasUsableAlternative(
               schedulingAccounts,
               targetModel,
-              attemptedAccount.id
+              attemptedAccount.id,
+              schedulingPool,
+              requestConfig.providers,
+              requiredCapabilities,
+              [...failedAccountIds]
             )
             // Keep the final usable source routable after ordinary transport,
             // timeout, 5xx, or incomplete-stream failures. With no peer to
@@ -1007,7 +1462,10 @@ export class GatewayServer implements GatewayController {
               )
               const health = this.scheduler.recordFailure(attemptedAccount.id, {
                 retryAfterMs,
-                maxConcurrency: attemptedAccount.maxConcurrency
+                maxConcurrency: attemptedAccount.maxConcurrency,
+                reason: gatewayError.providerFailure?.category === 'rate_limit' || quotaExhausted
+                  ? 'quota'
+                  : 'failure'
               })
               this.emitAccountState({
                 accountId: attemptedAccount.id,
@@ -1017,7 +1475,9 @@ export class GatewayServer implements GatewayController {
                 cooldownUntil: accountAction === 'disable' ? undefined : health.cooldownUntil,
                 cooldownReason: accountAction === 'disable'
                   ? undefined
-                  : gatewayError.providerFailure?.category === 'rate_limit' ? 'quota' : 'failure',
+                  : gatewayError.providerFailure?.category === 'rate_limit' || quotaExhausted
+                    ? 'quota'
+                    : 'failure',
                 lastError: gatewayError.message,
                 lastUsedAt: this.now(),
                 ...gatewayError.quotaSignals
@@ -1032,8 +1492,9 @@ export class GatewayServer implements GatewayController {
           if (!canRetry) throw gatewayError
           lastRetryableError = gatewayError
           failoverCount += 1
-          emitProgressLog('retrying')
+          scheduleProgressLog('retrying')
         } finally {
+          attemptActive = false
           upstreamDeadline?.clear()
           release?.()
         }
@@ -1055,7 +1516,12 @@ export class GatewayServer implements GatewayController {
       if (gatewayError.type === 'request_body_timeout' && !response.headersSent) {
         response.setHeader('connection', 'close')
       }
-      this.writeJson(
+      // At this boundary the retry loop has conclusively ended. Buffered
+      // client writes can remain backpressured for a long time, but no later
+      // upstream attempt can need the parsed request, so release its shared
+      // parsing budget before writing the terminal response.
+      releaseCommittedRequestBody()
+      await this.writeJson(
         response,
         gatewayError.statusCode,
         gatewayError.responseBody ?? { error: { message: gatewayError.message, type: gatewayError.type } }
@@ -1071,6 +1537,7 @@ export class GatewayServer implements GatewayController {
       })
       if (finishedLog && successfulSubagentCancellation) this.successRequests += 1
     } finally {
+      cancelScheduledProgressLog()
       if (requestLogId && !requestLogFinished) {
         const successfulSubagentCancellation = clientAbortController.signal.aborted && subagentRequest
         if (clientAbortController.signal.aborted) failureStage = 'client'
@@ -1090,23 +1557,39 @@ export class GatewayServer implements GatewayController {
       releaseLargeRequestBody = undefined
       if (runtimeGeneration === this.runtimeGeneration) {
         this.activeRequests = Math.max(0, this.activeRequests - 1)
-        this.emitRuntimeState()
+        this.emitRuntimeState({ gatewayStatus: true })
       }
     }
   }
 
-  private authenticate(request: IncomingMessage, protocol: Protocol): Route {
+  private dispatchResponsesWebSocket(input: ResponsesWebSocketDispatchInput): Promise<Response> {
+    const headers = responsesWebSocketForwardHeaders(input.headers)
+    const host = formatUrlHost(this.config.settings.host)
+    return fetch(`http://${host}:${this.config.settings.port}/v1/responses`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(input.body),
+      signal: input.signal,
+      redirect: 'error',
+    })
+  }
+
+  private authenticate(request: IncomingMessage, protocol: Protocol, index = this.configIndex): Route {
     const token = readLocalToken(request)
     if (!token) throw new GatewayHttpError(401, 'A local gateway token is required', 'authentication_error')
-    const route = this.config.routes.find((candidate) =>
-      candidate.enabled && candidate.inboundProtocol === protocol && secureEquals(candidate.localToken, token)
-    )
+    const route = (index.enabledRoutesByProtocol.get(protocol) ?? [])
+      .find((candidate) => secureEquals(candidate.localToken, token))
     if (!route) throw new GatewayHttpError(401, 'Invalid local gateway token', 'authentication_error')
     return route
   }
 
   private async resolveConversationName(sessionId?: string): Promise<string | undefined> {
     if (!sessionId) return undefined
+    // The desktop resolver reads Codex's SQLite database synchronously. Defer
+    // observability-only title lookup until the request has had a chance to
+    // dispatch its upstream fetch, rather than putting local disk I/O on the
+    // scheduler/credential hot path.
+    await new Promise<void>((resolve) => setImmediate(resolve))
     try {
       const resolved = normalizeConversationName(await this.conversationTitleResolver?.(sessionId))
       if (resolved) return resolved
@@ -1116,24 +1599,23 @@ export class GatewayServer implements GatewayController {
     return fallbackConversationName(sessionId)
   }
 
-  private handleModelList(
+  private async handleModelList(
     request: IncomingMessage,
     response: ServerResponse,
-    kind: 'openai' | 'gemini'
-  ): void {
+    kind: 'openai' | 'gemini',
+    index: GatewayConfigIndex
+  ): Promise<void> {
     try {
-      const route = this.authenticateModelList(request, kind)
-      const pool = this.config.pools.find((candidate) => candidate.id === route.poolId)
+      const route = this.authenticateModelList(request, kind, index)
+      const pool = index.poolsById.get(route.poolId)
       if (!pool) throw new GatewayHttpError(503, 'The matched route has no available pool')
-      const accounts = this.config.accounts.filter((account) =>
-        pool.members.some((member) => member.accountId === account.id && member.enabled)
-      )
+      const accounts = index.accountsByPoolId.get(pool.id) ?? []
       const models = projectRouteModels(
-        enumerablePoolModels(pool, accounts, this.config.providers),
+        enumerablePoolModels(pool, accounts, index.providersById),
         route.modelMap
       )
       response.setHeader('cache-control', 'no-store')
-      this.writeJson(
+      await this.writeJson(
         response,
         200,
         kind === 'gemini'
@@ -1144,7 +1626,7 @@ export class GatewayServer implements GatewayController {
       )
     } catch (error) {
       const gatewayError = normalizeError(error)
-      this.writeJson(
+      await this.writeJson(
         response,
         gatewayError.statusCode,
         gatewayError.responseBody ?? { error: { message: gatewayError.message, type: gatewayError.type } }
@@ -1152,29 +1634,54 @@ export class GatewayServer implements GatewayController {
     }
   }
 
-  private authenticateModelList(request: IncomingMessage, kind: 'openai' | 'gemini'): Route {
+  private authenticateModelList(
+    request: IncomingMessage,
+    kind: 'openai' | 'gemini',
+    index: GatewayConfigIndex
+  ): Route {
     const token = readLocalToken(request)
     if (!token) throw new GatewayHttpError(401, 'A local gateway token is required', 'authentication_error')
-    const route = this.config.routes.find((candidate) =>
-      candidate.enabled &&
-      (kind === 'gemini' ? candidate.inboundProtocol === 'gemini' : candidate.inboundProtocol !== 'gemini') &&
-      secureEquals(candidate.localToken, token)
-    )
+    const candidates = kind === 'gemini'
+      ? index.enabledRoutesByProtocol.get('gemini') ?? []
+      : index.enabledNonGeminiRoutes
+    const route = candidates.find((candidate) => secureEquals(candidate.localToken, token))
     if (!route) throw new GatewayHttpError(401, 'Invalid local gateway token', 'authentication_error')
     return route
   }
 
-  private writeJson(response: ServerResponse, statusCode: number, payload: JsonObject): void {
-    if (response.writableEnded || response.destroyed) return
+  private async writeJson(
+    response: ServerResponse,
+    statusCode: number,
+    payload: JsonObject,
+    onClientWrite?: () => void
+  ): Promise<boolean> {
+    return this.writeJsonBytes(response, statusCode, Buffer.from(JSON.stringify(payload), 'utf8'), onClientWrite)
+  }
+
+  private async writeJsonBytes(
+    response: ServerResponse,
+    statusCode: number,
+    body: Uint8Array,
+    onClientWrite?: () => void
+  ): Promise<boolean> {
+    if (response.writableFinished) return true
+    if (response.writableEnded || response.destroyed) return false
     if (response.headersSent) {
       response.end()
-      return
+      return false
     }
-    const body = Buffer.from(JSON.stringify(payload), 'utf8')
     response.statusCode = statusCode
     response.setHeader('content-type', 'application/json; charset=utf-8')
     response.setHeader('content-length', body.byteLength)
-    response.end(body)
+    try {
+      if (body.byteLength > 0) onClientWrite?.()
+      // A buffered JSON response is already one contiguous body. Passing it to
+      // `end` lets Node form the final HTTP write in one operation rather than
+      // issuing `write` followed by a separate zero-byte `end` frame.
+      return await endAndWaitForFinish(response, body)
+    } catch {
+      return false
+    }
   }
 
   private makeLog(input: {
@@ -1182,6 +1689,7 @@ export class GatewayServer implements GatewayController {
     requestKind?: RequestLog['requestKind']
     route: Route
     account?: Account
+    providerName?: string
     model: string
     started: number
     finished?: number
@@ -1211,15 +1719,17 @@ export class GatewayServer implements GatewayController {
     streamLastSequenceNumber?: number
     terminalWaitMs?: number
   }): RequestLog {
-    const providerName = input.account
-      ? this.config.providers.find((provider) => provider.id === input.account?.providerId)?.name ?? 'Unknown provider'
-      : '等待选择'
+    const providerName = input.providerName
+      ?? (input.account
+        ? this.configIndex.providersById.get(input.account.providerId)?.name ?? 'Unknown provider'
+        : '等待选择')
     const usage = input.usage
     const finished = input.finished ?? this.now()
     return {
       id: input.id ?? randomUUID(),
       requestKind: input.requestKind,
       accountId: input.account?.id,
+      credentialType: input.account?.credentialType,
       conversationId: input.conversationId,
       conversationName: input.conversationName,
       timestamp: finished,
@@ -1252,6 +1762,7 @@ export class GatewayServer implements GatewayController {
       streamLastSequenceNumber: input.streamLastSequenceNumber,
       terminalWaitMs: input.terminalWaitMs,
       cachedInputTokens: usage?.cachedInputTokens,
+      cacheWriteInputTokens: usage?.cacheCreationInputTokens,
       reasoningTokens: usage?.reasoningTokens,
       failoverCount: input.failoverCount,
       error: input.error,
@@ -1260,53 +1771,103 @@ export class GatewayServer implements GatewayController {
   }
 
   private emitLog(log: RequestLog): void {
-    for (const listener of this.logListeners) listener(log)
+    for (const listener of this.logListeners) {
+      try {
+        listener(log)
+      } catch (error) {
+        // Observability is never allowed to turn a valid upstream response into
+        // a client-visible failure, including from deferred progress callbacks.
+        console.error('Stone request log listener failed', error)
+      }
+    }
   }
 
   private recordAccountPerformance(log: RequestLog): void {
     if (log.status !== 'success' || !log.accountId) return
-    if (log.upstreamFirstByteMs === undefined) {
-      // Reliability still learns from successful non-streaming responses even
-      // when the upstream did not expose phase timings.
-      this.scheduler.recordPerformance(log.accountId, {})
-      return
-    }
     const previousAttemptsMs = log.firstTokenMs !== undefined && log.accountFirstTokenMs !== undefined
       ? Math.max(0, log.firstTokenMs - log.accountFirstTokenMs)
       : 0
-    const accountFirstByteMs = Math.max(0, log.upstreamFirstByteMs - previousAttemptsMs)
-    if (accountFirstByteMs <= 0) {
+    const transportFirstBodyMs = log.upstreamFirstByteMs === undefined
+      ? undefined
+      : Math.max(0, log.upstreamFirstByteMs - previousAttemptsMs)
+    const semanticFirstTokenMs = log.accountFirstTokenMs
+    if (
+      (transportFirstBodyMs === undefined || transportFirstBodyMs <= 0)
+      && (semanticFirstTokenMs === undefined || semanticFirstTokenMs <= 0)
+    ) {
+      // Reliability still learns from successful non-streaming responses even
+      // when the upstream did not expose phase timings.
       this.scheduler.recordPerformance(log.accountId, {})
       return
     }
     const generationStartedMs = log.upstreamFirstByteMs
       ?? log.clientFirstWriteMs
       ?? log.firstTokenMs
-      ?? accountFirstByteMs
+      ?? transportFirstBodyMs
+      ?? semanticFirstTokenMs
+      ?? 0
     this.scheduler.recordPerformance(log.accountId, {
-      firstTokenMs: accountFirstByteMs,
+      transportFirstBodyMs,
+      semanticFirstTokenMs,
       outputTokens: log.outputTokens,
       generationDurationMs: Math.max(0, log.latencyMs - generationStartedMs)
     })
   }
 
-  private reportAccountSuccess(account: Account, attemptStarted: number, signals?: NormalizedQuotaSignals): void {
-    const now = this.now()
-    const quota = observedQuotaSignals(signals, now)
-    const actualResetAt = quotaSignalCooldownUntil(quota, now)
-    const quotaExhausted = codexQuotaIsExhausted(quota.codexQuota, now)
-      || genericQuotaExhausted(quota.quota, now)
-    if (quotaExhausted && actualResetAt !== undefined) this.scheduler.setCooldown(account.id, actualResetAt)
-    const health = quotaExhausted && actualResetAt !== undefined
-      ? this.scheduler.getHealth(account.id)
-      : this.scheduler.recordSuccess(account.id)
+  private applyExhaustedQuotaHeaders(
+    account: Account,
+    signals: NormalizedQuotaSignals,
+    observedAt: number
+  ): void {
+    const quota = observedQuotaSignals(signals, observedAt)
+    if (
+      !codexQuotaIsExhausted(quota.codexQuota, observedAt)
+      && !genericQuotaExhausted(quota.quota, observedAt)
+    ) return
+
+    const cooldownUntil = quotaSignalCooldownUntil(quota, observedAt)
+      ?? (signals.retryAt !== undefined && signals.retryAt > observedAt
+        ? signals.retryAt
+        : observedAt + QUOTA_EXHAUSTED_RECHECK_MS)
+    this.scheduler.setCooldown(account.id, cooldownUntil)
+    const health = this.scheduler.getHealth(account.id)
     this.emitAccountState({
       accountId: account.id,
-      status: quotaExhausted && actualResetAt !== undefined ? 'cooldown' : 'active',
+      status: 'cooldown',
       circuitState: health.circuitState,
       consecutiveFailures: health.consecutiveFailures,
-      cooldownUntil: quotaExhausted ? actualResetAt : undefined,
-      cooldownReason: quotaExhausted ? 'quota' : undefined,
+      cooldownUntil: health.cooldownUntil,
+      cooldownReason: 'quota',
+      lastUsedAt: observedAt,
+      ...quota
+    })
+  }
+
+  private reportAccountSuccess(
+    account: Account,
+    attemptStarted: number,
+    signals: NormalizedQuotaSignals | undefined,
+    selectedHealthRevision: number
+  ): void {
+    const now = this.now()
+    const quota = observedQuotaSignals(signals, now)
+    const quotaExhausted = codexQuotaIsExhausted(quota.codexQuota, now)
+      || genericQuotaExhausted(quota.quota, now)
+    // Exhausted headers were already committed synchronously when received.
+    // Do not turn a successfully delivered body into an "active" transition.
+    if (quotaExhausted) return
+
+    const health = this.scheduler.recordSuccess(account.id, selectedHealthRevision)
+    // A newer request has already changed this account's health. This older
+    // success must not overwrite its cooldown or persisted quota snapshot.
+    if (!health.applied) return
+    this.emitAccountState({
+      accountId: account.id,
+      status: 'active',
+      circuitState: health.circuitState,
+      consecutiveFailures: health.consecutiveFailures,
+      cooldownUntil: undefined,
+      cooldownReason: undefined,
       latencyMs: Math.max(0, now - attemptStarted),
       lastError: undefined,
       lastUsedAt: now,
@@ -1315,24 +1876,36 @@ export class GatewayServer implements GatewayController {
   }
 
   private emitAccountState(state: GatewayAccountState): void {
-    for (const listener of this.accountStateListeners) listener(state)
+    for (const listener of this.accountStateListeners) {
+      try {
+        listener(state)
+      } catch (error) {
+        // Account UI/persistence observers are control-plane work. Scheduler
+        // health has already been updated and the data path must keep moving.
+        console.error('Stone account state listener failed', error)
+      }
+    }
   }
 
-  private runtimeTrackedRelease(release: () => void, runtimeGeneration: number): () => void {
+  private runtimeTrackedRelease(
+    release: () => void,
+    runtimeGeneration: number,
+    accountId: string
+  ): () => void {
     let released = false
     return () => {
       if (released) return
       released = true
       if (runtimeGeneration !== this.runtimeGeneration) return
       release()
-      this.emitRuntimeState()
+      this.emitRuntimeState({ accountIds: [accountId] })
     }
   }
 
-  private emitRuntimeState(): void {
+  private emitRuntimeState(update: Parameters<GatewayRuntimeStateHandler>[0]): void {
     for (const listener of this.runtimeStateListeners) {
       try {
-        listener()
+        listener(update)
       } catch (error) {
         console.error('Stone runtime state listener failed', error)
       }
@@ -1342,6 +1915,37 @@ export class GatewayServer implements GatewayController {
 
 export function createGatewayServer(options: GatewayServerOptions): GatewayServer {
   return new GatewayServer(options)
+}
+
+const RESPONSES_WEBSOCKET_HOP_HEADERS = new Set([
+  'connection',
+  'content-length',
+  'host',
+  'keep-alive',
+  'proxy-connection',
+  'sec-websocket-extensions',
+  'sec-websocket-key',
+  'sec-websocket-protocol',
+  'sec-websocket-version',
+  'te',
+  'trailer',
+  'transfer-encoding',
+  'upgrade',
+])
+
+function responsesWebSocketForwardHeaders(source: IncomingMessage['headers']): Headers {
+  const headers = new Headers()
+  for (const [name, value] of Object.entries(source)) {
+    if (RESPONSES_WEBSOCKET_HOP_HEADERS.has(name.toLowerCase()) || value === undefined) continue
+    headers.set(name, Array.isArray(value) ? value.join(', ') : value)
+  }
+  headers.set('content-type', 'application/json')
+  headers.set('accept', 'text/event-stream')
+  return headers
+}
+
+function formatUrlHost(host: string): string {
+  return host.includes(':') && !host.startsWith('[') ? `[${host}]` : host
 }
 
 class GatewayHttpError extends Error {
@@ -1376,6 +1980,22 @@ function classifyIncomingRoute(pathname: string): IncomingRoute | undefined {
   return undefined
 }
 
+function requestPathname(value: string | undefined): string {
+  const raw = value || '/'
+  // Node's HTTP server normally receives origin-form targets. Avoid creating a
+  // URL object for every local request; retain the standards-compatible
+  // fallback for the uncommon absolute-form target.
+  if (raw.startsWith('/')) {
+    const query = raw.indexOf('?')
+    const fragment = raw.indexOf('#')
+    const end = query < 0
+      ? fragment < 0 ? raw.length : fragment
+      : fragment < 0 ? query : Math.min(query, fragment)
+    return raw.slice(0, end)
+  }
+  return new URL(raw, 'http://localhost').pathname
+}
+
 function classifyModelListRoute(pathname: string): 'openai' | 'gemini' | undefined {
   if (pathname === '/v1/models') return 'openai'
   if (pathname === '/v1beta/models') return 'gemini'
@@ -1384,13 +2004,13 @@ function classifyModelListRoute(pathname: string): 'openai' | 'gemini' | undefin
 
 function enumerablePoolModels(
   pool: Pool,
-  accounts: Account[],
-  providers: ProviderDefinition[]
+  accounts: readonly Account[],
+  providers: ReadonlyMap<string, ProviderDefinition>
 ): string[] {
   const availableModels = uniqueModels(accounts.flatMap((account) => {
     if (account.modelPolicy === 'selected') return account.modelAllowlist
     if (account.modelsRefreshedAt !== undefined) return account.availableModels
-    return providers.find((provider) => provider.id === account.providerId)?.models ?? []
+    return providers.get(account.providerId)?.models ?? []
   }))
   if (pool.modelPolicy !== 'selected') return availableModels
   const available = new Set(availableModels)
@@ -1690,12 +2310,37 @@ function withStreamingFlag(body: JsonObject, protocol: Protocol, streaming: bool
   return { ...body, stream: true }
 }
 
+function isChatGptCodexCredentialKind(
+  kind: 'api-key' | 'chatgpt-oauth' | 'chatgpt-agent-identity'
+): kind is 'chatgpt-oauth' | 'chatgpt-agent-identity' {
+  return kind === 'chatgpt-oauth' || kind === 'chatgpt-agent-identity'
+}
+
 function supportsNativeCompact(
   provider: ProviderDefinition,
-  credentialKind: 'api-key' | 'chatgpt-oauth'
+  credentialKind: 'api-key' | 'chatgpt-oauth' | 'chatgpt-agent-identity'
 ): boolean {
-  if (credentialKind === 'chatgpt-oauth') return true
-  return provider.sourceType === 'official-api' && provider.kind === 'openai'
+  if (provider.protocol !== 'openai-responses') return false
+  if (isChatGptCodexCredentialKind(credentialKind)) return true
+  if (isOfficialOpenAIResponsesProvider(provider)) return true
+  return provider.sourceType === 'relay'
+    && provider.responsesCompactMode === 'native'
+}
+
+function supportsOpaqueCompactHistory(
+  provider: ProviderDefinition,
+  credentialKind: 'api-key' | 'chatgpt-oauth' | 'chatgpt-agent-identity'
+): boolean {
+  if (supportsNativeCompact(provider, credentialKind)) return true
+  return provider.sourceType === 'relay'
+    && provider.protocol === 'openai-responses'
+    && provider.responsesCompactMode === 'passthrough'
+}
+
+function isOfficialOpenAIResponsesProvider(provider: ProviderDefinition): boolean {
+  return provider.sourceType === 'official-api'
+    && provider.kind === 'openai'
+    && provider.protocol === 'openai-responses'
 }
 
 function accountSupportsNativeCompact(
@@ -1703,22 +2348,38 @@ function accountSupportsNativeCompact(
   provider: ProviderDefinition | undefined
 ): boolean {
   if (!provider || provider.protocol !== 'openai-responses') return false
-  if (account.credentialType === 'chatgpt-oauth') return true
-  return provider.sourceType === 'official-api' && provider.kind === 'openai'
+  if (account.credentialType === 'chatgpt-oauth' || account.credentialType === 'chatgpt-agent-identity') return true
+  if (isOfficialOpenAIResponsesProvider(provider)) return true
+  return provider.sourceType === 'relay'
+    && provider.responsesCompactMode === 'native'
+}
+
+function accountSupportsOpaqueCompactHistory(
+  account: Account,
+  provider: ProviderDefinition | undefined
+): boolean {
+  if (accountSupportsNativeCompact(account, provider)) return true
+  return provider?.sourceType === 'relay'
+    && provider.protocol === 'openai-responses'
+    && provider.responsesCompactMode === 'passthrough'
 }
 
 function isCodexCompactV2Body(body: JsonObject): boolean {
   if (!Array.isArray(body.input) || body.input.length === 0) return false
-  return objectValue(body.input.at(-1))?.type === 'compaction_trigger'
+  return body.input.some((item) => objectValue(item)?.type === 'compaction_trigger')
 }
 
 function hasCodexOpaqueCompactHistory(body: JsonObject): boolean {
   if (!Array.isArray(body.input)) return false
   return body.input.some((item) => {
-    const type = objectValue(item)?.type
-    return type === 'compaction'
+    const compactItem = objectValue(item)
+    const type = compactItem?.type
+    const opaqueType = type === 'compaction'
       || type === 'compaction_summary'
       || type === 'context_compaction'
+    return opaqueType
+      && typeof compactItem?.encrypted_content === 'string'
+      && Boolean(compactItem.encrypted_content.trim())
   })
 }
 
@@ -1814,22 +2475,21 @@ function isValidCompactMessageContent(value: unknown): boolean {
 
 function recentCompactUserMessages(input: unknown): JsonObject[] {
   if (!Array.isArray(input)) return []
-  const candidates = input.flatMap((value) => {
-    const item = objectValue(value)
-    if (item?.role !== 'user' || !Array.isArray(item.content)) return []
-    const text = item.content
-      .map((part) => objectValue(part))
-      .filter((part) => part?.type === 'input_text' && typeof part.text === 'string')
-      .map((part) => part!.text as string)
-      .join('\n')
-      .trim()
-    if (!text || text.startsWith(COMPACT_SUMMARY_PREFIX)) return []
-    return [text]
-  })
   const selected: string[] = []
   let remaining = COMPACT_FALLBACK_USER_TEXT_BUDGET
-  for (let index = candidates.length - 1; index >= 0 && remaining > 0; index -= 1) {
-    const text = candidates[index]
+  // Old histories can contain hundreds of thousands of structured items. Walk
+  // from the newest item and stop as soon as the retained text budget is full;
+  // do not allocate/scan an intermediate candidate list for discarded history.
+  for (let index = input.length - 1; index >= 0 && remaining > 0; index -= 1) {
+    const item = objectValue(input[index])
+    if (item?.role !== 'user' || !Array.isArray(item.content)) continue
+    const textChunks: string[] = []
+    for (const value of item.content) {
+      const part = objectValue(value)
+      if (part?.type === 'input_text' && typeof part.text === 'string') textChunks.push(part.text)
+    }
+    const text = textChunks.join('\n').trim()
+    if (!text || text.startsWith(COMPACT_SUMMARY_PREFIX)) continue
     if (text.length <= remaining) {
       selected.push(text)
       remaining -= text.length
@@ -1884,37 +2544,258 @@ function copyCompactRequestHeaders(source: IncomingMessage, target: Headers): vo
   }
 }
 
-async function readUpstreamJson(response: Response): Promise<JsonObject> {
-  const text = await response.text()
-  if (!text) return {}
+interface ParsedUpstreamJson {
+  payload: JsonObject
+  /** Original bytes are reusable only when they parsed as a JSON object. */
+  rawJson?: Buffer
+}
+
+async function readUpstreamJsonWithBytes(
+  response: Response,
+  signal?: AbortSignal
+): Promise<ParsedUpstreamJson> {
+  if (!response.body) {
+    if (response.ok) {
+      throw new GatewayHttpError(
+        502,
+        'Upstream returned an empty JSON response',
+        'upstream_invalid_response'
+      )
+    }
+    return { payload: {} }
+  }
+  const reader = response.body.getReader()
+  const chunks: Buffer[] = []
+  let byteLength = 0
+  let reachedEof = false
+  let disposed = false
+  const dispose = (): void => {
+    if (disposed) return
+    disposed = true
+    cancelStreamReader(reader)
+  }
+  if (signal?.aborted) {
+    dispose()
+    throw abortSignalReason(signal)
+  }
+  signal?.addEventListener('abort', dispose, { once: true })
   try {
-    const parsed: unknown = JSON.parse(text)
-    return objectValue(parsed) ?? { error: { message: 'Upstream returned a non-object JSON response' } }
+    for (;;) {
+      const result = signal
+        ? await awaitWithAbortSignal(reader.read(), signal)
+        : await reader.read()
+      if (result.done) {
+        reachedEof = true
+        break
+      }
+      if (!result.value?.byteLength) continue
+      // Undici/Web Streams already hand us an owned Uint8Array view. Retain a
+      // Buffer view over the same backing store instead of copying every chunk;
+      // multi-chunk payloads still receive one final contiguous concat for
+      // UTF-8 decoding/JSON.parse below.
+      const chunk = Buffer.from(
+        result.value.buffer,
+        result.value.byteOffset,
+        result.value.byteLength
+      )
+      chunks.push(chunk)
+      byteLength += chunk.byteLength
+    }
+  } finally {
+    signal?.removeEventListener('abort', dispose)
+    if (!reachedEof) dispose()
+    else {
+      try {
+        reader.releaseLock()
+      } catch {
+        // EOF normally releases immediately; tolerate non-standard readers.
+      }
+    }
+  }
+  // `dispose()` cancels the reader when the request deadline fires. Some Web
+  // Stream implementations resolve the pending read as EOF before the abort
+  // rejection wins its Promise.race; preserve the actual timeout/cancellation
+  // instead of misclassifying that synthetic EOF as an invalid 2xx body.
+  if (signal?.aborted) throw abortSignalReason(signal)
+  const rawJson = chunks.length === 0
+    ? Buffer.alloc(0)
+    : chunks.length === 1
+      ? chunks[0]
+      : Buffer.concat(chunks, byteLength)
+  const text = rawJson.toString('utf8')
+  if (!text) {
+    if (response.ok) {
+      throw new GatewayHttpError(
+        502,
+        'Upstream returned an empty JSON response',
+        'upstream_invalid_response'
+      )
+    }
+    return { payload: {} }
+  }
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text) as unknown
   } catch {
+    if (response.ok) {
+      throw new GatewayHttpError(
+        502,
+        'Upstream returned a non-JSON response',
+        'upstream_invalid_response'
+      )
+    }
+    return { payload: { error: { message: 'Upstream returned a non-JSON response' }, raw: text.slice(0, 2000) } }
+  }
+  const payload = objectValue(parsed)
+  if (payload) return { payload, rawJson }
+  if (response.ok) {
+    throw new GatewayHttpError(
+      502,
+      'Upstream returned a non-object JSON response',
+      'upstream_invalid_response'
+    )
+  }
+  return { payload: { error: { message: 'Upstream returned a non-object JSON response' } } }
+}
+
+async function readUpstreamJson(response: Response, signal?: AbortSignal): Promise<JsonObject> {
+  if (!response.body) {
+    if (response.ok) {
+      throw new GatewayHttpError(
+        502,
+        'Upstream returned an empty JSON response',
+        'upstream_invalid_response'
+      )
+    }
+    return {}
+  }
+  // `Response.text()` lets Undici collect the body once instead of retaining
+  // a chunk array, making Buffer.concat, and then allocating a second UTF-8
+  // string. The fetch/attempt signal is still observed explicitly so a proxy
+  // that leaves the body pending cannot outlive the gateway request.
+  let text: string
+  try {
+    const reading = response.text()
+    text = signal ? await awaitWithAbortSignal(reading, signal) : await reading
+  } catch (error) {
+    if (signal?.aborted) throw abortSignalReason(signal)
+    throw error
+  }
+  if (signal?.aborted) throw abortSignalReason(signal)
+  if (!text) {
+    if (response.ok) {
+      throw new GatewayHttpError(
+        502,
+        'Upstream returned an empty JSON response',
+        'upstream_invalid_response'
+      )
+    }
+    return {}
+  }
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text) as unknown
+  } catch {
+    if (response.ok) {
+      throw new GatewayHttpError(
+        502,
+        'Upstream returned a non-JSON response',
+        'upstream_invalid_response'
+      )
+    }
     return { error: { message: 'Upstream returned a non-JSON response' }, raw: text.slice(0, 2000) }
   }
+  const payload = objectValue(parsed)
+  if (payload) return payload
+  if (response.ok) {
+    throw new GatewayHttpError(
+      502,
+      'Upstream returned a non-object JSON response',
+      'upstream_invalid_response'
+    )
+  }
+  return { error: { message: 'Upstream returned a non-object JSON response' } }
 }
 
 async function collectOpenAiResponsesUpstream(
   upstream: Response,
   options: StreamEncodingOptions,
-  idleTimeoutMs?: number
+  signal: AbortSignal | undefined,
+  firstBodyTimeoutMs: number,
+  idleTimeoutMs: number,
+  progressIdleTimeoutMs: number
 ): Promise<ReturnType<ReturnType<typeof createOpenAiResponsesStreamCollector>['finish']>> {
   const collector = createOpenAiResponsesStreamCollector(options)
   if (!upstream.body) return collector.finish()
   const reader = upstream.body.getReader()
-  for (;;) {
-    const { done, value } = idleTimeoutMs === undefined
-      ? await reader.read()
-      : await readIdleStreamChunk(reader, idleTimeoutMs)
-    if (done) break
-    collector.push(value)
-    if (collector.isComplete()) {
-      await reader.cancel().catch(() => undefined)
-      break
+  let reachedEof = false
+  let disposed = false
+  const dispose = (): void => {
+    if (disposed) return
+    disposed = true
+    cancelStreamReader(reader)
+  }
+  if (signal?.aborted) {
+    dispose()
+    throw abortSignalReason(signal)
+  }
+  signal?.addEventListener('abort', dispose, { once: true })
+  try {
+    let result = await readFirstStreamChunk(reader, firstBodyTimeoutMs, signal)
+    let progressCount = collector.getProtocolState().responsesProgressEventCount
+    let progressDeadlineAt = Date.now() + progressIdleTimeoutMs
+    let transportActivityWithoutProgress = false
+    for (;;) {
+      if (result.done) {
+        reachedEof = true
+        break
+      }
+      collector.push(result.value)
+      if (collector.isComplete()) {
+        dispose()
+        break
+      }
+      const nextProgressCount = collector.getProtocolState().responsesProgressEventCount
+      if (nextProgressCount > progressCount) {
+        progressCount = nextProgressCount
+        progressDeadlineAt = Date.now() + progressIdleTimeoutMs
+        transportActivityWithoutProgress = false
+      } else if (result.value.byteLength > 0) {
+        transportActivityWithoutProgress = true
+      }
+      const progressRemaining = transportActivityWithoutProgress
+        ? progressDeadlineAt - Date.now()
+        : undefined
+      if (progressRemaining !== undefined && progressRemaining <= 0) {
+        throw responsesProgressTimeoutError(progressIdleTimeoutMs)
+      }
+      const progressTimeoutSelected = progressRemaining !== undefined
+        && progressRemaining < idleTimeoutMs
+      try {
+        result = await readIdleStreamChunk(
+          reader,
+          Math.min(idleTimeoutMs, progressRemaining ?? Number.POSITIVE_INFINITY),
+          signal
+        )
+      } catch (error) {
+        if (progressTimeoutSelected && isStreamIdleTimeout(error)) {
+          throw responsesProgressTimeoutError(progressIdleTimeoutMs)
+        }
+        throw error
+      }
+    }
+    return collector.finish()
+  } finally {
+    signal?.removeEventListener('abort', dispose)
+    if (!reachedEof) dispose()
+    else {
+      try {
+        reader.releaseLock()
+      } catch {
+        // A non-standard reader may still report a pending read during EOF.
+      }
     }
   }
-  return collector.finish()
 }
 
 interface BufferedCompactV2Stream {
@@ -1925,6 +2806,8 @@ interface BufferedCompactV2Stream {
 interface CompactV2TimingCallbacks {
   firstBodyTimeoutMs: number
   idleTimeoutMs: number
+  progressIdleTimeoutMs: number
+  signal?: AbortSignal
   onFirstByte?: () => void
   onChunk?: (byteLength: number) => void
 }
@@ -1940,11 +2823,14 @@ async function collectCodexCompactV2Upstream(
   const validator = new CodexCompactV2SseValidator()
   let totalBytes = 0
   try {
-    let result = await readFirstStreamChunk(reader, timing.firstBodyTimeoutMs)
+    let result = await readFirstStreamChunk(reader, timing.firstBodyTimeoutMs, timing.signal)
     if (result.done || !result.value?.byteLength) {
       throw new GatewayHttpError(502, 'Remote compaction stream returned no body', 'upstream_compact_error')
     }
     timing.onFirstByte?.()
+    let progressEventCount = validator.getProgressEventCount()
+    let progressDeadlineAt = Date.now() + timing.progressIdleTimeoutMs
+    let transportActivityWithoutProgress = false
     for (;;) {
       const value = result.value
       if (value?.byteLength) {
@@ -1956,6 +2842,14 @@ async function collectCodexCompactV2Upstream(
         // must not make the outcome depend on packet boundaries.
         const inspected = value.subarray(0, Math.min(value.byteLength, remainingBytes + 1))
         validator.push(inspected)
+        const nextProgressEventCount = validator.getProgressEventCount()
+        if (nextProgressEventCount > progressEventCount) {
+          progressEventCount = nextProgressEventCount
+          progressDeadlineAt = Date.now() + timing.progressIdleTimeoutMs
+          transportActivityWithoutProgress = false
+        } else {
+          transportActivityWithoutProgress = true
+        }
         if (validator.isTerminal()) {
           if (validator.terminalWireByteLength() > MAX_COMPACT_V2_STREAM_BYTES) {
             throw new GatewayHttpError(
@@ -1979,7 +2873,26 @@ async function collectCodexCompactV2Upstream(
         cancelStreamReader(reader)
         break
       }
-      result = await readIdleStreamChunk(reader, timing.idleTimeoutMs)
+      const progressIdleRemaining = transportActivityWithoutProgress
+        ? progressDeadlineAt - Date.now()
+        : undefined
+      if (progressIdleRemaining !== undefined && progressIdleRemaining <= 0) {
+        throw responsesProgressTimeoutError(timing.progressIdleTimeoutMs)
+      }
+      const progressTimeoutSelected = progressIdleRemaining !== undefined
+        && progressIdleRemaining < timing.idleTimeoutMs
+      try {
+        result = await readIdleStreamChunk(
+          reader,
+          Math.min(timing.idleTimeoutMs, progressIdleRemaining ?? Number.POSITIVE_INFINITY),
+          timing.signal
+        )
+      } catch (error) {
+        if (progressTimeoutSelected && isStreamIdleTimeout(error)) {
+          throw responsesProgressTimeoutError(timing.progressIdleTimeoutMs)
+        }
+        throw error
+      }
       if (result.done) break
     }
     const validation = validator.finish()
@@ -2001,6 +2914,7 @@ class CodexCompactV2SseValidator {
   private eventName?: string
   private dataLines: string[] = []
   private compactionItems = 0
+  private progressEventCount = 0
   private completedResponse?: JsonObject
   private failure?: string
   private terminalTextLength?: number
@@ -2015,6 +2929,10 @@ class CodexCompactV2SseValidator {
 
   isTerminal(): boolean {
     return this.completedResponse !== undefined || this.failure !== undefined
+  }
+
+  getProgressEventCount(): number {
+    return this.progressEventCount
   }
 
   terminalWireByteLength(): number {
@@ -2119,6 +3037,7 @@ class CodexCompactV2SseValidator {
       return
     }
     const type = typeof payload.type === 'string' ? payload.type : eventName
+    if (type && compactEventAdvancesProgress(type)) this.progressEventCount += 1
     if (type === 'error' || type === 'response.failed' || type === 'response.incomplete') {
       this.failure ??= 'Remote compaction stream reported an unsuccessful response'
       return
@@ -2160,6 +3079,20 @@ class CodexCompactV2SseValidator {
   }
 }
 
+function compactEventAdvancesProgress(type: string): boolean {
+  return type === 'response.completed'
+    || type === 'response.failed'
+    || type === 'response.incomplete'
+    || type === 'error'
+    || type.startsWith('response.output_')
+    || type.startsWith('response.content_part.')
+    || type.startsWith('response.reasoning')
+    || type.startsWith('response.usage')
+    || type.startsWith('response.function_call')
+    || type.startsWith('response.custom_tool_call')
+    || type.startsWith('response.tool_')
+}
+
 async function writeBufferedResponsesStream(
   upstream: Response,
   response: ServerResponse,
@@ -2182,62 +3115,181 @@ async function writeBufferedResponsesStream(
   return !response.destroyed
 }
 
+interface TimedFetchResponse {
+  response: Response
+  headersAt: number
+}
+
 async function fetchWithOptionalHedge(
   fetchImplementation: typeof fetch,
   input: Parameters<typeof fetch>[0],
   init: RequestInit,
-  hedgeDelayMs?: number
-): Promise<Response> {
-  if (hedgeDelayMs === undefined) return fetchImplementation(input, init)
-  const start = (controller: AbortController) => fetchImplementation(input, {
-    ...init,
-    signal: init.signal
+  hedgeDelayMs?: number,
+  firstBodyTimeoutMs?: number,
+  now: () => number = Date.now,
+  onHeaders?: (headersAt: number) => void
+): Promise<TimedFetchResponse> {
+  if (hedgeDelayMs === undefined) {
+    const response = await fetchImplementation(input, init)
+    const headersAt = now()
+    onHeaders?.(headersAt)
+    return { response, headersAt }
+  }
+  const successfulHeaders = { primary: false, secondary: false }
+  const start = async (
+    source: keyof typeof successfulHeaders,
+    controller: AbortController
+  ): Promise<TimedFetchResponse> => {
+    const signal = init.signal
       ? AbortSignal.any([init.signal, controller.signal])
       : controller.signal
-  })
+    const response = await fetchImplementation(input, {
+      ...init,
+      signal
+    })
+    const headersAt = now()
+    onHeaders?.(headersAt)
+    successfulHeaders[source] = response.ok
+    // A successful streaming fetch resolves as soon as headers arrive. Peek the
+    // first non-empty body chunk so a fast header followed by a stalled body
+    // cannot defeat the hedge. The chunk is put back without decoding it.
+    return {
+      response: response.ok
+        ? await responseWithPrefetchedFirstBody(response, firstBodyTimeoutMs, signal)
+        : response,
+      headersAt
+    }
+  }
   const primaryController = new AbortController()
-  const primary = start(primaryController)
+  const primary = start('primary', primaryController)
   const first = await Promise.race([
-    primary.then((response) => ({ kind: 'response' as const, response })),
+    primary.then(
+      (result) => ({ kind: 'response' as const, result }),
+      (error: unknown) => ({ kind: 'error' as const, error })
+    ),
     new Promise<{ kind: 'delay' }>((resolve) => {
       const timer = setTimeout(() => resolve({ kind: 'delay' }), hedgeDelayMs)
       void primary.finally(() => clearTimeout(timer)).catch(() => undefined)
     })
   ])
-  if (first.kind === 'response') return first.response
+  if (first.kind === 'response') return first.result
 
   const secondaryController = new AbortController()
-  const secondary = start(secondaryController)
-  type Outcome = { source: 'primary' | 'secondary'; response?: Response; error?: unknown }
-  const outcome = (source: Outcome['source'], promise: Promise<Response>): Promise<Outcome> => promise.then(
-    (response) => ({ source, response }),
+  const secondary = start('secondary', secondaryController)
+  type Outcome = { source: 'primary' | 'secondary'; result?: TimedFetchResponse; error?: unknown }
+  const outcome = (source: Outcome['source'], promise: Promise<TimedFetchResponse>): Promise<Outcome> => promise.then(
+    (result) => ({ source, result }),
     (error) => ({ source, error })
   )
   const primaryOutcome = outcome('primary', primary)
   const secondaryOutcome = outcome('secondary', secondary)
   const firstOutcome = await Promise.race([primaryOutcome, secondaryOutcome])
   let winner = firstOutcome
-  if (!winner.response) {
+  if (!winner.result) {
     const other = await (winner.source === 'primary' ? secondaryOutcome : primaryOutcome)
     winner = other
-  } else if (!winner.response.ok) {
+  } else if (!winner.result.response.ok) {
     // Give the other lane only a short grace window to replace a fast 429/5xx;
     // never turn a quick upstream error into a full request-timeout wait.
-    const other = await settleWithin(
-      winner.source === 'primary' ? secondaryOutcome : primaryOutcome,
+    const otherSource = winner.source === 'primary' ? 'secondary' : 'primary'
+    const otherOutcome = otherSource === 'primary' ? primaryOutcome : secondaryOutcome
+    let other = await settleWithin(
+      otherOutcome,
       HEDGE_ERROR_GRACE_MS
     )
-    if (other?.response?.ok) winner = other
+    if (other?.result?.response.ok) winner = other
+    else if (successfulHeaders[otherSource]) {
+      // A fast hedge error must never cancel a candidate whose HTTP response
+      // has already been confirmed successful. Wait for that candidate's first
+      // body chunk; the shared attempt signal still enforces the global
+      // response-start deadline, so a bad 200 cannot hold the slot forever.
+      other = await otherOutcome
+      if (other.result?.response.ok) winner = other
+    }
   }
-  if (!winner.response) throw winner.error
+  if (!winner.result) throw winner.error
 
   const loserController = winner.source === 'primary' ? secondaryController : primaryController
   const loserOutcome = winner.source === 'primary' ? secondaryOutcome : primaryOutcome
   loserController.abort(new DOMException('Hedged request lost the response race', 'AbortError'))
   void loserOutcome.then(async (loser) => {
-    await loser.response?.body?.cancel().catch(() => undefined)
+    await loser.result?.response.body?.cancel().catch(() => undefined)
   })
-  return winner.response
+  return winner.result
+}
+
+async function responseWithPrefetchedFirstBody(
+  response: Response,
+  timeoutMs = MAX_FIRST_BODY_TIMEOUT_MS,
+  signal?: AbortSignal | null
+): Promise<Response> {
+  if (!response.body) {
+    throw new GatewayHttpError(
+      502,
+      'Upstream stream ended before its first body chunk',
+      'upstream_stream_error'
+    )
+  }
+  const reader = response.body.getReader()
+  let first: ReadableStreamReadResult<Uint8Array>
+  try {
+    first = await readFirstStreamChunk(reader, timeoutMs, signal ?? undefined)
+  } catch (error) {
+    cancelStreamReader(reader)
+    throw error
+  }
+  if (first.done) {
+    try {
+      reader.releaseLock()
+    } catch {
+      // EOF normally leaves no pending read; tolerate non-standard readers.
+    }
+    throw new GatewayHttpError(
+      502,
+      'Upstream stream ended before its first body chunk',
+      'upstream_stream_error'
+    )
+  }
+  let firstPending = true
+  const body = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        if (firstPending) {
+          firstPending = false
+          controller.enqueue(first.value!)
+          return
+        }
+        const next = await reader.read()
+        if (next.done) {
+          try {
+            reader.releaseLock()
+          } catch {
+            // The stream is complete even if a custom reader retains its lock.
+          }
+          controller.close()
+        } else controller.enqueue(next.value)
+      } catch (error) {
+        cancelStreamReader(reader)
+        controller.error(error)
+      }
+    },
+    cancel() {
+      // Some proxy transports never settle their cancel hook. Do not let that
+      // keep the reconstructed response locked or delay the winning request.
+      cancelStreamReader(reader)
+    }
+  })
+  const prepared = new Response(body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers
+  })
+  Object.defineProperties(prepared, {
+    url: { value: response.url },
+    redirected: { value: response.redirected },
+    type: { value: response.type }
+  })
+  return prepared
 }
 
 async function settleWithin<T>(promise: Promise<T>, timeoutMs: number): Promise<T | undefined> {
@@ -2277,11 +3329,17 @@ interface StreamPipeResult {
 interface StreamTimingCallbacks {
   firstBodyTimeoutMs: number
   idleTimeoutMs: number
+  responsesProgressIdleTimeoutMs: number
+  signal?: AbortSignal
   onFirstByte?: () => void
   onFirstToken?: () => void
   onClientWrite?: () => void
   onChunk?: (byteLength: number) => void
   onUsage?: (usage: NormalizedTokenUsage) => void
+  /** Apply attempt-scoped headers after validation but before headers are sent. */
+  onBeforeResponseCommit?: () => void
+  /** Release request-side resources only after headers are formally committed. */
+  onResponseCommit?: () => void
 }
 
 interface AbortDeadline {
@@ -2343,7 +3401,12 @@ async function pipeUpstreamResponse(
   let completedMessageObserved = false
   let completionDrainDeadline: number | undefined
   let terminalWaitStartedAt: number | undefined
-  let responsesEventCount = 0
+  let responsesProgressEventCount = 0
+  let responsesProgressDeadlineAt: number | undefined
+  let responsesTransportActivityWithoutProgress = false
+  let responseHeadersCommitted = false
+  const pendingPrecommitChunks: Uint8Array[] = []
+  let pendingPrecommitBytes = 0
   const diagnostics: StreamTerminationDiagnostics = {}
   const pendingToolCalls = new Set<number>()
   const logicalCompletionObserved = (): boolean => (
@@ -2365,8 +3428,12 @@ async function pipeUpstreamResponse(
   const syncResponsesState = (): void => {
     if (protocol !== 'openai-responses') return
     const state = parser.getProtocolState()
-    const hasNewSemanticEvent = state.responsesEventCount > responsesEventCount
-    responsesEventCount = state.responsesEventCount
+    const hasNewProtocolProgress = state.responsesProgressEventCount > responsesProgressEventCount
+    if (hasNewProtocolProgress) {
+      responsesProgressEventCount = state.responsesProgressEventCount
+      responsesProgressDeadlineAt = Date.now() + timing.responsesProgressIdleTimeoutMs
+      responsesTransportActivityWithoutProgress = false
+    }
     diagnostics.streamTerminalEvent = state.responsesTerminalEvent
     diagnostics.streamLastEventType = state.responsesLastEventType
     diagnostics.streamLastSequenceNumber = state.responsesLastSequenceNumber
@@ -2382,7 +3449,7 @@ async function pipeUpstreamResponse(
     if (logicalCompletionObserved()) {
       const now = Date.now()
       terminalWaitStartedAt ??= now
-      if (hasNewSemanticEvent) completionDrainDeadline = now + RESPONSES_TERMINAL_IDLE_TIMEOUT_MS
+      if (hasNewProtocolProgress) completionDrainDeadline = now + RESPONSES_TERMINAL_IDLE_TIMEOUT_MS
     }
   }
   let observationFailed = false
@@ -2431,38 +3498,72 @@ async function pipeUpstreamResponse(
   }
   response.once('close', cancelOnClose)
   try {
-    const first = await readFirstStreamChunk(reader, timing.firstBodyTimeoutMs)
+    const first = await readFirstStreamChunk(reader, timing.firstBodyTimeoutMs, timing.signal)
     if (first.done || !first.value?.byteLength) {
       throw new GatewayHttpError(502, 'Upstream stream ended before its first body chunk', 'upstream_stream_error')
     }
     timing.onFirstByte?.()
-    response.statusCode = upstream.status
-    response.setHeader('content-type', upstream.headers.get('content-type') ?? 'text/event-stream; charset=utf-8')
-    response.setHeader('cache-control', upstream.headers.get('cache-control') ?? 'no-cache')
-    response.setHeader('x-accel-buffering', upstream.headers.get('x-accel-buffering') ?? 'no')
-    response.flushHeaders()
+    if (protocol === 'openai-responses') {
+      responsesProgressDeadlineAt = Date.now() + timing.responsesProgressIdleTimeoutMs
+    }
+    const commitResponseHeaders = (): void => {
+      if (responseHeadersCommitted) return
+      response.statusCode = upstream.status
+      response.setHeader('content-type', upstream.headers.get('content-type') ?? 'text/event-stream; charset=utf-8')
+      response.setHeader('cache-control', upstream.headers.get('cache-control') ?? 'no-cache')
+      response.setHeader('x-accel-buffering', upstream.headers.get('x-accel-buffering') ?? 'no')
+      timing.onBeforeResponseCommit?.()
+      response.flushHeaders()
+      responseHeadersCommitted = true
+      timing.onResponseCommit?.()
+    }
+    const flushPendingPrecommitChunks = async (): Promise<boolean> => {
+      const written = await writeStreamChunks(response, pendingPrecommitChunks, timing.onClientWrite)
+      pendingPrecommitChunks.length = 0
+      pendingPrecommitBytes = 0
+      return written
+    }
     const consume = async (value: Uint8Array): Promise<boolean> => {
       timing.onChunk?.(value.byteLength)
+      if (protocol === 'openai-responses' && value.byteLength > 0) {
+        responsesTransportActivityWithoutProgress = true
+      }
       const events = parser.push(value)
       observeSafely(() => events)
       if (response.destroyed) return false
-      for (const chunk of redactor.push(value)) {
-        if (chunk.byteLength > 0) timing.onClientWrite?.()
-        if (!response.write(chunk)) await waitForDrain(response)
+      const safeChunks = redactor.push(value)
+      if (!responseHeadersCommitted) {
+        for (const chunk of safeChunks) {
+          pendingPrecommitChunks.push(chunk)
+          pendingPrecommitBytes += chunk.byteLength
+        }
+        if (pendingPrecommitBytes > MAX_COMPACT_V2_STREAM_BYTES) {
+          throw new GatewayHttpError(
+            502,
+            'Upstream stream produced too much data before its first valid event',
+            'upstream_stream_error'
+          )
+        }
+        if (parser.getRecognizedEventCount() === 0 || observationFailed) return true
+        commitResponseHeaders()
+        return await flushPendingPrecommitChunks()
       }
-      return !response.destroyed
+      return await writeStreamChunks(response, safeChunks, timing.onClientWrite)
     }
     if (!await consume(first.value)) {
       cancelStreamReader(reader)
       diagnostics.streamEndReason = 'client-closed'
       return streamPipeResult(protocolCompletionObserved(), usage, streamError, undefined, diagnostics)
     }
-    if (protocol !== 'openai-responses' && logicalCompletionObserved()) {
+    if (streamError && !protocolCompletionObserved()) {
+      diagnostics.streamEndReason = 'explicit-error'
+      cancelStreamReader(reader)
+    } else if (protocol !== 'openai-responses' && logicalCompletionObserved()) {
       completionDrainDeadline = Date.now() + TRAILING_FRAME_DRAIN_MS
     }
     if (transportTerminalObserved()) {
       cancelStreamReader(reader)
-    } else {
+    } else if (!streamError) {
       for (;;) {
         const completionDrainRemaining = completionDrainDeadline === undefined
           ? undefined
@@ -2482,19 +3583,36 @@ async function pipeUpstreamResponse(
           }
           break
         }
+        const progressIdleRemaining = !responsesTransportActivityWithoutProgress
+          || responsesProgressDeadlineAt === undefined
+          ? undefined
+          : responsesProgressDeadlineAt - Date.now()
+        if (progressIdleRemaining !== undefined && progressIdleRemaining <= 0) {
+          diagnostics.streamEndReason = 'stream-idle-timeout'
+          throw responsesProgressTimeoutError(timing.responsesProgressIdleTimeoutMs)
+        }
+        const terminalTimeoutSelected = completionDrainRemaining !== undefined
+          && completionDrainRemaining <= timing.idleTimeoutMs
+          && (progressIdleRemaining === undefined || completionDrainRemaining <= progressIdleRemaining)
+        const progressTimeoutSelected = progressIdleRemaining !== undefined
+          && progressIdleRemaining < timing.idleTimeoutMs
+          && (completionDrainRemaining === undefined || progressIdleRemaining < completionDrainRemaining)
+        const nextReadTimeoutMs = Math.min(
+          timing.idleTimeoutMs,
+          completionDrainRemaining ?? Number.POSITIVE_INFINITY,
+          progressIdleRemaining ?? Number.POSITIVE_INFINITY
+        )
         let next: ReadableStreamReadResult<Uint8Array>
         try {
           next = await readIdleStreamChunk(
             reader,
-            completionDrainRemaining === undefined
-              ? timing.idleTimeoutMs
-              : Math.min(timing.idleTimeoutMs, completionDrainRemaining)
+            nextReadTimeoutMs,
+            timing.signal
           )
         } catch (error) {
-          if (completionDrainDeadline !== undefined && isStreamIdleTimeout(error)) {
+          if (terminalTimeoutSelected && isStreamIdleTimeout(error)) {
             cancelStreamReader(reader)
-            if (protocol === 'openai-responses' && completionDrainRemaining !== undefined
-              && completionDrainRemaining <= timing.idleTimeoutMs) {
+            if (protocol === 'openai-responses') {
               diagnostics.streamEndReason = 'terminal-timeout'
               diagnostics.terminalWaitMs = terminalWaitStartedAt === undefined
                 ? undefined
@@ -2505,6 +3623,14 @@ async function pipeUpstreamResponse(
                 'upstream_response_terminal_timeout'
               )
             }
+            break
+          }
+          if (progressTimeoutSelected && isStreamIdleTimeout(error)) {
+            diagnostics.streamEndReason = 'stream-idle-timeout'
+            throw responsesProgressTimeoutError(timing.responsesProgressIdleTimeoutMs)
+          }
+          if (completionDrainDeadline !== undefined && isStreamIdleTimeout(error)) {
+            cancelStreamReader(reader)
             if (protocol === 'openai-responses') {
               diagnostics.streamEndReason = 'stream-idle-timeout'
               throw error
@@ -2522,6 +3648,11 @@ async function pipeUpstreamResponse(
           cancelStreamReader(reader)
           diagnostics.streamEndReason = 'client-closed'
           return streamPipeResult(protocolCompletionObserved(), usage, streamError, undefined, diagnostics)
+        }
+        if (streamError && !protocolCompletionObserved()) {
+          diagnostics.streamEndReason = 'explicit-error'
+          cancelStreamReader(reader)
+          break
         }
         if (protocol !== 'openai-responses' && completionDrainDeadline === undefined && logicalCompletionObserved()) {
           completionDrainDeadline = Date.now() + TRAILING_FRAME_DRAIN_MS
@@ -2542,12 +3673,26 @@ async function pipeUpstreamResponse(
         diagnostics
       )
     }
-    for (const chunk of redactor.finish()) {
-      if (chunk.byteLength > 0) timing.onClientWrite?.()
-      if (!response.write(chunk)) await waitForDrain(response)
-    }
     const explicitUpstreamStreamError = streamError
     if (!protocolCompletionObserved()) observeSafely(() => parser.finish(), false)
+    if (!responseHeadersCommitted) {
+      if (parser.getRecognizedEventCount() === 0 || observationFailed) {
+        throw new GatewayHttpError(
+          502,
+          streamError ?? 'Upstream Responses stream ended before its first valid event',
+          'upstream_stream_error'
+        )
+      }
+      commitResponseHeaders()
+      if (!await flushPendingPrecommitChunks()) {
+        diagnostics.streamEndReason = 'client-closed'
+        return streamPipeResult(protocolCompletionObserved(), usage, streamError, undefined, diagnostics)
+      }
+    }
+    if (!await writeStreamChunks(response, redactor.finish(), timing.onClientWrite)) {
+      diagnostics.streamEndReason = 'client-closed'
+      return streamPipeResult(protocolCompletionObserved(), usage, streamError, undefined, diagnostics)
+    }
     if (explicitUpstreamStreamError && !protocolCompletionObserved()) {
       diagnostics.streamEndReason ??= 'explicit-error'
       streamError = explicitUpstreamStreamError
@@ -2563,6 +3708,15 @@ async function pipeUpstreamResponse(
       await writeProtocolStreamFailure(response, protocol, options, streamFailure, timing.onClientWrite)
     }
   } catch (error) {
+    // Every exceptional exit owns the upstream reader until it explicitly
+    // cancels it. In particular, precommit validation may fail before any
+    // downstream headers are sent and then fail over to another account; the
+    // abandoned reader must not keep a pooled transport connection occupied.
+    cancelStreamReader(reader)
+    if (timing.signal?.aborted) {
+      diagnostics.streamEndReason = 'client-closed'
+      return streamPipeResult(protocolCompletionObserved(), usage, streamError, undefined, diagnostics)
+    }
     if (error instanceof GatewayHttpError && error.type === 'client_write_timeout') {
       diagnostics.streamEndReason = 'client-closed'
       response.destroy()
@@ -2621,7 +3775,12 @@ async function pipeConvertedUpstreamResponse(
   let completedMessageObserved = false
   let completionDrainDeadline: number | undefined
   let terminalWaitStartedAt: number | undefined
-  let responsesEventCount = 0
+  let responsesProgressEventCount = 0
+  let responsesProgressDeadlineAt: number | undefined
+  let responsesTransportActivityWithoutProgress = false
+  let responseHeadersCommitted = false
+  const pendingPrecommitChunks: Uint8Array[] = []
+  let pendingPrecommitBytes = 0
   const diagnostics: StreamTerminationDiagnostics = {}
   const pendingToolCalls = new Set<number>()
   const logicalCompletionObserved = (): boolean => (
@@ -2640,8 +3799,12 @@ async function pipeConvertedUpstreamResponse(
   const syncResponsesState = (): void => {
     if (from !== 'openai-responses') return
     const state = parser.getProtocolState()
-    const hasNewSemanticEvent = state.responsesEventCount > responsesEventCount
-    responsesEventCount = state.responsesEventCount
+    const hasNewProtocolProgress = state.responsesProgressEventCount > responsesProgressEventCount
+    if (hasNewProtocolProgress) {
+      responsesProgressEventCount = state.responsesProgressEventCount
+      responsesProgressDeadlineAt = Date.now() + timing.responsesProgressIdleTimeoutMs
+      responsesTransportActivityWithoutProgress = false
+    }
     diagnostics.streamTerminalEvent = state.responsesTerminalEvent
     diagnostics.streamLastEventType = state.responsesLastEventType
     diagnostics.streamLastSequenceNumber = state.responsesLastSequenceNumber
@@ -2657,13 +3820,25 @@ async function pipeConvertedUpstreamResponse(
     if (logicalCompletionObserved()) {
       const now = Date.now()
       terminalWaitStartedAt ??= now
-      if (hasNewSemanticEvent) completionDrainDeadline = now + RESPONSES_TERMINAL_IDLE_TIMEOUT_MS
+      if (hasNewProtocolProgress) completionDrainDeadline = now + RESPONSES_TERMINAL_IDLE_TIMEOUT_MS
     }
   }
   const cancelOnClose = (): void => {
     void reader.cancel().catch(() => undefined)
   }
+  const commitResponseHeaders = (): void => {
+    if (responseHeadersCommitted) return
+    response.statusCode = upstream.status
+    response.setHeader('content-type', 'text/event-stream; charset=utf-8')
+    response.setHeader('cache-control', 'no-cache')
+    response.setHeader('x-accel-buffering', 'no')
+    timing.onBeforeResponseCommit?.()
+    response.flushHeaders()
+    responseHeadersCommitted = true
+    timing.onResponseCommit?.()
+  }
   const forward = async (events: CanonicalStreamEvent[], acceptTerminal = true): Promise<boolean> => {
+    const encoded: Uint8Array[] = []
     for (const event of events) {
       const safeEvent = event.type === 'error'
         ? {
@@ -2697,36 +3872,57 @@ async function pipeConvertedUpstreamResponse(
         if (safeEvent.reason === 'tool_calls') terminalObserved = true
       }
       if (meaningfulStreamEvent(safeEvent)) timing.onFirstToken?.()
-      if (!await writeStreamChunks(response, encoder.encode(safeEvent), timing.onClientWrite)) return false
+      encoded.push(...encoder.encode(safeEvent))
     }
     syncResponsesState()
-    return true
+    if (!responseHeadersCommitted) {
+      for (const chunk of encoded) {
+        pendingPrecommitChunks.push(chunk)
+        pendingPrecommitBytes += chunk.byteLength
+      }
+      if (pendingPrecommitBytes > MAX_COMPACT_V2_STREAM_BYTES) {
+        throw new GatewayHttpError(
+          502,
+          'Upstream stream produced too much data before its first valid event',
+          'upstream_stream_error'
+        )
+      }
+      if (parser.getRecognizedEventCount() === 0 || streamError) return true
+      commitResponseHeaders()
+      const written = await writeStreamChunks(response, pendingPrecommitChunks, timing.onClientWrite)
+      pendingPrecommitChunks.length = 0
+      pendingPrecommitBytes = 0
+      return written
+    }
+    return await writeStreamChunks(response, encoded, timing.onClientWrite)
   }
 
   response.once('close', cancelOnClose)
   try {
-    const first = await readFirstStreamChunk(reader, timing.firstBodyTimeoutMs)
+    const first = await readFirstStreamChunk(reader, timing.firstBodyTimeoutMs, timing.signal)
     if (first.done || !first.value?.byteLength) {
       throw new GatewayHttpError(502, 'Upstream stream ended before its first body chunk', 'upstream_stream_error')
     }
     timing.onFirstByte?.()
+    if (from === 'openai-responses') {
+      responsesProgressDeadlineAt = Date.now() + timing.responsesProgressIdleTimeoutMs
+    }
     timing.onChunk?.(first.value.byteLength)
-    response.statusCode = upstream.status
-    response.setHeader('content-type', 'text/event-stream; charset=utf-8')
-    response.setHeader('cache-control', 'no-cache')
-    response.setHeader('x-accel-buffering', 'no')
-    response.flushHeaders()
+    if (from === 'openai-responses') responsesTransportActivityWithoutProgress = true
     if (!await forward(parser.push(first.value))) {
       cancelStreamReader(reader)
       diagnostics.streamEndReason = 'client-closed'
       return streamPipeResult(protocolCompletionObserved(), usage, streamError, undefined, diagnostics)
     }
-    if (from !== 'openai-responses' && logicalCompletionObserved()) {
+    if (streamError && !protocolCompletionObserved()) {
+      diagnostics.streamEndReason = 'explicit-error'
+      cancelStreamReader(reader)
+    } else if (from !== 'openai-responses' && logicalCompletionObserved()) {
       completionDrainDeadline = Date.now() + TRAILING_FRAME_DRAIN_MS
     }
     if (transportTerminalObserved()) {
       cancelStreamReader(reader)
-    } else {
+    } else if (!streamError) {
       for (;;) {
         const completionDrainRemaining = completionDrainDeadline === undefined
           ? undefined
@@ -2746,19 +3942,36 @@ async function pipeConvertedUpstreamResponse(
           }
           break
         }
+        const progressIdleRemaining = !responsesTransportActivityWithoutProgress
+          || responsesProgressDeadlineAt === undefined
+          ? undefined
+          : responsesProgressDeadlineAt - Date.now()
+        if (progressIdleRemaining !== undefined && progressIdleRemaining <= 0) {
+          diagnostics.streamEndReason = 'stream-idle-timeout'
+          throw responsesProgressTimeoutError(timing.responsesProgressIdleTimeoutMs)
+        }
+        const terminalTimeoutSelected = completionDrainRemaining !== undefined
+          && completionDrainRemaining <= timing.idleTimeoutMs
+          && (progressIdleRemaining === undefined || completionDrainRemaining <= progressIdleRemaining)
+        const progressTimeoutSelected = progressIdleRemaining !== undefined
+          && progressIdleRemaining < timing.idleTimeoutMs
+          && (completionDrainRemaining === undefined || progressIdleRemaining < completionDrainRemaining)
+        const nextReadTimeoutMs = Math.min(
+          timing.idleTimeoutMs,
+          completionDrainRemaining ?? Number.POSITIVE_INFINITY,
+          progressIdleRemaining ?? Number.POSITIVE_INFINITY
+        )
         let next: ReadableStreamReadResult<Uint8Array>
         try {
           next = await readIdleStreamChunk(
             reader,
-            completionDrainRemaining === undefined
-              ? timing.idleTimeoutMs
-              : Math.min(timing.idleTimeoutMs, completionDrainRemaining)
+            nextReadTimeoutMs,
+            timing.signal
           )
         } catch (error) {
-          if (completionDrainDeadline !== undefined && isStreamIdleTimeout(error)) {
+          if (terminalTimeoutSelected && isStreamIdleTimeout(error)) {
             cancelStreamReader(reader)
-            if (from === 'openai-responses' && completionDrainRemaining !== undefined
-              && completionDrainRemaining <= timing.idleTimeoutMs) {
+            if (from === 'openai-responses') {
               diagnostics.streamEndReason = 'terminal-timeout'
               diagnostics.terminalWaitMs = terminalWaitStartedAt === undefined
                 ? undefined
@@ -2769,6 +3982,14 @@ async function pipeConvertedUpstreamResponse(
                 'upstream_response_terminal_timeout'
               )
             }
+            break
+          }
+          if (progressTimeoutSelected && isStreamIdleTimeout(error)) {
+            diagnostics.streamEndReason = 'stream-idle-timeout'
+            throw responsesProgressTimeoutError(timing.responsesProgressIdleTimeoutMs)
+          }
+          if (completionDrainDeadline !== undefined && isStreamIdleTimeout(error)) {
+            cancelStreamReader(reader)
             if (from === 'openai-responses') {
               diagnostics.streamEndReason = 'stream-idle-timeout'
               throw error
@@ -2783,10 +4004,18 @@ async function pipeConvertedUpstreamResponse(
           break
         }
         timing.onChunk?.(value.byteLength)
+        if (from === 'openai-responses' && value.byteLength > 0) {
+          responsesTransportActivityWithoutProgress = true
+        }
         if (!await forward(parser.push(value))) {
           cancelStreamReader(reader)
           diagnostics.streamEndReason = 'client-closed'
           return streamPipeResult(protocolCompletionObserved(), usage, streamError, undefined, diagnostics)
+        }
+        if (streamError && !protocolCompletionObserved()) {
+          diagnostics.streamEndReason = 'explicit-error'
+          cancelStreamReader(reader)
+          break
         }
         if (from !== 'openai-responses' && completionDrainDeadline === undefined && logicalCompletionObserved()) {
           completionDrainDeadline = Date.now() + TRAILING_FRAME_DRAIN_MS
@@ -2801,7 +4030,10 @@ async function pipeConvertedUpstreamResponse(
       diagnostics.streamEndReason = 'client-closed'
       return streamPipeResult(protocolCompletionObserved(), usage, streamError, undefined, diagnostics)
     }
-    if (!protocolCompletionObserved()) {
+    if (streamError && !protocolCompletionObserved()) {
+      diagnostics.streamEndReason ??= 'explicit-error'
+      streamFailure = new GatewayHttpError(502, streamError, 'upstream_stream_error')
+    } else if (!protocolCompletionObserved()) {
       const finishEvents = parser.finish()
       for (const event of finishEvents) {
         if (event.type === 'error' && !streamError) streamError = redactSensitiveText(event.message, secrets)
@@ -2820,11 +4052,25 @@ async function pipeConvertedUpstreamResponse(
         return streamPipeResult(protocolCompletionObserved(), usage, streamError, undefined, diagnostics)
       }
     }
+    if (!responseHeadersCommitted) {
+      throw streamFailure ?? new GatewayHttpError(
+        502,
+        streamError ?? 'Upstream stream ended before its first valid event',
+        'upstream_stream_error'
+      )
+    }
     if (!await writeStreamChunks(response, encoder.finish(), timing.onClientWrite)) {
       diagnostics.streamEndReason = 'client-closed'
       return streamPipeResult(protocolCompletionObserved(), usage, streamError, undefined, diagnostics)
     }
   } catch (error) {
+    // Keep converted streams under the same ownership rule as identity
+    // streams: an exception always releases the upstream transport slot.
+    cancelStreamReader(reader)
+    if (timing.signal?.aborted) {
+      diagnostics.streamEndReason = 'client-closed'
+      return streamPipeResult(protocolCompletionObserved(), usage, streamError, undefined, diagnostics)
+    }
     if (error instanceof GatewayHttpError && error.type === 'client_write_timeout') {
       diagnostics.streamEndReason = 'client-closed'
       response.destroy()
@@ -2914,7 +4160,7 @@ async function writeStreamChunks(
   for (const chunk of chunks) {
     if (response.destroyed) return false
     if (chunk.byteLength > 0) onClientWrite?.()
-    if (!response.write(Buffer.from(chunk))) await waitForDrain(response)
+    if (!response.write(chunk)) await waitForDrain(response)
     if (response.destroyed) return false
   }
   return true
@@ -2922,7 +4168,8 @@ async function writeStreamChunks(
 
 async function readFirstStreamChunk(
   reader: ReadableStreamDefaultReader<Uint8Array>,
-  timeoutMs: number
+  timeoutMs: number,
+  signal?: AbortSignal
 ): Promise<ReadableStreamReadResult<Uint8Array>> {
   let timer: ReturnType<typeof setTimeout> | undefined
   try {
@@ -2934,11 +4181,15 @@ async function readFirstStreamChunk(
       )), timeoutMs)
     })
     for (;;) {
-      const result = await Promise.race([reader.read(), timeout])
+      const pending = reader.read()
+      const result = await Promise.race([
+        signal ? awaitWithAbortSignal(pending, signal) : pending,
+        timeout
+      ])
       if (result.done || (result.value?.byteLength ?? 0) > 0) return result
     }
   } catch (error) {
-    void reader.cancel().catch(() => undefined)
+    cancelStreamReader(reader)
     throw error
   } finally {
     if (timer) clearTimeout(timer)
@@ -2947,7 +4198,8 @@ async function readFirstStreamChunk(
 
 async function readIdleStreamChunk(
   reader: ReadableStreamDefaultReader<Uint8Array>,
-  timeoutMs: number
+  timeoutMs: number,
+  signal?: AbortSignal
 ): Promise<ReadableStreamReadResult<Uint8Array>> {
   let timer: ReturnType<typeof setTimeout> | undefined
   try {
@@ -2960,11 +4212,15 @@ async function readIdleStreamChunk(
     })
     // Empty chunks are transport noise and must not reset the idle deadline.
     for (;;) {
-      const result = await Promise.race([reader.read(), timeout])
+      const pending = reader.read()
+      const result = await Promise.race([
+        signal ? awaitWithAbortSignal(pending, signal) : pending,
+        timeout
+      ])
       if (result.done || (result.value?.byteLength ?? 0) > 0) return result
     }
   } catch (error) {
-    void reader.cancel().catch(() => undefined)
+    cancelStreamReader(reader)
     throw error
   } finally {
     if (timer) clearTimeout(timer)
@@ -2974,11 +4230,29 @@ async function readIdleStreamChunk(
 function cancelStreamReader(reader: ReadableStreamDefaultReader<Uint8Array>): void {
   // Completion must not wait for a transport-specific cancel hook. Some
   // proxies keep that promise pending even though the semantic stream ended.
-  void reader.cancel().catch(() => undefined)
+  const cancellation = reader.cancel().catch(() => undefined)
+  const release = (): void => {
+    try {
+      reader.releaseLock()
+    } catch {
+      // A pending read can keep the lock briefly; the cancellation completion
+      // gets a second chance below without delaying the request path.
+    }
+  }
+  queueMicrotask(release)
+  void cancellation.finally(release)
 }
 
 function isStreamIdleTimeout(error: unknown): boolean {
   return error instanceof GatewayHttpError && error.type === 'upstream_stream_idle_timeout'
+}
+
+function responsesProgressTimeoutError(timeoutMs: number): GatewayHttpError {
+  return new GatewayHttpError(
+    504,
+    `Upstream Responses stream made no protocol progress for ${timeoutMs} ms`,
+    'upstream_response_progress_timeout'
+  )
 }
 
 function meaningfulStreamEvent(event: CanonicalStreamEvent): boolean {
@@ -3023,6 +4297,71 @@ async function waitForDrain(response: ServerResponse): Promise<void> {
   })
 }
 
+async function endAndWaitForFinish(
+  response: ServerResponse,
+  body?: Uint8Array
+): Promise<boolean> {
+  if (response.writableFinished) return true
+  if (response.destroyed) return false
+  return new Promise<boolean>((resolve) => {
+    let progressTimer: ReturnType<typeof setTimeout> | undefined
+    let lastBytesWritten = response.socket?.bytesWritten ?? 0
+    let lastWritableLength = response.writableLength
+    let settled = false
+    const cleanup = (): void => {
+      if (progressTimer) clearTimeout(progressTimer)
+      response.off('finish', onFinish)
+      response.off('close', onClose)
+      response.off('error', onError)
+    }
+    const settle = (finished: boolean): void => {
+      if (settled) return
+      settled = true
+      cleanup()
+      resolve(finished)
+    }
+    const onFinish = (): void => settle(true)
+    const onClose = (): void => settle(response.writableFinished)
+    const onError = (): void => settle(false)
+    response.once('finish', onFinish)
+    response.once('close', onClose)
+    response.once('error', onError)
+    response.end(body)
+    // `finish` is normally immediate, but a peer that stops reading can keep
+    // a buffered response pending indefinitely. Use an idle-progress guard,
+    // not a total-duration limit: any socket or writable-buffer progress earns
+    // a fresh full window, so a slow but actively draining client is untouched.
+    lastBytesWritten = response.socket?.bytesWritten ?? lastBytesWritten
+    lastWritableLength = response.writableLength
+    const checkProgress = (): void => {
+      if (settled) return
+      if (response.writableFinished) {
+        settle(true)
+        return
+      }
+      if (response.destroyed) {
+        settle(false)
+        return
+      }
+      const bytesWritten = response.socket?.bytesWritten ?? lastBytesWritten
+      const writableLength = response.writableLength
+      if (bytesWritten > lastBytesWritten || writableLength < lastWritableLength) {
+        lastBytesWritten = bytesWritten
+        lastWritableLength = writableLength
+        progressTimer = setTimeout(checkProgress, CLIENT_WRITE_DRAIN_TIMEOUT_MS)
+        progressTimer.unref?.()
+        return
+      }
+      settle(false)
+      response.destroy()
+    }
+    if (!settled) {
+      progressTimer = setTimeout(checkProgress, CLIENT_WRITE_DRAIN_TIMEOUT_MS)
+      progressTimer.unref?.()
+    }
+  })
+}
+
 function getSessionId(request: IncomingMessage, body: JsonObject): string | undefined {
   const headerNames = ['x-stone-session-id', 'session-id', 'session_id', 'thread-id'] as const
   for (const name of headerNames) {
@@ -3042,11 +4381,86 @@ function getSessionId(request: IncomingMessage, body: JsonObject): string | unde
   return candidates.find((value): value is string => typeof value === 'string' && Boolean(value.trim()))?.trim()
 }
 
+function requiredUpstreamCapabilities(
+  body: JsonObject,
+  streaming: boolean
+): UpstreamCapabilityRequirement[] {
+  const required = new Set<UpstreamCapabilityRequirement>([
+    streaming ? 'streaming' : 'nonStreaming'
+  ])
+  // Compact routing already applies credential-aware native/fallback filters
+  // below. Provider-only capability metadata cannot distinguish an OAuth
+  // account from a relay account sharing the hidden Responses provider.
+  if (body.store === true) required.add('store')
+  if (typeof body.previous_response_id === 'string' && body.previous_response_id.trim()) {
+    required.add('previousResponseId')
+  }
+  if (body.parallel_tool_calls === true) required.add('parallelToolCalls')
+  if (objectValue(body.reasoning)) required.add('reasoning')
+  if (Array.isArray(body.tools) && body.tools.length > 0) required.add('toolCalls')
+
+  const stack: unknown[] = [body.tools, body.input, body.messages, body.contents, body.system]
+  while (stack.length > 0) {
+    const value = stack.pop()
+    if (Array.isArray(value)) {
+      for (const item of value) stack.push(item)
+      continue
+    }
+    const object = objectValue(value)
+    if (!object) continue
+    const type = typeof object.type === 'string' ? object.type.toLowerCase() : ''
+    if (type === 'function' || type === 'tool_use' || type === 'function_call') required.add('toolCalls')
+    if (type === 'web_search' || type === 'web_search_preview') required.add('webSearch')
+    if (type === 'image_generation') required.add('imageGeneration')
+    if (type === 'input_image' || type === 'image_url' || type === 'image'
+      || object.inlineData || object.inline_data || object.fileData || object.file_data) {
+      required.add('imageInput')
+    }
+    if (Object.hasOwn(object, 'cache_control')) required.add('promptCaching')
+    for (const [key, child] of Object.entries(object)) {
+      if (key === 'arguments' || key === 'input_schema' || key === 'parameters') continue
+      if (child && typeof child === 'object') stack.push(child)
+    }
+  }
+  return [...required]
+}
+
 function enabledHeader(value: string | string[] | undefined): boolean {
   const first = Array.isArray(value) ? value[0] : value
   if (typeof first !== 'string') return false
   const normalized = first.trim().toLowerCase()
   return Boolean(normalized) && !['0', 'false', 'no', 'off'].includes(normalized)
+}
+
+function headerText(value: string | string[] | undefined): string | undefined {
+  const first = Array.isArray(value) ? value[0] : value
+  if (typeof first !== 'string') return undefined
+  const trimmed = first.trim()
+  return trimmed || undefined
+}
+
+function codexTurnMetadataIndicatesSubagent(value: string | string[] | undefined): boolean {
+  const raw = headerText(value)
+  if (!raw) return false
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false
+    const metadata = parsed as Record<string, unknown>
+    return [metadata.subagent_kind, metadata.parent_thread_id]
+      .some((entry) => typeof entry === 'string' && Boolean(entry.trim()))
+  } catch {
+    return false
+  }
+}
+
+function isCodexSubagentRequest(request: IncomingMessage): boolean {
+  const explicitMarker = headerText(request.headers['x-openai-subagent'])
+  // Codex deliberately sends `false` for some primary-task auxiliary calls.
+  // Treat an explicit marker as authoritative; fallbacks are only for client
+  // versions/turns where the marker is omitted.
+  if (explicitMarker) return enabledHeader(explicitMarker)
+  if (codexTurnMetadataIndicatesSubagent(request.headers['x-codex-turn-metadata'])) return true
+  return Boolean(headerText(request.headers['x-codex-parent-thread-id']))
 }
 
 function getConversationName(request: IncomingMessage, body: JsonObject): string | undefined {

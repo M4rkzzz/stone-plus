@@ -1,15 +1,38 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { EventEmitter } from 'node:events'
-import type { Account, AppSnapshot, ProviderDefinition, PublicProxyDefinition, RequestLog, RouteClient } from '../../src/shared/types'
+import type { Account, AppSnapshot, PersistentTask, ProviderDefinition, PublicProxyDefinition, RequestLog, RouteClient } from '../../src/shared/types'
 import type { GatewayController } from '../../src/main/ipc/gateway-api'
-import type { GatewayAccountState } from '../../src/main/gateway'
+import type { GatewayAccountState, GatewayRuntimeStateUpdate } from '../../src/main/gateway'
 import { registerGatewayApi } from '../../src/main/ipc/gateway-api'
 import type { AppStore } from '../../src/main/store/app-store'
 import type { ClientConfigService } from '../../src/main/client-config'
 import type { OutboundTransportManager } from '../../src/main/proxy'
+import { OutboundReloadCoordinator } from '../../src/main/proxy/outbound-reload-coordinator'
 import type { ChatGptOAuthSessionController } from '../../src/main/auth/chatgpt-oauth-flow'
+import { PersistentTaskRunner } from '../../src/main/tasks'
 
 type InvokeHandler = (event: unknown, ...args: unknown[]) => unknown
+
+class MemoryPersistentTaskStore {
+  private readonly tasks = new Map<string, PersistentTask>()
+  listPersistentTasks(limit = 200): PersistentTask[] { return [...this.tasks.values()].slice(0, limit).map((task) => structuredClone(task)) }
+  getPersistentTask(id: string): PersistentTask | undefined { const task = this.tasks.get(id); return task ? structuredClone(task) : undefined }
+  async upsertPersistentTask(task: PersistentTask): Promise<void> { this.tasks.set(task.id, structuredClone(task)) }
+  async deletePersistentTask(id: string): Promise<void> { this.tasks.delete(id) }
+  async prunePersistentTasks(cutoff: number, maximumTerminalRows: number): Promise<number> {
+    const terminal = [...this.tasks.values()]
+      .filter((task) => ['completed', 'cancelled', 'failed'].includes(task.status))
+      .sort((left, right) => right.updatedAt - left.updatedAt)
+    const removed = new Set(terminal.filter((task, index) => task.updatedAt < cutoff || index >= maximumTerminalRows).map((task) => task.id))
+    for (const id of removed) this.tasks.delete(id)
+    return removed.size
+  }
+  async clearTerminalPersistentTasks(): Promise<number> {
+    const ids = [...this.tasks.values()].filter((task) => ['completed', 'cancelled', 'failed'].includes(task.status)).map((task) => task.id)
+    for (const id of ids) this.tasks.delete(id)
+    return ids.length
+  }
+}
 
 const electron = vi.hoisted(() => ({
   handlers: new Map<string, InvokeHandler>(),
@@ -140,10 +163,73 @@ describe('refresh provider models IPC', () => {
     const result = await handler({ senderFrame: mainFrame, sender: { mainFrame } })
 
     expect(result).toMatchObject({ targets: [{ summary: 'DIRECT', reachable: true }] })
-    expect(harness.transport.detectSystemProxy).toHaveBeenCalledWith([
-      'https://chatgpt.com',
-      'https://api.openai.com'
-    ])
+    expect(harness.transport.reloadSystemProxyConfiguration).toHaveBeenCalledOnce()
+    expect(harness.transport.detectSystemProxy).toHaveBeenCalledWith(expect.arrayContaining([
+      'https://chatgpt.com/backend-api/codex/responses',
+      'https://api.openai.com/v1/models',
+      'https://auth.openai.com/.well-known/openid-configuration',
+    ]))
+  })
+
+  it('detects only enabled route sources and preserves a custom upstream path for PAC routing', async () => {
+    const account = apiKeyAccount()
+    const harness = createHarness([account], { [account.credentialId]: 'sk-private' }, vi.fn())
+    const snapshot = harness.store.getSnapshot()
+    snapshot.providers[0].baseUrl = 'https://relay.example/custom/v1?tenant=stone'
+    snapshot.pools.push({
+      id: 'pool-custom-relay', name: 'Custom relay', kind: 'standard', protocol: 'openai-responses',
+      strategy: 'priority', members: [{ accountId: account.id, enabled: true, order: 0, weight: 1 }],
+      modelPolicy: 'all', modelAllowlist: [], stickySessions: false, stickyTtlMinutes: 30,
+      maxRetries: 0, forceFastMode: false, createdAt: 1, updatedAt: 1
+    })
+    const handler = electron.handlers.get('stone:detect-system-proxy')
+    if (!handler) throw new Error('detect-system-proxy handler was not registered')
+    const mainFrame = { url: 'http://127.0.0.1:5173/index.html' }
+
+    await handler({ senderFrame: mainFrame, sender: { mainFrame } })
+    expect(harness.transport.detectSystemProxy).not.toHaveBeenLastCalledWith(
+      expect.arrayContaining(['https://relay.example/custom/v1?tenant=stone'])
+    )
+
+    snapshot.routes.push({
+      id: 'route-custom-relay', client: 'codex', enabled: true, poolId: provider.id,
+      inboundProtocol: 'openai-responses', modelMap: {}, localToken: 'local-token',
+      createdAt: 1, updatedAt: 1
+    })
+    await handler({ senderFrame: mainFrame, sender: { mainFrame } })
+    expect(harness.transport.detectSystemProxy).toHaveBeenLastCalledWith(
+      expect.arrayContaining(['https://relay.example/custom/v1?tenant=stone'])
+    )
+  })
+
+  it('accepts a shared outbound reload coordinator without taking ownership of it', async () => {
+    const detection = { detectedAt: 9, targets: [] }
+    const reload = vi.fn(async () => undefined)
+    const detect = vi.fn(async () => detection)
+    const shared = new OutboundReloadCoordinator({
+      transport: {
+        reloadSystemProxyConfiguration: reload,
+        detectSystemProxy: detect
+      },
+      collectTargets: () => new Map()
+    })
+    const harness = createHarness(
+      [oauthAccount()],
+      {},
+      vi.fn(),
+      [],
+      { current: 'discovery-fingerprint' },
+      {} as ClientConfigService,
+      shared
+    )
+    const handler = electron.handlers.get('stone:detect-system-proxy')
+    if (!handler) throw new Error('detect-system-proxy handler was not registered')
+
+    await expect(handler(rendererEvent(404))).resolves.toBe(detection)
+    await harness.dispose()
+    await expect(shared.detectExternalSystemProxy()).resolves.toBe(detection)
+    expect(reload).toHaveBeenCalledTimes(2)
+    await shared.close()
   })
 
   it('repairs client configuration through its selected profile directory', async () => {
@@ -237,7 +323,168 @@ describe('refresh provider models IPC', () => {
     })
 
     expect(harness.transport.configureOutboundNetwork).toHaveBeenCalledWith('system', 15721)
+    expect(harness.transport.reloadSystemProxyConfiguration).toHaveBeenCalledOnce()
     expect(harness.gateway.stop).not.toHaveBeenCalled()
+  })
+
+  it('rechecks failure-cooled accounts on enabled implicit routes after system proxy activation', async () => {
+    const account = apiKeyAccount()
+    const upstreamFetch = vi.fn(async () => new Response('{}', {
+      status: 200,
+      headers: { 'content-type': 'application/json' }
+    }))
+    const harness = createHarness([account], { [account.credentialId]: 'sk-private' }, upstreamFetch)
+    const snapshot = harness.store.getSnapshot()
+    snapshot.pools.push({
+      id: 'pool-system-route', name: 'System route', kind: 'standard', protocol: 'openai-responses',
+      strategy: 'priority', members: [{ accountId: account.id, enabled: true, order: 0, weight: 1 }],
+      modelPolicy: 'all', modelAllowlist: [], stickySessions: false, stickyTtlMinutes: 30,
+      maxRetries: 0, forceFastMode: false, createdAt: 1, updatedAt: 1
+    })
+    snapshot.routes.push({
+      id: 'route-system', client: 'codex', enabled: true, poolId: 'pool-system-route',
+      inboundProtocol: 'openai-responses', modelMap: {}, localToken: 'local-token',
+      createdAt: 1, updatedAt: 1
+    })
+    Object.assign(account, {
+      status: 'cooldown' as const,
+      circuitState: 'open' as const,
+      cooldownReason: 'failure' as const,
+      cooldownUntil: Date.now() + 60_000,
+      consecutiveFailures: 2,
+      lastError: 'old direct-route failure'
+    })
+    const handler = electron.handlers.get('stone:update-gateway')
+    if (!handler) throw new Error('update-gateway handler was not registered')
+    const mainFrame = { url: 'http://127.0.0.1:5173/index.html' }
+
+    await handler({ senderFrame: mainFrame, sender: { mainFrame } }, {
+      host: '127.0.0.1', port: 15721, autoStart: false, logPayloads: false,
+      requestTimeoutSeconds: 120, outboundNetworkMode: 'system'
+    })
+
+    await vi.waitFor(() => expect(account).toMatchObject({
+      status: 'active', circuitState: 'closed', consecutiveFailures: 0
+    }))
+    expect(account.cooldownReason).toBeUndefined()
+    expect(upstreamFetch).toHaveBeenCalledOnce()
+    await harness.dispose()
+  })
+
+  it('serializes concurrent gateway setting updates across the complete restart lifecycle', async () => {
+    const harness = createHarness([oauthAccount()], {}, vi.fn())
+    const handler = electron.handlers.get('stone:update-gateway')
+    if (!handler) throw new Error('update-gateway handler was not registered')
+    const mainFrame = { url: 'http://127.0.0.1:5173/index.html' }
+    const event = { senderFrame: mainFrame, sender: { mainFrame } }
+    harness.store.getSnapshot().gatewayStatus.running = true
+    let releaseFirstStop!: () => void
+    vi.mocked(harness.gateway.stop).mockImplementationOnce(async () => {
+      await new Promise<void>((resolve) => { releaseFirstStop = resolve })
+    })
+    const gatewaySettings = (port: number) => ({
+      host: '127.0.0.1',
+      port,
+      autoStart: false,
+      logPayloads: false,
+      requestTimeoutSeconds: 120,
+    })
+
+    const first = handler(event, gatewaySettings(15722)) as Promise<AppSnapshot>
+    await vi.waitFor(() => expect(harness.gateway.stop).toHaveBeenCalledOnce())
+    const second = handler(event, gatewaySettings(15723)) as Promise<AppSnapshot>
+    await Promise.resolve()
+
+    expect(harness.store.updateGateway).toHaveBeenCalledOnce()
+    expect(harness.gateway.start).not.toHaveBeenCalled()
+    releaseFirstStop()
+    await Promise.all([first, second])
+
+    expect(harness.store.updateGateway).toHaveBeenCalledTimes(2)
+    expect(harness.gateway.stop).toHaveBeenCalledTimes(2)
+    expect(harness.gateway.start).toHaveBeenCalledTimes(2)
+    expect(harness.store.getSnapshot().gateway.port).toBe(15723)
+    expect(vi.mocked(harness.gateway.start).mock.invocationCallOrder[0])
+      .toBeLessThan(vi.mocked(harness.store.updateGateway).mock.invocationCallOrder[1])
+  })
+
+  it('continues the gateway lifecycle queue after an earlier update fails', async () => {
+    const harness = createHarness([oauthAccount()], {}, vi.fn())
+    const handler = electron.handlers.get('stone:update-gateway')
+    if (!handler) throw new Error('update-gateway handler was not registered')
+    const mainFrame = { url: 'http://127.0.0.1:5173/index.html' }
+    const event = { senderFrame: mainFrame, sender: { mainFrame } }
+    harness.store.getSnapshot().gatewayStatus.running = true
+    vi.mocked(harness.gateway.stop).mockRejectedValueOnce(new Error('temporary stop failure'))
+    const gatewaySettings = (port: number) => ({
+      host: '127.0.0.1',
+      port,
+      autoStart: false,
+      logPayloads: false,
+      requestTimeoutSeconds: 120,
+    })
+
+    const first = handler(event, gatewaySettings(15722)) as Promise<AppSnapshot>
+    const second = handler(event, gatewaySettings(15723)) as Promise<AppSnapshot>
+
+    await expect(first).rejects.toThrow('temporary stop failure')
+    await expect(second).resolves.toMatchObject({ gateway: { port: 15723 } })
+    expect(harness.store.updateGateway).toHaveBeenCalledTimes(2)
+    expect(harness.gateway.stop).toHaveBeenCalledTimes(2)
+    expect(harness.gateway.start).toHaveBeenCalledOnce()
+  })
+
+  it('forwards an explicit Responses compact capability through save-provider IPC', async () => {
+    const harness = createHarness([oauthAccount()], {}, vi.fn())
+    const handler = electron.handlers.get('stone:save-provider')
+    if (!handler) throw new Error('save-provider handler was not registered')
+    const mainFrame = { url: 'http://127.0.0.1:5173/index.html' }
+    const input = {
+      id: provider.id,
+      name: 'Relay',
+      sourceType: 'relay',
+      kind: 'openai-compatible',
+      baseUrl: 'https://relay.example/v1',
+      protocol: 'openai-responses',
+      models: [],
+      responsesCompactMode: 'passthrough'
+    }
+
+    await handler({ senderFrame: mainFrame, sender: { mainFrame } }, input)
+
+    expect(harness.store.saveProvider).toHaveBeenCalledWith(input)
+    expect(harness.gateway.updateConfig).toHaveBeenCalled()
+    expect(harness.store.getSnapshot().providers[0]).toMatchObject({
+      sourceType: 'relay',
+      responsesCompactMode: 'passthrough'
+    })
+  })
+
+  it('forwards an explicit Responses compact capability through the current API-source IPC', async () => {
+    const account = apiKeyAccount()
+    const harness = createHarness([account], {}, vi.fn())
+    const handler = electron.handlers.get('stone:save-api-source')
+    if (!handler) throw new Error('save-api-source handler was not registered')
+    const mainFrame = { url: 'http://127.0.0.1:5173/index.html' }
+    const input = {
+      id: provider.id,
+      name: 'Relay',
+      sourceType: 'relay',
+      kind: 'openai-compatible',
+      baseUrl: 'https://relay.example/v1',
+      protocol: 'openai-responses',
+      models: [],
+      priority: 1,
+      weight: 1,
+      maxConcurrency: 1,
+      responsesCompactMode: 'native'
+    }
+
+    await handler({ senderFrame: mainFrame, sender: { mainFrame } }, input)
+
+    expect(harness.store.saveApiSource).toHaveBeenCalledWith(input)
+    expect(harness.store.getSnapshot().providers[0]).toMatchObject({ responsesCompactMode: 'native' })
+    expect(harness.gateway.updateConfig).toHaveBeenCalled()
   })
 
   it('applies a FAST source toggle and refreshes the live gateway configuration', async () => {
@@ -676,7 +923,7 @@ describe('refresh provider models IPC', () => {
       }) as { sessionId: string }
       harness.store.getSnapshot().proxies = []
 
-      await expect(wait(owner, started.sessionId)).rejects.toThrow('选择的出口代理已被删除')
+      await expect(wait(owner, started.sessionId)).rejects.toThrow('选择的代理已被删除')
       expect(harness.transport.fetchFor).not.toHaveBeenCalled()
       expect(harness.store.importChatGptAccounts).not.toHaveBeenCalled()
     } finally {
@@ -696,12 +943,12 @@ describe('refresh provider models IPC', () => {
       poolId: null,
       proxyMode: 'proxy',
       proxyId: 'proxy-deleted-after-modal-open'
-    })).rejects.toThrow('出口代理已被删除')
+    })).rejects.toThrow('代理已被删除')
 
     expect(harness.store.importChatGptAccounts).not.toHaveBeenCalled()
   })
 
-  it('coalesces rapid request-log snapshots before publishing to the renderer', async () => {
+  it('coalesces rapid request-log deltas without building a full snapshot', async () => {
     vi.useFakeTimers()
     const send = vi.fn()
     electron.getAllWindows.mockReturnValue([{
@@ -719,15 +966,47 @@ describe('refresh provider models IPC', () => {
       await Promise.resolve()
       await Promise.resolve()
 
-      await vi.advanceTimersByTimeAsync(999)
-      expect(send).not.toHaveBeenCalled()
-      await vi.advanceTimersByTimeAsync(1)
+      await vi.advanceTimersByTimeAsync(50)
       expect(send).toHaveBeenCalledOnce()
+      expect(send).toHaveBeenCalledWith('stone:runtime-delta', expect.objectContaining({
+        requestLogs: [expect.objectContaining({ id: 'log' }), expect.objectContaining({ id: 'log-2' })]
+      }))
       expect(harness.store.appendLog).toHaveBeenCalledTimes(2)
       expect(harness.gateway.updateConfig).not.toHaveBeenCalled()
       expect(harness.runtimeChanged).not.toHaveBeenCalled()
     } finally {
       electron.getAllWindows.mockReturnValue([])
+      vi.useRealTimers()
+    }
+  })
+
+  it('checkpoints long live requests once per interval instead of persisting every progress event', async () => {
+    vi.useFakeTimers()
+    try {
+      const harness = createHarness([oauthAccount()], {}, vi.fn())
+      const needsCheckpoint = vi.mocked(harness.store.hasUncheckpointedLiveRequestLogs)
+      const checkpoint = vi.mocked(harness.store.checkpointLiveRequestLogs)
+      needsCheckpoint.mockReturnValue(true)
+      checkpoint.mockImplementation(async () => {
+        needsCheckpoint.mockReturnValue(false)
+        return 1
+      })
+      const log = {
+        id: 'long-live-log', timestamp: Date.now(), client: 'codex', protocol: 'openai-responses',
+        providerName: 'OpenAI', accountName: 'Account', model: 'gpt', status: 'streaming', latencyMs: 10
+      } satisfies RequestLog
+
+      for (let index = 0; index < 100; index += 1) {
+        harness.emitLog({ ...log, latencyMs: index })
+      }
+      expect(harness.store.appendLog).toHaveBeenCalledTimes(100)
+      expect(checkpoint).not.toHaveBeenCalled()
+
+      await vi.advanceTimersByTimeAsync(9_999)
+      expect(checkpoint).not.toHaveBeenCalled()
+      await vi.advanceTimersByTimeAsync(1)
+      expect(checkpoint).toHaveBeenCalledOnce()
+    } finally {
       vi.useRealTimers()
     }
   })
@@ -745,6 +1024,8 @@ describe('refresh provider models IPC', () => {
       vi.mocked(harness.gateway.getAccountInFlight).mockReturnValue({ [oauth.id]: 1 })
 
       harness.emitRuntimeState()
+      expect(send).not.toHaveBeenCalled()
+      await vi.advanceTimersByTimeAsync(0)
       expect(send).toHaveBeenCalledOnce()
       expect(send.mock.calls[0][1].accounts.find((account: Account) => account.id === oauth.id)?.inFlight).toBe(1)
 
@@ -761,7 +1042,7 @@ describe('refresh provider models IPC', () => {
     }
   })
 
-  it('suppresses hidden live telemetry but always publishes the terminal request snapshot', async () => {
+  it('does not build or send live and terminal telemetry while the renderer is hidden', async () => {
     vi.useFakeTimers()
     const send = vi.fn()
     electron.getAllWindows.mockReturnValue([{
@@ -772,12 +1053,18 @@ describe('refresh provider models IPC', () => {
     }])
     try {
       const harness = createHarness([oauthAccount()], {}, vi.fn())
+      const getSnapshot = electron.handlers.get('stone:get-snapshot')
+      if (!getSnapshot) throw new Error('get-snapshot handler was not registered')
+      const mainFrame = { url: 'http://127.0.0.1:5173/index.html' }
+      const event = { senderFrame: mainFrame, sender: { mainFrame } }
+      const before = await getSnapshot(event) as AppSnapshot
       const appendLog = vi.mocked(harness.store.appendLog)
       appendLog.mockImplementation(async (log) => {
         const snapshot = harness.store.getSnapshot()
         const index = snapshot.requestLogs.findIndex((candidate) => candidate.id === log.id)
         if (index >= 0) snapshot.requestLogs[index] = log
         else snapshot.requestLogs.unshift(log)
+        return log
       })
       const liveLog = {
         id: 'hidden-log', timestamp: Date.now(), startedAt: Date.now(), client: 'codex', protocol: 'openai-responses',
@@ -790,10 +1077,49 @@ describe('refresh provider models IPC', () => {
       harness.emitLog({ ...liveLog, timestamp: Date.now() + 20, status: 'success', statusCode: 200, latencyMs: 30 })
       await Promise.resolve()
       await Promise.resolve()
+      await vi.advanceTimersByTimeAsync(0)
 
-      expect(send).toHaveBeenCalledOnce()
-      expect(send.mock.calls[0][1].requestLogs).toContainEqual(expect.objectContaining({
-        id: 'hidden-log', status: 'success', statusCode: 200
+      expect(send).not.toHaveBeenCalled()
+      const after = await getSnapshot(event) as AppSnapshot
+      expect(after.runtimeRevision).toBeGreaterThan(before.runtimeRevision ?? -1)
+    } finally {
+      electron.getAllWindows.mockReturnValue([])
+      vi.useRealTimers()
+    }
+  })
+
+  it('retries a failed terminal write and publishes completion only after it is durable', async () => {
+    vi.useFakeTimers()
+    const send = vi.fn()
+    electron.getAllWindows.mockReturnValue([{
+      isDestroyed: () => false,
+      isVisible: () => true,
+      isMinimized: () => false,
+      webContents: { send }
+    }])
+    try {
+      const harness = createHarness([oauthAccount()], {}, vi.fn())
+      const appendLog = vi.mocked(harness.store.appendLog)
+      appendLog.mockRejectedValueOnce(new Error('database busy')).mockImplementation(async (log) => log)
+      const terminal = {
+        id: 'durable-terminal', timestamp: Date.now(), startedAt: Date.now(),
+        client: 'codex', protocol: 'openai-responses', providerName: 'OpenAI',
+        accountName: 'Account', model: 'gpt', status: 'success', statusCode: 200, latencyMs: 10
+      } satisfies RequestLog
+
+      harness.emitLog(terminal)
+      await Promise.resolve()
+      expect(send).not.toHaveBeenCalled()
+      await vi.advanceTimersByTimeAsync(249)
+      expect(appendLog).toHaveBeenCalledOnce()
+      await vi.advanceTimersByTimeAsync(1)
+      await Promise.resolve()
+      await Promise.resolve()
+      await vi.advanceTimersByTimeAsync(50)
+
+      expect(appendLog).toHaveBeenCalledTimes(2)
+      expect(send).toHaveBeenCalledWith('stone:runtime-delta', expect.objectContaining({
+        requestLogs: [expect.objectContaining({ id: terminal.id, status: 'success' })]
       }))
     } finally {
       electron.getAllWindows.mockReturnValue([])
@@ -801,12 +1127,66 @@ describe('refresh provider models IPC', () => {
     }
   })
 
+  it('tombstones pending terminal ids when logs are cleared and ignores their late completion', async () => {
+    const harness = createHarness([oauthAccount()], {}, vi.fn())
+    const appendLog = vi.mocked(harness.store.appendLog)
+    let resolveWrite!: (log: RequestLog | undefined) => void
+    appendLog.mockReturnValueOnce(new Promise((resolve) => { resolveWrite = resolve }))
+    const terminal = {
+      id: 'clear-pending-terminal', timestamp: Date.now(), startedAt: Date.now(),
+      client: 'codex', protocol: 'openai-responses', providerName: 'OpenAI',
+      accountName: 'Account', model: 'gpt', status: 'success', statusCode: 200, latencyMs: 10
+    } satisfies RequestLog
+    harness.emitLog(terminal)
+    const clear = electron.handlers.get('stone:clear-logs')
+    if (!clear) throw new Error('clear-logs handler was not registered')
+
+    await clear(rendererEvent(301))
+    expect(harness.store.clearLogs).toHaveBeenCalledWith(['clear-pending-terminal'])
+    resolveWrite(terminal)
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(appendLog).toHaveBeenCalledOnce()
+    await harness.dispose()
+  })
+
+  it('retries terminal durability during shutdown and unsubscribes every gateway listener', async () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    const harness = createHarness([oauthAccount()], {}, vi.fn())
+    const appendLog = vi.mocked(harness.store.appendLog)
+    appendLog
+      .mockRejectedValueOnce(new Error('database busy before shutdown'))
+      .mockRejectedValueOnce(new Error('database busy during shutdown'))
+      .mockImplementation(async (log) => log)
+    const terminal = {
+      id: 'shutdown-retry-terminal', timestamp: Date.now(), startedAt: Date.now(),
+      client: 'codex', protocol: 'openai-responses', providerName: 'OpenAI',
+      accountName: 'Account', model: 'gpt', status: 'success', statusCode: 200, latencyMs: 10
+    } satisfies RequestLog
+    try {
+      harness.emitLog(terminal)
+      await vi.waitFor(() => expect(appendLog).toHaveBeenCalledOnce())
+      await harness.dispose()
+
+      expect(appendLog).toHaveBeenCalledTimes(3)
+      expect(appendLog.mock.calls.at(-1)?.[0]).toEqual(terminal)
+      expect(harness.unsubscribers.log).toHaveBeenCalledOnce()
+      expect(harness.unsubscribers.accountState).toHaveBeenCalledOnce()
+      expect(harness.unsubscribers.runtimeState).toHaveBeenCalledOnce()
+    } finally {
+      errorSpy.mockRestore()
+    }
+  })
+
   it('reconciles orphaned live logs only after pending terminal writes settle', async () => {
     const harness = createHarness([oauthAccount()], {}, vi.fn())
     const appendLog = vi.mocked(harness.store.appendLog)
     const finalize = vi.mocked(harness.store.finalizeOrphanedStreamingLogs)
-    appendLog.mockImplementation(async () => undefined)
-    finalize.mockResolvedValue(true)
+    appendLog.mockImplementation(async (log) => log)
+    finalize.mockResolvedValue([{
+      id: 'possibly-orphaned', timestamp: Date.now(), client: 'codex', protocol: 'openai-responses',
+      providerName: 'OpenAI', accountName: 'Account', model: 'gpt', status: 'error', latencyMs: 10
+    }])
 
     harness.emitLog({
       id: 'possibly-orphaned',
@@ -838,12 +1218,40 @@ describe('refresh provider models IPC', () => {
       await vi.advanceTimersByTimeAsync(249)
       expect(harness.store.updateAccountRuntimeState).not.toHaveBeenCalled()
       await vi.advanceTimersByTimeAsync(1)
-      expect(harness.store.updateAccountRuntimeState).toHaveBeenCalledOnce()
-      expect(harness.store.updateAccountRuntimeState).toHaveBeenCalledWith(oauth.id, expect.objectContaining({
-        latencyMs: 80,
-        lastUsedAt: 2_000
-      }))
+      expect(harness.store.updateAccountRuntimeStates).toHaveBeenCalledOnce()
+      expect(harness.store.updateAccountRuntimeStates).toHaveBeenCalledWith([
+        expect.objectContaining({
+          id: oauth.id,
+          patch: expect.objectContaining({ latencyMs: 80, lastUsedAt: 2_000 })
+        })
+      ])
       expect(harness.gateway.updateConfig).not.toHaveBeenCalled()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('patches quota on the affected gateway account without replaying full history', async () => {
+    vi.useFakeTimers()
+    try {
+      const oauth = oauthAccount()
+      const harness = createHarness([oauth], {}, vi.fn())
+      harness.emitAccountState({
+        ...activeAccountState(oauth.id, 80, 2_000),
+        quota: {
+          requests: { limit: 100, remaining: 75 },
+          observedAt: 2_000
+        }
+      })
+
+      await vi.advanceTimersByTimeAsync(250)
+
+      expect(harness.gateway.updateRuntimeAccounts).toHaveBeenCalledOnce()
+      expect(harness.gateway.updateRuntimeAccounts).toHaveBeenCalledWith([
+        expect.objectContaining({ id: oauth.id })
+      ])
+      expect(harness.gateway.updateConfig).not.toHaveBeenCalled()
+      expect(harness.store.getAccountFitnessHistory).not.toHaveBeenCalled()
     } finally {
       vi.useRealTimers()
     }
@@ -931,6 +1339,190 @@ describe('refresh provider models IPC', () => {
     expect(oauth.cooldownUntil).toBeLessThanOrEqual(Date.now() + resetAfterSeconds * 1_000)
   })
 
+  it('runs bulk account checks as a durable credential-free task', async () => {
+    const oauth = oauthAccount()
+    const upstreamFetch = vi.fn(async () => new Response(JSON.stringify({
+      rate_limit: {
+        allowed: true,
+        limit_reached: false,
+        primary_window: { used_percent: 20, limit_window_seconds: 18_000 },
+        secondary_window: { used_percent: 30, limit_window_seconds: 604_800 }
+      }
+    }), { status: 200, headers: { 'content-type': 'application/json' } }))
+    const harness = createHarness([oauth], { [oauth.credentialId]: oauthCredential() }, upstreamFetch)
+    const handler = electron.handlers.get('stone:start-account-check-task')
+    if (!handler) throw new Error('start-account-check-task handler was not registered')
+    const mainFrame = { url: 'http://127.0.0.1:5173/index.html' }
+
+    const started = await handler({ senderFrame: mainFrame, sender: { mainFrame } }, [oauth.id]) as PersistentTask
+    await vi.waitFor(() => expect(harness.taskRunner.get(started.id)?.status).toBe('completed'))
+    const completed = harness.taskRunner.get(started.id)!
+    expect(completed).toMatchObject({
+      kind: 'account.bulk-check',
+      status: 'completed',
+      payload: { accountIds: [oauth.id] },
+      result: { checked: 1, succeeded: 1, failed: 0, skipped: 0 },
+      progress: { completed: 1, total: 1, percent: 100 }
+    })
+    expect(JSON.stringify(completed.payload)).not.toContain('oauth-access-private')
+  })
+
+  it('checks quota-exhausted accounts after non-exhausted accounts', async () => {
+    const available = apiKeyAccount()
+    const exhausted = {
+      ...apiKeyAccount(),
+      id: 'account-api-key-exhausted',
+      name: 'Exhausted API key',
+      credentialId: 'credential-api-key-exhausted',
+      status: 'cooldown' as const,
+      circuitState: 'open' as const,
+      cooldownReason: 'quota' as const,
+      quotaRemaining: 0,
+      quotaUnit: 'percent' as const,
+    }
+    const upstreamFetch = vi.fn(async () => new Response('{}', {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    }))
+    const harness = createHarness(
+      [exhausted, available],
+      {
+        [available.credentialId]: 'sk-available',
+        [exhausted.credentialId]: 'sk-exhausted',
+      },
+      upstreamFetch,
+    )
+    const handler = electron.handlers.get('stone:start-account-check-task')
+    if (!handler) throw new Error('start-account-check-task handler was not registered')
+    const mainFrame = { url: 'http://127.0.0.1:5173/index.html' }
+
+    const started = await handler(
+      { senderFrame: mainFrame, sender: { mainFrame } },
+      [exhausted.id, available.id],
+    ) as PersistentTask
+    await vi.waitFor(() => expect(harness.taskRunner.get(started.id)?.status).toBe('completed'))
+
+    const completed = harness.taskRunner.get(started.id)!
+    expect(completed).toMatchObject({
+      payload: { accountIds: [available.id, exhausted.id] },
+      result: { checked: 2, succeeded: 2, failed: 0, skipped: 0 },
+    })
+    const checkingOrder = vi.mocked(harness.store.setAccountCheckResult).mock.calls
+      .filter(([, patch]) => (patch as Partial<Account>).status === 'checking')
+      .map(([id]) => id)
+    expect(checkingOrder).toEqual([available.id, exhausted.id])
+    expect(upstreamFetch).toHaveBeenCalledTimes(2)
+  })
+
+  it('starts a bulk check when every selected account is quota exhausted', async () => {
+    const exhausted = {
+      ...oauthAccount(),
+      status: 'cooldown' as const,
+      circuitState: 'open' as const,
+      cooldownReason: 'quota' as const,
+      codexQuota: {
+        allowed: false,
+        limitReached: true,
+        fiveHour: { usedPercent: 100, resetAt: Date.now() + 3_600_000 },
+        observedAt: Date.now(),
+      },
+    }
+    const upstreamFetch = vi.fn(async () => new Response(JSON.stringify({
+      rate_limit: {
+        allowed: false,
+        limit_reached: true,
+        primary_window: {
+          used_percent: 100,
+          limit_window_seconds: 18_000,
+          reset_after_seconds: 3_600,
+        },
+      },
+    }), { status: 200, headers: { 'content-type': 'application/json' } }))
+    const harness = createHarness(
+      [exhausted],
+      { [exhausted.credentialId]: oauthCredential() },
+      upstreamFetch,
+    )
+    const handler = electron.handlers.get('stone:start-account-check-task')
+    if (!handler) throw new Error('start-account-check-task handler was not registered')
+    const mainFrame = { url: 'http://127.0.0.1:5173/index.html' }
+
+    const started = await handler(
+      { senderFrame: mainFrame, sender: { mainFrame } },
+      [exhausted.id],
+    ) as PersistentTask
+    await vi.waitFor(() => expect(harness.taskRunner.get(started.id)?.status).toBe('completed'))
+
+    expect(harness.taskRunner.get(started.id)).toMatchObject({
+      payload: { accountIds: [exhausted.id] },
+      result: { checked: 1, succeeded: 0, failed: 1, skipped: 0 },
+    })
+    expect(upstreamFetch).toHaveBeenCalledOnce()
+  })
+
+  it('aborts an in-flight durable account probe without recording a health failure', async () => {
+    const oauth = oauthAccount()
+    const upstreamFetch = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      return await new Promise<Response>((_resolve, reject) => {
+        const signal = init?.signal
+        if (signal?.aborted) return reject(signal.reason)
+        signal?.addEventListener('abort', () => reject(signal.reason), { once: true })
+      })
+    })
+    const harness = createHarness([oauth], { [oauth.credentialId]: oauthCredential() }, upstreamFetch)
+    const handler = electron.handlers.get('stone:start-account-check-task')
+    if (!handler) throw new Error('start-account-check-task handler was not registered')
+    const mainFrame = { url: 'http://127.0.0.1:5173/index.html' }
+
+    const started = await handler({ senderFrame: mainFrame, sender: { mainFrame } }, [oauth.id]) as PersistentTask
+    await vi.waitFor(() => expect(upstreamFetch).toHaveBeenCalledTimes(1))
+    await harness.taskRunner.cancel(started.id)
+
+    await vi.waitFor(() => expect(oauth.status).toBe('active'))
+    expect(harness.taskRunner.get(started.id)?.status).toBe('cancelled')
+    expect(harness.store.setAccountCheckResult).not.toHaveBeenCalledWith(
+      oauth.id,
+      expect.objectContaining({ status: 'disabled' }),
+    )
+    expect(harness.store.setAccountCheckResult).toHaveBeenLastCalledWith(
+      oauth.id,
+      expect.objectContaining({ status: 'active', consecutiveFailures: 0 }),
+    )
+    expect(upstreamFetch).toHaveBeenCalledOnce()
+  })
+
+  it('does not let an older account probe overwrite a newer health result', async () => {
+    const account = apiKeyAccount()
+    const replies: Array<(response: Response) => void> = []
+    const upstreamFetch = vi.fn(() => new Promise<Response>((resolve) => replies.push(resolve)))
+    const harness = createHarness(
+      [account],
+      { [account.credentialId]: 'sk-api-private' },
+      upstreamFetch,
+    )
+    const handler = electron.handlers.get('stone:check-account')
+    if (!handler) throw new Error('check-account handler was not registered')
+    const mainFrame = { url: 'http://127.0.0.1:5173/index.html' }
+    const event = { senderFrame: mainFrame, sender: { mainFrame } }
+
+    const older = handler(event, account.id) as Promise<AppSnapshot>
+    await vi.waitFor(() => expect(upstreamFetch).toHaveBeenCalledTimes(1))
+    const newer = handler(event, account.id) as Promise<AppSnapshot>
+    await vi.waitFor(() => expect(upstreamFetch).toHaveBeenCalledTimes(2))
+
+    replies[1](new Response('{}', { status: 200 }))
+    await newer
+    expect(account).toMatchObject({ status: 'active', circuitState: 'closed', consecutiveFailures: 0 })
+
+    replies[0](new Response(JSON.stringify({ error: 'stale rejection' }), { status: 401 }))
+    await older
+    expect(account).toMatchObject({ status: 'active', circuitState: 'closed', consecutiveFailures: 0 })
+    expect(harness.store.setAccountCheckResult).not.toHaveBeenCalledWith(
+      account.id,
+      expect.objectContaining({ status: 'disabled', lastError: expect.any(String) }),
+    )
+  })
+
   it('does not let delayed success telemetry re-enable a manually disabled account', async () => {
     vi.useFakeTimers()
     try {
@@ -946,6 +1538,48 @@ describe('refresh provider models IPC', () => {
     } finally {
       vi.useRealTimers()
     }
+  })
+
+  it('serializes a cooldown followed by recovery so the older write cannot win', async () => {
+    const oauth = oauthAccount()
+    const harness = createHarness([oauth], {}, vi.fn())
+    const updateState = vi.mocked(harness.store.updateAccountRuntimeState)
+    const applyState = updateState.getMockImplementation()
+    if (!applyState) throw new Error('Account runtime-state mock is unavailable')
+    let releaseCooldown!: () => void
+    const cooldownGate = new Promise<void>((resolve) => { releaseCooldown = resolve })
+    updateState.mockImplementationOnce(async (...args) => {
+      await cooldownGate
+      await applyState(...args)
+    })
+
+    harness.emitAccountState({
+      accountId: oauth.id,
+      status: 'cooldown',
+      circuitState: 'open',
+      consecutiveFailures: 1,
+      cooldownReason: 'failure',
+      cooldownUntil: Date.now() + 30_000,
+      lastError: 'temporary upstream failure'
+    })
+    harness.emitAccountState(activeAccountState(oauth.id, 70, 3_000))
+    // A routine active telemetry update must not supersede the queued recovery's
+    // health side effects while the older cooldown write is still blocked.
+    harness.emitAccountState(activeAccountState(oauth.id, 60, 3_100))
+
+    expect(updateState).toHaveBeenCalledOnce()
+    releaseCooldown()
+    await vi.waitFor(() => expect(updateState).toHaveBeenCalledTimes(2))
+    await vi.waitFor(() => expect(oauth).toMatchObject({
+      status: 'active',
+      circuitState: 'closed',
+      consecutiveFailures: 0
+    }))
+    expect(oauth.cooldownReason).toBeUndefined()
+    expect(harness.gateway.updateRuntimeAccounts).toHaveBeenLastCalledWith([
+      expect.objectContaining({ id: oauth.id, status: 'active', circuitState: 'closed' })
+    ])
+    await harness.dispose()
   })
 
   it('uses the ChatGPT Codex model catalog with the unpacked OAuth credential', async () => {
@@ -1183,18 +1817,27 @@ function createHarness(
   upstreamFetch: ReturnType<typeof vi.fn>,
   proxies: PublicProxyDefinition[] = [],
   discoveryFingerprint: { current: string } = { current: 'discovery-fingerprint' },
-  clientConfigService: ClientConfigService = {} as ClientConfigService
+  clientConfigService: ClientConfigService = {} as ClientConfigService,
+  sharedOutboundReloadCoordinator?: OutboundReloadCoordinator
 ): {
   store: AppStore
   gateway: GatewayController
   transport: OutboundTransportManager
   emitLog: (log: RequestLog) => void
   emitAccountState: (state: GatewayAccountState) => void
-  emitRuntimeState: () => void
+  emitRuntimeState: (update?: GatewayRuntimeStateUpdate) => void
   runtimeChanged: ReturnType<typeof vi.fn>
   oauthFlow: ChatGptOAuthSessionController
+  taskRunner: PersistentTaskRunner
   dispose: () => Promise<void>
+  unsubscribers: {
+    log: ReturnType<typeof vi.fn>
+    accountState: ReturnType<typeof vi.fn>
+    runtimeState: ReturnType<typeof vi.fn>
+  }
 } {
+  const taskRunner = new PersistentTaskRunner(new MemoryPersistentTaskStore())
+  void taskRunner.recover()
   const snapshot = {
     providers: [{ ...provider, models: [] }],
     accounts: accounts.map(({ credentialId: _credentialId, chatgptAccountId: _chatgptAccountId, ...account }) => account),
@@ -1218,7 +1861,16 @@ function createHarness(
     vaultBackend: 'test'
   } as unknown as AppSnapshot
 
+  const setAccountCheckResult = vi.fn(async (id: string, patch: Partial<Account>) => {
+    const runtimeAccount = accounts.find((account) => account.id === id)
+    if (runtimeAccount) Object.assign(runtimeAccount, patch)
+    const publicAccount = snapshot.accounts.find((account) => account.id === id)
+    if (publicAccount) Object.assign(publicAccount, patch)
+    return snapshot
+  })
+
   const store = {
+    getPersistentTaskRunner: vi.fn(() => taskRunner),
     getSnapshot: vi.fn(() => snapshot),
     getAccountFitnessHistory: vi.fn(() => snapshot.requestLogs),
     getRuntimeConfiguration: vi.fn(() => ({
@@ -1232,6 +1884,25 @@ function createHarness(
     getRuntimeAccounts: vi.fn(() => accounts),
     getRuntimeAccount: vi.fn((id: string) => accounts.find((account) => account.id === id)),
     getRuntimeProxies: vi.fn(() => proxies),
+    saveProvider: vi.fn(async (input: Record<string, unknown>) => {
+      snapshot.providers[0] = { ...snapshot.providers[0], ...input } as ProviderDefinition
+      return snapshot
+    }),
+    saveApiSource: vi.fn(async (input: Record<string, unknown>) => {
+      snapshot.providers[0] = { ...snapshot.providers[0], ...input } as ProviderDefinition
+      return {
+        snapshot,
+        source: {
+          sourceId: provider.id,
+          providerId: provider.id,
+          accountId: accounts[0]?.id ?? 'account',
+          credentialId: accounts[0]?.credentialId ?? 'credential',
+          created: false,
+          credentialChanged: false,
+          connectionChanged: false
+        }
+      }
+    }),
     setRouteSourceFastMode: vi.fn(async () => snapshot),
     setRouteSource: vi.fn(async (client: RouteClient, sourceId: string) => {
       const route = snapshot.routes.find((candidate) => candidate.client === client)
@@ -1264,12 +1935,15 @@ function createHarness(
         warnings: []
       }
     }),
-    setAccountCheckResult: vi.fn(async (id: string, patch: Partial<Account>) => {
-      const runtimeAccount = accounts.find((account) => account.id === id)
-      if (runtimeAccount) Object.assign(runtimeAccount, patch)
-      const publicAccount = snapshot.accounts.find((account) => account.id === id)
-      if (publicAccount) Object.assign(publicAccount, patch)
-      return snapshot
+    setAccountCheckResult,
+    setAccountCheckResultIf: vi.fn(async (
+      id: string,
+      patch: Partial<Account>,
+      isCurrent: () => boolean,
+    ) => {
+      if (!isCurrent()) return { applied: false, snapshot }
+      await setAccountCheckResult(id, patch)
+      return { applied: true, snapshot }
     }),
     setProviderModels: vi.fn(async (_id: string, models: string[]) => {
       snapshot.providers[0].models = models
@@ -1294,46 +1968,72 @@ function createHarness(
     }),
     setGatewayStatus: vi.fn(),
     updateGateway: vi.fn(async (settings) => {
-      Object.assign(snapshot.gateway, settings)
+      snapshot.gateway = { ...snapshot.gateway, ...settings }
       return snapshot
     }),
-    appendLog: vi.fn(async () => undefined),
-    finalizeOrphanedStreamingLogs: vi.fn(async () => false),
+    getPublicRuntimeAccounts: vi.fn((ids?: ReadonlySet<string>) => snapshot.accounts.filter((account) => !ids || ids.has(account.id))),
+    getRuntimeObservability: vi.fn(() => snapshot.observability),
+    getRuntimeGatewaySettings: vi.fn(() => snapshot.gateway),
+    persistHealthEvent: vi.fn(async (event) => event),
+    appendLog: vi.fn(async (log: RequestLog) => log),
+    clearLogs: vi.fn(async () => {
+      snapshot.requestLogs = []
+      return snapshot
+    }),
+    hasLiveRequestLogs: vi.fn(() => false),
+    hasUncheckpointedLiveRequestLogs: vi.fn(() => false),
+    checkpointLiveRequestLogs: vi.fn(async () => 0),
+    finalizeOrphanedStreamingLogs: vi.fn(async () => []),
     updateAccountRuntimeState: vi.fn(async (id: string, patch: Partial<Account>) => {
       const runtimeAccount = accounts.find((account) => account.id === id)
       if (runtimeAccount) Object.assign(runtimeAccount, patch)
     }),
+    updateAccountRuntimeStates: vi.fn(async (updates: Array<{ id: string; patch: Partial<Account> }>) => {
+      for (const { id, patch } of updates) {
+        const runtimeAccount = accounts.find((account) => account.id === id)
+        if (runtimeAccount) Object.assign(runtimeAccount, patch)
+      }
+    }),
     getRuntimeProvider: vi.fn((id: string) => snapshot.providers.find((candidate) => candidate.id === id)),
+    getApiSourceProbeConnectionFingerprint: vi.fn(() => 'connection-fingerprint'),
+    saveApiSourceCapabilityProbe: vi.fn(async () => snapshot),
     appendHealthEvent: vi.fn(async () => snapshot)
   } as unknown as AppStore
   let logListener: ((log: RequestLog) => void) | undefined
   let accountStateListener: ((state: GatewayAccountState) => void) | undefined
-  let runtimeStateListener: (() => void) | undefined
+  let runtimeStateListener: ((update?: GatewayRuntimeStateUpdate) => void) | undefined
+  const unsubscribeLog = vi.fn()
+  const unsubscribeAccountState = vi.fn()
+  const unsubscribeRuntimeState = vi.fn()
   const gateway = {
     start: vi.fn(async () => undefined),
     stop: vi.fn(async () => undefined),
     getStatus: vi.fn(() => snapshot.gatewayStatus),
     updateConfig: vi.fn(),
+    updateRuntimeAccounts: vi.fn(),
     resetAccountHealth: vi.fn(),
     getAccountFitness: vi.fn(() => ({})),
-    getAccountInFlight: vi.fn(() => Object.fromEntries(accounts.map((account) => [account.id, account.inFlight]))),
+    getAccountInFlight: vi.fn((ids?: readonly string[]) => Object.fromEntries(accounts
+      .filter((account) => !ids || ids.includes(account.id))
+      .map((account) => [account.id, account.inFlight]))),
     onLog: vi.fn((listener: (log: RequestLog) => void) => {
       logListener = listener
-      return () => undefined
+      return unsubscribeLog
     }),
     onAccountState: vi.fn((listener: (state: GatewayAccountState) => void) => {
       accountStateListener = listener
-      return () => undefined
+      return unsubscribeAccountState
     }),
-    onRuntimeState: vi.fn((listener: () => void) => {
+    onRuntimeState: vi.fn((listener: (update?: GatewayRuntimeStateUpdate) => void) => {
       runtimeStateListener = listener
-      return () => undefined
+      return unsubscribeRuntimeState
     })
   } as unknown as GatewayController
   const transport = {
     fetchFor: vi.fn(() => upstreamFetch as unknown as typeof fetch),
     configureOutboundNetwork: vi.fn(),
     invalidateSystemProxyCache: vi.fn(),
+    reloadSystemProxyConfiguration: vi.fn(async () => undefined),
     detectSystemProxy: vi.fn(async () => ({
       detectedAt: Date.now(),
       targets: [{ target: 'https://chatgpt.com', summary: 'DIRECT', reachable: true }]
@@ -1374,7 +2074,9 @@ function createHarness(
     undefined,
     runtimeChanged,
     undefined,
-    oauthFlow
+    oauthFlow,
+    undefined,
+    sharedOutboundReloadCoordinator
   )
   return {
     store,
@@ -1382,7 +2084,13 @@ function createHarness(
     transport,
     runtimeChanged,
     oauthFlow,
+    taskRunner,
     dispose,
+    unsubscribers: {
+      log: unsubscribeLog,
+      accountState: unsubscribeAccountState,
+      runtimeState: unsubscribeRuntimeState
+    },
     emitLog: (log) => {
       if (!logListener) throw new Error('Gateway log listener was not registered')
       logListener(log)
@@ -1391,9 +2099,9 @@ function createHarness(
       if (!accountStateListener) throw new Error('Gateway account-state listener was not registered')
       accountStateListener(state)
     },
-    emitRuntimeState: () => {
+    emitRuntimeState: (update) => {
       if (!runtimeStateListener) throw new Error('Gateway runtime-state listener was not registered')
-      runtimeStateListener()
+      runtimeStateListener(update)
     }
   }
 }

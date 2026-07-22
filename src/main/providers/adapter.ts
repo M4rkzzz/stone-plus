@@ -185,9 +185,9 @@ async function fetchProbe(
 }
 
 function probeSignal(input: ProviderProbeInput): AbortSignal | undefined {
-  return input.signal ?? (input.timeoutMs === 0
-    ? undefined
-    : AbortSignal.timeout(input.timeoutMs ?? 10_000))
+  if (input.timeoutMs === 0) return input.signal
+  const timeout = AbortSignal.timeout(input.timeoutMs ?? 10_000)
+  return input.signal ? AbortSignal.any([input.signal, timeout]) : timeout
 }
 
 function withCursor(endpoint: string, cursor: ModelDiscoveryCursor | undefined): string {

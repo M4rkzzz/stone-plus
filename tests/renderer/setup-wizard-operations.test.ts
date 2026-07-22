@@ -1,6 +1,11 @@
 import { describe, expect, it, vi } from 'vitest'
-import type { AppSnapshot, Pool, PublicAccount } from '../../src/shared/types'
-import { confirmSetupWizardAction, persistSetupWizardSourceProxy } from '../../src/renderer/src/setup-wizard-operations'
+import type { ApiSourceInput, AppSnapshot, Pool, PublicAccount } from '../../src/shared/types'
+import {
+  captureSetupSourceProbeBinding,
+  confirmSetupWizardAction,
+  persistSetupWizardSourceProxy,
+  setupSourceProbeMatches,
+} from '../../src/renderer/src/setup-wizard-operations'
 
 const account: PublicAccount = {
   id: 'account-1',
@@ -22,6 +27,26 @@ const account: PublicAccount = {
 }
 
 describe('setup wizard operations', () => {
+  it('invalidates a source probe when any tested connection or capability field changes', () => {
+    const draft: ApiSourceInput = {
+      name: 'Relay', sourceType: 'relay', kind: 'openai-compatible', baseUrl: 'https://relay.example/v1',
+      protocol: 'openai-responses', responsesCompactMode: 'legacy', credential: 'secret', models: [],
+      defaultModel: 'gpt-test', priority: 10, weight: 10, maxConcurrency: 4, proxyId: 'proxy-1',
+    }
+    const binding = captureSetupSourceProbeBinding(draft, 'proxy-1', 'gpt-test')
+    expect(setupSourceProbeMatches(binding, draft, 'proxy-1', 'gpt-test')).toBe(true)
+    for (const changed of [
+      { ...draft, baseUrl: 'https://other.example/v1' },
+      { ...draft, protocol: 'openai-chat' as const },
+      { ...draft, responsesCompactMode: 'native' as const },
+      { ...draft, credential: 'other-secret' },
+    ]) {
+      expect(setupSourceProbeMatches(binding, changed, 'proxy-1', 'gpt-test')).toBe(false)
+    }
+    expect(setupSourceProbeMatches(binding, draft, 'proxy-2', 'gpt-test')).toBe(false)
+    expect(setupSourceProbeMatches(binding, draft, 'proxy-1', 'other-model')).toBe(false)
+  })
+
   it('persists the selected proxy while preserving account scheduling fields', async () => {
     const snapshot = {} as AppSnapshot
     const saveAccount = vi.fn().mockResolvedValue(snapshot)

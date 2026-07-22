@@ -1,7 +1,7 @@
 import { readdir, readFile, rm } from 'node:fs/promises'
 import { basename, dirname, resolve } from 'node:path'
 import { allClientFiles, clientDirectory, clientFiles, resolveClientConfigPaths } from './paths'
-import { planClientConfig, planClientConfigRepair } from './planners'
+import { planClientConfig, planClientConfigRepair, planCodexOfficialLoginConfig } from './planners'
 import { applyClientConfigFieldPatches, clientConfigEditorFields } from './catalog'
 import { createClientConfigEditorFile, restoreClientConfigEditorContent, revisionOf } from './editor'
 import { atomicWriteFile, copyExclusive, pathStat, readTextIfPresent } from './filesystem'
@@ -32,8 +32,17 @@ const backupMarker = '.stone-backup.'
 const timestampPattern = /^(\d{8}T\d{9}Z)(?:\.(\d+))?$/
 const maximumBackupSequence = 999
 // Profile-scoped services are short-lived wrappers around the same filesystem.
-// Keep one process-wide queue so concurrent operations cannot interleave roles.
-let backupQueue: Promise<void> = Promise.resolve()
+// Keep one process-wide mutation queue so read/plan/backup/write/rollback cannot
+// interleave across wrappers that address the same client files.
+let configMutationQueue: Promise<void> = Promise.resolve()
+
+async function runConfigMutation<T>(operation: () => Promise<T>): Promise<T> {
+  const preceding = configMutationQueue
+  let release!: () => void
+  configMutationQueue = new Promise<void>((resolveQueue) => { release = resolveQueue })
+  await preceding
+  try { return await operation() } finally { release() }
+}
 
 function timestampForFile(date: Date): string {
   return date.toISOString().replace(/[-:.]/g, '')
@@ -130,6 +139,15 @@ export class ClientConfigService {
     changes: ClientConfigEditorChanges,
     options: ClientConfigApplyOptions = {},
   ): Promise<ApplyClientConfigResult> {
+    return runConfigMutation(() => this.applyEditorUnlocked(client, target, changes, options))
+  }
+
+  private async applyEditorUnlocked(
+    client: SupportedClient,
+    target: ClientConnectionTarget,
+    changes: ClientConfigEditorChanges,
+    options: ClientConfigApplyOptions,
+  ): Promise<ApplyClientConfigResult> {
     if (changes.files.length > 5) throw new ClientConfigValidationError('Too many client configuration files were submitted')
     const files = clientFiles(this.paths, client)
     const fileByRole = new Map(files.map((file) => [file.role, file]))
@@ -142,7 +160,7 @@ export class ClientConfigService {
       const file = fileByRole.get(draft.role)
       if (!file) throw new ClientConfigValidationError('A client configuration file does not belong to the selected client')
       const source = existing[file.role]
-      if (draft.revision !== revisionOf(source)) {
+      if (draft.revision !== revisionOf(file, source)) {
         throw new ClientConfigValidationError('Client configuration changed outside Stone+. Reload it before saving.')
       }
       edited[file.role] = restoreClientConfigEditorContent(file, draft.content, source)
@@ -167,7 +185,7 @@ export class ClientConfigService {
         })),
       ],
     }
-    return this.applyPlan(client, plan, options)
+    return this.applyPlan(client, plan, options, existing)
   }
 
   async apply(
@@ -175,8 +193,11 @@ export class ClientConfigService {
     target: ClientConnectionTarget,
     options: ClientConfigApplyOptions = {},
   ): Promise<ApplyClientConfigResult> {
-    const plan = await this.plan(client, target)
-    return this.applyPlan(client, plan, options)
+    return runConfigMutation(async () => {
+      const existing = await this.readExisting(client)
+      const plan = planClientConfig(client, this.paths, existing, target)
+      return this.applyPlan(client, plan, options, existing)
+    })
   }
 
   /**
@@ -189,21 +210,39 @@ export class ClientConfigService {
     target: ClientConnectionTarget,
     options: ClientConfigApplyOptions = {},
   ): Promise<RepairClientConfigResult> {
-    const existing = await this.readExisting(client)
-    const plan = planClientConfigRepair(client, this.paths, existing, target)
-    const applied = await this.applyPlan(client, plan, options)
-    return {
-      ...applied,
-      rebuiltRoles: plan.rebuiltRoles,
-    }
+    return runConfigMutation(async () => {
+      const existing = await this.readExisting(client)
+      const plan = planClientConfigRepair(client, this.paths, existing, target)
+      const applied = await this.applyPlan(client, plan, options, existing)
+      return {
+        ...applied,
+        rebuiltRoles: plan.rebuiltRoles,
+      }
+    })
+  }
+
+  /**
+   * Transactionally remove Stone+'s Codex connection/authentication overrides.
+   * Existing official ChatGPT credentials and unrelated settings are retained.
+   */
+  async restoreCodexOfficialLogin(
+    options: ClientConfigApplyOptions = {},
+  ): Promise<ApplyClientConfigResult> {
+    return runConfigMutation(async () => {
+      const existing = await this.readExisting('codex')
+      const plan = planCodexOfficialLoginConfig(this.paths.codex, existing)
+      return this.applyPlan('codex', plan, options, existing)
+    })
   }
 
   private async applyPlan(
     client: SupportedClient,
     plan: ClientConfigPlan,
     options: ClientConfigApplyOptions,
+    expected: ExistingClientConfig,
   ): Promise<ApplyClientConfigResult> {
     const changes = plan.files.filter((file) => file.changed)
+    await this.assertExpectedFiles(changes, expected)
     // Capture one timestamp and collision sequence for the complete operation.
     // This keeps config/auth and settings/env backups in an unambiguous set.
     const backups = await this.backupFiles(changes, this.now())
@@ -211,11 +250,15 @@ export class ClientConfigService {
     const written: ClientConfigFilePath[] = []
     try {
       for (const change of changes) {
+        await this.assertMatchesBackup(change, backups.find((backup) => backup.role === change.role))
         await atomicWriteFile(change.path, change.content, this.randomId, change.containsCredential)
         written.push(change)
       }
     } catch (error) {
-      await this.rollback(written, backups)
+      const rollbackFailures = await this.rollback(written, backups, plan)
+      if (rollbackFailures.length) {
+        throw new Error(`${messageOf(error)}; rollback was incomplete for: ${rollbackFailures.join(', ')}`)
+      }
       throw error
     }
 
@@ -223,7 +266,7 @@ export class ClientConfigService {
     let retentionWarning: string | undefined
     if (options.backupRetention !== undefined) {
       try {
-        removedBackups = await this.pruneBackups(client, options.backupRetention)
+        removedBackups = await this.pruneBackupsUnlocked(client, options.backupRetention)
       } catch {
         retentionWarning = 'Client configuration was applied, but old backups could not be pruned.'
       }
@@ -248,6 +291,10 @@ export class ClientConfigService {
   }
 
   async pruneBackups(client: SupportedClient, retention: number): Promise<string[]> {
+    return runConfigMutation(() => this.pruneBackupsUnlocked(client, retention))
+  }
+
+  private async pruneBackupsUnlocked(client: SupportedClient, retention: number): Promise<string[]> {
     validateBackupRetention(retention)
     const backups = await this.listBackups(client)
     const retainedByRole = new Map<ClientConfigFilePath['role'], number>()
@@ -281,6 +328,13 @@ export class ClientConfigService {
     client: SupportedClient,
     retention?: number,
   ): Promise<CreateBackupSetResult> {
+    return runConfigMutation(() => this.createBackupSetUnlocked(client, retention))
+  }
+
+  private async createBackupSetUnlocked(
+    client: SupportedClient,
+    retention?: number,
+  ): Promise<CreateBackupSetResult> {
     if (retention !== undefined) validateBackupRetention(retention)
     const backups = await this.backupFiles(clientFiles(this.paths, client), this.now())
     if (backups.length === 0) {
@@ -291,7 +345,7 @@ export class ClientConfigService {
     let retentionWarning: string | undefined
     if (retention !== undefined) {
       try {
-        removedBackups = await this.pruneBackups(client, retention)
+        removedBackups = await this.pruneBackupsUnlocked(client, retention)
       } catch {
         retentionWarning = 'The backup set was created, but old backups could not be pruned.'
       }
@@ -307,10 +361,14 @@ export class ClientConfigService {
 
   /** Restore the newest exact backup group for a client. */
   async restoreLatestBackupSet(client: SupportedClient): Promise<RestoreBackupSetResult> {
+    return runConfigMutation(() => this.restoreLatestBackupSetUnlocked(client))
+  }
+
+  private async restoreLatestBackupSetUnlocked(client: SupportedClient): Promise<RestoreBackupSetResult> {
     const backups = await this.listBackups(client)
     const latest = backups[0]
     if (!latest) throw new Error(`No backups are available for ${client}.`)
-    return this.restoreBackupSet(client, latest.groupId)
+    return this.restoreBackupSetUnlocked(client, latest.groupId)
   }
 
   /**
@@ -318,6 +376,13 @@ export class ClientConfigService {
    * legacy callers only when that millisecond maps to exactly one group.
    */
   async restoreBackupSet(
+    client: SupportedClient,
+    groupIdOrCreatedAt: string | number,
+  ): Promise<RestoreBackupSetResult> {
+    return runConfigMutation(() => this.restoreBackupSetUnlocked(client, groupIdOrCreatedAt))
+  }
+
+  private async restoreBackupSetUnlocked(
     client: SupportedClient,
     groupIdOrCreatedAt: string | number,
   ): Promise<RestoreBackupSetResult> {
@@ -376,11 +441,25 @@ export class ClientConfigService {
     const written: ClientConfigFilePath[] = []
     try {
       for (const file of restoreFiles) {
+        await this.assertMatchesBackup(file, safetyBackups.find((backup) => backup.role === file.role))
         await atomicWriteFile(file.path, sourceContents.get(file.role)!, this.randomId, file.containsCredential)
         written.push(file)
       }
     } catch (error) {
-      await this.rollback(written, safetyBackups)
+      const expectedPlan: ClientConfigPlan = {
+        client,
+        files: restoreFiles.map((file) => ({
+          ...file,
+          content: sourceContents.get(file.role)!.toString('utf8'),
+          changed: true,
+          existed: Boolean(safetyBackups.find((backup) => backup.role === file.role)),
+          managedFields: ['complete document'],
+        })),
+      }
+      const rollbackFailures = await this.rollback(written, safetyBackups, expectedPlan)
+      if (rollbackFailures.length) {
+        throw new Error(`${messageOf(error)}; rollback was incomplete for: ${rollbackFailures.join(', ')}`)
+      }
       throw error
     }
 
@@ -396,6 +475,10 @@ export class ClientConfigService {
   }
 
   async restore(backupPath: string, client?: SupportedClient): Promise<RestoreBackupResult> {
+    return runConfigMutation(() => this.restoreUnlocked(backupPath, client))
+  }
+
+  private async restoreUnlocked(backupPath: string, client?: SupportedClient): Promise<RestoreBackupResult> {
     const normalized = this.normalizedPath(backupPath)
     const record = (await this.listBackups(client)).find((candidate) =>
       this.normalizedPath(candidate.backupPath) === normalized)
@@ -407,6 +490,7 @@ export class ClientConfigService {
     if (!file) throw new Error('Backup target is no longer configured')
     const safetyBackup = await this.backupFile(file)
     const content = await readFile(record.backupPath)
+    await this.assertMatchesBackup(file, safetyBackup)
     await atomicWriteFile(record.targetPath, content, this.randomId, file.containsCredential)
     return {
       client: record.client,
@@ -435,17 +519,7 @@ export class ClientConfigService {
     requestedFiles: ClientConfigFilePath[],
     operationDate: Date,
   ): Promise<BackupRecord[]> {
-    const preceding = backupQueue
-    let release!: () => void
-    backupQueue = new Promise<void>((resolveQueue) => {
-      release = resolveQueue
-    })
-    await preceding
-    try {
-      return await this.backupFilesUnlocked(requestedFiles, operationDate)
-    } finally {
-      release()
-    }
+    return this.backupFilesUnlocked(requestedFiles, operationDate)
   }
 
   private async backupFilesUnlocked(
@@ -544,17 +618,57 @@ export class ClientConfigService {
     return records
   }
 
-  private async rollback(written: ClientConfigFilePath[], backups: BackupRecord[]): Promise<void> {
-    for (const file of [...written].reverse()) {
-      const backup = backups.find((candidate) => candidate.role === file.role)
-      if (backup) {
-        const content = await readFile(backup.backupPath)
-        await atomicWriteFile(file.path, content, this.randomId, file.containsCredential).catch(() => undefined)
-      } else {
-        await rm(file.path, { force: true }).catch(() => undefined)
+  private async assertExpectedFiles(files: ClientConfigFilePath[], expected: ExistingClientConfig): Promise<void> {
+    for (const file of files) {
+      const current = await readTextIfPresent(file.path)
+      if (current !== expected[file.role]) {
+        throw new ClientConfigValidationError('Client configuration changed outside Stone+. Reload it before saving.')
       }
     }
   }
+
+  private async assertMatchesBackup(file: ClientConfigFilePath, backup: BackupRecord | undefined): Promise<void> {
+    const current = await readFile(file.path).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === 'ENOENT') return undefined
+      throw error
+    })
+    if (!backup) {
+      if (current !== undefined) throw new ClientConfigValidationError('Client configuration changed while Stone+ was preparing the update.')
+      return
+    }
+    const expected = await readFile(backup.backupPath)
+    if (!current?.equals(expected)) {
+      throw new ClientConfigValidationError('Client configuration changed while Stone+ was preparing the update.')
+    }
+  }
+
+  private async rollback(
+    written: ClientConfigFilePath[],
+    backups: BackupRecord[],
+    plan: ClientConfigPlan,
+  ): Promise<string[]> {
+    const failures: string[] = []
+    for (const file of [...written].reverse()) {
+      const planned = plan.files.find((candidate) => candidate.role === file.role)
+      const backup = backups.find((candidate) => candidate.role === file.role)
+      try {
+        const current = await readFile(file.path)
+        if (!planned || !current.equals(Buffer.from(planned.content, 'utf8'))) {
+          failures.push(file.path)
+          continue
+        }
+        if (backup) {
+          const content = await readFile(backup.backupPath)
+          await atomicWriteFile(file.path, content, this.randomId, file.containsCredential)
+        } else await rm(file.path, { force: true })
+      } catch { failures.push(file.path) }
+    }
+    return failures
+  }
+}
+
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
 }
 
 function backupSequence(path: string): number {

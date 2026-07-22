@@ -1,6 +1,47 @@
-import type { AppSnapshot, GatewayApi, Pool, PublicAccount } from '@shared/types'
+import type { ApiSourceInput, AppSnapshot, GatewayApi, Pool, PublicAccount } from '@shared/types'
 
 type SetupWizardSourceApi = Pick<GatewayApi, 'saveAccount' | 'saveAggregateRelay'>
+
+export interface SetupSourceProbeBinding {
+  sourceType: ApiSourceInput['sourceType']
+  kind: ApiSourceInput['kind']
+  baseUrl: string
+  protocol: ApiSourceInput['protocol']
+  responsesCompactMode: ApiSourceInput['responsesCompactMode']
+  credential: string
+  proxyId: string
+  model: string
+}
+
+/** Keep a successful source probe tied to the exact in-memory connection it tested. */
+export function captureSetupSourceProbeBinding(
+  draft: ApiSourceInput,
+  proxyId: string,
+  model: string,
+): SetupSourceProbeBinding {
+  return {
+    sourceType: draft.sourceType,
+    kind: draft.kind,
+    baseUrl: draft.baseUrl.trim(),
+    protocol: draft.protocol,
+    responsesCompactMode: draft.responsesCompactMode,
+    credential: draft.credential?.trim() ?? '',
+    proxyId: (proxyId || draft.proxyId || '').trim(),
+    model: (model || draft.defaultModel || '').trim(),
+  }
+}
+
+export function setupSourceProbeMatches(
+  binding: SetupSourceProbeBinding | null,
+  draft: ApiSourceInput,
+  proxyId: string,
+  model: string,
+): boolean {
+  if (!binding) return false
+  const current = captureSetupSourceProbeBinding(draft, proxyId, model)
+  return Object.keys(current).every((key) => current[key as keyof SetupSourceProbeBinding]
+    === binding[key as keyof SetupSourceProbeBinding])
+}
 
 /** Persist the network exit selected by the wizard before any upstream check runs. */
 export async function persistSetupWizardSourceProxy(

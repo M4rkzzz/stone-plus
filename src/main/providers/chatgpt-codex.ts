@@ -37,6 +37,12 @@ export interface ChatGptCredentialAccess {
   serialized: string
 }
 
+export interface ChatGptCodexAuthorization {
+  authorization: string
+  accountId: string
+  fedramp?: boolean
+}
+
 export interface ChatGptCredentialRefreshOptions {
   /** Stable local account/credential key used to isolate concurrent refreshes. */
   refreshKey?: string
@@ -248,6 +254,31 @@ export function applyChatGptCodexSearchHeaders(
   headers.set('content-type', 'application/json')
 }
 
+/** Applies first-party Codex headers for a dynamically signed AgentAssertion. */
+export function applyChatGptAgentIdentityHeaders(
+  headers: Headers,
+  authorization: string,
+  accountId: string,
+  fedramp = false,
+  sourceHeaders?: ChatGptSourceHeaders,
+  accept: 'stream' | 'json' = 'stream'
+): void {
+  for (const name of CODEX_PASSTHROUGH_HEADERS) {
+    const value = readSourceHeader(sourceHeaders, name)
+    if (value) headers.set(name, value)
+  }
+  const clientVersion = resolveCodexClientVersion(sourceHeaders)
+  headers.set('authorization', authorization)
+  headers.set('chatgpt-account-id', accountId)
+  if (fedramp) headers.set('x-openai-fedramp', 'true')
+  headers.set('originator', 'codex_cli_rs')
+  headers.set('user-agent', `codex_cli_rs/${clientVersion} (Windows 11; x86_64)`)
+  headers.set('version', clientVersion)
+  headers.set('accept', accept === 'stream' ? 'text/event-stream' : 'application/json')
+  headers.set('content-type', 'application/json')
+  if (accept === 'stream') headers.set('openai-beta', 'responses=experimental')
+}
+
 function applyChatGptCodexIdentityHeaders(
   headers: Headers,
   bundle: ChatGptCredentialBundle,
@@ -308,9 +339,26 @@ export async function probeChatGptAccount(
   fetchImplementation: typeof fetch = fetch,
   signal?: AbortSignal
 ): Promise<{ ok: boolean; latencyMs: number; statusCode?: number; failure?: ProviderFailure }> {
+  return probeChatGptAccountAuthorized(account, {
+    authorization: `Bearer ${bundle.accessToken}`,
+    accountId: bundle.accountId
+  }, fetchImplementation, signal)
+}
+
+export async function probeChatGptAccountAuthorized(
+  account: Account,
+  authorization: ChatGptCodexAuthorization,
+  fetchImplementation: typeof fetch = fetch,
+  signal?: AbortSignal
+): Promise<{ ok: boolean; latencyMs: number; statusCode?: number; failure?: ProviderFailure }> {
   const started = Date.now()
   const headers = new Headers()
-  applyChatGptCodexHeaders(headers, bundle)
+  applyChatGptAgentIdentityHeaders(
+    headers,
+    authorization.authorization,
+    authorization.accountId,
+    authorization.fedramp
+  )
   try {
     const response = await fetchImplementation(CHATGPT_CODEX_RESPONSES_URL, {
       method: 'POST', headers, signal,
@@ -329,13 +377,50 @@ export async function probeChatGptAccount(
   }
 }
 
+export async function checkChatGptAccountAuthorized(
+  account: Account,
+  authorization: ChatGptCodexAuthorization,
+  fetchImplementation: typeof fetch = fetch,
+  signal?: AbortSignal
+): Promise<{ ok: boolean; latencyMs: number; quota?: AccountCodexQuotaSnapshot; statusCode?: number; failure?: ProviderFailure }> {
+  try {
+    const result = await queryChatGptCodexQuotaAuthorized(
+      authorization,
+      fetchImplementation,
+      signal
+    )
+    return { ok: true, latencyMs: result.latencyMs, quota: result.quota }
+  } catch {
+    // A caller cancellation is authoritative. Falling through to the
+    // Responses probe would start another request after a durable task has
+    // already been cancelled and could turn cancellation into health data.
+    if (signal?.aborted) throw abortReason(signal)
+    // The usage endpoint is not available to every valid credential. A real,
+    // lightweight Responses probe is authoritative for account usability.
+    return probeChatGptAccountAuthorized(account, authorization, fetchImplementation, signal)
+  }
+}
+
 export async function queryChatGptCodexModels(
   bundle: ChatGptCredentialBundle,
   fetchImplementation: typeof fetch = fetch,
   signal?: AbortSignal
 ): Promise<string[]> {
+  return queryChatGptCodexModelsAuthorized({
+    authorization: `Bearer ${bundle.accessToken}`,
+    accountId: bundle.accountId
+  }, fetchImplementation, signal)
+}
+
+export async function queryChatGptCodexModelsAuthorized(
+  authorization: ChatGptCodexAuthorization,
+  fetchImplementation: typeof fetch = fetch,
+  signal?: AbortSignal
+): Promise<string[]> {
   const headers = new Headers({ accept: 'application/json' })
-  applyChatGptCodexIdentityHeaders(headers, bundle)
+  headers.set('authorization', authorization.authorization)
+  headers.set('chatgpt-account-id', authorization.accountId)
+  if (authorization.fedramp) headers.set('x-openai-fedramp', 'true')
   let response: Response
   try {
     response = await fetchImplementation(CHATGPT_CODEX_MODELS_URL, {
@@ -397,14 +482,27 @@ export async function queryChatGptCodexQuota(
   signal?: AbortSignal,
   now = Date.now()
 ): Promise<{ quota: AccountCodexQuotaSnapshot; latencyMs: number }> {
+  return queryChatGptCodexQuotaAuthorized({
+    authorization: `Bearer ${bundle.accessToken}`,
+    accountId: bundle.accountId
+  }, fetchImplementation, signal, now)
+}
+
+export async function queryChatGptCodexQuotaAuthorized(
+  authorization: ChatGptCodexAuthorization,
+  fetchImplementation: typeof fetch = fetch,
+  signal?: AbortSignal,
+  now = Date.now()
+): Promise<{ quota: AccountCodexQuotaSnapshot; latencyMs: number }> {
   const startedAt = Date.now()
   let response: Response
   try {
     response = await fetchImplementation(CHATGPT_CODEX_USAGE_URL, {
       method: 'GET',
       headers: {
-        authorization: `Bearer ${bundle.accessToken}`,
-        'chatgpt-account-id': bundle.accountId,
+        authorization: authorization.authorization,
+        'chatgpt-account-id': authorization.accountId,
+        ...(authorization.fedramp ? { 'x-openai-fedramp': 'true' } : {}),
         'openai-beta': 'codex-1',
         'oai-language': 'zh-CN',
         originator: 'Codex Desktop',

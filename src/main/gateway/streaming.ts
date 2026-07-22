@@ -40,12 +40,23 @@ export interface CanonicalStreamParser {
   finish(): CanonicalStreamEvent[]
   /** Exact upstream Responses protocol state; generic canonical `done` is intentionally excluded. */
   getProtocolState(): CanonicalProtocolState
+  /** Count of payloads matching a known event shape for the selected protocol. */
+  getRecognizedEventCount(): number
+  /** Parsed terminal Responses payload, exposed without framing/parsing the SSE a second time. */
+  getResponsesTerminalResponse(): JsonObject | undefined
 }
 
 export type ResponsesTerminalEvent = 'response.completed' | 'response.incomplete' | 'response.failed'
 
 export interface CanonicalProtocolState {
   responsesEventCount: number
+  /**
+   * Responses events that prove application-level work is advancing. Transport
+   * keepalives and lifecycle-only created/queued/in_progress frames are
+   * intentionally excluded so callers can distinguish a live model stream from
+   * a half-open connection that only emits heartbeats.
+   */
+  responsesProgressEventCount: number
   responsesTerminalEvent?: ResponsesTerminalEvent
   responsesLastEventType?: string
   responsesLastSequenceNumber?: number
@@ -68,11 +79,18 @@ export interface OpenAiResponsesStreamCollector {
   push(chunk: Uint8Array): void
   /** Reports that a complete terminal Responses event has already been parsed. */
   isComplete(): boolean
+  /** Exposes protocol progress so a non-streaming caller can ignore transport heartbeats. */
+  getProtocolState(): CanonicalProtocolState
   /** Finalizes the stream and returns one ordinary Responses API object. */
   finish(): OpenAiResponsesStreamResult
 }
 
 type SseHandler = (eventName: string | undefined, data: string) => void
+
+const ANTHROPIC_RECOGNIZED_EVENTS = new Set([
+  'error', 'message_start', 'content_block_start', 'content_block_delta',
+  'content_block_stop', 'message_delta', 'message_stop'
+])
 
 class SseFramer {
   private buffer = ''
@@ -123,19 +141,17 @@ class SseFramer {
 interface CollectedToolCall {
   id?: string
   name?: string
-  arguments: string
+  argumentChunks: string[]
 }
 
 class ResponsesStreamCollector implements OpenAiResponsesStreamCollector {
   private readonly parser = createCanonicalStreamParser('openai-responses')
-  private readonly decoder = new TextDecoder()
-  private readonly terminalFramer = new SseFramer((eventName, data) => this.captureTerminalResponse(eventName, data))
   private readonly tools = new Map<number, CollectedToolCall>()
   private readonly now: () => number
   private id?: string
   private model?: string
   private createdAt?: number
-  private text = ''
+  private readonly textChunks: string[] = []
   private usage: NonNullable<OpenAiResponsesStreamResult['usage']> = {}
   private stopReason?: CanonicalStopReason
   private terminalResponse?: JsonObject
@@ -151,20 +167,23 @@ class ResponsesStreamCollector implements OpenAiResponsesStreamCollector {
 
   push(chunk: Uint8Array): void {
     if (this.finished) throw new Error('Cannot append to a finalized Responses stream')
-    this.terminalFramer.push(this.decoder.decode(chunk, { stream: true }))
+    if (this.done) return
     this.consume(this.parser.push(chunk))
   }
 
   isComplete(): boolean {
-    return this.done && this.stopReason !== undefined
+    return this.error !== undefined || (this.done && this.stopReason !== undefined)
+  }
+
+  getProtocolState(): CanonicalProtocolState {
+    return this.parser.getProtocolState()
   }
 
   finish(): OpenAiResponsesStreamResult {
     if (this.result) return this.result
     this.finished = true
-    this.terminalFramer.push(this.decoder.decode())
-    this.terminalFramer.finish()
-    this.consume(this.parser.finish())
+    if (!this.done) this.consume(this.parser.finish())
+    this.captureTerminalResponse()
 
     const usage = Object.keys(this.usage).length > 0 ? { ...this.usage } : undefined
     const error = this.error
@@ -181,17 +200,18 @@ class ResponsesStreamCollector implements OpenAiResponsesStreamCollector {
 
   private consume(events: CanonicalStreamEvent[]): void {
     for (const event of events) {
+      if (this.done) break
       if (event.type === 'start') {
         this.id = event.id ?? this.id
         this.model = event.model ?? this.model
         this.createdAt = event.createdAt ?? this.createdAt
       } else if (event.type === 'text-delta') {
-        this.text += event.text
+        this.textChunks.push(event.text)
       } else if (event.type === 'tool-call-delta') {
-        const tool = this.tools.get(event.index) ?? { arguments: '' }
+        const tool = this.tools.get(event.index) ?? { argumentChunks: [] }
         tool.id = event.id ?? tool.id
         tool.name = event.name ?? tool.name
-        if (event.arguments) tool.arguments += event.arguments
+        if (event.arguments) tool.argumentChunks.push(event.arguments)
         this.tools.set(event.index, tool)
       } else if (event.type === 'usage') {
         if (event.inputTokens !== undefined) this.usage.input_tokens = event.inputTokens
@@ -209,49 +229,17 @@ class ResponsesStreamCollector implements OpenAiResponsesStreamCollector {
     }
   }
 
-  private captureTerminalResponse(eventName: string | undefined, data: string): void {
-    if (data.trim() === '[DONE]') return
-    let payload: JsonObject | undefined
-    try {
-      payload = objectValue(JSON.parse(data) as unknown)
-    } catch {
-      return
-    }
-    const type = stringValue(payload?.type, eventName ?? '')
-    if (type !== 'response.completed' && type !== 'response.incomplete') return
-    const response = objectValue(payload?.response)
+  private captureTerminalResponse(): void {
+    const state = this.parser.getProtocolState()
+    if (state.responsesTerminalEvent !== 'response.completed' && state.responsesTerminalEvent !== 'response.incomplete') return
+    const response = this.parser.getResponsesTerminalResponse()
     if (!response) return
-    this.terminalType = type
+    this.terminalType = state.responsesTerminalEvent
     this.terminalResponse = response
   }
 
   private buildResponse(): JsonObject {
     const id = this.id ?? this.options.id ?? `resp_${this.now()}`
-    const aggregateOutput: JsonObject[] = []
-    if (this.text) {
-      aggregateOutput.push({
-        id: `msg_${safeIdentifier(id)}`,
-        type: 'message',
-        status: 'completed',
-        role: 'assistant',
-        content: [{ type: 'output_text', text: this.text, annotations: [] }]
-      })
-    }
-    for (const [index, tool] of [...this.tools.entries()].sort(([left], [right]) => left - right)) {
-      const callId = tool.id ?? `call_${safeIdentifier(id)}_${index}`
-      aggregateOutput.push({
-        id: `fc_${safeIdentifier(id)}_${index}`,
-        type: 'function_call',
-        status: 'completed',
-        call_id: callId,
-        name: tool.name ?? '',
-        arguments: tool.arguments
-      })
-    }
-
-    const status = this.terminalType === 'response.incomplete' || this.stopReason === 'length'
-      ? 'incomplete'
-      : 'completed'
     const aggregateUsage = omitUndefined({
       input_tokens: this.usage.input_tokens,
       output_tokens: this.usage.output_tokens,
@@ -261,6 +249,56 @@ class ResponsesStreamCollector implements OpenAiResponsesStreamCollector {
       output_tokens_details: this.usage.reasoning_tokens === undefined
         ? undefined : { reasoning_tokens: this.usage.reasoning_tokens }
     })
+    const terminal = this.terminalResponse
+    const terminalOutput = Array.isArray(terminal?.output) ? terminal.output : undefined
+    const status = this.terminalType === 'response.incomplete' || this.stopReason === 'length'
+      || this.stopReason === 'content_filter'
+      ? 'incomplete'
+      : 'completed'
+    const incompleteReason = this.stopReason === 'content_filter' ? 'content_filter' : 'max_output_tokens'
+    if (terminal && terminalOutput && terminalOutput.length > 0) {
+      const terminalUsage = { ...(objectValue(terminal.usage) ?? {}) }
+      delete terminalUsage.cached_input_tokens
+      delete terminalUsage.reasoning_tokens
+      const terminalBase: JsonObject = {
+        id,
+        object: 'response',
+        created_at: Math.floor((this.createdAt ?? this.now()) / 1000),
+        status,
+        model: this.model ?? this.options.model ?? ''
+      }
+      if (status === 'incomplete') terminalBase.incomplete_details = { reason: incompleteReason }
+      return {
+        ...terminalBase,
+        ...terminal,
+        usage: { ...aggregateUsage, ...terminalUsage }
+      }
+    }
+
+    // Most Responses terminal payloads already contain the complete output.
+    // Only materialize a second aggregate output when the terminal omitted it.
+    const aggregateOutput: JsonObject[] = []
+    if (this.textChunks.length > 0) {
+      aggregateOutput.push({
+        id: `msg_${safeIdentifier(id)}`,
+        type: 'message',
+        status,
+        role: 'assistant',
+        content: [{ type: 'output_text', text: this.textChunks.join(''), annotations: [] }]
+      })
+    }
+    for (const [index, tool] of [...this.tools.entries()].sort(([left], [right]) => left - right)) {
+      const callId = tool.id ?? `call_${safeIdentifier(id)}_${index}`
+      aggregateOutput.push({
+        id: `fc_${safeIdentifier(id)}_${index}`,
+        type: 'function_call',
+        status,
+        call_id: callId,
+        name: tool.name ?? '',
+        arguments: tool.argumentChunks.join('')
+      })
+    }
+
     const aggregate: JsonObject = {
       id,
       object: 'response',
@@ -270,11 +308,9 @@ class ResponsesStreamCollector implements OpenAiResponsesStreamCollector {
       output: aggregateOutput,
       usage: aggregateUsage
     }
-    if (status === 'incomplete') aggregate.incomplete_details = { reason: 'max_output_tokens' }
+    if (status === 'incomplete') aggregate.incomplete_details = { reason: incompleteReason }
 
-    const terminal = this.terminalResponse
     if (!terminal) return aggregate
-    const terminalOutput = Array.isArray(terminal.output) ? terminal.output : undefined
     const output = terminalOutput && (terminalOutput.length > 0 || aggregateOutput.length === 0)
       ? terminalOutput
       : aggregateOutput
@@ -407,9 +443,12 @@ class ProtocolParser implements CanonicalStreamParser {
   private usageCachedInputTokens: number | undefined
   private usageReasoningTokens: number | undefined
   private responsesEventCount = 0
+  private responsesProgressEventCount = 0
   private responsesTerminalEvent: ResponsesTerminalEvent | undefined
   private responsesLastEventType: string | undefined
   private responsesLastSequenceNumber: number | undefined
+  private responsesTerminalResponse: JsonObject | undefined
+  private recognizedEventCount = 0
 
   constructor(private readonly protocol: Protocol) {
     if (protocol !== 'gemini') this.framing = 'sse'
@@ -444,10 +483,19 @@ class ProtocolParser implements CanonicalStreamParser {
   getProtocolState(): CanonicalProtocolState {
     return {
       responsesEventCount: this.responsesEventCount,
+      responsesProgressEventCount: this.responsesProgressEventCount,
       responsesTerminalEvent: this.responsesTerminalEvent,
       responsesLastEventType: this.responsesLastEventType,
       responsesLastSequenceNumber: this.responsesLastSequenceNumber
     }
+  }
+
+  getRecognizedEventCount(): number {
+    return this.recognizedEventCount
+  }
+
+  getResponsesTerminalResponse(): JsonObject | undefined {
+    return this.responsesTerminalResponse
   }
 
   private consumeText(text: string): void {
@@ -475,6 +523,9 @@ class ProtocolParser implements CanonicalStreamParser {
   }
 
   private handleSse(eventName: string | undefined, data: string): void {
+    // A Responses terminal event is definitive. Ignore any transport trailer or
+    // accidentally concatenated events without paying for more JSON parsing.
+    if (this.protocol === 'openai-responses' && this.done) return
     if (data.trim() === '[DONE]') {
       if (this.protocol === 'openai-responses') {
         this.responsesLastEventType = '[DONE]'
@@ -498,6 +549,7 @@ class ProtocolParser implements CanonicalStreamParser {
       this.emitError('Stream payload must be a JSON object', 'invalid_payload')
       return
     }
+    if (recognizedProtocolPayload(this.protocol, eventName, payload)) this.recognizedEventCount += 1
     if (this.protocol === 'openai-chat') this.handleOpenAiChat(payload)
     else if (this.protocol === 'openai-responses') this.handleOpenAiResponses(eventName, payload)
     else if (this.protocol === 'anthropic-messages') this.handleAnthropic(eventName, payload)
@@ -546,11 +598,13 @@ class ProtocolParser implements CanonicalStreamParser {
     const type = stringValue(payload.type, eventName ?? '')
     if (type) {
       this.responsesEventCount += 1
+      if (responsesEventAdvancesProgress(type)) this.responsesProgressEventCount += 1
       this.responsesLastEventType = type
       const sequenceNumber = numberValue(payload.sequence_number)
       if (sequenceNumber !== undefined) this.responsesLastSequenceNumber = sequenceNumber
       if (type === 'response.completed' || type === 'response.incomplete' || type === 'response.failed') {
         this.responsesTerminalEvent = type
+        this.responsesTerminalResponse = objectValue(payload.response)
       }
     }
     if (type === 'error' || type === 'response.error') {
@@ -688,8 +742,11 @@ class ProtocolParser implements CanonicalStreamParser {
       this.emitUsage(objectValue(response?.usage), 'input_tokens', 'output_tokens', 'total_tokens')
       const incomplete = objectValue(response?.incomplete_details)
       const rawReason = stringValue(incomplete?.reason)
+      const normalizedReason = rawReason.trim().toLowerCase()
       const reason = type === 'response.incomplete'
-        ? (rawReason.includes('max') ? 'length' : 'other')
+        ? normalizedReason === 'content_filter' || normalizedReason.includes('content_filter')
+          ? 'content_filter'
+          : normalizedReason.includes('max') ? 'length' : 'other'
         : (this.sawToolCall ? 'tool_calls' : 'stop')
       this.emitStop(reason, rawReason || undefined)
       this.emitDone()
@@ -922,6 +979,26 @@ class ProtocolParser implements CanonicalStreamParser {
   }
 }
 
+function recognizedProtocolPayload(protocol: Protocol, eventName: string | undefined, payload: JsonObject): boolean {
+  if (protocol === 'openai-responses') {
+    const type = stringValue(payload.type, eventName ?? '')
+    return type === 'response.created'
+      || type === 'response.queued'
+      || type === 'response.in_progress'
+      || responsesEventAdvancesProgress(type)
+  }
+  if (protocol === 'openai-chat') {
+    return Boolean(payload.error) || Array.isArray(payload.choices) || objectValue(payload.usage) !== undefined
+  }
+  if (protocol === 'anthropic-messages') {
+    const type = stringValue(payload.type, eventName ?? '')
+    return ANTHROPIC_RECOGNIZED_EVENTS.has(type)
+  }
+  return Boolean(payload.error) || Array.isArray(payload.candidates)
+    || objectValue(payload.usageMetadata ?? payload.usage_metadata) !== undefined
+    || objectValue(payload.promptFeedback ?? payload.prompt_feedback) !== undefined
+}
+
 interface EncodedToolState {
   index: number
   id: string
@@ -1029,7 +1106,7 @@ class ProtocolEncoder implements CanonicalStreamEncoder {
       return
     }
     if (event.type === 'stop') {
-      if (this.stopped) return
+      if (this.failed || this.stopped) return
       this.ensureOpenAiChatStart()
       this.stopped = true
       this.frames.push(sseFrame({
@@ -1341,12 +1418,16 @@ class ProtocolEncoder implements CanonicalStreamEncoder {
   }
 
   private closeResponsesOutput(stop: Extract<CanonicalStreamEvent, { type: 'stop' }>): void {
+    const incompleteReason = stop.reason === 'length'
+      ? 'max_output_tokens'
+      : stop.reason === 'content_filter' ? 'content_filter' : undefined
+    const itemStatus = incompleteReason ? 'incomplete' : 'completed'
     const output: JsonObject[] = []
     if (this.responsesTextStarted) {
       const item = {
         id: `${this.id}_message`,
         type: 'message',
-        status: 'completed',
+        status: itemStatus,
         role: 'assistant',
         content: [{ type: 'output_text', text: this.responsesText, annotations: [] }]
       }
@@ -1378,7 +1459,7 @@ class ProtocolEncoder implements CanonicalStreamEncoder {
       const item = {
         id: tool.itemId,
         type: 'function_call',
-        status: 'completed',
+        status: itemStatus,
         call_id: tool.id || tool.itemId,
         name: tool.name,
         arguments: tool.arguments
@@ -1396,10 +1477,10 @@ class ProtocolEncoder implements CanonicalStreamEncoder {
       }))
       output.push(item)
     }
-    const response = this.responsesEnvelope(stop.reason === 'length' ? 'incomplete' : 'completed', output)
-    if (stop.reason === 'length') response.incomplete_details = { reason: 'max_output_tokens' }
+    const response = this.responsesEnvelope(incompleteReason ? 'incomplete' : 'completed', output)
+    if (incompleteReason) response.incomplete_details = { reason: incompleteReason }
     this.frames.push(responsesSse(
-      stop.reason === 'length' ? 'response.incomplete' : 'response.completed',
+      incompleteReason ? 'response.incomplete' : 'response.completed',
       { response }
     ))
   }
@@ -1688,6 +1769,33 @@ function hasUsage(event: Extract<CanonicalStreamEvent, { type: 'usage' }>): bool
 
 function canonicalError(event: Extract<CanonicalStreamEvent, { type: 'error' }>): JsonObject {
   return omitUndefined({ message: event.message, type: event.errorType, code: event.code })
+}
+
+function responsesEventAdvancesProgress(type: string): boolean {
+  if (type === 'response.completed'
+    || type === 'response.incomplete'
+    || type === 'response.failed'
+    || type === 'response.error'
+    || type === 'error') return true
+
+  // Only application events that represent generated output, internal
+  // reasoning, tool execution, usage, or a terminal result advance this
+  // counter. In particular, response.created/queued/in_progress and transport
+  // ping/heartbeat frames must not make a stalled request look healthy.
+  return type.startsWith('response.output_')
+    || type.startsWith('response.content_part.')
+    || type.startsWith('response.reasoning')
+    || type.startsWith('response.refusal')
+    || type.startsWith('response.audio')
+    || type.startsWith('response.usage')
+    || type.startsWith('response.function_call')
+    || type.startsWith('response.custom_tool_call')
+    || type.startsWith('response.file_search_call')
+    || type.startsWith('response.web_search_call')
+    || type.startsWith('response.code_interpreter_call')
+    || type.startsWith('response.image_generation_call')
+    || type.startsWith('response.mcp_')
+    || type.startsWith('response.tool_')
 }
 
 function chatStopReason(reason: string): CanonicalStopReason {

@@ -13,7 +13,7 @@ vi.mock('electron', () => ({
   }
 }))
 
-import { DatabaseBackupService } from '../../src/main/backup'
+import { DatabaseBackupService, encryptPortableBackup } from '../../src/main/backup'
 import { AppStore } from '../../src/main/store/app-store'
 import { SQLITE_DATABASE_FILENAME, SQLITE_SCHEMA_VERSION } from '../../src/main/store/sqlite-state-store'
 import type { PersistedState } from '../../src/main/store/types'
@@ -81,10 +81,85 @@ describe('DatabaseBackupService', () => {
     expect(database.prepare('SELECT COUNT(*) AS count FROM accounts').get()).toEqual({ count: 1 })
     expect(database.prepare('SELECT COUNT(*) AS count FROM proxies').get()).toEqual({ count: 1 })
     expect(database.prepare('SELECT COUNT(*) AS count FROM account_codex_quota_samples').get()).toEqual({ count: 1 })
+    expect(database.prepare('SELECT COUNT(*) AS count FROM built_in_proxy_settings').get()).toEqual({ count: 1 })
+    expect(database.prepare('SELECT COUNT(*) AS count FROM proxy_profiles').get()).toEqual({ count: 0 })
     database.close()
     expect((await readFile(join(service.directory, backup.id))).includes(Buffer.from('backup-secret'))).toBe(false)
     expect((await readFile(join(service.directory, backup.id))).includes(Buffer.from(proxyPassword))).toBe(false)
     expect(snapshot.accounts).toHaveLength(1)
+  })
+
+  it('rewraps portable credentials for a different destination vault', async () => {
+    const created = await store.saveAccount({
+      providerId: 'provider-openai',
+      name: 'Portable account',
+      credential: 'portable-api-secret',
+      priority: 1,
+      weight: 1,
+      maxConcurrency: 1,
+      modelAllowlist: [],
+    })
+    expect(created.accounts.some((account) => account.name === 'Portable account')).toBe(true)
+    const credentialId = store.getStateRepository().read().accounts
+      .find((account) => account.name === 'Portable account')!.credentialId
+    const sourceVault = {
+      isEncryptionAvailable: () => true,
+      encryptString: (value: string) => Buffer.from(`vault:${value}`),
+      decryptString: (value: Buffer) => {
+        const text = value.toString('utf8')
+        if (!text.startsWith('vault:')) throw new Error('wrong source vault')
+        return text.slice('vault:'.length)
+      },
+    }
+    await service.close()
+    service = createService({ portableSecretVault: sourceVault })
+    await service.initialize()
+    const portablePath = join(directory, 'cross-vault.stonebackup')
+    await service.exportPortableBackup(portablePath, 'portable backup password')
+
+    const destinationVault = {
+      isEncryptionAvailable: () => true,
+      encryptString: (value: string) => Buffer.from(`destination:${value}`),
+      decryptString: (value: Buffer) => {
+        const text = value.toString('utf8')
+        if (!text.startsWith('destination:')) throw new Error('wrong destination vault')
+        return text.slice('destination:'.length)
+      },
+    }
+    await service.close()
+    service = createService({ portableSecretVault: destinationVault })
+    await service.initialize()
+    const imported = await service.importPortableBackup(portablePath, 'portable backup password')
+    const database = new DatabaseSync(join(service.directory, imported.id), { readOnly: true })
+    const row = database.prepare('SELECT encrypted_value FROM credentials WHERE id = ?').get(credentialId) as {
+      encrypted_value: string
+    }
+    database.close()
+    expect(Buffer.from(row.encrypted_value, 'base64').toString('utf8')).toBe('destination:portable-api-secret')
+    expect((await readFile(portablePath)).includes(Buffer.from('portable-api-secret'))).toBe(false)
+  })
+
+  it('rejects a legacy v1 archive outside its original OS vault', async () => {
+    await store.saveAccount({
+      providerId: 'provider-openai', name: 'Legacy account', credential: 'legacy-secret',
+      priority: 1, weight: 1, maxConcurrency: 1, modelAllowlist: [],
+    })
+    const local = await service.createBackup()
+    const legacyPath = join(directory, 'legacy-v1.stonebackup')
+    await encryptPortableBackup(
+      join(service.directory, local.id), legacyPath, 'legacy archive password', Date.now, 1,
+    )
+    await service.close()
+    service = createService({
+      portableSecretVault: {
+        isEncryptionAvailable: () => true,
+        encryptString: (value) => Buffer.from(`other:${value}`),
+        decryptString: () => { throw new Error('foreign vault') },
+      },
+    })
+    await service.initialize()
+    await expect(service.importPortableBackup(legacyPath, 'legacy archive password'))
+      .rejects.toThrow(/portable-v1-vault-mismatch/)
   })
 
   it('restores a selected backup and retains a verified pre-restore snapshot', async () => {
@@ -146,6 +221,31 @@ describe('DatabaseBackupService', () => {
     await expect(service.verifyBackup(`..${join('/', SQLITE_DATABASE_FILENAME)}`)).rejects.toThrow(/identifier/)
     await expect(service.deleteBackup('stone-backup-invalid.sqlite3')).rejects.toThrow(/identifier/)
     expect(store.getSnapshot().gateway.port).toBe(15721)
+  })
+
+  it('requires the built-in proxy tables for schema v9 while accepting a genuine v8 backup', async () => {
+    const current = await service.createBackup()
+    const currentPath = join(service.directory, current.id)
+    let database = new DatabaseSync(currentPath)
+    database.exec('DROP TABLE proxy_profiles')
+    database.close()
+    await expect(service.verifyBackup(current.id)).resolves.toMatchObject({
+      valid: false,
+      schemaVersion: 9,
+      issue: expect.stringContaining('proxy_profiles'),
+    })
+
+    const legacy = await service.createBackup()
+    const legacyPath = join(service.directory, legacy.id)
+    database = new DatabaseSync(legacyPath)
+    database.exec(`
+      DROP TABLE built_in_proxy_settings;
+      DROP TABLE proxy_profiles;
+      DELETE FROM schema_migrations WHERE version = 9;
+      PRAGMA user_version = 8;
+    `)
+    database.close()
+    await expect(service.verifyBackup(legacy.id)).resolves.toMatchObject({ valid: true, schemaVersion: 8 })
   })
 
   it('rolls back the live database if a verified old backup cannot migrate', async () => {

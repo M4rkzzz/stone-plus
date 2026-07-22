@@ -176,7 +176,7 @@ const englishFieldMetadata: Readonly<Record<string, EnglishFieldMetadata>> = Obj
   ['codex.feature.shell_snapshot', 'Shell snapshot', 'Caches the shell environment to speed up repeated commands.'],
   ['codex.feature.shell_tool', 'Shell tool', 'Enables the default shell tool.'],
   ['codex.feature.unified_exec', 'Unified execution terminal', 'Uses the PTY-based unified command execution tool.'],
-  ['codex.agentsMaxThreads', 'Maximum concurrent agents', 'The maximum number of agent tasks that may remain open at the same time.'],
+  ['codex.agentsMaxThreads', 'Subagent limit', 'The maximum number of subagents that may run at the same time, excluding the primary task. Higher values increase parallelism and resource usage.'],
   ['codex.agentsMaxDepth', 'Agent nesting depth', 'The maximum number of levels at which sub-agents can create more agents. Higher values increase fan-out and usage.'],
   ['codex.agentsJobTimeout', 'Batch agent timeout', 'The default maximum runtime in seconds for each spawn_agents_on_csv worker.'],
   ['codex.agentsInterruptMessage', 'Record interruption messages', 'Records a visible message in model context when an agent is interrupted.'],

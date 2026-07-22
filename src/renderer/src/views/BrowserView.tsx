@@ -27,22 +27,22 @@ import type {
   GatewayApi,
 } from '@shared/types'
 import { localizeBackendError, localizeBackendMessage } from '../backend-message'
+import {
+  BUILTIN_BROWSER_DEFAULT_URL,
+  BUILTIN_BROWSER_LEGACY_SHORTCUTS_KEY,
+  BUILTIN_BROWSER_SHORTCUTS_KEY,
+  resolveBuiltinBrowserShortcuts,
+  type BrowserShortcut,
+} from '../browser-defaults'
+import { BUILT_IN_PROXY_BINDING_NOTICE, useBuiltInProxyInterlock } from '../built-in-proxy-interlocks'
 import { translate, useI18n, type UiLanguage } from '../i18n'
 import { setupPoolDisplayName } from '../system-generated-text'
 import { Badge, ImportProgress, Modal } from '../ui'
 
-const DEFAULT_URL = 'https://aiprobe.top/'
-const SHORTCUTS_KEY = 'stone.builtin-browser.shortcuts.v1'
 const ZOOM_KEY = 'stone.builtin-browser.zoom.v1'
 const ZOOM_LEVELS = [50, 67, 75, 80, 90, 100, 110, 125, 150, 175, 200]
 const EMPTY_QUEUE: BrowserImportQueueState = { items: [], readyCount: 0, totalBytes: 0, revision: 0 }
 const EMPTY_CACHE: BrowserJsonCacheState = { items: [], totalBytes: 0 }
-
-interface BrowserShortcut {
-  id: string
-  name: string
-  url: string
-}
 
 interface EmbeddedWebview extends HTMLElement {
   loadURL(url: string): Promise<void>
@@ -72,7 +72,8 @@ type PageTitleEvent = Event & { title?: string }
 
 export function BrowserView({ snapshot, api }: { snapshot: AppSnapshot; api: GatewayApi }) {
   const { t, language, locale } = useI18n()
-  const [tabs, setTabs] = useState<BrowserTab[]>(() => [createBrowserTab(DEFAULT_URL, language)])
+  const builtInProxyInterlocked = useBuiltInProxyInterlock(snapshot, api)
+  const [tabs, setTabs] = useState<BrowserTab[]>(() => [createBrowserTab(BUILTIN_BROWSER_DEFAULT_URL, language)])
   const [activeTabId, setActiveTabId] = useState(() => tabs[0].id)
   const webviewsRef = useRef(new Map<string, EmbeddedWebview>())
   const [zoom, setZoom] = useState(loadZoom)
@@ -132,7 +133,7 @@ export function BrowserView({ snapshot, api }: { snapshot: AppSnapshot; api: Gat
     else webviewsRef.current.delete(id)
   }, [])
 
-  const openTab = useCallback((value = DEFAULT_URL): void => {
+  const openTab = useCallback((value = BUILTIN_BROWSER_DEFAULT_URL): void => {
     if (!isHttpUrl(value)) return
     const tab = createBrowserTab(value, language)
     setTabs((current) => [...current, tab])
@@ -146,7 +147,7 @@ export function BrowserView({ snapshot, api }: { snapshot: AppSnapshot; api: Gat
   }), [api, openTab])
 
   useEffect(() => {
-    localStorage.setItem(SHORTCUTS_KEY, JSON.stringify(shortcuts))
+    localStorage.setItem(BUILTIN_BROWSER_SHORTCUTS_KEY, JSON.stringify(shortcuts))
   }, [shortcuts])
 
   useEffect(() => {
@@ -348,7 +349,7 @@ export function BrowserView({ snapshot, api }: { snapshot: AppSnapshot; api: Gat
       <div className="builtin-browser__toolbar">
         <button type="button" className="icon-button" disabled={!activeTab.canGoBack} title={t('后退', 'Back')} onClick={() => webviewsRef.current.get(activeTab.id)?.goBack()}><ArrowLeft size={17} /></button>
         <button type="button" className="icon-button" disabled={!activeTab.canGoForward} title={t('前进', 'Forward')} onClick={() => webviewsRef.current.get(activeTab.id)?.goForward()}><ArrowRight size={17} /></button>
-        <button type="button" className="icon-button" title={t('主页', 'Home')} onClick={() => navigate(DEFAULT_URL)}><Home size={16} /></button>
+        <button type="button" className="icon-button" title={t('主页', 'Home')} onClick={() => navigate(BUILTIN_BROWSER_DEFAULT_URL)}><Home size={16} /></button>
         <button type="button" className="icon-button" title={activeTab.loading ? t('停止', 'Stop') : t('刷新', 'Reload')} onClick={() => activeTab.loading ? webviewsRef.current.get(activeTab.id)?.stop() : webviewsRef.current.get(activeTab.id)?.reload()}>{activeTab.loading ? <XCircle size={16} /> : <RotateCw size={16} />}</button>
         <form className="builtin-browser__address" onSubmit={submitAddress}>
           <Globe2 size={15} />
@@ -376,7 +377,7 @@ export function BrowserView({ snapshot, api }: { snapshot: AppSnapshot; api: Gat
       <button type="submit" form="browser-shortcut-form" className="button button--primary"><Plus size={16} />{t('添加', 'Add')}</button>
     </>}>
       <form id="browser-shortcut-form" className="form-grid" onSubmit={saveShortcut}>
-        <label className="field field--full"><span>{t('名称', 'Name')}</span><input value={shortcutDraft.name} maxLength={30} placeholder={t('例如 AIProbe', 'For example, AIProbe')} onChange={(event) => setShortcutDraft({ ...shortcutDraft, name: event.target.value })} /></label>
+        <label className="field field--full"><span>{t('名称', 'Name')}</span><input value={shortcutDraft.name} maxLength={30} placeholder={t('例如 NVTokens', 'For example, NVTokens')} onChange={(event) => setShortcutDraft({ ...shortcutDraft, name: event.target.value })} /></label>
         <label className="field field--full"><span>{t('网址', 'URL')}</span><input required value={shortcutDraft.url} placeholder="https://example.com/" onChange={(event) => setShortcutDraft({ ...shortcutDraft, url: event.target.value })} /></label>
       </form>
     </Modal>
@@ -406,16 +407,16 @@ export function BrowserView({ snapshot, api }: { snapshot: AppSnapshot; api: Gat
     </>}>
       <div className="browser-import-modal">
         <details className="browser-import-options">
-          <summary><div><strong>{t('账号归类与网络（可选）', 'Account organization and network (optional)')}</strong><span>{t('为本批次设置 Tag、目标号池与出口代理', 'Set a tag, destination pool, and outbound proxy for this batch')}</span></div><ChevronDown size={16} /></summary>
+          <summary><div><strong>{t('账号归类与网络（可选）', 'Account organization and network (optional)')}</strong><span>{t('为本批次设置 Tag、目标号池与代理', 'Set a tag, destination pool, and proxy for this batch')}</span></div><ChevronDown size={16} /></summary>
           <div className="form-grid browser-import-options__body">
           <label className="field"><span>{t('本批次 Tag', 'Tag for this batch')}</span><select value={tagId ?? ''} onChange={(event) => setTagId(event.target.value || null)}><option value="">{t('未标记（同时清空重复账号的 Tag）', 'Untagged (also clears tags on duplicate accounts)')}</option>{snapshot.accountTags.map((tag) => <option value={tag.id} key={tag.id}>{tag.name}</option>)}</select></label>
           <label className="field"><span>{t('导入后加入号池（可选）', 'Add to pool after import (optional)')}</span><select value={poolId ?? ''} onChange={(event) => setPoolId(event.target.value || null)}><option value="">{t('不加入号池', 'Do not add to a pool')}</option>{compatiblePools.map((pool) => <option value={pool.id} key={pool.id}>{setupPoolDisplayName(pool.name, t)} · {t(`${pool.members.length} 个成员`, `${pool.members.length} members`)} · {pool.strategy}</option>)}</select></label>
-          <label className="field field--full"><span>{t('批量出口代理', 'Outbound proxy for this batch')}</span><select value={proxyValue} onChange={(event) => {
+          <label className="field field--full"><span>{t('批量代理', 'Proxy for this batch')}</span><select value={proxyValue} disabled={builtInProxyInterlocked} onChange={(event) => {
             const value = event.target.value
             if (value === '__preserve__') { setProxyMode('preserve'); setProxyId('') }
             else if (value === '__direct__') { setProxyMode('direct'); setProxyId('') }
             else { setProxyMode('proxy'); setProxyId(value) }
-          }}><option value="__preserve__">{t('不指定 / 沿用 JSON 配置', 'Unspecified / keep JSON settings')}</option><option value="__direct__">{t('直连（清除 JSON 代理）', 'Direct (clear JSON proxy)')}</option>{snapshot.proxies.map((proxy) => <option value={proxy.id} key={proxy.id}>{proxy.name} · {proxy.protocol.toUpperCase()} · {proxy.host}:{proxy.port}</option>)}</select><small>{proxyMode === 'proxy' ? t('本批账号统一使用所选代理，导入后的状态刷新与模型查询也走该代理。', 'All accounts in this batch use the selected proxy, including post-import status and model checks.') : proxyMode === 'direct' ? t('本批账号全部直连，并清除 JSON 中的代理设置。', 'All accounts in this batch connect directly, and proxy settings from JSON are removed.') : t('保留 JSON 内仍有效的 proxyId；没有有效代理时使用直连。', 'Keep a valid proxyId from each JSON file; use direct access when no valid proxy is present.')}</small></label>
+          }}><option value="__preserve__">{t('不指定 / 沿用 JSON 配置', 'Unspecified / keep JSON settings')}</option><option value="__direct__">{t('直连（清除 JSON 代理）', 'Direct (clear JSON proxy)')}</option>{snapshot.proxies.map((proxy) => <option value={proxy.id} key={proxy.id}>{proxy.name} · {proxy.protocol.toUpperCase()} · {proxy.host}:{proxy.port}</option>)}</select><small>{builtInProxyInterlocked ? t(BUILT_IN_PROXY_BINDING_NOTICE.zh, BUILT_IN_PROXY_BINDING_NOTICE.en) : proxyMode === 'proxy' ? t('本批账号统一使用所选代理，导入后的状态刷新与模型查询也走该代理。', 'All accounts in this batch use the selected proxy, including post-import status and model checks.') : proxyMode === 'direct' ? t('本批账号全部直连，并清除 JSON 中的代理设置。', 'All accounts in this batch connect directly, and proxy settings from JSON are removed.') : t('保留 JSON 内仍有效的 proxyId；没有有效代理时使用直连。', 'Keep a valid proxyId from each JSON file; use direct access when no valid proxy is present.')}</small></label>
           </div>
         </details>
         {busy && importProgress && <ImportProgress progress={importProgress} />}
@@ -550,18 +551,9 @@ function loadZoom(): number {
 }
 
 function loadShortcuts(): BrowserShortcut[] {
-  const fallback = [{ id: 'aiprobe-default', name: 'AIProbe', url: DEFAULT_URL }]
-  try {
-    const parsed = JSON.parse(localStorage.getItem(SHORTCUTS_KEY) || '') as unknown
-    if (!Array.isArray(parsed)) return fallback
-    const valid = parsed.filter((item): item is BrowserShortcut => Boolean(
-      item && typeof item === 'object' && typeof (item as BrowserShortcut).id === 'string'
-      && typeof (item as BrowserShortcut).name === 'string' && isHttpUrl((item as BrowserShortcut).url),
-    )).slice(0, 30)
-    return valid.length ? valid : fallback
-  } catch {
-    return fallback
-  }
+  const current = localStorage.getItem(BUILTIN_BROWSER_SHORTCUTS_KEY)
+  if (current !== null) return resolveBuiltinBrowserShortcuts(current, false)
+  return resolveBuiltinBrowserShortcuts(localStorage.getItem(BUILTIN_BROWSER_LEGACY_SHORTCUTS_KEY), true)
 }
 
 function normalizeUrl(value: string, language: UiLanguage): string {

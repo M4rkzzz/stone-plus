@@ -332,8 +332,8 @@ const fields: readonly FieldDefinition[] = Object.freeze([
   })),
   {
     id: 'codex.agentsMaxThreads', client: 'codex', role: 'codex-config', path: ['agents', 'max_threads'], section: '多代理',
-    label: '最大并发代理数', description: '允许同时保持打开的代理线程上限。',
-    control: 'number', min: 1, max: 64, step: 1, defaultValue: null, recommendedValue: 6, advanced: true,
+    label: '子代理上限', description: '同时运行的子代理数量上限，不包含主任务；提高上限会增加并行能力和资源占用。',
+    control: 'number', min: 1, max: 64, step: 1, defaultValue: null, recommendedValue: 6,
   },
   {
     id: 'codex.agentsMaxDepth', client: 'codex', role: 'codex-config', path: ['agents', 'max_depth'], section: '多代理',

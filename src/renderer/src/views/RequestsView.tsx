@@ -9,9 +9,13 @@ import {
   Filter,
   Search,
   TriangleAlert,
+  Clipboard,
+  LoaderCircle,
+  Play,
 } from 'lucide-react'
-import type { AppSnapshot, GatewayApi, RequestLog, RouteClient } from '@shared/types'
+import type { AppSnapshot, GatewayApi, RequestLog, RequestReplayResult, RequestReplayTemplate, RouteClient } from '@shared/types'
 import type { ActionRunner } from '../App'
+import { requestLogSourceLabel } from '../account-source-label'
 import {
   Badge,
   ConfirmDialog,
@@ -122,6 +126,13 @@ function formatTransferBytes(value: number): string {
   return `${(value / 1024 / 1024).toFixed(1)} MB`
 }
 
+function localizeReplayError(cause: unknown, language: string, fallback: string): string {
+  const message = cause instanceof Error ? cause.message : String(cause ?? '')
+  if (!message) return fallback
+  if (language === 'en' && /[\u3400-\u9fff]/u.test(message)) return fallback
+  return message
+}
+
 export function RequestsView({
   snapshot,
   api,
@@ -138,11 +149,20 @@ export function RequestsView({
   const [status, setStatus] = useState<'all' | RequestLog['status']>('all')
   const [client, setClient] = useState<'all' | RouteClient>('all')
   const [selected, setSelected] = useState<RequestLog | null>(null)
+  const [replayTemplate, setReplayTemplate] = useState<RequestReplayTemplate | null>(null)
+  const [replayLoading, setReplayLoading] = useState(false)
+  const [replayResult, setReplayResult] = useState<RequestReplayResult | null>(null)
+  const [replayError, setReplayError] = useState('')
+  const selectedId = selected?.id
   const [confirmClear, setConfirmClear] = useState(false)
   const [showConversationNames, setShowConversationNames] = useState(false)
   const [columnWidths, setColumnWidths] = useState<RequestColumnWidths>(loadRequestColumnWidths)
   const [liveNow, setLiveNow] = useState(Date.now())
   const resizingColumn = useRef<{ id: RequestColumnId; startX: number; startWidth: number } | null>(null)
+  const accountCredentialTypes = useMemo(
+    () => new Map(snapshot.accounts.map((account) => [account.id, account.credentialType])),
+    [snapshot.accounts],
+  )
 
   useEffect(() => {
     try {
@@ -180,10 +200,10 @@ export function RequestsView({
       if (status !== 'all' && log.status !== status) return false
       if (client !== 'all' && log.client !== client) return false
       if (!normalized) return true
-      return [log.id, log.model, log.providerName, accountDisplayName(log.accountName, t), log.conversationId, conversationDisplayName(log.conversationName, t), log.error]
+      return [log.id, log.model, requestLogSourceLabel(log, accountCredentialTypes.get(log.accountId ?? '')), accountDisplayName(log.accountName, t), log.conversationId, conversationDisplayName(log.conversationName, t), log.error]
         .some((value) => value?.toLowerCase().includes(normalized))
     })
-  }, [client, query, snapshot.requestLogs, status, t])
+  }, [accountCredentialTypes, client, query, snapshot.requestLogs, status, t])
 
   useEffect(() => {
     if (!snapshot.requestLogs.some((log) => log.status === 'streaming')) return
@@ -197,6 +217,32 @@ export function RequestsView({
     const latest = snapshot.requestLogs.find((log) => log.id === selected.id)
     if (latest && latest !== selected) setSelected(latest)
   }, [selected, snapshot.requestLogs])
+
+  useEffect(() => {
+    let active = true
+    setReplayTemplate(null)
+    setReplayResult(null)
+    setReplayError('')
+    if (!selectedId) return () => { active = false }
+    void api.getRequestReplayTemplate(selectedId).then((template) => {
+      if (active) setReplayTemplate(template)
+    }).catch(() => undefined)
+    return () => { active = false }
+  }, [api, selectedId])
+
+  const replaySelected = async () => {
+    if (!selected) return
+    setReplayLoading(true)
+    setReplayResult(null)
+    setReplayError('')
+    try {
+      setReplayResult(await api.replayRequest(selected.id))
+    } catch (cause) {
+      setReplayError(localizeReplayError(cause, language, t('请求回放失败', 'Request replay failed')))
+    } finally {
+      setReplayLoading(false)
+    }
+  }
 
   const successCount = snapshot.requestLogs.filter((log) => log.status === 'success').length
   const errorCount = snapshot.requestLogs.filter((log) => log.status === 'error').length
@@ -305,7 +351,7 @@ export function RequestsView({
                       <td><div className="cell-with-icon"><span className={`client-dot client-dot--${log.client}`} />{clientNames[log.client]}</div></td>
                       <td><div className={`table-primary request-conversation${showConversationNames ? '' : ' request-conversation--hidden'}`}>{showConversationNames && <strong title={conversationDisplayName(log.conversationName, t)}>{conversationDisplayName(log.conversationName, t) ?? '—'}</strong>}<span className="mono" title={log.conversationId}>{compactConversationId(log.conversationId)}</span></div></td>
                       <td><span className="mono table-model">{log.model}</span></td>
-                      <td><div className="table-primary"><strong>{log.providerName}</strong><span>{accountDisplayName(log.accountName, t)}</span></div></td>
+                      <td><div className="table-primary"><strong>{requestLogSourceLabel(log, accountCredentialTypes.get(log.accountId ?? ''))}</strong><span>{accountDisplayName(log.accountName, t)}</span></div></td>
                       <td>{log.status === 'streaming'
                         ? <span className="request-live-status"><i aria-hidden="true" /><span>{t(liveStageLabels[log.progressStage ?? 'receiving-body'][0], liveStageLabels[log.progressStage ?? 'receiving-body'][1])}</span></span>
                         : <><RequestStatusBadge status={log.status} statusCode={log.statusCode} requestKind={log.requestKind} />{log.statusCode && <span className="status-code">{log.statusCode}</span>}</>}</td>
@@ -339,7 +385,7 @@ export function RequestsView({
               <DetailItem label={t('对话 ID', 'Conversation ID')} mono>{selected.conversationId ?? '—'}</DetailItem>
               <DetailItem label={t('入站协议', 'Inbound Protocol')}>{protocolLabels[selected.protocol]}</DetailItem>
               <DetailItem label={t('模型', 'Model')} mono>{selected.model}</DetailItem>
-              <DetailItem label={t('供应商', 'Provider')}>{selected.providerName}</DetailItem>
+              <DetailItem label={t('供应商', 'Provider')}>{requestLogSourceLabel(selected, accountCredentialTypes.get(selected.accountId ?? ''))}</DetailItem>
               <DetailItem label={t('账号', 'Account')}>{accountDisplayName(selected.accountName, t)}</DetailItem>
               {selected.status === 'streaming' && <DetailItem label={t('实时阶段', 'Live Stage')}>{t(liveStageLabels[selected.progressStage ?? 'receiving-body'][0], liveStageLabels[selected.progressStage ?? 'receiving-body'][1])}</DetailItem>}
               {selected.failureStage && <DetailItem label={t('失败阶段', 'Failure Stage')}>{t(failureStageLabels[selected.failureStage][0], failureStageLabels[selected.failureStage][1])}</DetailItem>}
@@ -361,7 +407,16 @@ export function RequestsView({
               {selected.status === 'streaming' && <DetailItem label={t('已接收流数据', 'Stream Data Received')}>{formatTransferBytes(selected.streamedBytes ?? 0)}</DetailItem>}
             </div>
             {selected.error && <div className="request-error"><TriangleAlert size={17} /><div><strong>{t('请求失败', 'Request Failed')}</strong><p>{language === 'en' && /[\u3400-\u9fff]/u.test(selected.error) ? 'The upstream request failed.' : selected.error}</p></div></div>}
-            <div className="privacy-note"><Badge tone="neutral">{t('Payload 未记录', 'Payload not recorded')}</Badge><span>{t('仅记录会话标识和客户端提供的名称，不包含请求与响应正文', 'Only conversation identifiers and client-provided names are recorded; request and response bodies are excluded')}</span></div>
+            {replayTemplate ? <div className="request-replay">
+              <div className="request-replay__heading"><div><Badge tone="neutral">{t('默认脱敏', 'Redacted by default')}</Badge><span>{t('仅在内存中临时保留；不会写入请求日志或备份。', 'Retained temporarily in memory only; never written to request logs or backups.')}</span></div><div>
+                <button className="button button--secondary" type="button" onClick={() => void navigator.clipboard?.writeText(JSON.stringify(replayTemplate, null, 2))}><Clipboard size={15} />{t('复制模板', 'Copy Template')}</button>
+                <button className="button button--primary" type="button" disabled={replayLoading || selected.status === 'streaming'} onClick={() => void replaySelected()}>{replayLoading ? <LoaderCircle size={15} className="spin" /> : <Play size={15} />}{t('本机回放', 'Replay Locally')}</button>
+              </div></div>
+              <pre className="mono">{JSON.stringify(replayTemplate.body, null, 2)}</pre>
+              <small>{t('回放使用内存中的原始请求，并通过当前启用的本地路由重新发送。', 'Replay uses the original in-memory request and resends it through the currently enabled local route.')}</small>
+              {replayResult && <div className="client-config-notice">HTTP {replayResult.status} · {durationLabel(replayResult.latencyMs)}{replayResult.responsePreview ? ` · ${replayResult.responsePreview.slice(0, 240)}` : ''}</div>}
+              {replayError && <div className="request-error"><TriangleAlert size={16} /><span>{replayError}</span></div>}
+            </div> : <div className="privacy-note"><Badge tone="neutral">{t('Payload 未捕获', 'Payload not captured')}</Badge><span>{t('默认仅记录元数据；在设置中启用内存回放后才会临时捕获新请求。', 'Metadata only by default. Enable in-memory replay in Settings to capture new requests temporarily.')}</span></div>}
           </div>
         )}
       </Modal>

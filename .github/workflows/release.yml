@@ -63,15 +63,18 @@ jobs:
           - name: Windows x64
             id: windows-x64
             os: windows-latest
+            runtime_targets: win-x64
             builder_args: --win nsis portable --x64
             artifact_path: |
               release/StonePlus-*-windows-x64-setup.exe
               release/StonePlus-*-windows-x64-setup.exe.blockmap
               release/StonePlus-*-windows-x64-portable.exe
+              release/StonePlus-CodeSigning.cer
               release/latest.yml
           - name: Linux x64
             id: linux-x64
             os: ubuntu-latest
+            runtime_targets: linux-x64
             builder_args: --linux AppImage deb --x64
             artifact_path: |
               release/StonePlus-*-linux-x86_64.AppImage
@@ -80,6 +83,7 @@ jobs:
           - name: Linux arm64
             id: linux-arm64
             os: ubuntu-24.04-arm
+            runtime_targets: linux-arm64
             builder_args: --linux AppImage deb --arm64
             artifact_path: |
               release/StonePlus-*-linux-arm64.AppImage
@@ -88,6 +92,7 @@ jobs:
           - name: macOS Intel and Apple Silicon
             id: macos
             os: macos-15
+            runtime_targets: mac-x64 mac-arm64
             builder_args: --mac dmg zip --x64 --arm64 --config.mac.identity=- --config.mac.hardenedRuntime=false
             artifact_path: |
               release/StonePlus-*-macos-x64.dmg
@@ -114,10 +119,39 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Fetch and verify pinned sing-box runtime
+        shell: pwsh
+        run: |
+          $targets = '${{ matrix.runtime_targets }}'.Split(' ', [StringSplitOptions]::RemoveEmptyEntries)
+          ./scripts/fetch-sing-box.ps1 -Target $targets
+          foreach ($target in $targets) {
+            node scripts/verify-sing-box-runtime.mjs --target $target
+            if ($LASTEXITCODE -ne 0) {
+              throw "sing-box runtime verification failed for $target."
+            }
+          }
+
+      - name: Require Windows signing material
+        if: matrix.id == 'windows-x64'
+        shell: pwsh
+        env:
+          WIN_CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
+          WIN_CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
+          WIN_SIGNING_CERT_SHA1: ${{ vars.WIN_SIGNING_CERT_SHA1 }}
+        run: |
+          foreach ($required in @('WIN_CSC_LINK', 'WIN_CSC_KEY_PASSWORD', 'WIN_SIGNING_CERT_SHA1')) {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($required))) {
+              throw "Required Windows signing setting is missing: $required"
+            }
+          }
+
       - name: Build application
         run: npm run build
 
       - name: Build native packages
+        env:
+          WIN_CSC_LINK: ${{ matrix.id == 'windows-x64' && secrets.WIN_CSC_LINK || '' }}
+          WIN_CSC_KEY_PASSWORD: ${{ matrix.id == 'windows-x64' && secrets.WIN_CSC_KEY_PASSWORD || '' }}
         run: >-
           npx electron-builder ${{ matrix.builder_args }} --publish never
           --config.extraMetadata.homepage=https://github.com/${{ github.repository }}
@@ -125,6 +159,37 @@ jobs:
           --config.extraMetadata.author.name=${{ github.repository_owner }}
           --config.extraMetadata.author.email=${{ github.repository_owner }}@users.noreply.github.com
           --config.linux.maintainer=${{ github.repository_owner }}@users.noreply.github.com
+
+      - name: Verify Windows signatures and packaged core
+        if: matrix.id == 'windows-x64'
+        shell: pwsh
+        env:
+          WIN_SIGNING_CERT_SHA1: ${{ vars.WIN_SIGNING_CERT_SHA1 }}
+        run: |
+          node scripts/verify-sing-box-runtime.mjs --target win-x64 --runtime-root release/win-unpacked/resources/sing-box
+          if ($LASTEXITCODE -ne 0) {
+            throw 'The packaged sing-box runtime no longer matches its pinned manifest.'
+          }
+
+          $expectedThumbprint = $env:WIN_SIGNING_CERT_SHA1.Replace(' ', '').ToUpperInvariant()
+          $signedFiles = @(
+            'release/win-unpacked/Stone+.exe',
+            (Get-ChildItem release/StonePlus-*-windows-x64-setup.exe -File -ErrorAction Stop).FullName,
+            (Get-ChildItem release/StonePlus-*-windows-x64-portable.exe -File -ErrorAction Stop).FullName
+          )
+          foreach ($file in $signedFiles) {
+            $signature = Get-AuthenticodeSignature -LiteralPath $file
+            if (-not $signature.SignerCertificate) {
+              throw "Authenticode signature is missing: $file"
+            }
+            if ($signature.SignerCertificate.Thumbprint.ToUpperInvariant() -ne $expectedThumbprint) {
+              throw "Unexpected Authenticode signer: $file"
+            }
+            if ($signature.Status -in @('NotSigned', 'HashMismatch')) {
+              throw "Invalid Authenticode signature for ${file}: $($signature.Status)"
+            }
+          }
+          Copy-Item -LiteralPath build/signing/StonePlus-CodeSigning.cer -Destination release/StonePlus-CodeSigning.cer
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
@@ -135,9 +200,58 @@ jobs:
           compression-level: 0
           retention-days: 7
 
+  source:
+    name: Prepare corresponding source
+    needs: quality
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.4'
+
+      - name: Prepare pinned corresponding source
+        shell: pwsh
+        run: ./scripts/prepare-sing-box-source.ps1
+
+      - name: Upload corresponding source
+        uses: actions/upload-artifact@v4
+        with:
+          name: stone-corresponding-source
+          path: release/sources/StonePlus-*-sing-box-*-corresponding-source.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  attest:
+    name: Attest release artifacts
+    needs: [package, source]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: stone-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: release-assets/*
+
   release:
     name: Publish GitHub Release
-    needs: package
+    needs: [package, source, attest]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -173,6 +287,8 @@ jobs:
             "StonePlus-${version}-windows-x64-setup.exe"
             "StonePlus-${version}-windows-x64-setup.exe.blockmap"
             "StonePlus-${version}-windows-x64-portable.exe"
+            "StonePlus-CodeSigning.cer"
+            "StonePlus-${version}-sing-box-1.13.14-corresponding-source.tar.gz"
             "StonePlus-${version}-linux-x86_64.AppImage"
             "StonePlus-${version}-linux-amd64.deb"
             "StonePlus-${version}-linux-arm64.AppImage"
@@ -291,7 +407,7 @@ jobs:
               --target "$GITHUB_SHA"
               --title "Stone+ ${RELEASE_TAG}"
               --generate-notes
-              --notes $'> [!WARNING]\n> macOS artifacts are ad-hoc signed and are not Apple-notarized. Windows artifacts are unsigned. Linux credential storage requires a Secret Service-compatible keyring; AppImage may require FUSE 2.'
+              --notes $'> [!WARNING]\n> Windows artifacts carry the persistent StonePlus project Authenticode signature, but its self-signed certificate is not in the Microsoft trusted publisher program and SmartScreen may still warn. Verify the published certificate thumbprint, SHA256SUMS, and GitHub build provenance. macOS artifacts are ad-hoc signed and are not Apple-notarized. Linux credential storage requires a Secret Service-compatible keyring; AppImage may require FUSE 2.'
             )
             if [[ "$is_prerelease" == 'true' ]]; then
               create_args+=(--prerelease)

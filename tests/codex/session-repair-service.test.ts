@@ -141,7 +141,7 @@ describe('CodexSessionRepairService', () => {
     const threadOne = database.prepare('SELECT model_provider, has_user_event, cwd FROM threads WHERE id = ?').get('thread-one') as Record<string, unknown>
     const orphan = database.prepare('SELECT model_provider FROM threads WHERE id = ?').get('orphan-thread') as Record<string, unknown>
     database.close()
-    expect(threadOne).toEqual(expect.objectContaining({ model_provider: 'stone', has_user_event: 1, cwd: 'D:\\project\\stone+' }))
+    expect(threadOne).toEqual(expect.objectContaining({ model_provider: 'stone', has_user_event: 1, cwd: 'D:/project/stone+' }))
     expect(orphan.model_provider).toBe('stone')
 
     const after = await service.preview('stone')
@@ -168,5 +168,166 @@ describe('CodexSessionRepairService', () => {
   it('rejects unsafe provider identifiers', async () => {
     const { service } = await createFixture()
     await expect(service.preview('../bad')).rejects.toThrow('Provider ID')
+  })
+
+  it('does not interleave with another Stone+ or Codex++ provider sync lock', async () => {
+    const { service, codexHome, activeRollout } = await createFixture()
+    const preview = await service.preview('stone')
+    await mkdir(join(codexHome, 'tmp', 'provider-sync.lock'), { recursive: true })
+
+    await expect(service.repair('stone', preview.revision)).rejects.toThrow('另一个 Stone+ / Codex++')
+    const firstLine = JSON.parse((await readFile(activeRollout, 'utf8')).split(/\r?\n/)[0]) as Record<string, unknown>
+    expect((firstLine.payload as Record<string, unknown>).model_provider).toBe('openai')
+  })
+
+  it('reclaims a stale Codex++ owner.json lock whose process no longer exists', async () => {
+    const { service, codexHome } = await createFixture()
+    const preview = await service.preview('stone')
+    const lockPath = join(codexHome, 'tmp', 'provider-sync.lock')
+    await mkdir(lockPath, { recursive: true })
+    await writeFile(join(lockPath, 'owner.json'), JSON.stringify({
+      pid: 2_147_483_647,
+      startedAt: 1_784_444_363,
+    }))
+
+    await expect(service.repair('stone', preview.revision)).resolves.toMatchObject({ targetProvider: 'stone' })
+  })
+
+  it('preserves a Codex++ owner.json lock while its owner process is alive', async () => {
+    const { service, codexHome } = await createFixture()
+    const preview = await service.preview('stone')
+    const lockPath = join(codexHome, 'tmp', 'provider-sync.lock')
+    await mkdir(lockPath, { recursive: true })
+    await writeFile(join(lockPath, 'owner.json'), JSON.stringify({
+      pid: process.pid,
+      startedAt: Math.floor(Date.now() / 1_000),
+    }))
+
+    await expect(service.repair('stone', preview.revision)).rejects.toThrow('另一个 Stone+ / Codex++')
+    await expect(readFile(join(lockPath, 'owner.json'), 'utf8')).resolves.toContain(`"pid":${process.pid}`)
+  })
+
+  it('normalizes bounded global workspace fields, preserves unrelated state, and backs up the original bytes', async () => {
+    const { service, codexHome } = await createFixture()
+    const statePath = join(codexHome, '.codex-global-state.json')
+    const original = JSON.stringify({
+      'projectless-thread-ids': ['thread-projectless'],
+      'electron-saved-workspace-roots': ['\\\\?\\D:\\work\\app', 'd:/work/app/'],
+      'project-order': '\\\\?\\UNC\\server\\share',
+      'active-workspace-roots': '\\\\?\\D:\\work\\app',
+      'electron-workspace-root-labels': { '\\\\?\\D:\\work\\app': 'App' },
+      'open-in-target-preferences': { target: 'vscode', perPath: { '\\\\?\\UNC\\server\\share': 'cursor' } },
+      untouched: { nested: true },
+    }, null, 2) + '\r\n'
+    await writeFile(statePath, original)
+
+    const preview = await service.preview('stone')
+    expect(preview.globalStateFieldsToUpdate).toBe(5)
+    expect(preview.globalStateConflictingFields).toEqual([])
+
+    const result = await service.repair('stone', preview.revision)
+    expect(result.globalStateFieldsUpdated).toBe(5)
+    const state = JSON.parse(await readFile(statePath, 'utf8')) as Record<string, unknown>
+    expect(state).toMatchObject({
+      'electron-saved-workspace-roots': ['D:/work/app'],
+      'project-order': ['\\\\server\\share'],
+      'active-workspace-roots': 'D:/work/app',
+      'electron-workspace-root-labels': { 'D:/work/app': 'App' },
+      'open-in-target-preferences': { target: 'vscode', perPath: { '\\\\server\\share': 'cursor' } },
+      untouched: { nested: true },
+    })
+    expect(await readFile(join(result.backupPath!, '.codex-global-state.json'), 'utf8')).toBe(original)
+    expect(JSON.parse(await readFile(join(result.backupPath!, 'metadata.json'), 'utf8'))).toMatchObject({
+      changedGlobalStateFields: [
+        'active-workspace-roots',
+        'electron-saved-workspace-roots',
+        'electron-workspace-root-labels',
+        'open-in-target-preferences',
+        'project-order',
+      ],
+    })
+    expect((await service.preview('stone')).globalStateFieldsToUpdate).toBe(0)
+  })
+
+  it('fails closed on conflicting path-keyed values and never overwrites them', async () => {
+    const { service, codexHome } = await createFixture()
+    const statePath = join(codexHome, '.codex-global-state.json')
+    const labels = { 'D:\\work\\app': 'First', '\\\\?\\D:\\work\\app': 'Second' }
+    await writeFile(statePath, JSON.stringify({
+      'projectless-thread-ids': ['thread-projectless'],
+      'electron-workspace-root-labels': labels,
+    }))
+
+    const preview = await service.preview('stone')
+    expect(preview.globalStateConflictingFields).toEqual(['electron-workspace-root-labels'])
+    const result = await service.repair('stone', preview.revision)
+    expect(result.globalStateConflictingFields).toEqual(['electron-workspace-root-labels'])
+    expect((JSON.parse(await readFile(statePath, 'utf8')) as Record<string, unknown>)['electron-workspace-root-labels']).toEqual(labels)
+  })
+
+  it('rejects global state changed after preview before writing rollout or SQLite changes', async () => {
+    const { service, codexHome, activeRollout, databasePath } = await createFixture()
+    await writeFile(join(codexHome, '.codex-global-state.json'), JSON.stringify({
+      'projectless-thread-ids': ['thread-projectless'],
+      'active-workspace-roots': '\\\\?\\D:\\before-preview',
+    }))
+    const preview = await service.preview('stone')
+    await writeFile(join(codexHome, '.codex-global-state.json'), JSON.stringify({
+      'projectless-thread-ids': ['thread-projectless'],
+      'active-workspace-roots': '\\\\?\\D:\\after-preview',
+    }))
+
+    await expect(service.repair('stone', preview.revision)).rejects.toThrow('预览后发生变化')
+    const firstLine = JSON.parse((await readFile(activeRollout, 'utf8')).split(/\r?\n/)[0]) as Record<string, unknown>
+    expect((firstLine.payload as Record<string, unknown>).model_provider).toBe('openai')
+    const database = new DatabaseSync(databasePath, { readOnly: true })
+    expect((database.prepare('SELECT model_provider FROM threads WHERE id = ?').get('thread-one') as Record<string, unknown>).model_provider).toBe('openai')
+    database.close()
+  })
+
+  it('does not make provider repair stale when only unrelated global state changes', async () => {
+    const { service, codexHome } = await createFixture()
+    const preview = await service.preview('stone')
+    await writeFile(join(codexHome, '.codex-global-state.json'), JSON.stringify({
+      'projectless-thread-ids': ['thread-projectless'],
+      'electron-main-window-bounds': { x: 20, y: 30, width: 1200, height: 800 },
+    }))
+
+    await expect(service.repair('stone', preview.revision)).resolves.toMatchObject({ repairedRolloutFiles: 1 })
+    expect((JSON.parse(await readFile(join(codexHome, '.codex-global-state.json'), 'utf8')) as Record<string, unknown>)['electron-main-window-bounds'])
+      .toEqual({ x: 20, y: 30, width: 1200, height: 800 })
+  })
+
+  it('backs up and applies a global-state-only repair without touching the session index', async () => {
+    const { service, codexHome } = await createFixture()
+    const initial = await service.preview('stone')
+    await service.repair('stone', initial.revision)
+    const globalOnlyService = new CodexSessionRepairService({
+      codexHome,
+      now: () => new Date('2026-07-18T13:00:01Z'),
+      randomId: () => 'secondbackup',
+    })
+    const indexPath = join(codexHome, 'session_index.jsonl')
+    const indexText = JSON.stringify({ id: 'ghost', thread_name: 'keep', updated_at: '2026-07-20T00:00:00Z' }) + '\n'
+    await writeFile(indexPath, indexText)
+    await writeFile(join(codexHome, '.codex-global-state.json'), JSON.stringify({
+      'projectless-thread-ids': ['thread-projectless'],
+      'active-workspace-roots': '\\\\?\\D:\\only-global',
+    }))
+
+    const preview = await globalOnlyService.preview('stone')
+    expect(preview).toMatchObject({
+      rolloutFilesToUpdate: 0,
+      sqliteProviderRowsToUpdate: 0,
+      sqliteUserEventRowsToUpdate: 0,
+      sqliteCwdRowsToUpdate: 0,
+      globalStateFieldsToUpdate: 1,
+    })
+    const result = await globalOnlyService.repair('stone', preview.revision)
+
+    expect(result.backupPath).toBeTruthy()
+    expect(result.globalStateFieldsUpdated).toBe(1)
+    expect(await readFile(indexPath, 'utf8')).toBe(indexText)
+    expect((JSON.parse(await readFile(join(codexHome, '.codex-global-state.json'), 'utf8')) as Record<string, unknown>)['active-workspace-roots']).toBe('D:/only-global')
   })
 })

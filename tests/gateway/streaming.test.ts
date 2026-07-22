@@ -117,6 +117,30 @@ describe('canonical streaming protocol conversion', () => {
     })
   })
 
+  it('stops parsing events after a Responses terminal and reuses its complete output', () => {
+    const collector = createOpenAiResponsesStreamCollector()
+    collector.push(encoder.encode([
+      'event: response.completed',
+      'data: {"type":"response.completed","response":{"id":"resp_terminal","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"terminal"}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}',
+      '',
+      // A malformed trailer must not be decoded/parsed after the definitive
+      // terminal event, nor overwrite output assembled by that terminal.
+      'event: response.output_text.delta',
+      'data: {not-json',
+      '',
+      ''
+    ].join('\n')))
+
+    expect(collector.isComplete()).toBe(true)
+    expect(collector.finish()).toMatchObject({
+      response: {
+        id: 'resp_terminal',
+        status: 'completed',
+        output: [{ content: [{ text: 'terminal' }] }]
+      }
+    })
+  })
+
   it('marks completed Responses function-call arguments before response.completed', () => {
     const parser = createCanonicalStreamParser('openai-responses')
     const events = parser.push(encoder.encode([
@@ -320,6 +344,7 @@ describe('canonical streaming protocol conversion', () => {
     expect(events).toContainEqual({ type: 'message-complete', index: 0 })
     expect(parser.getProtocolState()).toEqual({
       responsesEventCount: 2,
+      responsesProgressEventCount: 2,
       responsesTerminalEvent: 'response.completed',
       responsesLastEventType: 'response.completed',
       responsesLastSequenceNumber: 42
@@ -350,9 +375,36 @@ describe('canonical streaming protocol conversion', () => {
     expect(events).not.toContainEqual({ type: 'done' })
     expect(parser.getProtocolState()).toEqual({
       responsesEventCount: 1,
+      responsesProgressEventCount: 1,
       responsesTerminalEvent: undefined,
       responsesLastEventType: '[DONE]',
       responsesLastSequenceNumber: 9
+    })
+  })
+
+  it('tracks Responses protocol progress without counting lifecycle frames or heartbeats', () => {
+    const parser = createCanonicalStreamParser('openai-responses')
+    const wire = [
+      'event: response.queued\ndata: {"type":"response.queued","sequence_number":1}\n\n',
+      'event: response.created\ndata: {"type":"response.created","sequence_number":2,"response":{"id":"resp_progress","status":"queued"}}\n\n',
+      'event: response.in_progress\ndata: {"type":"response.in_progress","sequence_number":3,"response":{"id":"resp_progress","status":"in_progress"}}\n\n',
+      'event: ping\ndata: {"type":"ping"}\n\n',
+      'event: heartbeat\ndata: {"type":"heartbeat"}\n\n',
+      'event: response.reasoning_summary_text.delta\ndata: {"type":"response.reasoning_summary_text.delta","sequence_number":4,"delta":"checking"}\n\n',
+      'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","sequence_number":5,"delta":"answer"}\n\n',
+      'event: response.function_call_arguments.delta\ndata: {"type":"response.function_call_arguments.delta","sequence_number":6,"output_index":0,"delta":"{}"}\n\n',
+      'event: response.usage.updated\ndata: {"type":"response.usage.updated","sequence_number":7,"usage":{"output_tokens":1}}\n\n',
+      'event: response.completed\ndata: {"type":"response.completed","sequence_number":8,"response":{"status":"completed","output":[]}}\n\n'
+    ].join('')
+
+    for (const chunk of byteChunks(wire, 5)) parser.push(chunk)
+
+    expect(parser.getProtocolState()).toEqual({
+      responsesEventCount: 10,
+      responsesProgressEventCount: 5,
+      responsesTerminalEvent: 'response.completed',
+      responsesLastEventType: 'response.completed',
+      responsesLastSequenceNumber: 8
     })
   })
 
@@ -458,6 +510,81 @@ describe('canonical streaming protocol conversion', () => {
     expect(wire).toContain('event: error')
     expect(wire).not.toContain('event: message_delta')
     expect(wire).not.toContain('event: message_stop')
+  })
+
+  it('preserves Responses content-filter termination in the canonical stream', () => {
+    const parser = createCanonicalStreamParser('openai-responses')
+    const events = parser.push(encoder.encode(
+      'event: response.incomplete\ndata: {"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"content_filter"}}}\n\n'
+    ))
+
+    expect(events).toContainEqual({ type: 'stop', reason: 'content_filter', rawReason: 'content_filter' })
+    expect(events).toContainEqual({ type: 'done' })
+  })
+
+  it('collects incomplete Responses output with matching item status', () => {
+    const collector = createOpenAiResponsesStreamCollector({
+      id: 'resp-collected-incomplete',
+      model: 'model-test',
+      now: () => 1_700_000_000_000
+    })
+    collector.push(encoder.encode([
+      'event: response.output_text.delta',
+      'data: {"type":"response.output_text.delta","delta":"partial"}',
+      '',
+      'event: response.incomplete',
+      'data: {"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"content_filter"},"output":[]}}',
+      '',
+      ''
+    ].join('\n')))
+
+    expect(collector.finish().response).toMatchObject({
+      status: 'incomplete',
+      incomplete_details: { reason: 'content_filter' },
+      output: [{ type: 'message', status: 'incomplete' }]
+    })
+  })
+
+  it('encodes Responses content filtering as response.incomplete', () => {
+    const streamEncoder = createCanonicalStreamEncoder('openai-responses', {
+      id: 'resp-test',
+      model: 'model-test',
+      now: () => 1_700_000_000_000
+    })
+    const wire = [
+      ...streamEncoder.encode({ type: 'start', id: 'resp-test', model: 'model-test' }),
+      ...streamEncoder.encode({ type: 'text-delta', text: 'partial' }),
+      ...streamEncoder.encode({ type: 'stop', reason: 'content_filter' }),
+      ...streamEncoder.encode({ type: 'done' })
+    ]
+    const text = new TextDecoder().decode(Buffer.concat(wire.map((chunk) => Buffer.from(chunk))))
+
+    expect(text).toContain('event: response.incomplete')
+    expect(text).toContain('"reason":"content_filter"')
+    expect(text).not.toContain('event: response.completed')
+    const terminalMatch = /event: response\.incomplete\ndata: ([^\n]+)/.exec(text)
+    const terminal = JSON.parse(terminalMatch?.[1] ?? '{}') as {
+      response?: { status?: string; output?: Array<{ status?: string }> }
+    }
+    expect(terminal.response?.status).toBe('incomplete')
+    expect(terminal.response?.output?.[0]?.status).toBe('incomplete')
+  })
+
+  it('does not emit a normal Chat stop frame after a streaming error', () => {
+    const streamEncoder = createCanonicalStreamEncoder('openai-chat', {
+      id: 'chat-test',
+      model: 'model-test',
+      now: () => 1_700_000_000_000
+    })
+    const wire = [
+      ...streamEncoder.encode({ type: 'error', message: 'upstream failed', errorType: 'upstream_stream_error' }),
+      ...streamEncoder.encode({ type: 'stop', reason: 'error' }),
+      ...streamEncoder.encode({ type: 'done' })
+    ]
+    const text = new TextDecoder().decode(Buffer.concat(wire.map((chunk) => Buffer.from(chunk))))
+
+    expect(text).toContain('"error"')
+    expect(text).not.toContain('"finish_reason":"stop"')
   })
 })
 

@@ -7,6 +7,7 @@ import {
   CHATGPT_CODEX_SEARCH_URL,
   CHATGPT_CODEX_USAGE_URL,
   CODEX_CLIENT_VERSION,
+  checkChatGptAccountAuthorized,
   classifyChatGptCodexFailure,
   isChatGptCodexResponsesLiteBody,
   probeChatGptAccount,
@@ -271,6 +272,34 @@ describe('ChatGPT Codex provider path', () => {
       expect(result).not.toContain(bundle.accessToken)
       expect(result).not.toContain(bundle.accountId)
     }
+  })
+
+  it('keeps a usable account active when only the usage endpoint is unavailable', async () => {
+    const account: Account = {
+      id: 'agent-account', providerId: 'chatgpt', name: 'Agent Identity',
+      credentialId: 'agent-credential', maskedCredential: 'agent-****',
+      credentialType: 'chatgpt-agent-identity', status: 'active', priority: 1,
+      weight: 1, maxConcurrency: 4, inFlight: 0, availableModels: ['gpt-5.4'],
+      modelPolicy: 'all', modelAllowlist: ['gpt-5.4'], createdAt: 1, updatedAt: 1
+    }
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(null, { status: 403 }))
+      .mockResolvedValueOnce(new Response('data: {"type":"response.completed"}\n\n', {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' }
+      }))
+
+    const result = await checkChatGptAccountAuthorized(account, {
+      authorization: 'AgentAssertion test-private',
+      accountId: 'acct-agent'
+    }, fetchMock as typeof fetch)
+
+    expect(result).toMatchObject({ ok: true })
+    expect(result.quota).toBeUndefined()
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      CHATGPT_CODEX_USAGE_URL,
+      CHATGPT_CODEX_RESPONSES_URL
+    ])
   })
 
   it('classifies Codex OAuth failures without API-key wording', () => {

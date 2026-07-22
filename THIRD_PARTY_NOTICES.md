@@ -21,6 +21,8 @@ replace or modify those terms.
 | `js-yaml` | 4.3.0 | MIT |
 | `jsonfile` | 6.2.1 | MIT |
 | `lazy-val` | 1.0.5 | MIT |
+| `libsodium-sumo` | 0.7.16 | ISC |
+| `libsodium-wrappers-sumo` | 0.7.16 | ISC |
 | `lucide-react` | 0.468.0 | ISC |
 | `lodash.escaperegexp` | 4.1.2 | MIT |
 | `lodash.isequal` | 4.5.0 | MIT |
@@ -36,6 +38,7 @@ replace or modify those terms.
 | `tiny-typed-emitter` | 2.1.0 | MIT |
 | `undici` | 7.28.0 | MIT |
 | `universalify` | 2.0.1 | MIT |
+| `ws` | 8.21.1 | MIT |
 | `zustand` | 5.0.14 | MIT |
 
 The complete license text for each npm package is retained with that package
@@ -71,3 +74,28 @@ and other third-party components. Electron's MIT license is distributed as
 `LICENSE.electron.txt`; Chromium and embedded component notices are distributed
 as `LICENSES.chromium.html`. These files are generated and included by the
 Electron packaging toolchain and must remain with binary distributions.
+
+## sing-box And libcronet
+
+Stone+ packages unmodified official sing-box v1.13.14 runtime files from the
+SagerNet project, Copyright (C) 2022 nekohasekai. sing-box is licensed under
+the GNU General Public License, version 3 or (at your option) any later
+version. Project: https://github.com/SagerNet/sing-box
+
+The Windows x64 runtime includes `libcronet.dll`; the Linux x64 and arm64
+pure-Go runtimes include `libcronet.so`. The official macOS x64 and arm64
+archives contain no external Cronet library. libcronet is selected through
+cronet-go commit `98d539ce67568fb911654e66a14cf4247ed833ec`, which pins
+NaiveProxy commit `888e114241c89b05fac4e4ee01482d7bd89ca15a` and its Chromium
+network-stack sources.
+
+The complete GPL text is distributed as
+`licenses/GPL-3.0-or-later.txt`; the upstream sing-box notice is distributed
+as `licenses/sing-box-v1.13.14.txt`. cronet-go, NaiveProxy, Chromium, and
+their retained third-party notices are distributed under
+`licenses/libcronet/`. Corresponding-source access and the release artifact
+requirements are described in `SOURCE_OFFER-sing-box.md`.
+
+Every sing-box archive and every extracted runtime file is authenticated by
+the pinned size and SHA-256 values in the installed sing-box manifests before
+packaging and before startup.

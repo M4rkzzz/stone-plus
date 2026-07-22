@@ -23,6 +23,133 @@ export type ProxyProtocol = 'http' | 'https' | 'socks4' | 'socks5'
 export type ProxyStatus = 'unchecked' | 'available' | 'error'
 export type OutboundNetworkMode = 'direct' | 'system'
 
+export type BuiltInProxyAccessMode = 'system' | 'tun'
+export type BuiltInProxyRuleMode = 'rule' | 'global' | 'direct'
+export type BuiltInProxyProfileFormat = 'sing-box-json' | 'clash-meta-yaml' | 'uri-list'
+export type BuiltInProxyLifecycleStatus = 'disabled' | 'starting' | 'ready' | 'stopping' | 'error'
+
+/** Durable built-in proxy preferences. External gateway routing remains independent. */
+export interface BuiltInProxySettings {
+  desiredEnabled: boolean
+  activeProfileId?: string
+  accessMode: BuiltInProxyAccessMode
+  ruleMode: BuiltInProxyRuleMode
+  mixedPort: number
+  lanEnabled: boolean
+  autoStart: boolean
+  /** Sticky activation history used to distinguish first-run guidance from fail-closed recovery. */
+  hasEverActivated: boolean
+  lastActivatedAt?: number
+  updatedAt: number
+}
+
+export interface BuiltInProxyNodeSummary {
+  /** Stable parser-derived id; it does not contain a node address or credential. */
+  id: string
+  name: string
+  type: string
+  groupIds: string[]
+  latencyMs?: number
+  latencyStatus: 'untested' | 'testing' | 'available' | 'timeout' | 'error'
+  lastTestedAt?: number
+}
+
+/** Renderer-safe profile projection. Subscription URLs and full node payloads are excluded. */
+export interface BuiltInProxyProfileSummary {
+  id: string
+  name: string
+  source: 'subscription' | 'import'
+  format: BuiltInProxyProfileFormat
+  nodes: BuiltInProxyNodeSummary[]
+  nodeCount: number
+  groupCount: number
+  ruleStatus: 'preserved' | 'fallback'
+  activeNodeId?: string
+  warning?: string
+  createdAt: number
+  updatedAt: number
+  lastRefreshAt?: number
+}
+
+export interface EffectiveOutboundRoute {
+  generation: number
+  kind: 'external' | 'built-in-mixed' | 'built-in-tun' | 'blocked'
+  externalMode?: OutboundNetworkMode
+  profileId?: string
+  nodeId?: string
+  mixedPort?: number
+  activatedAt?: number
+}
+
+export type BuiltInProxyErrorCategory =
+  | 'core-missing'
+  | 'core-integrity'
+  | 'configuration-invalid'
+  | 'node-handshake'
+  | 'mixed-port'
+  | 'tun-elevation'
+  | 'subscription-update'
+  | 'system-proxy'
+  | 'health-check'
+  | 'core-crashed'
+  | 'unknown'
+
+export interface BuiltInProxyRuntimeState {
+  desiredEnabled: boolean
+  status: BuiltInProxyLifecycleStatus
+  routeGeneration: number
+  settings: BuiltInProxySettings
+  profiles: BuiltInProxyProfileSummary[]
+  effectiveRoute: EffectiveOutboundRoute
+  coreVersion?: string
+  startedAt?: number
+  lastReadyAt?: number
+  error?: {
+    category: BuiltInProxyErrorCategory
+    message: string
+    retryable: boolean
+  }
+}
+
+export type BuiltInProxyImportInput =
+  | {
+      source: 'subscription'
+      name?: string
+      url: string
+      token?: string
+      format?: BuiltInProxyProfileFormat
+    }
+  | {
+      source: 'import'
+      name?: string
+      content: string
+      format?: BuiltInProxyProfileFormat
+    }
+
+export interface ProxyTrafficSnapshot {
+  capturedAt: number
+  uploadBytes: number
+  downloadBytes: number
+  uploadRateBytesPerSecond: number
+  downloadRateBytesPerSecond: number
+  activeConnections: number
+  totalConnections: number
+}
+
+export interface ProxyConnectionSummary {
+  id: string
+  network: 'tcp' | 'udp'
+  protocol?: string
+  source: string
+  destination: string
+  outbound: string
+  profileId?: string
+  nodeId?: string
+  uploadBytes: number
+  downloadBytes: number
+  startedAt: number
+}
+
 export interface ProxyDefinition {
   id: string
   name: string
@@ -182,6 +309,77 @@ export interface ClientConfigProfile {
   updatedAt: number
 }
 
+export type ManagedClientInstanceStatus = 'stopped' | 'starting' | 'running' | 'stopping' | 'failed'
+export type ManagedClientLaunchMode = 'terminal' | 'background'
+
+export interface ManagedClientInstance {
+  id: string
+  name: string
+  client: RouteClient
+  configDirectory: string
+  workingDirectory?: string
+  executablePath?: string
+  launchArgs: string[]
+  launchMode: ManagedClientLaunchMode
+  routeId?: string
+  profileId?: string
+  status: ManagedClientInstanceStatus
+  pid?: number
+  processAlive?: boolean
+  stopError?: string
+  lastStartedAt?: number
+  lastStoppedAt?: number
+  lastError?: string
+  createdAt: number
+  updatedAt: number
+}
+
+export interface ManagedClientInstanceInput {
+  id?: string
+  name: string
+  client: RouteClient
+  configDirectory: string
+  workingDirectory?: string
+  executablePath?: string
+  launchArgs?: string[]
+  launchMode?: ManagedClientLaunchMode
+  routeId?: string
+  profileId?: string
+}
+
+export type CodexSessionKind = 'active' | 'archived' | 'trash'
+
+export interface CodexManagedSession {
+  id: string
+  /** Exact file/path revision required by native and destructive actions. */
+  revision: string
+  title: string
+  kind: CodexSessionKind
+  relativePath: string
+  cwd?: string
+  modelProvider?: string
+  createdAt?: number
+  updatedAt: number
+  sizeBytes: number
+  inputTokens: number
+  outputTokens: number
+  cachedInputTokens: number
+  reasoningTokens: number
+  totalTokens: number
+}
+
+export interface CodexSessionQuery {
+  search?: string
+  kind?: CodexSessionKind | 'all'
+  limit?: number
+}
+
+export interface CodexSessionExportResult {
+  cancelled: boolean
+  sessionId: string
+  filePath?: string
+}
+
 export interface ClientConfigProfileInput {
   id?: string
   name: string
@@ -244,6 +442,45 @@ export interface ClientConfigRestoreResult {
   safetyBackup?: ClientConfigBackup
 }
 
+export type ResponsesCompactMode = 'legacy' | 'passthrough' | 'native'
+
+/**
+ * A credential-free, persisted description of features exposed by an upstream.
+ * Optional feature flags deliberately distinguish "not supported" from
+ * "not checked" so legacy providers remain routable after upgrading.
+ */
+export interface UpstreamCapabilityProfile {
+  version: 1
+  origin: 'declared' | 'probed' | 'inferred'
+  checkedAt?: number
+  streaming?: boolean
+  nonStreaming?: boolean
+  toolCalls?: boolean
+  modelDiscovery?: boolean
+  imageInput?: boolean
+  imageGeneration?: boolean
+  webSearch?: boolean
+  compact?: boolean
+  websocket?: boolean
+  promptCaching?: boolean
+  reasoning?: boolean
+  store?: boolean
+  previousResponseId?: boolean
+  parallelToolCalls?: boolean
+}
+
+export type UpstreamCapabilityRequirement = Exclude<keyof UpstreamCapabilityProfile,
+  'version' | 'origin' | 'checkedAt'>
+
+export interface ModelCapabilityDefinition {
+  id: string
+  displayName?: string
+  contextWindow?: number
+  maxOutputTokens?: number
+  capabilities?: Partial<Record<UpstreamCapabilityRequirement, boolean>>
+  discoveredAt?: number
+}
+
 export interface ProviderDefinition {
   id: string
   name: string
@@ -256,6 +493,15 @@ export interface ProviderDefinition {
   models: string[]
   /** Force the OpenAI priority service tier for this standalone relay source. */
   forceFastMode?: boolean
+  /**
+   * Declares how an OpenAI Responses-compatible source handles compact data.
+   *
+   * Official OpenAI Responses sources and ChatGPT OAuth credentials are always
+   * treated as `native`, regardless of this override.
+   */
+  responsesCompactMode?: ResponsesCompactMode
+  capabilityProfile?: UpstreamCapabilityProfile
+  modelCatalog?: ModelCapabilityDefinition[]
   createdAt: number
   updatedAt: number
 }
@@ -273,7 +519,7 @@ export interface Account {
   name: string
   credentialId: string
   maskedCredential: string
-  credentialType?: 'api-key' | 'chatgpt-oauth'
+  credentialType?: 'api-key' | 'chatgpt-oauth' | 'chatgpt-agent-identity'
   chatgptAccountId?: string
   credentialExpiresAt?: number
   renewable?: boolean
@@ -292,6 +538,8 @@ export interface Account {
   quotaUnit?: 'usd' | 'requests' | 'tokens' | 'percent'
   quota?: AccountQuotaSnapshot
   codexQuota?: AccountCodexQuotaSnapshot
+  /** Optional quota reserve guard. Omitted policies preserve legacy scheduling. */
+  quotaProtection?: QuotaProtectionPolicy
   cooldownUntil?: number
   cooldownReason?: 'quota' | 'failure'
   circuitState?: AccountCircuitState
@@ -316,7 +564,16 @@ export interface AccountFitnessSnapshot {
   recentSuccessRate?: number
   /** Confidence in the rating, from 0 to 100, based on effective historical sample weight. */
   confidence?: number
+  /**
+   * Preferred user-visible response latency. This is the semantic first-token
+   * latency when available and falls back to the first upstream body byte for
+   * historical/non-semantic samples.
+   */
   firstTokenMs?: number
+  /** Semantic first-token latency measured for the successful account attempt. */
+  semanticFirstTokenMs?: number
+  /** Transport latency until the first upstream response body byte. */
+  transportFirstBodyMs?: number
   outputTokensPerSecond?: number
   failurePenalty: number
   components?: {
@@ -365,6 +622,20 @@ export interface AccountCodexQuotaSnapshot {
   source: CodexQuotaSource
 }
 
+/**
+ * Keeps a configurable reserve in Codex rolling quota windows. Percentages are
+ * remaining quota (0-100), rather than the upstream API's used percentage.
+ * Unknown/stale quota is allowed by default so existing configurations retain
+ * their pre-policy behaviour.
+ */
+export interface QuotaProtectionPolicy {
+  fiveHourRemainingPercent?: number
+  sevenDayRemainingPercent?: number
+  unavailableBehavior?: 'allow' | 'block'
+  /** Treat a snapshot older than this as unavailable. Omit to accept any age. */
+  staleAfterMinutes?: number
+}
+
 export interface CodexQuotaHistoryPoint {
   accountId: string
   observedAt: number
@@ -404,6 +675,8 @@ export interface Pool {
   stickyTtlMinutes: number
   maxRetries: number
   forceFastMode?: boolean
+  /** Pool-wide reserve guard, combined with each member's account policy. */
+  quotaProtection?: QuotaProtectionPolicy
   hedgedRequests?: boolean
   hedgeDelayMs?: number
   firstBodyTimeoutMs?: number
@@ -416,6 +689,8 @@ export interface Route {
   id: string
   client: RouteClient
   enabled: boolean
+  /** Prioritize request forwarding over nonessential background/UI work for high-concurrency routes. */
+  highConcurrencyMode?: boolean
   poolId: string
   inboundProtocol: Protocol
   modelMap: Record<string, string>
@@ -430,6 +705,10 @@ export interface GatewaySettings {
   autoStart: boolean
   logPayloads: boolean
   requestTimeoutSeconds: number
+  /** Opt-in downstream OpenAI Responses WebSocket transport. */
+  responsesWebSocketEnabled?: boolean
+  /** Disable the optional Work Louder Codex Micro integration on managed Codex restarts. */
+  disableCodexMicro?: boolean
   launchAtLogin?: boolean
   desktopNotifications?: boolean
   automaticBackups?: boolean
@@ -551,6 +830,8 @@ export interface RequestLog {
   /** Logical request purpose. Compaction is buffered and has no first-token metric. */
   requestKind?: 'generation' | 'search' | 'compaction'
   accountId?: string
+  /** Non-sensitive account credential kind retained for accurate historical source labels. */
+  credentialType?: Account['credentialType']
   conversationId?: string
   conversationName?: string
   timestamp: number
@@ -609,6 +890,34 @@ export interface RequestLog {
   failoverCount?: number
 }
 
+/** Memory-only, renderer-safe replay template. Prompt/content fields are redacted. */
+export interface RequestReplayTemplate {
+  id: string
+  path: string
+  body: Record<string, unknown>
+  headers: Record<string, string>
+  createdAt: number
+  expiresAt: number
+  contentRedacted: boolean
+}
+
+export interface RequestReplayResult {
+  ok: boolean
+  status: number
+  latencyMs: number
+  responsePreview: string
+}
+
+/** Read-only status. The authentication token is deliberately never exposed to the renderer. */
+export interface LocalEventServerStatus {
+  running: boolean
+  address?: string
+  discoveryFile: string
+  authentication: 'bearer-token'
+  connectedClients: number
+  startedAt?: number
+}
+
 export interface ObservabilitySummary {
   windowStart: number
   windowEnd: number
@@ -626,10 +935,17 @@ export interface ObservabilitySummary {
 }
 
 export interface AppSnapshot {
+  /** Monotonic main-process runtime revision used to detect missed delta IPC events. */
+  runtimeRevision?: number
   providers: ProviderDefinition[]
   accounts: PublicAccount[]
   accountTags: AccountTagDefinition[]
   proxies: PublicProxyDefinition[]
+  /** Durable, renderer-safe built-in proxy state; secret material is kept in the main-process vault. */
+  builtInProxySettings?: BuiltInProxySettings
+  builtInProxyProfiles?: BuiltInProxyProfileSummary[]
+  /** Live ownership state may be injected by the main-process coordinator; it is never persisted. */
+  builtInProxyRuntimeState?: BuiltInProxyRuntimeState
   pools: Pool[]
   routes: Route[]
   gateway: GatewaySettings
@@ -648,6 +964,19 @@ export interface AppSnapshot {
   vaultBackend: string
 }
 
+/**
+ * High-frequency gateway state sent independently from the durable application
+ * snapshot. Every collection is an upsert set; omitted fields are unchanged.
+ */
+export interface AppRuntimeDelta {
+  revision: number
+  gatewayStatus?: GatewayStatus
+  requestLogs?: RequestLog[]
+  accounts?: PublicAccount[]
+  healthEvents?: HealthEvent[]
+  observability?: AppSnapshot['observability']
+}
+
 export interface ProviderInput {
   id?: string
   name: string
@@ -656,6 +985,9 @@ export interface ProviderInput {
   baseUrl: string
   protocol: Protocol
   models: string[]
+  responsesCompactMode?: ResponsesCompactMode
+  capabilityProfile?: UpstreamCapabilityProfile
+  modelCatalog?: ModelCapabilityDefinition[]
 }
 
 export interface AccountInput {
@@ -670,6 +1002,7 @@ export interface AccountInput {
   modelAllowlist: string[]
   proxyId?: string
   tagId?: string | null
+  quotaProtection?: QuotaProtectionPolicy
 }
 
 export interface AccountTagInput {
@@ -765,6 +1098,43 @@ export interface AccountImportProgress {
   total: number
   percent: number
   message: string
+}
+
+export type PersistentTaskStatus = 'running' | 'paused' | 'cancelled' | 'completed' | 'failed'
+
+export interface PersistentTaskProgress {
+  completed: number
+  total: number
+  percent: number
+  message?: string
+  /** Kind-specific, credential-free counters/cursor metadata. */
+  details?: Record<string, number | string | boolean>
+}
+
+/** Durable, credential-free descriptor for background work. */
+export interface PersistentTask<TPayload = unknown, TResult = unknown> {
+  id: string
+  kind: string
+  status: PersistentTaskStatus
+  payload: TPayload
+  progress: PersistentTaskProgress
+  result?: TResult
+  error?: string
+  resumable: boolean
+  /** Increments for each execution attempt, including restart recovery. */
+  attempt: number
+  createdAt: number
+  updatedAt: number
+  startedAt?: number
+  finishedAt?: number
+}
+
+export interface PersistentTaskCreateInput<TPayload = unknown> {
+  id?: string
+  kind: string
+  payload: TPayload
+  resumable?: boolean
+  total?: number
 }
 
 export interface ChatGptAccountFileImportFileResult {
@@ -874,6 +1244,7 @@ export interface PoolInput {
   stickyTtlMinutes: number
   maxRetries: number
   forceFastMode?: boolean
+  quotaProtection?: QuotaProtectionPolicy
   hedgedRequests?: boolean
   hedgeDelayMs?: number
   firstBodyTimeoutMs?: number
@@ -887,6 +1258,7 @@ export interface ApiSourceInput {
   kind: ProviderKind
   baseUrl: string
   protocol: Protocol
+  responsesCompactMode?: ResponsesCompactMode
   credential?: string
   models: string[]
   defaultModel?: string
@@ -895,6 +1267,8 @@ export interface ApiSourceInput {
   maxConcurrency: number
   proxyId?: string
   unlinkIncompatiblePools?: boolean
+  capabilityProfile?: UpstreamCapabilityProfile
+  modelCatalog?: ModelCapabilityDefinition[]
 }
 
 export interface ApiSourceProbeInput {
@@ -904,9 +1278,12 @@ export interface ApiSourceProbeInput {
   kind: ProviderKind
   baseUrl: string
   protocol: Protocol
+  responsesCompactMode?: ResponsesCompactMode
   credential?: string
   model?: string
   proxyId?: string
+  /** Persist the credential-free capability result when probing an existing source. */
+  persistCapabilities?: boolean
 }
 
 export type ApiSourceProbeStageId = 'network' | 'authentication' | 'models' | 'generation'
@@ -926,6 +1303,44 @@ export interface ApiSourceProbeResult {
   latencyMs?: number
   error?: string
   warnings: string[]
+  capabilityProfile: UpstreamCapabilityProfile
+  modelCatalog: ModelCapabilityDefinition[]
+}
+
+export interface RoutePreviewInput {
+  route: Route
+  requestedModel?: string
+  requiredCapabilities?: UpstreamCapabilityRequirement[]
+}
+
+export type RoutePreviewIssueSeverity = 'info' | 'warning' | 'error'
+
+export interface RoutePreviewIssue {
+  code:
+    | 'route-disabled'
+    | 'invalid-inbound-protocol'
+    | 'source-missing'
+    | 'source-unavailable'
+    | 'protocol-conversion'
+    | 'model-mapped'
+    | 'model-unavailable'
+    | 'capability-unsupported'
+    | 'capability-unknown'
+  severity: RoutePreviewIssueSeverity
+  message: string
+  capability?: UpstreamCapabilityRequirement
+}
+
+export interface RoutePreviewResult {
+  status: 'ready' | 'warning' | 'blocked'
+  sourceId: string
+  sourceName?: string
+  sourceProtocol?: Protocol
+  inboundProtocol: Protocol
+  requestedModel?: string
+  upstreamModel?: string
+  eligibleAccountCount: number
+  issues: RoutePreviewIssue[]
 }
 
 export interface AggregateRelayMemberInput {
@@ -943,6 +1358,7 @@ export interface AggregateRelayInput {
   stickySessions: boolean
   stickyTtlMinutes: number
   maxRetries: number
+  quotaProtection?: QuotaProtectionPolicy
   proxyId?: string
 }
 
@@ -991,13 +1407,25 @@ export interface SetupWizardState {
   poolId?: string
   routeId?: string
   client?: RouteClient
+  /** Optional client configuration directory definition selected by the wizard. */
+  profileId?: string
   model?: string
   proxyId?: string
   lastError?: string
   /** Written only by the main process after a successful loopback end-to-end request. */
   verifiedAt?: number
+  /** Credential-free before-images used to safely roll back routes touched by this session. */
+  routingRollbacks?: SetupWizardRoutingRollback[]
   createdAt: number
   updatedAt: number
+}
+
+export interface SetupWizardRoutingRollback {
+  routeId: string
+  routeCreated: boolean
+  expectedUpdatedAt: number
+  createdPoolIds: string[]
+  previous?: Pick<Route, 'poolId' | 'enabled' | 'highConcurrencyMode' | 'inboundProtocol' | 'modelMap'>
 }
 
 export interface SetupWizardProgressInput {
@@ -1010,6 +1438,7 @@ export interface SetupWizardProgressInput {
   poolId?: string | null
   routeId?: string | null
   client?: RouteClient
+  profileId?: string | null
   model?: string
   proxyId?: string | null
   lastError?: string
@@ -1044,6 +1473,8 @@ export interface EnsureGatewayRunningResult {
 }
 
 export interface SetupRouteVerificationInput {
+  sessionId: string
+  routeId: string
   client: RouteClient
   model: string
 }
@@ -1074,6 +1505,45 @@ export interface BackupOperationResult {
   backup?: BackupRecordSummary
   restored?: BackupRecordSummary
   restartRequired?: boolean
+}
+
+export interface PortableBackupTransferResult {
+  cancelled: boolean
+  path?: string
+  backup?: BackupRecordSummary
+}
+
+export interface WebDavBackupConfiguration {
+  baseUrl: string
+  username: string
+  hasPassword: boolean
+  requiresPassword?: boolean
+  configured: boolean
+}
+
+export interface WebDavBackupConfigurationInput {
+  baseUrl: string
+  username?: string
+  password?: string
+  clearPassword?: boolean
+  /** Explicit password edit semantics; omitted preserves the legacy fields. */
+  passwordAction?: 'keep' | 'replace' | 'clear'
+}
+
+export interface WebDavBackupEntry {
+  name: string
+  size?: number
+  modifiedAt?: number
+}
+
+export interface WebDavBackupUploadResult {
+  entry: WebDavBackupEntry
+  localBackup: BackupRecordSummary
+}
+
+export interface WebDavBackupImportResult {
+  entry: WebDavBackupEntry
+  localBackup: BackupRecordSummary
 }
 
 export interface DesktopRuntimeSettings {
@@ -1169,6 +1639,8 @@ export interface CodexSessionRepairPreview extends CodexSessionRepairOverview {
   sqliteProviderRowsToUpdate: number
   sqliteUserEventRowsToUpdate: number
   sqliteCwdRowsToUpdate: number
+  globalStateFieldsToUpdate: number
+  globalStateConflictingFields: string[]
   encryptedSessionFiles: number
   encryptedSourceProviders: string[]
 }
@@ -1179,6 +1651,8 @@ export interface CodexSessionRepairResult {
   sqliteProviderRowsUpdated: number
   sqliteUserEventRowsUpdated: number
   sqliteCwdRowsUpdated: number
+  globalStateFieldsUpdated: number
+  globalStateConflictingFields: string[]
   skippedFiles: string[]
   encryptedSessionFiles: number
   encryptedSourceProviders: string[]
@@ -1190,10 +1664,39 @@ export interface ChatGptDesktopRestartState {
   wasRunning: boolean
   /** AppUserModelId or executable path captured before ChatGPT is closed. */
   launchTarget: string
+  /** Direct executable used by the optional Codex Micro-disabled startup path. */
+  executablePath?: string
 }
 
 export interface CodexSessionRepairRestartResult {
   repair: CodexSessionRepairResult
+  chatGptWasRunning: boolean
+  chatGptRestarted: boolean
+}
+
+export interface CodexOfficialLoginRecoveryResult extends CodexSessionRepairRestartResult {
+  clientConfig: ClientConfigApplyResult
+}
+
+export interface CodexSessionIndexCleanupCandidate {
+  id: string
+  threadName: string
+  updatedAt: string
+}
+
+export interface CodexSessionIndexCleanupPreview {
+  snapshotSha256: string
+  candidates: CodexSessionIndexCleanupCandidate[]
+}
+
+export interface CodexSessionIndexCleanupResult {
+  prunedEntries: number
+  backupPath?: string
+  retentionWarning?: string
+}
+
+export interface CodexSessionIndexCleanupRestartResult {
+  cleanup: CodexSessionIndexCleanupResult
   chatGptWasRunning: boolean
   chatGptRestarted: boolean
 }
@@ -1267,11 +1770,28 @@ export interface GatewayApi {
   saveProxy(input: ProxyInput): Promise<AppSnapshot>
   deleteProxy(id: string): Promise<AppSnapshot>
   checkProxy(id: string): Promise<AppSnapshot>
+  getBuiltInProxyState(): Promise<BuiltInProxyRuntimeState>
+  setBuiltInProxyEnabled(enabled: boolean): Promise<BuiltInProxyRuntimeState>
+  retryBuiltInProxy(): Promise<BuiltInProxyRuntimeState>
+  importBuiltInProxyProfile(input: BuiltInProxyImportInput): Promise<BuiltInProxyRuntimeState>
+  refreshBuiltInProxyProfile(id: string): Promise<BuiltInProxyRuntimeState>
+  deleteBuiltInProxyProfile(id: string): Promise<BuiltInProxyRuntimeState>
+  selectBuiltInProxyProfile(id: string): Promise<BuiltInProxyRuntimeState>
+  selectBuiltInProxyNode(profileId: string, nodeId: string): Promise<BuiltInProxyRuntimeState>
+  setBuiltInProxyRuleMode(mode: BuiltInProxySettings['ruleMode']): Promise<BuiltInProxyRuntimeState>
+  setBuiltInProxyAccessMode(mode: BuiltInProxySettings['accessMode']): Promise<BuiltInProxyRuntimeState>
+  setBuiltInProxyLanEnabled(enabled: boolean): Promise<BuiltInProxyRuntimeState>
+  setBuiltInProxyAutoStart(enabled: boolean): Promise<BuiltInProxyRuntimeState>
+  testBuiltInProxyLatency(profileId?: string, nodeIds?: string[]): Promise<BuiltInProxyNodeSummary[]>
+  getBuiltInProxyTraffic(): Promise<ProxyTrafficSnapshot>
+  listBuiltInProxyConnections(): Promise<ProxyConnectionSummary[]>
+  closeBuiltInProxyConnection(id: string): Promise<void>
   savePool(input: PoolInput): Promise<AppSnapshot>
   deletePool(id: string): Promise<AppSnapshot>
   setRouteSourceFastMode(input: RouteSourceFastModeInput): Promise<AppSnapshot>
   saveApiSource(input: ApiSourceInput): Promise<AppSnapshot>
   probeApiSource(input: ApiSourceProbeInput): Promise<ApiSourceProbeResult>
+  previewRoute(input: RoutePreviewInput): Promise<RoutePreviewResult>
   deleteApiSource(id: string): Promise<AppSnapshot>
   saveAggregateRelay(input: AggregateRelayInput): Promise<AppSnapshot>
   getSetupWizardState(): Promise<SetupWizardState | null>
@@ -1294,6 +1814,9 @@ export interface GatewayApi {
   getAccountCodexQuotaHistory(id: string, from?: number, to?: number): Promise<CodexQuotaHistoryPoint[]>
   getAccountCodexQuotaCycleCosts(id: string): Promise<CodexQuotaCycleCosts>
   clearLogs(): Promise<AppSnapshot>
+  getRequestReplayTemplate(id: string): Promise<RequestReplayTemplate | null>
+  replayRequest(id: string): Promise<RequestReplayResult>
+  getLocalEventServerStatus(): Promise<LocalEventServerStatus>
   clearHealthEvents(): Promise<AppSnapshot>
   saveClientProfile(input: ClientConfigProfileInput): Promise<AppSnapshot>
   deleteClientProfile(id: string): Promise<AppSnapshot>
@@ -1304,6 +1827,7 @@ export interface GatewayApi {
   previewClientConfig(client: RouteClient, profileId?: string): Promise<ClientConfigPreview>
   applyClientConfig(client: RouteClient, profileId?: string): Promise<ClientConfigApplyResult>
   repairClientConfig(client: RouteClient, profileId?: string): Promise<ClientConfigRepairResult>
+  restoreCodexOfficialLoginAndSessions(profileId?: string): Promise<CodexOfficialLoginRecoveryResult>
   listClientConfigBackups(client: RouteClient, profileId?: string): Promise<ClientConfigBackup[]>
   createClientConfigBackup(client: RouteClient, profileId?: string): Promise<ClientConfigBackupCreateResult>
   restoreLatestClientConfigBackup(client: RouteClient, profileId?: string): Promise<ClientConfigBackupSetRestoreResult>
@@ -1311,10 +1835,32 @@ export interface GatewayApi {
   restoreClientConfig(backupPath: string, client: RouteClient, profileId?: string): Promise<ClientConfigRestoreResult>
   getClientConfigEditor(client: RouteClient, profileId?: string): Promise<ClientConfigEditorState>
   saveClientConfigEditor(input: ClientConfigEditorSaveInput): Promise<ClientConfigApplyResult>
+  listManagedClientInstances(): Promise<ManagedClientInstance[]>
+  saveManagedClientInstance(input: ManagedClientInstanceInput): Promise<ManagedClientInstance[]>
+  deleteManagedClientInstance(id: string): Promise<ManagedClientInstance[]>
+  startManagedClientInstance(id: string): Promise<ManagedClientInstance[]>
+  stopManagedClientInstance(id: string): Promise<ManagedClientInstance[]>
+  onManagedClientInstancesChanged(listener: (instances: ManagedClientInstance[]) => void): () => void
+  listPersistentTasks(): Promise<PersistentTask[]>
+  pausePersistentTask(id: string): Promise<PersistentTask>
+  resumePersistentTask(id: string): Promise<PersistentTask>
+  waitForPersistentTask(id: string): Promise<PersistentTask>
+  cancelPersistentTask(id: string): Promise<PersistentTask>
+  clearPersistentTasks(): Promise<PersistentTask[]>
+  startAccountCheckTask(accountIds?: string[]): Promise<PersistentTask>
   listStateBackups(): Promise<BackupRecordSummary[]>
   createStateBackup(): Promise<BackupOperationResult>
   verifyStateBackup(path: string): Promise<BackupRecordSummary>
   restoreStateBackup(path: string): Promise<BackupOperationResult>
+  exportPortableStateBackup(password: string): Promise<PortableBackupTransferResult>
+  importPortableStateBackup(password: string): Promise<PortableBackupTransferResult>
+  getWebDavBackupConfiguration(): Promise<WebDavBackupConfiguration>
+  saveWebDavBackupConfiguration(input: WebDavBackupConfigurationInput): Promise<WebDavBackupConfiguration>
+  clearWebDavBackupConfiguration(): Promise<WebDavBackupConfiguration>
+  testWebDavBackup(): Promise<void>
+  listWebDavBackups(): Promise<WebDavBackupEntry[]>
+  uploadLatestWebDavBackup(password: string): Promise<WebDavBackupUploadResult>
+  downloadWebDavBackup(name: string, password: string): Promise<WebDavBackupImportResult>
   getDesktopRuntimeSettings(): Promise<DesktopRuntimeSettings>
   updateDesktopRuntimeSettings(settings: Pick<DesktopRuntimeSettings, 'launchAtLogin'>): Promise<DesktopRuntimeSettings>
   exportDiagnostics(): Promise<string>
@@ -1332,8 +1878,17 @@ export interface GatewayApi {
   inspectCodexSessionRepair(): Promise<CodexSessionRepairOverview>
   previewCodexSessionRepair(targetProvider: string): Promise<CodexSessionRepairPreview>
   repairCodexSessions(targetProvider: string, expectedRevision: string): Promise<CodexSessionRepairResult>
-  repairCodexSessionsAndRestartChatGpt(): Promise<CodexSessionRepairRestartResult>
+  repairCodexSessionsAndRestartChatGpt(targetProvider?: string, expectedRevision?: string): Promise<CodexSessionRepairRestartResult>
+  previewCodexSessionIndexCleanup(): Promise<CodexSessionIndexCleanupPreview>
+  cleanupCodexSessionIndexAndRestart(snapshotSha256: string, threadIds: string[]): Promise<CodexSessionIndexCleanupRestartResult>
+  listCodexSessions(query?: CodexSessionQuery): Promise<CodexManagedSession[]>
+  openCodexSessionLocation(id: string, expectedRevision: string): Promise<void>
+  exportCodexSession(id: string, expectedRevision: string): Promise<CodexSessionExportResult>
+  trashCodexSession(id: string, expectedRevision: string): Promise<CodexManagedSession[]>
+  restoreCodexSession(id: string, expectedRevision: string): Promise<CodexManagedSession[]>
   onSnapshot(listener: (snapshot: AppSnapshot) => void): () => void
+  onBuiltInProxyState(listener: (state: BuiltInProxyRuntimeState) => void): () => void
+  onRuntimeDelta(listener: (delta: AppRuntimeDelta) => void): () => void
   onAccountImportProgress(listener: (progress: AccountImportProgress) => void): () => void
   onBrowserImportQueue(listener: (state: BrowserImportQueueState) => void): () => void
   onBrowserOpenTab(listener: (request: BrowserOpenTabRequest) => void): () => void

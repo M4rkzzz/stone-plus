@@ -16,12 +16,12 @@ describe('system proxy PAC parsing', () => {
       : `${directive.proxy.protocol}:${directive.proxy.host}:${directive.proxy.port}`)).toEqual([
       'http:127.0.0.1:7890',
       'https:secure.example:8443',
-      'socks5:socks.example:1080',
+      'socks4:socks.example:1080',
       'socks5:backup.example:1081',
       'direct'
     ])
     expect(summarizeSystemProxyChain(chain)).toBe(
-      'HTTP 127.0.0.1:7890 → HTTPS secure.example:8443 → SOCKS5 socks.example:1080 → SOCKS5 backup.example:1081 → DIRECT'
+      'HTTP 127.0.0.1:7890 → HTTPS secure.example:8443 → SOCKS4 socks.example:1080 → SOCKS5 backup.example:1081 → DIRECT'
     )
   })
 

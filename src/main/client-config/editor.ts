@@ -27,7 +27,7 @@ export function createClientConfigEditorFile(
   file: ClientConfigFilePath,
   source: string | undefined,
 ): ClientConfigEditorFile {
-  const revision = revisionOf(source)
+  const revision = revisionOf(file, source)
   if (file.role === 'codex-auth') {
     return {
       role: file.role,
@@ -90,8 +90,18 @@ export function restoreClientConfigEditorContent(
   return restoreTomlDocument(draft, original)
 }
 
-export function revisionOf(source: string | undefined): string {
-  return createHmac('sha256', revisionKey).update(source === undefined ? '\0missing' : `\x01${source}`).digest('hex')
+/**
+ * Opaque optimistic-concurrency token for one exact managed file.
+ *
+ * Binding the token to the client, role, and resolved path prevents a renderer
+ * snapshot from one profile (or another file with identical bytes) from being
+ * replayed against a different configuration target.
+ */
+export function revisionOf(file: ClientConfigFilePath, source: string | undefined): string {
+  return createHmac('sha256', revisionKey)
+    .update(JSON.stringify([file.client, file.role, file.format, file.path]))
+    .update(source === undefined ? '\0missing' : `\x01${source}`)
+    .digest('hex')
 }
 
 function defaultContent(format: ClientConfigFilePath['format']): string {

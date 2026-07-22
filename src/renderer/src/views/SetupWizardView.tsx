@@ -45,9 +45,25 @@ import type {
   SetupWizardState,
   SetupWizardStep,
 } from '@shared/types'
-import { Badge, protocolLabels } from '../ui'
+import { isAvailableRouteAccount } from '@shared/route-sources'
+import { Badge, InfoTip, protocolLabels } from '../ui'
+import { BUILT_IN_PROXY_BINDING_NOTICE, useBuiltInProxyInterlock } from '../built-in-proxy-interlocks'
 import { useI18n } from '../i18n'
-import { confirmSetupWizardAction, persistSetupWizardSourceProxy } from '../setup-wizard-operations'
+import {
+  effectiveResponsesCompactMode,
+  officialOpenAiUsesNativeCompact,
+  relayCanConfigureResponsesCompact,
+  responsesCompactModeCopy,
+  responsesCompactModes,
+  type ResponsesCompactMode,
+} from '../responses-compact-mode'
+import {
+  captureSetupSourceProbeBinding,
+  confirmSetupWizardAction,
+  persistSetupWizardSourceProxy,
+  setupSourceProbeMatches,
+  type SetupSourceProbeBinding,
+} from '../setup-wizard-operations'
 import { setupPoolDisplayName } from '../system-generated-text'
 import '../setup-wizard.css'
 
@@ -86,6 +102,7 @@ const emptyApiSource = (sourceType: 'official-api' | 'relay'): ApiSourceInput =>
   kind: sourceType === 'official-api' ? 'openai' : 'openai-compatible',
   baseUrl: 'https://api.openai.com/v1',
   protocol: 'openai-responses',
+  responsesCompactMode: sourceType === 'relay' ? 'legacy' : undefined,
   credential: '',
   models: [],
   defaultModel: '',
@@ -105,6 +122,7 @@ export function SetupWizardView({
   onExit: () => void
 }) {
   const { t } = useI18n()
+  const builtInProxyInterlocked = useBuiltInProxyInterlock(snapshot, api)
   const steps = useMemo(() => wizardSteps(t), [t])
   const [wizard, setWizard] = useState<SetupWizardState | null>(null)
   const [sourceMode, setSourceMode] = useState<SourceMode>('existing')
@@ -119,8 +137,10 @@ export function SetupWizardView({
   const [poolId, setPoolId] = useState<string | null>(null)
   const [proxyId, setProxyId] = useState('')
   const [probe, setProbe] = useState<ApiSourceProbeResult | null>(null)
+  const [probeBinding, setProbeBinding] = useState<SetupSourceProbeBinding | null>(null)
   const [model, setModel] = useState('')
   const [client, setClient] = useState<RouteClient>('codex')
+  const [clientProfileId, setClientProfileId] = useState('')
   const [routing, setRouting] = useState<SetupRoutingResult | null>(null)
   const [verification, setVerification] = useState<SetupRouteVerificationResult | null>(null)
   const [previewText, setPreviewText] = useState('')
@@ -142,6 +162,7 @@ export function SetupWizardView({
   const oauthAttemptRef = useRef(0)
 
   const providerById = useMemo(() => new Map(snapshot.providers.map((provider) => [provider.id, provider])), [snapshot.providers])
+  const availableAccounts = useMemo(() => snapshot.accounts.filter(isAvailableRouteAccount), [snapshot.accounts])
   const selectedAccount = oauthImportedSnapshot?.accounts.find((account) => account.id === selectedAccountId)
     ?? snapshot.accounts.find((account) => account.id === selectedAccountId)
   const selectedProvider = selectedAccount
@@ -149,7 +170,9 @@ export function SetupWizardView({
       ?? providerById.get(selectedAccount.providerId)
     : undefined
   const compatiblePools = snapshot.pools.filter((pool) => pool.kind === 'standard' && pool.protocol === 'openai-responses')
-  const aggregatePools = snapshot.pools.filter((pool) => pool.kind === 'relay-aggregate')
+  const aggregatePools = snapshot.pools.filter((pool) => pool.kind === 'relay-aggregate'
+    && pool.members.some((member) => member.enabled
+      && availableAccounts.some((account) => account.id === member.accountId)))
   const currentStep = wizard?.step ?? 'scan'
   const currentIndex = Math.max(0, steps.findIndex((step) => step.id === currentStep))
   const oauthActive = oauthStage === 'starting' || oauthStage === 'waiting' || oauthStage === 'submitting' || oauthStage === 'exchanging' || oauthStage === 'cancelling'
@@ -164,6 +187,7 @@ export function SetupWizardView({
     if (sourceDraft.defaultModel) values.add(sourceDraft.defaultModel)
     return [...values]
   }, [probe, selectedAccount, selectedProvider, sourceDraft])
+  const currentProbe = probe && setupSourceProbeMatches(probeBinding, sourceDraft, proxyId, model) ? probe : null
 
   useEffect(() => {
     let cancelled = false
@@ -179,6 +203,7 @@ export function SetupWizardView({
           setProxyId(next.proxyId ?? '')
           setModel(next.model ?? '')
           setClient(next.client ?? 'codex')
+          setClientProfileId(next.profileId ?? '')
           const restoredMode = sourceModeFromProgress(next.sourceMethod, next.sourceType, next.sourceId)
           setSourceMode(restoredMode)
           setAccountAddMethod(next.sourceMethod === 'token-json' ? 'token-json' : 'oauth')
@@ -208,6 +233,11 @@ export function SetupWizardView({
     if (!model && modelOptions.length) setModel(modelOptions[0])
   }, [model, modelOptions])
 
+  useEffect(() => {
+    const profiles = snapshot.clientProfiles.filter((profile) => profile.client === client)
+    if (!profiles.some((profile) => profile.id === clientProfileId)) setClientProfileId(profiles[0]?.id ?? '')
+  }, [client, clientProfileId, snapshot.clientProfiles])
+
   const run = async <T,>(key: string, operation: () => Promise<T>): Promise<T | undefined> => {
     setBusy(key)
     setError('')
@@ -233,6 +263,7 @@ export function SetupWizardView({
       poolId: patch.poolId !== undefined ? patch.poolId : poolId,
       routeId: patch.routeId !== undefined ? patch.routeId : wizard?.routeId,
       client: patch.client ?? client,
+      profileId: patch.profileId !== undefined ? patch.profileId : clientProfileId || null,
       model: patch.model ?? (model || wizard?.model),
       proxyId: patch.proxyId !== undefined ? patch.proxyId : proxyId || null,
       lastError: patch.lastError,
@@ -256,7 +287,7 @@ export function SetupWizardView({
     const report = await run('scan', () => api.runNetworkDiagnostics(proxyId ? { proxyId } : {}))
     if (!report) return
     setNotice(report.summary === 'error'
-      ? t('基础网络存在异常，仍可继续并在网络步骤选择出口代理。', 'Basic network checks found a problem. You can continue and choose an outbound proxy in the network step.')
+      ? t('基础网络存在异常，仍可继续并在网络步骤选择代理。', 'Basic network checks found a problem. You can continue and choose a proxy in the network step.')
       : t('环境扫描完成，可以开始选择来源。', 'Environment scan complete. You can now choose a source.'))
     await move('source')
   }
@@ -267,6 +298,8 @@ export function SetupWizardView({
     setSelectedAccountId('')
     setAggregatePoolId('')
     setProbe(null)
+    setProbeBinding(null)
+    setModel('')
     setVerification(null)
     setOauthImportedSnapshot(null)
     if (mode === 'official-api' || mode === 'relay') setSourceDraft(emptyApiSource(mode))
@@ -284,7 +317,7 @@ export function SetupWizardView({
     if (!account) return setError(t('选择的来源已不存在。', 'The selected source no longer exists.'))
     const provider = providerById.get(account.providerId)
     const nextProxyId = account.proxyId ?? ''
-    const nextModel = model || account.availableModels[0] || provider?.models[0] || ''
+    const nextModel = account.availableModels[0] || provider?.models[0] || ''
     setProxyId(nextProxyId)
     setModel(nextModel)
     await move('network', {
@@ -299,13 +332,16 @@ export function SetupWizardView({
   const selectAggregate = async () => {
     const pool = snapshot.pools.find((candidate) => candidate.id === aggregatePoolId && candidate.kind === 'relay-aggregate')
     if (!pool) return setError(t('请选择一个聚合中转。', 'Choose an aggregate relay.'))
-    const first = pool.members.find((member) => member.enabled)
+    const first = pool.members.find((member) => member.enabled
+      && availableAccounts.some((account) => account.id === member.accountId))
     if (!first) return setError(t('聚合中转没有启用成员。', 'The aggregate relay has no enabled members.'))
     setSelectedAccountId(first.accountId)
     setPoolId(pool.id)
     const nextProxyId = pool.proxyId ?? ''
     setProxyId(nextProxyId)
-    const nextModel = model || pool.modelAllowlist[0] || ''
+    const account = availableAccounts.find((candidate) => candidate.id === first.accountId)
+    const provider = account ? providerById.get(account.providerId) : undefined
+    const nextModel = pool.modelAllowlist[0] || account?.availableModels[0] || provider?.models[0] || ''
     setModel(nextModel)
     await move('network', { sourceMethod: 'aggregate', sourceId: first.accountId, poolId: pool.id, sourceType: 'relay', proxyId: nextProxyId || null, model: nextModel || undefined })
   }
@@ -583,7 +619,7 @@ export function SetupWizardView({
       google: { kind: 'google', baseUrl: 'https://generativelanguage.googleapis.com', protocol: 'gemini', name: 'Google Gemini API' },
     }
     if (kind !== 'openai' && kind !== 'anthropic' && kind !== 'google') return
-    setSourceDraft((current) => ({ ...current, ...presets[kind] }))
+    setSourceDraft((current) => ({ ...current, ...presets[kind], responsesCompactMode: undefined }))
   }
 
   const probeDraft = async () => {
@@ -597,23 +633,28 @@ export function SetupWizardView({
       kind: sourceDraft.kind,
       baseUrl: sourceDraft.baseUrl,
       protocol: sourceDraft.protocol,
+      responsesCompactMode: sourceDraft.responsesCompactMode,
       credential: sourceDraft.credential,
       model: model || sourceDraft.defaultModel,
       proxyId: proxyId || sourceDraft.proxyId,
     }))
     if (!result) return
     setProbe(result)
-    if (!model && result.models.length) setModel(result.models[0])
+    const testedModel = model || sourceDraft.defaultModel || result.models[0] || ''
+    if (!model && testedModel) setModel(testedModel)
+    setProbeBinding(captureSetupSourceProbeBinding(sourceDraft, proxyId, testedModel))
     if (result.ok) setNotice(t('来源验证通过，可以安全保存。', 'Source verification passed. It is ready to save.'))
   }
 
   const saveDraft = async () => {
-    if (!probe?.ok) return setError(t('配置向导要求先完成一次真实上游验证。', 'Run a real upstream test before saving this source.'))
+    if (!currentProbe?.ok) return setError(t('来源配置已在测试后变更，请重新运行真实上游验证。', 'The source changed after it was tested. Run the real upstream test again.'))
     const result = await run('save-source', () => api.saveApiSource({
       ...sourceDraft,
       proxyId: proxyId || sourceDraft.proxyId,
       defaultModel: model || sourceDraft.defaultModel,
-      models: probe.models.length ? probe.models : sourceDraft.models,
+      models: currentProbe.models.length ? currentProbe.models : sourceDraft.models,
+      capabilityProfile: currentProbe.capabilityProfile,
+      modelCatalog: currentProbe.modelCatalog,
     }))
     if (!result) return
     const provider = sourceDraft.id
@@ -695,7 +736,9 @@ export function SetupWizardView({
 
   const verifyRoute = async () => {
     if (!model) return setError(t('请选择测试模型。', 'Choose a model to test.'))
-    const result = await run('verify', () => api.verifySetupRoute({ client, model }))
+    if (!wizard?.sessionId || !wizard.routeId) return setError(t('缺少本次向导的路由绑定，请重新应用号池与路由。', 'This setup is no longer bound to a route. Apply the pool and route again.'))
+    const { sessionId, routeId } = wizard
+    const result = await run('verify', () => api.verifySetupRoute({ sessionId, routeId, client, model }))
     if (!result) return
     setVerification(result)
     if (!result.ok) return setError(result.error
@@ -706,7 +749,7 @@ export function SetupWizardView({
   }
 
   const previewClient = async () => {
-    const result = await run('preview-client', () => api.previewClientConfig(client))
+    const result = await run('preview-client', () => api.previewClientConfig(client, clientProfileId || undefined))
     if (!result) return
     setPreviewText(result.files.map((file) => `${file.path}\n${file.changed
       ? t(`将更新：${file.managedFields.join('、') || '受管配置'}`, `Will update: ${file.managedFields.join(', ') || 'managed settings'}`)
@@ -714,7 +757,7 @@ export function SetupWizardView({
   }
 
   const applyClient = async () => {
-    const result = await run('apply-client', () => api.applyClientConfig(client))
+    const result = await run('apply-client', () => api.applyClientConfig(client, clientProfileId || undefined))
     if (!result) return
     setNotice(result.changedFiles.length
       ? t(`已更新 ${result.changedFiles.length} 个客户端配置文件并创建备份。`, `Updated ${result.changedFiles.length} client configuration file(s) and created backups.`)
@@ -734,6 +777,29 @@ export function SetupWizardView({
     const discarded = await run('discard', () => confirmSetupWizardAction(() => api.discardSetupWizard()))
     if (!discarded) return
     onExit()
+  }
+
+  const configureAnotherSource = async () => {
+    const next = await run('restart', async () => {
+      await api.discardSetupWizard()
+      return api.saveSetupWizardProgress({ step: 'source' })
+    })
+    if (!next) return
+    setWizard(next)
+    setSourceMode('existing')
+    setSelectedAccountId('')
+    setAggregatePoolId('')
+    setTagId(null)
+    setPoolId(null)
+    setProxyId('')
+    setProbe(null)
+    setProbeBinding(null)
+    setModel('')
+    setClientProfileId('')
+    setRouting(null)
+    setVerification(null)
+    setPreviewText('')
+    setOauthImportedSnapshot(null)
   }
 
   return (
@@ -764,21 +830,21 @@ export function SetupWizardView({
               <Choice icon={<ShieldCheck />} title="Codex OAuth / Sub2API CPA" description={t('浏览器 OAuth 授权，或使用 Token / JSON 兼容导入', 'Authorize with OAuth in your browser, or import a compatible Token / JSON file')} onClick={() => chooseMode('oauth-import')} />
               <Choice icon={<Cloud />} title={t('官方 API', 'Official API')} description={t('OpenAI、Anthropic 或 Google Gemini', 'OpenAI, Anthropic, or Google Gemini')} onClick={() => chooseMode('official-api')} />
               <Choice icon={<Server />} title={t('中转站', 'Relay')} description={t('配置兼容 Base URL 与单把 Key', 'Configure a compatible Base URL and one API key')} onClick={() => chooseMode('relay')} />
-              <Choice icon={<KeyRound />} title={t('已有来源', 'Existing source')} description={t(`${snapshot.accounts.length} 个可调度凭据`, `${snapshot.accounts.length} schedulable credential(s)`)} onClick={() => chooseMode('existing')} disabled={!snapshot.accounts.length} />
+              <Choice icon={<KeyRound />} title={t('已有来源', 'Existing source')} description={t(`${availableAccounts.length} 个可调度凭据`, `${availableAccounts.length} schedulable credential(s)`)} onClick={() => chooseMode('existing')} disabled={!availableAccounts.length} />
               <Choice icon={<Network />} title={t('已有聚合中转', 'Existing aggregate relay')} description={t(`${aggregatePools.length} 个聚合配置`, `${aggregatePools.length} aggregate configuration(s)`)} onClick={() => chooseMode('aggregate')} disabled={!aggregatePools.length} />
             </div>
           </WizardSection>}
 
           {currentStep === 'source-config' && sourceMode === 'existing' && <WizardSection icon={<KeyRound />} title={t('选择已有来源', 'Choose an existing source')} description={t('向导会重新检查账号状态和模型。', 'The wizard will check the account status and models again.')}>
-            <select className="setup-select" value={selectedAccountId} onChange={(event) => setSelectedAccountId(event.target.value)}>
+            <select className="setup-select" value={selectedAccountId} onChange={(event) => { setSelectedAccountId(event.target.value); setModel('') }}>
               <option value="">{t('选择来源', 'Choose a source')}</option>
-              {snapshot.accounts.map((account) => <option value={account.id} key={account.id}>{account.name} · {providerById.get(account.providerId)?.name}</option>)}
+              {availableAccounts.map((account) => <option value={account.id} key={account.id}>{account.name} · {providerById.get(account.providerId)?.name}</option>)}
             </select>
             <PrimaryAction disabled={!selectedAccountId} busy={false} onClick={() => void selectExisting()} label={t('使用此来源', 'Use this source')} />
           </WizardSection>}
 
           {currentStep === 'source-config' && sourceMode === 'aggregate' && <WizardSection icon={<Network />} title={t('选择聚合中转', 'Choose an aggregate relay')} description={t('路由将直接复用聚合中转的成员和策略。', 'The route will reuse the aggregate relay members and scheduling policy.')}>
-            <select className="setup-select" value={aggregatePoolId} onChange={(event) => setAggregatePoolId(event.target.value)}>
+            <select className="setup-select" value={aggregatePoolId} onChange={(event) => { setAggregatePoolId(event.target.value); setModel('') }}>
               <option value="">{t('选择聚合中转', 'Choose an aggregate relay')}</option>
               {aggregatePools.map((pool) => <option value={pool.id} key={pool.id}>{setupPoolDisplayName(pool.name, t)} · {protocolLabels[pool.protocol]} · {t(`${pool.members.length} 个成员`, `${pool.members.length} member(s)`)}</option>)}
             </select>
@@ -798,7 +864,7 @@ export function SetupWizardView({
                 <label><span><Tag size={13} />{t('账号 Tag（代替备注）', 'Account tag (replaces notes)')}</span><select value={tagId ?? ''} disabled={importConfigurationLocked} onChange={(event) => { const value = event.target.value || null; setTagId(value); void move('source-config', { sourceMethod: accountAddMethod, tagId: value }) }}><option value="">{t('未标记', 'Untagged')}</option>{snapshot.accountTags.map((tag) => <option value={tag.id} key={tag.id}>{tag.name}</option>)}</select><small>{t('同一账号仅使用一个 Tag；未标记会清空重复账号原 Tag。', 'An account can have one tag. Choosing Untagged clears the existing tag on a duplicate account.')}</small></label>
                 <label><span>{t('导入后加入号池（可选）', 'Add to a pool after import (optional)')}</span><select value={poolId ?? ''} disabled={importConfigurationLocked} onChange={(event) => { const value = event.target.value || null; setPoolId(value); void move('source-config', { sourceMethod: accountAddMethod, poolId: value }) }}><option value="">{t('不加入号池', 'Do not add to a pool')}</option>{compatiblePools.map((pool) => <option value={pool.id} key={pool.id}>{setupPoolDisplayName(pool.name, t)} · {t(`${pool.members.length} 个成员`, `${pool.members.length} member(s)`)} · {pool.strategy}</option>)}</select><small>{t('仅列出普通 OpenAI Responses 号池；只加入检测成功账号。', 'Only standard OpenAI Responses pools are listed, and only accounts that pass checks are added.')}</small></label>
                 <label className="full"><span>{t('快速新建 Tag', 'Create a tag')}</span><div className="setup-inline-create"><input maxLength={24} disabled={importConfigurationLocked} value={newTagName} onChange={(event) => setNewTagName(event.target.value)} placeholder={t('自定义 Tag', 'Custom tag')} /><button className="button button--secondary" type="button" disabled={importConfigurationLocked || !newTagName.trim() || Boolean(busy)} onClick={() => void createImportTag()}>{busy === 'create-tag' ? <LoaderCircle size={15} className="spin" /> : <Plus size={15} />}{t('新建并选中', 'Create and select')}</button></div></label>
-                <label><span>{accountAddMethod === 'oauth' ? t('Token 交换与后续检测出口', 'Network exit for token exchange and checks') : t('出口代理', 'Outbound proxy')}</span><select value={proxyId} disabled={importConfigurationLocked} onChange={(event) => { const value = event.target.value; setProxyId(value); void move('source-config', { sourceMethod: accountAddMethod, proxyId: value || null }) }}><option value="">{t('Stone+ 直连 / 全局出口设置', 'Direct / global outbound setting')}</option>{snapshot.proxies.map((proxy) => <option value={proxy.id} key={proxy.id}>{proxy.name} · {proxy.protocol.toUpperCase()}</option>)}</select><small>{accountAddMethod === 'oauth' ? t('系统浏览器使用自身网络；此选择只用于 Token 交换、检测和后续上游请求。', 'Your system browser uses its own network. This exit is only used for token exchange, account checks, and later upstream requests.') : t('所选出口用于导入后的账号检测和后续上游请求。', 'The selected exit is used to check imported accounts and for later upstream requests.')}</small></label>
+                <label><span>{accountAddMethod === 'oauth' ? t('Token 交换与后续检测代理', 'Proxy for token exchange and checks') : t('代理', 'Proxy')}</span><select value={proxyId} disabled={importConfigurationLocked || builtInProxyInterlocked} onChange={(event) => { const value = event.target.value; setProxyId(value); void move('source-config', { sourceMethod: accountAddMethod, proxyId: value || null }) }}><option value="">{t('Stone+ 直连 / 全局出口设置', 'Direct / global outbound setting')}</option>{snapshot.proxies.map((proxy) => <option value={proxy.id} key={proxy.id}>{proxy.name} · {proxy.protocol.toUpperCase()}</option>)}</select><small>{builtInProxyInterlocked ? t(BUILT_IN_PROXY_BINDING_NOTICE.zh, BUILT_IN_PROXY_BINDING_NOTICE.en) : accountAddMethod === 'oauth' ? t('系统浏览器使用自身网络；此选择只用于 Token 交换、检测和后续上游请求。', 'Your system browser uses its own network. This proxy is only used for token exchange, account checks, and later upstream requests.') : t('所选代理用于导入后的账号检测和后续上游请求。', 'The selected proxy is used to check imported accounts and for later upstream requests.')}</small></label>
                 <label><span>{t('账号名称（可选）', 'Account name (optional)')}</span><input value={accountName} disabled={importConfigurationLocked} onChange={(event) => setAccountName(event.target.value)} placeholder={t('留空则使用账号邮箱', 'Leave blank to use the account email')} /></label>
               </div>
               </div>
@@ -827,13 +893,14 @@ export function SetupWizardView({
           </WizardSection>}
 
           {currentStep === 'source-config' && (sourceMode === 'official-api' || sourceMode === 'relay') && <WizardSection icon={<Server />} title={sourceMode === 'official-api' ? t('配置官方 API', 'Configure official API') : t('配置中转站', 'Configure relay')} description={t('先完成真实请求测试，再保存到本机安全存储。', 'Run a real request test before saving the source to secure local storage.')}>
-            <ApiSourceForm draft={sourceDraft} proxyId={proxyId} proxies={snapshot.proxies} onProxyChange={setProxyId} onChange={setSourceDraft} onVendor={applyOfficialVendor} official={sourceMode === 'official-api'} />
-            {probe && <ProbeResult result={probe} />}
-            <div className="setup-actions"><button className="button button--secondary" type="button" disabled={Boolean(busy)} onClick={() => void probeDraft()}>{busy === 'probe' ? <LoaderCircle size={16} className="spin" /> : <ShieldCheck size={16} />}{t('测试连接', 'Test connection')}</button><PrimaryAction disabled={!probe?.ok} busy={busy === 'save-source'} onClick={() => void saveDraft()} label={t('保存并继续', 'Save and continue')} /></div>
+            <ApiSourceForm draft={sourceDraft} proxyId={proxyId} proxies={snapshot.proxies} proxyInterlocked={builtInProxyInterlocked} onProxyChange={setProxyId} onChange={setSourceDraft} onVendor={applyOfficialVendor} official={sourceMode === 'official-api'} />
+            {currentProbe && <ProbeResult result={currentProbe} />}
+            {probe && !currentProbe && <div className="setup-message setup-message--error"><CircleAlert size={17} /><span>{t('来源配置已变更，原测试结果已失效。', 'The source changed, so the previous test result is no longer valid.')}</span></div>}
+            <div className="setup-actions"><button className="button button--secondary" type="button" disabled={Boolean(busy)} onClick={() => void probeDraft()}>{busy === 'probe' ? <LoaderCircle size={16} className="spin" /> : <ShieldCheck size={16} />}{t('测试连接', 'Test connection')}</button><PrimaryAction disabled={!currentProbe?.ok} busy={busy === 'save-source'} onClick={() => void saveDraft()} label={t('保存并继续', 'Save and continue')} /></div>
           </WizardSection>}
 
           {currentStep === 'network' && <WizardSection icon={<Router />} title={t('检查网络出口', 'Check the network exit')} description={t('使用来源配置的实际出口运行网络诊断。', 'Run network diagnostics through the actual exit configured for this source.')}>
-            <label className="setup-field"><span>{t('出口代理', 'Outbound proxy')}</span><select value={proxyId} onChange={(event) => setProxyId(event.target.value)}><option value="">{t('直连 / 跟随全局网络设置', 'Direct / use global network setting')}</option>{snapshot.proxies.map((proxy) => <option value={proxy.id} key={proxy.id}>{proxy.name} · {proxy.protocol.toUpperCase()}</option>)}</select></label>
+            <label className="setup-field"><span>{t('代理', 'Proxy')}</span><select value={proxyId} disabled={builtInProxyInterlocked} onChange={(event) => setProxyId(event.target.value)}><option value="">{t('直连 / 跟随全局网络设置', 'Direct / use global network setting')}</option>{snapshot.proxies.map((proxy) => <option value={proxy.id} key={proxy.id}>{proxy.name} · {proxy.protocol.toUpperCase()}</option>)}</select>{builtInProxyInterlocked && <small>{t(BUILT_IN_PROXY_BINDING_NOTICE.zh, BUILT_IN_PROXY_BINDING_NOTICE.en)}</small>}</label>
             <PrimaryAction busy={busy === 'network'} onClick={() => void checkNetwork()} label={t('检测此出口', 'Test this exit')} icon={<Network size={16} />} />
           </WizardSection>}
 
@@ -864,13 +931,14 @@ export function SetupWizardView({
           </WizardSection>}
 
           {currentStep === 'client-config' && <WizardSection icon={<Settings2 />} title={t('连接客户端（可选）', 'Connect the client (optional)')} description={t('可以先预览并备份配置，也可以跳过后手动处理。', 'Preview and back up the configuration now, or skip this step and configure it manually later.')}>
+            {snapshot.clientProfiles.some((profile) => profile.client === client) && <label className="setup-field"><span>{t('配置目录', 'Configuration directory')}</span><select value={clientProfileId} onChange={(event) => { setClientProfileId(event.target.value); setPreviewText(''); void move('client-config', { profileId: event.target.value || null }) }}>{snapshot.clientProfiles.filter((profile) => profile.client === client).map((profile) => <option value={profile.id} key={profile.id}>{profile.name} · {profile.directory || t('默认目录', 'Default directory')}</option>)}</select><small>{t('向导只会写入所选目录的 Stone+ 受管连接字段；托管实例和高级字段请在客户端页配置。', 'The wizard writes only Stone+-managed connection fields in the selected directory. Configure managed instances and advanced fields on the Clients page.')}</small></label>}
             {previewText && <pre className="setup-preview">{previewText}</pre>}
             <div className="setup-actions"><button className="button button--secondary" type="button" disabled={Boolean(busy)} onClick={() => void previewClient()}>{t('预览配置', 'Preview configuration')}</button><button className="button button--secondary" type="button" disabled={Boolean(busy)} onClick={() => void finish()}>{t('暂时跳过', 'Skip for now')}</button><PrimaryAction busy={busy === 'apply-client'} onClick={() => void applyClient()} label={t('应用并备份', 'Apply and back up')} /></div>
           </WizardSection>}
 
           {currentStep === 'complete' && <WizardSection icon={<CheckCircle2 />} title={t('配置已经跑通', 'Setup is working')} description={t('Stone+ 已完成一次从本地网关到上游模型的真实请求。', 'Stone+ completed a real request from the local gateway to the upstream model.')}>
             <SummaryRows rows={[[t('客户端', 'Client'), clientLabels[client]], [t('模型', 'Model'), model], [t('号池', 'Pool'), poolId ?? routing?.poolId ?? '—'], [t('本地网关', 'Local gateway'), `http://${snapshot.gatewayStatus.host}:${snapshot.gatewayStatus.port}`], [t('测试耗时', 'Test duration'), verification ? `${verification.latencyMs} ms` : '—']]} />
-            <div className="setup-actions"><button className="button button--secondary" type="button" onClick={() => { setVerification(null); void api.saveSetupWizardProgress({ step: 'source' }).then(setWizard) }}>{t('继续配置另一个来源', 'Configure another source')}</button><button className="button button--primary" type="button" onClick={() => void exitWizard()}>{t('返回总览', 'Return to overview')}</button></div>
+            <div className="setup-actions"><button className="button button--secondary" type="button" disabled={Boolean(busy)} onClick={() => void configureAnotherSource()}>{busy === 'restart' ? <LoaderCircle size={16} className="spin" /> : null}{t('继续配置另一个来源', 'Configure another source')}</button><button className="button button--primary" type="button" onClick={() => void exitWizard()}>{t('返回总览', 'Return to overview')}</button></div>
           </WizardSection>}
 
           {currentStep !== 'complete' && <footer className="setup-wizard__footer"><button className="text-button" type="button" disabled={currentIndex === 0 || Boolean(busy) || oauthCommitLocked} onClick={() => void back()}><ArrowLeft size={15} />{t('上一步', 'Previous')}</button><button className="text-button danger" type="button" disabled={Boolean(busy) || oauthCommitLocked} onClick={() => void discard()}>{t('放弃本次向导', 'Discard this setup')}</button></footer>}
@@ -899,22 +967,46 @@ function ScanSummary({ snapshot }: { snapshot: AppSnapshot }) {
   return <div className="setup-metrics"><div><span>{t('可用来源', 'Usable sources')}</span><strong>{usable}</strong></div><div><span>{t('号池', 'Pools')}</span><strong>{snapshot.pools.length}</strong></div><div><span>{t('启用路由', 'Enabled routes')}</span><strong>{enabledRoutes}</strong></div><div><span>{t('网关', 'Gateway')}</span><strong>{snapshot.gatewayStatus.running ? t('运行中', 'Running') : t('未启动', 'Not started')}</strong></div></div>
 }
 
-function ApiSourceForm({ draft, proxies, proxyId, official, onChange, onProxyChange, onVendor }: { draft: ApiSourceInput; proxies: AppSnapshot['proxies']; proxyId: string; official: boolean; onChange: (value: ApiSourceInput) => void; onProxyChange: (value: string) => void; onVendor: (kind: ProviderKind) => void }) {
+function ApiSourceForm({ draft, proxies, proxyId, proxyInterlocked, official, onChange, onProxyChange, onVendor }: { draft: ApiSourceInput; proxies: AppSnapshot['proxies']; proxyId: string; proxyInterlocked: boolean; official: boolean; onChange: (value: ApiSourceInput) => void; onProxyChange: (value: string) => void; onVendor: (kind: ProviderKind) => void }) {
   const { t } = useI18n()
   const compatibleKinds: ProviderKind[] = ['openai-compatible', 'anthropic-compatible', 'custom']
   const protocols: Protocol[] = draft.kind === 'anthropic' || draft.kind === 'anthropic-compatible'
     ? ['anthropic-messages']
     : draft.kind === 'google' ? ['gemini'] : ['openai-responses', 'openai-chat']
+  const compactMode = effectiveResponsesCompactMode(draft.responsesCompactMode)
+  const compactCopy = responsesCompactModeCopy[compactMode]
   return <div className="setup-form-grid">
     {official && <label><span>{t('官方厂商', 'Official provider')}</span><select value={draft.kind} onChange={(event) => onVendor(event.target.value as ProviderKind)}><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option><option value="google">Google Gemini</option></select></label>}
-    {!official && <label><span>{t('兼容类型', 'Compatibility type')}</span><select value={draft.kind} onChange={(event) => { const kind = event.target.value as ProviderKind; onChange({ ...draft, kind, protocol: kind === 'anthropic-compatible' ? 'anthropic-messages' : draft.protocol === 'anthropic-messages' ? 'openai-responses' : draft.protocol }) }}>{compatibleKinds.map((kind) => <option value={kind} key={kind}>{kind}</option>)}</select></label>}
+    {!official && <label><span>{t('兼容类型', 'Compatibility type')}</span><select value={draft.kind} onChange={(event) => {
+      const kind = event.target.value as ProviderKind
+      const protocol = kind === 'anthropic-compatible' ? 'anthropic-messages' : draft.protocol === 'anthropic-messages' ? 'openai-responses' : draft.protocol
+      onChange({
+        ...draft,
+        kind,
+        protocol,
+        responsesCompactMode: relayCanConfigureResponsesCompact(draft.sourceType, protocol)
+          ? effectiveResponsesCompactMode(draft.responsesCompactMode)
+          : undefined,
+      })
+    }}>{compatibleKinds.map((kind) => <option value={kind} key={kind}>{kind}</option>)}</select></label>}
     <label><span>{t('显示名称', 'Display name')}</span><input value={draft.name} onChange={(event) => onChange({ ...draft, name: event.target.value })} /></label>
     <label className="full"><span>Base URL</span><input className="mono" disabled={official} value={draft.baseUrl} onChange={(event) => onChange({ ...draft, baseUrl: event.target.value })} /></label>
-    <label><span>{t('协议', 'Protocol')}</span><select value={draft.protocol} onChange={(event) => onChange({ ...draft, protocol: event.target.value as Protocol })}>{protocols.map((protocol) => <option value={protocol} key={protocol}>{protocolLabels[protocol]}</option>)}</select></label>
+    <label><span>{t('协议', 'Protocol')}</span><select value={draft.protocol} onChange={(event) => {
+      const protocol = event.target.value as Protocol
+      onChange({
+        ...draft,
+        protocol,
+        responsesCompactMode: relayCanConfigureResponsesCompact(draft.sourceType, protocol)
+          ? effectiveResponsesCompactMode(draft.responsesCompactMode)
+          : undefined,
+      })
+    }}>{protocols.map((protocol) => <option value={protocol} key={protocol}>{protocolLabels[protocol]}</option>)}</select></label>
+    {relayCanConfigureResponsesCompact(draft.sourceType, draft.protocol) && <label className="full"><span className="field-label-with-help">{t('Responses Compact 能力', 'Responses compact capability')}<InfoTip text={t(compactCopy.helpZh, compactCopy.helpEn)} /></span><select value={compactMode} onChange={(event) => onChange({ ...draft, responsesCompactMode: event.target.value as ResponsesCompactMode })}>{responsesCompactModes.map((mode) => <option value={mode} key={mode}>{t(responsesCompactModeCopy[mode].labelZh, responsesCompactModeCopy[mode].labelEn)}</option>)}</select></label>}
+    {officialOpenAiUsesNativeCompact(draft.sourceType, draft.kind, draft.protocol) && <label className="full"><span className="field-label-with-help"><ShieldCheck size={13} />{t('Responses Compact 能力', 'Responses compact capability')}<InfoTip text={t('官方 OpenAI 按 Responses 协议自动使用完整原生 Compact，无需手动配置。', 'Official OpenAI automatically uses full native compact through the Responses protocol. No manual setting is needed.')} /></span><input disabled value={t('自动：完整原生 Compact', 'Automatic: full native compact')} /></label>}
     <label><span>{t('测试/默认模型', 'Test/default model')}</span><input value={draft.defaultModel ?? ''} onChange={(event) => onChange({ ...draft, defaultModel: event.target.value })} placeholder={t('例如 gpt-5.4', 'For example, gpt-5.4')} /></label>
     <label className="full"><span>API Key</span><input type="password" value={draft.credential ?? ''} onChange={(event) => onChange({ ...draft, credential: event.target.value })} /></label>
     <label><span>{t('最大并发', 'Max concurrency')}</span><input type="number" min={1} max={100} value={draft.maxConcurrency} onChange={(event) => onChange({ ...draft, maxConcurrency: Number(event.target.value) })} /></label>
-    <label><span>{t('出口代理', 'Outbound proxy')}</span><select value={proxyId} onChange={(event) => onProxyChange(event.target.value)}><option value="">{t('直连', 'Direct')}</option>{proxies.map((proxy) => <option value={proxy.id} key={proxy.id}>{proxy.name}</option>)}</select></label>
+    <label><span>{t('代理', 'Proxy')}</span><select value={proxyId} disabled={proxyInterlocked} onChange={(event) => onProxyChange(event.target.value)}><option value="">{t('直连', 'Direct')}</option>{proxies.map((proxy) => <option value={proxy.id} key={proxy.id}>{proxy.name}</option>)}</select>{proxyInterlocked && <small>{t(BUILT_IN_PROXY_BINDING_NOTICE.zh, BUILT_IN_PROXY_BINDING_NOTICE.en)}</small>}</label>
   </div>
 }
 
@@ -974,14 +1066,18 @@ const gatewayErrorEnglish = new Map<string, string>([
   ['向导选择的来源缺少上游定义。', 'The selected source is missing its upstream definition.'],
   ['选择的聚合中转已不存在。', 'The selected aggregate relay no longer exists.'],
   ['聚合中转不包含当前来源。', 'The aggregate relay does not contain the current source.'],
+  ['选择的号池没有可完成向导验证的模型与基础生成能力。', 'The selected pool has no member that can serve the model and baseline generation required by the wizard.'],
   ['配置向导会话已更新，请重新打开向导。', 'The setup session changed. Reopen the wizard.'],
   ['配置向导步骤无效。', 'The setup wizard step is invalid.'],
   ['配置向导会话不存在或已过期。', 'The setup session does not exist or has expired.'],
   ['只有端到端真实请求成功后才能完成配置向导。', 'The wizard can finish only after a successful real end-to-end request.'],
   ['无法应用向导路由。', 'Could not apply the wizard route.'],
+  ['端到端验证缺少向导会话或路由绑定。', 'The end-to-end test is missing its setup session or route binding.'],
+  ['端到端验证目标与本次向导已应用的路由不一致。', 'The end-to-end target no longer matches the route applied by this setup.'],
+  ['验证期间路由已变更，请重新运行端到端验证。', 'The route changed during verification. Run the end-to-end test again.'],
   ['不支持的账号导入代理选项。', 'The selected account-import proxy option is unsupported.'],
-  ['请选择一个出口代理后再导入账号。', 'Choose an outbound proxy before importing accounts.'],
-  ['选择的出口代理已被删除，请重新选择后再导入。', 'The selected outbound proxy was deleted. Choose another before importing.'],
+  ['请选择一个代理后再导入账号。', 'Choose a proxy before importing accounts.'],
+  ['选择的代理已被删除，请重新选择后再导入。', 'The selected proxy was deleted. Choose another before importing.'],
 ])
 
 const probeMessageEnglish = new Map<string, string>([

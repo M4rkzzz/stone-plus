@@ -1,5 +1,6 @@
 import { createServer as createNodeServer } from 'node:net'
-import { request as createHttpRequest } from 'node:http'
+import { request as createHttpRequest, ServerResponse } from 'node:http'
+import { EventEmitter } from 'node:events'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { Account, GatewaySettings, Pool, ProviderDefinition, RequestLog, Route } from '../../src/shared/types'
 import { createCanonicalStreamParser, GatewayServer } from '../../src/main/gateway'
@@ -104,6 +105,48 @@ async function post(port: number, token = 'local-secret', body: Record<string, u
   })
 }
 
+function beginPausedPost(
+  port: number,
+  body: Record<string, unknown> = {}
+): {
+  finish: () => void
+  result: Promise<{ statusCode?: number; body: string }>
+} {
+  const wireBody = JSON.stringify({
+    model: 'source-model',
+    messages: [{ role: 'user', content: 'Hello' }],
+    ...body
+  })
+  const splitAt = Math.max(1, Math.floor(wireBody.length / 2))
+  let request!: ReturnType<typeof createHttpRequest>
+  const result = new Promise<{ statusCode?: number; body: string }>((resolve, reject) => {
+    request = createHttpRequest({
+      host: '127.0.0.1',
+      port,
+      path: '/v1/chat/completions',
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer local-secret',
+        'content-type': 'application/json',
+        'content-length': Buffer.byteLength(wireBody)
+      }
+    }, (response) => {
+      const chunks: Buffer[] = []
+      response.on('data', (chunk) => chunks.push(Buffer.from(chunk)))
+      response.on('end', () => resolve({
+        statusCode: response.statusCode,
+        body: Buffer.concat(chunks).toString('utf8')
+      }))
+    })
+    request.on('error', reject)
+    request.write(wireBody.slice(0, splitAt))
+  })
+  return {
+    finish: () => request.end(wireBody.slice(splitAt)),
+    result
+  }
+}
+
 function upsertLog(logs: RequestLog[], log: RequestLog): void {
   const index = logs.findIndex((candidate) => candidate.id === log.id)
   if (index >= 0) logs[index] = log
@@ -204,11 +247,230 @@ async function getModels(port: number, path = '/v1/models', token = 'local-secre
   })
 }
 
+async function runConcurrencyModeRequest(highConcurrencyMode: boolean): Promise<{
+  gateway: GatewayServer
+  rawLogs: RequestLog[]
+  runtimeAccountUpdates: string[][]
+  status: number
+  titleResolver: ReturnType<typeof vi.fn>
+  upstreamFetch: ReturnType<typeof vi.fn>
+  wire: string
+}> {
+  const port = await freePort()
+  const gatewayConfig = config(port, { logPayloads: true })
+  gatewayConfig.routes[0].highConcurrencyMode = highConcurrencyMode
+  gatewayConfig.accounts[1].status = 'disabled'
+  gatewayConfig.pools[0].maxRetries = 0
+  gatewayConfig.pools[0].hedgedRequests = true
+  gatewayConfig.pools[0].hedgeDelayMs = 250
+  const titleResolver = vi.fn(() => 'Resolved concurrency title')
+  const rawLogs: RequestLog[] = []
+  const runtimeAccountUpdates: string[][] = []
+  const firstFrame = [
+    'data: {"id":"chat-concurrency-mode","model":"source-model","choices":[{"index":0,"delta":{"content":"Mode output"},"finish_reason":null}]}',
+    '', ''
+  ].join('\n')
+  const terminalFrame = [
+    'data: {"id":"chat-concurrency-mode","model":"source-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":4,"total_tokens":15}}',
+    '',
+    'data: [DONE]',
+    '', ''
+  ].join('\n')
+  const upstreamFetch = vi.fn(async () => {
+    // Normal routes should launch the 250 ms hedge. High-concurrency routes
+    // deliberately wait for this primary lane instead of duplicating work.
+    if (upstreamFetch.mock.calls.length === 1) {
+      await new Promise((resolve) => setTimeout(resolve, 325))
+    }
+    return scheduledSseResponse([
+      { atMs: 0, data: firstFrame },
+      { atMs: 30, data: terminalFrame, close: true }
+    ])
+  })
+  const gateway = new GatewayServer({
+    config: gatewayConfig,
+    credentialResolver: () => 'credential',
+    fetchImplementation: upstreamFetch as typeof fetch,
+    conversationTitleResolver: titleResolver,
+    onLog: (log) => rawLogs.push(log)
+  })
+  gateway.onRuntimeState((update) => {
+    if (update.accountIds?.length) runtimeAccountUpdates.push([...update.accountIds])
+  })
+  runningServers.push(gateway)
+  await gateway.start()
+
+  const response = await post(port, 'local-secret', {
+    stream: true,
+    metadata: { session_id: 'concurrency-session' }
+  })
+  const status = response.status
+  const wire = await response.text()
+  await vi.waitFor(() => expect(rawLogs.some((log) => log.status === 'success')).toBe(true))
+  await new Promise<void>((resolve) => setImmediate(resolve))
+  return { gateway, rawLogs, runtimeAccountUpdates, status, titleResolver, upstreamFetch, wire }
+}
+
 afterEach(async () => {
   await Promise.all(runningServers.splice(0).map((server) => server.stop({ force: true })))
 })
 
 describe('GatewayServer', () => {
+  it('captures replay payloads only when enabled and exposes a content-redacted template', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port, { logPayloads: true })
+    gatewayConfig.accounts[1].status = 'disabled'
+    gatewayConfig.pools[0].maxRetries = 0
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'credential',
+      fetchImplementation: vi.fn(async () => new Response(JSON.stringify({
+        id: 'chatcmpl-replay',
+        choices: [{ index: 0, message: { role: 'assistant', content: 'Done' }, finish_reason: 'stop' }]
+      }), { status: 200, headers: { 'content-type': 'application/json' } })) as typeof fetch
+    })
+    runningServers.push(gateway)
+    let terminal: RequestLog | undefined
+    gateway.onLog((log) => { if (log.status !== 'streaming') terminal = log })
+    await gateway.start()
+    expect((await post(port)).status).toBe(200)
+    expect(terminal).toBeDefined()
+    expect(gateway.getRequestReplayTemplate(terminal!.id)).toMatchObject({
+      path: '/v1/chat/completions',
+      body: { model: 'source-model', messages: [{ role: 'user', content: '[CONTENT REDACTED]' }] },
+      contentRedacted: true
+    })
+    gateway.updateConfig({ ...gatewayConfig, settings: { ...gatewayConfig.settings, logPayloads: false } })
+    expect(gateway.getRequestReplayTemplate(terminal!.id)).toBeUndefined()
+  })
+
+  it('does not let an in-flight upload repopulate replay after an explicit clear', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port, { logPayloads: true })
+    gatewayConfig.accounts[1].status = 'disabled'
+    gatewayConfig.pools[0].maxRetries = 0
+    const rawLogs: RequestLog[] = []
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'credential',
+      fetchImplementation: vi.fn(async () => new Response(JSON.stringify({
+        id: 'chatcmpl-replay-generation',
+        choices: [{ index: 0, message: { role: 'assistant', content: 'Done' }, finish_reason: 'stop' }]
+      }), { status: 200, headers: { 'content-type': 'application/json' } })) as typeof fetch,
+      onLog: (log) => rawLogs.push(log)
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    expect((await post(port)).status).toBe(200)
+    const completedId = rawLogs.find((log) => log.status === 'success')?.id
+    expect(completedId).toBeDefined()
+    expect(gateway.getRequestReplayTemplate(completedId!)).toBeDefined()
+
+    const paused = beginPausedPost(port)
+    await vi.waitFor(() => expect(rawLogs.filter((log) => (
+      log.status === 'streaming'
+        && log.progressStage === 'receiving-body'
+        && log.id !== completedId
+    ))).toHaveLength(1))
+    const inFlightId = rawLogs.find((log) => (
+      log.status === 'streaming'
+        && log.progressStage === 'receiving-body'
+        && log.id !== completedId
+    ))!.id
+
+    gateway.clearRequestReplays()
+    expect(gateway.getRequestReplayTemplate(completedId!)).toBeUndefined()
+    paused.finish()
+    expect((await paused.result).statusCode).toBe(200)
+    expect(gateway.getRequestReplayTemplate(inFlightId)).toBeUndefined()
+  })
+
+  it('honors replay disable when callers mutate and resubmit the same config object', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port, { logPayloads: true })
+    gatewayConfig.accounts[1].status = 'disabled'
+    gatewayConfig.pools[0].maxRetries = 0
+    const rawLogs: RequestLog[] = []
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'credential',
+      fetchImplementation: vi.fn(async () => new Response(JSON.stringify({
+        id: 'chatcmpl-replay-same-config',
+        choices: [{ index: 0, message: { role: 'assistant', content: 'Done' }, finish_reason: 'stop' }]
+      }), { status: 200, headers: { 'content-type': 'application/json' } })) as typeof fetch,
+      onLog: (log) => rawLogs.push(log)
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    expect((await post(port)).status).toBe(200)
+    const completedId = rawLogs.find((log) => log.status === 'success')?.id
+    expect(completedId).toBeDefined()
+    expect(gateway.getRequestReplayTemplate(completedId!)).toBeDefined()
+
+    const paused = beginPausedPost(port)
+    await vi.waitFor(() => expect(rawLogs.filter((log) => (
+      log.status === 'streaming'
+        && log.progressStage === 'receiving-body'
+        && log.id !== completedId
+    ))).toHaveLength(1))
+    const inFlightId = rawLogs.find((log) => (
+      log.status === 'streaming'
+        && log.progressStage === 'receiving-body'
+        && log.id !== completedId
+    ))!.id
+
+    gatewayConfig.settings.logPayloads = false
+    gateway.updateConfig(gatewayConfig)
+    expect(gateway.getRequestReplayTemplate(completedId!)).toBeUndefined()
+    paused.finish()
+    expect((await paused.result).statusCode).toBe(200)
+    expect(gateway.getRequestReplayTemplate(inFlightId)).toBeUndefined()
+  })
+
+  it('pins high-concurrency mode after authentication when the same route object is mutated', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port, { logPayloads: true })
+    gatewayConfig.accounts[1].status = 'disabled'
+    gatewayConfig.pools[0].maxRetries = 0
+    gatewayConfig.routes[0].highConcurrencyMode = false
+    const rawLogs: RequestLog[] = []
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'credential',
+      fetchImplementation: vi.fn(async () => new Response(JSON.stringify({
+        id: 'chatcmpl-mode-snapshot',
+        choices: [{ index: 0, message: { role: 'assistant', content: 'Done' }, finish_reason: 'stop' }]
+      }), { status: 200, headers: { 'content-type': 'application/json' } })) as typeof fetch,
+      onLog: (log) => rawLogs.push(log)
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const paused = beginPausedPost(port)
+    await vi.waitFor(() => expect(rawLogs.filter((log) => (
+      log.status === 'streaming' && log.progressStage === 'receiving-body'
+    ))).toHaveLength(1))
+    const authenticatedRequestId = rawLogs.find((log) => (
+      log.status === 'streaming' && log.progressStage === 'receiving-body'
+    ))!.id
+
+    gatewayConfig.routes[0].highConcurrencyMode = true
+    gateway.updateConfig(gatewayConfig)
+    paused.finish()
+    expect((await paused.result).statusCode).toBe(200)
+    expect(gateway.getRequestReplayTemplate(authenticatedRequestId)).toBeDefined()
+
+    const nextLogOffset = rawLogs.length
+    expect((await post(port)).status).toBe(200)
+    const nextRequestId = rawLogs.slice(nextLogOffset).find((log) => (
+      log.progressStage === 'receiving-body'
+    ))?.id
+    expect(nextRequestId).toBeDefined()
+    expect(gateway.getRequestReplayTemplate(nextRequestId!)).toBeUndefined()
+  })
+
   it('reports live per-account concurrency while an upstream request is running', async () => {
     const port = await freePort()
     const gatewayConfig = config(port)
@@ -255,6 +517,210 @@ describe('GatewayServer', () => {
       expect.objectContaining({ activeRequests: 1, first: 1 }),
       expect.objectContaining({ activeRequests: 0, first: 0 })
     ]))
+  })
+
+  it('coalesces first-byte progress and never emits streaming after the terminal log', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.accounts[1].status = 'disabled'
+    gatewayConfig.pools[0].maxRetries = 0
+    const encoder = new TextEncoder()
+    let upstreamController: ReadableStreamDefaultController<Uint8Array> | undefined
+    const rawLogs: RequestLog[] = []
+    const upstreamFetch = vi.fn(async () => new Response(new ReadableStream<Uint8Array>({
+      start(controller) { upstreamController = controller }
+    }), { status: 200, headers: { 'content-type': 'text/event-stream' } }))
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'credential',
+      fetchImplementation: upstreamFetch as typeof fetch,
+      onLog: (log) => rawLogs.push(log)
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const responsePending = post(port, 'local-secret', { stream: true })
+    await vi.waitFor(() => expect(upstreamController).toBeDefined())
+    upstreamController?.enqueue(encoder.encode(
+      'data: {"id":"chat-progress","model":"source-model","choices":[{"index":0,"delta":{"content":"A"},"finish_reason":null}]}\n\n'
+    ))
+    const response = await responsePending
+    await new Promise<void>((resolve) => setImmediate(resolve))
+
+    // Upstream-first-byte, semantic-first-token and client-first-write all
+    // happen on the same frame, but observability publishes one merged update.
+    expect(rawLogs.filter((log) => log.status === 'streaming' && log.progressStage === 'streaming')).toHaveLength(1)
+
+    upstreamController?.enqueue(encoder.encode(
+      'data: {"id":"chat-progress","model":"source-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
+    ))
+    upstreamController?.close()
+    await response.text()
+    await new Promise<void>((resolve) => setImmediate(resolve))
+
+    const terminalIndex = rawLogs.findIndex((log) => log.status !== 'streaming')
+    expect(terminalIndex).toBeGreaterThanOrEqual(0)
+    expect(rawLogs.slice(terminalIndex + 1).some((log) => log.status === 'streaming')).toBe(false)
+  })
+
+  it('keeps terminal data while high-concurrency mode skips replay, title lookup, hedging, and noisy progress', async () => {
+    const {
+      gateway, rawLogs, runtimeAccountUpdates, status, titleResolver, upstreamFetch, wire
+    } = await runConcurrencyModeRequest(true)
+    const terminal = rawLogs.find((log) => log.status === 'success')
+
+    expect(status).toBe(200)
+    expect(wire).toContain('Mode output')
+    expect(upstreamFetch).toHaveBeenCalledOnce()
+    expect(titleResolver).not.toHaveBeenCalled()
+    expect(terminal).toMatchObject({
+      id: rawLogs[0].id,
+      status: 'success',
+      statusCode: 200,
+      accountId: 'first',
+      providerName: 'Provider',
+      model: 'source-model',
+      conversationId: 'concurrency-session',
+      conversationName: '对话 concurrency-session',
+      inputTokens: 11,
+      outputTokens: 4,
+      failoverCount: 0
+    })
+    expect(terminal?.streamedBytes).toBeGreaterThan(0)
+    expect(terminal?.streamedChunks).toBe(2)
+    expect(terminal?.bodyReadMs).toEqual(expect.any(Number))
+    expect(terminal?.schedulerSelectMs).toEqual(expect.any(Number))
+    expect(terminal?.credentialResolveMs).toEqual(expect.any(Number))
+    expect(terminal?.upstreamHeadersMs).toEqual(expect.any(Number))
+    expect(gateway.getRequestReplayTemplate(rawLogs[0].id)).toBeUndefined()
+    expect(gateway.getAccountInFlight().first).toBe(0)
+    // Acquisition chatter is paused, but the release delta is retained so a
+    // renderer can never be left displaying a stale in-flight count.
+    expect(runtimeAccountUpdates).toEqual([['first']])
+
+    expect(rawLogs.map((log) => [log.status, log.progressStage])).toEqual([
+      ['streaming', 'receiving-body'],
+      ['streaming', 'streaming'],
+      ['success', undefined]
+    ])
+  })
+
+  it('retains replay, title lookup, hedging, and detailed progress when high-concurrency mode is off', async () => {
+    const { gateway, rawLogs, status, titleResolver, upstreamFetch, wire } = await runConcurrencyModeRequest(false)
+    const terminal = rawLogs.find((log) => log.status === 'success')
+    const progressStages = rawLogs
+      .filter((log) => log.status === 'streaming')
+      .map((log) => log.progressStage)
+
+    expect(status).toBe(200)
+    expect(wire).toContain('Mode output')
+    expect(upstreamFetch).toHaveBeenCalledTimes(2)
+    expect(titleResolver).toHaveBeenCalledOnce()
+    expect(titleResolver).toHaveBeenCalledWith('concurrency-session')
+    expect(progressStages).toContain('connecting')
+    expect(progressStages).toContain('streaming')
+    expect(terminal).toMatchObject({
+      id: rawLogs[0].id,
+      status: 'success',
+      statusCode: 200,
+      accountId: 'first',
+      model: 'source-model',
+      conversationId: 'concurrency-session',
+      conversationName: 'Resolved concurrency title',
+      inputTokens: 11,
+      outputTokens: 4
+    })
+    expect(gateway.getRequestReplayTemplate(rawLogs[0].id)).toMatchObject({
+      path: '/v1/chat/completions',
+      body: {
+        model: 'source-model',
+        messages: [{ role: 'user', content: '[CONTENT REDACTED]' }],
+        metadata: { session_id: 'concurrency-session' },
+        stream: true
+      },
+      contentRedacted: true
+    })
+  })
+
+  it('waits for non-streaming backpressure and distinguishes finish from close', async () => {
+    const port = await freePort()
+    const gateway = new GatewayServer({
+      config: config(port),
+      credentialResolver: () => 'credential',
+      fetchImplementation: vi.fn() as typeof fetch
+    })
+    class ControlledResponse extends EventEmitter {
+      writableFinished = false
+      writableEnded = false
+      destroyed = false
+      headersSent = false
+      statusCode = 0
+      blockWrite = true
+      writableLength = 1_024
+      socket = { bytesWritten: 0 }
+      setHeader(): void {}
+      write(): boolean { return !this.blockWrite }
+      end(): void { this.writableEnded = true }
+      destroy(): void {
+        this.destroyed = true
+        this.emit('close')
+      }
+    }
+    const writeJson = (gateway as unknown as {
+      writeJson(response: unknown, statusCode: number, payload: Record<string, unknown>): Promise<boolean>
+    }).writeJson.bind(gateway)
+
+    const finishedResponse = new ControlledResponse()
+    let settled = false
+    const finishedWrite = writeJson(finishedResponse, 200, { ok: true }).then((result) => {
+      settled = true
+      return result
+    })
+    await Promise.resolve()
+    expect(settled).toBe(false)
+    finishedResponse.emit('drain')
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    expect(finishedResponse.writableEnded).toBe(true)
+    expect(settled).toBe(false)
+    finishedResponse.writableFinished = true
+    finishedResponse.emit('finish')
+    expect(await finishedWrite).toBe(true)
+
+    const closedResponse = new ControlledResponse()
+    closedResponse.blockWrite = false
+    const closedWrite = writeJson(closedResponse, 200, { ok: true })
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    expect(closedResponse.writableEnded).toBe(true)
+    closedResponse.destroyed = true
+    closedResponse.emit('close')
+    expect(await closedWrite).toBe(false)
+
+    vi.useFakeTimers()
+    try {
+      const progressingResponse = new ControlledResponse()
+      let progressingSettled = false
+      const progressingWrite = writeJson(progressingResponse, 200, { ok: true }).then((result) => {
+        progressingSettled = true
+        return result
+      })
+      await vi.advanceTimersByTimeAsync(9_000)
+      progressingResponse.socket.bytesWritten += 1
+      progressingResponse.writableLength = 512
+      await vi.advanceTimersByTimeAsync(1_000)
+      await vi.advanceTimersByTimeAsync(9_999)
+      expect(progressingSettled).toBe(false)
+      progressingResponse.writableFinished = true
+      progressingResponse.emit('finish')
+      expect(await progressingWrite).toBe(true)
+
+      const stalledResponse = new ControlledResponse()
+      const stalledWrite = writeJson(stalledResponse, 200, { ok: true })
+      await vi.advanceTimersByTimeAsync(10_000)
+      expect(await stalledWrite).toBe(false)
+      expect(stalledResponse.destroyed).toBe(true)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('requires the matching local route token before calling upstream', async () => {
@@ -840,6 +1306,280 @@ describe('GatewayServer', () => {
     })
   }, 20_000)
 
+  it('releases an unknown-length large-body permit when a valid stream commits', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers[0] = {
+      ...gatewayConfig.providers[0],
+      sourceType: 'official-api',
+      kind: 'openai',
+      baseUrl: 'https://api.openai.com/v1',
+      protocol: 'openai-responses'
+    }
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    gatewayConfig.pools[0].maxRetries = 0
+    gatewayConfig.accounts[0].maxConcurrency = 2
+    gatewayConfig.accounts[1].status = 'disabled'
+    const encoder = new TextEncoder()
+    let firstController: ReadableStreamDefaultController<Uint8Array> | undefined
+    const firstDelta = 'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"A","sequence_number":1}\n\n'
+    const completed = 'event: response.completed\ndata: {"type":"response.completed","sequence_number":2,"response":{"id":"resp-large","object":"response","status":"completed","model":"source-model","output":[]}}\n\n'
+    const upstreamFetch = vi.fn()
+      .mockImplementationOnce(async () => new Response(new ReadableStream<Uint8Array>({
+        start(controller) { firstController = controller }
+      }), { status: 200, headers: { 'content-type': 'text/event-stream' } }))
+      .mockResolvedValueOnce(new Response(`${firstDelta}${completed}`, {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' }
+      }))
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'official-key',
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const sendChunkedStream = (input: string): {
+      headers: Promise<number | undefined>
+      done: Promise<string>
+    } => {
+      const wireBody = JSON.stringify({ model: 'source-model', input, stream: true })
+      let resolveHeaders!: (statusCode: number | undefined) => void
+      const headers = new Promise<number | undefined>((resolve) => { resolveHeaders = resolve })
+      const done = new Promise<string>((resolve, reject) => {
+        const request = createHttpRequest({
+          host: '127.0.0.1',
+          port,
+          path: '/v1/responses',
+          method: 'POST',
+          headers: {
+            authorization: 'Bearer local-secret',
+            'content-type': 'application/json',
+            'transfer-encoding': 'chunked'
+          }
+        }, (response) => {
+          resolveHeaders(response.statusCode)
+          const chunks: Buffer[] = []
+          response.on('data', (chunk) => chunks.push(Buffer.from(chunk)))
+          response.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')))
+        })
+        request.on('error', reject)
+        request.end(wireBody)
+      })
+      return { headers, done }
+    }
+
+    const first = sendChunkedStream(`large-first:${'a'.repeat(10 * 1024 * 1024)}`)
+    await vi.waitFor(() => expect(upstreamFetch).toHaveBeenCalledOnce())
+    const second = sendChunkedStream(`large-second:${'b'.repeat(10 * 1024 * 1024)}`)
+    await vi.waitFor(() => expect(gateway.getStatus().activeRequests).toBe(2))
+    expect(upstreamFetch).toHaveBeenCalledOnce()
+
+    // A recognized frame commits the first stream but deliberately leaves it
+    // running. The second large upload must acquire the parsing budget now,
+    // rather than waiting for the first generation's terminal event.
+    firstController?.enqueue(encoder.encode(firstDelta))
+    await expect(first.headers).resolves.toBe(200)
+    await vi.waitFor(() => expect(upstreamFetch).toHaveBeenCalledTimes(2))
+    await expect(second.headers).resolves.toBe(200)
+    await expect(second.done).resolves.toContain('response.completed')
+
+    firstController?.enqueue(encoder.encode(completed))
+    firstController?.close()
+    await expect(first.done).resolves.toContain('response.completed')
+  }, 20_000)
+
+  it('releases large-body permits before every validated buffered response write', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers[0] = {
+      ...gatewayConfig.providers[0],
+      sourceType: 'official-api',
+      kind: 'openai',
+      baseUrl: 'https://api.openai.com/v1',
+      protocol: 'openai-responses'
+    }
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    gatewayConfig.pools[0].maxRetries = 0
+    gatewayConfig.accounts[1].status = 'disabled'
+    const upstreamFetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      const upstreamBody = JSON.parse(String(init?.body)) as { input?: Array<Record<string, unknown>> }
+      if (Array.isArray(upstreamBody.input)
+        && upstreamBody.input.some((item) => item.type === 'compaction_trigger')) {
+        return new Response([
+          'event: response.output_item.done',
+          'data: {"type":"response.output_item.done","output_index":0,"item":{"id":"cmp_release","type":"compaction","encrypted_content":"encrypted-release"}}',
+          '',
+          'event: response.completed',
+          'data: {"type":"response.completed","response":{"id":"resp_compact_release","model":"source-model","status":"completed","output":[]}}',
+          '',
+          ''
+        ].join('\n'), { status: 200, headers: { 'content-type': 'text/event-stream' } })
+      }
+      if (String(_input).endsWith('/responses/compact')) {
+        return new Response(JSON.stringify({
+          output: [{ type: 'compaction', encrypted_content: 'legacy-release' }]
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      return new Response(JSON.stringify({
+        id: 'resp_buffered_release',
+        object: 'response',
+        model: 'source-model',
+        status: 'completed',
+        output: []
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    })
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'official-key',
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+
+    type BufferedWriteGateway = {
+      largeRequestBodies: {
+        acquire(byteLength: number, signal: AbortSignal): Promise<() => void>
+      }
+      writeJson(
+        response: unknown,
+        statusCode: number,
+        payload: Record<string, unknown>,
+        onClientWrite?: () => void
+      ): Promise<boolean>
+      writeJsonBytes(
+        response: unknown,
+        statusCode: number,
+        body: Uint8Array,
+        onClientWrite?: () => void
+      ): Promise<boolean>
+    }
+    const internal = gateway as unknown as BufferedWriteGateway
+    const permitReleases: Array<ReturnType<typeof vi.fn>> = []
+    vi.spyOn(internal.largeRequestBodies, 'acquire').mockImplementation(async () => {
+      const release = vi.fn()
+      permitReleases.push(release)
+      return release
+    })
+    const originalWriteJson = internal.writeJson.bind(internal)
+    vi.spyOn(internal, 'writeJson').mockImplementation(async (...args) => {
+      if (args[1] === 200) expect(permitReleases.at(-1)).toHaveBeenCalledOnce()
+      return originalWriteJson(...args)
+    })
+    const originalWriteJsonBytes = internal.writeJsonBytes.bind(internal)
+    vi.spyOn(internal, 'writeJsonBytes').mockImplementation(async (...args) => {
+      if (args[1] === 200) expect(permitReleases.at(-1)).toHaveBeenCalledOnce()
+      return originalWriteJsonBytes(...args)
+    })
+    const originalFlushHeaders = ServerResponse.prototype.flushHeaders
+    const flushHeaders = vi.spyOn(ServerResponse.prototype, 'flushHeaders').mockImplementation(function(
+      this: ServerResponse
+    ) {
+      expect(permitReleases.at(-1)).toHaveBeenCalledOnce()
+      return originalFlushHeaders.call(this)
+    })
+    await gateway.start()
+
+    const largePadding = 'p'.repeat(10 * 1024 * 1024)
+    try {
+      const buffered = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+        method: 'POST',
+        headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'source-model', input: largePadding, stream: false })
+      })
+      expect(buffered.status).toBe(200)
+      await buffered.text()
+
+      const compact = await fetch(`http://127.0.0.1:${port}/v1/responses/compact`, {
+        method: 'POST',
+        headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+        body: JSON.stringify({
+          model: 'source-model',
+          input: [{ role: 'user', content: [{ type: 'input_text', text: largePadding }] }]
+        })
+      })
+      expect(compact.status).toBe(200)
+      await compact.text()
+
+      const compactV2 = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+        method: 'POST',
+        headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+        body: JSON.stringify({
+          model: 'source-model',
+          input: [
+            { role: 'user', content: [{ type: 'input_text', text: largePadding }] },
+            { type: 'compaction_trigger' }
+          ],
+          stream: true
+        })
+      })
+      expect(compactV2.status).toBe(200)
+      await compactV2.text()
+    } finally {
+      flushHeaders.mockRestore()
+    }
+
+    expect(permitReleases).toHaveLength(3)
+    expect(permitReleases.every((release) => release.mock.calls.length === 1)).toBe(true)
+  }, 30_000)
+
+  it('releases a large-body permit before writing a terminal non-retryable error', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers[0] = {
+      ...gatewayConfig.providers[0],
+      sourceType: 'official-api',
+      kind: 'openai',
+      baseUrl: 'https://api.openai.com/v1',
+      protocol: 'openai-responses'
+    }
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    gatewayConfig.pools[0].maxRetries = 3
+    gatewayConfig.accounts[1].status = 'disabled'
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'official-key',
+      fetchImplementation: vi.fn(async () => new Response(
+        JSON.stringify({ error: { message: 'terminal bad request' } }),
+        { status: 400, headers: { 'content-type': 'application/json' } }
+      )) as typeof fetch
+    })
+    runningServers.push(gateway)
+    type ErrorWriteGateway = {
+      largeRequestBodies: {
+        acquire(byteLength: number, signal: AbortSignal): Promise<() => void>
+      }
+      writeJson(
+        response: unknown,
+        statusCode: number,
+        payload: Record<string, unknown>,
+        onClientWrite?: () => void
+      ): Promise<boolean>
+    }
+    const internal = gateway as unknown as ErrorWriteGateway
+    const releasePermit = vi.fn()
+    vi.spyOn(internal.largeRequestBodies, 'acquire').mockResolvedValue(releasePermit)
+    const originalWriteJson = internal.writeJson.bind(internal)
+    vi.spyOn(internal, 'writeJson').mockImplementation(async (...args) => {
+      if (args[1] === 400) expect(releasePermit).toHaveBeenCalledOnce()
+      return originalWriteJson(...args)
+    })
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'source-model', input: 'e'.repeat(10 * 1024 * 1024), stream: false })
+    })
+
+    expect(response.status).toBe(400)
+    expect(await response.json()).toMatchObject({ error: { message: 'terminal bad request' } })
+    expect(releasePermit).toHaveBeenCalledOnce()
+  }, 20_000)
+
   it('finishes a first-body timeout instead of leaving its pending log streaming', async () => {
     const port = await freePort()
     const gatewayConfig = config(port)
@@ -900,8 +1640,35 @@ describe('GatewayServer', () => {
       await vi.waitFor(() => expect(gateway.getStatus().activeRequests).toBe(0))
       expect(events[0]).toMatchObject({ status: 'error', statusCode: 504 })
     },
-    5_000
+    // The response deadline itself is one second. Leave enough room for the
+    // non-cooperative body case plus forced server/socket cleanup when the
+    // full gateway suite is running under load.
+    10_000
   )
+
+  it('actively cancels a non-streaming upstream JSON reader when its request signal aborts', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port, { requestTimeoutSeconds: 1 })
+    gatewayConfig.accounts[1].status = 'disabled'
+    gatewayConfig.pools[0].maxRetries = 0
+    let cancelled = false
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'credential',
+      fetchImplementation: vi.fn(async () => new Response(new ReadableStream<Uint8Array>({
+        pull: () => new Promise<void>(() => undefined),
+        cancel() { cancelled = true }
+      }), { status: 200, headers: { 'content-type': 'application/json' } })) as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await post(port)
+    expect(response.status).toBe(504)
+    await response.text()
+    await vi.waitFor(() => expect(cancelled).toBe(true))
+    expect(gateway.getStatus().activeRequests).toBe(0)
+  }, 5_000)
 
   it('leaves first-token timing empty for buffered non-streaming responses', async () => {
     const port = await freePort()
@@ -1139,6 +1906,58 @@ describe('GatewayServer', () => {
     expect(JSON.parse(String(request.body))).toMatchObject({ store: false, stream: true, service_tier: 'priority' })
   })
 
+  it('retains Agent Identity as non-sensitive request-log metadata', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers[0] = {
+      ...gatewayConfig.providers[0],
+      name: 'ChatGPT OAuth',
+      protocol: 'openai-responses'
+    }
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    gatewayConfig.accounts[0] = {
+      ...gatewayConfig.accounts[0],
+      credentialType: 'chatgpt-agent-identity',
+      chatgptAccountId: 'acct-agent'
+    }
+    gatewayConfig.accounts[1].status = 'disabled'
+    const logs: RequestLog[] = []
+    const stream = [
+      'data: {"type":"response.created","response":{"id":"resp_agent","model":"gpt-5.1"}}\n\n',
+      'data: {"type":"response.output_text.delta","delta":"OK"}\n\n',
+      'data: {"type":"response.completed","response":{"id":"resp_agent","model":"gpt-5.1","status":"completed","output":[]}}\n\n'
+    ].join('')
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => ({
+        secret: 'AgentAssertion test-private',
+        kind: 'chatgpt-agent-identity',
+        accountId: 'acct-agent'
+      }),
+      fetchImplementation: vi.fn(async () => new Response(stream, {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' }
+      })) as typeof fetch,
+      onLog: (log) => upsertLog(logs, log)
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-5.1', input: 'Hello', stream: true })
+    })
+
+    expect(response.status).toBe(200)
+    expect(await response.text()).toContain('response.completed')
+    expect(logs.find((log) => log.status === 'success')).toMatchObject({
+      credentialType: 'chatgpt-agent-identity',
+      providerName: 'ChatGPT OAuth'
+    })
+  })
+
   it('proxies legacy compact requests to the native ChatGPT endpoint without changing the history', async () => {
     const port = await freePort()
     const gatewayConfig = config(port)
@@ -1146,7 +1965,8 @@ describe('GatewayServer', () => {
       ...gatewayConfig.providers[0],
       sourceType: 'oauth-system',
       kind: 'openai',
-      protocol: 'openai-responses'
+      protocol: 'openai-responses',
+      responsesCompactMode: 'legacy'
     }
     gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
     gatewayConfig.pools[0].protocol = 'openai-responses'
@@ -1229,7 +2049,8 @@ describe('GatewayServer', () => {
       sourceType: 'official-api',
       kind: 'openai',
       baseUrl: 'https://api.openai.com/v1',
-      protocol: 'openai-responses'
+      protocol: 'openai-responses',
+      responsesCompactMode: 'legacy'
     }
     gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
     gatewayConfig.pools[0].protocol = 'openai-responses'
@@ -1315,7 +2136,11 @@ describe('GatewayServer', () => {
     const originalInput = [{ role: 'user', content: [{ type: 'input_text', text: 'Original task' }] }]
     const response = await fetch(`http://127.0.0.1:${port}/v1/responses/compact`, {
       method: 'POST',
-      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      headers: {
+        authorization: 'Bearer local-secret',
+        'content-type': 'application/json',
+        'x-codex-turn-state': 'legacy-fallback-must-not-forward'
+      },
       body: JSON.stringify({
         model: 'source-model',
         input: originalInput,
@@ -1335,6 +2160,7 @@ describe('GatewayServer', () => {
     expect(upstreamFetch).toHaveBeenCalledOnce()
     expect(upstreamFetch.mock.calls[0][0]).toBe('https://relay.example.test/v1/responses')
     const requestBody = JSON.parse(String(upstreamFetch.mock.calls[0][1]?.body)) as Record<string, unknown>
+    expect(new Headers(upstreamFetch.mock.calls[0][1]?.headers).get('x-codex-turn-state')).toBeNull()
     expect(requestBody).toMatchObject({
       model: 'source-model',
       tools: [],
@@ -1382,6 +2208,7 @@ describe('GatewayServer', () => {
     expect(response.status).toBe(400)
     expect(credentialResolver).not.toHaveBeenCalled()
     expect(upstreamFetch).not.toHaveBeenCalled()
+
     expect(logs[0]).toMatchObject({ status: 'error', statusCode: 400, failureStage: 'body' })
   })
 
@@ -1678,6 +2505,495 @@ describe('GatewayServer', () => {
     expect(credentialResolver).not.toHaveBeenCalled()
     expect(upstreamFetch).not.toHaveBeenCalled()
     expect(logs[0]).toMatchObject({ status: 'error', statusCode: 422, failureStage: 'scheduler' })
+
+    const embeddedTrigger = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'source-model',
+        input: [
+          { type: 'compaction_trigger' },
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'must not bypass' }] }
+        ],
+        stream: true
+      })
+    })
+    expect(embeddedTrigger.status).toBe(422)
+    expect(await embeddedTrigger.text()).toContain('disable remote_compaction_v2')
+    expect(credentialResolver).not.toHaveBeenCalled()
+    expect(upstreamFetch).not.toHaveBeenCalled()
+  })
+
+  it('rejects only genuinely opaque compact history on legacy relay sources', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers[0] = {
+      ...gatewayConfig.providers[0],
+      sourceType: 'relay',
+      kind: 'openai-compatible',
+      protocol: 'openai-responses',
+      responsesCompactMode: 'legacy'
+    }
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    gatewayConfig.accounts[1].status = 'disabled'
+    gatewayConfig.pools[0].maxRetries = 0
+    const upstreamFetch = vi.fn(async () => new Response([
+      'event: response.completed',
+      'data: {"type":"response.completed","response":{"id":"resp_plaintext_compact","status":"completed","output":[]}}',
+      '',
+      ''
+    ].join('\n'), { status: 200, headers: { 'content-type': 'text/event-stream' } }))
+    const credentialResolver = vi.fn(() => 'relay-private')
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver,
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const opaque = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'source-model',
+        input: [{ type: 'compaction', encrypted_content: 'encrypted-history' }],
+        stream: true
+      })
+    })
+    expect(opaque.status).toBe(422)
+    const opaqueError = await opaque.text()
+    expect(opaqueError).toContain('configured to pass through encrypted')
+    expect(opaqueError).not.toContain('created it')
+    expect(credentialResolver).not.toHaveBeenCalled()
+    expect(upstreamFetch).not.toHaveBeenCalled()
+
+    const standaloneOpaque = await fetch(`http://127.0.0.1:${port}/v1/responses/compact`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'source-model',
+        input: [{ type: 'compaction', encrypted_content: 'encrypted-standalone-history' }]
+      })
+    })
+    expect(standaloneOpaque.status).toBe(422)
+    expect(await standaloneOpaque.text()).toContain('configured to pass through encrypted')
+    expect(credentialResolver).not.toHaveBeenCalled()
+    expect(upstreamFetch).not.toHaveBeenCalled()
+
+    const plaintext = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'source-model',
+        input: [
+          { type: 'compaction' },
+          { type: 'compaction_summary', encrypted_content: '' },
+          { type: 'context_compaction', encrypted_content: '   ' },
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'continue' }] }
+        ],
+        stream: true
+      })
+    })
+    expect(plaintext.status).toBe(200)
+    expect(await plaintext.text()).toContain('resp_plaintext_compact')
+    expect(credentialResolver).toHaveBeenCalledOnce()
+    expect(upstreamFetch).toHaveBeenCalledOnce()
+  })
+
+  it('allows opaque continuation but not compact creation on passthrough relay sources', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers[0] = {
+      ...gatewayConfig.providers[0],
+      sourceType: 'relay',
+      kind: 'openai-compatible',
+      baseUrl: 'https://relay.example.test/v1',
+      protocol: 'openai-responses',
+      responsesCompactMode: 'passthrough'
+    }
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    gatewayConfig.accounts[1].status = 'disabled'
+    gatewayConfig.pools[0].maxRetries = 0
+    const upstreamFetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      const requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>
+      if (requestBody.stream === false) {
+        return new Response(JSON.stringify({
+          id: 'resp_passthrough_fallback',
+          status: 'completed',
+          output: [{
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'Fallback summary for passthrough source.' }]
+          }]
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      return new Response([
+        'event: response.output_text.delta',
+        'data: {"type":"response.output_text.delta","delta":"continued through relay"}',
+        '',
+        'event: response.completed',
+        'data: {"type":"response.completed","response":{"id":"resp_passthrough","status":"completed","output":[]}}',
+        '',
+        ''
+      ].join('\n'), {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream', 'x-codex-turn-state': 'relay-turn-after' }
+      })
+    })
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'relay-private',
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const opaqueInput = [
+      { type: 'compaction', encrypted_content: 'encrypted-passthrough' },
+      { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'continue' }] }
+    ]
+    const followup = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer local-secret',
+        'content-type': 'application/json',
+        'x-codex-turn-state': 'relay-turn-before'
+      },
+      body: JSON.stringify({ model: 'source-model', input: opaqueInput, stream: true })
+    })
+    expect(followup.status).toBe(200)
+    expect(followup.headers.get('x-codex-turn-state')).toBe('relay-turn-after')
+    expect(await followup.text()).toContain('continued through relay')
+    expect(JSON.parse(String(upstreamFetch.mock.calls[0][1]?.body))).toMatchObject({ input: opaqueInput })
+    expect(new Headers(upstreamFetch.mock.calls[0][1]?.headers).get('x-codex-turn-state')).toBe('relay-turn-before')
+
+    const standalone = await fetch(`http://127.0.0.1:${port}/v1/responses/compact`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer local-secret',
+        'content-type': 'application/json',
+        'x-codex-turn-state': 'passthrough-compact-before'
+      },
+      body: JSON.stringify({
+        model: 'source-model',
+        input: [
+          { type: 'compaction', encrypted_content: 'encrypted-passthrough-standalone' },
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'compact' }] }
+        ]
+      })
+    })
+    expect(standalone.status).toBe(200)
+    expect(await standalone.text()).toContain('Fallback summary for passthrough source.')
+    expect(upstreamFetch.mock.calls[1][0]).toBe('https://relay.example.test/v1/responses')
+    expect(new Headers(upstreamFetch.mock.calls[1][1]?.headers).get('x-codex-turn-state')).toBe('passthrough-compact-before')
+
+    const createCompact = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'source-model', input: [{ type: 'compaction_trigger' }], stream: true })
+    })
+    expect(createCompact.status).toBe(422)
+    expect(await createCompact.text()).toContain('native OpenAI Responses compact support')
+    expect(upstreamFetch).toHaveBeenCalledTimes(2)
+  })
+
+  it('uses native compact creation and endpoint routing for upgraded relay sources', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers[0] = {
+      ...gatewayConfig.providers[0],
+      sourceType: 'relay',
+      kind: 'openai-compatible',
+      baseUrl: 'https://native-relay.example.test/v1',
+      protocol: 'openai-responses',
+      responsesCompactMode: 'native'
+    }
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    gatewayConfig.accounts[1].status = 'disabled'
+    gatewayConfig.pools[0].maxRetries = 0
+    const upstreamFetch = vi.fn(async (input: string | URL | Request) => {
+      if (String(input).endsWith('/responses/compact')) {
+        return new Response(JSON.stringify({
+          output: [{ type: 'compaction', encrypted_content: 'native-endpoint-encrypted' }]
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      return new Response([
+        'event: response.output_item.done',
+        'data: {"type":"response.output_item.done","item":{"id":"cmp_native_relay","type":"compaction","encrypted_content":"native-trigger-encrypted"}}',
+        '',
+        'event: response.completed',
+        'data: {"type":"response.completed","response":{"id":"resp_native_relay","status":"completed","output":[]}}',
+        '',
+        ''
+      ].join('\n'), { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    })
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'relay-private',
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const trigger = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'source-model', input: [{ type: 'compaction_trigger' }], stream: true })
+    })
+    expect(trigger.status).toBe(200)
+    expect(await trigger.text()).toContain('native-trigger-encrypted')
+
+    const standalone = await fetch(`http://127.0.0.1:${port}/v1/responses/compact`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'source-model',
+        input: [
+          { type: 'compaction', encrypted_content: 'encrypted-native-standalone' },
+          { type: 'message', role: 'user', content: [] }
+        ]
+      })
+    })
+    expect(standalone.status).toBe(200)
+    expect(await standalone.text()).toContain('native-endpoint-encrypted')
+    expect(upstreamFetch.mock.calls.map((call) => call[0])).toEqual([
+      'https://native-relay.example.test/v1/responses',
+      'https://native-relay.example.test/v1/responses/compact'
+    ])
+  })
+
+  it('filters legacy accounts out of mixed pools before standalone opaque compact routing', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers = [
+      {
+        ...gatewayConfig.providers[0],
+        id: 'legacy-relay',
+        sourceType: 'relay',
+        kind: 'openai-compatible',
+        baseUrl: 'https://legacy-relay.example.test/v1',
+        protocol: 'openai-responses',
+        responsesCompactMode: 'legacy'
+      },
+      {
+        ...gatewayConfig.providers[0],
+        id: 'native-relay',
+        sourceType: 'relay',
+        kind: 'openai-compatible',
+        baseUrl: 'https://native-relay.example.test/v1',
+        protocol: 'openai-responses',
+        responsesCompactMode: 'native'
+      }
+    ]
+    gatewayConfig.accounts = [
+      { ...gatewayConfig.accounts[0], providerId: 'legacy-relay', credentialType: 'api-key' },
+      { ...gatewayConfig.accounts[1], providerId: 'native-relay', credentialType: 'api-key' }
+    ]
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    gatewayConfig.pools[0].members = gatewayConfig.accounts.map((item) => ({ accountId: item.id, enabled: true }))
+    gatewayConfig.pools[0].maxRetries = 1
+    const selectedAccountIds: string[] = []
+    const upstreamFetch = vi.fn(async () => new Response(JSON.stringify({
+      output: [{ type: 'compaction', encrypted_content: 'mixed-native-result' }]
+    }), { status: 200, headers: { 'content-type': 'application/json' } }))
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: (selected) => {
+        selectedAccountIds.push(selected.id)
+        return 'relay-private'
+      },
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses/compact`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'source-model',
+        input: [{ type: 'compaction', encrypted_content: 'mixed-encrypted-history' }]
+      })
+    })
+    expect(response.status).toBe(200)
+    expect(await response.text()).toContain('mixed-native-result')
+    expect(selectedAccountIds).toEqual(['second'])
+    expect(upstreamFetch).toHaveBeenCalledOnce()
+    expect(upstreamFetch.mock.calls[0][0]).toBe('https://native-relay.example.test/v1/responses/compact')
+  })
+
+  it('does not leak Responses state headers from an empty-body failover attempt', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers[0] = {
+      ...gatewayConfig.providers[0],
+      sourceType: 'relay',
+      kind: 'openai-compatible',
+      protocol: 'openai-responses',
+      responsesCompactMode: 'passthrough'
+    }
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    gatewayConfig.pools[0].maxRetries = 1
+    gatewayConfig.accounts = gatewayConfig.accounts.map((item) => ({ ...item, credentialType: 'api-key' }))
+    const selectedAccountIds: string[] = []
+    const upstreamFetch = vi.fn(async () => {
+      if (upstreamFetch.mock.calls.length === 1) {
+        return new Response(null, {
+          status: 200,
+          headers: {
+            'content-type': 'text/event-stream',
+            'x-codex-stale-attempt': 'must-not-leak',
+            'x-codex-turn-state': 'stale-turn-state'
+          }
+        })
+      }
+      return new Response([
+        'event: response.output_text.delta',
+        'data: {"type":"response.output_text.delta","delta":"successful failover"}',
+        '',
+        'event: response.completed',
+        'data: {"type":"response.completed","response":{"id":"resp_header_failover","status":"completed","output":[]}}',
+        '',
+        ''
+      ].join('\n'), {
+        status: 200,
+        headers: {
+          'content-type': 'text/event-stream',
+          'x-codex-turn-state': 'successful-turn-state'
+        }
+      })
+    })
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: (selected) => {
+        selectedAccountIds.push(selected.id)
+        return 'relay-private'
+      },
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer local-secret',
+        'content-type': 'application/json',
+        'x-codex-turn-state': 'client-turn-state'
+      },
+      body: JSON.stringify({
+        model: 'source-model',
+        input: [
+          { type: 'compaction', encrypted_content: 'encrypted-header-history' },
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'continue' }] }
+        ],
+        stream: true
+      })
+    })
+    expect(response.status).toBe(200)
+    expect(response.headers.get('x-codex-turn-state')).toBe('successful-turn-state')
+    expect(response.headers.get('x-codex-stale-attempt')).toBeNull()
+    expect(await response.text()).toContain('successful failover')
+    expect(selectedAccountIds).toEqual(['first', 'second'])
+    expect(upstreamFetch).toHaveBeenCalledTimes(2)
+  })
+
+  it('cancels an oversized precommit noise stream before failover and keeps later requests usable', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers[0] = {
+      ...gatewayConfig.providers[0],
+      sourceType: 'relay',
+      kind: 'openai-compatible',
+      protocol: 'openai-responses',
+      responsesCompactMode: 'passthrough'
+    }
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    gatewayConfig.pools[0].maxRetries = 1
+    gatewayConfig.accounts = gatewayConfig.accounts.map((item) => ({ ...item, credentialType: 'api-key' }))
+    const selectedAccountIds: string[] = []
+    const upstreamCancel = vi.fn()
+    const noiseChunk = new TextEncoder().encode(`:${'n'.repeat(1024 * 1024)}\n\n`)
+    const successfulWire = [
+      'event: response.output_text.delta',
+      'data: {"type":"response.output_text.delta","delta":"usable after noisy failover"}',
+      '',
+      'event: response.completed',
+      'data: {"type":"response.completed","response":{"id":"resp_after_noise","status":"completed","output":[]}}',
+      '',
+      ''
+    ].join('\n')
+    const upstreamFetch = vi.fn(async () => {
+      if (upstreamFetch.mock.calls.length === 1) {
+        return new Response(new ReadableStream<Uint8Array>({
+          start(controller) {
+            // Comments are valid SSE transport noise but not semantic
+            // Responses events, so response metadata must remain uncommitted.
+            for (let index = 0; index < 11; index += 1) controller.enqueue(noiseChunk)
+          },
+          cancel() {
+            upstreamCancel()
+          }
+        }), {
+          status: 200,
+          headers: {
+            'content-type': 'text/event-stream',
+            'x-codex-stale-noise-source': 'must-not-leak'
+          }
+        })
+      }
+      return new Response(successfulWire, {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream', 'x-codex-turn-state': 'usable-turn-state' }
+      })
+    })
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: (selected) => {
+        selectedAccountIds.push(selected.id)
+        return 'relay-private'
+      },
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const sendOpaque = (sessionId: string): Promise<Response> => fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer local-secret',
+        'content-type': 'application/json',
+        'session-id': sessionId
+      },
+      body: JSON.stringify({
+        model: 'source-model',
+        input: [
+          { type: 'compaction', encrypted_content: 'encrypted-noise-history' },
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'continue' }] }
+        ],
+        stream: true
+      })
+    })
+
+    const failover = await sendOpaque('noise-failover-session')
+    expect(failover.status).toBe(200)
+    expect(failover.headers.get('x-codex-stale-noise-source')).toBeNull()
+    expect(failover.headers.get('x-codex-turn-state')).toBe('usable-turn-state')
+    expect(await failover.text()).toContain('usable after noisy failover')
+    expect(upstreamCancel).toHaveBeenCalledOnce()
+    expect(selectedAccountIds).toEqual(['first', 'second'])
+
+    const later = await sendOpaque('later-noise-session')
+    expect(later.status).toBe(200)
+    expect(await later.text()).toContain('usable after noisy failover')
+    expect(upstreamFetch).toHaveBeenCalledTimes(3)
   })
 
   it('buffers and validates V2 compact before failing over without exposing the invalid first stream', async () => {
@@ -2003,6 +3319,110 @@ describe('GatewayServer', () => {
     expect(gateway.getStatus().activeRequests).toBe(0)
     expect(gateway.getAccountInFlight().first).toBe(0)
   })
+
+  it('does not let Compact V2 lifecycle heartbeats hold a buffered request open', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port, { requestTimeoutSeconds: 1 })
+    gatewayConfig.providers[0] = {
+      ...gatewayConfig.providers[0], sourceType: 'oauth-system', kind: 'openai', protocol: 'openai-responses'
+    }
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    gatewayConfig.accounts[0] = {
+      ...gatewayConfig.accounts[0], credentialType: 'chatgpt-oauth', chatgptAccountId: 'acct-compact-stall'
+    }
+    gatewayConfig.accounts[1].status = 'disabled'
+    gatewayConfig.pools[0].maxRetries = 0
+    const logs: RequestLog[] = []
+    const upstreamFetch = vi.fn(async () => scheduledSseResponse([
+      {
+        atMs: 0,
+        data: 'event: response.created\ndata: {"type":"response.created","sequence_number":1,"response":{"id":"resp_compact_stall","status":"in_progress"}}\n\n'
+      },
+      { atMs: 200, data: ': compact-keep-alive\n\n' },
+      { atMs: 400, data: 'event: response.in_progress\ndata: {"type":"response.in_progress","sequence_number":2,"response":{"id":"resp_compact_stall","status":"in_progress"}}\n\n' },
+      { atMs: 600, data: 'event: heartbeat\ndata: {"type":"heartbeat"}\n\n' },
+      { atMs: 800, data: ': compact-keep-alive\n\n' }
+    ]))
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => ({
+        secret: 'oauth-compact-stall', kind: 'chatgpt-oauth' as const, accountId: 'acct-compact-stall'
+      }),
+      fetchImplementation: upstreamFetch as typeof fetch,
+      onLog: (log) => upsertLog(logs, log)
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'source-model', input: [{ type: 'compaction_trigger' }], stream: true })
+    })
+
+    expect(response.status).toBe(504)
+    expect(await response.text()).toContain('upstream_response_progress_timeout')
+    expect(logs[0]).toMatchObject({ status: 'error', statusCode: 504 })
+    expect(gateway.getStatus().activeRequests).toBe(0)
+    expect(gateway.getAccountInFlight().first).toBe(0)
+  }, 10_000)
+
+  it('keeps Compact V2 alive while reasoning and compaction output keep advancing', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port, { requestTimeoutSeconds: 1 })
+    gatewayConfig.providers[0] = {
+      ...gatewayConfig.providers[0], sourceType: 'oauth-system', kind: 'openai', protocol: 'openai-responses'
+    }
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    gatewayConfig.accounts[0] = {
+      ...gatewayConfig.accounts[0], credentialType: 'chatgpt-oauth', chatgptAccountId: 'acct-compact-progress'
+    }
+    gatewayConfig.accounts[1].status = 'disabled'
+    gatewayConfig.pools[0].maxRetries = 0
+    const upstreamFetch = vi.fn(async () => scheduledSseResponse([
+      {
+        atMs: 0,
+        data: 'event: response.created\ndata: {"type":"response.created","sequence_number":1,"response":{"id":"resp_compact_progress","status":"in_progress"}}\n\n'
+      },
+      {
+        atMs: 600,
+        data: 'event: response.reasoning_summary_text.delta\ndata: {"type":"response.reasoning_summary_text.delta","sequence_number":2,"delta":"compressing"}\n\n'
+      },
+      {
+        atMs: 1_200,
+        data: 'event: response.output_item.done\ndata: {"type":"response.output_item.done","sequence_number":3,"output_index":0,"item":{"id":"cmp_progress","type":"compaction","encrypted_content":"encrypted-progress"}}\n\n'
+      },
+      {
+        atMs: 1_800,
+        data: 'event: response.completed\ndata: {"type":"response.completed","sequence_number":4,"response":{"id":"resp_compact_progress","status":"completed","output":[]}}\n\n',
+        close: true
+      }
+    ]))
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => ({
+        secret: 'oauth-compact-progress', kind: 'chatgpt-oauth' as const, accountId: 'acct-compact-progress'
+      }),
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'source-model', input: [{ type: 'compaction_trigger' }], stream: true })
+    })
+    const wire = await response.text()
+
+    expect(response.status).toBe(200)
+    expect(wire).toContain('encrypted-progress')
+    expect(wire).toContain('response.completed')
+    expect(wire).not.toContain('upstream_response_progress_timeout')
+    expect(gateway.getStatus().successRequests).toBe(1)
+  }, 10_000)
 
   it('keeps Responses Lite and Search operations on one OAuth account and returns Search JSON directly', async () => {
     const port = await freePort()
@@ -2410,6 +3830,197 @@ describe('GatewayServer', () => {
     })
   })
 
+  it('records Anthropic cache creation usage as cache-write input tokens', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers[0] = {
+      ...gatewayConfig.providers[0],
+      kind: 'anthropic',
+      protocol: 'anthropic-messages'
+    }
+    gatewayConfig.pools[0] = {
+      ...gatewayConfig.pools[0],
+      protocol: 'anthropic-messages'
+    }
+    gatewayConfig.routes[0] = {
+      ...gatewayConfig.routes[0],
+      inboundProtocol: 'anthropic-messages'
+    }
+    gatewayConfig.accounts[1].status = 'disabled'
+    const logs: RequestLog[] = []
+    const upstreamFetch = vi.fn(async () => new Response(JSON.stringify({
+      id: 'message-cache-usage',
+      type: 'message',
+      role: 'assistant',
+      model: 'source-model',
+      content: [{ type: 'text', text: 'Done' }],
+      stop_reason: 'end_turn',
+      stop_sequence: null,
+      usage: {
+        input_tokens: 120,
+        output_tokens: 7,
+        cache_read_input_tokens: 30,
+        cache_creation_input_tokens: 40
+      }
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' }
+    }))
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'credential',
+      fetchImplementation: upstreamFetch as typeof fetch,
+      onLog: (log) => upsertLog(logs, log)
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'source-model',
+        max_tokens: 64,
+        messages: [{ role: 'user', content: 'Hello' }]
+      })
+    })
+
+    expect(response.status).toBe(200)
+    expect(await response.json()).toMatchObject({ id: 'message-cache-usage', type: 'message' })
+    expect(logs).toHaveLength(1)
+    expect(logs[0]).toMatchObject({
+      status: 'success',
+      inputTokens: 120,
+      outputTokens: 7,
+      cachedInputTokens: 30,
+      cacheWriteInputTokens: 40
+    })
+  })
+
+  it('blocks new scheduling at exhausted headers and ignores an older late success', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.accounts[0].maxConcurrency = 4
+    gatewayConfig.accounts[1].status = 'disabled'
+    gatewayConfig.pools[0].maxRetries = 0
+    const states: Array<{
+      accountId: string
+      status: string
+      cooldownUntil?: number
+      cooldownReason?: string
+    }> = []
+    let finishOlder = (): void => undefined
+    let finishExhausted = (): void => undefined
+    const completion = JSON.stringify({
+      id: 'completion',
+      model: 'source-model',
+      choices: [{ message: { role: 'assistant', content: 'Done' }, finish_reason: 'stop' }]
+    })
+    const controlledResponse = (
+      setFinish: (finish: () => void) => void,
+      headers: Record<string, string> = {}
+    ): Response => new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        setFinish(() => {
+          controller.enqueue(new TextEncoder().encode(completion))
+          controller.close()
+        })
+      }
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/json', ...headers }
+    })
+    const upstreamFetch = vi.fn()
+      .mockImplementationOnce(async () => controlledResponse((finish) => { finishOlder = finish }))
+      .mockImplementationOnce(async () => controlledResponse(
+        (finish) => { finishExhausted = finish },
+        {
+          'x-ratelimit-limit-requests': '100',
+          'x-ratelimit-remaining-requests': '0'
+        }
+      ))
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'credential',
+      fetchImplementation: upstreamFetch as typeof fetch,
+      now: () => timestamp,
+      onAccountState: (state) => states.push(state)
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const olderRequest = post(port)
+    await vi.waitFor(() => expect(upstreamFetch).toHaveBeenCalledTimes(1))
+    const exhaustedRequest = post(port)
+    await vi.waitFor(() => expect(upstreamFetch).toHaveBeenCalledTimes(2))
+    await vi.waitFor(() => expect(states.at(-1)).toMatchObject({
+      accountId: 'first',
+      status: 'cooldown',
+      cooldownUntil: timestamp + 30_000,
+      cooldownReason: 'quota'
+    }))
+
+    // The exhausted response body is still in flight. Header observation alone
+    // must already keep a third request away from the account.
+    expect((await post(port)).status).toBe(503)
+    expect(upstreamFetch).toHaveBeenCalledTimes(2)
+
+    finishExhausted()
+    expect((await exhaustedRequest).status).toBe(200)
+    finishOlder()
+    expect((await olderRequest).status).toBe(200)
+
+    // The older request selected revision 0 and completed after the quota
+    // transition. It must neither clear scheduler health nor emit active state.
+    expect(states.filter((state) => state.accountId === 'first').every((state) => state.status === 'cooldown')).toBe(true)
+    expect((await post(port)).status).toBe(503)
+    expect(upstreamFetch).toHaveBeenCalledTimes(2)
+  })
+
+  it('applies exhausted headers before a non-success body finishes', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.accounts[0].maxConcurrency = 4
+    gatewayConfig.accounts[1].status = 'disabled'
+    gatewayConfig.pools[0].maxRetries = 0
+    const states: Array<{ status: string; cooldownUntil?: number }> = []
+    let finishError = (): void => undefined
+    const upstreamFetch = vi.fn(async () => new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        finishError = () => {
+          controller.enqueue(new TextEncoder().encode(JSON.stringify({ error: { message: 'limited' } })))
+          controller.close()
+        }
+      }
+    }), {
+      status: 429,
+      headers: {
+        'content-type': 'application/json',
+        'x-ratelimit-remaining-requests': '0'
+      }
+    }))
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'credential',
+      fetchImplementation: upstreamFetch as typeof fetch,
+      now: () => timestamp,
+      onAccountState: (state) => states.push(state)
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const limitedRequest = post(port)
+    await vi.waitFor(() => expect(states.at(-1)).toMatchObject({
+      status: 'cooldown',
+      cooldownUntil: timestamp + 30_000
+    }))
+    expect((await post(port)).status).toBe(503)
+    expect(upstreamFetch).toHaveBeenCalledOnce()
+
+    finishError()
+    expect((await limitedRequest).status).toBe(429)
+  })
+
   it('uses the actual exhausted quota reset when it is later than Retry-After', async () => {
     const port = await freePort()
     const states: Array<{ accountId: string; status: string; cooldownUntil?: number; consecutiveFailures: number }> = []
@@ -2443,7 +4054,7 @@ describe('GatewayServer', () => {
     await gateway.start()
 
     expect((await post(port)).status).toBe(200)
-    expect(states[0]).toMatchObject({
+    expect(states.find((state) => state.accountId === 'first' && state.consecutiveFailures === 1)).toMatchObject({
       accountId: 'first',
       status: 'cooldown',
       cooldownUntil: timestamp + 604_800_000,
@@ -2679,7 +4290,8 @@ describe('GatewayServer', () => {
 
   it('passes through a same-protocol streaming response without buffering it as JSON', async () => {
     const port = await freePort()
-    const upstreamFetch = vi.fn(async () => new Response('data: {"delta":"one"}\n\ndata: [DONE]\n\n', {
+    const wire = 'data: {"choices":[{"index":0,"delta":{"content":"one"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
+    const upstreamFetch = vi.fn(async () => new Response(wire, {
       status: 200,
       headers: { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' }
     }))
@@ -2695,8 +4307,240 @@ describe('GatewayServer', () => {
     expect(response.status).toBe(200)
     expect(response.headers.get('content-type')).toBe('text/event-stream')
     expect(response.headers.get('cache-control')).toBe('no-cache')
-    expect(await response.text()).toBe('data: {"delta":"one"}\n\ndata: [DONE]\n\n')
+    expect(await response.text()).toBe(wire)
     expect(gateway.getStatus()).toMatchObject({ activeRequests: 0, successRequests: 1 })
+  })
+
+  it('preserves original same-protocol non-streaming JSON bytes', async () => {
+    const port = await freePort()
+    const original = '{\n  "id": "raw-response",\n  "choices": [ { "message": { "content": "Done" } } ]\n}\n'
+    const framed = new TextEncoder().encode(`prefix${original}suffix`)
+    const slicedPayload = framed.subarray('prefix'.length, framed.byteLength - 'suffix'.length)
+    const gateway = new GatewayServer({
+      config: config(port),
+      credentialResolver: () => 'credential',
+      fetchImplementation: vi.fn(async () => new Response(new ReadableStream<Uint8Array>({
+        start(controller) {
+          // Exercise a single Uint8Array chunk whose byteOffset is non-zero;
+          // the gateway must retain only this view and preserve its exact bytes.
+          controller.enqueue(slicedPayload)
+          controller.close()
+        }
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      })) as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await post(port)
+    expect(response.status).toBe(200)
+    expect(await response.text()).toBe(original)
+  })
+
+  it.each([
+    ['empty', null],
+    ['non-JSON', '<html>upstream proxy error</html>'],
+    ['non-object JSON', '["unexpected"]']
+  ] as const)('rejects a successful %s upstream body instead of reporting success', async (_label, upstreamBody) => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.accounts[1].status = 'disabled'
+    gatewayConfig.pools[0].maxRetries = 0
+    const logs: RequestLog[] = []
+    const states: Array<{ status: string }> = []
+    const upstreamFetch = vi.fn(async () => new Response(upstreamBody, {
+      status: 200,
+      headers: { 'content-type': 'application/json' }
+    }))
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'credential',
+      fetchImplementation: upstreamFetch as typeof fetch,
+      onLog: (log) => upsertLog(logs, log),
+      onAccountState: (state) => states.push(state)
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await post(port)
+    expect(response.status).toBe(502)
+    expect(await response.json()).toMatchObject({
+      error: { type: 'upstream_invalid_response' }
+    })
+    expect(upstreamFetch).toHaveBeenCalledOnce()
+    expect(states).not.toContainEqual(expect.objectContaining({ status: 'active' }))
+    expect(logs[0]).toMatchObject({ status: 'error', statusCode: 502 })
+    expect(gateway.getStatus()).toMatchObject({ activeRequests: 0, successRequests: 0 })
+  })
+
+  it('rejects a malformed successful search response without reporting account success', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers[0] = {
+      ...gatewayConfig.providers[0],
+      protocol: 'openai-responses'
+    }
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    gatewayConfig.accounts[1].status = 'disabled'
+    gatewayConfig.pools[0].maxRetries = 0
+    const states: Array<{ status: string }> = []
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'credential',
+      fetchImplementation: vi.fn(async () => new Response('not-json', {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      })) as typeof fetch,
+      onAccountState: (state) => states.push(state)
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/alpha/search`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({ id: 'search-session', model: 'source-model', query: 'Stone+' })
+    })
+    expect(response.status).toBe(502)
+    expect(await response.json()).toMatchObject({ error: { type: 'upstream_invalid_response' } })
+    expect(states).not.toContainEqual(expect.objectContaining({ status: 'active' }))
+    expect(gateway.getStatus()).toMatchObject({ activeRequests: 0, successRequests: 0 })
+  })
+
+  it('keeps a structured non-2xx upstream JSON error intact', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.accounts[1].status = 'disabled'
+    gatewayConfig.pools[0].maxRetries = 0
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'credential',
+      fetchImplementation: vi.fn(async () => new Response(JSON.stringify({
+        error: { message: 'upstream rate limited', code: 'rate_limit' }
+      }), {
+        status: 429,
+        headers: { 'content-type': 'application/json' }
+      })) as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await post(port)
+    expect(response.status).toBe(429)
+    expect(await response.json()).toEqual({
+      error: { message: 'upstream rate limited', code: 'rate_limit' }
+    })
+  })
+
+  it('does not let OAuth non-stream Responses heartbeats wait for the global request deadline', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port, { requestTimeoutSeconds: 10 })
+    gatewayConfig.providers[0] = {
+      ...gatewayConfig.providers[0], sourceType: 'oauth-system', kind: 'openai', protocol: 'openai-responses'
+    }
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    gatewayConfig.accounts[0] = {
+      ...gatewayConfig.accounts[0], credentialType: 'chatgpt-oauth', chatgptAccountId: 'acct-oauth-stall'
+    }
+    gatewayConfig.accounts[1].status = 'disabled'
+    gatewayConfig.pools[0].maxRetries = 0
+    const logs: RequestLog[] = []
+    const upstreamFetch = vi.fn(async () => scheduledSseResponse([
+      {
+        atMs: 0,
+        data: 'event: response.created\ndata: {"type":"response.created","sequence_number":1,"response":{"id":"resp_oauth_stall","model":"source-model","status":"in_progress","output":[]}}\n\n'
+      },
+      { atMs: 200, data: ': oauth-keep-alive\n\n' },
+      { atMs: 400, data: 'event: response.in_progress\ndata: {"type":"response.in_progress","sequence_number":2,"response":{"id":"resp_oauth_stall","status":"in_progress"}}\n\n' },
+      { atMs: 600, data: 'event: heartbeat\ndata: {"type":"heartbeat"}\n\n' },
+      { atMs: 800, data: ': oauth-keep-alive\n\n' }
+    ]))
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => ({
+        secret: 'oauth-stall-secret', kind: 'chatgpt-oauth' as const, accountId: 'acct-oauth-stall'
+      }),
+      responsesProgressIdleTimeoutMs: 1_000,
+      fetchImplementation: upstreamFetch as typeof fetch,
+      onLog: (log) => upsertLog(logs, log)
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'source-model', input: 'Reply', stream: false })
+    })
+
+    expect(response.status).toBe(504)
+    expect(await response.text()).toContain('upstream_response_progress_timeout')
+    expect(logs[0]).toMatchObject({ status: 'error', statusCode: 504 })
+    expect(gateway.getStatus().activeRequests).toBe(0)
+    expect(gateway.getAccountInFlight().first).toBe(0)
+  }, 10_000)
+
+  it('does not wait for an OAuth terminal stream cancel hook to settle', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port, { requestTimeoutSeconds: 10 })
+    gatewayConfig.providers[0] = {
+      ...gatewayConfig.providers[0],
+      sourceType: 'oauth-system',
+      kind: 'openai',
+      protocol: 'openai-responses'
+    }
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    gatewayConfig.pools[0].maxRetries = 0
+    gatewayConfig.accounts[0] = {
+      ...gatewayConfig.accounts[0],
+      credentialType: 'chatgpt-oauth',
+      chatgptAccountId: 'acct-first'
+    }
+    gatewayConfig.accounts[1].status = 'disabled'
+    let cancelCalled = false
+    const terminal = new TextEncoder().encode([
+      'event: response.completed',
+      'data: {"type":"response.completed","response":{"id":"resp_nonstream_terminal","model":"source-model","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Done"}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}',
+      '',
+      ''
+    ].join('\n'))
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => ({
+        secret: 'oauth-secret',
+        kind: 'chatgpt-oauth' as const,
+        accountId: 'acct-first'
+      }),
+      fetchImplementation: vi.fn(async () => new Response(new ReadableStream<Uint8Array>({
+        start(controller) { controller.enqueue(terminal) },
+        cancel() {
+          cancelCalled = true
+          return new Promise<void>(() => undefined)
+        }
+      }), { status: 200, headers: { 'content-type': 'text/event-stream' } })) as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const completed = fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'source-model', input: 'Reply', stream: false })
+    }).then(async (response) => ({ status: response.status, body: await response.text() }))
+    const result = await Promise.race([
+      completed,
+      new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error('cancel hook blocked completion')), 500))
+    ])
+
+    expect(result.status).toBe(200)
+    expect(result.body).toContain('resp_nonstream_terminal')
+    expect(cancelCalled).toBe(true)
+    expect(gateway.getAccountInFlight().first).toBe(0)
   })
 
   it('releases a completed Responses request even when the upstream transport stays open', async () => {
@@ -3064,6 +4908,164 @@ describe('GatewayServer', () => {
     })
   })
 
+  it('stops reading immediately after an explicit upstream stream error', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port, { requestTimeoutSeconds: 10 })
+    gatewayConfig.providers[0].protocol = 'openai-responses'
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    gatewayConfig.accounts[1].status = 'disabled'
+    gatewayConfig.pools[0].maxRetries = 0
+    const encoder = new TextEncoder()
+    const logs: RequestLog[] = []
+    let upstreamCancelled = false
+    let errorTimer: ReturnType<typeof setTimeout> | undefined
+    const upstreamFetch = vi.fn(async () => new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode(
+          'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_error_open","model":"source-model","status":"in_progress","output":[]}}\n\n'
+        ))
+        errorTimer = setTimeout(() => controller.enqueue(encoder.encode(
+          'event: error\ndata: {"type":"error","error":{"message":"upstream exploded","type":"server_error"}}\n\n'
+        )), 25)
+      },
+      cancel() {
+        upstreamCancelled = true
+        if (errorTimer) clearTimeout(errorTimer)
+        return new Promise<void>(() => undefined)
+      }
+    }), { status: 200, headers: { 'content-type': 'text/event-stream' } }))
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'credential',
+      fetchImplementation: upstreamFetch as typeof fetch,
+      onLog: (log) => upsertLog(logs, log)
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const startedAt = performance.now()
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'source-model', input: 'Reply', stream: true })
+    })
+    const wire = await response.text()
+    const elapsedMs = performance.now() - startedAt
+
+    expect(response.status).toBe(200)
+    expect(wire).toContain('upstream exploded')
+    expect(elapsedMs).toBeLessThan(1_000)
+    expect(upstreamCancelled).toBe(true)
+    expect(logs[0]).toMatchObject({
+      status: 'error',
+      statusCode: 502,
+      streamEndReason: 'explicit-error'
+    })
+    expect(gateway.getStatus().activeRequests).toBe(0)
+    expect(gateway.getAccountInFlight().first).toBe(0)
+  }, 10_000)
+
+  it('does not let Responses lifecycle heartbeats keep a stalled stream alive', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port, { requestTimeoutSeconds: 1 })
+    gatewayConfig.providers[0].protocol = 'openai-responses'
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    gatewayConfig.accounts[1].status = 'disabled'
+    gatewayConfig.pools[0].maxRetries = 0
+    const logs: RequestLog[] = []
+    const upstreamFetch = vi.fn(async () => scheduledSseResponse([
+      {
+        atMs: 0,
+        data: 'event: response.created\ndata: {"type":"response.created","sequence_number":1,"response":{"id":"resp_stalled","model":"source-model","status":"in_progress","output":[]}}\n\n'
+      },
+      { atMs: 200, data: ': keep-alive\n\n' },
+      { atMs: 400, data: 'event: response.in_progress\ndata: {"type":"response.in_progress","sequence_number":2,"response":{"id":"resp_stalled","status":"in_progress"}}\n\n' },
+      { atMs: 600, data: 'event: heartbeat\ndata: {"type":"heartbeat"}\n\n' },
+      { atMs: 800, data: ': keep-alive\n\n' },
+      {
+        atMs: 1_400,
+        data: 'event: response.completed\ndata: {"type":"response.completed","sequence_number":3,"response":{"id":"resp_stalled","status":"completed","output":[]}}\n\n',
+        close: true
+      }
+    ]))
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'credential',
+      fetchImplementation: upstreamFetch as typeof fetch,
+      onLog: (log) => upsertLog(logs, log)
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'source-model', input: 'Reply', stream: true })
+    })
+    const wire = await response.text()
+
+    expect(response.status).toBe(200)
+    expect(wire).toContain('upstream_response_progress_timeout')
+    expect(logs[0]).toMatchObject({
+      status: 'error',
+      statusCode: 504,
+      streamEndReason: 'stream-idle-timeout'
+    })
+    expect(gateway.getStatus().activeRequests).toBe(0)
+    expect(gateway.getAccountInFlight().first).toBe(0)
+  }, 10_000)
+
+  it('keeps a long Responses stream alive while reasoning and output keep advancing', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port, { requestTimeoutSeconds: 1 })
+    gatewayConfig.providers[0].protocol = 'openai-responses'
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    const logs: RequestLog[] = []
+    const upstreamFetch = vi.fn(async () => scheduledSseResponse([
+      {
+        atMs: 0,
+        data: 'event: response.created\ndata: {"type":"response.created","sequence_number":1,"response":{"id":"resp_progressing","model":"source-model","status":"in_progress","output":[]}}\n\n'
+      },
+      {
+        atMs: 600,
+        data: 'event: response.reasoning_summary_text.delta\ndata: {"type":"response.reasoning_summary_text.delta","sequence_number":2,"delta":"checking"}\n\n'
+      },
+      {
+        atMs: 1_200,
+        data: 'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","sequence_number":3,"response_id":"resp_progressing","output_index":0,"content_index":0,"delta":"done"}\n\n'
+      },
+      {
+        atMs: 1_800,
+        data: 'event: response.completed\ndata: {"type":"response.completed","sequence_number":4,"response":{"id":"resp_progressing","model":"source-model","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}\n\n',
+        close: true
+      }
+    ]))
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'credential',
+      fetchImplementation: upstreamFetch as typeof fetch,
+      onLog: (log) => upsertLog(logs, log)
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'source-model', input: 'Reply', stream: true })
+    })
+    const wire = await response.text()
+
+    expect(response.status).toBe(200)
+    expect(wire).toContain('response.reasoning_summary_text.delta')
+    expect(wire).toContain('response.completed')
+    expect(wire).not.toContain('upstream_response_progress_timeout')
+    expect(logs[0]).toMatchObject({ status: 'success', statusCode: 200 })
+  }, 10_000)
+
   it('emits a terminal Responses error after an upstream idle timeout', async () => {
     const port = await freePort()
     const gatewayConfig = config(port, { requestTimeoutSeconds: 1 })
@@ -3118,7 +5120,9 @@ describe('GatewayServer', () => {
     let pullCount = 0
     const upstreamFetch = vi.fn(async () => new Response(new ReadableStream<Uint8Array>({
       start(controller) {
-        controller.enqueue(encoder.encode('data: {"delta":"first"}\n\n'))
+        controller.enqueue(encoder.encode(
+          'data: {"choices":[{"index":0,"delta":{"content":"first"},"finish_reason":null}]}\n\n'
+        ))
       },
       async pull(controller) {
         pullCount += 1
@@ -3157,6 +5161,77 @@ describe('GatewayServer', () => {
     expect(new TextDecoder().decode(remaining.value)).toContain('[DONE]')
     await reader!.read()
   })
+
+  it.each([
+    {
+      label: 'same-protocol',
+      inboundProtocol: 'openai-chat' as const,
+      path: '/v1/chat/completions',
+      body: { model: 'source-model', messages: [{ role: 'user', content: 'Reply' }], stream: true }
+    },
+    {
+      label: 'converted',
+      inboundProtocol: 'openai-responses' as const,
+      path: '/v1/responses',
+      body: { model: 'source-model', input: 'Reply', stream: true }
+    }
+  ])('interrupts a blocked $label stream reader when the client disconnects', async ({ inboundProtocol, path, body }) => {
+    const port = await freePort()
+    const gatewayConfig = config(port, { requestTimeoutSeconds: 10 })
+    gatewayConfig.routes[0].inboundProtocol = inboundProtocol
+    gatewayConfig.accounts[1].status = 'disabled'
+    gatewayConfig.pools[0].maxRetries = 0
+    const logs: RequestLog[] = []
+    const encoder = new TextEncoder()
+    const pendingRead = new Promise<ReadableStreamReadResult<Uint8Array>>(() => undefined)
+    const reader = {
+      read: vi.fn()
+        .mockResolvedValueOnce({
+          done: false,
+          value: encoder.encode(
+            'data: {"id":"chat-abort","model":"source-model","choices":[{"index":0,"delta":{"content":"started"},"finish_reason":null}]}\n\n'
+          )
+        })
+        .mockImplementation(() => pendingRead),
+      cancel: vi.fn(() => new Promise<void>(() => undefined)),
+      releaseLock: vi.fn()
+    } as unknown as ReadableStreamDefaultReader<Uint8Array>
+    const upstreamResponse = new Response(null, {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream' }
+    })
+    Object.defineProperty(upstreamResponse, 'body', {
+      configurable: true,
+      value: { getReader: () => reader }
+    })
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'credential',
+      fetchImplementation: vi.fn(async () => upstreamResponse) as typeof fetch,
+      onLog: (log) => upsertLog(logs, log)
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const controller = new AbortController()
+    const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: controller.signal
+    })
+    await vi.waitFor(() => expect(reader.read).toHaveBeenCalledTimes(2))
+    const abortedAt = performance.now()
+    controller.abort()
+    await response.text().catch(() => undefined)
+    await vi.waitFor(() => expect(logs[0]?.status).toBe('error'))
+
+    expect(performance.now() - abortedAt).toBeLessThan(1_500)
+    expect(reader.cancel).toHaveBeenCalled()
+    expect(logs[0]).toMatchObject({ statusCode: 499, failureStage: 'client' })
+    expect(gateway.getStatus().activeRequests).toBe(0)
+    expect(gateway.getAccountInFlight().first).toBe(0)
+  }, 10_000)
 
   it('keeps a same-protocol stream alive beyond the request deadline while chunks keep arriving', async () => {
     const port = await freePort()
@@ -3500,6 +5575,95 @@ describe('GatewayServer', () => {
     expect(upstreamFetch).toHaveBeenCalledTimes(2)
   }, 10_000)
 
+  it('fails over before committing a converted stream with no recognized protocol event', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.routes[0].inboundProtocol = 'anthropic-messages'
+    const upstreamFetch = vi.fn()
+      .mockResolvedValueOnce(new Response('data: {}\n\n', {
+        status: 200, headers: { 'content-type': 'text/event-stream' }
+      }))
+      .mockResolvedValueOnce(new Response([
+        'data: {"id":"chat-converted-valid","model":"source-model","choices":[{"index":0,"delta":{"content":"Recovered"},"finish_reason":"stop"}]}',
+        '', 'data: [DONE]', '', ''
+      ].join('\n'), { status: 200, headers: { 'content-type': 'text/event-stream' } }))
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: (selected) => `key-${selected.id}`,
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'source-model', stream: true, max_tokens: 64,
+        messages: [{ role: 'user', content: 'Hello' }]
+      })
+    })
+    expect(response.status).toBe(200)
+    expect(await response.text()).toContain('Recovered')
+    expect(upstreamFetch).toHaveBeenCalledTimes(2)
+  })
+
+  it('fails over before committing a same-protocol stream with no recognized protocol event', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    const recoveredWire = [
+      'data: {"id":"chat-native-valid","model":"source-model","choices":[{"index":0,"delta":{"content":"Recovered"},"finish_reason":"stop"}]}',
+      '', 'data: [DONE]', '', ''
+    ].join('\n')
+    const upstreamFetch = vi.fn()
+      .mockResolvedValueOnce(new Response('data: {"type":"heartbeat"}\n\n', {
+        status: 200, headers: { 'content-type': 'text/event-stream' }
+      }))
+      .mockResolvedValueOnce(new Response(recoveredWire, {
+        status: 200, headers: { 'content-type': 'text/event-stream' }
+      }))
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: (selected) => `key-${selected.id}`,
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await post(port, 'local-secret', { stream: true })
+    expect(response.status).toBe(200)
+    expect(await response.text()).toBe(recoveredWire)
+    expect(upstreamFetch).toHaveBeenCalledTimes(2)
+  })
+
+  it('rejects a lossy built-in-tool conversion before acquiring an upstream account', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    const credentialResolver = vi.fn(() => 'credential')
+    const upstreamFetch = vi.fn()
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver,
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'source-model', input: 'hello',
+        tools: [{ type: 'web_search_preview' }], tool_choice: 'auto'
+      })
+    })
+    expect(response.status).toBe(422)
+    expect(await response.text()).toContain('web_search_preview')
+    expect(credentialResolver).not.toHaveBeenCalled()
+    expect(upstreamFetch).not.toHaveBeenCalled()
+  })
+
   it('optionally hedges slow response headers through another hot transport lane', async () => {
     const port = await freePort()
     const gatewayConfig = config(port)
@@ -3524,6 +5688,174 @@ describe('GatewayServer', () => {
     expect(response.status).toBe(200)
     expect(await response.text()).toContain('Fast')
     expect(upstreamFetch).toHaveBeenCalledTimes(2)
+  })
+
+  it('hedges a response whose headers arrive quickly but first body stalls', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.pools[0].hedgedRequests = true
+    gatewayConfig.pools[0].hedgeDelayMs = 250
+    const encoder = new TextEncoder()
+    let primaryTimer: ReturnType<typeof setTimeout> | undefined
+    const primaryStream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        primaryTimer = setTimeout(() => {
+          try {
+            controller.enqueue(encoder.encode('data: {"id":"chat-slow-body","model":"source-model","choices":[{"index":0,"delta":{"content":"Slow"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'))
+            controller.close()
+          } catch { /* The hedge cancelled the losing body. */ }
+        }, 800)
+      },
+      cancel() {
+        if (primaryTimer) clearTimeout(primaryTimer)
+      }
+    })
+    const fastStream = 'data: {"id":"chat-fast-body","model":"source-model","choices":[{"index":0,"delta":{"content":"Fast body"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
+    const upstreamFetch = vi.fn()
+      .mockResolvedValueOnce(new Response(primaryStream, { status: 200, headers: { 'content-type': 'text/event-stream' } }))
+      .mockResolvedValueOnce(new Response(fastStream, { status: 200, headers: { 'content-type': 'text/event-stream' } }))
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'credential',
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await post(port, 'local-secret', { stream: true })
+    expect(response.status).toBe(200)
+    expect(await response.text()).toContain('Fast body')
+    expect(upstreamFetch).toHaveBeenCalledTimes(2)
+  })
+
+  it('bounds first-body waits for both successful hedge lanes', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port, { requestTimeoutSeconds: 10 })
+    gatewayConfig.pools[0].hedgedRequests = true
+    gatewayConfig.pools[0].hedgeDelayMs = 250
+    gatewayConfig.pools[0].firstBodyTimeoutMs = 1_000
+    gatewayConfig.pools[0].maxRetries = 0
+    let cancelled = 0
+    const upstreamFetch = vi.fn(async () => new Response(new ReadableStream<Uint8Array>({
+      cancel() {
+        cancelled += 1
+      }
+    }), { status: 200, headers: { 'content-type': 'text/event-stream' } }))
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'credential',
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const startedAt = performance.now()
+    const response = await post(port, 'local-secret', { stream: true })
+    const elapsedMs = performance.now() - startedAt
+
+    expect(response.status).toBeGreaterThanOrEqual(500)
+    expect(elapsedMs).toBeLessThan(3_000)
+    expect(upstreamFetch).toHaveBeenCalledTimes(2)
+    await vi.waitFor(() => expect(cancelled).toBe(2))
+    expect(gateway.getStatus().activeRequests).toBe(0)
+    expect(gateway.getAccountInFlight().first).toBe(0)
+  }, 10_000)
+
+  it('does not let a fast hedge error cancel a primary with successful headers', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.pools[0].hedgedRequests = true
+    gatewayConfig.pools[0].hedgeDelayMs = 250
+    gatewayConfig.pools[0].maxRetries = 0
+    const encoder = new TextEncoder()
+    let primaryTimer: ReturnType<typeof setTimeout> | undefined
+    const primaryStream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        primaryTimer = setTimeout(() => {
+          try {
+            controller.enqueue(encoder.encode('data: {"id":"chat-valid-primary","model":"source-model","choices":[{"index":0,"delta":{"content":"Primary survived"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'))
+            controller.close()
+          } catch { /* A failing implementation may cancel the valid primary. */ }
+        }, 1_200)
+      },
+      cancel() {
+        if (primaryTimer) clearTimeout(primaryTimer)
+      }
+    })
+    const upstreamFetch = vi.fn()
+      .mockResolvedValueOnce(new Response(primaryStream, {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' }
+      }))
+      .mockResolvedValueOnce(new Response('temporarily unavailable', { status: 503 }))
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'credential',
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await post(port, 'local-secret', { stream: true })
+    expect(response.status).toBe(200)
+    expect(await response.text()).toContain('Primary survived')
+    expect(upstreamFetch).toHaveBeenCalledTimes(2)
+  })
+
+  it.each([
+    ['empty-body', ''],
+    ['null-body', null]
+  ])('does not let a %s successful stream beat a valid hedge', async (_label, emptyBody) => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.pools[0].hedgedRequests = true
+    gatewayConfig.pools[0].hedgeDelayMs = 250
+    gatewayConfig.pools[0].maxRetries = 0
+    const validStream = 'data: {"id":"chat-valid-hedge","model":"source-model","choices":[{"index":0,"delta":{"content":"Valid hedge"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
+    const upstreamFetch = vi.fn()
+      .mockResolvedValueOnce(new Response(emptyBody, {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' }
+      }))
+      .mockResolvedValueOnce(new Response(validStream, {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' }
+      }))
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'credential',
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await post(port, 'local-secret', { stream: true })
+    expect(response.status).toBe(200)
+    expect(await response.text()).toContain('Valid hedge')
+    expect(upstreamFetch).toHaveBeenCalledTimes(2)
+  })
+
+  it('does not hedge after the primary has produced its first body chunk', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.pools[0].hedgedRequests = true
+    gatewayConfig.pools[0].hedgeDelayMs = 250
+    const stream = 'data: {"id":"chat-ready","model":"source-model","choices":[{"index":0,"delta":{"content":"Ready"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
+    const upstreamFetch = vi.fn(async () => new Response(stream, {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream' }
+    }))
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'credential',
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await post(port, 'local-secret', { stream: true })
+    expect(await response.text()).toContain('Ready')
+    expect(upstreamFetch).toHaveBeenCalledOnce()
   })
 
   it('evicts only the unproven sticky session when the client disconnects before first output', async () => {
@@ -3566,7 +5898,9 @@ describe('GatewayServer', () => {
       headers: {
         authorization: 'Bearer local-secret',
         'content-type': 'application/json',
-        'x-stone-session-id': 'cancelled-thread'
+        'x-stone-session-id': 'cancelled-thread',
+        'x-codex-parent-thread-id': 'parent-thread',
+        'x-openai-subagent': 'false'
       },
       body: JSON.stringify({ model: 'source-model', messages: [{ role: 'user', content: 'Hello' }] }),
       signal: controller.signal
@@ -3593,7 +5927,16 @@ describe('GatewayServer', () => {
     expect(upstreamFetch).toHaveBeenCalledTimes(2)
   })
 
-  it('records an intentional subagent cancellation as a successful 499 without evicting the sticky session', async () => {
+  it.each([
+    ['explicit marker', { 'x-openai-subagent': 'thread_spawn' }],
+    ['parent thread fallback', { 'x-codex-parent-thread-id': 'parent-thread' }],
+    ['turn metadata fallback', {
+      'x-codex-turn-metadata': JSON.stringify({
+        parent_thread_id: 'parent-thread',
+        subagent_kind: 'thread_spawn'
+      })
+    }]
+  ])('records an intentional subagent cancellation as a successful 499 without evicting the sticky session (%s)', async (_label, subagentHeaders) => {
     const port = await freePort()
     const gatewayConfig = config(port)
     gatewayConfig.pools[0].stickySessions = true
@@ -3634,7 +5977,7 @@ describe('GatewayServer', () => {
         authorization: 'Bearer local-secret',
         'content-type': 'application/json',
         'x-stone-session-id': 'subagent-thread',
-        'x-openai-subagent': 'true'
+        ...subagentHeaders
       },
       body: JSON.stringify({ model: 'source-model', messages: [{ role: 'user', content: 'Hello' }] }),
       signal: controller.signal
@@ -3769,7 +6112,7 @@ describe('GatewayServer', () => {
     expect(states).toEqual([])
   })
 
-  it('records 499 when Codex closes after receiving a completed assistant item without a Responses terminal', async () => {
+  it('records a streamed subagent cancellation as a successful 499 after a completed assistant item', async () => {
     const port = await freePort()
     const gatewayConfig = config(port)
     gatewayConfig.providers[0].protocol = 'openai-responses'
@@ -3813,7 +6156,11 @@ describe('GatewayServer', () => {
 
     const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
       method: 'POST',
-      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      headers: {
+        authorization: 'Bearer local-secret',
+        'content-type': 'application/json',
+        'x-codex-parent-thread-id': 'parent-thread'
+      },
       body: JSON.stringify({ model: 'source-model', input: 'Reply', stream: true })
     })
     const reader = response.body?.getReader()
@@ -3822,9 +6169,9 @@ describe('GatewayServer', () => {
     expect(new TextDecoder().decode(first.value)).toContain('response.output_item.done')
     await reader!.cancel()
 
-    await vi.waitFor(() => expect(logs[0]?.status).toBe('error'))
+    await vi.waitFor(() => expect(logs[0]?.status).toBe('success'))
     expect(logs[0]).toMatchObject({
-      status: 'error',
+      status: 'success',
       statusCode: 499,
       streamEndReason: 'client-closed',
       streamLastEventType: 'response.output_item.done'
@@ -3945,6 +6292,7 @@ describe('GatewayServer', () => {
     gatewayConfig.pools[0].maxRetries = 0
     let releaseTitles!: () => void
     const titleGate = new Promise<void>((resolve) => { releaseTitles = resolve })
+    const logs: RequestLog[] = []
     const upstreamFetch = vi.fn(async () => new Response(JSON.stringify({
       id: 'chat-capacity',
       model: 'source-model',
@@ -3954,6 +6302,7 @@ describe('GatewayServer', () => {
       config: gatewayConfig,
       credentialResolver: () => 'credential',
       fetchImplementation: upstreamFetch as typeof fetch,
+      onLog: (log) => upsertLog(logs, log),
       conversationTitleResolver: async () => {
         await titleGate
         return 'Resolved later'
@@ -3967,9 +6316,13 @@ describe('GatewayServer', () => {
 
     expect(first.status).toBe(200)
     expect(second.status).toBe(200)
+    await Promise.all([first.text(), second.text()])
+    await vi.waitFor(() => expect(gateway.getStatus().activeRequests).toBe(0))
+    expect(gateway.getAccountInFlight().first).toBe(0)
+    expect(logs.every((log) => log.status === 'success')).toBe(true)
     expect(upstreamFetch).toHaveBeenCalledTimes(2)
     releaseTitles()
-    await Promise.all([first.text(), second.text()])
+    await vi.waitFor(() => expect(logs.every((log) => log.conversationName === 'Resolved later')).toBe(true))
   })
 
   it('preserves a same-protocol stream error while marking the account request as failed', async () => {
@@ -4140,6 +6493,58 @@ describe('GatewayServer', () => {
     gateway.updateConfig(gatewayConfig)
     expect((await post(port)).status).toBe(200)
     expect(upstreamFetch).toHaveBeenCalledOnce()
+  })
+
+  it('rebuilds provider, pool, account, and route indexes on a hot config handoff', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.accounts[1].status = 'disabled'
+    gatewayConfig.pools[0].maxRetries = 0
+    const selected: string[] = []
+    const upstreamUrls: string[] = []
+    const upstreamFetch = vi.fn(async (input: string | URL | Request) => {
+      upstreamUrls.push(String(input))
+      return new Response(JSON.stringify({
+        id: 'hot-index',
+        choices: [{ message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }]
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    })
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: (account) => {
+        selected.push(account.id)
+        return 'credential'
+      },
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    gatewayConfig.providers[0] = {
+      ...gatewayConfig.providers[0],
+      id: 'provider-v2',
+      baseUrl: 'https://new.example.test/v2'
+    }
+    gatewayConfig.accounts[0] = { ...gatewayConfig.accounts[0], status: 'disabled' }
+    gatewayConfig.accounts[1] = {
+      ...gatewayConfig.accounts[1],
+      providerId: 'provider-v2',
+      status: 'active'
+    }
+    gatewayConfig.pools[0] = {
+      ...gatewayConfig.pools[0],
+      members: [{ accountId: 'second', enabled: true }]
+    }
+    gatewayConfig.routes[0] = { ...gatewayConfig.routes[0], localToken: 'hot-secret' }
+    // Deliberately submit the same object identity after in-place edits.
+    gateway.updateConfig(gatewayConfig)
+
+    expect((await post(port)).status).toBe(401)
+    const response = await post(port, 'hot-secret')
+    expect(response.status).toBe(200)
+    await response.text()
+    expect(selected).toEqual(['second'])
+    expect(upstreamUrls[0]).toContain('new.example.test/v2')
   })
 
   it('checks account allowlists against the mapped upstream model', async () => {

@@ -1,26 +1,49 @@
-import { app, BrowserWindow, Menu, nativeImage, net, powerMonitor, session, shell, Tray } from 'electron'
+import { app, BrowserWindow, Menu, nativeImage, net, powerMonitor, safeStorage, session, shell, Tray } from 'electron'
 import electronUpdater from 'electron-updater'
 import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { GatewayServer, type GatewayConfig } from './gateway'
+import { GatewayServer, type GatewayConfig, type ResolvedGatewayCredential } from './gateway'
 import { ClientConfigService } from './client-config'
 import { rebuildGatewayConnections, registerGatewayApi, warmGatewayConnections } from './ipc/gateway-api'
 import { registerUpdateApi } from './ipc/update-api'
 import { AppStore } from './store/app-store'
 import { DatabaseBackupService } from './backup'
 import { resolveChatGptCredential } from './providers'
-import { OutboundTransportManager, resolveEffectiveProxy } from './proxy'
+import { resolveChatGptAgentIdentity } from './auth'
+import {
+  createOutboundReloadCoordinator,
+  OutboundTransportManager,
+  resolveEffectiveProxy,
+  type OutboundReloadCoordinator,
+} from './proxy'
 import { UpdateService } from './update'
 import { FrpTunnelService } from './tunnel'
 import { registerTunnelApi } from './ipc/tunnel-api'
 import {
   CodexConversationTitleResolver,
   CodexRepairAndRestartService,
+  CodexSessionManager,
+  CodexSessionIndexCleanupService,
   CodexSessionRepairService,
   WindowsChatGptDesktopController,
 } from './codex'
 import { registerCodexSessionRepairApi } from './ipc/session-repair-api'
+import { ClientInstanceManager } from './client-instances'
+import { registerClientInstanceApi } from './ipc/client-instance-api'
+import { registerCodexSessionManagerApi } from './ipc/session-manager-api'
+import { registerPersistentTaskApi } from './ipc/persistent-task-api'
 import { BROWSER_SESSION_PARTITION, BrowserImportQueue } from './browser-import-queue'
+import { LocalEventServer } from './events'
+import { SystemLifecycleCoordinator } from './system-lifecycle'
+import { registerBuiltInProxyApi } from './ipc/built-in-proxy-api'
+import { SingBoxService } from './proxy/built-in/sing-box-service'
+import { BuiltInProxyOrchestrator } from './proxy/built-in/orchestrator'
+import { createChromiumMixedSessionGeneration } from './proxy/built-in/chromium-route-session'
+import { FileSystemProxyLeaseRecoveryStore } from './proxy/built-in/lease-recovery'
+import { SystemProxyLease } from './proxy/built-in/system-proxy-lease'
+import { createSystemProxyPlatformAdapter } from './proxy/built-in/platform-adapters'
+import { ElevatedSingBoxTunAdapter } from './proxy/built-in/tun-sidecar-adapter'
+import { TunController } from './proxy/built-in/tun-controller'
 
 const { autoUpdater } = electronUpdater
 const WINDOWS_APP_USER_MODEL_ID = 'io.github.m4rkzzz.stoneplus'
@@ -32,18 +55,28 @@ let store: AppStore
 let gateway: GatewayServer
 let backups: DatabaseBackupService<import('./store/types').PersistedState>
 let outboundTransport: OutboundTransportManager
+let outboundReloadCoordinator: OutboundReloadCoordinator
+let builtInProxy: BuiltInProxyOrchestrator
+let singBoxService: SingBoxService
 let updateService: UpdateService
 let tunnelService: FrpTunnelService
 let codexConversationTitles: CodexConversationTitleResolver
 let codexSessionRepair: CodexSessionRepairService
+let codexSessionIndexCleanup: CodexSessionIndexCleanupService
 let codexRepairAndRestart: CodexRepairAndRestartService
+let codexSessionManager: CodexSessionManager
+let clientInstanceManager: ClientInstanceManager
 let browserImportQueue: BrowserImportQueue
+let localEventServer: LocalEventServer
+let systemLifecycle: SystemLifecycleCoordinator
 let isQuitting = false
 let storeClosed = false
 let shutdownForUpdate = false
 let shutdownPromise: Promise<void> | undefined
 let flushGatewayApiState: (() => Promise<void>) | undefined
+let disposeBuiltInProxyApi: (() => void) | undefined
 let focusMainWindowOnReady = false
+let builtInChromiumGeneration = 0
 
 if (process.env.STONE_USER_DATA_DIR) {
   app.setPath('userData', resolve(process.env.STONE_USER_DATA_DIR))
@@ -64,29 +97,132 @@ async function bootstrap(): Promise<void> {
   store = new AppStore(app.getPath('userData'))
   await store.initialize()
   const gatewaySettings = store.getSnapshot().gateway
+  const singBoxRuntimeRoot = app.isPackaged
+    ? join(process.resourcesPath, 'sing-box')
+    : resolve('build', 'sing-box')
+  const systemProxyLease = new SystemProxyLease({
+    adapter: createSystemProxyPlatformAdapter(),
+    recoveryStore: new FileSystemProxyLeaseRecoveryStore(
+      join(app.getPath('userData'), 'built-in-proxy', 'system-proxy-lease.json')
+    )
+  })
+  // A stale OS proxy lease must be repaired before Chromium reloads PAC/system
+  // state or any background service gets a chance to issue an outbound request.
+  // initialize() retries and publishes a fail-closed error if this first repair
+  // attempt cannot complete.
+  await systemProxyLease.recoverStaleLease().catch((error) => {
+    console.error('[built-in-proxy] Could not repair the previous system-proxy lease before startup', error)
+  })
+  singBoxService = new SingBoxService({
+    userDataPath: app.getPath('userData'),
+    runtimeRoot: singBoxRuntimeRoot,
+    manifestPath: join(singBoxRuntimeRoot, 'runtime-manifest.json')
+  })
+  const tunController = new TunController({
+    adapter: new ElevatedSingBoxTunAdapter({
+      userDataPath: app.getPath('userData'),
+      runtimeRoot: singBoxRuntimeRoot,
+      manifestPath: join(singBoxRuntimeRoot, 'runtime-manifest.json')
+    })
+  })
   outboundTransport = new OutboundTransportManager({
     outboundNetworkMode: gatewaySettings.outboundNetworkMode ?? 'direct',
     localGatewayPort: gatewaySettings.port,
+    // System mode must execute through Chromium's network stack rather than
+    // reimplementing its PAC/WinINET decision with an Undici proxy. This keeps
+    // Windows trust, integrated proxy auth, bypass and failover semantics.
+    systemProxyFetch: ((input, init) => session.defaultSession.fetch(
+      input instanceof URL ? input.toString() : input,
+      { ...init, bypassCustomProtocolHandlers: true }
+    )) as typeof fetch,
+    reloadSystemProxy: () => session.defaultSession.forceReloadProxyConfig(),
     resolveSystemProxy: (url) => session.defaultSession.resolveProxy(url),
     onSystemProxyWarning: (message) => console.warn(`[system-proxy] ${message}`)
   })
+  if (gatewaySettings.outboundNetworkMode === 'system') {
+    await outboundTransport.reloadSystemProxyConfiguration().catch((error) => {
+      console.warn('[system-proxy] Could not refresh the saved system proxy configuration at startup', error)
+    })
+  }
+  outboundReloadCoordinator = createOutboundReloadCoordinator(store, outboundTransport)
+  builtInProxy = new BuiltInProxyOrchestrator({
+    store,
+    core: singBoxService,
+    routes: outboundTransport.builtInRoutes,
+    systemProxyLease,
+    tunController,
+    createChromiumGeneration: (mixedEndpoint) => createChromiumMixedSessionGeneration({
+      mixedEndpoint,
+      // Non-persistent, per-generation partitions keep a node/rule switch from
+      // changing the proxy underneath responses still draining on the old route.
+      createSession: () => session.fromPartition(
+        `stone-built-in-proxy-${process.pid}-${++builtInChromiumGeneration}`,
+        { cache: false }
+      )
+    }),
+    subscriptionFetch: outboundTransport.fetchFor(undefined),
+    localGateway: { host: '127.0.0.1', port: gatewaySettings.port, transport: 'tcp' },
+    reloadExternalSystemProxy: () => outboundReloadCoordinator.reloadExternalSystemRoute(),
+    detectBuiltInTargets: async (targets) => {
+      await outboundTransport.builtInRoutes.warm(targets)
+      return { targets: [...targets] }
+    },
+    coordinateBuiltInRouteChange: outboundReloadCoordinator.builtInRouteChangeCoordinator(),
+    scheduleBuiltInRouteChange: (detector) => outboundReloadCoordinator.scheduleBuiltInRouteChange(detector)
+  })
   codexConversationTitles = new CodexConversationTitleResolver(app.getPath('home'))
   codexSessionRepair = new CodexSessionRepairService({ codexHome: join(app.getPath('home'), '.codex') })
+  codexSessionIndexCleanup = new CodexSessionIndexCleanupService({ codexHome: join(app.getPath('home'), '.codex') })
+  codexSessionManager = new CodexSessionManager({ codexHome: join(app.getPath('home'), '.codex') })
   codexRepairAndRestart = new CodexRepairAndRestartService(
     codexSessionRepair,
-    new WindowsChatGptDesktopController(),
+    new WindowsChatGptDesktopController({
+      shouldDisableCodexMicro: () => store.getRuntimeGatewaySettings().disableCodexMicro === true,
+    }),
+    codexSessionIndexCleanup,
   )
   await store.refreshRequestConversationTitles((conversationId) => codexConversationTitles.resolve(conversationId))
   backups = new DatabaseBackupService({
     userDataPath: app.getPath('userData'),
     store: store.getStateRepository(),
-    automaticRetention: store.getSnapshot().gateway.backupRetention ?? 10
+    automaticRetention: store.getSnapshot().gateway.backupRetention ?? 10,
+    portableSecretVault: safeStorage,
   })
   await backups.initialize()
   if (store.getSnapshot().gateway.automaticBackups !== false) backups.startAutomaticBackups()
   gateway = new GatewayServer({
     config: toGatewayConfig(store),
     credentialResolver: async (account, fetchImplementation = fetch, signal) => {
+      if (account.credentialType === 'chatgpt-agent-identity') {
+        const serialized = store.getCredential(account.credentialId)
+        if (!serialized) return undefined
+        const resolve = async (
+          source: string,
+          forceTaskRegistration = false,
+          expectedTaskId?: string
+        ): Promise<ResolvedGatewayCredential> => {
+          const access = await resolveChatGptAgentIdentity(
+            source,
+            (rotated, expectedSource) => store.updateChatGptAgentIdentityCredential(account.id, rotated, expectedSource),
+            fetchImplementation,
+            { signal, forceTaskRegistration, expectedTaskId }
+          )
+          return {
+            secret: access.authorization,
+            kind: 'chatgpt-agent-identity' as const,
+            accountId: access.bundle.accountId,
+            fedramp: access.bundle.fedramp,
+            recoverInvalidTask: async () => {
+              // Re-read after initial registration so compare-and-swap task
+              // persistence never overwrites a newer import.
+              const latest = store.getCredential(account.credentialId)
+              if (!latest) throw new Error('Agent Identity credential is unavailable.')
+              return await resolve(latest, true, access.bundle.taskId)
+            }
+          }
+        }
+        return await resolve(serialized)
+      }
       if (account.credentialType === 'chatgpt-oauth') {
         const serialized = store.getCredential(account.credentialId)
         if (!serialized) return undefined
@@ -102,17 +238,74 @@ async function bootstrap(): Promise<void> {
       const secret = store.getCredential(account.credentialId)
       return secret ? { secret, kind: 'api-key' as const } : undefined
     },
-    outboundFetchResolver: (account, pool) => {
-      const proxy = resolveEffectiveProxy(account, pool, store.getRuntimeProxies())
-      return outboundTransport.fetchFor(proxy, proxy ? store.getProxyPassword(proxy.id) : undefined)
+    outboundFetchResolver: (account, pool, proxies) => {
+      const proxy = resolveEffectiveProxy(account, pool, proxies)
+      if (!proxy) return outboundTransport.fetchFor(undefined)
+      const cached = outboundTransport.fetchForCached(proxy)
+      if (cached) return cached
+      return outboundTransport.fetchFor(proxy, proxy.hasPassword ? store.getProxyPassword(proxy.id) : undefined)
     },
     conversationTitleResolver: (conversationId) => codexConversationTitles.resolve(conversationId)
   })
+  localEventServer = new LocalEventServer({ userDataPath: app.getPath('userData') })
+  try {
+    await localEventServer.start()
+    gateway.onLog((log) => localEventServer.publish('request.log', log))
+    gateway.onAccountState((state) => localEventServer.publish('account.state', state))
+    gateway.onRuntimeState((state) => {
+      localEventServer.publish('gateway.runtime', state)
+      if (state.gatewayStatus) localEventServer.publish('gateway.status', gateway.getStatus())
+    })
+  } catch (error) {
+    // The event stream is an optional local integration surface. A port or
+    // filesystem failure must never prevent the gateway itself from starting.
+    console.warn('Stone+ local event stream is unavailable', error)
+  }
   const clientConfigHome = process.env.STONE_CLIENT_CONFIG_HOME
   const clientConfig = new ClientConfigService({
     homeDir: clientConfigHome ? resolve(clientConfigHome) : app.getPath('home'),
     platform: process.platform
   })
+  clientInstanceManager = new ClientInstanceManager({
+    store: store.getStateRepository(),
+    resolveBinding: (instance) => {
+      const snapshot = store.getSnapshot()
+      const route = instance.routeId
+        ? snapshot.routes.find((candidate) => candidate.id === instance.routeId)
+        : snapshot.routes.find((candidate) => candidate.client === instance.client && candidate.enabled)
+      if (!route) throw new Error(instance.routeId ? 'The bound client route no longer exists.' : 'No enabled client route is available.')
+      if (!route.enabled) throw new Error('The bound client route is disabled.')
+      if (route.client !== instance.client) throw new Error('The bound route does not match this client type.')
+      if (instance.profileId) {
+        const profile = snapshot.clientProfiles.find((candidate) => candidate.id === instance.profileId)
+        if (!profile || profile.client !== instance.client) throw new Error('The bound client profile is unavailable.')
+        if (profile.directory && resolve(profile.directory) !== resolve(instance.configDirectory)) {
+          throw new Error('The bound client profile uses a different configuration directory. Update this instance before starting it.')
+        }
+      }
+      const host = snapshot.gateway.host.includes(':') ? `[${snapshot.gateway.host}]` : snapshot.gateway.host
+      const base = `http://${host}:${snapshot.gateway.port}`
+      if (instance.client === 'codex') return { env: { OPENAI_BASE_URL: `${base}/v1`, OPENAI_API_KEY: route.localToken } }
+      if (instance.client === 'claude') return { env: { ANTHROPIC_BASE_URL: base, ANTHROPIC_AUTH_TOKEN: route.localToken } }
+      return { env: { GOOGLE_GEMINI_BASE_URL: base, GEMINI_API_KEY: route.localToken } }
+    }
+  })
+  const initializedInstances = clientInstanceManager.initialize()
+  const instanceSnapshot = store.getSnapshot()
+  const profiles = instanceSnapshot.clientProfiles
+  for (const instance of initializedInstances) {
+    const routeId = instance.routeId
+      ?? instanceSnapshot.routes.find((candidate) => candidate.client === instance.client && candidate.enabled)?.id
+    const profile = instance.profileId
+      ? profiles.find((candidate) => candidate.id === instance.profileId && candidate.client === instance.client)
+      : undefined
+    const profileId = profile && (!profile.directory || resolve(profile.directory) === resolve(instance.configDirectory))
+      ? profile.id
+      : undefined
+    if (routeId !== instance.routeId || profileId !== instance.profileId) {
+      await clientInstanceManager.save({ ...instance, routeId, profileId })
+    }
+  }
 
   updateService = new UpdateService({
     currentVersion: app.getVersion(),
@@ -159,11 +352,31 @@ async function bootstrap(): Promise<void> {
     })
   })
 
-  flushGatewayApiState = registerGatewayApi(store, gateway, clientConfig, outboundTransport, backups, updateTrayMenu, browserImportQueue)
-  powerMonitor.on('resume', () => {
-    void rebuildGatewayConnections(store, outboundTransport).catch(() => undefined)
+  flushGatewayApiState = registerGatewayApi(
+    store, gateway, clientConfig, outboundTransport, backups,
+    updateTrayMenu, browserImportQueue, undefined, localEventServer, outboundReloadCoordinator
+  )
+  disposeBuiltInProxyApi = registerBuiltInProxyApi(builtInProxy, builtInProxy)
+  await builtInProxy.initialize().catch((error) => {
+    // Built-in startup failures are renderer-visible and deliberately do not
+    // prevent the local gateway UI from opening. Previously activated routes
+    // have already moved to the coordinator's fail-closed generation.
+    console.error('[built-in-proxy] Automatic initialization failed', error)
   })
-  registerCodexSessionRepairApi(codexSessionRepair, codexRepairAndRestart)
+  systemLifecycle = new SystemLifecycleCoordinator({
+    rebuildConnections: () => rebuildGatewayConnections(store, outboundTransport),
+    isOnline: () => net.isOnline()
+  })
+  powerMonitor.on('suspend', () => systemLifecycle.onSuspend())
+  powerMonitor.on('resume', () => systemLifecycle.onResume())
+  systemLifecycle.start()
+  registerCodexSessionRepairApi(codexSessionRepair, codexRepairAndRestart, {
+    clientConfig,
+    clientProfiles: () => store.getSnapshot().clientProfiles,
+  }, codexSessionIndexCleanup)
+  registerClientInstanceApi(clientInstanceManager, store)
+  registerCodexSessionManagerApi(codexSessionManager)
+  registerPersistentTaskApi(store.getPersistentTaskRunner())
   registerUpdateApi(updateService)
   registerTunnelApi(tunnelService)
   createWindow()
@@ -415,22 +628,69 @@ function shutdownServices(): Promise<void> {
   if (storeClosed) return Promise.resolve()
   if (shutdownPromise) return shutdownPromise
   shutdownPromise = (async () => {
-    try {
+    // Every service gets its own best-effort shutdown step. In particular, a
+    // failed gateway stop must not skip pending-state flushes, backup cleanup,
+    // transport teardown, or the durable store close. The store is
+    // intentionally the final step because most preceding services can still
+    // have state to checkpoint while they are closing.
+    await shutdownStep('update service', () => {
       if (!shutdownForUpdate && updateService) updateService.close()
+    })
+    await shutdownStep('managed client instances', async () => {
+      if (clientInstanceManager) await clientInstanceManager.stopAll()
+    })
+    await shutdownStep('Codex repair service', async () => {
       if (codexRepairAndRestart) await codexRepairAndRestart.close()
+    })
+    await shutdownStep('tunnel service', async () => {
       if (tunnelService) await tunnelService.close()
+    })
+    await shutdownStep('system lifecycle coordinator', async () => {
+      if (systemLifecycle) await systemLifecycle.close()
+    })
+    await shutdownStep('gateway', async () => {
       if (gateway) await gateway.stop({ force: true })
+    })
+    await shutdownStep('gateway state flush', async () => {
       if (flushGatewayApiState) await flushGatewayApiState()
+    })
+    await shutdownStep('built-in proxy IPC', () => {
+      disposeBuiltInProxyApi?.()
+      disposeBuiltInProxyApi = undefined
+    })
+    await shutdownStep('built-in proxy', async () => {
+      if (builtInProxy) await builtInProxy.close()
+    })
+    await shutdownStep('outbound reload coordinator', async () => {
+      if (outboundReloadCoordinator) await outboundReloadCoordinator.close()
+    })
+    await shutdownStep('database backup service', async () => {
       if (backups) await backups.close()
+    })
+    await shutdownStep('outbound transport', async () => {
       if (outboundTransport) await outboundTransport.close()
+    })
+    await shutdownStep('conversation title resolver', () => {
       if (codexConversationTitles) codexConversationTitles.close()
+    })
+    await shutdownStep('browser import queue', async () => {
       if (browserImportQueue) await browserImportQueue.close()
+    })
+    await shutdownStep('local event server', async () => {
+      if (localEventServer) await localEventServer.close()
+    })
+    await shutdownStep('application store', async () => {
       if (store) await store.close()
-    } catch (error: unknown) {
-      console.error('Stone+ could not finish graceful shutdown', error)
-    } finally {
-      storeClosed = true
-    }
+    })
+    storeClosed = true
   })()
   return shutdownPromise
+}
+
+async function shutdownStep(name: string, operation: () => void | Promise<void>): Promise<void> {
+  try {
+    await operation()
+  } catch (error: unknown) {
+    console.error(`Stone+ could not close ${name} during graceful shutdown`, error)
+  }
 }

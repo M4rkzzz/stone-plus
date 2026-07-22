@@ -48,6 +48,7 @@ import type {
 import type { ActionRunner } from '../App'
 import { normalizeAggregateRelayMembers, toggleAggregateRelayMember } from '../aggregate-relay-members'
 import { providerBrandIcon } from '../brand-icons'
+import { BUILT_IN_PROXY_BINDING_NOTICE, useBuiltInProxyInterlock } from '../built-in-proxy-interlocks'
 import {
   localizeBackendError,
   localizeBackendMessage,
@@ -58,6 +59,16 @@ import {
 } from '../backend-message'
 import { useI18n } from '../i18n'
 import { setupPoolDisplayName } from '../system-generated-text'
+import { PersistentTaskCenter } from '../persistent-task-center'
+import {
+  effectiveResponsesCompactMode,
+  officialOpenAiUsesNativeCompact,
+  relayCanConfigureResponsesCompact,
+  responsesCompactModeCopy,
+  responsesCompactModeForSave,
+  responsesCompactModes,
+  type ResponsesCompactMode,
+} from '../responses-compact-mode'
 import {
   AccountStatusBadge,
   Badge,
@@ -313,6 +324,7 @@ function emptyApiSource(sourceType: 'official-api' | 'relay'): ApiSourceDraft {
     kind: sourceType === 'official-api' ? 'openai' : 'openai-compatible',
     baseUrl: sourceType === 'official-api' ? official.baseUrl : 'https://',
     protocol: sourceType === 'official-api' ? official.protocol : 'openai-chat',
+    responsesCompactMode: sourceType === 'relay' ? 'legacy' : undefined,
     credential: '',
     modelsText: '',
     defaultModel: '',
@@ -333,6 +345,7 @@ function emptyAggregateRelay(): AggregateRelayDraft {
     stickyTtlMinutes: 30,
     maxRetries: 2,
     proxyId: '',
+    quotaProtection: undefined,
   }
 }
 
@@ -347,6 +360,7 @@ function makeAccountDraft(providerId = ''): AccountDraft {
     modelPolicy: 'all',
     modelAllowlist: [],
     proxyId: '',
+    quotaProtection: undefined,
   }
 }
 
@@ -354,11 +368,13 @@ function ApiSourceForm({
   draft,
   setDraft,
   proxies,
+  proxyInterlocked,
   errors,
 }: {
   draft: ApiSourceDraft
   setDraft: (value: ApiSourceDraft) => void
   proxies: PublicProxyDefinition[]
+  proxyInterlocked: boolean
   errors: Record<string, string>
 }) {
   const { t } = useI18n()
@@ -366,6 +382,8 @@ function ApiSourceForm({
   const availableKinds: ProviderKind[] = draft.sourceType === 'official-api'
     ? ['openai', 'anthropic', 'google']
     : ['openai-compatible', 'anthropic-compatible', 'custom']
+  const compactMode = effectiveResponsesCompactMode(draft.responsesCompactMode)
+  const compactCopy = responsesCompactModeCopy[compactMode]
   return (
     <div className="form-grid">
       <label className="field field--full">
@@ -379,11 +397,15 @@ function ApiSourceForm({
           const kind = event.target.value as ProviderKind
           const supported = protocolsByKind[kind]
           const official = kind === 'openai' || kind === 'anthropic' || kind === 'google' ? officialSourceDefaults[kind] : undefined
+          const protocol = official?.protocol ?? (supported.includes(draft.protocol) ? draft.protocol : supported[0])
           setDraft({
             ...draft,
             kind,
-            protocol: official?.protocol ?? (supported.includes(draft.protocol) ? draft.protocol : supported[0]),
+            protocol,
             baseUrl: official?.baseUrl ?? draft.baseUrl,
+            responsesCompactMode: relayCanConfigureResponsesCompact(draft.sourceType, protocol)
+              ? effectiveResponsesCompactMode(draft.responsesCompactMode)
+              : undefined,
           })
         }}>
           {availableKinds.map((kind) => <option value={kind} key={kind}>{t(providerKindLabels[kind], providerKindLabelsEn[kind])}</option>)}
@@ -391,10 +413,29 @@ function ApiSourceForm({
       </label>
       <label className="field">
         <span>{t('上游协议', 'Upstream protocol')}</span>
-        <select value={draft.protocol} onChange={(event) => setDraft({ ...draft, protocol: event.target.value as Protocol })}>
+        <select value={draft.protocol} onChange={(event) => {
+          const protocol = event.target.value as Protocol
+          setDraft({
+            ...draft,
+            protocol,
+            responsesCompactMode: relayCanConfigureResponsesCompact(draft.sourceType, protocol)
+              ? effectiveResponsesCompactMode(draft.responsesCompactMode)
+              : undefined,
+          })
+        }}>
           {availableProtocols.map((protocol) => <option value={protocol} key={protocol}>{protocolLabels[protocol]}</option>)}
         </select>
       </label>
+      {relayCanConfigureResponsesCompact(draft.sourceType, draft.protocol) && <label className="field field--full">
+        <span className="field-label-with-help">{t('Responses Compact 能力', 'Responses compact capability')}<InfoTip text={t(compactCopy.helpZh, compactCopy.helpEn)} /></span>
+        <select value={compactMode} onChange={(event) => setDraft({ ...draft, responsesCompactMode: event.target.value as ResponsesCompactMode })}>
+          {responsesCompactModes.map((mode) => <option value={mode} key={mode}>{t(responsesCompactModeCopy[mode].labelZh, responsesCompactModeCopy[mode].labelEn)}</option>)}
+        </select>
+      </label>}
+      {officialOpenAiUsesNativeCompact(draft.sourceType, draft.kind, draft.protocol) && <div className="form-context field--full">
+        <ShieldCheck size={16} />
+        <span>{t('官方 OpenAI 自动使用完整原生 Compact', 'Official OpenAI automatically uses full native compact')}<InfoTip text={t('该能力由 Stone+ 按官方 Responses 协议自动管理，包括 compact 请求和后续 opaque 历史，无需手动配置。', 'Stone+ manages this automatically using the official Responses protocol, including compact requests and subsequent opaque history. No manual setting is needed.')} /></span>
+      </div>}
       <label className="field field--full">
         <span className="field-label-with-help">{t('基础地址', 'Base URL')}{draft.sourceType === 'official-api' && <InfoTip text={t('官方 API 地址由 Stone+ 锁定，避免误接到第三方中转端点。', 'Stone+ locks official API URLs to prevent accidental routing through a third-party relay.')} />}</span>
         <input className="mono" disabled={draft.sourceType === 'official-api'} value={draft.baseUrl} onChange={(event) => setDraft({ ...draft, baseUrl: event.target.value })} placeholder="https://api.example.com/v1" />
@@ -416,7 +457,7 @@ function ApiSourceForm({
       <label className="field"><span className="field-label-with-help">{t('优先级', 'Priority')}<InfoTip text={t('数值越小越优先，仅在优先级调度或故障转移时决定先后顺序。', 'Lower values have higher priority and determine order only for priority scheduling or failover.')} /></span><input type="number" min={1} max={999} value={draft.priority} onChange={(event) => setDraft({ ...draft, priority: Number(event.target.value) })} /></label>
       <label className="field"><span className="field-label-with-help">{t('调度权重', 'Scheduling weight')}<InfoTip text={t('数值越大，被加权策略分配到请求的比例越高。', 'Higher values receive a larger share of requests under weighted strategies.')} /></span><input type="number" min={1} max={100} value={draft.weight} onChange={(event) => setDraft({ ...draft, weight: Number(event.target.value) })} /></label>
       <label className="field"><span className="field-label-with-help">{t('最大并发', 'Maximum concurrency')}<InfoTip text={t('限制该来源同时处理的请求数，达到上限后会等待或选择其他来源。', 'Limits simultaneous requests for this source. At the limit, requests wait or use another source.')} /></span><input type="number" min={1} max={100} value={draft.maxConcurrency} onChange={(event) => setDraft({ ...draft, maxConcurrency: Number(event.target.value) })} /></label>
-      <label className="field"><span>{t('出口代理', 'Exit proxy')}</span><select value={draft.proxyId ?? ''} onChange={(event) => setDraft({ ...draft, proxyId: event.target.value })}><option value="">{t('直连', 'Direct')}</option>{proxies.map((proxy) => <option key={proxy.id} value={proxy.id}>{proxy.name} · {proxy.protocol.toUpperCase()} · {proxy.host}:{proxy.port}</option>)}</select></label>
+      <label className="field"><span>{t('代理', 'Proxy')}</span><select value={draft.proxyId ?? ''} disabled={proxyInterlocked} onChange={(event) => setDraft({ ...draft, proxyId: event.target.value })}><option value="">{t('直连', 'Direct')}</option>{proxies.map((proxy) => <option key={proxy.id} value={proxy.id}>{proxy.name} · {proxy.protocol.toUpperCase()} · {proxy.host}:{proxy.port}</option>)}</select>{proxyInterlocked && <small>{t(BUILT_IN_PROXY_BINDING_NOTICE.zh, BUILT_IN_PROXY_BINDING_NOTICE.en)}</small>}</label>
     </div>
   )
 }
@@ -426,6 +467,7 @@ function AccountForm({
   setDraft,
   providers,
   proxies,
+  proxyInterlocked,
   account,
   editing,
   oauthAccount,
@@ -439,6 +481,7 @@ function AccountForm({
   setDraft: (value: AccountDraft) => void
   providers: ProviderDefinition[]
   proxies: PublicProxyDefinition[]
+  proxyInterlocked: boolean
   account?: PublicAccount
   editing: boolean
   oauthAccount: boolean
@@ -484,11 +527,12 @@ function AccountForm({
         <input type="number" min={1} max={999} value={draft.priority} onChange={(event) => setDraft({ ...draft, priority: Number(event.target.value) })} />
       </label>
       <label className="field field--full">
-        <span className="field-label-with-help">{t('账号出口代理', 'Account exit proxy')}<InfoTip text={t('账号专属代理优先于号池默认代理，独立检测未设置时使用直连。', 'An account-specific proxy takes precedence over the pool default. Standalone checks use a direct connection when none is set.')} /></span>
-        <select value={draft.proxyId ?? ''} onChange={(event) => setDraft({ ...draft, proxyId: event.target.value })}>
+        <span className="field-label-with-help">{t('账号代理', 'Account proxy')}<InfoTip text={t('账号专属代理优先于号池默认代理，独立检测未设置时使用直连。', 'An account-specific proxy takes precedence over the pool default. Standalone checks use a direct connection when none is set.')} /></span>
+        <select value={draft.proxyId ?? ''} disabled={proxyInterlocked} onChange={(event) => setDraft({ ...draft, proxyId: event.target.value })}>
           <option value="">{t('使用号池默认（独立检测时直连）', 'Use pool default (direct for standalone checks)')}</option>
           {proxies.map((proxy) => <option key={proxy.id} value={proxy.id}>{proxy.name} · {proxy.protocol.toUpperCase()} · {proxy.host}:{proxy.port}</option>)}
         </select>
+        {proxyInterlocked && <small>{t(BUILT_IN_PROXY_BINDING_NOTICE.zh, BUILT_IN_PROXY_BINDING_NOTICE.en)}</small>}
       </label>
       <label className="field">
         <span className="field-label-with-help">{t('调度权重', 'Scheduling weight')}<InfoTip text={t('数值越大，被加权策略分配到请求的比例越高。', 'Higher values receive a larger share of requests under weighted strategies.')} /></span>
@@ -498,6 +542,13 @@ function AccountForm({
         <span className="field-label-with-help">{t('最大并发', 'Maximum concurrency')}<InfoTip text={t('限制该账号同时处理的请求数，达到上限后会等待或切换账号。', 'Limits simultaneous requests for this account. At the limit, requests wait or switch accounts.')} /></span>
         <input type="number" min={1} max={100} value={draft.maxConcurrency} onChange={(event) => setDraft({ ...draft, maxConcurrency: Number(event.target.value) })} />
       </label>
+      {oauthAccount && <div className="field field--full inline-settings"><div><strong>{t('账号额度保护线', 'Account quota reserve guard')}<InfoTip text={t('达到保留额度后不再为新请求选择该账号。', 'Stop selecting this account for new requests when its reserve is reached.')} /></strong></div><button className={`toggle ${draft.quotaProtection ? 'toggle--on' : ''}`} type="button" role="switch" aria-checked={Boolean(draft.quotaProtection)} onClick={() => setDraft({ ...draft, quotaProtection: draft.quotaProtection ? undefined : { fiveHourRemainingPercent: 10, sevenDayRemainingPercent: 10, unavailableBehavior: 'allow', staleAfterMinutes: 15 } })}><span /></button></div>}
+      {oauthAccount && draft.quotaProtection && <>
+        <label className="field"><span>{t('5 小时最低保留（%）', '5-hour reserve (%)')}</span><input type="number" min={0} max={100} value={draft.quotaProtection.fiveHourRemainingPercent ?? ''} onChange={(event) => setDraft({ ...draft, quotaProtection: { ...draft.quotaProtection!, fiveHourRemainingPercent: event.target.value === '' ? undefined : Number(event.target.value) } })} /></label>
+        <label className="field"><span>{t('周额度最低保留（%）', 'Weekly reserve (%)')}</span><input type="number" min={0} max={100} value={draft.quotaProtection.sevenDayRemainingPercent ?? ''} onChange={(event) => setDraft({ ...draft, quotaProtection: { ...draft.quotaProtection!, sevenDayRemainingPercent: event.target.value === '' ? undefined : Number(event.target.value) } })} /></label>
+        <label className="field"><span>{t('额度未知或过期', 'Unknown or stale quota')}</span><select value={draft.quotaProtection.unavailableBehavior ?? 'allow'} onChange={(event) => setDraft({ ...draft, quotaProtection: { ...draft.quotaProtection!, unavailableBehavior: event.target.value as 'allow' | 'block' } })}><option value="allow">{t('继续调度', 'Continue scheduling')}</option><option value="block">{t('保守停用', 'Block conservatively')}</option></select></label>
+        <label className="field"><span>{t('快照有效期（分钟）', 'Snapshot validity (minutes)')}</span><input type="number" min={1} max={10080} value={draft.quotaProtection.staleAfterMinutes ?? ''} onChange={(event) => setDraft({ ...draft, quotaProtection: { ...draft.quotaProtection!, staleAfterMinutes: event.target.value === '' ? undefined : Number(event.target.value) } })} /></label>
+      </>}
       {selectedProvider && <div className="form-context field--full"><Server size={16} /><span>{protocolLabels[selectedProvider.protocol]}</span><code>{selectedProvider.baseUrl}</code></div>}
       <div className="field field--full">
         <ModelPolicyEditor
@@ -535,6 +586,7 @@ export function ProvidersView({
   busyKeys: Set<string>
 }) {
   const { t, language, locale } = useI18n()
+  const builtInProxyInterlocked = useBuiltInProxyInterlock(snapshot, api)
   const [tab, setTab] = useState<'accounts' | 'official' | 'relays'>('accounts')
   const [providerModal, setProviderModal] = useState(false)
   const [accountModal, setAccountModal] = useState(false)
@@ -604,7 +656,8 @@ export function ProvidersView({
   const editingAccount = accountDraft.id ? snapshot.accounts.find((account) => account.id === accountDraft.id) : undefined
   const accountModelsBusy = Boolean(accountDraft.id && busyKeys.has(`refresh-account-models-${accountDraft.id}`))
   const oauthAccounts = useMemo(
-    () => snapshot.accounts.filter((account) => account.credentialType === 'chatgpt-oauth'),
+    () => snapshot.accounts.filter((account) => account.credentialType === 'chatgpt-oauth'
+      || account.credentialType === 'chatgpt-agent-identity'),
     [snapshot.accounts]
   )
   const tagById = useMemo(() => new Map(snapshot.accountTags.map((tag) => [tag.id, tag])), [snapshot.accountTags])
@@ -752,7 +805,9 @@ export function ProvidersView({
   }, [tagById, tagFilter])
 
   const openProvider = (sourceType: 'official-api' | 'relay', provider?: ProviderDefinition) => {
-    const account = provider ? snapshot.accounts.find((candidate) => candidate.providerId === provider.id && candidate.credentialType !== 'chatgpt-oauth') : undefined
+    const account = provider ? snapshot.accounts.find((candidate) => candidate.providerId === provider.id
+      && candidate.credentialType !== 'chatgpt-oauth'
+      && candidate.credentialType !== 'chatgpt-agent-identity') : undefined
     setProviderDraft(provider ? {
       id: provider.id,
       name: provider.name,
@@ -760,6 +815,11 @@ export function ProvidersView({
       kind: provider.kind,
       baseUrl: provider.baseUrl,
       protocol: provider.protocol,
+      responsesCompactMode: provider.sourceType === 'relay' && provider.protocol === 'openai-responses'
+        ? effectiveResponsesCompactMode(provider.responsesCompactMode)
+        : undefined,
+      capabilityProfile: provider.capabilityProfile,
+      modelCatalog: provider.modelCatalog,
       credential: '',
       modelsText: provider.models.join('\n'),
       defaultModel: account?.modelAllowlist[0] ?? provider.models[0] ?? '',
@@ -791,6 +851,7 @@ export function ProvidersView({
       stickySessions: pool.stickySessions,
       stickyTtlMinutes: pool.stickyTtlMinutes,
       maxRetries: pool.maxRetries,
+      quotaProtection: pool.quotaProtection ? { ...pool.quotaProtection } : undefined,
       proxyId: pool.proxyId ?? '',
     } : emptyAggregateRelay())
     setErrors({})
@@ -843,6 +904,7 @@ export function ProvidersView({
       modelPolicy: account.modelPolicy,
       modelAllowlist: [...account.modelAllowlist],
       proxyId: account.proxyId ?? '',
+      quotaProtection: account.quotaProtection ? { ...account.quotaProtection } : undefined,
     } : makeAccountDraft(snapshot.providers[0]?.id))
     setErrors({})
     setAccountModal(true)
@@ -877,7 +939,9 @@ export function ProvidersView({
     setErrors(nextErrors)
     if (Object.keys(nextErrors).length) return
     const sourceAccount = providerDraft.id
-      ? snapshot.accounts.find((account) => account.providerId === providerDraft.id && account.credentialType !== 'chatgpt-oauth')
+      ? snapshot.accounts.find((account) => account.providerId === providerDraft.id
+        && account.credentialType !== 'chatgpt-oauth'
+        && account.credentialType !== 'chatgpt-agent-identity')
       : undefined
     const incompatiblePools = sourceAccount
       ? snapshot.pools.filter((pool) => pool.protocol !== providerDraft.protocol && pool.members.some((member) => member.accountId === sourceAccount.id))
@@ -893,6 +957,11 @@ export function ProvidersView({
       kind: providerDraft.kind,
       baseUrl: providerDraft.baseUrl.replace(/\/$/, ''),
       protocol: providerDraft.protocol,
+      responsesCompactMode: responsesCompactModeForSave(
+        providerDraft.sourceType,
+        providerDraft.protocol,
+        providerDraft.responsesCompactMode,
+      ),
       credential: providerDraft.credential?.trim() || undefined,
       models: providerDraft.modelsText.split(/[\n,]/).map((model) => model.trim()).filter(Boolean),
       defaultModel: providerDraft.defaultModel.trim() || undefined,
@@ -901,6 +970,8 @@ export function ProvidersView({
       maxConcurrency: providerDraft.maxConcurrency,
       proxyId: providerDraft.proxyId || undefined,
       unlinkIncompatiblePools,
+      capabilityProfile: providerDraft.capabilityProfile,
+      modelCatalog: providerDraft.modelCatalog,
     }))
     if (success) setProviderModal(false)
   }
@@ -917,18 +988,23 @@ export function ProvidersView({
         kind: providerDraft.kind,
         baseUrl: providerDraft.baseUrl.replace(/\/$/, ''),
         protocol: providerDraft.protocol,
+        responsesCompactMode: providerDraft.responsesCompactMode,
         credential: providerDraft.credential?.trim() || undefined,
         model: providerDraft.defaultModel.trim() || undefined,
         proxyId: providerDraft.proxyId || undefined,
       })
       setProviderProbe(result)
-      if (result.models.length) {
-        setProviderDraft((current) => ({
-          ...current,
+      setProviderDraft((current) => ({
+        ...current,
+        ...(result.models.length ? {
           modelsText: result.models.join('\n'),
           defaultModel: current.defaultModel || result.models[0],
-        }))
-      }
+        } : {}),
+        ...(result.ok ? {
+          capabilityProfile: result.capabilityProfile,
+          modelCatalog: result.modelCatalog,
+        } : {}),
+      }))
     } catch (cause) {
       setErrors({ sourceProbe: localizeBackendError(cause, language, t('连接测试失败', 'Connection test failed.')) })
     } finally {
@@ -947,8 +1023,10 @@ export function ProvidersView({
         kind: provider.kind,
         baseUrl: provider.baseUrl,
         protocol: provider.protocol,
+        responsesCompactMode: provider.responsesCompactMode,
         model: account?.modelAllowlist[0] ?? account?.availableModels[0] ?? provider.models[0],
         proxyId: account?.proxyId,
+        persistCapabilities: true,
       })
       const resultError = localizeBackendMessage(
         result.error ?? result.stages.find((stage) => stage.status === 'error')?.message,
@@ -974,6 +1052,9 @@ export function ProvidersView({
       kind: provider.kind,
       baseUrl: provider.baseUrl,
       protocol: provider.protocol,
+      responsesCompactMode: provider.sourceType === 'relay' && provider.protocol === 'openai-responses'
+        ? effectiveResponsesCompactMode(provider.responsesCompactMode)
+        : undefined,
       modelsText: provider.models.join('\n'),
       defaultModel: account?.modelAllowlist[0] ?? account?.availableModels[0] ?? provider.models[0] ?? '',
       priority: account?.priority ?? 10,
@@ -981,6 +1062,8 @@ export function ProvidersView({
       maxConcurrency: account?.maxConcurrency ?? 4,
       proxyId: account?.proxyId ?? '',
       credential: '',
+      capabilityProfile: provider.capabilityProfile,
+      modelCatalog: provider.modelCatalog,
     })
     setProviderProbe(null)
     setErrors({})
@@ -1013,6 +1096,7 @@ export function ProvidersView({
       modelPolicy: accountDraft.modelPolicy,
       modelAllowlist: accountDraft.modelAllowlist,
       proxyId: accountDraft.proxyId ?? '',
+      quotaProtection: accountDraft.quotaProtection,
     }))
     if (success) setAccountModal(false)
   }
@@ -1330,17 +1414,7 @@ export function ProvidersView({
   const checkAllAccounts = async () => {
     if (!oauthAccounts.length || checkingAllAccounts) return
     await runAction('check-all-accounts', async () => {
-      const accountIds = oauthAccounts.map((account) => account.id)
-      let cursor = 0
-      const worker = async (): Promise<void> => {
-        for (;;) {
-          const index = cursor
-          cursor += 1
-          if (index >= accountIds.length) return
-          await api.checkAccount(accountIds[index]).catch(() => undefined)
-        }
-      }
-      await Promise.all(Array.from({ length: Math.min(4, accountIds.length) }, () => worker()))
+      await api.startAccountCheckTask(oauthAccounts.map((account) => account.id))
       return api.getSnapshot()
     })
   }
@@ -1464,6 +1538,7 @@ export function ProvidersView({
       </div>
       {importNotice && <div className="client-config-notice"><CheckCircle2 size={16} />{importNotice}</div>}
       {exportNotice && <div className="client-config-notice"><Download size={16} />{exportNotice}</div>}
+      {tab === 'accounts' && <PersistentTaskCenter api={api} />}
 
       {tab === 'accounts' ? (
         <section className="panel panel--flush">
@@ -1518,11 +1593,11 @@ export function ProvidersView({
                         <td className="account-select-column"><input type="checkbox" aria-label={t(`选择账号 ${account.name}`, `Select account ${account.name}`)} checked={selectedAccountIds.includes(account.id)} onChange={() => toggleSelectedAccount(account.id)} /></td>
                         <td><div className="provider-cell"><span className="provider-avatar" style={{ '--provider-color': provider?.color ?? '#61736f' } as React.CSSProperties}>{provider?.name.slice(0, 1) ?? '?'}</span><div><strong title={account.name}>{accountNameById.get(account.id) ?? account.name}</strong><span>{provider?.name ?? t('供应商已删除', 'Provider deleted')}{account.proxyId ? ` · ${proxyById.get(account.proxyId)?.name ?? t('代理已删除', 'Proxy deleted')}` : ''} · {modelSummary}</span></div></div></td>
                         <td>{account.tagId && tagById.has(account.tagId) ? <span className="account-tag-chip"><Tag size={12} />{tagById.get(account.tagId)?.name}</span> : <span className="muted">{t('未标记', 'Untagged')}</span>}</td>
-                        <td><AccountStatusBadge status={account.status} circuitState={account.circuitState} /><CooldownCountdown account={account} />{account.credentialType === 'chatgpt-oauth' && <span className="row-note">ChatGPT OAuth · {account.renewable ? t('可续期', 'Renewable') : t('会话到期即停用', 'Disabled when the session expires')}</span>}{Boolean(account.consecutiveFailures) && <span className="row-note">{t('连续失败', 'Consecutive failures')} {account.consecutiveFailures}</span>}{account.lastError && <span className="row-note row-note--danger" title={localizeBackendMessage(account.lastError, language, t('账号检测失败', 'Account check failed.'))}>{localizeBackendMessage(account.lastError, language, t('账号检测失败', 'Account check failed.'))}</span>}</td>
+                        <td><AccountStatusBadge status={account.status} circuitState={account.circuitState} /><CooldownCountdown account={account} />{(account.credentialType === 'chatgpt-oauth' || account.credentialType === 'chatgpt-agent-identity') && <span className="row-note">{account.credentialType === 'chatgpt-agent-identity' ? 'Agent Identity' : 'ChatGPT OAuth'} · {account.renewable ? t('可续期', 'Renewable') : t('会话到期即停用', 'Disabled when the session expires')}</span>}{Boolean(account.consecutiveFailures) && <span className="row-note">{t('连续失败', 'Consecutive failures')} {account.consecutiveFailures}</span>}{account.lastError && <span className="row-note row-note--danger" title={localizeBackendMessage(account.lastError, language, t('账号检测失败', 'Account check failed.'))}>{localizeBackendMessage(account.lastError, language, t('账号检测失败', 'Account check failed.'))}</span>}</td>
                         <td><AccountFitness fitness={account.fitness} /></td>
                         <td><span className="mono masked-key">{account.maskedCredential}</span></td>
                         <td><div className="concurrency-cell"><strong>{account.inFlight} / {account.maxConcurrency}</strong><div className="mini-progress"><span style={{ width: `${Math.min(100, account.inFlight / account.maxConcurrency * 100)}%` }} /></div></div></td>
-                        <td>{account.credentialType === 'chatgpt-oauth'
+                        <td>{account.credentialType === 'chatgpt-oauth' || account.credentialType === 'chatgpt-agent-identity'
                           ? <CodexQuotaCompact quota={account.codexQuota} onClick={() => setQuotaAccountId(account.id)} />
                           : account.quotaRemaining !== undefined ? <strong>{account.quotaUnit === 'usd' ? new Intl.NumberFormat(locale, { style: 'currency', currency: 'USD', currencyDisplay: 'narrowSymbol' }).format(account.quotaRemaining) : `${new Intl.NumberFormat(locale).format(account.quotaRemaining)}${account.quotaUnit === 'percent' ? '%' : ''}`}</strong> : <span className="muted">{t('未知', 'Unknown')}</span>}</td>
                         <td>{account.latencyMs ? durationLabel(account.latencyMs) : '—'}</td>
@@ -1551,7 +1626,9 @@ export function ProvidersView({
         (tab === 'official' ? officialProviders.length : relayProviders.length + aggregateRelays.length) ? (
           <div className="provider-grid">
             {(tab === 'official' ? officialProviders : relayProviders).map((provider) => {
-              const sourceAccount = snapshot.accounts.find((account) => account.providerId === provider.id && account.credentialType !== 'chatgpt-oauth')
+              const sourceAccount = snapshot.accounts.find((account) => account.providerId === provider.id
+                && account.credentialType !== 'chatgpt-oauth'
+                && account.credentialType !== 'chatgpt-agent-identity')
               const brandIcon = providerBrandIcon(provider.kind)
               return (
                 <article className="provider-card" key={provider.id}>
@@ -1563,7 +1640,7 @@ export function ProvidersView({
                     <OverflowMenu open={menuOpen === provider.id} onOpenChange={(open) => setMenuOpen(open ? provider.id : null)} label={t('来源操作', 'Source actions')}><button type="button" disabled={testingSourceId === provider.id || !sourceAccount} onClick={() => void testSavedSource(provider, sourceAccount)}>{testingSourceId === provider.id ? <LoaderCircle size={15} className="spin" /> : <RefreshCw size={15} />}{t('测试', 'Test')}</button><button type="button" onClick={() => openProvider(provider.sourceType === 'relay' ? 'relay' : 'official-api', provider)}><Edit3 size={15} />{t('编辑', 'Edit')}</button><button type="button" onClick={() => copySourceConfiguration(provider, sourceAccount)}><Copy size={15} />{t('复制配置', 'Copy configuration')}</button><button className="danger" type="button" onClick={() => { setDeleteTarget({ kind: 'provider', id: provider.id, name: provider.name }); setMenuOpen(null) }}><Trash2 size={15} />{t('删除', 'Delete')}</button></OverflowMenu>
                   </div>
                   <div className="provider-card__endpoint"><span>{t('基础地址', 'Base URL')}</span><code>{provider.baseUrl}</code></div>
-                  <div className="provider-card__meta"><Badge tone="info">{protocolLabels[provider.protocol]}</Badge><span><KeyRound size={14} />{sourceAccount?.maskedCredential ?? t('凭据待完善', 'Credential required')}</span><span><Boxes size={14} />{t(`${provider.models.length} 个模型`, `${provider.models.length} ${provider.models.length === 1 ? 'model' : 'models'}`)}</span></div>
+                  <div className="provider-card__meta"><Badge tone="info">{protocolLabels[provider.protocol]}</Badge><span><KeyRound size={14} />{sourceAccount?.maskedCredential ?? t('凭据待完善', 'Credential required')}</span><span><Boxes size={14} />{t(`${provider.models.length} 个模型`, `${provider.models.length} ${provider.models.length === 1 ? 'model' : 'models'}`)}</span>{provider.capabilityProfile?.checkedAt && <Badge tone="success">{t('能力已探测', 'Capabilities probed')}</Badge>}</div>
                   {sourceAccount && <div className="provider-source-health"><AccountStatusBadge status={sourceAccount.status} circuitState={sourceAccount.circuitState} /><span>{t('并发', 'Concurrency')} {sourceAccount.inFlight} / {sourceAccount.maxConcurrency}</span><span>{t('权重', 'Weight')} {sourceAccount.weight}</span>{sourceAccount.latencyMs !== undefined && <span>{durationLabel(sourceAccount.latencyMs)}</span>}</div>}
                   <div className="model-tags">
                     {provider.models.slice(0, 3).map((model) => <span key={model}>{model}</span>)}
@@ -1680,10 +1757,10 @@ export function ProvidersView({
             <small>{t('只显示普通 OpenAI Responses 号池；仅检测成功的账号会加入。', 'Only standard OpenAI Responses pools are shown, and only accounts that pass checks are added.')}</small>
           </label>
           <label className="field field--full">
-            <span>{accountAddMethod === 'oauth' ? t('Token 交换与后续检测出口', 'Proxy for token exchange and later checks') : t('出口代理', 'Exit proxy')}</span>
+            <span>{accountAddMethod === 'oauth' ? t('Token 交换与后续检测代理', 'Proxy for token exchange and later checks') : t('代理', 'Proxy')}</span>
             <select
               value={importProxyValue(chatGptImport.proxyMode, chatGptImport.proxyId)}
-              disabled={importConfigurationLocked}
+              disabled={importConfigurationLocked || builtInProxyInterlocked}
               onChange={(event) => {
                 const value = event.target.value
                 if (value === '__preserve__') setChatGptImport({ ...chatGptImport, proxyMode: 'preserve', proxyId: '' })
@@ -1697,7 +1774,9 @@ export function ProvidersView({
                 && <option value={chatGptImport.proxyId} disabled>{t('原选择已删除，请重新选择', 'The previous selection was deleted. Choose another.')}</option>}
               {snapshot.proxies.map((proxy) => <option key={proxy.id} value={proxy.id}>{proxy.name} · {proxySafeSummary(proxy)}</option>)}
             </select>
-            <small>{chatGptImport.proxyMode === 'preserve'
+            <small>{builtInProxyInterlocked
+              ? t(BUILT_IN_PROXY_BINDING_NOTICE.zh, BUILT_IN_PROXY_BINDING_NOTICE.en)
+              : chatGptImport.proxyMode === 'preserve'
               ? t('保留文件中仍然存在的 proxyId；未配置或已失效时使用 Stone+ 全局出口设置。', 'Keep a proxyId from the file if it still exists; otherwise use the Stone+ global exit setting.')
               : chatGptImport.proxyMode === 'direct'
                 ? accountAddMethod === 'oauth'
@@ -1764,7 +1843,7 @@ export function ProvidersView({
         width="large"
         footer={<><button type="button" className="button button--secondary" onClick={() => setProviderModal(false)}>{t('取消', 'Cancel')}</button><button type="button" className="button button--secondary" disabled={providerProbeBusy} onClick={() => void probeProvider()}>{providerProbeBusy ? <LoaderCircle size={16} className="spin" /> : <RefreshCw size={16} />}{t('测试连接', 'Test connection')}</button><button type="submit" form="provider-form" className="button button--primary" disabled={busyKeys.has('save-api-source')}>{busyKeys.has('save-api-source') ? <LoaderCircle size={16} className="spin" /> : <CheckCircle2 size={16} />}{t('保存来源', 'Save source')}</button></>}
       >
-        <form id="provider-form" onSubmit={(event) => void submitProvider(event)}><ApiSourceForm draft={providerDraft} setDraft={setProviderDraft} proxies={snapshot.proxies} errors={errors} /></form>
+        <form id="provider-form" onSubmit={(event) => void submitProvider(event)}><ApiSourceForm draft={providerDraft} setDraft={setProviderDraft} proxies={snapshot.proxies} proxyInterlocked={builtInProxyInterlocked} errors={errors} /></form>
         {(providerProbe || errors.sourceProbe) && <div className={`source-probe-result ${providerProbe?.ok ? 'source-probe-result--ok' : 'source-probe-result--error'}`}>
           <strong>{providerProbe?.ok ? t('连接验证通过', 'Connection verified') : t('连接验证未通过', 'Connection verification failed')}</strong>
           {providerProbe?.stages.map((stage) => {
@@ -1772,6 +1851,7 @@ export function ProvidersView({
             return <div key={stage.id}><Badge tone={stage.status === 'success' ? 'success' : stage.status === 'warning' ? 'warning' : stage.status === 'error' ? 'danger' : 'neutral'}>{providerProbeStatusLabel(stage, language)}</Badge><span><strong>{providerProbeStageLabel(stage, language)}</strong> · {localizedStage.message}</span>{stage.latencyMs !== undefined && <small>{durationLabel(stage.latencyMs)}</small>}</div>
           })}
           {providerProbe?.models.length ? <small>{t(`发现 ${providerProbe.models.length} 个模型`, `${providerProbe.models.length} models found`)}</small> : null}
+          {providerProbe?.ok && <small>{t('能力档案已生成，保存来源后生效。', 'A capability profile was generated and will take effect after saving the source.')}</small>}
           <FieldError>{errors.sourceProbe ?? (providerProbe?.error ? localizeBackendMessage(providerProbe.error, language, t('连接验证失败', 'Connection verification failed.')) : undefined)}</FieldError>
         </div>}
       </Modal>
@@ -1784,7 +1864,7 @@ export function ProvidersView({
         width="xlarge"
         footer={<><button type="button" className="button button--secondary" onClick={() => setAccountModal(false)}>{t('取消', 'Cancel')}</button><button type="submit" form="account-form" className="button button--primary" disabled={busyKeys.has('save-account')}>{busyKeys.has('save-account') ? <LoaderCircle size={16} className="spin" /> : <CheckCircle2 size={16} />}{t('保存账号', 'Save account')}</button></>}
       >
-        <form id="account-form" onSubmit={(event) => void submitAccount(event)}><AccountForm draft={accountDraft} setDraft={setAccountDraft} providers={snapshot.providers} proxies={snapshot.proxies} account={editingAccount} editing={Boolean(accountDraft.id)} oauthAccount={editingAccount?.credentialType === 'chatgpt-oauth'} refreshingModels={accountModelsBusy} refreshDisabledReason={refreshModelsDisabledReason} onRefreshModels={() => void refreshEditingAccountModels()} onTestModel={accountDraft.id ? (model) => api.testAccountModel(accountDraft.id as string, model) : undefined} errors={errors} /></form>
+        <form id="account-form" onSubmit={(event) => void submitAccount(event)}><AccountForm draft={accountDraft} setDraft={setAccountDraft} providers={snapshot.providers} proxies={snapshot.proxies} proxyInterlocked={builtInProxyInterlocked} account={editingAccount} editing={Boolean(accountDraft.id)} oauthAccount={editingAccount?.credentialType === 'chatgpt-oauth' || editingAccount?.credentialType === 'chatgpt-agent-identity'} refreshingModels={accountModelsBusy} refreshDisabledReason={refreshModelsDisabledReason} onRefreshModels={() => void refreshEditingAccountModels()} onTestModel={accountDraft.id ? (model) => api.testAccountModel(accountDraft.id as string, model) : undefined} errors={errors} /></form>
       </Modal>
 
       <Modal
@@ -1808,7 +1888,7 @@ export function ProvidersView({
             <span>{t('API 来源成员', 'API source members')}</span>
             <div className="aggregate-member-picker">
               {snapshot.accounts.filter((account) => {
-                if (account.credentialType === 'chatgpt-oauth') return false
+                if (account.credentialType === 'chatgpt-oauth' || account.credentialType === 'chatgpt-agent-identity') return false
                 const provider = providerById.get(account.providerId)
                 return (provider?.sourceType === 'official-api' || provider?.sourceType === 'relay') && provider.protocol === aggregateDraft.protocol
               }).map((account) => {
@@ -1820,13 +1900,15 @@ export function ProvidersView({
                   {member && <div className="aggregate-member-controls"><button type="button" title={t('上移', 'Move up')} disabled={memberIndex === 0} onClick={() => { const next = [...aggregateDraft.members]; [next[memberIndex - 1], next[memberIndex]] = [next[memberIndex], next[memberIndex - 1]]; updateAggregateMembers(next) }}>↑</button><button type="button" title={t('下移', 'Move down')} disabled={memberIndex === aggregateDraft.members.length - 1} onClick={() => { const next = [...aggregateDraft.members]; [next[memberIndex + 1], next[memberIndex]] = [next[memberIndex], next[memberIndex + 1]]; updateAggregateMembers(next) }}>↓</button><label>{t('权重', 'Weight')} <input type="number" min={1} max={100} value={member.weight} onChange={(event) => updateAggregateMembers(aggregateDraft.members.map((item) => item.accountId === member.accountId ? { ...item, weight: Number(event.target.value) } : item))} /></label><span>#{memberIndex + 1}</span></div>}
                 </div>
               })}
-              {!snapshot.accounts.some((account) => account.credentialType !== 'chatgpt-oauth' && providerById.get(account.providerId)?.protocol === aggregateDraft.protocol) && <div className="aggregate-member-picker__empty">{t('没有同协议的官方 API 或中转站，请先添加来源。', 'No official API or relay uses this protocol. Add a source first.')}</div>}
+              {!snapshot.accounts.some((account) => account.credentialType !== 'chatgpt-oauth' && account.credentialType !== 'chatgpt-agent-identity' && providerById.get(account.providerId)?.protocol === aggregateDraft.protocol) && <div className="aggregate-member-picker__empty">{t('没有同协议的官方 API 或中转站，请先添加来源。', 'No official API or relay uses this protocol. Add a source first.')}</div>}
             </div>
             <FieldError>{errors.aggregateMembers}</FieldError>
           </div>
           <label className="field"><span>{t('失败重试次数', 'Failure retries')}</span><input type="number" min={0} max={10} value={aggregateDraft.maxRetries} onChange={(event) => setAggregateDraft({ ...aggregateDraft, maxRetries: Number(event.target.value) })} /></label>
-          <label className="field"><span>{t('默认出口代理', 'Default exit proxy')}</span><select value={aggregateDraft.proxyId ?? ''} onChange={(event) => setAggregateDraft({ ...aggregateDraft, proxyId: event.target.value })}><option value="">{t('直连', 'Direct')}</option>{snapshot.proxies.map((proxy) => <option key={proxy.id} value={proxy.id}>{proxy.name}</option>)}</select></label>
+          <label className="field"><span>{t('默认代理', 'Default proxy')}</span><select value={aggregateDraft.proxyId ?? ''} disabled={builtInProxyInterlocked} onChange={(event) => setAggregateDraft({ ...aggregateDraft, proxyId: event.target.value })}><option value="">{t('直连', 'Direct')}</option>{snapshot.proxies.map((proxy) => <option key={proxy.id} value={proxy.id}>{proxy.name}</option>)}</select>{builtInProxyInterlocked && <small>{t(BUILT_IN_PROXY_BINDING_NOTICE.zh, BUILT_IN_PROXY_BINDING_NOTICE.en)}</small>}</label>
           <div className="field field--full inline-settings"><div><strong>{t('会话粘性', 'Session stickiness')}<InfoTip text={t('同一会话优先复用已分配来源，减少上下文和缓存命中波动。', 'Prefer the assigned source for the same session to reduce context and cache-hit variability.')} /></strong></div><button className={`toggle ${aggregateDraft.stickySessions ? 'toggle--on' : ''}`} role="switch" aria-label={t('会话粘性', 'Session stickiness')} aria-checked={aggregateDraft.stickySessions} type="button" onClick={() => setAggregateDraft({ ...aggregateDraft, stickySessions: !aggregateDraft.stickySessions })}><span /></button></div>
+          <div className="field field--full inline-settings"><div><strong>{t('额度保护线', 'Quota reserve guard')}</strong></div><button className={`toggle ${aggregateDraft.quotaProtection ? 'toggle--on' : ''}`} role="switch" aria-checked={Boolean(aggregateDraft.quotaProtection)} type="button" onClick={() => setAggregateDraft({ ...aggregateDraft, quotaProtection: aggregateDraft.quotaProtection ? undefined : { fiveHourRemainingPercent: 10, sevenDayRemainingPercent: 10, unavailableBehavior: 'allow', staleAfterMinutes: 15 } })}><span /></button></div>
+          {aggregateDraft.quotaProtection && <><label className="field"><span>{t('5 小时最低保留（%）', '5-hour reserve (%)')}</span><input type="number" min={0} max={100} value={aggregateDraft.quotaProtection.fiveHourRemainingPercent ?? ''} onChange={(event) => setAggregateDraft({ ...aggregateDraft, quotaProtection: { ...aggregateDraft.quotaProtection!, fiveHourRemainingPercent: event.target.value === '' ? undefined : Number(event.target.value) } })} /></label><label className="field"><span>{t('周额度最低保留（%）', 'Weekly reserve (%)')}</span><input type="number" min={0} max={100} value={aggregateDraft.quotaProtection.sevenDayRemainingPercent ?? ''} onChange={(event) => setAggregateDraft({ ...aggregateDraft, quotaProtection: { ...aggregateDraft.quotaProtection!, sevenDayRemainingPercent: event.target.value === '' ? undefined : Number(event.target.value) } })} /></label><label className="field"><span>{t('额度未知或过期', 'Unknown or stale quota')}</span><select value={aggregateDraft.quotaProtection.unavailableBehavior ?? 'allow'} onChange={(event) => setAggregateDraft({ ...aggregateDraft, quotaProtection: { ...aggregateDraft.quotaProtection!, unavailableBehavior: event.target.value as 'allow' | 'block' } })}><option value="allow">{t('继续调度', 'Continue scheduling')}</option><option value="block">{t('保守停用', 'Block conservatively')}</option></select></label><label className="field"><span>{t('快照有效期（分钟）', 'Snapshot validity (minutes)')}</span><input type="number" min={1} max={10080} value={aggregateDraft.quotaProtection.staleAfterMinutes ?? ''} onChange={(event) => setAggregateDraft({ ...aggregateDraft, quotaProtection: { ...aggregateDraft.quotaProtection!, staleAfterMinutes: event.target.value === '' ? undefined : Number(event.target.value) } })} /></label></>}
           {aggregateDraft.stickySessions && <label className="field"><span>{t('粘性时长（分钟）', 'Stickiness duration (minutes)')}</span><input type="number" min={1} max={1440} value={aggregateDraft.stickyTtlMinutes} onChange={(event) => setAggregateDraft({ ...aggregateDraft, stickyTtlMinutes: Number(event.target.value) })} /></label>}
         </form>
       </Modal>

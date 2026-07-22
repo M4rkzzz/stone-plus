@@ -1,5 +1,15 @@
-import type { Account, AccountCircuitState, AccountFitnessSnapshot, Pool, RequestLog } from '../../shared/types'
+import type {
+  Account,
+  AccountCircuitState,
+  AccountFitnessSnapshot,
+  Pool,
+  ProviderDefinition,
+  QuotaProtectionPolicy,
+  RequestLog,
+  UpstreamCapabilityRequirement
+} from '../../shared/types'
 import { codexQuotaIsExhausted } from '../providers/quota'
+import { evaluateSourceEligibility } from '../../shared/source-eligibility'
 import type { ScheduledAccount, SchedulerSelectionInput } from './types'
 
 interface StickyAssignment {
@@ -12,10 +22,33 @@ interface StickyFailureAvoidance {
   expiresAt: number
 }
 
+interface StickyExpiryEntry {
+  key: string
+  expiresAt: number
+}
+
 interface SmoothWeightedState {
-  /** Reset the accumulated scores whenever membership/order/weights change. */
-  signature: string
+  /** Reset accumulated scores whenever membership/order/weights change. */
+  configuration: Map<string, number>
   current: Map<string, number>
+}
+
+interface AggregatePoolIndex {
+  pool: Pool
+  members: Pool['members']
+  updatedAt: number
+  orderedAccountIds: string[]
+  orderByAccountId: Map<string, number>
+  weightByAccountId: Map<string, number>
+  smoothConfiguration: Map<string, number>
+}
+
+interface AccountModelIndex {
+  updatedAt: number
+  modelPolicy: Account['modelPolicy']
+  modelsRefreshedAt?: number
+  source: string[]
+  allowed: Set<string>
 }
 
 export interface AccountRuntimeHealth {
@@ -26,14 +59,26 @@ export interface AccountRuntimeHealth {
   lastFailureAt?: number
 }
 
+export interface AccountSuccessResult extends AccountRuntimeHealth {
+  /** False when a newer failure/quota transition superseded this attempt. */
+  applied: boolean
+  revision: number
+}
+
 export interface AccountFailureOptions {
   retryAfterMs?: number
   baseDelayMs?: number
   maxDelayMs?: number
   maxConcurrency?: number
+  reason?: 'quota' | 'failure'
 }
 
 export interface AccountPerformanceSample {
+  /** Transport latency until the first upstream response body byte. */
+  transportFirstBodyMs?: number
+  /** User-visible semantic first-token latency for the successful attempt. */
+  semanticFirstTokenMs?: number
+  /** @deprecated Compatibility alias for semanticFirstTokenMs. */
   firstTokenMs?: number
   outputTokens?: number
   generationDurationMs?: number
@@ -44,10 +89,14 @@ interface AccountPerformanceState {
   successCount: number
   failureCount: number
   performanceSampleCount: number
+  transportSampleCount: number
+  semanticSampleCount: number
+  throughputSampleCount: number
   historySuccessWeight: number
   historyFailureWeight: number
   recentSuccessRate: number
-  firstTokenMs?: number
+  transportFirstBodyMs?: number
+  semanticFirstTokenMs?: number
   outputTokensPerSecond?: number
   failurePenalty: number
   updatedAt: number
@@ -67,6 +116,12 @@ const FITNESS_CONFIDENCE_SAMPLES = 12
 const STICKY_ESCAPE_MINIMUM_SAMPLES = 3
 const STICKY_ESCAPE_MINIMUM_DELTA_MS = 1_000
 const STICKY_ESCAPE_RATIO = 1.5
+// A raw response byte only proves that the network path is alive; it says
+// nothing about how long the model will take to emit useful output. Keep old
+// transport-only history useful, but make it a conservative fallback when it
+// competes with a real semantic-TTFT observation.
+const TRANSPORT_FALLBACK_UNCERTAINTY_MS = 1_500
+const TRANSPORT_FALLBACK_FLOOR_MS = 3_000
 // Prefer spreading simultaneously active conversations across accounts without
 // making it a hard constraint. A clearly unhealthy/slow alternative may still
 // lose even when it currently owns fewer conversations.
@@ -92,7 +147,7 @@ export function accountAllowsModel(account: Account, model: string): boolean {
   return true
 }
 
-export function poolAllowsModel(pool: Pool, accounts: Account[], model: string): boolean {
+export function poolAllowsModel(pool: Pool, accounts: readonly Account[], model: string): boolean {
   if (pool.modelPolicy === 'selected' && !pool.modelAllowlist.includes(model)) return false
   return accounts.some((account) => accountAllowsModel(account, model))
 }
@@ -103,10 +158,19 @@ export class PoolScheduler {
   private readonly roundRobinOffsets = new Map<string, number>()
   private readonly smoothWeighted = new Map<string, SmoothWeightedState>()
   private readonly sticky = new Map<string, StickyAssignment>()
+  private readonly stickyExpiry: StickyExpiryEntry[] = []
+  private readonly stickyKeysByAccount = new Map<string, Set<string>>()
   /** One-shot per-session avoidance after its assigned account actually failed. */
   private readonly stickyFailureAvoidance = new Map<string, StickyFailureAvoidance>()
+  private readonly stickyFailureExpiry: StickyExpiryEntry[] = []
   private readonly activeStickySessions = new Map<string, Map<string, number>>()
+  private readonly activeStickySessionCounts = new Map<string, number>()
+  private aggregatePoolIndexes = new WeakMap<Pool, AggregatePoolIndex>()
+  private accountModelIndexes = new WeakMap<Account, AccountModelIndex>()
   private readonly health = new Map<string, AccountRuntimeHealth>()
+  /** Monotonic per-account generation guarding concurrent attempt outcomes. */
+  private readonly healthRevisions = new Map<string, number>()
+  private readonly healthReasons = new Map<string, 'quota' | 'failure'>()
   private readonly performance = new Map<string, AccountPerformanceState>()
 
   constructor(
@@ -114,10 +178,28 @@ export class PoolScheduler {
     private readonly random: () => number = () => Math.random()
   ) {}
 
-  hydrate(accounts: Account[]): void {
+  hydrate(accounts: readonly Account[], pools?: readonly Pool[]): void {
+    // updateConfig/hydrate is the explicit configuration-version boundary.
+    // Reset object-content indexes so in-place edits are observed even when a
+    // caller forgot to replace the allowlist/member array or bump updatedAt.
+    this.accountModelIndexes = new WeakMap()
+    this.aggregatePoolIndexes = new WeakMap()
+    if (pools) {
+      const poolIds = new Set(pools.map((pool) => pool.id))
+      for (const poolId of this.roundRobinOffsets.keys()) {
+        if (!poolIds.has(poolId)) this.roundRobinOffsets.delete(poolId)
+      }
+      for (const poolId of this.smoothWeighted.keys()) {
+        if (!poolIds.has(poolId)) this.smoothWeighted.delete(poolId)
+      }
+    }
     const accountIds = new Set(accounts.map((account) => account.id))
     for (const accountId of this.health.keys()) {
-      if (!accountIds.has(accountId)) this.health.delete(accountId)
+      if (!accountIds.has(accountId)) {
+        this.health.delete(accountId)
+        this.healthRevisions.delete(accountId)
+        this.healthReasons.delete(accountId)
+      }
     }
     for (const accountId of this.performance.keys()) {
       if (!accountIds.has(accountId)) this.performance.delete(accountId)
@@ -135,6 +217,7 @@ export class PoolScheduler {
         cooldownUntil: account.cooldownUntil,
         lastFailureAt: account.updatedAt
       })
+      this.healthReasons.set(account.id, account.cooldownReason === 'quota' ? 'quota' : 'failure')
     }
   }
 
@@ -162,28 +245,63 @@ export class PoolScheduler {
         .sort((a, b) => a.timestamp - b.timestamp)
         .slice(-PERFORMANCE_HYDRATION_SAMPLES_PER_ACCOUNT)
       for (const log of recent) {
-        const firstTokenMs = log.status === 'success' ? rawFirstBytePerformanceMs(log) : undefined
+        const transportFirstBodyMs = log.status === 'success'
+          ? transportFirstBodyPerformanceMs(log)
+          : undefined
+        const semanticFirstTokenMs = log.status === 'success'
+          ? semanticFirstTokenPerformanceMs(log)
+          : undefined
+        const previousAttemptsMs = failedAttemptDurationMs(log)
+        const generationStartedMs = transportFirstBodyMs ?? semanticFirstTokenMs
         this.observeOutcome(accountId, log.status === 'success', {
-          firstTokenMs,
+          transportFirstBodyMs,
+          semanticFirstTokenMs,
           outputTokens: log.outputTokens,
-          generationDurationMs: firstTokenMs === undefined
+          generationDurationMs: generationStartedMs === undefined
             ? undefined
-            : Math.max(0, log.latencyMs - (log.upstreamFirstByteMs ?? firstTokenMs))
+            : Math.max(0, log.latencyMs - previousAttemptsMs - generationStartedMs)
         }, log.timestamp, false)
       }
     }
   }
 
-  selectAndAcquire(input: SchedulerSelectionInput): ScheduledAccount {
+  selectAndAcquire(input: SchedulerSelectionInput): ScheduledAccount & { healthRevision: number } {
     const { pool, accounts, model, sessionId } = input
-    const excludedAccountIds = new Set(input.excludedAccountIds ?? [])
+    const now = this.now()
+    this.cleanupExpiredSticky(now)
+    const excludedAccountIds = input.excludedAccountIds?.length
+      ? new Set(input.excludedAccountIds)
+      : undefined
     if (pool.strategy !== 'weighted-round-robin') this.smoothWeighted.delete(pool.id)
-    if (!poolAllowsModel(pool, accounts, model)) throw new ModelNotExposedError()
+    if (pool.modelPolicy === 'selected' && !pool.modelAllowlist.includes(model)) {
+      throw new ModelNotExposedError()
+    }
 
-    const candidates = accounts
-      .filter((account) => accountAllowsModel(account, model))
-      .filter((account) => this.isEligible(account, pool.strategy === 'autobalanced'))
-      .filter((account) => !excludedAccountIds.has(account.id))
+    // Static model/capability eligibility is shared with route preview. A
+    // declared false capability is never scheduled; unknown metadata is a
+    // backward-compatible fallback only when no verified member exists.
+    const sourceEligibility = evaluateSourceEligibility({
+      accounts,
+      providers: input.providers ?? [],
+      model,
+      poolModelPolicy: pool.modelPolicy,
+      poolModelAllowlist: pool.modelAllowlist,
+      requiredCapabilities: input.requiredCapabilities,
+    })
+    if (sourceEligibility.modelEligible.length === 0) throw new ModelNotExposedError()
+
+    const adaptiveConcurrency = pool.strategy === 'autobalanced'
+    // Capability preference is applied after runtime availability. Otherwise a
+    // cooled or saturated verified account can mask a healthy legacy/unknown
+    // member and turn a compatible pool into a false 503.
+    const runtimeEligible = (account: Account): boolean => (
+      !excludedAccountIds?.has(account.id)
+      && this.isEligible(account, pool, adaptiveConcurrency, now)
+    )
+    const verifiedCandidates = sourceEligibility.verified.filter(runtimeEligible)
+    const candidates = verifiedCandidates.length > 0
+      ? verifiedCandidates
+      : sourceEligibility.unknown.filter(runtimeEligible)
     if (candidates.length === 0) {
       throw new NoEligibleAccountError()
     }
@@ -194,17 +312,17 @@ export class PoolScheduler {
     let failedStickyAccountId: string | undefined
     if (pool.stickySessions && stickyKey) {
       const avoidance = this.stickyFailureAvoidance.get(stickyKey)
-      if (avoidance && avoidance.expiresAt > this.now()) {
+      if (avoidance && avoidance.expiresAt > now) {
         // Prefer another account after a proven failure, but do not turn a
         // single-account pool into a hard outage once that account is eligible.
         if (candidates.some((account) => account.id !== avoidance.accountId)) {
           failedStickyAccountId = avoidance.accountId
         }
       } else if (avoidance) {
-        this.stickyFailureAvoidance.delete(stickyKey)
+        this.deleteStickyFailureAvoidance(stickyKey)
       }
       const assignment = this.sticky.get(stickyKey)
-      if (assignment && assignment.expiresAt > this.now()) {
+      if (assignment && assignment.expiresAt > now) {
         selected = candidates.find((account) => (
           account.id === assignment.accountId && account.id !== failedStickyAccountId
         ))
@@ -218,15 +336,18 @@ export class PoolScheduler {
         ) {
           escapedStickyAccountId = selected.id
           selected = undefined
-          this.sticky.delete(stickyKey)
+          this.deleteSticky(stickyKey)
         }
       } else if (assignment) {
-        this.sticky.delete(stickyKey)
+        this.deleteSticky(stickyKey)
       }
     }
 
-    const avoidedAccountIds = new Set([escapedStickyAccountId, failedStickyAccountId].filter(Boolean))
-    const preferredCandidates = candidates.filter((account) => !avoidedAccountIds.has(account.id))
+    const preferredCandidates = escapedStickyAccountId || failedStickyAccountId
+      ? candidates.filter((account) => (
+          account.id !== escapedStickyAccountId && account.id !== failedStickyAccountId
+        ))
+      : candidates
     selected ??= this.pick(
       pool,
       preferredCandidates.length > 0 ? preferredCandidates : candidates,
@@ -237,16 +358,20 @@ export class PoolScheduler {
     if (stickyKey) this.acquireActiveStickySession(stickyKey, selected.id)
 
     if (pool.stickySessions && stickyKey) {
-      this.stickyFailureAvoidance.delete(stickyKey)
-      this.sticky.set(stickyKey, {
+      this.deleteStickyFailureAvoidance(stickyKey)
+      this.setSticky(stickyKey, {
         accountId: selected.id,
-        expiresAt: this.now() + Math.max(1, pool.stickyTtlMinutes) * 60_000
+        expiresAt: now + Math.max(1, pool.stickyTtlMinutes) * 60_000
       })
     }
 
     let released = false
     return {
       account: selected,
+      // JavaScript executes selection and this snapshot synchronously. Any
+      // later health transition therefore invalidates only attempts selected
+      // before it, without relying on millisecond timestamps.
+      healthRevision: this.getHealthRevision(selected.id),
       release: () => {
         if (released) return
         released = true
@@ -264,12 +389,27 @@ export class PoolScheduler {
    * request is still a routing alternative and must not make a multi-source
    * pool masquerade as a singleton.
    */
-  hasUsableAlternative(accounts: Account[], model: string, accountId: string): boolean {
-    return accounts.some((account) => (
-      account.id !== accountId
-      && accountAllowsModel(account, model)
-      && this.isAvailable(account)
-    ))
+  hasUsableAlternative(
+    accounts: readonly Account[],
+    model: string,
+    accountId: string,
+    pool?: Pool,
+    providers: readonly ProviderDefinition[] = [],
+    requiredCapabilities: readonly UpstreamCapabilityRequirement[] = [],
+    excludedAccountIds: readonly string[] = []
+  ): boolean {
+    const excluded = new Set([accountId, ...excludedAccountIds])
+    const eligibility = evaluateSourceEligibility({
+      accounts: accounts.filter((account) => !excluded.has(account.id)),
+      providers,
+      model,
+      poolModelPolicy: pool?.modelPolicy,
+      poolModelAllowlist: pool?.modelAllowlist,
+      requiredCapabilities
+    })
+    const verifiedAvailable = eligibility.verified.some((account) => this.isAvailable(account, pool))
+    if (verifiedAvailable) return true
+    return eligibility.unknown.some((account) => this.isAvailable(account, pool))
   }
 
   /**
@@ -279,12 +419,14 @@ export class PoolScheduler {
    */
   recordStickyFailure(poolId: string, sessionId: string | undefined, accountId: string): boolean {
     if (!sessionId) return false
+    const now = this.now()
+    this.cleanupExpiredSticky(now)
     const stickyKey = `${poolId}:${sessionId}`
     const assignment = this.sticky.get(stickyKey)
     if (!assignment || assignment.accountId !== accountId) return false
-    this.sticky.delete(stickyKey)
-    if (assignment.expiresAt > this.now()) {
-      this.stickyFailureAvoidance.set(stickyKey, {
+    this.deleteSticky(stickyKey)
+    if (assignment.expiresAt > now) {
+      this.setStickyFailureAvoidance(stickyKey, {
         accountId,
         expiresAt: assignment.expiresAt
       })
@@ -301,17 +443,23 @@ export class PoolScheduler {
       cooldownUntil: Math.max(until, existing?.cooldownUntil ?? 0),
       lastFailureAt: existing?.lastFailureAt
     })
+    this.healthReasons.set(accountId, 'quota')
+    this.bumpHealthRevision(accountId)
   }
 
   recordFailure(accountId: string, options: AccountFailureOptions = {}): AccountRuntimeHealth {
     // A proven runtime account failure is not session-local. Drop every
     // assignment that still points at it, while keeping one-shot per-session
     // avoidance so those conversations prefer a healthy peer next time.
-    for (const [stickyKey, assignment] of this.sticky) {
-      if (assignment.accountId !== accountId) continue
-      this.sticky.delete(stickyKey)
-      if (assignment.expiresAt > this.now()) {
-        this.stickyFailureAvoidance.set(stickyKey, {
+    const now = this.now()
+    this.cleanupExpiredSticky(now)
+    const stickyKeys = this.stickyKeysByAccount.get(accountId)
+    for (const stickyKey of stickyKeys ? [...stickyKeys] : []) {
+      const assignment = this.sticky.get(stickyKey)
+      if (!assignment || assignment.accountId !== accountId) continue
+      this.deleteSticky(stickyKey)
+      if (assignment.expiresAt > now) {
+        this.setStickyFailureAvoidance(stickyKey, {
           accountId,
           expiresAt: assignment.expiresAt
         })
@@ -324,16 +472,27 @@ export class PoolScheduler {
     const exponent = Math.min(20, consecutiveFailures - 1)
     const backoffMs = Math.min(maxDelayMs, baseDelayMs * 2 ** exponent)
     const retryAfterMs = Math.max(0, options.retryAfterMs ?? 0)
+    const cooldownUntil = now + Math.max(backoffMs, retryAfterMs)
     const state: AccountRuntimeHealth = {
       accountId,
       circuitState: 'open',
       consecutiveFailures,
-      cooldownUntil: this.now() + Math.max(backoffMs, retryAfterMs),
-      lastFailureAt: this.now()
+      // A generic transport failure must never shorten an already observed
+      // quota window.
+      cooldownUntil: Math.max(cooldownUntil, existing?.cooldownUntil ?? 0),
+      lastFailureAt: now
     }
     this.health.set(accountId, state)
+    const existingReason = this.healthReasons.get(accountId)
+    this.healthReasons.set(
+      accountId,
+      existingReason === 'quota' && (existing?.cooldownUntil ?? 0) > now
+        ? 'quota'
+        : options.reason ?? 'failure'
+    )
+    this.bumpHealthRevision(accountId)
     const performance = this.performance.get(accountId)
-    this.observeOutcome(accountId, false, {}, this.now(), true)
+    this.observeOutcome(accountId, false, {}, now, true)
     const updated = this.performance.get(accountId)
     if (updated) {
       updated.dynamicConcurrency = Math.max(1, Math.floor(
@@ -344,14 +503,41 @@ export class PoolScheduler {
     return { ...state }
   }
 
-  recordSuccess(accountId: string): AccountRuntimeHealth {
+  recordSuccess(accountId: string, expectedRevision?: number): AccountSuccessResult {
+    const revision = this.getHealthRevision(accountId)
+    const existing = this.health.get(accountId)
+    const superseded = expectedRevision !== undefined && expectedRevision !== revision
+    // A success without an attempt generation may still close an ordinary
+    // failure circuit for backwards compatibility, but must never erase a
+    // quota observation. Manual resets use resetHealth() explicitly.
+    const missingQuotaGeneration = expectedRevision === undefined
+      && existing !== undefined
+      && this.healthReasons.get(accountId) === 'quota'
+    if (superseded || missingQuotaGeneration) {
+      return { ...this.getHealth(accountId), applied: false, revision }
+    }
     const state: AccountRuntimeHealth = {
       accountId,
       circuitState: 'closed',
       consecutiveFailures: 0
     }
+    if (existing) {
+      this.health.delete(accountId)
+      this.healthReasons.delete(accountId)
+      return { ...state, applied: true, revision: this.bumpHealthRevision(accountId) }
+    }
+    return { ...state, applied: true, revision }
+  }
+
+  resetHealth(accountId: string): AccountRuntimeHealth {
     this.health.delete(accountId)
-    return state
+    this.healthReasons.delete(accountId)
+    this.bumpHealthRevision(accountId)
+    return { accountId, circuitState: 'closed', consecutiveFailures: 0 }
+  }
+
+  getHealthRevision(accountId: string): number {
+    return this.healthRevisions.get(accountId) ?? 0
   }
 
   recordPerformance(accountId: string, sample: AccountPerformanceSample): void {
@@ -365,7 +551,10 @@ export class PoolScheduler {
     observedAt: number,
     adaptConcurrency: boolean
   ): void {
-    const firstTokenMs = positiveMetric(sample.firstTokenMs)
+    const transportFirstBodyMs = positiveMetric(sample.transportFirstBodyMs)
+    const semanticFirstTokenMs = positiveMetric(
+      sample.semanticFirstTokenMs ?? sample.firstTokenMs
+    )
     const outputTokens = positiveMetric(sample.outputTokens)
     const generationDurationMs = positiveMetric(sample.generationDurationMs)
     const outputTokensPerSecond = outputTokens !== undefined && generationDurationMs !== undefined
@@ -379,8 +568,20 @@ export class PoolScheduler {
     const recentAlpha = success ? 0.12 : 0.28
     const recentSuccessRate = updateEwma(existing?.recentSuccessRate, success ? 1 : 0, recentAlpha) ?? (success ? 1 : 0)
     const performanceSampleCount = (existing?.performanceSampleCount ?? 0)
-      + (success && (firstTokenMs !== undefined || outputTokensPerSecond !== undefined) ? 1 : 0)
-    const alpha = performanceSampleCount < 5 ? 0.45 : 0.18
+      + (success && (
+        transportFirstBodyMs !== undefined
+        || semanticFirstTokenMs !== undefined
+        || outputTokensPerSecond !== undefined
+      ) ? 1 : 0)
+    const transportSampleCount = (existing?.transportSampleCount ?? 0)
+      + (success && transportFirstBodyMs !== undefined ? 1 : 0)
+    const semanticSampleCount = (existing?.semanticSampleCount ?? 0)
+      + (success && semanticFirstTokenMs !== undefined ? 1 : 0)
+    const throughputSampleCount = (existing?.throughputSampleCount ?? 0)
+      + (success && outputTokensPerSecond !== undefined ? 1 : 0)
+    const transportAlpha = metricAlpha(transportSampleCount)
+    const semanticAlpha = metricAlpha(semanticSampleCount)
+    const throughputAlpha = metricAlpha(throughputSampleCount)
     const successStreak = adaptConcurrency && success ? (existing?.successStreak ?? 0) + 1 : 0
     const dynamicConcurrency = existing?.dynamicConcurrency === undefined
       ? undefined
@@ -390,14 +591,26 @@ export class PoolScheduler {
       successCount: (existing?.successCount ?? 0) + (success ? 1 : 0),
       failureCount: (existing?.failureCount ?? 0) + (success ? 0 : 1),
       performanceSampleCount,
+      transportSampleCount,
+      semanticSampleCount,
+      throughputSampleCount,
       historySuccessWeight,
       historyFailureWeight,
       recentSuccessRate,
-      firstTokenMs: updateEwma(existing?.firstTokenMs, firstTokenMs, alpha),
+      transportFirstBodyMs: updateEwma(
+        existing?.transportFirstBodyMs,
+        transportFirstBodyMs,
+        transportAlpha
+      ),
+      semanticFirstTokenMs: updateEwma(
+        existing?.semanticFirstTokenMs,
+        semanticFirstTokenMs,
+        semanticAlpha
+      ),
       outputTokensPerSecond: updateEwma(
         existing?.outputTokensPerSecond,
         outputTokensPerSecond,
-        alpha
+        throughputAlpha
       ),
       failurePenalty: success
         ? decayedFailurePenaltyAt(existing, observedAt) * 0.65
@@ -442,7 +655,8 @@ export class PoolScheduler {
         state.recentSuccessRate * recentMemory + longTermSuccessRate * (1 - recentMemory)
       ))
       const reliability = 100 * (longTermSuccessRate * 0.65 + recentSuccessRate * 0.35)
-      const responsiveness = responseFitness(state.firstTokenMs)
+      const preferredFirstTokenMs = state.semanticFirstTokenMs ?? state.transportFirstBodyMs
+      const responsiveness = responseFitness(preferredFirstTokenMs)
       const throughput = throughputFitness(state.outputTokensPerSecond)
       const failurePenalty = state.failurePenalty * 0.5 ** (elapsed / FAILURE_PENALTY_HALF_LIFE_MS)
       const circuitPenalty = account.cooldownReason === 'failure' || account.circuitState === 'open'
@@ -466,7 +680,9 @@ export class PoolScheduler {
         successRate: roundedPercent(longTermSuccessRate),
         recentSuccessRate: roundedPercent(recentSuccessRate),
         confidence: roundedPercent(confidenceRatio),
-        firstTokenMs: state.firstTokenMs,
+        firstTokenMs: preferredFirstTokenMs,
+        semanticFirstTokenMs: state.semanticFirstTokenMs,
+        transportFirstBodyMs: state.transportFirstBodyMs,
         outputTokensPerSecond: state.outputTokensPerSecond,
         failurePenalty,
         components,
@@ -483,19 +699,32 @@ export class PoolScheduler {
     this.roundRobinOffsets.clear()
     this.smoothWeighted.clear()
     this.sticky.clear()
+    this.stickyExpiry.length = 0
+    this.stickyKeysByAccount.clear()
     this.stickyFailureAvoidance.clear()
+    this.stickyFailureExpiry.length = 0
     this.activeStickySessions.clear()
+    this.activeStickySessionCounts.clear()
+    this.aggregatePoolIndexes = new WeakMap()
+    this.accountModelIndexes = new WeakMap()
     this.health.clear()
+    this.healthRevisions.clear()
+    this.healthReasons.clear()
     this.performance.clear()
   }
 
-  private isEligible(account: Account, adaptiveConcurrency: boolean): boolean {
-    if (!this.isAvailable(account)) return false
+  private bumpHealthRevision(accountId: string): number {
+    const next = this.getHealthRevision(accountId) + 1
+    this.healthRevisions.set(accountId, next)
+    return next
+  }
+
+  private isEligible(account: Account, pool: Pool, adaptiveConcurrency: boolean, now = this.now()): boolean {
+    if (!this.isAvailable(account, pool, now)) return false
     return this.inFlight(account) < this.concurrencyLimit(account, adaptiveConcurrency)
   }
 
-  private isAvailable(account: Account): boolean {
-    const now = this.now()
+  private isAvailable(account: Account, pool?: Pool, now = this.now()): boolean {
     const health = this.health.get(account.id)
     if (health?.circuitState === 'open' && (health.cooldownUntil ?? 0) <= now) {
       health.circuitState = 'half-open'
@@ -504,31 +733,32 @@ export class PoolScheduler {
     if (account.status === 'disabled' || account.status === 'expired' || account.status === 'checking') return false
     if (account.status === 'cooldown' && account.cooldownUntil === undefined) return false
     if (quotaExhausted(account, now)) return false
+    if (quotaProtectionBlocks(account.codexQuota, account.quotaProtection, now)) return false
+    if (quotaProtectionBlocks(account.codexQuota, pool?.quotaProtection, now)) return false
     if (cooldownUntil > now || (health?.circuitState === 'half-open' && this.inFlight(account) > 0)) return false
     return true
   }
 
-  private pick(pool: Pool, candidates: Account[], configuredAccounts: Account[], stickyKey?: string): Account {
+  private pick(pool: Pool, candidates: Account[], configuredAccounts: readonly Account[], stickyKey?: string): Account {
     const aggregate = isRelayAggregate(pool)
+    const aggregateIndex = aggregate ? this.getAggregatePoolIndex(pool) : undefined
     switch (pool.strategy) {
       case 'priority':
-        if (aggregate) return orderedAggregateCandidates(pool, candidates)[0]
-        return [...candidates].sort((a, b) =>
-          effectivePriority(a) - effectivePriority(b)
-          || this.inFlight(a) - this.inFlight(b))[0]
+        return selectMinimum(candidates, (account) => aggregateIndex
+          ? aggregateIndex.orderByAccountId.get(account.id) ?? Number.MAX_SAFE_INTEGER
+          : effectivePriority(account), (a, b) => this.inFlight(a) - this.inFlight(b))
       case 'balanced':
-        return [...candidates].sort((a, b) => {
-          const utilizationA = this.inFlight(a) / this.concurrencyLimit(a, false)
-          const utilizationB = this.inFlight(b) / this.concurrencyLimit(b, false)
-          return utilizationA - utilizationB
-            || quotaPressure(a) - quotaPressure(b)
+        return selectMinimum(candidates,
+          (account) => this.inFlight(account) / this.concurrencyLimit(account, false),
+          (a, b) => quotaPressure(a) - quotaPressure(b)
             || a.priority - b.priority
-            || a.id.localeCompare(b.id)
-        })[0]
+            || a.id.localeCompare(b.id))
       case 'autobalanced':
         return this.pickAutoBalanced(candidates, stickyKey)
       case 'round-robin': {
-        const ordered = aggregate ? orderedAggregateCandidates(pool, candidates) : candidates
+        const ordered = aggregateIndex
+          ? orderAggregateCandidates(aggregateIndex, candidates)
+          : candidates
         const offset = this.roundRobinOffsets.get(pool.id) ?? 0
         const selected = ordered[offset % ordered.length]
         this.roundRobinOffsets.set(pool.id, (offset + 1) % ordered.length)
@@ -555,39 +785,52 @@ export class PoolScheduler {
    * while spreading high-weight members across the window instead of serving
    * them in one burst.
    */
-  private pickSmoothWeighted(pool: Pool, candidates: Account[], configuredAccounts: Account[]): Account {
+  private pickSmoothWeighted(pool: Pool, candidates: Account[], configuredAccounts: readonly Account[]): Account {
     const aggregate = isRelayAggregate(pool)
-    const ordered = aggregate ? orderedAggregateCandidates(pool, candidates) : candidates
-    const weighted = ordered.map((account) => ({
-      account,
-      weight: aggregate ? aggregateMemberWeight(pool, account.id) : effectiveWeight(account)
-    }))
-    const usable = weighted.some(({ weight }) => weight > 0)
-      ? weighted
-      : weighted.map(({ account }) => ({ account, weight: 1 }))
-    const signature = smoothWeightedSignature(pool, configuredAccounts)
+    const aggregateIndex = aggregate ? this.getAggregatePoolIndex(pool) : undefined
+    const ordered = aggregateIndex ? orderAggregateCandidates(aggregateIndex, candidates) : candidates
     let state = this.smoothWeighted.get(pool.id)
-    if (!state || state.signature !== signature) {
-      state = { signature, current: new Map() }
+    const aggregateConfiguration = aggregateIndex?.smoothConfiguration
+    const configurationChanged = aggregateConfiguration
+      ? !state || !orderedMapEqual(state.configuration, aggregateConfiguration)
+      : !state || !configurationMatchesAccounts(state.configuration, configuredAccounts)
+    if (configurationChanged) {
+      const configuration = aggregateConfiguration ?? new Map(
+        configuredAccounts.map((account) => [account.id, effectiveWeight(account)])
+      )
+      state = { configuration, current: new Map() }
       this.smoothWeighted.set(pool.id, state)
     }
+    if (!state) throw new NoEligibleAccountError()
 
-    const totalWeight = usable.reduce((sum, { weight }) => sum + weight, 0)
-    let selected = usable[0]
+    const weightFor = (account: Account): number => aggregateIndex
+      ? aggregateIndex.weightByAccountId.get(account.id) ?? 1
+      : effectiveWeight(account)
+    let hasPositiveWeight = false
+    for (const account of ordered) {
+      if (weightFor(account) > 0) {
+        hasPositiveWeight = true
+        break
+      }
+    }
+    let totalWeight = 0
+    let selected = ordered[0]
     let selectedCurrent = Number.NEGATIVE_INFINITY
-    for (const entry of usable) {
-      const current = (state.current.get(entry.account.id) ?? 0) + entry.weight
-      state.current.set(entry.account.id, current)
+    for (const account of ordered) {
+      const weight = hasPositiveWeight ? weightFor(account) : 1
+      totalWeight += weight
+      const current = (state.current.get(account.id) ?? 0) + weight
+      state.current.set(account.id, current)
       // Keeping the first entry on ties makes the result deterministic. Relay
       // aggregates are already sorted by member order; standard pools retain
       // their existing account-array order.
       if (current > selectedCurrent) {
-        selected = entry
+        selected = account
         selectedCurrent = current
       }
     }
-    state.current.set(selected.account.id, selectedCurrent - totalWeight)
-    return selected.account
+    state.current.set(selected.id, selectedCurrent - totalWeight)
+    return selected
   }
 
   private inFlight(account: Account): number {
@@ -595,49 +838,63 @@ export class PoolScheduler {
   }
 
   private pickAutoBalanced(candidates: Account[], stickyKey?: string): Account {
-    const unmeasured = candidates.filter((account) => !this.hasPerformanceSample(account.id))
-    const measured = candidates.filter((account) => this.hasPerformanceSample(account.id))
+    const unmeasured: Account[] = []
+    const measured: Account[] = []
+    for (const account of candidates) {
+      ;(this.hasPerformanceSample(account.id) ? measured : unmeasured).push(account)
+    }
     if (unmeasured.length > 0 && measured.length > 0 && this.random() < AUTO_BALANCED_EXPLORATION_RATE) {
       return unmeasured[Math.min(unmeasured.length - 1, Math.floor(this.random() * unmeasured.length))]
     }
+    const now = this.now()
     const prior = conservativePerformancePrior(measured.map((account) =>
-      performanceCost(this.performance.get(account.id), this.now())))
-    const scored = candidates.map((account) => ({
-      account,
-      cost: this.autoBalancedCost(account, prior, stickyKey)
-    }))
-    const minimumCost = Math.min(...scored.map(({ cost }) => cost))
-    const best = scored.filter(({ cost }) => Math.abs(cost - minimumCost) < 0.001)
-    if (best.length > 1) {
-      return best[Math.min(best.length - 1, Math.floor(this.random() * best.length))].account
+      performanceCost(this.performance.get(account.id), now)))
+    let minimumCost = Number.POSITIVE_INFINITY
+    const best: Account[] = []
+    for (const account of candidates) {
+      const cost = this.autoBalancedCost(account, prior, stickyKey, now)
+      if (cost < minimumCost - 0.001) {
+        minimumCost = cost
+        best.length = 0
+        best.push(account)
+      } else if (Math.abs(cost - minimumCost) < 0.001) {
+        best.push(account)
+      }
     }
-    return best[0].account
+    if (best.length > 1) {
+      return best[Math.min(best.length - 1, Math.floor(this.random() * best.length))]
+    }
+    return best[0]
   }
 
   private shouldEscapeSticky(selected: Account, candidates: Account[]): boolean {
     const selectedPerformance = this.performance.get(selected.id)
+    const selectedMetric = stickyResponseMetric(selectedPerformance)
     if (
-      !selectedPerformance?.firstTokenMs
-      || selectedPerformance.sampleCount < STICKY_ESCAPE_MINIMUM_SAMPLES
+      !selectedPerformance
+      || !selectedMetric
+      || selectedMetric.sampleCount < STICKY_ESCAPE_MINIMUM_SAMPLES
       || this.now() - selectedPerformance.updatedAt >= PERFORMANCE_STALE_AFTER_MS
     ) return false
-    const alternatives = candidates
-      .filter((account) => account.id !== selected.id)
-      .map((account) => ({ account, performance: this.performance.get(account.id) }))
-      .filter((candidate): candidate is {
-        account: Account
-        performance: AccountPerformanceState & { firstTokenMs: number }
-      } => Boolean(
-        candidate.performance?.firstTokenMs
-        && candidate.performance.sampleCount >= STICKY_ESCAPE_MINIMUM_SAMPLES
-        && this.now() - candidate.performance.updatedAt < PERFORMANCE_STALE_AFTER_MS
-      ))
-      .sort((a, b) => a.performance.firstTokenMs - b.performance.firstTokenMs)
-    const fastest = alternatives[0]
-    if (!fastest) return false
-    return selectedPerformance.firstTokenMs >= Math.max(
-      fastest.performance.firstTokenMs + STICKY_ESCAPE_MINIMUM_DELTA_MS,
-      fastest.performance.firstTokenMs * STICKY_ESCAPE_RATIO
+    const now = this.now()
+    let fastestMs = Number.POSITIVE_INFINITY
+    for (const account of candidates) {
+      if (account.id === selected.id) continue
+      const performance = this.performance.get(account.id)
+      const metric = stickyResponseMetric(performance)
+      if (
+        !performance
+        || !metric
+        || metric.kind !== selectedMetric.kind
+        || metric.sampleCount < STICKY_ESCAPE_MINIMUM_SAMPLES
+        || now - performance.updatedAt >= PERFORMANCE_STALE_AFTER_MS
+      ) continue
+      if (metric.valueMs < fastestMs) fastestMs = metric.valueMs
+    }
+    if (!Number.isFinite(fastestMs)) return false
+    return selectedMetric.valueMs >= Math.max(
+      fastestMs + STICKY_ESCAPE_MINIMUM_DELTA_MS,
+      fastestMs * STICKY_ESCAPE_RATIO
     )
   }
 
@@ -648,24 +905,41 @@ export class PoolScheduler {
   ): boolean {
     const selectedSessionLoad = this.activeStickySessionCount(selected.id, stickyKey)
     if (selectedSessionLoad <= 0) return false
-    const lowerLoadAlternatives = candidates.filter((account) =>
-      account.id !== selected.id
-      && this.activeStickySessionCount(account.id, stickyKey) < selectedSessionLoad
-    )
-    if (lowerLoadAlternatives.length === 0) return false
+    let hasLowerLoadAlternative = false
+    for (const account of candidates) {
+      if (
+        account.id !== selected.id
+        && this.activeStickySessionCount(account.id, stickyKey) < selectedSessionLoad
+      ) {
+        hasLowerLoadAlternative = true
+        break
+      }
+    }
+    if (!hasLowerLoadAlternative) return false
     const measured = candidates.filter((account) => this.hasPerformanceSample(account.id))
+    const now = this.now()
     const prior = conservativePerformancePrior(measured.map((account) =>
-      performanceCost(this.performance.get(account.id), this.now())))
-    const selectedCost = this.autoBalancedCost(selected, prior, stickyKey)
-    return lowerLoadAlternatives.some((account) =>
-      this.autoBalancedCost(account, prior, stickyKey) < selectedCost
-    )
+      performanceCost(this.performance.get(account.id), now)))
+    const selectedCost = this.autoBalancedCost(selected, prior, stickyKey, now)
+    for (const account of candidates) {
+      if (
+        account.id !== selected.id
+        && this.activeStickySessionCount(account.id, stickyKey) < selectedSessionLoad
+        && this.autoBalancedCost(account, prior, stickyKey, now) < selectedCost
+      ) return true
+    }
+    return false
   }
 
-  private autoBalancedCost(account: Account, unmeasuredPrior: number, stickyKey?: string): number {
+  private autoBalancedCost(
+    account: Account,
+    unmeasuredPrior: number,
+    stickyKey?: string,
+    now = this.now()
+  ): number {
     const utilization = this.inFlight(account) / this.concurrencyLimit(account, true)
     const performance = this.performance.get(account.id)
-    const performanceEstimate = estimatedPerformanceCost(performance, unmeasuredPrior, this.now())
+    const performanceEstimate = estimatedPerformanceCost(performance, unmeasuredPrior, now)
     return utilization * 1_000
       + this.activeStickySessionCount(account.id, stickyKey) * CONCURRENT_STICKY_SESSION_PENALTY
       + quotaPressure(account) * 200
@@ -674,15 +948,16 @@ export class PoolScheduler {
   }
 
   private activeStickySessionCount(accountId: string, excludingStickyKey?: string): number {
-    let count = 0
-    for (const [stickyKey, accounts] of this.activeStickySessions) {
-      if (stickyKey !== excludingStickyKey && (accounts.get(accountId) ?? 0) > 0) count += 1
-    }
-    return count
+    const count = this.activeStickySessionCounts.get(accountId) ?? 0
+    if (!excludingStickyKey) return count
+    return count - ((this.activeStickySessions.get(excludingStickyKey)?.get(accountId) ?? 0) > 0 ? 1 : 0)
   }
 
   private acquireActiveStickySession(stickyKey: string, accountId: string): void {
     const accounts = this.activeStickySessions.get(stickyKey) ?? new Map<string, number>()
+    if ((accounts.get(accountId) ?? 0) === 0) {
+      this.activeStickySessionCounts.set(accountId, (this.activeStickySessionCounts.get(accountId) ?? 0) + 1)
+    }
     accounts.set(accountId, (accounts.get(accountId) ?? 0) + 1)
     this.activeStickySessions.set(stickyKey, accounts)
   }
@@ -692,12 +967,131 @@ export class PoolScheduler {
     if (!accounts) return
     const remaining = Math.max(0, (accounts.get(accountId) ?? 0) - 1)
     if (remaining > 0) accounts.set(accountId, remaining)
-    else accounts.delete(accountId)
+    else {
+      accounts.delete(accountId)
+      const sessionCount = Math.max(0, (this.activeStickySessionCounts.get(accountId) ?? 0) - 1)
+      if (sessionCount > 0) this.activeStickySessionCounts.set(accountId, sessionCount)
+      else this.activeStickySessionCounts.delete(accountId)
+    }
     if (accounts.size === 0) this.activeStickySessions.delete(stickyKey)
   }
 
+  private setSticky(stickyKey: string, assignment: StickyAssignment): void {
+    this.deleteSticky(stickyKey)
+    this.sticky.set(stickyKey, assignment)
+    const keys = this.stickyKeysByAccount.get(assignment.accountId) ?? new Set<string>()
+    keys.add(stickyKey)
+    this.stickyKeysByAccount.set(assignment.accountId, keys)
+    pushExpiry(this.stickyExpiry, { key: stickyKey, expiresAt: assignment.expiresAt })
+    compactExpiryHeap(this.stickyExpiry, this.sticky)
+  }
+
+  private deleteSticky(stickyKey: string): StickyAssignment | undefined {
+    const assignment = this.sticky.get(stickyKey)
+    if (!assignment) return undefined
+    this.sticky.delete(stickyKey)
+    const keys = this.stickyKeysByAccount.get(assignment.accountId)
+    keys?.delete(stickyKey)
+    if (keys?.size === 0) this.stickyKeysByAccount.delete(assignment.accountId)
+    return assignment
+  }
+
+  private setStickyFailureAvoidance(stickyKey: string, avoidance: StickyFailureAvoidance): void {
+    this.stickyFailureAvoidance.set(stickyKey, avoidance)
+    pushExpiry(this.stickyFailureExpiry, { key: stickyKey, expiresAt: avoidance.expiresAt })
+    compactExpiryHeap(this.stickyFailureExpiry, this.stickyFailureAvoidance)
+  }
+
+  private deleteStickyFailureAvoidance(stickyKey: string): void {
+    this.stickyFailureAvoidance.delete(stickyKey)
+  }
+
+  /**
+   * Expiration heaps make cleanup global instead of relying on the same
+   * session being selected again. Entries are lazy: replacing/deleting a
+   * sticky assignment leaves its old heap node behind, which is discarded
+   * after comparing it with the current map value.
+   */
+  private cleanupExpiredSticky(now: number): void {
+    while ((this.stickyExpiry[0]?.expiresAt ?? Number.POSITIVE_INFINITY) <= now) {
+      const expired = popExpiry(this.stickyExpiry)
+      if (!expired) break
+      const current = this.sticky.get(expired.key)
+      if (current?.expiresAt === expired.expiresAt) this.deleteSticky(expired.key)
+    }
+    while ((this.stickyFailureExpiry[0]?.expiresAt ?? Number.POSITIVE_INFINITY) <= now) {
+      const expired = popExpiry(this.stickyFailureExpiry)
+      if (!expired) break
+      const current = this.stickyFailureAvoidance.get(expired.key)
+      if (current?.expiresAt === expired.expiresAt) this.deleteStickyFailureAvoidance(expired.key)
+    }
+  }
+
+  private getAggregatePoolIndex(pool: Pool): AggregatePoolIndex {
+    const cached = this.aggregatePoolIndexes.get(pool)
+    if (
+      cached
+      && cached.pool === pool
+      && cached.members === pool.members
+      && cached.updatedAt === pool.updatedAt
+    ) return cached
+
+    const orderedMembers = pool.members
+      .map((member, position) => ({
+        member,
+        position,
+        order: finiteNumber(member.order, position)
+      }))
+      .sort((a, b) => a.order - b.order
+        || a.position - b.position
+        || a.member.accountId.localeCompare(b.member.accountId))
+    const orderedAccountIds = orderedMembers.map(({ member }) => member.accountId)
+    const orderByAccountId = new Map(orderedAccountIds.map((accountId, rank) => [accountId, rank]))
+    const weightByAccountId = new Map(pool.members.map((member) => [
+      member.accountId,
+      positiveFiniteNumber(member.weight, 1)
+    ]))
+    const smoothConfiguration = new Map(orderedMembers
+      .filter(({ member }) => member.enabled)
+      .map(({ member }) => [member.accountId, positiveFiniteNumber(member.weight, 1)]))
+    const index: AggregatePoolIndex = {
+      pool,
+      members: pool.members,
+      updatedAt: pool.updatedAt,
+      orderedAccountIds,
+      orderByAccountId,
+      weightByAccountId,
+      smoothConfiguration
+    }
+    this.aggregatePoolIndexes.set(pool, index)
+    return index
+  }
+
+  private accountAllowsModel(account: Account, model: string): boolean {
+    if (account.modelPolicy !== 'selected' && account.modelsRefreshedAt === undefined) return true
+    const source = account.modelPolicy === 'selected' ? account.modelAllowlist : account.availableModels
+    let index = this.accountModelIndexes.get(account)
+    if (
+      !index
+      || index.updatedAt !== account.updatedAt
+      || index.modelPolicy !== account.modelPolicy
+      || index.modelsRefreshedAt !== account.modelsRefreshedAt
+      || index.source !== source
+    ) {
+      index = {
+        updatedAt: account.updatedAt,
+        modelPolicy: account.modelPolicy,
+        modelsRefreshedAt: account.modelsRefreshedAt,
+        source,
+        allowed: new Set(source)
+      }
+      this.accountModelIndexes.set(account, index)
+    }
+    return index.allowed.has(model)
+  }
+
   private hasPerformanceSample(accountId: string): boolean {
-    return (this.performance.get(accountId)?.sampleCount ?? 0) > 0
+    return (this.performance.get(accountId)?.performanceSampleCount ?? 0) > 0
   }
 
   private decayedFailurePenalty(state: AccountPerformanceState | undefined): number {
@@ -715,6 +1109,57 @@ export class PoolScheduler {
   }
 }
 
+/** Pure policy evaluator exported for diagnostics and deterministic tests. */
+export function quotaProtectionBlocks(
+  quota: Account['codexQuota'],
+  policy: QuotaProtectionPolicy | undefined,
+  now = Date.now()
+): boolean {
+  if (!policy) return false
+  const protectsFiveHour = finiteReserve(policy.fiveHourRemainingPercent) !== undefined
+  const protectsSevenDay = finiteReserve(policy.sevenDayRemainingPercent) !== undefined
+  if (!protectsFiveHour && !protectsSevenDay) return false
+
+  const staleAfterMinutes = positiveFinite(policy.staleAfterMinutes)
+  const unavailable = !quota || (
+    staleAfterMinutes !== undefined
+    && now - quota.observedAt > staleAfterMinutes * 60_000
+  )
+  if (unavailable) return policy.unavailableBehavior === 'block'
+
+  const fiveHourReserve = finiteReserve(policy.fiveHourRemainingPercent)
+  if (fiveHourReserve !== undefined) {
+    const used = finiteUsedPercent(quota.fiveHour?.usedPercent)
+    if (used === undefined) {
+      if (policy.unavailableBehavior === 'block') return true
+    } else if (100 - used <= fiveHourReserve) {
+      return true
+    }
+  }
+  const sevenDayReserve = finiteReserve(policy.sevenDayRemainingPercent)
+  if (sevenDayReserve !== undefined) {
+    const used = finiteUsedPercent(quota.sevenDay?.usedPercent)
+    if (used === undefined) {
+      if (policy.unavailableBehavior === 'block') return true
+    } else if (100 - used <= sevenDayReserve) {
+      return true
+    }
+  }
+  return false
+}
+
+function finiteReserve(value: number | undefined): number | undefined {
+  return Number.isFinite(value) ? Math.max(0, Math.min(100, value!)) : undefined
+}
+
+function finiteUsedPercent(value: number | undefined): number | undefined {
+  return Number.isFinite(value) ? Math.max(0, Math.min(100, value!)) : undefined
+}
+
+function positiveFinite(value: number | undefined): number | undefined {
+  return Number.isFinite(value) && value! > 0 ? value : undefined
+}
+
 function estimatedPerformanceCost(
   state: AccountPerformanceState | undefined,
   unmeasuredPrior: number,
@@ -728,7 +1173,7 @@ function estimatedPerformanceCost(
 
 function performanceCost(state: AccountPerformanceState | undefined, now: number): number {
   if (!state) return 4
-  const firstTokenSeconds = state.firstTokenMs === undefined ? 3 : state.firstTokenMs / 1000
+  const firstTokenSeconds = schedulerFirstTokenCostMs(state) / 1000
   const outputPenalty = state.outputTokensPerSecond === undefined
     ? 1.5
     : 50 / Math.max(1, state.outputTokensPerSecond)
@@ -746,7 +1191,7 @@ function conservativePerformancePrior(costs: number[]): number {
   return Math.max(4, p75 * 1.15)
 }
 
-function rawFirstBytePerformanceMs(log: RequestLog): number | undefined {
+function transportFirstBodyPerformanceMs(log: RequestLog): number | undefined {
   if (log.upstreamFirstByteMs !== undefined) {
     // firstTokenMs is request-relative while accountFirstTokenMs is relative to
     // the successful attempt. Their difference removes time spent in failed
@@ -761,6 +1206,54 @@ function rawFirstBytePerformanceMs(log: RequestLog): number | undefined {
   return log.accountFirstTokenMs === undefined ? positiveMetric(log.firstTokenMs) : undefined
 }
 
+function semanticFirstTokenPerformanceMs(log: RequestLog): number | undefined {
+  return positiveMetric(log.accountFirstTokenMs)
+}
+
+function failedAttemptDurationMs(log: RequestLog): number {
+  return log.firstTokenMs !== undefined && log.accountFirstTokenMs !== undefined
+    ? Math.max(0, log.firstTokenMs - log.accountFirstTokenMs)
+    : 0
+}
+
+function schedulerFirstTokenCostMs(state: AccountPerformanceState): number {
+  if (state.semanticFirstTokenMs !== undefined) return state.semanticFirstTokenMs
+  if (state.transportFirstBodyMs !== undefined) {
+    return Math.max(
+      TRANSPORT_FALLBACK_FLOOR_MS,
+      state.transportFirstBodyMs + TRANSPORT_FALLBACK_UNCERTAINTY_MS
+    )
+  }
+  return 3_000
+}
+
+type StickyResponseMetric = {
+  kind: 'semantic' | 'transport'
+  valueMs: number
+  sampleCount: number
+}
+
+function stickyResponseMetric(
+  state: AccountPerformanceState | undefined
+): StickyResponseMetric | undefined {
+  if (!state) return undefined
+  if (state.semanticFirstTokenMs !== undefined) {
+    return {
+      kind: 'semantic',
+      valueMs: state.semanticFirstTokenMs,
+      sampleCount: state.semanticSampleCount
+    }
+  }
+  if (state.transportFirstBodyMs !== undefined) {
+    return {
+      kind: 'transport',
+      valueMs: state.transportFirstBodyMs,
+      sampleCount: state.transportSampleCount
+    }
+  }
+  return undefined
+}
+
 function positiveMetric(value: number | undefined): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined
 }
@@ -773,6 +1266,10 @@ function updateEwma(
   if (sample === undefined) return current
   if (current === undefined) return sample
   return current + alpha * (sample - current)
+}
+
+function metricAlpha(sampleCount: number): number {
+  return sampleCount < 5 ? 0.45 : 0.18
 }
 
 function responseFitness(firstTokenMs: number | undefined): number {
@@ -811,10 +1308,12 @@ function quotaExhausted(account: Account, now: number): boolean {
 }
 
 function quotaPressure(account: Account): number {
-  const ratios = quotaWindows(account)
-    .filter((window) => window?.limit !== undefined && window.limit > 0 && window.remaining !== undefined)
-    .map((window) => Math.max(0, Math.min(1, 1 - window!.remaining! / window!.limit!)))
-  return ratios.length ? Math.max(...ratios) : 0
+  let pressure = 0
+  for (const window of quotaWindows(account)) {
+    if (window?.limit === undefined || window.limit <= 0 || window.remaining === undefined) continue
+    pressure = Math.max(pressure, Math.max(0, Math.min(1, 1 - window.remaining / window.limit)))
+  }
+  return pressure
 }
 
 function effectivePriority(account: Account): number {
@@ -829,41 +1328,108 @@ function isRelayAggregate(pool: Pool): boolean {
   return pool.kind === 'relay-aggregate'
 }
 
-function orderedAggregateCandidates(pool: Pool, candidates: Account[]): Account[] {
-  const members = pool.members
-  const memberPosition = new Map(members.map((member, index) => [member.accountId, index]))
-  const memberOrder = new Map(members.map((member, index) => [
-    member.accountId,
-    finiteNumber(member.order, index)
-  ]))
-  return [...candidates].sort((a, b) =>
-    (memberOrder.get(a.id) ?? Number.MAX_SAFE_INTEGER)
-      - (memberOrder.get(b.id) ?? Number.MAX_SAFE_INTEGER)
-    || (memberPosition.get(a.id) ?? Number.MAX_SAFE_INTEGER)
-      - (memberPosition.get(b.id) ?? Number.MAX_SAFE_INTEGER)
-    || a.id.localeCompare(b.id)
-  )
-}
-
-function aggregateMemberWeight(pool: Pool, accountId: string): number {
-  const member = pool.members.find((candidate) => candidate.accountId === accountId)
-  return positiveFiniteNumber(member?.weight, 1)
-}
-
-function smoothWeightedSignature(pool: Pool, configuredAccounts: readonly Account[]): string {
-  if (isRelayAggregate(pool)) {
-    return pool.members
-      .filter((member) => member.enabled)
-      .map((member, index) => [
-        member.accountId,
-        finiteNumber(member.order, index),
-        positiveFiniteNumber(member.weight, 1)
-      ].join(':'))
-      .join('|')
+function orderAggregateCandidates(index: AggregatePoolIndex, candidates: Account[]): Account[] {
+  const ordered: Account[] = []
+  const candidatesById = new Map(candidates.map((account) => [account.id, account]))
+  for (const accountId of index.orderedAccountIds) {
+    const candidate = candidatesById.get(accountId)
+    if (candidate) ordered.push(candidate)
   }
-  return configuredAccounts
-    .map((account) => `${account.id}:${effectiveWeight(account)}`)
-    .join('|')
+  // Defensive compatibility for a transient configuration snapshot where the
+  // scheduler sees an account before the pool-member index. Normal aggregate
+  // calls never enter this branch.
+  const unknown = candidates
+    .filter((account) => !index.orderByAccountId.has(account.id))
+    .sort((a, b) => a.id.localeCompare(b.id))
+  ordered.push(...unknown)
+  return ordered
+}
+
+function orderedMapEqual(left: Map<string, number>, right: Map<string, number>): boolean {
+  if (left.size !== right.size) return false
+  const leftEntries = left.entries()
+  const rightEntries = right.entries()
+  while (true) {
+    const a = leftEntries.next()
+    const b = rightEntries.next()
+    if (a.done || b.done) return a.done === b.done
+    if (a.value[0] !== b.value[0] || a.value[1] !== b.value[1]) return false
+  }
+}
+
+function configurationMatchesAccounts(
+  configuration: Map<string, number>,
+  accounts: readonly Account[]
+): boolean {
+  if (configuration.size !== accounts.length) return false
+  const entries = configuration.entries()
+  for (const account of accounts) {
+    const entry = entries.next()
+    if (entry.done || entry.value[0] !== account.id || entry.value[1] !== effectiveWeight(account)) return false
+  }
+  return entries.next().done === true
+}
+
+function selectMinimum(
+  candidates: Account[],
+  score: (account: Account) => number,
+  tieBreak: (left: Account, right: Account) => number
+): Account {
+  let selected = candidates[0]
+  let selectedScore = score(selected)
+  for (let index = 1; index < candidates.length; index += 1) {
+    const candidate = candidates[index]
+    const candidateScore = score(candidate)
+    if (
+      candidateScore < selectedScore
+      || (candidateScore === selectedScore && tieBreak(candidate, selected) < 0)
+    ) {
+      selected = candidate
+      selectedScore = candidateScore
+    }
+  }
+  return selected
+}
+
+function pushExpiry(heap: StickyExpiryEntry[], entry: StickyExpiryEntry): void {
+  let index = heap.push(entry) - 1
+  while (index > 0) {
+    const parent = Math.floor((index - 1) / 2)
+    if (heap[parent].expiresAt <= entry.expiresAt) break
+    heap[index] = heap[parent]
+    index = parent
+  }
+  heap[index] = entry
+}
+
+function popExpiry(heap: StickyExpiryEntry[]): StickyExpiryEntry | undefined {
+  const first = heap[0]
+  const last = heap.pop()
+  if (!first || !last || heap.length === 0) return first
+  let index = 0
+  while (true) {
+    const left = index * 2 + 1
+    if (left >= heap.length) break
+    const right = left + 1
+    const child = right < heap.length && heap[right].expiresAt < heap[left].expiresAt ? right : left
+    if (heap[child].expiresAt >= last.expiresAt) break
+    heap[index] = heap[child]
+    index = child
+  }
+  heap[index] = last
+  return first
+}
+
+function compactExpiryHeap<T extends { expiresAt: number }>(
+  heap: StickyExpiryEntry[],
+  current: ReadonlyMap<string, T>
+): void {
+  // Renewals intentionally leave lazy heap entries behind. Periodic linear
+  // compaction keeps memory proportional to live sessions while retaining the
+  // cheap O(log n) common path.
+  if (heap.length <= current.size * 4 + 64) return
+  heap.length = 0
+  for (const [key, value] of current) pushExpiry(heap, { key, expiresAt: value.expiresAt })
 }
 
 function finiteNumber(value: number | undefined, fallback: number): number {

@@ -6,6 +6,7 @@ import type {
   AppUpdateState,
   BrowserImportQueueState,
   BrowserJsonCacheState,
+  BuiltInProxyRuntimeState,
   ClientConfigBackup,
   ClientConfigEditorState,
   ClientConfigFileRole,
@@ -25,9 +26,11 @@ import type {
   RouteClient,
   SetupWizardState,
 } from '@shared/types'
+import { previewRoute as buildRoutePreview } from '@shared/route-preview'
 import { supportsFastServiceTier } from '@shared/types'
 import { summarizeOpenAiTokenCosts } from '@shared/openai-pricing'
 import { hasRouteSourceIdCollision, isAvailableRouteAccount, resolveRouteSource } from '@shared/route-sources'
+import { patchCodexTomlPaths } from '../../main/client-config/toml-format'
 import { buildPoolModelCoverage, pruneModelSelection } from './model-policy'
 
 const STORAGE_KEY = 'stone.browser-mock.v2'
@@ -374,6 +377,7 @@ const routes: Route[] = [
     id: 'route-claude',
     client: 'claude',
     enabled: true,
+    highConcurrencyMode: false,
     poolId: 'pool-claude',
     inboundProtocol: 'anthropic-messages',
     modelMap: { 'claude-sonnet-4-20250514': 'claude-sonnet-4' },
@@ -385,6 +389,7 @@ const routes: Route[] = [
     id: 'route-codex',
     client: 'codex',
     enabled: true,
+    highConcurrencyMode: false,
     poolId: 'pool-codex',
     inboundProtocol: 'openai-responses',
     modelMap: { 'gpt-5-codex': 'gpt-5', 'gpt-5-mini': 'gpt-5-mini' },
@@ -396,6 +401,7 @@ const routes: Route[] = [
     id: 'route-gemini',
     client: 'gemini',
     enabled: false,
+    highConcurrencyMode: false,
     poolId: 'pool-gemini',
     inboundProtocol: 'gemini',
     modelMap: {},
@@ -688,7 +694,7 @@ const mockEditorContent: Record<RouteClient, Partial<Record<ClientConfigFileRole
     'claude-settings': '{\n  "model": "claude-sonnet-4-5",\n  "effortLevel": "high",\n  "permissions": {\n    "defaultMode": "default",\n    "allow": ["Read", "Grep"]\n  },\n  "env": {\n    "ANTHROPIC_AUTH_TOKEN": "__STONE_PROTECTED_VALUE__"\n  }\n}\n',
     'claude-mcp': '{\n  "mcpServers": {\n    "filesystem": {\n      "command": "npx",\n      "args": ["-y", "@modelcontextprotocol/server-filesystem"]\n    }\n  }\n}\n',
   },
-  codex: { 'codex-config': 'model_provider = "stone"\nmodel = "gpt-5.6-sol"\nmodel_reasoning_effort = "medium"\nmodel_reasoning_summary = "auto"\nmodel_verbosity = "medium"\npersonality = "pragmatic"\napproval_policy = "on-request"\nsandbox_mode = "workspace-write"\nweb_search = "cached"\ncli_auth_credentials_store = "file"\n\n[features]\nfast_mode = true\nmulti_agent = true\n\n[windows]\nsandbox = "elevated"\n\n[model_providers.stone]\nname = "OpenAI"\nbase_url = "http://127.0.0.1:15720/v1"\nwire_api = "responses"\nrequires_openai_auth = true\n' },
+  codex: { 'codex-config': 'model_provider = "stone"\nmodel = "gpt-5.6-sol"\nmodel_reasoning_effort = "medium"\nmodel_reasoning_summary = "auto"\nmodel_verbosity = "medium"\npersonality = "pragmatic"\napproval_policy = "on-request"\nsandbox_mode = "workspace-write"\nweb_search = "cached"\ncli_auth_credentials_store = "file"\n\n[features]\nfast_mode = true\nmulti_agent = true\n\n[agents]\nmax_threads = 6\n\n[windows]\nsandbox = "elevated"\n\n[model_providers.stone]\nname = "OpenAI"\nbase_url = "http://127.0.0.1:15720/v1"\nwire_api = "responses"\nrequires_openai_auth = true\n' },
   gemini: { 'gemini-settings': '{\n  "model": { "name": "gemini-2.5-pro" },\n  "general": { "defaultApprovalMode": "default" },\n  "ui": { "theme": "Default" }\n}\n', 'gemini-env': 'GEMINI_API_KEY="__STONE_PROTECTED_VALUE__"\nGOOGLE_GEMINI_BASE_URL="__STONE_PROTECTED_VALUE__"\n' },
 }
 
@@ -706,6 +712,7 @@ const mockEditorFields: Record<RouteClient, ClientConfigEditorState['fields']> =
     { id: 'codex.sandboxMode', role: 'codex-config', path: ['sandbox_mode'], section: '权限与沙箱', label: '沙箱模式', description: '限制工具可读取、写入和访问网络的范围。', control: 'select', value: 'workspace-write', recommendedValue: 'workspace-write', options: [{ value: 'read-only', label: '只读' }, { value: 'workspace-write', label: '工作区可写', recommended: true }, { value: 'danger-full-access', label: '完全访问' }] },
     { id: 'codex.webSearch', role: 'codex-config', path: ['web_search'], section: '工具与联网', label: '网页搜索', description: '控制网页搜索使用缓存索引还是实时网络。', control: 'select', value: 'cached', recommendedValue: 'cached', options: [{ value: 'disabled', label: '关闭' }, { value: 'cached', label: '缓存索引', recommended: true }, { value: 'indexed', label: '受控联网' }, { value: 'live', label: '实时联网' }] },
     { id: 'codex.feature.multi_agent', role: 'codex-config', path: ['features', 'multi_agent'], section: '功能开关', label: '多代理协作', description: '启用子代理协作工具。', control: 'toggle', value: true, recommendedValue: true, advanced: true },
+    { id: 'codex.agentsMaxThreads', role: 'codex-config', path: ['agents', 'max_threads'], section: '多代理', label: '子代理上限', description: '同时运行的子代理数量上限，不包含主任务；提高上限会增加并行能力和资源占用。', control: 'number', value: 6, min: 1, max: 64, step: 1, defaultValue: null, recommendedValue: 6 },
     { id: 'codex.windowsSandbox', role: 'codex-config', path: ['windows', 'sandbox'], section: '权限与沙箱', label: 'Windows 原生沙箱', description: '选择原生 Windows 沙箱实现。', control: 'select', value: 'elevated', recommendedValue: 'elevated', advanced: true, options: [{ value: 'elevated', label: '增强隔离', recommended: true }, { value: 'unelevated', label: '普通隔离' }] },
     { id: 'codex.discovered.model_providers/stone/base_url', role: 'codex-config', path: ['model_providers', 'stone', 'base_url'], section: '模型供应商（扩展）', label: 'base_url', description: 'Stone+ 本地网关地址；应用路由时自动维护。', control: 'text', value: 'http://127.0.0.1:15720/v1', readOnly: true, managedByStone: true, advanced: true, source: 'discovered' },
   ],
@@ -780,12 +787,31 @@ export function createMockApi(): GatewayApi {
     logs: [],
   }
   const listeners = new Set<(value: AppSnapshot) => void>()
+  const builtInProxyListeners = new Set<(value: BuiltInProxyRuntimeState) => void>()
   const accountImportProgressListeners = new Set<(value: AccountImportProgress) => void>()
   const updateListeners = new Set<(value: AppUpdateState) => void>()
   const browserImportListeners = new Set<(value: BrowserImportQueueState) => void>()
   let browserImportQueue: BrowserImportQueueState = { items: [], readyCount: 0, totalBytes: 0, revision: 0 }
   let browserJsonCache: BrowserJsonCacheState = { items: [], totalBytes: 0 }
   let setupWizardState: Awaited<ReturnType<GatewayApi['getSetupWizardState']>> = null
+  let webDavConfiguration = { baseUrl: '', username: '', hasPassword: false, configured: false }
+  let builtInProxyState: BuiltInProxyRuntimeState = {
+    desiredEnabled: false,
+    status: 'disabled',
+    routeGeneration: 0,
+    settings: {
+      desiredEnabled: false,
+      accessMode: 'system',
+      ruleMode: 'rule',
+      mixedPort: 20800,
+      lanEnabled: false,
+      autoStart: false,
+      hasEverActivated: false,
+      updatedAt: Date.now(),
+    },
+    profiles: [],
+    effectiveRoute: { generation: 0, kind: 'external', externalMode: 'direct' },
+  }
   const oauthSessions = new Map<string, {
     input: Parameters<GatewayApi['startChatGptOAuth']>[0]
     callbackSubmitted: boolean
@@ -872,6 +898,58 @@ export function createMockApi(): GatewayApi {
     }
     const value = clone(updateState)
     updateListeners.forEach((listener) => listener(value))
+    return value
+  }
+
+  const reconcileBuiltInProxyState = (): BuiltInProxyRuntimeState => {
+    const timestamp = Date.now()
+    const activeProfile = builtInProxyState.profiles.find((profile) => (
+      profile.id === builtInProxyState.settings.activeProfileId
+    ))
+    const activeNode = activeProfile?.nodes.find((node) => node.id === activeProfile.activeNodeId)
+    const generation = builtInProxyState.routeGeneration + 1
+    const ready = builtInProxyState.desiredEnabled && activeProfile !== undefined && activeNode !== undefined
+    const awaitingFirstConfiguration = builtInProxyState.desiredEnabled
+      && builtInProxyState.profiles.length === 0
+      && !builtInProxyState.settings.hasEverActivated
+    const failClosed = builtInProxyState.desiredEnabled
+      && !ready
+      && builtInProxyState.settings.hasEverActivated
+    builtInProxyState = {
+      ...builtInProxyState,
+      status: !builtInProxyState.desiredEnabled || awaitingFirstConfiguration
+        ? 'disabled'
+        : ready ? 'ready' : 'error',
+      routeGeneration: generation,
+      settings: {
+        ...builtInProxyState.settings,
+        desiredEnabled: builtInProxyState.desiredEnabled,
+        hasEverActivated: builtInProxyState.settings.hasEverActivated || ready,
+        ...(ready ? { lastActivatedAt: timestamp } : {}),
+        updatedAt: timestamp,
+      },
+      effectiveRoute: ready ? {
+        generation,
+        kind: builtInProxyState.settings.accessMode === 'tun' ? 'built-in-tun' : 'built-in-mixed',
+        profileId: activeProfile.id,
+        nodeId: activeNode.id,
+        mixedPort: builtInProxyState.settings.mixedPort,
+        activatedAt: timestamp,
+      } : {
+        generation,
+        kind: failClosed ? 'blocked' : 'external',
+        ...(!failClosed ? { externalMode: snapshot.gateway.outboundNetworkMode ?? 'direct' } : {}),
+      },
+      ...(ready || !builtInProxyState.desiredEnabled || awaitingFirstConfiguration ? { error: undefined } : {
+        error: {
+          category: 'configuration-invalid',
+          message: mockText('请选择可用的内置代理节点', 'Select an available built-in proxy node.'),
+          retryable: false,
+        },
+      }),
+    }
+    const value = clone(builtInProxyState)
+    builtInProxyListeners.forEach((listener) => listener(value))
     return value
   }
 
@@ -1034,7 +1112,7 @@ export function createMockApi(): GatewayApi {
           : parsed.proxy_id ?? parsed.proxyId
       if (selectedProxyId && !snapshot.proxies.some((proxy) => proxy.id === selectedProxyId)) {
         throw new Error(input.proxyMode === 'proxy'
-          ? mockText('选择的出口代理已被删除，请重新选择后再导入。', 'The selected outbound proxy was deleted. Select another proxy before importing.')
+          ? mockText('选择的代理已被删除，请重新选择后再导入。', 'The selected proxy was deleted. Select another proxy before importing.')
           : mockText('文件代理不存在。', 'The proxy specified by the file does not exist.'))
       }
       if (input.tagId && !snapshot.accountTags.some((tag) => tag.id === input.tagId)) throw new Error(mockText('标签不存在', 'Tag not found'))
@@ -1084,7 +1162,7 @@ export function createMockApi(): GatewayApi {
       await pause(180)
       emitImportProgress(input.progressId, { phase: 'importing', completed: 2, total: 2, percent: 50, message: '正在导入文件 2/2' })
       if (input.proxyMode === 'proxy' && !snapshot.proxies.some((proxy) => proxy.id === input.proxyId)) {
-        throw new Error(mockText('选择的出口代理已被删除，请重新选择后再导入。', 'The selected outbound proxy was deleted. Select another proxy before importing.'))
+        throw new Error(mockText('选择的代理已被删除，请重新选择后再导入。', 'The selected proxy was deleted. Select another proxy before importing.'))
       }
       if (input.tagId && !snapshot.accountTags.some((tag) => tag.id === input.tagId)) throw new Error(mockText('标签不存在', 'Tag not found'))
       const provider = ensureOAuthProvider()
@@ -1136,7 +1214,7 @@ export function createMockApi(): GatewayApi {
     },
     async startChatGptOAuth(input) {
       if (input.proxyMode === 'proxy' && !snapshot.proxies.some((proxy) => proxy.id === input.proxyId)) {
-        throw new Error(mockText('选择的出口代理已被删除，请重新选择后再授权。', 'The selected outbound proxy was deleted. Select another proxy before authorizing.'))
+        throw new Error(mockText('选择的代理已被删除，请重新选择后再授权。', 'The selected proxy was deleted. Select another proxy before authorizing.'))
       }
       if (input.tagId && !snapshot.accountTags.some((tag) => tag.id === input.tagId)) throw new Error(mockText('标签不存在', 'Tag not found'))
       const sessionId = makeId('oauth')
@@ -1316,6 +1394,173 @@ export function createMockApi(): GatewayApi {
       } : proxy)
       return publish()
     },
+    async getBuiltInProxyState() {
+      return clone(builtInProxyState)
+    },
+    async setBuiltInProxyEnabled(enabled: boolean) {
+      builtInProxyState = { ...builtInProxyState, desiredEnabled: enabled }
+      return reconcileBuiltInProxyState()
+    },
+    async retryBuiltInProxy() {
+      return reconcileBuiltInProxyState()
+    },
+    async importBuiltInProxyProfile(input) {
+      const timestamp = Date.now()
+      const profileId = makeId('built-in-profile')
+      const nodeId = makeId('built-in-node')
+      const profile: BuiltInProxyRuntimeState['profiles'][number] = {
+        id: profileId,
+        name: input.name?.trim() || mockText('演示内置代理', 'Demo built-in proxy'),
+        source: input.source,
+        format: input.format ?? (input.source === 'subscription' ? 'clash-meta-yaml' : 'sing-box-json'),
+        nodes: [{
+          id: nodeId,
+          name: mockText('演示节点', 'Demo node'),
+          type: 'mock',
+          groupIds: [],
+          latencyStatus: 'untested',
+        }],
+        nodeCount: 1,
+        groupCount: 0,
+        ruleStatus: 'fallback',
+        activeNodeId: nodeId,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      }
+      builtInProxyState = {
+        ...builtInProxyState,
+        profiles: [...builtInProxyState.profiles, profile],
+        settings: {
+          ...builtInProxyState.settings,
+          activeProfileId: builtInProxyState.settings.activeProfileId ?? profileId,
+        },
+      }
+      return reconcileBuiltInProxyState()
+    },
+    async refreshBuiltInProxyProfile(id: string) {
+      if (!builtInProxyState.profiles.some((profile) => profile.id === id)) {
+        throw new Error(mockText('内置代理配置不存在', 'Built-in proxy profile not found'))
+      }
+      const timestamp = Date.now()
+      builtInProxyState = {
+        ...builtInProxyState,
+        profiles: builtInProxyState.profiles.map((profile) => profile.id === id ? {
+          ...profile,
+          updatedAt: timestamp,
+          lastRefreshAt: timestamp,
+        } : profile),
+      }
+      return reconcileBuiltInProxyState()
+    },
+    async deleteBuiltInProxyProfile(id: string) {
+      const profiles = builtInProxyState.profiles.filter((profile) => profile.id !== id)
+      builtInProxyState = {
+        ...builtInProxyState,
+        profiles,
+        settings: {
+          ...builtInProxyState.settings,
+          activeProfileId: builtInProxyState.settings.activeProfileId === id
+            ? profiles[0]?.id
+            : builtInProxyState.settings.activeProfileId,
+        },
+      }
+      return reconcileBuiltInProxyState()
+    },
+    async selectBuiltInProxyProfile(id: string) {
+      if (!builtInProxyState.profiles.some((profile) => profile.id === id)) {
+        throw new Error(mockText('内置代理配置不存在', 'Built-in proxy profile not found'))
+      }
+      builtInProxyState = {
+        ...builtInProxyState,
+        settings: { ...builtInProxyState.settings, activeProfileId: id },
+      }
+      return reconcileBuiltInProxyState()
+    },
+    async selectBuiltInProxyNode(profileId: string, nodeId: string) {
+      const profile = builtInProxyState.profiles.find((candidate) => candidate.id === profileId)
+      if (!profile?.nodes.some((node) => node.id === nodeId)) {
+        throw new Error(mockText('内置代理节点不存在', 'Built-in proxy node not found'))
+      }
+      builtInProxyState = {
+        ...builtInProxyState,
+        profiles: builtInProxyState.profiles.map((candidate) => candidate.id === profileId
+          ? { ...candidate, activeNodeId: nodeId, updatedAt: Date.now() }
+          : candidate),
+        settings: { ...builtInProxyState.settings, activeProfileId: profileId },
+      }
+      return reconcileBuiltInProxyState()
+    },
+    async setBuiltInProxyRuleMode(ruleMode) {
+      builtInProxyState = {
+        ...builtInProxyState,
+        settings: { ...builtInProxyState.settings, ruleMode },
+      }
+      return reconcileBuiltInProxyState()
+    },
+    async setBuiltInProxyAccessMode(accessMode) {
+      builtInProxyState = {
+        ...builtInProxyState,
+        settings: { ...builtInProxyState.settings, accessMode },
+      }
+      return reconcileBuiltInProxyState()
+    },
+    async setBuiltInProxyLanEnabled(lanEnabled: boolean) {
+      builtInProxyState = {
+        ...builtInProxyState,
+        settings: { ...builtInProxyState.settings, lanEnabled },
+      }
+      return reconcileBuiltInProxyState()
+    },
+    async setBuiltInProxyAutoStart(autoStart: boolean) {
+      builtInProxyState = {
+        ...builtInProxyState,
+        settings: { ...builtInProxyState.settings, autoStart },
+      }
+      return reconcileBuiltInProxyState()
+    },
+    async testBuiltInProxyLatency(profileId, nodeIds) {
+      const selectedProfileId = profileId ?? builtInProxyState.settings.activeProfileId
+      const selectedNodeIds = nodeIds ? new Set(nodeIds) : undefined
+      const testedNodes: BuiltInProxyRuntimeState['profiles'][number]['nodes'] = []
+      const timestamp = Date.now()
+      builtInProxyState = {
+        ...builtInProxyState,
+        profiles: builtInProxyState.profiles.map((profile) => {
+          if (profile.id !== selectedProfileId) return profile
+          return {
+            ...profile,
+            nodes: profile.nodes.map((node) => {
+              if (selectedNodeIds && !selectedNodeIds.has(node.id)) return node
+              const tested = {
+                ...node,
+                latencyMs: 42,
+                latencyStatus: 'available' as const,
+                lastTestedAt: timestamp,
+              }
+              testedNodes.push(tested)
+              return tested
+            }),
+            updatedAt: timestamp,
+          }
+        }),
+      }
+      return clone(testedNodes)
+    },
+    async getBuiltInProxyTraffic() {
+      return {
+        capturedAt: Date.now(),
+        uploadBytes: 0,
+        downloadBytes: 0,
+        uploadRateBytesPerSecond: 0,
+        downloadRateBytesPerSecond: 0,
+        activeConnections: 0,
+        totalConnections: 0,
+      }
+    },
+    async listBuiltInProxyConnections() {
+      return []
+    },
+    async closeBuiltInProxyConnection(_id: string) {},
     async savePool(input: PoolInput) {
       const timestamp = Date.now()
       const existing = input.id ? snapshot.pools.find((pool) => pool.id === input.id) : undefined
@@ -1388,7 +1633,18 @@ export function createMockApi(): GatewayApi {
       throw new Error('API source mock is not implemented yet.')
     },
     async probeApiSource() {
-      return { ok: false, stages: [], models: [], error: 'API source mock is not implemented yet.', warnings: [] }
+      return {
+        ok: false,
+        stages: [],
+        models: [],
+        error: 'API source mock is not implemented yet.',
+        warnings: [],
+        capabilityProfile: { version: 1, origin: 'inferred' },
+        modelCatalog: [],
+      }
+    },
+    async previewRoute(input) {
+      return buildRoutePreview(input, snapshot)
     },
     async deleteApiSource(id: string) {
       const provider = snapshot.providers.find((candidate) => candidate.id === id)
@@ -1502,7 +1758,11 @@ export function createMockApi(): GatewayApi {
       if (route.enabled && source?.provider && !source.accounts.some(isAvailableRouteAccount)) {
         throw new Error(mockText('所选 API 来源没有可用账号', 'The selected API source has no available accounts'))
       }
-      snapshot.routes = snapshot.routes.map((item) => (item.id === route.id ? { ...route, updatedAt: Date.now() } : item))
+      snapshot.routes = snapshot.routes.map((item) => (item.id === route.id ? {
+        ...route,
+        highConcurrencyMode: route.highConcurrencyMode === true,
+        updatedAt: Date.now()
+      } : item))
       return changed()
     },
     async updateGateway(settings: GatewaySettings) {
@@ -1614,6 +1874,22 @@ export function createMockApi(): GatewayApi {
       snapshot.requestLogs = []
       return changed()
     },
+    async getRequestReplayTemplate() {
+      return null
+    },
+    async replayRequest() {
+      throw new Error(mockText('开发预览没有可回放的内存请求', 'No memory-only replay is available in the development preview'))
+    },
+    async getLocalEventServerStatus() {
+      return {
+        running: true,
+        address: 'ws://127.0.0.1:15741/events',
+        discoveryFile: '~/.stone/event-server.json',
+        authentication: 'bearer-token' as const,
+        connectedClients: 0,
+        startedAt: Date.now()
+      }
+    },
     async clearHealthEvents() {
       snapshot.healthEvents = []
       return changed()
@@ -1707,6 +1983,19 @@ export function createMockApi(): GatewayApi {
       const result = await this.applyClientConfig(client, profileId)
       return { ...result, rebuiltRoles: [] }
     },
+    async restoreCodexOfficialLoginAndSessions(profileId) {
+      const profile = snapshot.clientProfiles.find((candidate) => candidate.id === profileId)
+      if (profileId && !profile) throw new Error(mockText('客户端配置 Profile 不存在', 'The client configuration profile does not exist'))
+      if (profile && profile.client !== 'codex') throw new Error(mockText('客户端配置 Profile 与 Codex 不匹配', 'The client configuration profile does not match Codex'))
+      const clientConfig = await this.applyClientConfig('codex', profileId)
+      const repair = await this.repairCodexSessions('openai', 'a'.repeat(64))
+      return {
+        clientConfig,
+        repair,
+        chatGptWasRunning: true,
+        chatGptRestarted: true,
+      }
+    },
     async listClientConfigBackups(client) {
       await pause()
       return clone(clientBackups.filter((backup) => backup.client === client))
@@ -1793,13 +2082,61 @@ export function createMockApi(): GatewayApi {
         const file = mockClientFiles[input.client].find((candidate) => candidate.role === draft.role)
         if (file) changedFiles.add(file.path)
       }
+      const codexPatches: Array<{ path: string[]; value: ClientConfigEditorState['fields'][number]['value'] }> = []
+      for (const patch of input.patches) {
+        const field = mockEditorFields[input.client].find((candidate) => candidate.id === patch.id)
+        if (!field || field.readOnly) continue
+        field.value = clone(patch.value)
+        if (input.client === 'codex' && field.role === 'codex-config') {
+          codexPatches.push({ path: field.path, value: patch.value })
+        }
+      }
+      if (codexPatches.length) {
+        mockEditorContent.codex['codex-config'] = patchCodexTomlPaths(
+          mockEditorContent.codex['codex-config'],
+          codexPatches,
+        ).content
+      }
       if (input.patches.length) changedFiles.add(mockClientFiles[input.client][0].path)
       return { client: input.client, changedFiles: [...changedFiles], backups: [], removedBackups: [] }
     },
+    async listManagedClientInstances() { return [] },
+    async saveManagedClientInstance() { return [] },
+    async deleteManagedClientInstance() { return [] },
+    async startManagedClientInstance() { return [] },
+    async stopManagedClientInstance() { return [] },
+    onManagedClientInstancesChanged() { return () => undefined },
+    async listPersistentTasks() { return [] },
+    async pausePersistentTask() { throw new Error('Persistent task not found.') },
+    async resumePersistentTask() { throw new Error('Persistent task not found.') },
+    async waitForPersistentTask() { throw new Error('Persistent task not found.') },
+    async cancelPersistentTask() { throw new Error('Persistent task not found.') },
+    async clearPersistentTasks() { return [] },
+    async startAccountCheckTask() { throw new Error('Persistent tasks are unavailable in mock mode.') },
     async listStateBackups() { return [] },
     async createStateBackup() { return {} },
     async verifyStateBackup(path) { return { path, createdAt: Date.now(), size: 0, integrity: 'valid', automatic: false } },
     async restoreStateBackup(path) { return { restored: { path, createdAt: Date.now(), size: 0, integrity: 'valid', automatic: false }, restartRequired: true } },
+    async exportPortableStateBackup() { return { cancelled: false, path: 'C:\\Users\\demo\\Documents\\StonePlus-state.stonebackup' } },
+    async importPortableStateBackup() { return { cancelled: false, path: 'C:\\Users\\demo\\Documents\\StonePlus-state.stonebackup' } },
+    async getWebDavBackupConfiguration() { return { ...webDavConfiguration } },
+    async saveWebDavBackupConfiguration(input) {
+      webDavConfiguration = {
+        baseUrl: input.baseUrl,
+        username: input.username ?? '',
+        hasPassword: Boolean(input.password) || (webDavConfiguration.hasPassword && !input.clearPassword),
+        configured: Boolean(input.baseUrl),
+      }
+      return { ...webDavConfiguration }
+    },
+    async clearWebDavBackupConfiguration() {
+      webDavConfiguration = { baseUrl: '', username: '', hasPassword: false, configured: false }
+      return { ...webDavConfiguration }
+    },
+    async testWebDavBackup() {},
+    async listWebDavBackups() { return [] },
+    async uploadLatestWebDavBackup() { throw new Error('WebDAV backup is unavailable in browser preview.') },
+    async downloadWebDavBackup() { throw new Error('WebDAV backup is unavailable in browser preview.') },
     async getDesktopRuntimeSettings() { return { launchAtLogin: false, supported: false } },
     async updateDesktopRuntimeSettings() { return { launchAtLogin: false, supported: false } },
     async exportDiagnostics() { return JSON.stringify({ version: __APP_VERSION__, platform: 'browser-preview' }, null, 2) },
@@ -1901,6 +2238,8 @@ export function createMockApi(): GatewayApi {
         sqliteProviderRowsToUpdate: targetProvider === 'stone' ? 21 : 86,
         sqliteUserEventRowsToUpdate: 2,
         sqliteCwdRowsToUpdate: 3,
+        globalStateFieldsToUpdate: 2,
+        globalStateConflictingFields: [],
         encryptedSessionFiles: 1,
         encryptedSourceProviders: ['openai'],
       }
@@ -1913,19 +2252,53 @@ export function createMockApi(): GatewayApi {
         sqliteProviderRowsUpdated: 21,
         sqliteUserEventRowsUpdated: 2,
         sqliteCwdRowsUpdated: 3,
+        globalStateFieldsUpdated: 2,
+        globalStateConflictingFields: [],
         skippedFiles: [],
         encryptedSessionFiles: 1,
         encryptedSourceProviders: ['openai'],
         backupPath: 'C:\\Users\\demo\\.codex\\backups_state\\stone-session-repair\\20260718210000000-demo',
       }
     },
-    async repairCodexSessionsAndRestartChatGpt() {
-      const repair = await this.repairCodexSessions('stone', 'a'.repeat(64))
+    async repairCodexSessionsAndRestartChatGpt(targetProvider = 'stone', expectedRevision = 'a'.repeat(64)) {
+      const repair = await this.repairCodexSessions(targetProvider, expectedRevision)
       return { repair, chatGptWasRunning: true, chatGptRestarted: true }
     },
+    async previewCodexSessionIndexCleanup() {
+      return {
+        snapshotSha256: 'b'.repeat(64),
+        candidates: [
+          { id: '0197f80d-1111-7000-8000-000000000001', threadName: '旧的测试任务', updatedAt: '2026-07-08T10:20:00Z' },
+          { id: '0197f80d-2222-7000-8000-000000000002', threadName: '可能仍在云端', updatedAt: '2026-07-09T09:12:00Z' },
+        ],
+      }
+    },
+    async cleanupCodexSessionIndexAndRestart(_snapshotSha256, threadIds) {
+      await pause(420)
+      return {
+        cleanup: {
+          prunedEntries: threadIds.length,
+          backupPath: 'C:\\Users\\demo\\.codex\\backups_state\\stone-session-index-cleanup\\20260718210000000-demo',
+        },
+        chatGptWasRunning: true,
+        chatGptRestarted: true,
+      }
+    },
+    async listCodexSessions() { return [] },
+    async openCodexSessionLocation() {},
+    async exportCodexSession(id) { return { cancelled: true, sessionId: id } },
+    async trashCodexSession() { return [] },
+    async restoreCodexSession() { return [] },
     onSnapshot(listener) {
       listeners.add(listener)
       return () => listeners.delete(listener)
+    },
+    onBuiltInProxyState(listener) {
+      builtInProxyListeners.add(listener)
+      return () => builtInProxyListeners.delete(listener)
+    },
+    onRuntimeDelta() {
+      return () => undefined
     },
     onAccountImportProgress(listener) {
       accountImportProgressListeners.add(listener)

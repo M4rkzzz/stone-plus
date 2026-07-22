@@ -27,10 +27,51 @@ describe('setup routing transaction', () => {
     expect(draft.routes[0].localToken).toBe(token)
   })
 
+  it('preserves high-concurrency mode when the wizard reuses an existing route', () => {
+    const draft = state()
+    applySetupRoutingDraft(draft, { sessionId: 'session', sourceId: 'one', client: 'codex', model: 'gpt-test' }, { now: 10 })
+    draft.routes[0].highConcurrencyMode = true
+
+    applySetupRoutingDraft(draft, { sessionId: 'session', sourceId: 'one', client: 'codex', model: 'gpt-test' }, { now: 20 })
+
+    expect(draft.routes[0].highConcurrencyMode).toBe(true)
+  })
+
   it('reuses a compatible import target pool', () => {
     const draft = state()
     draft.pools.push({ id: 'import-pool', name: 'Imported', kind: 'standard', protocol: 'openai-responses', strategy: 'priority', members: [{ accountId: 'one', enabled: true }], modelPolicy: 'all', modelAllowlist: [], stickySessions: false, stickyTtlMinutes: 60, maxRetries: 0, createdAt: 1, updatedAt: 1 })
     const result = applySetupRoutingDraft(draft, { sessionId: 'session', sourceId: 'one', client: 'codex', model: 'gpt-test' }, { preferredPoolId: 'import-pool' })
     expect(result).toMatchObject({ poolId: 'import-pool', createdPool: false })
+  })
+
+  it('mixes eligible OAuth and Agent Identity peers but excludes unsupported members', () => {
+    const draft = state()
+    draft.accounts[1].credentialType = 'chatgpt-agent-identity'
+    draft.accounts.push({
+      ...draft.accounts[1], id: 'unsupported', credentialId: 'credential-unsupported',
+      availableModels: ['other-model'], modelsRefreshedAt: 2,
+    })
+    draft.providers[0].capabilityProfile = { version: 1, origin: 'probed', nonStreaming: true }
+
+    applySetupRoutingDraft(draft, {
+      sessionId: 'session', sourceId: 'one', client: 'codex', model: 'gpt-test',
+    })
+    expect(draft.pools[0].members.map((member) => member.accountId)).toEqual(['one', 'two'])
+  })
+
+  it('rejects an aggregate that cannot serve the tested model and baseline generation capability', () => {
+    const draft = state()
+    draft.accounts.forEach((account) => { account.modelsRefreshedAt = 2 })
+    draft.providers[0].capabilityProfile = { version: 1, origin: 'declared', nonStreaming: false }
+    draft.pools.push({
+      id: 'aggregate', name: 'Aggregate', kind: 'relay-aggregate', protocol: 'openai-responses',
+      strategy: 'priority', members: [{ accountId: 'one', enabled: true }], modelPolicy: 'all',
+      modelAllowlist: [], stickySessions: false, stickyTtlMinutes: 30, maxRetries: 0,
+      createdAt: 1, updatedAt: 1,
+    })
+
+    expect(() => applySetupRoutingDraft(draft, {
+      sessionId: 'session', sourceId: 'one', client: 'codex', model: 'gpt-test', aggregatePoolId: 'aggregate',
+    })).toThrow('基础生成能力')
   })
 })

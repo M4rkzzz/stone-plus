@@ -12,6 +12,60 @@ const weatherSchema = {
 }
 
 describe('non-streaming tool protocol conversion', () => {
+  it('keeps direct Responses/Anthropic conversion byte-shape compatible with the Chat bridge', () => {
+    const responsesSource = {
+      instructions: [{ type: 'input_text', text: 'System' }],
+      max_output_tokens: 77,
+      temperature: 0.4,
+      top_p: 0.8,
+      stream: false,
+      parallel_tool_calls: true,
+      tool_choice: 'required',
+      tools: [{ type: 'function', name: 'lookup', parameters: weatherSchema }],
+      input: [
+        { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Checking.' }] },
+        { type: 'function_call', call_id: 'call_1', name: 'lookup', arguments: '{"city":"Paris"}' },
+        { type: 'function_call', call_id: 'call_2', name: 'lookup', arguments: '{"city":"Tokyo"}' },
+        { type: 'function_call_output', call_id: 'call_1', output: [{ type: 'input_text', text: '21' }] },
+        { type: 'function_call_output', call_id: 'call_2', output: '26' },
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Continue' }] }
+      ]
+    }
+    const directAnthropic = convertRequest(
+      'openai-responses', 'anthropic-messages', responsesSource, 'target'
+    )
+    const responsesChat = convertRequest('openai-responses', 'openai-chat', responsesSource, 'target')
+    const bridgedAnthropic = convertRequest('openai-chat', 'anthropic-messages', responsesChat.body, 'target')
+    expect(directAnthropic).toEqual(bridgedAnthropic)
+
+    const anthropicSource = {
+      system: [{ type: 'text', text: 'System' }],
+      max_tokens: 91,
+      temperature: 0.3,
+      stream: false,
+      tool_choice: { type: 'any', disable_parallel_tool_use: false },
+      tools: [{ name: 'lookup', input_schema: weatherSchema }],
+      messages: [
+        { role: 'assistant', content: [
+          { type: 'text', text: 'Before.' },
+          { type: 'tool_use', id: 'tool_1', name: 'lookup', input: { city: 'Paris' } },
+          { type: 'text', text: 'After.' }
+        ] },
+        { role: 'user', content: [
+          { type: 'text', text: 'prefix' },
+          { type: 'tool_result', tool_use_id: 'tool_1', content: [{ type: 'text', text: '21' }] },
+          { type: 'text', text: 'suffix' }
+        ] }
+      ]
+    }
+    const directResponses = convertRequest(
+      'anthropic-messages', 'openai-responses', anthropicSource, 'target'
+    )
+    const anthropicChat = convertRequest('anthropic-messages', 'openai-chat', anthropicSource, 'target')
+    const bridgedResponses = convertRequest('openai-chat', 'openai-responses', anthropicChat.body, 'target')
+    expect(directResponses).toEqual(bridgedResponses)
+  })
+
   it('converts a multi-round Responses request to Anthropic without losing tool semantics', () => {
     const converted = convertRequest('openai-responses', 'anthropic-messages', {
       model: 'gpt-source',

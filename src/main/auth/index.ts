@@ -20,6 +20,21 @@ export {
   CHATGPT_OAUTH_PORTS,
   CHATGPT_OAUTH_SCOPE
 } from './chatgpt-oauth-flow'
+export {
+  agentIdentitySensitiveValues,
+  buildAgentAssertion,
+  deserializeChatGptAgentIdentity,
+  isInvalidAgentIdentityTaskResponse,
+  parseChatGptAgentIdentityImport,
+  resolveChatGptAgentIdentity,
+  serializeChatGptAgentIdentity
+} from './chatgpt-agent-identity'
+export type {
+  AgentIdentityAccess,
+  AgentIdentityResolveOptions,
+  ChatGptAgentIdentityBundle,
+  ParsedChatGptAgentIdentities
+} from './chatgpt-agent-identity'
 export type {
   ChatGptOAuthFlowOptions,
   ChatGptOAuthSessionController,

@@ -106,6 +106,35 @@ describe('ClientConfigService editor workflow', () => {
     expect(await service.listBackups('claude')).toEqual([])
   })
 
+  it('binds an editor revision to the exact profile path even when file bytes match', async () => {
+    const original = JSON.stringify({ model: 'same-content' }, null, 2) + '\n'
+    const alternateDirectory = join(homeDir, 'alternate-claude')
+    const alternate = service.withOverrides({ claudeDirectory: alternateDirectory })
+    await mkdir(service.paths.claude.directory, { recursive: true })
+    await mkdir(alternate.paths.claude.directory, { recursive: true })
+    await writeFile(service.paths.claude.settings.path, original)
+    await writeFile(alternate.paths.claude.settings.path, original)
+    const defaultFile = (await service.editor('claude')).files
+      .find((candidate) => candidate.role === 'claude-settings')!
+    const alternateFile = (await alternate.editor('claude')).files
+      .find((candidate) => candidate.role === 'claude-settings')!
+
+    expect(defaultFile.revision).not.toBe(alternateFile.revision)
+    await expect(alternate.applyEditor('claude', {
+      gatewayBaseUrl: 'http://127.0.0.1:15721',
+      token: 'stone-target-token',
+    }, {
+      patches: [],
+      files: [{
+        role: alternateFile.role,
+        revision: defaultFile.revision,
+        content: alternateFile.content!,
+      }],
+    })).rejects.toBeInstanceOf(ClientConfigValidationError)
+    expect(await readFile(alternate.paths.claude.settings.path, 'utf8')).toBe(original)
+    expect(await alternate.listBackups('claude')).toEqual([])
+  })
+
   it('backs up the source, combines advanced and common Claude edits, and forces Stone connection fields', async () => {
     const original = JSON.stringify({
       model: 'original-model',

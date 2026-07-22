@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import type { Account, Pool, RequestLog } from '../../src/shared/types'
-import { ModelNotExposedError, NoEligibleAccountError, PoolScheduler } from '../../src/main/gateway'
+import type { Account, Pool, ProviderDefinition, RequestLog } from '../../src/shared/types'
+import { ModelNotExposedError, NoEligibleAccountError, PoolScheduler, quotaProtectionBlocks } from '../../src/main/gateway/scheduler'
 
 const timestamp = 1_700_000_000_000
 
@@ -44,6 +44,26 @@ function pool(overrides: Partial<Pool> = {}): Pool {
   }
 }
 
+function provider(id: string, webSearch?: boolean): ProviderDefinition {
+  return {
+    id,
+    name: id,
+    sourceType: 'relay',
+    kind: 'openai-compatible',
+    baseUrl: `https://${id}.example/v1`,
+    protocol: 'openai-responses',
+    models: ['model'],
+    capabilityProfile: {
+      version: 1,
+      origin: 'declared',
+      streaming: true,
+      ...(webSearch === undefined ? {} : { webSearch }),
+    },
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  }
+}
+
 function requestLog(accountId: string, overrides: Partial<RequestLog> = {}): RequestLog {
   return {
     id: `${accountId}-${overrides.timestamp ?? timestamp}`,
@@ -72,6 +92,166 @@ function countByValue(values: readonly string[]): Record<string, number> {
 }
 
 describe('PoolScheduler', () => {
+  it('never schedules a member that explicitly lacks a required capability', () => {
+    const scheduler = new PoolScheduler(() => timestamp, () => 0)
+    const unsupported = account('unsupported', { providerId: 'unsupported-provider' })
+    const supported = account('supported', { providerId: 'supported-provider' })
+    const selected = scheduler.selectAndAcquire({
+      pool: pool(),
+      accounts: [unsupported, supported],
+      providers: [provider('unsupported-provider', false), provider('supported-provider', true)],
+      requiredCapabilities: ['webSearch'],
+      model: 'model',
+    })
+    expect(selected.account.id).toBe('supported')
+  })
+  it('falls back to an unknown-capability member when every verified member is runtime-unavailable', () => {
+    const scheduler = new PoolScheduler(() => timestamp, () => 0)
+    const coolingVerified = account('verified', {
+      providerId: 'verified-provider',
+      status: 'cooldown',
+      cooldownUntil: timestamp + 60_000,
+    })
+    const availableUnknown = account('unknown', { providerId: 'unknown-provider' })
+
+    const selected = scheduler.selectAndAcquire({
+      pool: pool(),
+      accounts: [coolingVerified, availableUnknown],
+      providers: [provider('verified-provider', true), provider('unknown-provider')],
+      requiredCapabilities: ['webSearch'],
+      model: 'model',
+    })
+
+    expect(selected.account.id).toBe('unknown')
+  })
+  it('does not treat an explicitly incompatible member as a usable failover peer', () => {
+    const scheduler = new PoolScheduler(() => timestamp, () => 0)
+    const selected = account('selected', { providerId: 'supported-provider' })
+    const incompatible = account('incompatible', { providerId: 'unsupported-provider' })
+
+    expect(scheduler.hasUsableAlternative(
+      [selected, incompatible],
+      'model',
+      selected.id,
+      pool(),
+      [provider('supported-provider', true), provider('unsupported-provider', false)],
+      ['webSearch'],
+    )).toBe(false)
+  })
+  it('keeps quota reserves without changing legacy or unknown-quota behaviour by default', () => {
+    expect(quotaProtectionBlocks(undefined, undefined, timestamp)).toBe(false)
+    expect(quotaProtectionBlocks(undefined, {
+      fiveHourRemainingPercent: 10,
+      unavailableBehavior: 'allow'
+    }, timestamp)).toBe(false)
+    expect(quotaProtectionBlocks(undefined, {
+      fiveHourRemainingPercent: 10,
+      unavailableBehavior: 'block'
+    }, timestamp)).toBe(true)
+    expect(quotaProtectionBlocks({
+      observedAt: timestamp,
+      source: 'usage-endpoint',
+      fiveHour: { usedPercent: 91 },
+      sevenDay: { usedPercent: 70 }
+    }, { fiveHourRemainingPercent: 10 }, timestamp)).toBe(true)
+  })
+
+  it('combines account and pool quota protection and rejects stale snapshots conservatively', () => {
+    const scheduler = new PoolScheduler(() => timestamp)
+    const guardedPool = pool({
+      quotaProtection: { sevenDayRemainingPercent: 20, unavailableBehavior: 'block', staleAfterMinutes: 5 }
+    })
+    const stale = account('stale', {
+      codexQuota: {
+        observedAt: timestamp - 6 * 60_000,
+        source: 'usage-endpoint',
+        fiveHour: { usedPercent: 5 },
+        sevenDay: { usedPercent: 5 }
+      }
+    })
+    expect(() => scheduler.selectAndAcquire({ pool: guardedPool, accounts: [stale], model: 'model' }))
+      .toThrow(NoEligibleAccountError)
+
+    const accountGuarded = account('account-guarded', {
+      quotaProtection: { fiveHourRemainingPercent: 25 },
+      codexQuota: {
+        observedAt: timestamp,
+        source: 'usage-endpoint',
+        fiveHour: { usedPercent: 80 },
+        sevenDay: { usedPercent: 1 }
+      }
+    })
+    expect(() => scheduler.selectAndAcquire({ pool: pool(), accounts: [accountGuarded], model: 'model' }))
+      .toThrow(NoEligibleAccountError)
+  })
+  it('globally reclaims expired sticky assignments and failure avoidances', () => {
+    let now = timestamp
+    const scheduler = new PoolScheduler(() => now, () => 0)
+    const stickyPool = pool({ stickySessions: true, stickyTtlMinutes: 1 })
+    const first = account('first')
+    const second = account('second')
+
+    const one = scheduler.selectAndAcquire({
+      pool: stickyPool,
+      accounts: [first, second],
+      model: 'model',
+      sessionId: 'one'
+    })
+    one.release()
+    const two = scheduler.selectAndAcquire({
+      pool: stickyPool,
+      accounts: [first, second],
+      model: 'model',
+      sessionId: 'two'
+    })
+    two.release()
+    scheduler.recordStickyFailure(stickyPool.id, 'one', one.account.id)
+
+    const state = scheduler as unknown as {
+      sticky: Map<string, unknown>
+      stickyFailureAvoidance: Map<string, unknown>
+      stickyKeysByAccount: Map<string, Set<string>>
+    }
+    expect(state.sticky.size).toBe(1)
+    expect(state.stickyFailureAvoidance.size).toBe(1)
+
+    now += 60_001
+    const trigger = scheduler.selectAndAcquire({
+      pool: pool(),
+      accounts: [first],
+      model: 'model'
+    })
+    trigger.release()
+
+    expect(state.sticky.size).toBe(0)
+    expect(state.stickyFailureAvoidance.size).toBe(0)
+    expect(state.stickyKeysByAccount.size).toBe(0)
+  })
+
+  it('counts a concurrent sticky session once regardless of its request count', () => {
+    const scheduler = new PoolScheduler(() => timestamp, () => 0)
+    const stickyPool = pool({ stickySessions: true })
+    const selectedAccount = account('selected', { maxConcurrency: 4 })
+    const first = scheduler.selectAndAcquire({
+      pool: stickyPool,
+      accounts: [selectedAccount],
+      model: 'model',
+      sessionId: 'same-session'
+    })
+    const second = scheduler.selectAndAcquire({
+      pool: stickyPool,
+      accounts: [selectedAccount],
+      model: 'model',
+      sessionId: 'same-session'
+    })
+    const state = scheduler as unknown as { activeStickySessionCounts: Map<string, number> }
+    expect(state.activeStickySessionCounts.get(selectedAccount.id)).toBe(1)
+    first.release()
+    expect(state.activeStickySessionCounts.get(selectedAccount.id)).toBe(1)
+    second.release()
+    expect(state.activeStickySessionCounts.has(selectedAccount.id)).toBe(false)
+  })
+
   it('uses an absolute confidence-weighted rating instead of forcing the current best account to 100', () => {
     const scheduler = new PoolScheduler(() => timestamp)
     const fast = account('fast')
@@ -100,6 +280,8 @@ describe('PoolScheduler', () => {
     expect(fitness.unmeasured).toMatchObject({ sampleCount: 0, stale: true })
     expect(fitness.unmeasured.score).toBeUndefined()
     expect(fitness.fast.firstTokenMs).toBe(500)
+    expect(fitness.fast.semanticFirstTokenMs).toBe(500)
+    expect(fitness.fast.transportFirstBodyMs).toBeUndefined()
     expect(fitness.fast.outputTokensPerSecond).toBe(100)
   })
 
@@ -169,6 +351,42 @@ describe('PoolScheduler', () => {
     scheduled.release()
     expect(scheduler.getInFlight(onlyAccount)).toBe(0)
     expect(scheduler.selectAndAcquire({ pool: pool(), accounts: [onlyAccount], model: 'model' }).account.id).toBe('a')
+  })
+
+  it('admits 200 synchronous autobalanced selections across available account capacity without oversubscription', () => {
+    const scheduler = new PoolScheduler(() => timestamp, () => 0.5)
+    const accounts = Array.from({ length: 50 }, (_, index) => account(`account-${index}`, {
+      maxConcurrency: 4
+    }))
+    const highConcurrencyPool = pool({
+      strategy: 'autobalanced',
+      stickySessions: true
+    })
+    const selections = Array.from({ length: 200 }, (_, index) => scheduler.selectAndAcquire({
+      pool: highConcurrencyPool,
+      accounts,
+      model: 'model',
+      sessionId: `session-${index}`
+    }))
+
+    // Admission is deliberately synchronous: the scheduler must not hide a
+    // local wait queue in front of the upstream transport.
+    expect(selections.every((selection) => typeof (selection as { then?: unknown }).then === 'undefined')).toBe(true)
+    const selectedCounts = countByValue(selections.map(({ account: selected }) => selected.id))
+    expect(Object.keys(selectedCounts)).toHaveLength(accounts.length)
+    for (const candidate of accounts) {
+      expect(selectedCounts[candidate.id]).toBe(candidate.maxConcurrency)
+      expect(scheduler.getInFlight(candidate)).toBe(candidate.maxConcurrency)
+    }
+    expect(() => scheduler.selectAndAcquire({
+      pool: highConcurrencyPool,
+      accounts,
+      model: 'model',
+      sessionId: 'over-capacity'
+    })).toThrow(NoEligibleAccountError)
+
+    for (const selection of selections) selection.release()
+    for (const candidate of accounts) expect(scheduler.getInFlight(candidate)).toBe(0)
   })
 
   it('skips accounts in cooldown and restores them after expiry', () => {
@@ -330,6 +548,22 @@ describe('PoolScheduler', () => {
     expect(afterClear.account.id).toBe('b')
   })
 
+  it('drops scheduling cursors for pools removed at a configuration handoff', () => {
+    const scheduler = new PoolScheduler()
+    const roundRobin = pool({ strategy: 'round-robin' })
+    const accounts = [account('a'), account('b')]
+
+    const first = scheduler.selectAndAcquire({ pool: roundRobin, accounts, model: 'model' })
+    expect(first.account.id).toBe('a')
+    first.release()
+
+    scheduler.hydrate(accounts, [])
+    scheduler.hydrate(accounts, [roundRobin])
+    const afterRecreate = scheduler.selectAndAcquire({ pool: roundRobin, accounts, model: 'model' })
+
+    expect(afterRecreate.account.id).toBe('a')
+  })
+
   it('keeps balanced scheduling independent from runtime speed samples', () => {
     const scheduler = new PoolScheduler()
     const slow = account('a-slow', { maxConcurrency: 4 })
@@ -399,7 +633,7 @@ describe('PoolScheduler', () => {
     expect(selected.account.id).toBe(measured.id)
   })
 
-  it('hydrates autobalanced performance from persisted raw first-byte timing', () => {
+  it('prioritizes persisted semantic TTFT over an earlier transport first body', () => {
     const scheduler = new PoolScheduler(() => timestamp, () => 0.5)
     const rawFastVisibleSlow = account('raw-fast', { maxConcurrency: 4 })
     const rawSlowVisibleFast = account('raw-slow', { maxConcurrency: 4 })
@@ -426,7 +660,81 @@ describe('PoolScheduler', () => {
       model: 'model'
     })
 
-    expect(selected.account.id).toBe(rawFastVisibleSlow.id)
+    expect(selected.account.id).toBe(rawSlowVisibleFast.id)
+    const fitness = scheduler.getFitness([rawFastVisibleSlow, rawSlowVisibleFast])
+    expect(fitness[rawFastVisibleSlow.id]).toMatchObject({
+      semanticFirstTokenMs: 4_500,
+      transportFirstBodyMs: 800,
+      firstTokenMs: 4_500
+    })
+    expect(fitness[rawSlowVisibleFast.id]).toMatchObject({
+      semanticFirstTokenMs: 900,
+      transportFirstBodyMs: 2_500,
+      firstTokenMs: 900
+    })
+  })
+
+  it('keeps transport-only legacy logs useful when semantic timing is unavailable', () => {
+    const scheduler = new PoolScheduler(() => timestamp, () => 0.5)
+    const legacyFast = account('legacy-fast', { maxConcurrency: 4 })
+    const legacySlow = account('legacy-slow', { maxConcurrency: 4 })
+    scheduler.hydratePerformance([
+      ...Array.from({ length: 4 }, (_, index) => requestLog(legacyFast.id, {
+        id: `legacy-fast-${index}`,
+        timestamp: timestamp - 4_000 + index,
+        upstreamFirstByteMs: 800,
+        firstTokenMs: 800,
+        accountFirstTokenMs: undefined
+      })),
+      ...Array.from({ length: 4 }, (_, index) => requestLog(legacySlow.id, {
+        id: `legacy-slow-${index}`,
+        timestamp: timestamp - 4_000 + index,
+        upstreamFirstByteMs: 2_500,
+        firstTokenMs: 2_500,
+        accountFirstTokenMs: undefined
+      }))
+    ])
+
+    const selected = scheduler.selectAndAcquire({
+      pool: pool({ strategy: 'autobalanced' }),
+      accounts: [legacySlow, legacyFast],
+      model: 'model'
+    })
+
+    expect(selected.account.id).toBe(legacyFast.id)
+    expect(scheduler.getFitness([legacyFast])[legacyFast.id]).toMatchObject({
+      semanticFirstTokenMs: undefined,
+      transportFirstBodyMs: 800,
+      firstTokenMs: 800
+    })
+  })
+
+  it('selects the account with faster semantic output when transport timing disagrees', () => {
+    const scheduler = new PoolScheduler(() => timestamp, () => 0.5)
+    const quickSocketSlowModel = account('quick-socket-slow-model', { maxConcurrency: 4 })
+    const slowSocketQuickModel = account('slow-socket-quick-model', { maxConcurrency: 4 })
+    for (let index = 0; index < 4; index += 1) {
+      scheduler.recordPerformance(quickSocketSlowModel.id, {
+        transportFirstBodyMs: 100,
+        semanticFirstTokenMs: 5_000,
+        outputTokens: 100,
+        generationDurationMs: 2_000
+      })
+      scheduler.recordPerformance(slowSocketQuickModel.id, {
+        transportFirstBodyMs: 2_000,
+        semanticFirstTokenMs: 800,
+        outputTokens: 100,
+        generationDurationMs: 2_000
+      })
+    }
+
+    const selected = scheduler.selectAndAcquire({
+      pool: pool({ strategy: 'autobalanced' }),
+      accounts: [quickSocketSlowModel, slowSocketQuickModel],
+      model: 'model'
+    })
+
+    expect(selected.account.id).toBe(slowSocketQuickModel.id)
   })
 
   it('deducts failed-attempt time when hydrating the winning account performance', () => {
@@ -459,6 +767,13 @@ describe('PoolScheduler', () => {
     })
 
     expect(selected.account.id).toBe(fastAfterFailover.id)
+    expect(scheduler.getFitness([fastAfterFailover])[fastAfterFailover.id]).toMatchObject({
+      // The preceding failed attempt took 5 seconds. Neither winning-account
+      // metric may inherit that time.
+      transportFirstBodyMs: 1_100,
+      semanticFirstTokenMs: 1_500,
+      firstTokenMs: 1_500
+    })
   })
 
   it('ignores stale persisted performance during autobalanced hydration', () => {
@@ -812,6 +1127,46 @@ describe('PoolScheduler', () => {
     expect(escaped.account.id).toBe(fast.id)
   })
 
+  it('uses semantic TTFT rather than transport timing for sticky escape', () => {
+    const scheduler = new PoolScheduler(() => timestamp, () => 0)
+    const quickSocketSlowModel = account('a-quick-socket-slow-model', { maxConcurrency: 4 })
+    const slowSocketQuickModel = account('z-slow-socket-quick-model', { maxConcurrency: 4 })
+    const stickyPool = pool({ strategy: 'autobalanced', stickySessions: true })
+
+    const initial = scheduler.selectAndAcquire({
+      pool: stickyPool,
+      accounts: [quickSocketSlowModel, slowSocketQuickModel],
+      model: 'model',
+      sessionId: 'semantic-sticky-session'
+    })
+    expect(initial.account.id).toBe(quickSocketSlowModel.id)
+    initial.release()
+
+    for (let index = 0; index < 3; index += 1) {
+      scheduler.recordPerformance(quickSocketSlowModel.id, {
+        transportFirstBodyMs: 100,
+        semanticFirstTokenMs: 5_000,
+        outputTokens: 100,
+        generationDurationMs: 2_000
+      })
+      scheduler.recordPerformance(slowSocketQuickModel.id, {
+        transportFirstBodyMs: 2_000,
+        semanticFirstTokenMs: 800,
+        outputTokens: 100,
+        generationDurationMs: 2_000
+      })
+    }
+
+    const escaped = scheduler.selectAndAcquire({
+      pool: stickyPool,
+      accounts: [quickSocketSlowModel, slowSocketQuickModel],
+      model: 'model',
+      sessionId: 'semantic-sticky-session'
+    })
+
+    expect(escaped.account.id).toBe(slowSocketQuickModel.id)
+  })
+
   it('does not immediately reselect the account that triggered sticky escape', () => {
     const scheduler = new PoolScheduler(() => timestamp, () => 0)
     const slowFirstByte = account('slow-first-byte', { maxConcurrency: 4 })
@@ -1031,6 +1386,66 @@ describe('PoolScheduler', () => {
     expect(scheduler.recordSuccess('a')).toMatchObject({ circuitState: 'closed', consecutiveFailures: 0 })
     const normal = scheduler.selectAndAcquire({ pool: pool(), accounts: [onlyAccount], model: 'model' })
     expect(normal.account.id).toBe('a')
+  })
+
+  it('does not let an older successful attempt clear a newer quota cooldown', () => {
+    const scheduler = new PoolScheduler(() => timestamp)
+    const onlyAccount = account('a', { maxConcurrency: 4 })
+    const selected = scheduler.selectAndAcquire({
+      pool: pool(),
+      accounts: [onlyAccount],
+      model: 'model'
+    })
+
+    scheduler.setCooldown('a', timestamp + 60_000)
+    const staleSuccess = scheduler.recordSuccess('a', selected.healthRevision)
+
+    expect(staleSuccess).toMatchObject({
+      applied: false,
+      circuitState: 'open',
+      cooldownUntil: timestamp + 60_000
+    })
+    expect(() => scheduler.selectAndAcquire({ pool: pool(), accounts: [onlyAccount], model: 'model' }))
+      .toThrow(NoEligibleAccountError)
+    selected.release()
+  })
+
+  it('requires an attempt revision to clear quota health after its cooldown expires', () => {
+    let now = timestamp
+    const scheduler = new PoolScheduler(() => now)
+    const onlyAccount = account('a', { maxConcurrency: 4 })
+
+    scheduler.setCooldown('a', now + 1_000)
+    expect(scheduler.recordSuccess('a')).toMatchObject({
+      applied: false,
+      circuitState: 'open'
+    })
+
+    now += 1_001
+    const probe = scheduler.selectAndAcquire({ pool: pool(), accounts: [onlyAccount], model: 'model' })
+    expect(scheduler.recordSuccess('a', probe.healthRevision)).toMatchObject({
+      applied: true,
+      circuitState: 'closed',
+      consecutiveFailures: 0
+    })
+    probe.release()
+  })
+
+  it('never shortens a quota cooldown when a later generic failure is recorded', () => {
+    const scheduler = new PoolScheduler(() => timestamp)
+    scheduler.setCooldown('a', timestamp + 60_000)
+
+    expect(scheduler.recordFailure('a', {
+      baseDelayMs: 1_000,
+      maxDelayMs: 1_000,
+      reason: 'failure'
+    })).toMatchObject({
+      cooldownUntil: timestamp + 60_000
+    })
+    expect(scheduler.recordSuccess('a')).toMatchObject({
+      applied: false,
+      cooldownUntil: timestamp + 60_000
+    })
   })
 
   it('hydrates persisted failures and allows only one half-open probe after restart', () => {

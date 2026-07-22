@@ -229,16 +229,18 @@ describe('client configuration editor protection', () => {
 
 describe('client configuration revisions', () => {
   it('is deterministic and distinguishes missing, empty, and changed content', () => {
-    const missing = revisionOf(undefined)
-    const empty = revisionOf('')
+    const file = paths.claude.settings
+    const missing = revisionOf(file, undefined)
+    const empty = revisionOf(file, '')
     const source = '{"model":"gpt-5"}\n'
 
     expect(missing).toMatch(/^[a-f0-9]{64}$/)
-    expect(revisionOf(undefined)).toBe(missing)
+    expect(revisionOf(file, undefined)).toBe(missing)
     expect(empty).not.toBe(missing)
-    expect(revisionOf(source)).toBe(revisionOf(source))
-    expect(revisionOf(source)).not.toBe(revisionOf(source.replace('gpt-5', 'gpt-5-mini')))
-    expect(revisionOf(source)).not.toBe(revisionOf(source.replace('\n', '\r\n')))
-    expect(createClientConfigEditorFile(paths.claude.settings, source).revision).toBe(revisionOf(source))
+    expect(revisionOf(file, source)).toBe(revisionOf(file, source))
+    expect(revisionOf(file, source)).not.toBe(revisionOf(file, source.replace('gpt-5', 'gpt-5-mini')))
+    expect(revisionOf(file, source)).not.toBe(revisionOf(file, source.replace('\n', '\r\n')))
+    expect(revisionOf(paths.claude.mcp!, source)).not.toBe(revisionOf(file, source))
+    expect(createClientConfigEditorFile(file, source).revision).toBe(revisionOf(file, source))
   })
 })

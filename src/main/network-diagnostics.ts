@@ -9,6 +9,23 @@ import type {
 const TEST_TIMEOUT_MS = 10_000
 const CHATGPT_HOST = 'chatgpt.com'
 
+export type BuiltInProxyDiagnosticCategory =
+  | 'core_missing'
+  | 'config_invalid'
+  | 'node_handshake'
+  | 'mixed_port'
+  | 'tun_elevation'
+  | 'subscription_update'
+
+const BUILT_IN_PROXY_DIAGNOSES: Readonly<Record<BuiltInProxyDiagnosticCategory, string>> = Object.freeze({
+  core_missing: '内置代理核心缺失或校验失败：请重新安装完整版本，并确认安全软件未隔离 sing-box 运行文件。',
+  config_invalid: '内置代理配置无效：请检查当前配置和活动节点，或重新导入订阅。',
+  node_handshake: '内置代理节点握手失败：请测试节点延迟、检查节点凭据、系统时间和 TLS/SNI 设置。',
+  mixed_port: '内置代理 mixed 端口不可用：请释放已保存端口或在代理页选择新的本地端口。',
+  tun_elevation: 'TUN 启动未获得临时提权：请重试并允许本次管理员权限请求。',
+  subscription_update: '内置代理订阅更新失败：请检查订阅地址、令牌、网络可达性和返回格式。'
+})
+
 export const NETWORK_DIAGNOSTIC_HTTP_TARGETS = Object.freeze([
   { id: 'chatgpt-web', label: 'ChatGPT 网站', url: 'https://chatgpt.com/' },
   { id: 'codex-models', label: 'Codex 模型接口', url: 'https://chatgpt.com/backend-api/codex/models?client_version=0.144.3' },
@@ -107,7 +124,7 @@ async function probeHttp(
       redirect: 'follow',
       signal: AbortSignal.timeout(TEST_TIMEOUT_MS)
     })
-    await response.body?.cancel().catch(() => undefined)
+    cancelResponseBody(response)
     const status = httpDiagnosticStatus(response.status)
     return {
       id: target.id,
@@ -117,10 +134,24 @@ async function probeHttp(
       status,
       latencyMs: elapsed(startedAt, now()),
       httpStatus: response.status,
+      errorCode: response.status === 407 ? 'PROXY_AUTH_REQUIRED' : undefined,
       message: httpStatusMessage(response.status, status)
     }
   } catch (error) {
     return failedResult(target.id, target.label, displayTarget(target.url), 'http', startedAt, now(), error)
+  }
+}
+
+/**
+ * Releasing a diagnostic response must never extend the diagnostic itself.
+ * Some proxy/network stacks only settle `cancel()` after the peer closes the
+ * connection, so intentionally observe the rejection without awaiting it.
+ */
+function cancelResponseBody(response: Response): void {
+  try {
+    void response.body?.cancel().catch(() => undefined)
+  } catch {
+    // A synchronously throwing, already-locked body is still safe to abandon.
   }
 }
 
@@ -181,6 +212,7 @@ function skippedResult(id: string, label: string, target: string, message: strin
 }
 
 function httpDiagnosticStatus(status: number): NetworkDiagnosticStatus {
+  if (status === 407) return 'error'
   if (status === 403 || status === 429 || status >= 500) return 'warning'
   return status >= 100 && status < 500 ? 'success' : 'error'
 }
@@ -188,6 +220,7 @@ function httpDiagnosticStatus(status: number): NetworkDiagnosticStatus {
 function httpStatusMessage(status: number, diagnosticStatus: NetworkDiagnosticStatus): string {
   if (status === 401) return '接口可达 · 未携带账号凭据，HTTP 401 属预期响应'
   if (status === 403) return '接口可达 · HTTP 403，可能受出口地区、WAF 或访问策略限制'
+  if (status === 407) return '代理认证失败 · HTTP 407，请检查代理用户名和密码'
   if (status === 429) return '接口可达 · HTTP 429，当前出口 IP 受到频率限制'
   if (status >= 500) return `接口可达，但上游服务返回 HTTP ${status}`
   return diagnosticStatus === 'success' ? `连接成功 · HTTP ${status}` : `返回 HTTP ${status}`
@@ -213,6 +246,12 @@ function diagnose(
   }
   if (codes.some((code) => /ECONNRESET|EPIPE|UND_ERR_SOCKET/i.test(code))) {
     diagnoses.push('连接被中途重置：检查代理节点稳定性、防火墙、杀毒软件和 TLS 分流规则。')
+  }
+  if (codes.includes('PROXY_AUTH_REQUIRED')) {
+    diagnoses.push('代理要求身份认证（HTTP 407）：请检查代理配置中的用户名和密码。')
+  }
+  for (const category of Object.keys(BUILT_IN_PROXY_DIAGNOSES) as BuiltInProxyDiagnosticCategory[]) {
+    if (codes.includes(category)) diagnoses.push(BUILT_IN_PROXY_DIAGNOSES[category])
   }
   if (byId.get('openai-auth')?.status === 'error' && http.some((result) => result.id !== 'openai-auth' && result.status !== 'error')) {
     diagnoses.push('业务接口可达但 OAuth 域名不可达：ChatGPT Access Token 到期后将无法自动续期，请检查 auth.openai.com 分流。')
@@ -255,19 +294,71 @@ function diagnosticError(code: string, message: string): Error & { code: string 
 }
 
 function errorCode(error: unknown): string {
+  const builtInCategory = nestedBuiltInProxyCategory(error, 3)
+  if (builtInCategory) return builtInCategory
+  const code = nestedErrorCode(error, 3)
+  if (code) return code.slice(0, 80)
   if (!error || typeof error !== 'object') return 'UNKNOWN'
-  const direct = 'code' in error && typeof error.code === 'string' ? error.code : undefined
-  const cause = 'cause' in error && error.cause && typeof error.cause === 'object'
-    && 'code' in error.cause && typeof error.cause.code === 'string' ? error.cause.code : undefined
   const name = 'name' in error && typeof error.name === 'string' ? error.name : undefined
   const message = 'message' in error && typeof error.message === 'string' ? error.message : ''
-  if (direct) return direct.slice(0, 80)
-  if (cause) return cause.slice(0, 80)
   if (/abort|timeout/i.test(`${name ?? ''} ${message}`)) return 'TIMEOUT'
   return (name || 'UNKNOWN').slice(0, 80)
 }
 
+/** Normalizes runtime/service aliases into the stable renderer-facing classes. */
+export function builtInProxyDiagnosticCategory(value: unknown): BuiltInProxyDiagnosticCategory | undefined {
+  if (typeof value !== 'string') return undefined
+  const normalized = value.trim().toLowerCase().replace(/[\s-]+/g, '_')
+  if (normalized === 'core_missing') return 'core_missing'
+  if (normalized === 'config_invalid') return 'config_invalid'
+  if (normalized === 'node_handshake' || normalized === 'node_handshake_failed') return 'node_handshake'
+  if (normalized === 'mixed_port' || normalized === 'mixed_port_unavailable') return 'mixed_port'
+  if (normalized === 'tun_elevation' || normalized === 'tun_elevation_denied') return 'tun_elevation'
+  if (normalized === 'subscription_update' || normalized === 'subscription_update_failed') return 'subscription_update'
+  return undefined
+}
+
+function nestedBuiltInProxyCategory(error: unknown, maxDepth: number): BuiltInProxyDiagnosticCategory | undefined {
+  let current = error
+  const visited = new Set<object>()
+  for (let depth = 0; depth < maxDepth; depth += 1) {
+    if (!current || typeof current !== 'object' || visited.has(current)) return undefined
+    visited.add(current)
+    const category = 'category' in current
+      ? builtInProxyDiagnosticCategory(current.category)
+      : undefined
+    if (category) return category
+    const code = 'code' in current
+      ? builtInProxyDiagnosticCategory(current.code)
+      : undefined
+    if (code) return code
+    current = 'cause' in current ? current.cause : undefined
+  }
+  return undefined
+}
+
+function nestedErrorCode(error: unknown, maxDepth: number): string | undefined {
+  let current = error
+  const visited = new Set<object>()
+  for (let depth = 0; depth < maxDepth; depth += 1) {
+    if (!current || typeof current !== 'object' || visited.has(current)) return undefined
+    visited.add(current)
+    if ('code' in current && typeof current.code === 'string' && current.code.trim()) {
+      return current.code
+    }
+    current = 'cause' in current ? current.cause : undefined
+  }
+  return undefined
+}
+
 function failureMessage(code: string): string {
+  const builtInCategory = builtInProxyDiagnosticCategory(code)
+  if (builtInCategory === 'core_missing') return '内置代理核心缺失 · core_missing'
+  if (builtInCategory === 'config_invalid') return '内置代理配置无效 · config_invalid'
+  if (builtInCategory === 'node_handshake') return '内置代理节点握手失败 · node_handshake'
+  if (builtInCategory === 'mixed_port') return '内置代理 mixed 端口不可用 · mixed_port'
+  if (builtInCategory === 'tun_elevation') return '内置代理 TUN 提权失败 · tun_elevation'
+  if (builtInCategory === 'subscription_update') return '内置代理订阅更新失败 · subscription_update'
   if (/ENOTFOUND|EAI_AGAIN|DNS/i.test(code)) return `域名解析失败 · ${code}`
   if (/CERT|TLS|SSL|SELF_SIGNED/i.test(code)) return `TLS/证书校验失败 · ${code}`
   if (/TIMEOUT|UND_ERR_CONNECT_TIMEOUT/i.test(code)) return `连接超时 · ${code}`
