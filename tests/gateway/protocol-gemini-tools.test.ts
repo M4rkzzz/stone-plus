@@ -8,6 +8,120 @@ const lookupSchema = {
 }
 
 describe('Gemini tool protocol conversion', () => {
+  it('keeps direct Responses/Gemini conversion shape compatible with the Chat bridge', () => {
+    const responsesSource = {
+      instructions: 'System',
+      max_output_tokens: 55,
+      temperature: 0.2,
+      top_p: 0.7,
+      tool_choice: { type: 'function', name: 'get_weather' },
+      tools: [{ type: 'function', name: 'get_weather', description: 'Weather', parameters: lookupSchema }],
+      input: [
+        { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Checking' }] },
+        { type: 'function_call', call_id: 'call_1', name: 'get_weather', arguments: '{"city":"Paris"}' },
+        { type: 'function_call_output', call_id: 'call_1', output: '{"temperature":21}' },
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Continue' }] }
+      ]
+    }
+    const directGemini = convertRequest('openai-responses', 'gemini', responsesSource, 'target')
+    const responsesChat = convertRequest('openai-responses', 'openai-chat', responsesSource, 'target')
+    const bridgedGemini = convertRequest('openai-chat', 'gemini', responsesChat.body, 'target')
+    expect(directGemini).toEqual(bridgedGemini)
+
+    const geminiSource = {
+      systemInstruction: { parts: [{ text: 'System' }] },
+      generationConfig: { maxOutputTokens: 66, temperature: 0.5, topP: 0.6 },
+      toolConfig: { functionCallingConfig: { mode: 'ANY', allowedFunctionNames: ['get_weather'] } },
+      tools: [{ functionDeclarations: [{ name: 'get_weather', description: 'Weather', parameters: lookupSchema }] }],
+      contents: [
+        { role: 'model', parts: [
+          { text: 'Checking' },
+          { functionCall: { name: 'get_weather', args: { city: 'Paris' } } }
+        ] },
+        { role: 'user', parts: [
+          { functionResponse: { name: 'get_weather', response: { temperature: 21 } } },
+          { text: 'Continue' }
+        ] }
+      ]
+    }
+    const directResponses = convertRequest('gemini', 'openai-responses', geminiSource, 'target')
+    const geminiChat = convertRequest('gemini', 'openai-chat', geminiSource, 'target')
+    const bridgedResponses = convertRequest('openai-chat', 'openai-responses', geminiChat.body, 'target')
+    expect(directResponses).toEqual(bridgedResponses)
+  })
+
+  it('keeps direct Anthropic/Gemini request and response conversion shape compatible with the Chat bridge', () => {
+    const anthropicSource = {
+      system: [{ type: 'text', text: 'System' }],
+      max_tokens: 88,
+      temperature: 0.2,
+      top_p: 0.7,
+      stop_sequences: ['DONE'],
+      tool_choice: { type: 'tool', name: 'get_weather' },
+      tools: [{ name: 'get_weather', description: 'Weather', input_schema: lookupSchema }],
+      messages: [
+        { role: 'assistant', content: [
+          { type: 'text', text: 'Checking' },
+          { type: 'tool_use', id: 'tool_1', name: 'get_weather', input: { city: 'Paris' } }
+        ] },
+        { role: 'user', content: [
+          { type: 'tool_result', tool_use_id: 'tool_1', content: '{"temperature":21}' },
+          { type: 'text', text: 'Continue' }
+        ] }
+      ]
+    }
+    const directGemini = convertRequest('anthropic-messages', 'gemini', anthropicSource, 'target')
+    const anthropicChat = convertRequest('anthropic-messages', 'openai-chat', anthropicSource, 'target')
+    const bridgedGemini = convertRequest('openai-chat', 'gemini', anthropicChat.body, 'target')
+    expect(directGemini).toEqual(bridgedGemini)
+
+    const geminiSource = {
+      systemInstruction: { parts: [{ text: 'System' }] },
+      generationConfig: { maxOutputTokens: 88, temperature: 0.2, topP: 0.7, stopSequences: ['DONE'] },
+      toolConfig: { functionCallingConfig: { mode: 'ANY', allowedFunctionNames: ['get_weather'] } },
+      tools: [{ functionDeclarations: [{ name: 'get_weather', description: 'Weather', parameters: lookupSchema }] }],
+      contents: [
+        { role: 'model', parts: [
+          { text: 'Checking' },
+          { functionCall: { id: 'tool_1', name: 'get_weather', args: { city: 'Paris' } } }
+        ] },
+        { role: 'user', parts: [
+          { functionResponse: { id: 'tool_1', name: 'get_weather', response: { temperature: 21 } } },
+          { text: 'Continue' }
+        ] }
+      ]
+    }
+    const directAnthropic = convertRequest('gemini', 'anthropic-messages', geminiSource, 'target')
+    const geminiChat = convertRequest('gemini', 'openai-chat', geminiSource, 'target')
+    const bridgedAnthropic = convertRequest('openai-chat', 'anthropic-messages', geminiChat.body, 'target')
+    expect(directAnthropic).toEqual(bridgedAnthropic)
+
+    const anthropicResponse = {
+      id: 'msg_1',
+      model: 'source',
+      content: [{ type: 'text', text: 'Done' }, { type: 'tool_use', id: 'tool_1', name: 'get_weather', input: { city: 'Paris' } }],
+      stop_reason: 'tool_use',
+      usage: { input_tokens: 4, output_tokens: 2 }
+    }
+    const directResponseGemini = convertResponse('anthropic-messages', 'gemini', anthropicResponse, 'target')
+    const responseChat = convertResponse('anthropic-messages', 'openai-chat', anthropicResponse, 'target', () => 1_700_000_000_000)
+    const bridgedResponseGemini = convertResponse('openai-chat', 'gemini', responseChat, 'target')
+    expect(directResponseGemini).toEqual(bridgedResponseGemini)
+
+    const geminiResponse = {
+      candidates: [{ content: { role: 'model', parts: [
+        { text: 'Done' },
+        { functionCall: { id: 'tool_1', name: 'get_weather', args: { city: 'Paris' } } }
+      ] }, finishReason: 'STOP' }],
+      usageMetadata: { promptTokenCount: 4, candidatesTokenCount: 2 }
+    }
+    const clock = () => 1_700_000_000_000
+    const directResponseAnthropic = convertResponse('gemini', 'anthropic-messages', geminiResponse, 'target', clock)
+    const geminiResponseChat = convertResponse('gemini', 'openai-chat', geminiResponse, 'target', clock)
+    const bridgedResponseAnthropic = convertResponse('openai-chat', 'anthropic-messages', geminiResponseChat, 'target', clock)
+    expect(directResponseAnthropic).toEqual(bridgedResponseAnthropic)
+  })
+
   it('round-trips a multi-round Responses conversation through Gemini', () => {
     const source = {
       model: 'source-model',

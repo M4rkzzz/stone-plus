@@ -1,0 +1,104 @@
+{
+  "schemaVersion": 1,
+  "version": "1.13.14",
+  "targets": {
+    "win-x64": {
+      "runtimeDirectory": "win-x64",
+      "executable": "sing-box.exe",
+      "cronetLibrary": "libcronet.dll",
+      "files": [
+        {
+          "path": "libcronet.dll",
+          "sha256": "c7434cfa93c3041321dd19111c4de6c52b8a9531a65661ba45425d3c51ec69e2",
+          "size": 9389056
+        },
+        {
+          "path": "LICENSE",
+          "sha256": "bb3805862b583aee73ad6f7805ec634747a37257a637a3069857843f05ea589c",
+          "size": 808
+        },
+        {
+          "path": "sing-box.exe",
+          "sha256": "db0d779948214cf761011d154c3a5da36df20394fa01a9fc798f1dc39fe9d183",
+          "size": 45403136
+        }
+      ]
+    },
+    "linux-x64": {
+      "runtimeDirectory": "linux-x64",
+      "executable": "sing-box",
+      "cronetLibrary": "libcronet.so",
+      "files": [
+        {
+          "path": "libcronet.so",
+          "sha256": "dc7293a929dffa695aae1a89555e7366158fa0a3f40bbe3012d445bc05c99672",
+          "size": 11765624
+        },
+        {
+          "path": "LICENSE",
+          "sha256": "650d5e3b99a446fb38e820fa87a49562e0c79eab868fff58618ac487a58e554c",
+          "size": 791
+        },
+        {
+          "path": "sing-box",
+          "sha256": "68aeab83cc4ab2659a5b92232261a20746ccdafc3b3d1e19b2d63247eec3bbf7",
+          "size": 57995520
+        }
+      ]
+    },
+    "linux-arm64": {
+      "runtimeDirectory": "linux-arm64",
+      "executable": "sing-box",
+      "cronetLibrary": "libcronet.so",
+      "files": [
+        {
+          "path": "libcronet.so",
+          "sha256": "1518e73270c7b49694592bc0448ba1033a80ff4084bfb92cfa5baacec627bd9f",
+          "size": 12249368
+        },
+        {
+          "path": "LICENSE",
+          "sha256": "650d5e3b99a446fb38e820fa87a49562e0c79eab868fff58618ac487a58e554c",
+          "size": 791
+        },
+        {
+          "path": "sing-box",
+          "sha256": "85f570b96754cd7c354d28e50f66e9340b374e06b5d77ec9e15e8d04f0c87a25",
+          "size": 54329600
+        }
+      ]
+    },
+    "mac-x64": {
+      "runtimeDirectory": "mac-x64",
+      "executable": "sing-box",
+      "files": [
+        {
+          "path": "LICENSE",
+          "sha256": "650d5e3b99a446fb38e820fa87a49562e0c79eab868fff58618ac487a58e554c",
+          "size": 791
+        },
+        {
+          "path": "sing-box",
+          "sha256": "9e550c4cc3bdb8a6f3525bbaaf97624f517d1e37e0d5c76a439988483a5b27a6",
+          "size": 53500192
+        }
+      ]
+    },
+    "mac-arm64": {
+      "runtimeDirectory": "mac-arm64",
+      "executable": "sing-box",
+      "files": [
+        {
+          "path": "LICENSE",
+          "sha256": "650d5e3b99a446fb38e820fa87a49562e0c79eab868fff58618ac487a58e554c",
+          "size": 791
+        },
+        {
+          "path": "sing-box",
+          "sha256": "813d8effd02a19572a8d75aef29fc073101404ca535b2496be86f21827c7684d",
+          "size": 49894194
+        }
+      ]
+    }
+  }
+}

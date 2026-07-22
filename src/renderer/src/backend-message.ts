@@ -40,7 +40,7 @@ const backendMessageEnglish = new Map<string, string>([
   ['OpenAI 要求重新登录后再授权。', 'OpenAI requires you to sign in again before authorizing.'],
   ['OpenAI OAuth 授权未完成，请重新开始。', 'OpenAI OAuth authorization did not complete. Start again.'],
   ['OAuth 授权失败。', 'OAuth authorization failed.'],
-  ['选择的出口代理已被删除，请重新开始 OAuth 授权。', 'The selected outbound proxy was deleted. Restart OAuth authorization.'],
+  ['选择的代理已被删除，请重新开始 OAuth 授权。', 'The selected proxy was deleted. Restart OAuth authorization.'],
   ['OAuth 授权期间所选 Tag 已被删除，账号已按“未标记”导入。', 'The selected Tag was deleted during OAuth authorization. The account was imported as untagged.'],
 
   // Account import/export and browser queue.

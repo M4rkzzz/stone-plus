@@ -11,6 +11,7 @@ import {
   FolderCog,
   History,
   LoaderCircle,
+  LogIn,
   Pencil,
   Plus,
   RefreshCw,
@@ -54,8 +55,10 @@ import { localizeBackendMessage } from '../backend-message'
 import { clientBrandMeta as clientMeta } from '../brand-icons'
 import { useI18n, type UiLanguage } from '../i18n'
 import { setupPoolDisplayName } from '../system-generated-text'
-import { Badge, ConfirmDialog, EmptyState, formatDateTime, Modal, Toggle } from '../ui'
+import { Badge, ConfirmDialog, EmptyState, formatDateTime, InfoTip, Modal, Toggle } from '../ui'
 import '../clients-view.css'
+import { ManagedClientInstancesPanel } from '../managed-client-instances'
+import { PersistentTaskCenter } from '../persistent-task-center'
 
 const clientOrder: RouteClient[] = ['claude', 'codex', 'gemini']
 
@@ -107,6 +110,7 @@ export function ClientsView({
   const [showBackups, setShowBackups] = useState(false)
   const [advancedOpen, setAdvancedOpen] = useState(false)
   const [restoreTarget, setRestoreTarget] = useState<ClientBackupGroup | null>(null)
+  const [officialLoginConfirm, setOfficialLoginConfirm] = useState(false)
   const [deleteProfileTarget, setDeleteProfileTarget] = useState<ClientConfigProfile | null>(null)
   const [pendingSwitch, setPendingSwitch] = useState<PendingSwitch | null>(null)
   const [busy, setBusy] = useState<string | null>('load')
@@ -248,6 +252,28 @@ export function ClientsView({
     [editor, language],
   )
   const isDirty = editor ? isClientConfigWorkbenchDirty(editor, fieldDrafts, fileDrafts) : false
+  const codexAgentLimitField = activeClient === 'codex'
+    ? editor?.fields.find((field) => field.id === 'codex.agentsMaxThreads')
+    : undefined
+  const codexAgentLimitValue = codexAgentLimitField
+    ? draftValue(codexAgentLimitField, fieldDrafts)
+    : null
+  const codexAgentLimitDirty = Boolean(codexAgentLimitField)
+    && !sameConfigValue(codexAgentLimitField?.value ?? null, codexAgentLimitValue)
+  const codexAgentLimitValid = codexAgentLimitValue === null
+    || (typeof codexAgentLimitValue === 'number'
+      && Number.isInteger(codexAgentLimitValue)
+      && codexAgentLimitValue >= 1
+      && codexAgentLimitValue <= 64)
+  const hasOtherEditorChanges = Boolean(editor) && (
+    editor?.fields.some((field) => field.id !== 'codex.agentsMaxThreads'
+      && !field.readOnly
+      && !sameConfigValue(field.value, draftValue(field, fieldDrafts)))
+    || editor?.files.some((file) => file.editable
+      && file.content !== undefined
+      && fileDrafts[file.role] !== undefined
+      && fileDrafts[file.role] !== file.content)
+  )
   const status = statuses.find((candidate) => candidate.client === activeClient)
   const hasExistingConfig = Boolean(status?.files.some((file) => file.exists))
   const meta = clientMeta[activeClient]
@@ -320,6 +346,7 @@ export function ClientsView({
     setActiveField(null)
     setShowBackups(false)
     setAdvancedOpen(false)
+    setOfficialLoginConfirm(false)
     setFieldSearch('')
     setFieldScope('basic')
     setConfigHealth('checking')
@@ -359,6 +386,23 @@ export function ClientsView({
         `${clientMeta[editor.client].name} configuration is already up to date`,
       ))
     await loadWorkspace(editor.client, editor.profileId)
+  }
+
+  const saveCodexAgentLimit = async () => {
+    if (!editor || editor.client !== 'codex' || !codexAgentLimitField || !codexAgentLimitDirty
+      || !codexAgentLimitValid || hasOtherEditorChanges) return
+    const value = codexAgentLimitValue
+    const result = await run('save-codex-agent-limit', () => api.saveClientConfigEditor({
+      client: 'codex',
+      profileId: editor.profileId,
+      patches: [{ id: codexAgentLimitField.id, value }],
+      files: [],
+    }))
+    if (!result) return
+    setNotice(value === null
+      ? t('子代理上限已恢复为 Codex 默认值', 'The subagent limit now follows the Codex default')
+      : t(`子代理上限已设为 ${value}，重新启动 Codex 后生效`, `The subagent limit is now ${value}; restart Codex to apply it`))
+    await loadWorkspace('codex', editor.profileId)
   }
 
   const repairConnection = async () => {
@@ -462,6 +506,20 @@ export function ClientsView({
       `${meta.name} restored ${result.restoredFiles.length} configuration ${result.restoredFiles.length === 1 ? 'file' : 'files'} · ${formatDateTime(target.createdAt, locale)}`,
     ))
     await loadWorkspace(activeClient, activeProfileId)
+  }
+
+  const restoreOfficialLogin = async () => {
+    const profileId = activeProfileId
+    const result = await run('restore-codex-official-login', () => (
+      api.restoreCodexOfficialLoginAndSessions(profileId)
+    ))
+    if (!result) return
+    setOfficialLoginConfirm(false)
+    setNotice(t(
+      '已完成：关闭 Codex → 恢复官方登录与会话 → 重新开启 Codex',
+      'Completed: Close Codex → Restore official login and sessions → Reopen Codex',
+    ))
+    await loadWorkspace('codex', profileId)
   }
 
   const createBackup = async () => {
@@ -671,6 +729,61 @@ export function ClientsView({
           </div>
         </div>
 
+        {activeClient === 'codex' && (
+          <div className="client-easy-setting" data-testid="codex-agent-limit-setting">
+            <label htmlFor="client-codex-agent-limit">
+              <strong>{t('子代理上限', 'Subagent limit')}</strong>
+              <InfoTip text={t(
+                '限制同一 Codex 会话可同时运行的子代理数量，不包含主任务。调高会增加并行能力，也会增加额度和系统资源占用；留空跟随 Codex 默认值。',
+                'Limits the number of subagents that can run concurrently in one Codex session, excluding the primary task. Higher values increase parallelism, usage, and system resource consumption. Leave blank to use the Codex default.',
+              )} />
+            </label>
+            <div className="client-easy-setting__control">
+              <input
+                id="client-codex-agent-limit"
+                type="number"
+                min={1}
+                max={64}
+                step={1}
+                value={typeof codexAgentLimitValue === 'number' ? codexAgentLimitValue : ''}
+                placeholder={t('默认', 'Default')}
+                aria-invalid={!codexAgentLimitValid}
+                disabled={!codexAgentLimitField || Boolean(busy)}
+                onChange={(event) => {
+                  const value = event.target.value === '' ? null : Number(event.target.value)
+                  setFieldDrafts((current) => ({ ...current, 'codex.agentsMaxThreads': value }))
+                }}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') void saveCodexAgentLimit()
+                }}
+              />
+              <span>{t('个', 'agents')}</span>
+              <button
+                className="text-button"
+                type="button"
+                disabled={!codexAgentLimitField || Boolean(busy) || codexAgentLimitValue === null}
+                onClick={() => setFieldDrafts((current) => ({ ...current, 'codex.agentsMaxThreads': null }))}
+              >
+                {t('默认', 'Default')}
+              </button>
+              <button
+                className="button button--secondary client-easy-setting__save"
+                type="button"
+                disabled={Boolean(busy) || !codexAgentLimitDirty || !codexAgentLimitValid || hasOtherEditorChanges}
+                title={hasOtherEditorChanges
+                  ? t('请先保存或撤销高级设置中的其他更改', 'Save or revert the other changes in Advanced settings first')
+                  : !codexAgentLimitValid
+                    ? t('请输入 1 到 64 之间的整数', 'Enter an integer from 1 to 64')
+                    : t('保存到当前 Codex 配置目录', 'Save to the current Codex configuration profile')}
+                onClick={() => void saveCodexAgentLimit()}
+              >
+                {busy === 'save-codex-agent-limit' ? <LoaderCircle size={15} className="spin" /> : <Save size={15} />}
+                {t('保存', 'Save')}
+              </button>
+            </div>
+          </div>
+        )}
+
         <div className="client-easy-status" aria-label={t('连接状态', 'Connection status')}>
           <div className={`client-easy-status__item ${configHealth === 'healthy' ? 'is-ok' : configHealth === 'invalid' ? 'is-bad' : 'is-warn'}`}>
             {configHealth === 'checking'
@@ -769,6 +882,20 @@ export function ClientsView({
               {busy === 'start-client-gateway' ? <LoaderCircle size={16} className="spin" /> : <Wrench size={16} />}{t('启动网关', 'Start gateway')}
             </button>
           )}
+          {activeClient === 'codex' && (
+            <button
+              className="button button--secondary"
+              type="button"
+              disabled={Boolean(busy) || isDirty}
+              title={isDirty
+                ? t('请先保存或撤销高级设置中的更改', 'Save or revert the changes in Advanced settings first')
+                : t('关闭 Codex，恢复官方登录与会话，再重新开启', 'Close Codex, restore official login and sessions, then reopen it')}
+              onClick={() => setOfficialLoginConfirm(true)}
+            >
+              {busy === 'restore-codex-official-login' ? <LoaderCircle size={16} className="spin" /> : <LogIn size={16} />}
+              {t('恢复官方登录', 'Restore official login')}
+            </button>
+          )}
           {latestBackupGroup && (
             <button
               className="button button--secondary"
@@ -785,6 +912,9 @@ export function ClientsView({
           )}</span>
         </footer>
       </section>
+
+      <ManagedClientInstancesPanel snapshot={snapshot} api={api} />
+      <PersistentTaskCenter api={api} />
 
       <section className={`client-advanced ${advancedOpen ? 'is-open' : ''}`}>
         <button
@@ -972,6 +1102,19 @@ export function ClientsView({
           </div>
         )}
       </section>
+
+      <ConfirmDialog
+        open={officialLoginConfirm}
+        title={t('恢复 Codex 官方登录', 'Restore official Codex login')}
+        message={t(
+          '将依次执行：1. 关闭 Codex；2. 备份配置并恢复官方登录与会话；3. 重新开启 Codex。现有官方登录令牌、模型、MCP 和其他设置会保留。继续吗？',
+          'This will: 1. close Codex; 2. back up the configuration and restore official login and sessions; 3. reopen Codex. Existing official sign-in tokens, models, MCP, and other settings are preserved. Continue?',
+        )}
+        confirmLabel={t('开始恢复', 'Start recovery')}
+        busy={busy === 'restore-codex-official-login'}
+        onCancel={() => setOfficialLoginConfirm(false)}
+        onConfirm={() => void restoreOfficialLogin()}
+      />
 
       <ConfirmDialog
         open={Boolean(restoreTarget)}

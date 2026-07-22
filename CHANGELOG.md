@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.9.5
+
+- “出口代理”统一更名为“代理”，新增独立的内置代理总开关；关闭时完整保留原账号、号池、
+  系统代理与直连优先级，开启后由专属 Chromium session 原子接管 Stone+ 新请求。
+- 内置 sing-box 固定为 v1.13.14，支持 sing-box JSON、Clash Meta YAML、Base64 与明文 URI
+  导入，以及规则、全局、直连、单活动配置、节点选择、延迟、流量与连接管理。
+- 新增系统代理租约和临时提权 TUN 接入；保存并比较恢复原 PAC、绕过规则和系统设置，
+  核心崩溃或已激活配置故障时 fail-closed，不自动回退直连。
+- 数据库升级到 schema v9，内置代理状态与 profile 独立持久化；完整配置、订阅凭据和节点
+  凭据继续通过 safeStorage 与 credentials 加密，旧代理配置及绑定保持无损。
+- 重构外部网络重载与检测协调流程，保留完整 PAC URL、5 秒单飞边界和既有故障分类；
+  内置代理切换只检测启用来源，并继续排除废弃号池和额度耗尽账号。
+- Windows x64 正式包随附经 SHA-256 清单校验的 sing-box、libcronet、GPL 与第三方声明；
+  同步提供固定上游 commit、vendored Go 依赖与 NaiveProxy 源码的对应源码归档。
+- Windows 主程序、安装器和便携包新增持久的项目 Authenticode 签名、DigiCert 时间戳与
+  GitHub build provenance；项目证书为自签名证书，不代表 Microsoft 或商业 CA 身份背书。
+
 ## 0.9.3
 
 - 为 Codex 增加完整的 compact 能力适配：官方来源走原生压缩，中转来源自动使用普通

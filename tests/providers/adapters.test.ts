@@ -248,7 +248,7 @@ describe('provider discovery and health probes', () => {
     expect(signals[2]).toBe(signals[0])
   })
 
-  it('follows Anthropic after_id pagination and keeps a shared caller signal', async () => {
+  it('follows Anthropic after_id pagination with one caller-and-timeout signal', async () => {
     const controller = new AbortController()
     const signals: Array<AbortSignal | null | undefined> = []
     const fetchImplementation = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
@@ -279,7 +279,13 @@ describe('provider discovery and health probes', () => {
     })
 
     expect(result).toMatchObject({ ok: true, models: ['claude-first', 'claude-second'] })
-    expect(signals).toEqual([controller.signal, controller.signal])
+    expect(signals[0]).toBeInstanceOf(AbortSignal)
+    expect(signals[0]).not.toBe(controller.signal)
+    expect(signals[1]).toBe(signals[0])
+
+    controller.abort(new DOMException('caller cancelled', 'AbortError'))
+    expect(signals[0]?.aborted).toBe(true)
+    expect(signals[0]?.reason).toMatchObject({ name: 'AbortError', message: 'caller cancelled' })
   })
 
   it('fails the whole discovery when a later page fails', async () => {

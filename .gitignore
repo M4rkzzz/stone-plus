@@ -59,6 +59,8 @@ node_modules/
 *.keychain-db
 *.mobileprovision
 *.provisionprofile
+!/build/signing/
+!/build/signing/StonePlus-CodeSigning.cer
 
 # Logs, temporary files and crash reports
 *.log
@@ -86,6 +88,9 @@ pnpm-debug.log*
 /tmp/
 /temp/
 /crashpad/
+
+# Downloaded sing-box runtimes are verified build inputs, not source files.
+/build/sing-box/*/
 
 # Local promotion metrics, automation state and unpublished drafts
 /.promo/

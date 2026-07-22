@@ -95,6 +95,75 @@ describe('client configuration field catalog', () => {
     expect(content).toContain('parallel = true # unknown section')
   })
 
+  it('exposes and reads the Codex sub-agent limit through the compatible agents.max_threads key', () => {
+    const existing = {
+      'codex-config': [
+        'agents.max_threads = 12 # keep limit comment',
+        'future_option = "keep"',
+        '',
+      ].join('\n'),
+    }
+
+    const limit = clientConfigEditorFields('codex', existing)
+      .find((field) => field.id === 'codex.agentsMaxThreads')
+
+    expect(limit).toMatchObject({
+      id: 'codex.agentsMaxThreads',
+      role: 'codex-config',
+      path: ['agents', 'max_threads'],
+      section: '多代理',
+      label: '子代理上限',
+      control: 'number',
+      value: 12,
+      defaultValue: null,
+      recommendedValue: 6,
+      min: 1,
+      max: 64,
+      step: 1,
+      source: 'catalog',
+    })
+    expect(limit?.advanced).toBeUndefined()
+  })
+
+  it('validates, patches, and removes the Codex sub-agent limit without renaming agents.max_threads', () => {
+    const existing = {
+      'codex-config': [
+        'agents.max_threads = 12 # keep limit comment',
+        'future_option = "keep"',
+        '',
+      ].join('\n'),
+    }
+
+    for (const value of [1, 64]) {
+      const content = applyClientConfigFieldPatches('codex', existing, [
+        { id: 'codex.agentsMaxThreads', value },
+      ])['codex-config']!
+
+      expect(parseCodexToml(content)).toMatchObject({
+        agents: { max_threads: value },
+        future_option: 'keep',
+      })
+      expect(content).toContain(`agents.max_threads = ${value} # keep limit comment`)
+      expect(content).not.toContain('agents_max_threads')
+    }
+
+    expect(() => applyClientConfigFieldPatches('codex', existing, [
+      { id: 'codex.agentsMaxThreads', value: 0 },
+    ])).toThrow('below its minimum')
+    expect(() => applyClientConfigFieldPatches('codex', existing, [
+      { id: 'codex.agentsMaxThreads', value: 65 },
+    ])).toThrow('above its maximum')
+    expect(() => applyClientConfigFieldPatches('codex', existing, [
+      { id: 'codex.agentsMaxThreads', value: 1.5 },
+    ])).toThrow('must be an integer')
+
+    const removed = applyClientConfigFieldPatches('codex', existing, [
+      { id: 'codex.agentsMaxThreads', value: null },
+    ])['codex-config']!
+    expect(parseCodexToml(removed)).toEqual({ future_option: 'keep' })
+    expect(removed).not.toContain('max_threads')
+  })
+
   it('extracts and patches Gemini fields while preserving unknown JSON and removing null fields', () => {
     const existing = {
       'gemini-settings': JSON.stringify({

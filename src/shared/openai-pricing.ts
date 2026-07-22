@@ -142,58 +142,84 @@ function emptyBreakdown(): OpenAiTokenCostBreakdown {
   }
 }
 
+/** Mutable accumulator used by callers that already scan request logs for
+ * other metrics. It avoids a second full traversal solely for token pricing. */
+export interface OpenAiTokenCostAccumulator {
+  breakdown: OpenAiTokenCostBreakdown
+  unknownModels: Set<string>
+}
+
+export function createOpenAiTokenCostAccumulator(): OpenAiTokenCostAccumulator {
+  return {
+    breakdown: emptyBreakdown(),
+    unknownModels: new Set<string>()
+  }
+}
+
+export function accumulateOpenAiTokenCost(
+  accumulator: OpenAiTokenCostAccumulator,
+  log: Readonly<RequestLog>
+): void {
+  const result = accumulator.breakdown
+  const input = tokens(log.inputTokens)
+  const output = tokens(log.outputTokens)
+  const total = input + output
+  if (!total) return
+
+  result.totalTokens += total
+  result.inputTokens += input
+  result.outputTokens += output
+
+  const pricing = resolveOpenAiModelPricing(log.model)
+  if (!pricing) {
+    result.unpricedTokens += total
+    result.unpricedRequestCount += 1
+    accumulator.unknownModels.add(log.model.trim() || '未知模型')
+    return
+  }
+
+  const cachedRead = Math.min(input, tokens(log.cachedInputTokens))
+  const cacheWrite = Math.min(Math.max(0, input - cachedRead), tokens(log.cacheWriteInputTokens))
+  const standardInput = Math.max(0, input - cachedRead - cacheWrite)
+  const isLongContext = pricing.longContextThresholdTokens !== undefined
+    && input > pricing.longContextThresholdTokens
+  const inputMultiplier = isLongContext ? pricing.longContextInputMultiplier ?? 1 : 1
+  const outputMultiplier = isLongContext ? pricing.longContextOutputMultiplier ?? 1 : 1
+  const standardInputCost = standardInput / MILLION * pricing.inputUsdPerMillion * inputMultiplier
+  const cacheWriteCost = cacheWrite / MILLION * pricing.cacheWriteUsdPerMillion * inputMultiplier
+  const cachedInputCost = cachedRead / MILLION * pricing.cachedInputUsdPerMillion * inputMultiplier
+  const outputCost = output / MILLION * pricing.outputUsdPerMillion * outputMultiplier
+
+  result.standardInputTokens += standardInput
+  result.cachedInputTokens += cachedRead
+  result.cacheWriteInputTokens += cacheWrite
+  result.pricedTokens += total
+  result.inputCostUsd += standardInputCost + cacheWriteCost
+  result.cacheWriteCostUsd += cacheWriteCost
+  result.cachedInputCostUsd += cachedInputCost
+  result.outputCostUsd += outputCost
+  result.totalCostUsd += standardInputCost + cacheWriteCost + cachedInputCost + outputCost
+  result.pricedRequestCount += 1
+  if (isLongContext) result.longContextRequestCount += 1
+}
+
+export function finishOpenAiTokenCostAccumulator(
+  accumulator: OpenAiTokenCostAccumulator
+): OpenAiTokenCostBreakdown {
+  accumulator.breakdown.unknownModels = [...accumulator.unknownModels]
+    .sort((left, right) => left.localeCompare(right))
+  return accumulator.breakdown
+}
+
 /**
  * Estimates standard API cost from observable usage. `inputTokens` already includes
  * cached reads (and cache writes when reported), so both are subtracted before the
  * ordinary input rate is applied to avoid double charging.
  */
 export function estimateOpenAiTokenCosts(logs: readonly RequestLog[]): OpenAiTokenCostBreakdown {
-  const result = emptyBreakdown()
-  const unknownModels = new Set<string>()
-  for (const log of logs) {
-    const input = tokens(log.inputTokens)
-    const output = tokens(log.outputTokens)
-    const total = input + output
-    if (!total) continue
-
-    result.totalTokens += total
-    result.inputTokens += input
-    result.outputTokens += output
-
-    const pricing = resolveOpenAiModelPricing(log.model)
-    if (!pricing) {
-      result.unpricedTokens += total
-      result.unpricedRequestCount += 1
-      unknownModels.add(log.model.trim() || '未知模型')
-      continue
-    }
-
-    const cachedRead = Math.min(input, tokens(log.cachedInputTokens))
-    const cacheWrite = Math.min(Math.max(0, input - cachedRead), tokens(log.cacheWriteInputTokens))
-    const standardInput = Math.max(0, input - cachedRead - cacheWrite)
-    const isLongContext = pricing.longContextThresholdTokens !== undefined
-      && input > pricing.longContextThresholdTokens
-    const inputMultiplier = isLongContext ? pricing.longContextInputMultiplier ?? 1 : 1
-    const outputMultiplier = isLongContext ? pricing.longContextOutputMultiplier ?? 1 : 1
-    const standardInputCost = standardInput / MILLION * pricing.inputUsdPerMillion * inputMultiplier
-    const cacheWriteCost = cacheWrite / MILLION * pricing.cacheWriteUsdPerMillion * inputMultiplier
-    const cachedInputCost = cachedRead / MILLION * pricing.cachedInputUsdPerMillion * inputMultiplier
-    const outputCost = output / MILLION * pricing.outputUsdPerMillion * outputMultiplier
-
-    result.standardInputTokens += standardInput
-    result.cachedInputTokens += cachedRead
-    result.cacheWriteInputTokens += cacheWrite
-    result.pricedTokens += total
-    result.inputCostUsd += standardInputCost + cacheWriteCost
-    result.cacheWriteCostUsd += cacheWriteCost
-    result.cachedInputCostUsd += cachedInputCost
-    result.outputCostUsd += outputCost
-    result.totalCostUsd += standardInputCost + cacheWriteCost + cachedInputCost + outputCost
-    result.pricedRequestCount += 1
-    if (isLongContext) result.longContextRequestCount += 1
-  }
-  result.unknownModels = [...unknownModels].sort((left, right) => left.localeCompare(right))
-  return result
+  const accumulator = createOpenAiTokenCostAccumulator()
+  for (const log of logs) accumulateOpenAiTokenCost(accumulator, log)
+  return finishOpenAiTokenCostAccumulator(accumulator)
 }
 
 export function localNaturalDayStart(now: number): number {
@@ -209,11 +235,19 @@ export function summarizeOpenAiTokenCosts(
   const todayStart = localNaturalDayStart(now)
   const tomorrow = new Date(todayStart)
   tomorrow.setDate(tomorrow.getDate() + 1)
+  const today = createOpenAiTokenCostAccumulator()
+  const allTime = createOpenAiTokenCostAccumulator()
+  for (const log of logs) {
+    accumulateOpenAiTokenCost(allTime, log)
+    if (log.timestamp >= todayStart && log.timestamp < tomorrow.getTime()) {
+      accumulateOpenAiTokenCost(today, log)
+    }
+  }
   return {
     generatedAt: now,
     todayStart,
-    today: estimateOpenAiTokenCosts(logs.filter((log) => log.timestamp >= todayStart && log.timestamp < tomorrow.getTime())),
-    allTime: estimateOpenAiTokenCosts(logs)
+    today: finishOpenAiTokenCostAccumulator(today),
+    allTime: finishOpenAiTokenCostAccumulator(allTime)
   }
 }
 
@@ -223,22 +257,44 @@ export function summarizeAccountCodexQuotaCycleCosts(
   quota: AccountCodexQuotaSnapshot | undefined,
   now = Date.now()
 ): CodexQuotaCycleCosts {
-  const accountLogs = logs.filter((log) => log.accountId === accountId)
+  const fiveHour = quota?.fiveHour
+    ? createOpenAiTokenCostAccumulator()
+    : undefined
+  const sevenDay = quota?.sevenDay
+    ? createOpenAiTokenCostAccumulator()
+    : undefined
+  const fiveHourBounds = quota?.fiveHour
+    ? quotaWindowBounds(quota.fiveHour, 5 * 60 * 60, now)
+    : undefined
+  const sevenDayBounds = quota?.sevenDay
+    ? quotaWindowBounds(quota.sevenDay, 7 * 24 * 60 * 60, now)
+    : undefined
+  // Account quota cards are opened while request history may contain 20k rows.
+  // Keep the account filter and both window checks in a single traversal rather
+  // than allocating an account array and rescanning it for each quota cycle.
+  for (const log of logs) {
+    if (log.accountId !== accountId) continue
+    if (fiveHourBounds && log.timestamp >= fiveHourBounds.start && log.timestamp < fiveHourBounds.end) {
+      accumulateOpenAiTokenCost(fiveHour!, log)
+    }
+    if (sevenDayBounds && log.timestamp >= sevenDayBounds.start && log.timestamp < sevenDayBounds.end) {
+      accumulateOpenAiTokenCost(sevenDay!, log)
+    }
+  }
   return {
-    ...(quota?.fiveHour ? { fiveHourUsd: quotaWindowCost(accountLogs, quota.fiveHour, 5 * 60 * 60, now) } : {}),
-    ...(quota?.sevenDay ? { sevenDayUsd: quotaWindowCost(accountLogs, quota.sevenDay, 7 * 24 * 60 * 60, now) } : {})
+    ...(fiveHour ? { fiveHourUsd: finishOpenAiTokenCostAccumulator(fiveHour).totalCostUsd } : {}),
+    ...(sevenDay ? { sevenDayUsd: finishOpenAiTokenCostAccumulator(sevenDay).totalCostUsd } : {})
   }
 }
 
-function quotaWindowCost(
-  logs: readonly RequestLog[],
+function quotaWindowBounds(
   window: CodexQuotaWindow,
   fallbackSeconds: number,
   now: number
-): number {
+): { start: number; end: number } {
   const durationMs = Math.max(1, window.windowSeconds ?? fallbackSeconds) * 1_000
   const resetAt = window.resetAt
   const start = resetAt === undefined ? now - durationMs : resetAt - durationMs
   const end = resetAt === undefined ? now : Math.min(now, resetAt)
-  return estimateOpenAiTokenCosts(logs.filter((log) => log.timestamp >= start && log.timestamp < end)).totalCostUsd
+  return { start, end }
 }

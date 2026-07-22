@@ -16,45 +16,39 @@ import {
   summarizeSystemProxyChain,
   type SystemProxyDirective
 } from './system-proxy'
+import { BuiltInProxyRouteCoordinator } from './built-in/route-coordinator'
 
 const PROBE_TARGETS = [
   { url: 'https://api.ipify.org?format=json', parse: parseJsonIp },
   { url: 'https://icanhazip.com', parse: parseTextIp }
 ] as const
-// Warm origin lanes deliberately own one connection each. Four lazy lanes can
-// therefore carry four simultaneous HTTP/1.1 streams, while HTTP/2 can
-// multiplex more work on each connection. The fallback remains wider so an
-// un-warmed/custom origin does not become artificially serialized.
-const OUTBOUND_LANE_CONNECTIONS = 1
-const OUTBOUND_FALLBACK_CONNECTIONS = 4
+// This is a per-origin ceiling, not a preconnect count. Undici creates sockets
+// lazily, so a quiet origin still owns only the connection(s) it actually uses.
+// The wider budget prevents long-lived, non-idempotent generation streams from
+// forming a second queue inside the transport after the scheduler has already
+// admitted them.
+const DEFAULT_OUTBOUND_CONNECTION_BUDGET = 200
 const OUTBOUND_CONNECT_TIMEOUT_MS = 10_000
 const OUTBOUND_KEEP_ALIVE_TIMEOUT_MS = 5 * 60_000
 const OUTBOUND_KEEP_ALIVE_MAX_TIMEOUT_MS = 10 * 60_000
 const OUTBOUND_H2_PING_INTERVAL_MS = 30_000
-const OPPORTUNISTIC_WARM_WAIT_MS = 100
 const DEFAULT_SYSTEM_PROXY_CACHE_TTL_MS = 30_000
+const DEFAULT_SYSTEM_PROXY_RELOAD_TIMEOUT_MS = 5_000
 
 interface TransportGeneration {
   updatedAt: number
   authenticationFingerprint: string
   createDispatcher: (connections: number) => Dispatcher
-  fallbackDispatcher: Dispatcher
   fetchImplementation: typeof fetch
-  originPools: Map<string, OriginLanePool>
+  originPools: Map<string, OriginTransportPool>
   warmups: Map<string, Promise<void>>
 }
 
-interface OriginLane {
+interface OriginTransportPool {
   dispatcher: Dispatcher
   fetchImplementation: typeof fetch
-  busy: number
-}
-
-interface OriginLanePool {
-  lanes: OriginLane[]
-  cursor: number
-  maximumLanes: number
-  createLane: () => OriginLane
+  usedByApplication: boolean
+  warmed: boolean
 }
 
 interface TransportHandle {
@@ -63,13 +57,25 @@ interface TransportHandle {
 }
 
 export interface OutboundTransportManagerOptions {
+  connectionCountForOrigin?: (origin: string) => number
+  /** @deprecated Kept for compatibility with pre-pool transport tests/configuration. */
   laneCountForOrigin?: (origin: string) => number
   outboundNetworkMode?: OutboundNetworkMode
+  /** Chromium/Electron fetch bound to the default session. In production this
+   * is the authoritative executor for Windows system proxy/PAC traffic. */
+  systemProxyFetch?: typeof fetch
+  /** Reloads WinINET/PAC configuration without closing in-flight requests. */
+  reloadSystemProxy?: () => Promise<void>
+  /** Bounds an operating-system/PAC reload so startup, diagnostics and
+   * shutdown cannot wait forever on WinINET/WPAD. */
+  systemProxyReloadTimeoutMs?: number
   resolveSystemProxy?: (url: string) => Promise<string>
   systemProxyCacheTtlMs?: number
   localGatewayPort?: number
   onSystemProxyWarning?: (message: string) => void
   now?: () => number
+  /** Route pointer fed by SingBoxService/main. It has no Electron dependency. */
+  builtInRouteCoordinator?: BuiltInProxyRouteCoordinator
 }
 
 interface SystemProxyResolution {
@@ -80,6 +86,7 @@ interface SystemProxyResolution {
 interface CachedSystemProxyResolution {
   expiresAt: number
   resolution: Promise<SystemProxyResolution>
+  refreshing?: Promise<void>
 }
 
 export interface ProxyProbeResult {
@@ -88,13 +95,17 @@ export interface ProxyProbeResult {
 }
 
 export class OutboundTransportManager {
+  public readonly builtInRoutes: BuiltInProxyRouteCoordinator
   private readonly cache = new Map<string, TransportGeneration>()
   private readonly systemCache = new Map<string, TransportGeneration>()
   private readonly rotations = new Map<string, Promise<void>>()
   private readonly retirements = new Set<Promise<void>>()
   private readonly handles = new Map<string, TransportHandle>()
-  private readonly laneCountForOrigin: (origin: string) => number
+  private readonly connectionCountForOrigin: (origin: string) => number
   private readonly resolveSystemProxy?: (url: string) => Promise<string>
+  private readonly systemProxyFetch?: typeof fetch
+  private readonly reloadSystemProxy?: () => Promise<void>
+  private readonly systemProxyReloadTimeoutMs: number
   private readonly systemProxyCacheTtlMs: number
   private readonly onSystemProxyWarning: (message: string) => void
   private readonly now: () => number
@@ -102,25 +113,46 @@ export class OutboundTransportManager {
   private outboundNetworkMode: OutboundNetworkMode
   private localGatewayPort?: number
   private systemProxyResolutionWarningReported = false
+  private systemProxyReloadFlight?: Promise<void>
   private direct?: TransportGeneration
   private closed = false
+  private readonly routedFetches = new WeakMap<typeof fetch, typeof fetch>()
+  private readonly loopbackFetchImplementation: typeof fetch
+  private readonly externalImplicitFetchImplementation: typeof fetch
   private readonly implicitFetchImplementation: typeof fetch
 
   constructor(options: OutboundTransportManagerOptions = {}) {
-    this.laneCountForOrigin = options.laneCountForOrigin ?? defaultLaneCountForOrigin
+    this.connectionCountForOrigin = options.connectionCountForOrigin
+      ?? options.laneCountForOrigin
+      ?? defaultConnectionCountForOrigin
     this.outboundNetworkMode = options.outboundNetworkMode ?? 'direct'
+    this.systemProxyFetch = options.systemProxyFetch
+    this.reloadSystemProxy = options.reloadSystemProxy
+    this.systemProxyReloadTimeoutMs = Math.max(1, options.systemProxyReloadTimeoutMs ?? DEFAULT_SYSTEM_PROXY_RELOAD_TIMEOUT_MS)
     this.resolveSystemProxy = options.resolveSystemProxy
     this.systemProxyCacheTtlMs = Math.max(1_000, options.systemProxyCacheTtlMs ?? DEFAULT_SYSTEM_PROXY_CACHE_TTL_MS)
     this.localGatewayPort = options.localGatewayPort
     this.onSystemProxyWarning = options.onSystemProxyWarning ?? ((message) => console.warn(message))
     this.now = options.now ?? (() => Date.now())
-    this.implicitFetchImplementation = (async (input, init) => {
+    this.builtInRoutes = options.builtInRouteCoordinator ?? new BuiltInProxyRouteCoordinator({
+      externalMode: this.outboundNetworkMode,
+      now: this.now,
+      directLoopbackPorts: this.localGatewayPort ? [this.localGatewayPort] : []
+    })
+    this.builtInRoutes.setExternalMode(this.outboundNetworkMode)
+    if (this.localGatewayPort) this.builtInRoutes.addDirectLoopbackPorts([this.localGatewayPort])
+    this.loopbackFetchImplementation = (async (input, init) => {
+      if (this.closed) throw new Error('Outbound transport manager is closed.')
+      return this.directFetch()(input, init)
+    }) as typeof fetch
+    this.externalImplicitFetchImplementation = (async (input, init) => {
       if (this.closed) throw new Error('Outbound transport manager is closed.')
       if (this.outboundNetworkMode === 'direct' || isLocalTarget(input)) {
         return this.directFetch()(input, init)
       }
       return this.fetchUsingSystemProxy(input, init)
     }) as typeof fetch
+    this.implicitFetchImplementation = this.routeFetch(this.externalImplicitFetchImplementation)
   }
 
   public fetchFor(proxy: PublicProxyDefinition | undefined, password?: string): typeof fetch {
@@ -128,7 +160,71 @@ export class OutboundTransportManager {
     if (!proxy) {
       return this.implicitFetchImplementation
     }
-    return this.fetchForResolvedProxy(proxy, password, false)
+    // Do not even instantiate an account/pool Undici dispatcher while a
+    // built-in generation owns Stone+ traffic. The lazy external closure is
+    // retained only so a request captured after an atomic disable can either
+    // use its exact explicit route or fail safely when credentials are absent.
+    const externalFetch = this.builtInRoutes.isIntercepting()
+      ? this.suspendedExternalFetch(proxy, password)
+      : this.fetchForResolvedProxy(proxy, password, false)
+    return this.routeFetch(externalFetch)
+  }
+
+  /** Reuses an already-authenticated explicit proxy generation without asking
+   * the credential vault for its password on every upstream attempt. */
+  public fetchForCached(proxy: PublicProxyDefinition): typeof fetch | undefined {
+    if (this.closed) throw new Error('Outbound transport manager is closed.')
+    if (this.builtInRoutes.isIntercepting()) {
+      return this.routeFetch(this.suspendedExternalFetch(proxy))
+    }
+    const cached = this.cache.get(proxy.id)
+    if (!cached || cached.updatedAt !== proxy.updatedAt) return undefined
+    return this.routeFetch(this.handleFor(
+      `explicit:${transportHandleKey(proxy, cached.authenticationFingerprint)}`,
+      cached
+    ).fetchImplementation)
+  }
+
+  private routeFetch(externalFetch: typeof fetch): typeof fetch {
+    const cached = this.routedFetches.get(externalFetch)
+    if (cached) return cached
+    const bound = this.builtInRoutes.bind(externalFetch, this.loopbackFetchImplementation)
+    const routed = (async (input, init) => {
+      if (this.closed) throw new Error('Outbound transport manager is closed.')
+      return bound(input, init)
+    }) as typeof fetch
+    this.routedFetches.set(externalFetch, routed)
+    return routed
+  }
+
+  /**
+   * Keeps explicit proxy construction and credential validation off the hot
+   * path while built-in routing is active. If the facade survives an atomic
+   * switch back to external routing, it may use an existing authenticated
+   * generation or the exact password captured by fetchFor(); it never falls
+   * through to DIRECT.
+   */
+  private suspendedExternalFetch(
+    proxy: PublicProxyDefinition,
+    password?: string
+  ): typeof fetch {
+    return (async (input, init) => {
+      const cached = this.cache.get(proxy.id)
+      const requestedFingerprint = password !== undefined || !proxy.hasPassword
+        ? proxyAuthenticationFingerprint(proxy, password)
+        : undefined
+      const canUseCached = cached?.updatedAt === proxy.updatedAt && (
+        requestedFingerprint === undefined
+        || cached.authenticationFingerprint === requestedFingerprint
+      )
+      const externalFetch = canUseCached
+        ? this.handleFor(
+            `explicit:${transportHandleKey(proxy, cached!.authenticationFingerprint)}`,
+            cached!
+          ).fetchImplementation
+        : this.fetchForResolvedProxy(proxy, password, false)
+      return externalFetch(input, init)
+    }) as typeof fetch
   }
 
   private fetchForResolvedProxy(
@@ -161,6 +257,8 @@ export class OutboundTransportManager {
 
   public async close(): Promise<void> {
     this.closed = true
+    await this.builtInRoutes.close({ force: true })
+    await Promise.allSettled(this.systemProxyReloadFlight ? [this.systemProxyReloadFlight] : [])
     const generations = [
       ...this.cache.values(),
       ...this.systemCache.values(),
@@ -180,16 +278,55 @@ export class OutboundTransportManager {
   public configureOutboundNetwork(mode: OutboundNetworkMode, localGatewayPort?: number): void {
     const changed = this.outboundNetworkMode !== mode || this.localGatewayPort !== localGatewayPort
     this.outboundNetworkMode = mode
+    this.builtInRoutes.setExternalMode(mode)
     this.localGatewayPort = localGatewayPort
+    if (localGatewayPort) this.builtInRoutes.addDirectLoopbackPorts([localGatewayPort])
     if (changed) {
       this.invalidateSystemProxyCache()
       this.systemProxyResolutionWarningReported = false
     }
   }
 
+  /**
+   * Refresh the operating-system proxy/PAC snapshot for subsequent requests.
+   * Chromium owns active session.fetch connections, so reloading its proxy
+   * configuration does not cancel a response that is already streaming.
+   * Fallback Undici system generations are retired gracefully as well.
+   */
+  public reloadSystemProxyConfiguration(): Promise<void> {
+    if (this.closed) return Promise.reject(new Error('Outbound transport manager is closed.'))
+    if (this.systemProxyReloadFlight) return this.systemProxyReloadFlight
+    const flight = (async () => {
+      try {
+        if (this.reloadSystemProxy) {
+          await withBoundedSystemProxyReload(
+            this.reloadSystemProxy(),
+            this.systemProxyReloadTimeoutMs
+          )
+        }
+      } finally {
+        this.invalidateSystemProxyCache()
+        this.systemProxyResolutionWarningReported = false
+        const generations = [...this.systemCache.values()]
+        this.systemCache.clear()
+        for (const generation of generations) this.retire(generation)
+      }
+    })().finally(() => {
+      if (this.systemProxyReloadFlight === flight) this.systemProxyReloadFlight = undefined
+    })
+    this.systemProxyReloadFlight = flight
+    return flight
+  }
+
   public invalidateSystemProxyCache(origin?: string): void {
-    if (origin) this.systemProxyCache.delete(normalizeOrigin(origin))
-    else this.systemProxyCache.clear()
+    if (!origin) {
+      this.systemProxyCache.clear()
+      return
+    }
+    const normalizedOrigin = normalizeOrigin(origin)
+    for (const target of this.systemProxyCache.keys()) {
+      if (normalizeOrigin(target) === normalizedOrigin) this.systemProxyCache.delete(target)
+    }
   }
 
   public async detectSystemProxy(targets: readonly string[]): Promise<SystemProxyDetectionResult> {
@@ -203,7 +340,19 @@ export class OutboundTransportManager {
     origin: string,
     signal: AbortSignal = AbortSignal.timeout(5_000)
   ): Promise<void> {
+    if (this.builtInRoutes.shouldDirectLoopback(origin) || (!proxy && isLocalTarget(origin))) {
+      await this.warmGeneration(this.generationFor(undefined), normalizeOrigin(origin), signal)
+      return
+    }
+    if (this.builtInRoutes.isIntercepting()) {
+      await this.builtInRoutes.warm([origin], signal)
+      return
+    }
     if (!proxy && this.outboundNetworkMode === 'system' && !isLocalTarget(origin)) {
+      if (this.systemProxyFetch) {
+        await this.warmNativeSystemProxy(origin, signal)
+        return
+      }
       const resolution = await this.resolveSystemProxyRoute(origin, true)
       await this.warmSystemProxyChain(resolution.directives, normalizeOrigin(origin), signal)
       return
@@ -222,6 +371,10 @@ export class OutboundTransportManager {
     origins: readonly string[] = []
   ): Promise<void> {
     if (this.closed) throw new Error('Outbound transport manager is closed.')
+    if (this.builtInRoutes.isIntercepting()) {
+      await this.builtInRoutes.rebuild(origins)
+      return
+    }
     if (proxy?.hasPassword && !password) {
       throw new Error('Proxy authentication is unavailable from the credential vault.')
     }
@@ -264,7 +417,7 @@ export class OutboundTransportManager {
 
   private generationFor(proxy?: PublicProxyDefinition, password?: string): TransportGeneration {
     if (!proxy) this.directFetch()
-    else this.fetchFor(proxy, password)
+    else this.fetchForResolvedProxy(proxy, password, false)
     const generation = proxy ? this.cache.get(proxy.id) : this.direct
     if (!generation) throw new Error('Outbound transport generation was not created.')
     return generation
@@ -286,9 +439,24 @@ export class OutboundTransportManager {
     input: Parameters<typeof fetch>[0],
     init?: Parameters<typeof fetch>[1]
   ): Promise<Response> {
-    const origin = originOf(input)
-    const resolution = await this.resolveSystemProxyRoute(origin)
+    if (this.systemProxyFetch) return this.fetchUsingNativeSystemProxy(input, init)
+    const resolution = await this.resolveSystemProxyRoute(requestUrlOf(input))
     return this.fetchSystemProxyChain(resolution.directives, input, init)
+  }
+
+  private async fetchUsingNativeSystemProxy(
+    input: Parameters<typeof fetch>[0],
+    init?: Parameters<typeof fetch>[1]
+  ): Promise<Response> {
+    try {
+      return await this.systemProxyFetch!(cloneRequestInput(input), init)
+    } catch (error) {
+      this.invalidateSystemProxyCache(originOf(input))
+      throw new Error(
+        `System proxy request failed: ${safeTransportFailure(error)}`,
+        { cause: error }
+      )
+    }
   }
 
   private async fetchSystemProxyChain(
@@ -321,25 +489,47 @@ export class OutboundTransportManager {
     )
   }
 
-  private async resolveSystemProxyRoute(origin: string, refresh = false): Promise<SystemProxyResolution> {
-    const normalizedOrigin = normalizeOrigin(origin)
-    if (refresh) this.systemProxyCache.delete(normalizedOrigin)
-    const cached = this.systemProxyCache.get(normalizedOrigin)
-    if (cached && cached.expiresAt > this.now()) return cached.resolution
-    const resolution = this.resolveSystemProxyRouteUncached(normalizedOrigin)
-    this.systemProxyCache.set(normalizedOrigin, {
+  private async resolveSystemProxyRoute(target: string, refresh = false): Promise<SystemProxyResolution> {
+    const normalizedTarget = new URL(target).toString()
+    if (refresh) this.systemProxyCache.delete(normalizedTarget)
+    const cached = this.systemProxyCache.get(normalizedTarget)
+    if (cached) {
+      if (cached.expiresAt > this.now()) return cached.resolution
+      this.refreshSystemProxyRoute(normalizedTarget, cached)
+      // PAC/system-proxy discovery is control-plane work. Keep an expired route
+      // available to hot requests while it is refreshed in the background;
+      // explicit invalidation and transport failures delete the entry first and
+      // therefore still force the next request to await a fresh resolution.
+      return cached.resolution
+    }
+    const resolution = this.resolveSystemProxyRouteUncached(normalizedTarget)
+    this.systemProxyCache.set(normalizedTarget, {
       expiresAt: this.now() + this.systemProxyCacheTtlMs,
       resolution
     })
     return resolution
   }
 
-  private async resolveSystemProxyRouteUncached(origin: string): Promise<SystemProxyResolution> {
+  private refreshSystemProxyRoute(origin: string, cached: CachedSystemProxyResolution): void {
+    if (cached.refreshing) return
+    const resolution = this.resolveSystemProxyRouteUncached(origin)
+    cached.refreshing = resolution.then((fresh) => {
+      if (this.systemProxyCache.get(origin) !== cached) return
+      this.systemProxyCache.set(origin, {
+        expiresAt: this.now() + this.systemProxyCacheTtlMs,
+        resolution: Promise.resolve(fresh)
+      })
+    }).catch(() => undefined).finally(() => {
+      if (this.systemProxyCache.get(origin) === cached) cached.refreshing = undefined
+    })
+  }
+
+  private async resolveSystemProxyRouteUncached(target: string): Promise<SystemProxyResolution> {
     if (!this.resolveSystemProxy) {
       return this.directSystemProxyFallback('System proxy resolver is unavailable; using DIRECT.')
     }
     try {
-      const value = await this.resolveSystemProxy(new URL('/', origin).toString())
+      const value = await this.resolveSystemProxy(target)
       const directives = parseSystemProxyChain(value, {
         blockedLoopbackPorts: this.localGatewayPort ? [this.localGatewayPort] : []
       })
@@ -387,6 +577,17 @@ export class OutboundTransportManager {
 
   private async rebuildSystemProxyOrigins(origins: readonly string[]): Promise<void> {
     this.invalidateSystemProxyCache()
+    if (this.systemProxyFetch) {
+      if (origins.length === 0) return
+      const results = await Promise.allSettled([...new Set(origins.map(normalizeTargetUrl))].map((target) =>
+        this.warmNativeSystemProxy(target, AbortSignal.timeout(5_000))
+      ))
+      const failure = results.find((result): result is PromiseRejectedResult => result.status === 'rejected')
+      if (failure) {
+        throw failure.reason
+      }
+      return
+    }
     if (origins.length === 0) {
       await this.rotateResolved(undefined, undefined, [])
       return
@@ -418,19 +619,32 @@ export class OutboundTransportManager {
   }
 
   private async detectSystemProxyTarget(target: string): Promise<SystemProxyTargetStatus> {
-    const origin = normalizeOrigin(target)
+    const url = new URL(target).toString()
     const startedAt = this.now()
-    const resolution = await this.resolveSystemProxyRoute(origin, true)
+    const resolution = await this.resolveSystemProxyRoute(url, true)
     const summary = summarizeSystemProxyChain(resolution.directives)
     try {
-      const response = await this.fetchSystemProxyChain(
-        resolution.directives,
-        new URL('/', origin),
-        { method: 'HEAD', redirect: 'manual', signal: AbortSignal.timeout(8_000) }
-      )
-      await response.body?.cancel().catch(() => undefined)
+      const response = this.systemProxyFetch
+        ? await this.fetchUsingNativeSystemProxy(url, {
+            method: 'GET', redirect: 'manual', signal: AbortSignal.timeout(8_000)
+          })
+        : await this.fetchSystemProxyChain(
+            resolution.directives,
+            url,
+            { method: 'GET', redirect: 'manual', signal: AbortSignal.timeout(8_000) }
+          )
+      cancelResponseBody(response)
+      if (response.status === 407) {
+        return {
+          target: url,
+          summary,
+          reachable: false,
+          latencyMs: Math.max(0, this.now() - startedAt),
+          error: 'PROXY_AUTH_REQUIRED'
+        }
+      }
       return {
-        target: origin,
+        target: url,
         summary,
         reachable: true,
         latencyMs: Math.max(0, this.now() - startedAt),
@@ -438,7 +652,7 @@ export class OutboundTransportManager {
       }
     } catch (error) {
       return {
-        target: origin,
+        target: url,
         summary,
         reachable: false,
         latencyMs: Math.max(0, this.now() - startedAt),
@@ -447,34 +661,56 @@ export class OutboundTransportManager {
     }
   }
 
+  private async warmNativeSystemProxy(target: string, signal: AbortSignal): Promise<void> {
+    // Preserve the full URL for Chromium/PAC. Some PAC files deliberately
+    // choose different routes for paths on the same origin.
+    const response = await this.fetchUsingNativeSystemProxy(normalizeTargetUrl(target), {
+      method: 'HEAD',
+      redirect: 'manual',
+      signal,
+    })
+    cancelResponseBody(response)
+    if (response.status === 407) throw new Error('System proxy requires authentication.')
+  }
+
   private createGeneration(
     updatedAt: number,
     authenticationFingerprint: string,
     createDispatcher: (connections: number) => Dispatcher
   ): TransportGeneration {
-    const fallbackDispatcher = createDispatcher(OUTBOUND_FALLBACK_CONNECTIONS)
     const generation: TransportGeneration = {
       updatedAt,
       authenticationFingerprint,
       createDispatcher,
-      fallbackDispatcher,
       fetchImplementation: undefined as unknown as typeof fetch,
       originPools: new Map(),
       warmups: new Map()
     }
-    const fallbackFetch = fetchWithDispatcher(fallbackDispatcher)
     generation.fetchImplementation = (async (input, init) => {
       const origin = originOf(input)
-      const warming = generation.warmups.get(origin)
-      // Warming is speculative: a failed/slow HEAD request must never fail or
-      // stall the real POST on the gateway hot path. Give it only a very small
-      // chance to finish, then use the generation's fallback dispatcher.
-      if (warming) await waitForOpportunisticWarmup(warming)
-      const pool = generation.originPools.get(origin)
-      if (!pool) return fallbackFetch(input, init)
-      return fetchThroughLane(selectLane(pool), input, init)
+      const pool = this.originPoolFor(generation, origin)
+      pool.usedByApplication = true
+      // A real request never waits for a speculative HEAD. Both use the same
+      // origin-scoped dispatcher, so a slow warmup can open another connection
+      // without creating a second, unrelated TLS/session pool.
+      return pool.fetchImplementation(input, init)
     }) as typeof fetch
     return generation
+  }
+
+  private originPoolFor(generation: TransportGeneration, origin: string): OriginTransportPool {
+    const existing = generation.originPools.get(origin)
+    if (existing) return existing
+    const connections = normalizeConnectionCount(this.connectionCountForOrigin(origin))
+    const dispatcher = generation.createDispatcher(connections)
+    const pool: OriginTransportPool = {
+      dispatcher,
+      fetchImplementation: fetchWithDispatcher(dispatcher),
+      usedByApplication: false,
+      warmed: false
+    }
+    generation.originPools.set(origin, pool)
+    return pool
   }
 
   private handleFor(key: string, generation: TransportGeneration): TransportHandle {
@@ -500,46 +736,40 @@ export class OutboundTransportManager {
     origin: string,
     signal: AbortSignal
   ): Promise<void> {
-    if (generation.originPools.has(origin)) return Promise.resolve()
+    const pool = this.originPoolFor(generation, origin)
+    if (pool.warmed) return Promise.resolve()
     const running = generation.warmups.get(origin)
     if (running) return running
-    const warmup = this.createAndWarmOriginPool(generation, origin, signal).finally(() => {
+    const warmup = this.warmOriginPool(generation, origin, pool, signal).finally(() => {
       if (generation.warmups.get(origin) === warmup) generation.warmups.delete(origin)
     })
     generation.warmups.set(origin, warmup)
     return warmup
   }
 
-  private async createAndWarmOriginPool(
+  private async warmOriginPool(
     generation: TransportGeneration,
     origin: string,
+    pool: OriginTransportPool,
     signal: AbortSignal
   ): Promise<void> {
-    const maximumLanes = clampLaneCount(this.laneCountForOrigin(origin))
-    const createLane = (): OriginLane => {
-      const dispatcher = generation.createDispatcher(OUTBOUND_LANE_CONNECTIONS)
-      return { dispatcher, fetchImplementation: fetchWithDispatcher(dispatcher), busy: 0 }
-    }
-    // Warm only the stable primary lane. Additional lanes are a concurrency
-    // escape hatch and are created lazily only while every existing lane is
-    // carrying a response body. This keeps sequential Codex turns on one hot
-    // H2/TLS session instead of round-robining them across four sessions.
-    const primary = createLane()
     try {
-      const response = await primary.fetchImplementation(new URL('/', origin), {
+      const response = await pool.fetchImplementation(new URL('/', origin), {
         method: 'HEAD',
         redirect: 'manual',
         signal
       })
       await response.arrayBuffer()
-      generation.originPools.set(origin, {
-        lanes: [primary],
-        cursor: 0,
-        maximumLanes,
-        createLane
-      })
+      pool.warmed = true
     } catch (error) {
-      await primary.dispatcher.close().catch(() => undefined)
+      // A request may have started on this pool while the speculative HEAD was
+      // in flight. Never close the shared dispatcher underneath that request.
+      // An unused failed pool is removed so a later warmup/request gets a clean
+      // dispatcher rather than retaining a failed connector indefinitely.
+      if (!pool.usedByApplication && generation.originPools.get(origin) === pool) {
+        generation.originPools.delete(origin)
+        await pool.dispatcher.close().catch(() => undefined)
+      }
       throw error
     }
   }
@@ -590,25 +820,18 @@ export class OutboundTransportManager {
   }
 
   private retire(generation: TransportGeneration): void {
+    // A new proxy revision gets a distinct handle key. Drop handles that still
+    // point at the retired generation so repeated edits cannot grow the map
+    // forever. In-flight callers retain their closure over the handle object;
+    // deleting the lookup entry does not interrupt those requests.
+    for (const [key, handle] of this.handles) {
+      if (handle.generation === generation) this.handles.delete(key)
+    }
     const retirement = closeGeneration(generation).finally(() => {
       this.retirements.delete(retirement)
     })
     this.retirements.add(retirement)
     void retirement.catch(() => undefined)
-  }
-}
-
-async function waitForOpportunisticWarmup(warming: Promise<void>): Promise<void> {
-  let timer: ReturnType<typeof setTimeout> | undefined
-  try {
-    await Promise.race([
-      warming.catch(() => undefined),
-      new Promise<void>((resolve) => {
-        timer = setTimeout(resolve, OPPORTUNISTIC_WARM_WAIT_MS)
-      })
-    ])
-  } finally {
-    if (timer) clearTimeout(timer)
   }
 }
 
@@ -634,106 +857,9 @@ function fetchWithDispatcher(dispatcher: Dispatcher): typeof fetch {
     } as Parameters<typeof undiciFetch>[1]) as unknown as Promise<Response>) as typeof fetch
 }
 
-function selectLane(pool: OriginLanePool): OriginLane {
-  const primary = pool.lanes[0]
-  if (primary.busy === 0) return primary
-
-  // Once a primary stream is active, reuse an already-created idle backup.
-  // Prefer the least-recent candidate so simultaneous requests spread across
-  // the available lanes without disturbing sequential primary affinity.
-  for (let offset = 1; offset <= pool.lanes.length; offset += 1) {
-    const index = (pool.cursor + offset) % pool.lanes.length
-    if (index === 0 || pool.lanes[index].busy !== 0) continue
-    pool.cursor = index
-    return pool.lanes[index]
-  }
-
-  // A cold backup is cheaper than queueing behind a long streaming response,
-  // but it should not exist until real concurrency demonstrates a need for it.
-  if (pool.lanes.length < pool.maximumLanes) {
-    const lane = pool.createLane()
-    pool.lanes.push(lane)
-    pool.cursor = pool.lanes.length - 1
-    return lane
-  }
-
-  const minimumBusy = Math.min(...pool.lanes.map(({ busy }) => busy))
-  for (let offset = 0; offset < pool.lanes.length; offset += 1) {
-    const index = (pool.cursor + offset) % pool.lanes.length
-    if (pool.lanes[index].busy !== minimumBusy) continue
-    pool.cursor = (index + 1) % pool.lanes.length
-    return pool.lanes[index]
-  }
-  return pool.lanes[0]
-}
-
-async function fetchThroughLane(
-  lane: OriginLane,
-  input: Parameters<typeof fetch>[0],
-  init?: Parameters<typeof fetch>[1]
-): Promise<Response> {
-  lane.busy += 1
-  let released = false
-  const release = (): void => {
-    if (released) return
-    released = true
-    lane.busy = Math.max(0, lane.busy - 1)
-  }
-  try {
-    const response = await lane.fetchImplementation(input, init)
-    if (!response.body) {
-      release()
-      return response
-    }
-    const reader = response.body.getReader()
-    const body = new ReadableStream<Uint8Array>({
-      async pull(controller) {
-        try {
-          const { done, value } = await reader.read()
-          if (done) {
-            release()
-            controller.close()
-          } else {
-            controller.enqueue(value)
-          }
-        } catch (error) {
-          release()
-          controller.error(error)
-        }
-      },
-      async cancel(reason) {
-        try {
-          await reader.cancel(reason)
-        } finally {
-          release()
-        }
-      }
-    })
-    const wrapped = new Response(body, {
-      status: response.status,
-      statusText: response.statusText,
-      headers: response.headers
-    })
-    // Reconstructing the body lets lane occupancy follow the whole stream;
-    // retain the observable fetch metadata that ResponseInit cannot express.
-    Object.defineProperties(wrapped, {
-      url: { value: response.url },
-      redirected: { value: response.redirected },
-      type: { value: response.type }
-    })
-    return wrapped
-  } catch (error) {
-    release()
-    throw error
-  }
-}
-
 async function closeGeneration(generation: TransportGeneration): Promise<void> {
   await Promise.allSettled([...generation.warmups.values()])
-  const dispatchers = [
-    generation.fallbackDispatcher,
-    ...[...generation.originPools.values()].flatMap(({ lanes }) => lanes.map(({ dispatcher }) => dispatcher))
-  ]
+  const dispatchers = [...generation.originPools.values()].map(({ dispatcher }) => dispatcher)
   await Promise.all(dispatchers.map((dispatcher) => dispatcher.close().catch(() => undefined)))
 }
 
@@ -756,8 +882,18 @@ function originOf(input: Parameters<typeof fetch>[0]): string {
   }
 }
 
+function requestUrlOf(input: Parameters<typeof fetch>[0]): string {
+  if (typeof input === 'string') return new URL(input).toString()
+  if (input instanceof URL) return input.toString()
+  return new URL(input.url).toString()
+}
+
 function normalizeOrigin(origin: string): string {
   return new URL(origin).origin
+}
+
+function normalizeTargetUrl(target: string): string {
+  return new URL(target).toString()
 }
 
 function requestWasAborted(signal: AbortSignal | null | undefined): boolean {
@@ -784,23 +920,94 @@ function cloneRequestInput(input: Parameters<typeof fetch>[0]): Parameters<typeo
 }
 
 function safeTransportFailure(error: unknown): string {
-  if (error instanceof DOMException && error.name === 'TimeoutError') return 'connection timed out'
-  if (error instanceof Error && /timeout/i.test(`${error.name} ${error.message}`)) return 'connection timed out'
-  if (error instanceof Error && /abort/i.test(`${error.name} ${error.message}`)) return 'request was aborted'
+  const chain = transportErrorChain(error)
+  // Prefer structured codes, including those on nested socket causes, over a
+  // Chromium wrapper such as net::ERR_FAILED in an outer error message.
+  const code = chain.map(explicitTransportErrorCode).find((candidate): candidate is string => Boolean(candidate))
+    ?? chain.map(messageTransportErrorCode).find((candidate): candidate is string => Boolean(candidate))
+  if (chain.some((candidate) => (
+    candidate instanceof DOMException && candidate.name === 'TimeoutError'
+  ) || (
+    candidate instanceof Error && /timeout/i.test(`${candidate.name} ${candidate.message}`)
+  )) || code && /(?:^|_)TIMEOUT(?:_|$)|ETIMEDOUT/i.test(code)) {
+    return code ? `connection timed out (${code})` : 'connection timed out'
+  }
+  if (chain.some((candidate) => candidate instanceof Error && /abort/i.test(`${candidate.name} ${candidate.message}`))) {
+    return 'request was aborted'
+  }
+  if (code && /ENOTFOUND|EAI_AGAIN|DNS/i.test(code)) return `DNS resolution failed (${code})`
+  if (code && /CERT|TLS|SSL|SELF_SIGNED/i.test(code)) return `TLS/certificate validation failed (${code})`
+  if (code && /ECONNREFUSED/i.test(code)) return `connection was refused (${code})`
+  if (code && /ECONNRESET|EPIPE|UND_ERR_SOCKET/i.test(code)) return `connection was reset (${code})`
+  if (code) return `connection failed (${code})`
   return 'connection failed'
 }
 
-function clampLaneCount(value: number): number {
-  if (!Number.isFinite(value)) return 1
-  return Math.max(1, Math.min(4, Math.trunc(value)))
+function transportErrorChain(error: unknown, maximumDepth = 6): unknown[] {
+  const chain: unknown[] = []
+  const visited = new Set<object>()
+  let current = error
+  while (chain.length < maximumDepth && current !== undefined && current !== null) {
+    chain.push(current)
+    if (typeof current !== 'object' || visited.has(current)) break
+    visited.add(current)
+    current = 'cause' in current ? current.cause : undefined
+  }
+  return chain
 }
 
-function defaultLaneCountForOrigin(origin: string): number {
-  const hostname = new URL(origin).hostname.toLowerCase()
-  if (hostname === 'chatgpt.com' || hostname.endsWith('.chatgpt.com')) return 4
-  if (hostname === 'api.openai.com' || hostname.endsWith('.openai.com')) return 2
-  if (hostname === 'api.anthropic.com' || hostname === 'generativelanguage.googleapis.com') return 2
-  return 1
+function explicitTransportErrorCode(error: unknown): string | undefined {
+  if (!error || typeof error !== 'object') return undefined
+  if ('code' in error && typeof error.code === 'string') {
+    return sanitizeTransportErrorCode(error.code)
+  }
+  return undefined
+}
+
+function messageTransportErrorCode(error: unknown): string | undefined {
+  if (!error || typeof error !== 'object') return undefined
+  if ('message' in error && typeof error.message === 'string') {
+    const match = /\b((?:ERR_|UND_ERR_)[A-Z0-9_]+)\b/i.exec(error.message)
+    return match ? sanitizeTransportErrorCode(match[1]) : undefined
+  }
+  return undefined
+}
+
+function sanitizeTransportErrorCode(value: string): string | undefined {
+  const normalized = value.trim().toUpperCase()
+  return /^[A-Z0-9_]{2,80}$/.test(normalized) ? normalized : undefined
+}
+
+function cancelResponseBody(response: Response): void {
+  // The response status is already available. Initiate cancellation, but never
+  // let a transport whose cancel promise does not settle hold up diagnostics,
+  // warmup, shutdown, or the next real request.
+  void response.body?.cancel().catch(() => undefined)
+}
+
+function withBoundedSystemProxyReload(operation: Promise<void>, timeoutMs: number): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      reject(Object.assign(
+        new Error(`System proxy configuration reload timed out after ${timeoutMs} ms.`),
+        { code: 'SYSTEM_PROXY_RELOAD_TIMEOUT' }
+      ))
+    }, timeoutMs)
+    timer.unref?.()
+  })
+  return Promise.race([operation, timeout]).finally(() => {
+    if (timer) clearTimeout(timer)
+  })
+}
+
+function normalizeConnectionCount(value: number): number {
+  if (!Number.isFinite(value)) return DEFAULT_OUTBOUND_CONNECTION_BUDGET
+  return Math.max(1, Math.trunc(value))
+}
+
+function defaultConnectionCountForOrigin(_origin: string): number {
+  return DEFAULT_OUTBOUND_CONNECTION_BUDGET
 }
 
 export function resolveEffectiveProxy(
@@ -811,7 +1018,7 @@ export function resolveEffectiveProxy(
   const proxyId = account.proxyId ?? pool?.proxyId
   if (!proxyId) return undefined
   const proxy = proxies.find((candidate) => candidate.id === proxyId)
-  if (!proxy) throw new Error('The configured outbound proxy no longer exists.')
+  if (!proxy) throw new Error('The configured proxy no longer exists.')
   return proxy
 }
 

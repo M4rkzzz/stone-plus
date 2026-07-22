@@ -1,5 +1,25 @@
 import { contextBridge, ipcRenderer } from 'electron'
-import type { GatewayApi } from '@shared/types'
+import type { AppRuntimeDelta, GatewayApi } from '@shared/types'
+
+const builtInProxyErrorPattern = /\[stone-built-in-proxy-error:([a-z0-9_-]+):(retryable|fatal)\]\s*([\s\S]*)$/i
+
+const invokeBuiltInProxy = async (channel: string, ...args: unknown[]) => {
+  try {
+    return await ipcRenderer.invoke(channel, ...args)
+  } catch (error) {
+    const serializedMessage = error instanceof Error ? error.message : String(error)
+    const match = serializedMessage.match(builtInProxyErrorPattern)
+    if (!match) throw error
+    const classified = new Error(match[3] || 'Built-in proxy operation failed.')
+    classified.name = 'BuiltInProxyError'
+    Object.assign(classified, {
+      category: match[1],
+      code: match[1],
+      retryable: match[2] === 'retryable',
+    })
+    throw classified
+  }
+}
 
 const stone: GatewayApi = {
   setUiLanguage: (language) => ipcRenderer.invoke('stone:set-ui-language', language),
@@ -34,11 +54,28 @@ const stone: GatewayApi = {
   saveProxy: (input) => ipcRenderer.invoke('stone:save-proxy', input),
   deleteProxy: (id) => ipcRenderer.invoke('stone:delete-proxy', id),
   checkProxy: (id) => ipcRenderer.invoke('stone:check-proxy', id),
+  getBuiltInProxyState: () => invokeBuiltInProxy('stone:get-built-in-proxy-state'),
+  setBuiltInProxyEnabled: (enabled) => invokeBuiltInProxy('stone:set-built-in-proxy-enabled', enabled),
+  retryBuiltInProxy: () => invokeBuiltInProxy('stone:retry-built-in-proxy'),
+  importBuiltInProxyProfile: (input) => invokeBuiltInProxy('stone:import-built-in-proxy-profile', input),
+  refreshBuiltInProxyProfile: (id) => invokeBuiltInProxy('stone:refresh-built-in-proxy-profile', id),
+  deleteBuiltInProxyProfile: (id) => invokeBuiltInProxy('stone:delete-built-in-proxy-profile', id),
+  selectBuiltInProxyProfile: (id) => invokeBuiltInProxy('stone:select-built-in-proxy-profile', id),
+  selectBuiltInProxyNode: (profileId, nodeId) => invokeBuiltInProxy('stone:select-built-in-proxy-node', profileId, nodeId),
+  setBuiltInProxyRuleMode: (mode) => invokeBuiltInProxy('stone:set-built-in-proxy-rule-mode', mode),
+  setBuiltInProxyAccessMode: (mode) => invokeBuiltInProxy('stone:set-built-in-proxy-access-mode', mode),
+  setBuiltInProxyLanEnabled: (enabled) => invokeBuiltInProxy('stone:set-built-in-proxy-lan-enabled', enabled),
+  setBuiltInProxyAutoStart: (enabled) => invokeBuiltInProxy('stone:set-built-in-proxy-auto-start', enabled),
+  testBuiltInProxyLatency: (profileId, nodeIds) => invokeBuiltInProxy('stone:test-built-in-proxy-latency', profileId, nodeIds),
+  getBuiltInProxyTraffic: () => invokeBuiltInProxy('stone:get-built-in-proxy-traffic'),
+  listBuiltInProxyConnections: () => invokeBuiltInProxy('stone:list-built-in-proxy-connections'),
+  closeBuiltInProxyConnection: (id) => invokeBuiltInProxy('stone:close-built-in-proxy-connection', id),
   savePool: (input) => ipcRenderer.invoke('stone:save-pool', input),
   deletePool: (id) => ipcRenderer.invoke('stone:delete-pool', id),
   setRouteSourceFastMode: (input) => ipcRenderer.invoke('stone:set-route-source-fast-mode', input),
   saveApiSource: (input) => ipcRenderer.invoke('stone:save-api-source', input),
   probeApiSource: (input) => ipcRenderer.invoke('stone:probe-api-source', input),
+  previewRoute: (input) => ipcRenderer.invoke('stone:preview-route', input),
   deleteApiSource: (id) => ipcRenderer.invoke('stone:delete-api-source', id),
   saveAggregateRelay: (input) => ipcRenderer.invoke('stone:save-aggregate-relay', input),
   getSetupWizardState: () => ipcRenderer.invoke('stone:get-setup-wizard-state'),
@@ -61,6 +98,9 @@ const stone: GatewayApi = {
   getAccountCodexQuotaHistory: (id, from, to) => ipcRenderer.invoke('stone:get-account-codex-quota-history', id, from, to),
   getAccountCodexQuotaCycleCosts: (id) => ipcRenderer.invoke('stone:get-account-codex-quota-cycle-costs', id),
   clearLogs: () => ipcRenderer.invoke('stone:clear-logs'),
+  getRequestReplayTemplate: (id) => ipcRenderer.invoke('stone:get-request-replay-template', id),
+  replayRequest: (id) => ipcRenderer.invoke('stone:replay-request', id),
+  getLocalEventServerStatus: () => ipcRenderer.invoke('stone:get-local-event-server-status'),
   clearHealthEvents: () => ipcRenderer.invoke('stone:clear-health-events'),
   saveClientProfile: (input) => ipcRenderer.invoke('stone:save-client-profile', input),
   deleteClientProfile: (id) => ipcRenderer.invoke('stone:delete-client-profile', id),
@@ -71,6 +111,7 @@ const stone: GatewayApi = {
   previewClientConfig: (client, profileId) => ipcRenderer.invoke('stone:preview-client-config', client, profileId),
   applyClientConfig: (client, profileId) => ipcRenderer.invoke('stone:apply-client-config', client, profileId),
   repairClientConfig: (client, profileId) => ipcRenderer.invoke('stone:repair-client-config', client, profileId),
+  restoreCodexOfficialLoginAndSessions: (profileId) => ipcRenderer.invoke('stone:restore-codex-official-login-and-sessions', profileId),
   listClientConfigBackups: (client, profileId) => ipcRenderer.invoke('stone:list-client-config-backups', client, profileId),
   createClientConfigBackup: (client, profileId) => ipcRenderer.invoke('stone:create-client-config-backup', client, profileId),
   restoreLatestClientConfigBackup: (client, profileId) => ipcRenderer.invoke('stone:restore-latest-client-config-backup', client, profileId),
@@ -78,10 +119,31 @@ const stone: GatewayApi = {
   restoreClientConfig: (backupPath, client, profileId) => ipcRenderer.invoke('stone:restore-client-config', backupPath, client, profileId),
   getClientConfigEditor: (client, profileId) => ipcRenderer.invoke('stone:get-client-config-editor', client, profileId),
   saveClientConfigEditor: (input) => ipcRenderer.invoke('stone:save-client-config-editor', input),
+  listManagedClientInstances: () => ipcRenderer.invoke('stone:list-managed-client-instances'),
+  saveManagedClientInstance: (input) => ipcRenderer.invoke('stone:save-managed-client-instance', input),
+  deleteManagedClientInstance: (id) => ipcRenderer.invoke('stone:delete-managed-client-instance', id),
+  startManagedClientInstance: (id) => ipcRenderer.invoke('stone:start-managed-client-instance', id),
+  stopManagedClientInstance: (id) => ipcRenderer.invoke('stone:stop-managed-client-instance', id),
+  listPersistentTasks: () => ipcRenderer.invoke('stone:list-persistent-tasks'),
+  pausePersistentTask: (id) => ipcRenderer.invoke('stone:pause-persistent-task', id),
+  resumePersistentTask: (id) => ipcRenderer.invoke('stone:resume-persistent-task', id),
+  waitForPersistentTask: (id) => ipcRenderer.invoke('stone:wait-for-persistent-task', id),
+  cancelPersistentTask: (id) => ipcRenderer.invoke('stone:cancel-persistent-task', id),
+  clearPersistentTasks: () => ipcRenderer.invoke('stone:clear-persistent-tasks'),
+  startAccountCheckTask: (accountIds) => ipcRenderer.invoke('stone:start-account-check-task', accountIds),
   listStateBackups: () => ipcRenderer.invoke('stone:list-state-backups'),
   createStateBackup: () => ipcRenderer.invoke('stone:create-state-backup'),
   verifyStateBackup: (path) => ipcRenderer.invoke('stone:verify-state-backup', path),
   restoreStateBackup: (path) => ipcRenderer.invoke('stone:restore-state-backup', path),
+  exportPortableStateBackup: (password) => ipcRenderer.invoke('stone:export-portable-state-backup', password),
+  importPortableStateBackup: (password) => ipcRenderer.invoke('stone:import-portable-state-backup', password),
+  getWebDavBackupConfiguration: () => ipcRenderer.invoke('stone:get-webdav-backup-configuration'),
+  saveWebDavBackupConfiguration: (input) => ipcRenderer.invoke('stone:save-webdav-backup-configuration', input),
+  clearWebDavBackupConfiguration: () => ipcRenderer.invoke('stone:clear-webdav-backup-configuration'),
+  testWebDavBackup: () => ipcRenderer.invoke('stone:test-webdav-backup'),
+  listWebDavBackups: () => ipcRenderer.invoke('stone:list-webdav-backups'),
+  uploadLatestWebDavBackup: (password) => ipcRenderer.invoke('stone:upload-latest-webdav-backup', password),
+  downloadWebDavBackup: (name, password) => ipcRenderer.invoke('stone:download-webdav-backup', name, password),
   getDesktopRuntimeSettings: () => ipcRenderer.invoke('stone:get-desktop-runtime-settings'),
   updateDesktopRuntimeSettings: (settings) => ipcRenderer.invoke('stone:update-desktop-runtime-settings', settings),
   exportDiagnostics: () => ipcRenderer.invoke('stone:export-diagnostics'),
@@ -99,13 +161,41 @@ const stone: GatewayApi = {
   inspectCodexSessionRepair: () => ipcRenderer.invoke('stone:inspect-codex-session-repair'),
   previewCodexSessionRepair: (targetProvider) => ipcRenderer.invoke('stone:preview-codex-session-repair', targetProvider),
   repairCodexSessions: (targetProvider, expectedRevision) => ipcRenderer.invoke('stone:repair-codex-sessions', targetProvider, expectedRevision),
-  repairCodexSessionsAndRestartChatGpt: () => ipcRenderer.invoke('stone:repair-codex-sessions-and-restart-chatgpt'),
+  repairCodexSessionsAndRestartChatGpt: (targetProvider, expectedRevision) => ipcRenderer.invoke('stone:repair-codex-sessions-and-restart-chatgpt', targetProvider, expectedRevision),
+  previewCodexSessionIndexCleanup: () => ipcRenderer.invoke('stone:preview-codex-session-index-cleanup'),
+  cleanupCodexSessionIndexAndRestart: (snapshotSha256, threadIds) => ipcRenderer.invoke('stone:cleanup-codex-session-index-and-restart', snapshotSha256, threadIds),
+  listCodexSessions: (query) => ipcRenderer.invoke('stone:list-codex-sessions', query),
+  openCodexSessionLocation: (id, expectedRevision) => ipcRenderer.invoke('stone:open-codex-session-location', id, expectedRevision),
+  exportCodexSession: (id, expectedRevision) => ipcRenderer.invoke('stone:export-codex-session', id, expectedRevision),
+  trashCodexSession: (id, expectedRevision) => ipcRenderer.invoke('stone:trash-codex-session', id, expectedRevision),
+  restoreCodexSession: (id, expectedRevision) => ipcRenderer.invoke('stone:restore-codex-session', id, expectedRevision),
   onSnapshot: (listener) => {
     const handler = (_event: Electron.IpcRendererEvent, snapshot: Awaited<ReturnType<GatewayApi['getSnapshot']>>) => {
       listener(snapshot)
     }
     ipcRenderer.on('stone:snapshot', handler)
     return () => ipcRenderer.removeListener('stone:snapshot', handler)
+  },
+  onBuiltInProxyState: (listener) => {
+    const handler = (_event: Electron.IpcRendererEvent, state: Awaited<ReturnType<GatewayApi['getBuiltInProxyState']>>) => {
+      listener(state)
+    }
+    ipcRenderer.on('stone:built-in-proxy-state', handler)
+    return () => ipcRenderer.removeListener('stone:built-in-proxy-state', handler)
+  },
+  onRuntimeDelta: (listener) => {
+    const handler = (_event: Electron.IpcRendererEvent, delta: AppRuntimeDelta) => {
+      listener(delta)
+    }
+    ipcRenderer.on('stone:runtime-delta', handler)
+    return () => ipcRenderer.removeListener('stone:runtime-delta', handler)
+  },
+  onManagedClientInstancesChanged: (listener) => {
+    const handler = (_event: Electron.IpcRendererEvent, instances: Awaited<ReturnType<GatewayApi['listManagedClientInstances']>>) => {
+      listener(instances)
+    }
+    ipcRenderer.on('stone:managed-client-instances', handler)
+    return () => ipcRenderer.removeListener('stone:managed-client-instances', handler)
   },
   onAccountImportProgress: (listener) => {
     const handler = (_event: Electron.IpcRendererEvent, progress: Parameters<typeof listener>[0]) => {

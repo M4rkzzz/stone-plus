@@ -1,6 +1,6 @@
 import { mutateDotenv, validateDotenv } from './dotenv-format'
 import { mutateJsonObject, objectField, type JsonObject, type TextMutation } from './json-format'
-import { planCodexToml, repairCodexToml } from './toml-format'
+import { planCodexOfficialLoginToml, planCodexToml, repairCodexToml } from './toml-format'
 import type {
   ClientConfigFilePath,
   ClientConfigPlan,
@@ -96,6 +96,43 @@ export function planCodexConfig(
       mutation(paths.auth, authSource, auth, ['auth_mode', 'OPENAI_API_KEY']),
     ],
   }
+}
+
+/**
+ * Restore Codex's built-in ChatGPT/OpenAI sign-in path while retaining cached
+ * ChatGPT tokens and every unrelated user setting.
+ */
+export function planCodexOfficialLoginConfig(
+  paths: ResolvedClientConfigPaths['codex'],
+  existing: ExistingClientConfig,
+): ClientConfigPlan {
+  const configSource = existing['codex-config']
+  const authSource = existing['codex-auth']
+  const config = planCodexOfficialLoginToml(configSource)
+  const files: PlannedFileMutation[] = [mutation(paths.config, configSource, config, [
+    'model_provider',
+    'cli_auth_credentials_store',
+    'features.remote_compaction_v2',
+    'model_providers.stone',
+  ])]
+
+  // Do not create an empty auth.json. With no cached credentials Codex should
+  // open its normal official sign-in flow on relaunch.
+  if (authSource !== undefined) {
+    const auth = mutateJsonObject(authSource, 'codex-auth', (root) => {
+      delete root.OPENAI_API_KEY
+      if (root.auth_mode !== 'apikey') return
+      const tokens = root.tokens
+      if (tokens && typeof tokens === 'object' && !Array.isArray(tokens) && Object.keys(tokens).length > 0) {
+        root.auth_mode = 'chatgpt'
+      } else {
+        delete root.auth_mode
+      }
+    })
+    files.push(mutation(paths.auth, authSource, auth, ['auth_mode', 'OPENAI_API_KEY']))
+  }
+
+  return { client: 'codex', files }
 }
 
 export function planGeminiConfig(

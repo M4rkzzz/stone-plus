@@ -4,7 +4,7 @@ import {
   type ServerResponse
 } from 'node:http'
 import { connect as connectTcp, type Socket } from 'node:net'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   OutboundTransportManager,
   proxyEntryAddress,
@@ -49,12 +49,12 @@ describe('effective proxy resolution', () => {
       { proxyId: 'deleted-account-proxy' },
       { proxyId: poolProxy.id },
       proxies
-    )).toThrow('configured outbound proxy no longer exists')
+    )).toThrow('configured proxy no longer exists')
     expect(() => resolveEffectiveProxy(
       {},
       { proxyId: 'deleted-pool-proxy' },
       proxies
-    )).toThrow('configured outbound proxy no longer exists')
+    )).toThrow('configured proxy no longer exists')
   })
 })
 
@@ -77,7 +77,172 @@ describe('proxy entry presentation', () => {
 })
 
 describe('outbound proxy transport', () => {
-  it('caches system proxy resolution by origin and supports explicit invalidation', async () => {
+  it('uses the Chromium system fetch for the complete request URL', async () => {
+    const systemProxyFetch = vi.fn(async () => new Response('chromium system route')) as unknown as typeof fetch
+    const resolver = vi.fn(async () => 'PROXY 127.0.0.1:7890')
+    const manager = trackManager(new OutboundTransportManager({
+      outboundNetworkMode: 'system',
+      systemProxyFetch,
+      resolveSystemProxy: resolver,
+    }))
+
+    const response = await manager.fetchFor(undefined)('https://chatgpt.com/backend-api/codex/models?client_version=1')
+
+    expect(await response.text()).toBe('chromium system route')
+    expect(systemProxyFetch).toHaveBeenCalledWith(
+      'https://chatgpt.com/backend-api/codex/models?client_version=1',
+      undefined,
+    )
+    expect(resolver).not.toHaveBeenCalled()
+  })
+
+  it('reloads the operating-system proxy configuration as a single flight', async () => {
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const reloadSystemProxy = vi.fn(async () => gate)
+    const manager = trackManager(new OutboundTransportManager({ reloadSystemProxy }))
+
+    const first = manager.reloadSystemProxyConfiguration()
+    const second = manager.reloadSystemProxyConfiguration()
+    expect(first).toBe(second)
+    expect(reloadSystemProxy).toHaveBeenCalledOnce()
+    release()
+    await Promise.all([first, second])
+  })
+
+  it('bounds a stuck operating-system proxy reload and still invalidates cached decisions', async () => {
+    const reloadSystemProxy = vi.fn(() => new Promise<void>(() => undefined))
+    const manager = trackManager(new OutboundTransportManager({
+      reloadSystemProxy,
+      systemProxyReloadTimeoutMs: 20,
+    }))
+    const invalidate = vi.spyOn(manager, 'invalidateSystemProxyCache')
+
+    await expect(manager.reloadSystemProxyConfiguration()).rejects.toMatchObject({
+      code: 'SYSTEM_PROXY_RELOAD_TIMEOUT',
+    })
+
+    expect(invalidate).toHaveBeenCalled()
+    await expect(manager.reloadSystemProxyConfiguration()).rejects.toMatchObject({
+      code: 'SYSTEM_PROXY_RELOAD_TIMEOUT',
+    })
+    expect(reloadSystemProxy).toHaveBeenCalledTimes(2)
+  })
+
+  it('preserves the complete target URL when warming and rebuilding native system routes', async () => {
+    const target = 'https://relay.example/openai/v1/responses?tenant=stone'
+    const systemProxyFetch = vi.fn(async () => new Response(null, { status: 204 })) as unknown as typeof fetch
+    const manager = trackManager(new OutboundTransportManager({
+      outboundNetworkMode: 'system',
+      systemProxyFetch,
+    }))
+
+    await manager.warmFor(undefined, undefined, target)
+    await manager.rebuild(undefined, undefined, [target])
+
+    expect(systemProxyFetch).toHaveBeenNthCalledWith(
+      1,
+      target,
+      expect.objectContaining({ method: 'HEAD' }),
+    )
+    expect(systemProxyFetch).toHaveBeenNthCalledWith(
+      2,
+      target,
+      expect.objectContaining({ method: 'HEAD' }),
+    )
+  })
+
+  it('reports a native system rebuild when any requested target fails to warm', async () => {
+    const goodTarget = 'https://relay.example/good/v1'
+    const badTarget = 'https://relay.example/bad/v1'
+    const systemProxyFetch = vi.fn(async (input: Parameters<typeof fetch>[0]) => {
+      if (String(input).includes('/bad/')) {
+        throw Object.assign(new Error('socket reset'), { code: 'ECONNRESET' })
+      }
+      return new Response(null, { status: 204 })
+    }) as unknown as typeof fetch
+    const manager = trackManager(new OutboundTransportManager({
+      outboundNetworkMode: 'system',
+      systemProxyFetch,
+    }))
+
+    await expect(manager.rebuild(undefined, undefined, [goodTarget, badTarget]))
+      .rejects.toThrow('ECONNRESET')
+    expect(systemProxyFetch).toHaveBeenCalledTimes(2)
+  })
+
+  it('uses Chromium for detection and marks proxy authentication as unavailable', async () => {
+    const target = 'https://auth.openai.com/.well-known/openid-configuration?probe=1'
+    const resolver = vi.fn(async () => 'PROXY corporate.example:8080')
+    const systemProxyFetch = vi.fn(async () => new Response('', { status: 407 })) as unknown as typeof fetch
+    const manager = trackManager(new OutboundTransportManager({
+      outboundNetworkMode: 'system',
+      systemProxyFetch,
+      resolveSystemProxy: resolver,
+    }))
+
+    const detection = await manager.detectSystemProxy([target])
+
+    expect(resolver).toHaveBeenCalledWith(target)
+    expect(systemProxyFetch).toHaveBeenCalledWith(target, expect.objectContaining({ method: 'GET' }))
+    expect(detection.targets[0]).toMatchObject({
+      target,
+      reachable: false,
+      summary: 'HTTP corporate.example:8080',
+      error: 'PROXY_AUTH_REQUIRED',
+    })
+  })
+
+  it('does not wait for a native response body cancellation during detection or warmup', async () => {
+    const systemProxyFetch = vi.fn(async () => new Response(new ReadableStream({
+      cancel: () => new Promise<void>(() => undefined),
+    }), { status: 401 })) as unknown as typeof fetch
+    const manager = trackManager(new OutboundTransportManager({
+      outboundNetworkMode: 'system',
+      systemProxyFetch,
+      resolveSystemProxy: async () => 'DIRECT',
+    }))
+
+    const detection = manager.detectSystemProxy(['https://chatgpt.com/backend-api/codex/models'])
+    await expect(Promise.race([
+      detection.then(() => 'completed'),
+      new Promise<string>((resolve) => setTimeout(() => resolve('timed out'), 75)),
+    ])).resolves.toBe('completed')
+
+    const warming = manager.warmFor(
+      undefined,
+      undefined,
+      'https://chatgpt.com/backend-api/codex/responses',
+    )
+    await expect(Promise.race([
+      warming.then(() => 'completed'),
+      new Promise<string>((resolve) => setTimeout(() => resolve('timed out'), 75)),
+    ])).resolves.toBe('completed')
+  })
+
+  it('preserves an actionable code from a nested native transport error', async () => {
+    const socketError = Object.assign(new Error('socket failed'), { code: 'ECONNRESET' })
+    const systemProxyFetch = vi.fn(async () => {
+      throw Object.assign(new TypeError('net::ERR_FAILED'), { cause: socketError })
+    }) as unknown as typeof fetch
+    const manager = trackManager(new OutboundTransportManager({
+      outboundNetworkMode: 'system',
+      systemProxyFetch,
+      resolveSystemProxy: async () => 'DIRECT',
+    }))
+
+    await expect(manager.fetchFor(undefined)('https://chatgpt.com/backend-api/codex/responses'))
+      .rejects.toThrow('ECONNRESET')
+    await expect(manager.detectSystemProxy(['https://chatgpt.com/backend-api/codex/models']))
+      .resolves.toMatchObject({
+        targets: [expect.objectContaining({
+          reachable: false,
+          error: expect.stringContaining('ECONNRESET'),
+        })],
+      })
+  })
+
+  it('caches an exact PAC URL decision and invalidates every URL for its origin', async () => {
     let resolutions = 0
     let now = 1_000
     let proxyConnects = 0
@@ -96,17 +261,62 @@ describe('outbound proxy transport', () => {
     const fetchImplementation = manager.fetchFor(undefined)
 
     expect(await (await fetchImplementation('http://system-cache.test/one')).text()).toBe('through system proxy')
-    expect(await (await fetchImplementation('http://system-cache.test/two')).text()).toBe('through system proxy')
+    expect(await (await fetchImplementation('http://system-cache.test/one')).text()).toBe('through system proxy')
     expect(resolutions).toBe(1)
 
     now += 1_001
-    expect(await (await fetchImplementation('http://system-cache.test/expired')).text()).toBe('through system proxy')
+    expect(await (await fetchImplementation('http://system-cache.test/one')).text()).toBe('through system proxy')
     expect(resolutions).toBe(2)
 
     manager.invalidateSystemProxyCache('http://system-cache.test')
     expect(await (await fetchImplementation('http://system-cache.test/three')).text()).toBe('through system proxy')
     expect(resolutions).toBe(3)
     expect(proxyConnects).toBeGreaterThan(0)
+  })
+
+  it('serves an expired system proxy route while a slow resolver refreshes it', async () => {
+    let resolutions = 0
+    let now = 1_000
+    let refreshStarted!: () => void
+    let releaseRefresh!: () => void
+    const refreshObserved = new Promise<void>((resolve) => { refreshStarted = resolve })
+    const refreshGate = new Promise<void>((resolve) => { releaseRefresh = resolve })
+    const origin = await listen(createHttpServer((_request, response) => response.end('stale route stayed hot')))
+    const proxyAddress = await listen(fixedTunnelProxy(origin.port))
+    const proxyDirective = `PROXY 127.0.0.1:${proxyAddress.port}; DIRECT`
+    const manager = trackManager(new OutboundTransportManager({
+      outboundNetworkMode: 'system',
+      systemProxyCacheTtlMs: 1_000,
+      now: () => now,
+      resolveSystemProxy: async () => {
+        resolutions += 1
+        if (resolutions === 2) {
+          refreshStarted()
+          await refreshGate
+        }
+        return proxyDirective
+      }
+    }))
+    const fetchImplementation = manager.fetchFor(undefined)
+
+    expect(await (await fetchImplementation('http://system-swr.test/resource')).text()).toBe('stale route stayed hot')
+    now += 1_001
+    const hotRequest = fetchImplementation('http://system-swr.test/resource').then((response) => response.text())
+    await refreshObserved
+    expect(await Promise.race([
+      hotRequest,
+      new Promise<string>((resolve) => setTimeout(() => resolve('timed out'), 75))
+    ])).toBe('stale route stayed hot')
+    expect(resolutions).toBe(2)
+
+    releaseRefresh()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(await (await fetchImplementation('http://system-swr.test/resource')).text()).toBe('stale route stayed hot')
+    expect(resolutions).toBe(2)
+
+    manager.invalidateSystemProxyCache('http://system-swr.test')
+    expect(await (await fetchImplementation('http://system-swr.test/invalidated')).text()).toBe('stale route stayed hot')
+    expect(resolutions).toBe(3)
   })
 
   it('advances through an ordered PAC proxy chain with a replayable POST body', async () => {
@@ -306,7 +516,147 @@ describe('outbound proxy transport', () => {
     expect(await warmingFailure).toBeInstanceOf(Error)
   })
 
-  it('warms only the primary lane and creates a backup lazily for a concurrent stream', async () => {
+  it('does not wait behind a slow warmup before starting a real request', async () => {
+    let headStarted!: () => void
+    let releaseHead!: () => void
+    const headObserved = new Promise<void>((resolve) => { headStarted = resolve })
+    const origin = createHttpServer((request, response) => {
+      if (request.method === 'HEAD') {
+        headStarted()
+        releaseHead = () => {
+          response.writeHead(204)
+          response.end()
+        }
+        return
+      }
+      response.writeHead(200, { 'content-type': 'text/plain' })
+      response.end('real request did not wait')
+    })
+    const address = await listen(origin)
+    const manager = trackManager(new OutboundTransportManager())
+    const originUrl = `http://127.0.0.1:${address.port}`
+
+    const warming = manager.warmFor(undefined, undefined, originUrl)
+    await headObserved
+    const result = await Promise.race([
+      manager.fetchFor(undefined)(`${originUrl}/real`).then(async (response) => response.text()),
+      new Promise<string>((resolve) => setTimeout(() => resolve('timed out'), 75))
+    ])
+
+    expect(result).toBe('real request did not wait')
+    releaseHead()
+    await warming
+  })
+
+  it('admits 200 concurrent HTTP/1.1 streams without queueing after the eighth request', async () => {
+    const concurrency = 200
+    const heldResponses: ServerResponse[] = []
+    let allStarted!: () => void
+    const allRequestsStarted = new Promise<void>((resolve) => { allStarted = resolve })
+    const origin = createHttpServer((request, response) => {
+      if (request.method === 'HEAD') {
+        response.writeHead(204)
+        response.end()
+        return
+      }
+      response.writeHead(200, { 'content-type': 'text/plain' })
+      response.write('ready')
+      heldResponses.push(response)
+      if (heldResponses.length === concurrency) allStarted()
+    })
+    const address = await listen(origin)
+    const manager = trackManager(new OutboundTransportManager())
+    const originUrl = `http://127.0.0.1:${address.port}`
+    const fetchImplementation = manager.fetchFor(undefined)
+
+    let responses: Response[] = []
+    try {
+      // Every response remains open until all 200 fetches have received their
+      // headers. A smaller local pool therefore cannot pass by recycling a few
+      // sockets after earlier streams complete.
+      responses = await Promise.all(Array.from({ length: concurrency }, (_, index) =>
+        fetchImplementation(`${originUrl}/stream-${index}`, {
+          signal: AbortSignal.timeout(12_000)
+        })
+      ))
+      await allRequestsStarted
+      expect(heldResponses).toHaveLength(concurrency)
+    } finally {
+      for (const response of heldResponses) response.end('done')
+    }
+
+    expect(await Promise.all(responses.map((response) => response.text())))
+      .toEqual(Array.from({ length: concurrency }, () => 'readydone'))
+  }, 20_000)
+
+  it('keeps the 200-connection budget lazy for a single request', async () => {
+    let connections = 0
+    const origin = createHttpServer((_request, response) => {
+      response.writeHead(200, { 'content-type': 'text/plain', 'content-length': '2' })
+      response.end('ok')
+    })
+    origin.on('connection', () => { connections += 1 })
+    const address = await listen(origin)
+    const manager = trackManager(new OutboundTransportManager())
+    const originUrl = `http://127.0.0.1:${address.port}`
+
+    const response = await manager.fetchFor(undefined)(`${originUrl}/single`)
+
+    expect(await response.text()).toBe('ok')
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    expect(connections).toBe(1)
+  })
+
+  it('does not retain application-level occupancy when reader cancellation never settles', async () => {
+    let heldResponse!: ServerResponse
+    const origin = createHttpServer((request, response) => {
+      if (request.method === 'HEAD') {
+        response.writeHead(204)
+        response.end()
+        return
+      }
+      if (request.url === '/held') {
+        response.writeHead(200, { 'content-type': 'text/plain' })
+        response.write('held')
+        heldResponse = response
+        return
+      }
+      response.end('next')
+    })
+    const address = await listen(origin)
+    const manager = trackManager(new OutboundTransportManager({ connectionCountForOrigin: () => 1 }))
+    const originUrl = `http://127.0.0.1:${address.port}`
+    const originalGetReader = ReadableStream.prototype.getReader
+    ReadableStream.prototype.getReader = function (...args: Parameters<typeof originalGetReader>) {
+      const reader = originalGetReader.apply(this, args)
+      return new Proxy(reader, {
+        get(target, property, receiver) {
+          if (property === 'cancel') return () => new Promise<never>(() => undefined)
+          const value = Reflect.get(target, property, receiver) as unknown
+          return typeof value === 'function' ? value.bind(target) : value
+        }
+      })
+    } as typeof ReadableStream.prototype.getReader
+
+    try {
+      await manager.warmFor(undefined, undefined, originUrl)
+      const held = await manager.fetchFor(undefined)(`${originUrl}/held`)
+      const cancellation = held.body?.cancel()
+      expect(await Promise.race([
+        cancellation?.then(() => 'cancelled'),
+        new Promise<string>((resolve) => setTimeout(() => resolve('timed out'), 75))
+      ])).toBe('cancelled')
+      const next = await manager.fetchFor(undefined)(`${originUrl}/next`, {
+        signal: AbortSignal.timeout(1_000)
+      })
+      expect(await next.text()).toBe('next')
+    } finally {
+      ReadableStream.prototype.getReader = originalGetReader
+      heldResponse.end()
+    }
+  })
+
+  it('uses multiple pooled connections for concurrent streams', async () => {
     let headRequests = 0
     const requestPorts = new Map<string, number>()
     const heldResponses: ServerResponse[] = []
@@ -324,7 +674,7 @@ describe('outbound proxy transport', () => {
       else heldResponses.push(response)
     })
     const address = await listen(origin)
-    const manager = trackManager(new OutboundTransportManager({ laneCountForOrigin: () => 2 }))
+    const manager = trackManager(new OutboundTransportManager({ connectionCountForOrigin: () => 2 }))
     const originUrl = `http://127.0.0.1:${address.port}`
 
     await Promise.all([
@@ -371,7 +721,7 @@ describe('outbound proxy transport', () => {
       }
     })
     const address = await listen(origin)
-    const manager = trackManager(new OutboundTransportManager({ laneCountForOrigin: () => 2 }))
+    const manager = trackManager(new OutboundTransportManager({ connectionCountForOrigin: () => 2 }))
     const originUrl = `http://127.0.0.1:${address.port}`
 
     await manager.warmFor(undefined, undefined, originUrl)
@@ -400,7 +750,7 @@ describe('outbound proxy transport', () => {
       response.end(request.method === 'HEAD' ? undefined : 'ok')
     })
     const address = await listen(origin)
-    const manager = trackManager(new OutboundTransportManager({ laneCountForOrigin: () => 2 }))
+    const manager = trackManager(new OutboundTransportManager({ connectionCountForOrigin: () => 2 }))
     const originUrl = `http://127.0.0.1:${address.port}`
     const capturedFetch = manager.fetchFor(undefined)
 

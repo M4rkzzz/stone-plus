@@ -71,6 +71,30 @@ describe('setup wizard repository', () => {
     expect(repository.get()?.completed).toBe(false)
   })
 
+  it('keeps credential-free route rollback metadata across progress updates', async () => {
+    const metadata = new MemoryMetadata()
+    const repository = new SetupWizardRepository(metadata, () => 275)
+    const state = await repository.save({ step: 'routing' })
+    await repository.recordRoutingMutation(state.sessionId, {
+      routeId: 'route-codex', routeCreated: false, expectedUpdatedAt: 274,
+      createdPoolId: 'wizard-pool',
+      previous: {
+        poolId: 'original-pool', enabled: true, highConcurrencyMode: true,
+        inboundProtocol: 'openai-responses',
+        modelMap: { alias: 'upstream' },
+      },
+    })
+    const resumed = await repository.save({ sessionId: state.sessionId, step: 'gateway' })
+    expect(resumed.routingRollbacks).toEqual([expect.objectContaining({
+      routeId: 'route-codex', routeCreated: false, expectedUpdatedAt: 274,
+      createdPoolIds: ['wizard-pool'],
+      previous: expect.objectContaining({
+        poolId: 'original-pool', highConcurrencyMode: true, modelMap: { alias: 'upstream' }
+      }),
+    })])
+    expect(metadata.values.get(SETUP_WIZARD_METADATA_KEY)).not.toContain('localToken')
+  })
+
   it('resumes OAuth resource selections and explicitly clears deleted optional resources', async () => {
     const metadata = new MemoryMetadata()
     const repository = new SetupWizardRepository(metadata, () => 300)

@@ -10,8 +10,16 @@ import type {
   DatabaseBackupVerification,
   DatabaseRestoreResult
 } from './types'
+import {
+  decryptPortableBackup,
+  encryptPortableBackup,
+  recoverPortableBackupReplacements,
+  type PortableBackupInfo,
+} from './portable-backup'
+import { preparePortableExportDatabase, preparePortableImportedDatabase } from './portable-secrets'
 
 const BACKUP_DIRECTORY_NAME = 'backups'
+const PORTABLE_REPLACE_JOURNAL_DIRECTORY_NAME = 'portable-replace-journals'
 const DEFAULT_AUTOMATIC_INTERVAL_MS = 24 * 60 * 60 * 1000
 const DEFAULT_AUTOMATIC_RETENTION = 7
 const DEFAULT_PRE_RESTORE_RETENTION = 3
@@ -30,6 +38,7 @@ const REQUIRED_SCHEMA_ONE_TABLES = [
 
 export class DatabaseBackupService<T> {
   private readonly backupDirectory: string
+  private readonly portableReplacementJournalDirectory: string
   private readonly store: DatabaseBackupServiceOptions<T>['store']
   private readonly automaticIntervalMs: number
   private automaticRetention: number
@@ -37,11 +46,16 @@ export class DatabaseBackupService<T> {
   private readonly now: () => number
   private readonly randomId: () => string
   private readonly onAutomaticBackupError: (error: Error) => void
+  private readonly portableSecretVault: DatabaseBackupServiceOptions<T>['portableSecretVault']
   private automaticTimer: NodeJS.Timeout | undefined
   private automaticRun: Promise<DatabaseBackupInfo | undefined> | undefined
 
   public constructor(options: DatabaseBackupServiceOptions<T>) {
     this.backupDirectory = join(options.userDataPath, BACKUP_DIRECTORY_NAME)
+    this.portableReplacementJournalDirectory = join(
+      this.backupDirectory,
+      PORTABLE_REPLACE_JOURNAL_DIRECTORY_NAME,
+    )
     this.store = options.store
     this.automaticIntervalMs = positiveInteger(
       options.automaticIntervalMs ?? DEFAULT_AUTOMATIC_INTERVAL_MS,
@@ -60,6 +74,7 @@ export class DatabaseBackupService<T> {
     this.onAutomaticBackupError = options.onAutomaticBackupError ?? ((error) => {
       console.error('Stone+ automatic database backup failed', error)
     })
+    this.portableSecretVault = options.portableSecretVault
   }
 
   public get directory(): string {
@@ -68,6 +83,12 @@ export class DatabaseBackupService<T> {
 
   public async initialize(): Promise<void> {
     await this.ensureDirectory()
+    const recovery = await recoverPortableBackupReplacements(this.portableReplacementJournalDirectory)
+    for (const failure of recovery.failures) {
+      this.onAutomaticBackupError(new Error(
+        `Portable backup replacement recovery failed (${failure.journalPath}): ${failure.error}`,
+      ))
+    }
     await this.removeTemporaryFiles()
     await this.pruneKind('automatic', this.automaticRetention)
     await this.pruneKind('pre-restore', this.preRestoreRetention)
@@ -105,6 +126,51 @@ export class DatabaseBackupService<T> {
       .filter((entry) => entry.isFile() && parseBackupId(entry.name))
       .map(async (entry) => withoutIntegrityRows(await this.verifyPath(this.pathForId(entry.name), entry.name))))
     return backups.sort((left, right) => right.createdAt - left.createdAt || right.id.localeCompare(left.id))
+  }
+
+  public async exportPortableBackup(destinationPath: string, password: string): Promise<{
+    backup: DatabaseBackupInfo
+    portable: PortableBackupInfo
+  }> {
+    const backup = await this.createBackup('manual')
+    const stagingPath = join(this.backupDirectory, `.${backup.id}.${this.randomId()}.portable-export`)
+    try {
+      await preparePortableExportDatabase(
+        this.pathForId(backup.id), stagingPath, password, this.portableSecretVault,
+      )
+      const portable = await encryptPortableBackup(
+        stagingPath,
+        destinationPath,
+        password,
+        this.now,
+        2,
+        this.portableReplacementJournalDirectory,
+      )
+      return { backup, portable }
+    } finally {
+      await rm(stagingPath, { force: true }).catch(() => undefined)
+    }
+  }
+
+  public async importPortableBackup(sourcePath: string, password: string): Promise<DatabaseBackupInfo> {
+    await this.ensureDirectory()
+    const createdAt = this.now()
+    const id = createBackupId(createdAt, 'manual', this.randomId())
+    const targetPath = this.pathForId(id)
+    const temporaryPath = join(this.backupDirectory, `.${id}.${this.randomId()}.portable-import`)
+    try {
+      const portable = await decryptPortableBackup(sourcePath, temporaryPath, password)
+      await preparePortableImportedDatabase(temporaryPath, password, portable.version, this.portableSecretVault)
+      const verification = await this.verifyPath(temporaryPath, id)
+      if (!verification.valid) {
+        throw new Error(`Portable backup verification failed: ${verification.issue ?? 'unknown integrity error'}`)
+      }
+      await rename(temporaryPath, targetPath)
+      return withoutIntegrityRows({ ...verification, id, kind: 'manual', createdAt })
+    } catch (error) {
+      await rm(temporaryPath, { force: true }).catch(() => undefined)
+      throw new Error(`Unable to import portable backup: ${messageOf(error)}`)
+    }
   }
 
   public async verifyBackup(id: string): Promise<DatabaseBackupVerification> {
@@ -236,7 +302,9 @@ export class DatabaseBackupService<T> {
         ...REQUIRED_SCHEMA_ONE_TABLES,
         ...(schemaVersion >= 3 ? ['client_profiles'] : []),
         ...(schemaVersion >= 4 ? ['health_events'] : []),
-        ...(schemaVersion >= 5 ? ['proxies', 'account_codex_quota_samples'] : [])
+        ...(schemaVersion >= 5 ? ['proxies', 'account_codex_quota_samples'] : []),
+        ...(schemaVersion >= 8 ? ['persistent_tasks'] : []),
+        ...(schemaVersion >= 9 ? ['built_in_proxy_settings', 'proxy_profiles'] : [])
       ]
       const missingTables = requiredTables.filter((table) => !tables.has(table))
       const initialized = tables.has('app_metadata')

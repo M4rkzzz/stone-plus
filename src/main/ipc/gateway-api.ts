@@ -1,17 +1,20 @@
-import { app, BrowserWindow, dialog, ipcMain, Notification, shell, type WebContents } from 'electron'
+import { app, BrowserWindow, dialog, ipcMain, Notification, safeStorage, shell, type WebContents } from 'electron'
 import { randomUUID } from 'node:crypto'
 import { lstat, readFile, writeFile } from 'node:fs/promises'
 import { basename, extname, join } from 'node:path'
 import { clientNativeProtocols } from '@shared/types'
+import { previewRoute } from '@shared/route-preview'
 import {
   hasRouteSourceIdCollision,
   isAvailableRouteAccount,
   resolveRouteSource
 } from '@shared/route-sources'
 import type {
+  Account,
   AccountFitnessSnapshot,
   AccountImportProgress,
   AccountModelTestResult,
+  AppRuntimeDelta,
   AppSnapshot,
   ClientConfigEditorSaveInput,
   ClientConfigEditorState,
@@ -22,37 +25,49 @@ import type {
   GatewaySettings,
   GatewayStatus,
   RequestLog,
+  RequestReplayResult,
+  RequestReplayTemplate,
   Route,
   RouteClient,
   UiLanguage
 } from '@shared/types'
-import type { GatewayAccountState, GatewayConfig } from '../gateway'
-import { CHATGPT_CODEX_RESPONSES_URL, codexQuotaCooldownUntil, codexQuotaIsExhausted, getProviderAdapter, probeChatGptAccount, probeChatGptCodexModel, probeProviderModel, queryChatGptCodexModels, queryChatGptCodexQuota, resolveChatGptCredential, type ProviderFailure } from '../providers'
+import type { GatewayAccountState, GatewayConfig, GatewayRuntimeStateUpdate } from '../gateway'
+import { checkChatGptAccountAuthorized, codexQuotaCooldownUntil, codexQuotaIsExhausted, getProviderAdapter, probeChatGptAccountAuthorized, probeChatGptCodexModel, probeProviderModel, queryChatGptCodexModels, queryChatGptCodexModelsAuthorized, queryChatGptCodexQuota, queryChatGptCodexQuotaAuthorized, resolveChatGptCredential, type ProviderFailure } from '../providers'
 import { validateAccountImportProxySelection, type AppStore } from '../store/app-store'
 import type { ClientConfigService } from '../client-config'
-import type { DatabaseBackupService } from '../backup'
+import { WebDavBackupService, type DatabaseBackupService } from '../backup'
 import type { PersistedState } from '../store/types'
 import { serializeDiagnostics } from './diagnostics'
 import { assertTrustedSender } from './trusted-sender'
 import { OutboundTransportManager, probeProxy, resolveEffectiveProxy } from '../proxy'
+import {
+  OutboundReloadCoordinator,
+  collectEnabledOutboundTargets,
+  type EnabledOutboundTarget
+} from '../proxy/outbound-reload-coordinator'
 import { runNetworkDiagnostics } from '../network-diagnostics'
 import type { BrowserImportQueue } from '../browser-import-queue'
 import { verifySetupRouteRequest } from '../setup/setup-verification'
 import { probeApiSource as runApiSourceProbe } from '../sources/api-source-service'
 import { ChatGptOAuthFlowManager, type ChatGptOAuthSessionController } from '../auth/chatgpt-oauth-flow'
-import { serializeChatGptCredential } from '../auth'
+import { resolveChatGptAgentIdentity, serializeChatGptCredential } from '../auth'
+import type { LocalEventServer } from '../events'
 
 export interface GatewayController {
   start(settings?: GatewaySettings): Promise<void>
   stop(options?: { force?: boolean; drainTimeoutMs?: number }): Promise<void>
   getStatus(): GatewayStatus
   updateConfig(config: GatewayConfig): void
+  updateRuntimeAccounts(accounts: ReadonlyArray<GatewayConfig['accounts'][number]>): void
   resetAccountHealth(accountId: string): void
-  getAccountFitness(): Record<string, AccountFitnessSnapshot>
-  getAccountInFlight(): Record<string, number>
+  getAccountFitness(accountIds?: readonly string[]): Record<string, AccountFitnessSnapshot>
+  getAccountInFlight(accountIds?: readonly string[]): Record<string, number>
+  getRequestReplayTemplate?(id: string): RequestReplayTemplate | undefined
+  replayRequest?(id: string): Promise<RequestReplayResult>
+  clearRequestReplays?(): void
   onLog(listener: (log: RequestLog) => void): () => void
   onAccountState(listener: (state: GatewayAccountState) => void): () => void
-  onRuntimeState(listener: () => void): () => void
+  onRuntimeState(listener: (update?: GatewayRuntimeStateUpdate) => void): () => void
 }
 
 export function registerGatewayApi(
@@ -65,23 +80,57 @@ export function registerGatewayApi(
   browserImports?: BrowserImportQueue,
   chatGptOAuth: ChatGptOAuthSessionController = new ChatGptOAuthFlowManager({
     openExternal: (url) => shell.openExternal(url)
-  })
+  }),
+  localEvents?: LocalEventServer,
+  sharedOutboundReloadCoordinator?: OutboundReloadCoordinator
 ): () => Promise<void> {
-  const snapshotPublishDelayMs = 1_000
-  const liveRuntimePublishIntervalMs = 50
+  const webDavBackups = backups ? new WebDavBackupService({
+    metadata: store.getStateRepository(),
+    safeStorage,
+    backups,
+    backupDirectory: backups.directory,
+    temporaryDirectory: join(app.getPath('userData'), 'webdav-transfer'),
+  }) : undefined
+  const runtimeDeltaPublishIntervalMs = 50
   const accountStateFlushDelayMs = 250
-  let scheduledSnapshotPublish: ReturnType<typeof setTimeout> | undefined
-  let scheduledLiveRuntimePublish: ReturnType<typeof setTimeout> | undefined
-  let lastLiveRuntimePublishAt: number | undefined
+  const requestLogCheckpointIntervalMs = 10_000
+  let scheduledRuntimeDeltaPublish: ReturnType<typeof setTimeout> | undefined
+  let scheduledRequestLogCheckpoint: ReturnType<typeof setTimeout> | undefined
+  let lastRuntimeDeltaPublishAt: number | undefined
+  let runtimeRevision = 0
+  let pendingGatewayStatus = false
+  let pendingObservability = false
+  let pendingAllAccountRuntime = false
+  const pendingRequestLogs = new Map<string, RequestLog>()
+  const pendingRuntimeAccountIds = new Set<string>()
+  const pendingHealthEvents = new Map<string, AppSnapshot['healthEvents'][number]>()
+  const publishedAccountRuntimeKeys = new Map<string, string>()
   let scheduledAccountStateFlush: ReturnType<typeof setTimeout> | undefined
+  let accountStateFlushFlight: Promise<void> | undefined
   const pendingActiveAccountStates = new Map<string, GatewayAccountState>()
+  const latestObservedAccountStates = new Map<string, GatewayAccountState>()
+  const accountStateRevisions = new Map<string, number>()
+  const accountStatePersistenceFlights = new Map<string, Promise<void>>()
   const quotaProbeTimers = new Map<string, ReturnType<typeof setTimeout>>()
   const quotaProbeFlights = new Set<string>()
   const lastQuotaProbeAt = new Map<string, number>()
+  const apiSourceCapabilityProbeOwners = new Map<string, symbol>()
   let automaticCooldownRefreshTriggered = false
   let automaticCooldownRefreshFlight: Promise<void> | undefined
   let evaluateAutomaticCooldownRefresh = (): void => undefined
-  const pendingRequestLogWrites = new Set<Promise<void>>()
+  let gatewayLifecycleTail: Promise<void> = Promise.resolve()
+  const enqueueGatewayLifecycle = <T>(operation: () => Promise<T>): Promise<T> => {
+    const result = gatewayLifecycleTail.then(operation, operation)
+    gatewayLifecycleTail = result.then(() => undefined, () => undefined)
+    return result
+  }
+  const pendingRequestLogWrites = new Set<Promise<unknown>>()
+  const pendingTerminalLogs = new Map<string, {
+    log: RequestLog
+    attempts: number
+    retryTimer?: ReturnType<typeof setTimeout>
+    flight?: Promise<RequestLog | undefined>
+  }>()
   let orphanedLogReconciliationScheduled = false
   let closed = false
   let rendererLanguage: UiLanguage | undefined
@@ -148,11 +197,12 @@ export function registerGatewayApi(
     }
     return { id, session }
   }
-  const withRuntimeMetrics = (snapshot: AppSnapshot): AppSnapshot => {
+  const withRuntimeMetrics = (snapshot: AppSnapshot, revision = runtimeRevision): AppSnapshot => {
     const fitness = gateway.getAccountFitness?.() ?? {}
     const inFlight = gateway.getAccountInFlight()
     return {
       ...snapshot,
+      runtimeRevision: revision,
       accounts: snapshot.accounts.map((account) => ({
         ...account,
         inFlight: Math.max(0, inFlight[account.id] ?? account.inFlight),
@@ -169,29 +219,23 @@ export function registerGatewayApi(
     snapshot: AppSnapshot,
     options: { runtimeChanged?: boolean } = { runtimeChanged: true }
   ): AppSnapshot => {
-    const enriched = withRuntimeMetrics(snapshot)
-    if (scheduledSnapshotPublish) {
-      clearTimeout(scheduledSnapshotPublish)
-      scheduledSnapshotPublish = undefined
-    }
+    if (scheduledRuntimeDeltaPublish) clearTimeout(scheduledRuntimeDeltaPublish)
+    scheduledRuntimeDeltaPublish = undefined
+    pendingGatewayStatus = false
+    pendingObservability = false
+    pendingAllAccountRuntime = false
+    pendingRequestLogs.clear()
+    pendingRuntimeAccountIds.clear()
+    pendingHealthEvents.clear()
+    const enriched = withRuntimeMetrics(snapshot, ++runtimeRevision)
+    publishedAccountRuntimeKeys.clear()
+    for (const account of enriched.accounts) publishedAccountRuntimeKeys.set(account.id, JSON.stringify(account))
     for (const window of BrowserWindow.getAllWindows()) {
       if (!window.isDestroyed()) {
         window.webContents.send('stone:snapshot', enriched)
       }
     }
     if (options.runtimeChanged !== false) onRuntimeChanged?.()
-    return enriched
-  }
-
-  const publishRoutine = (snapshot: AppSnapshot): AppSnapshot => {
-    const enriched = withRuntimeMetrics(snapshot)
-    if (scheduledSnapshotPublish) {
-      clearTimeout(scheduledSnapshotPublish)
-      scheduledSnapshotPublish = undefined
-    }
-    for (const window of BrowserWindow.getAllWindows()) {
-      if (canReceiveSnapshot(window)) window.webContents.send('stone:snapshot', enriched)
-    }
     return enriched
   }
   const publishBrowserImports = (state: ReturnType<BrowserImportQueue['getState']>): void => {
@@ -201,55 +245,152 @@ export function registerGatewayApi(
   }
   const unsubscribeBrowserImports = browserImports?.subscribe(publishBrowserImports)
 
-  const scheduleRuntimePublish = (): void => {
-    if (scheduledSnapshotPublish) return
-    scheduledSnapshotPublish = setTimeout(() => {
-      scheduledSnapshotPublish = undefined
-      store.setGatewayStatus(gateway.getStatus())
-      if (!BrowserWindow.getAllWindows().some(canReceiveSnapshot)) return
-      publishRoutine(store.getSnapshot())
-    }, snapshotPublishDelayMs)
+  const publicRuntimeAccounts = (ids?: ReadonlySet<string>): AppSnapshot['accounts'] => {
+    const selectedIds = ids ? [...ids] : undefined
+    const fitness = gateway.getAccountFitness?.(selectedIds) ?? {}
+    const inFlight = gateway.getAccountInFlight(selectedIds)
+    return store.getPublicRuntimeAccounts(ids).map((account) => ({
+      ...account,
+      inFlight: Math.max(0, inFlight[account.id] ?? account.inFlight),
+      ...(fitness[account.id] ? { fitness: fitness[account.id] } : {})
+    }))
   }
 
-  const flushLiveRuntimePublish = (): void => {
-    scheduledLiveRuntimePublish = undefined
+  const flushRuntimeDelta = (): void => {
+    scheduledRuntimeDeltaPublish = undefined
     if (closed) return
-    lastLiveRuntimePublishAt = Date.now()
-    store.setGatewayStatus(gateway.getStatus())
-    if (!BrowserWindow.getAllWindows().some(canReceiveSnapshot)) return
-    publishRoutine(store.getSnapshot())
-  }
-
-  const scheduleLiveRuntimePublish = (): void => {
-    if (closed || scheduledLiveRuntimePublish) return
-    const elapsed = lastLiveRuntimePublishAt === undefined
-      ? liveRuntimePublishIntervalMs
-      : Date.now() - lastLiveRuntimePublishAt
-    const delay = Math.max(0, liveRuntimePublishIntervalMs - elapsed)
-    if (delay === 0) {
-      flushLiveRuntimePublish()
+    lastRuntimeDeltaPublishAt = Date.now()
+    const recipients = BrowserWindow.getAllWindows().filter(canReceiveSnapshot)
+    const sendGatewayStatus = pendingGatewayStatus
+    const sendObservability = pendingObservability
+    const sendAllAccounts = pendingAllAccountRuntime
+    const logs = [...pendingRequestLogs.values()]
+    const accountIds = new Set(pendingRuntimeAccountIds)
+    const healthEvents = [...pendingHealthEvents.values()]
+    pendingGatewayStatus = false
+    pendingObservability = false
+    pendingAllAccountRuntime = false
+    pendingRequestLogs.clear()
+    pendingRuntimeAccountIds.clear()
+    pendingHealthEvents.clear()
+    // A focused renderer always reloads one authoritative snapshot. Do not do
+    // any database clone/observability work for hidden or minimized windows.
+    // Still advance the revision: otherwise two focus-triggered snapshots can
+    // carry the same revision even though one predates hidden runtime changes,
+    // allowing an older response to overwrite the newer one in the renderer.
+    if (recipients.length === 0) {
+      if (sendGatewayStatus || sendObservability || sendAllAccounts || logs.length
+        || accountIds.size || healthEvents.length) runtimeRevision += 1
       return
     }
-    scheduledLiveRuntimePublish = setTimeout(flushLiveRuntimePublish, delay)
-    scheduledLiveRuntimePublish.unref?.()
+
+    const candidateAccounts = sendAllAccounts
+      ? publicRuntimeAccounts()
+      : accountIds.size > 0 ? publicRuntimeAccounts(accountIds) : []
+    const accounts = candidateAccounts.filter((account) => {
+      const key = JSON.stringify(account)
+      if (publishedAccountRuntimeKeys.get(account.id) === key) return false
+      publishedAccountRuntimeKeys.set(account.id, key)
+      return true
+    })
+    const delta: AppRuntimeDelta = {
+      revision: ++runtimeRevision,
+      ...(sendGatewayStatus ? { gatewayStatus: gateway.getStatus() } : {}),
+      ...(logs.length ? { requestLogs: logs } : {}),
+      ...(accounts.length ? { accounts } : {}),
+      ...(healthEvents.length ? { healthEvents } : {}),
+      ...(sendObservability ? { observability: store.getRuntimeObservability() } : {})
+    }
+    const hasPayload = delta.gatewayStatus || delta.requestLogs || delta.accounts
+      || delta.healthEvents || delta.observability
+    if (!hasPayload) {
+      runtimeRevision -= 1
+      return
+    }
+    for (const window of recipients) window.webContents.send('stone:runtime-delta', delta)
+  }
+
+  const scheduleRuntimeDelta = (options: {
+    gatewayStatus?: boolean
+    requestLog?: RequestLog
+    accountId?: string
+    allAccounts?: boolean
+    healthEvent?: AppSnapshot['healthEvents'][number]
+    observability?: boolean
+  } = {}): void => {
+    if (closed) return
+    if (options.gatewayStatus) pendingGatewayStatus = true
+    if (options.requestLog) pendingRequestLogs.set(options.requestLog.id, options.requestLog)
+    if (options.accountId) pendingRuntimeAccountIds.add(options.accountId)
+    if (options.allAccounts) pendingAllAccountRuntime = true
+    if (options.healthEvent) pendingHealthEvents.set(options.healthEvent.id, options.healthEvent)
+    if (options.observability) pendingObservability = true
+    if (scheduledRuntimeDeltaPublish) return
+    const elapsed = lastRuntimeDeltaPublishAt === undefined
+      ? runtimeDeltaPublishIntervalMs
+      : Date.now() - lastRuntimeDeltaPublishAt
+    const delay = Math.max(0, runtimeDeltaPublishIntervalMs - elapsed)
+    scheduledRuntimeDeltaPublish = setTimeout(flushRuntimeDelta, delay)
+    scheduledRuntimeDeltaPublish.unref?.()
+  }
+
+  const trackRequestLogWrite = (write: Promise<unknown>): void => {
+    pendingRequestLogWrites.add(write)
+    void write.then(
+      () => pendingRequestLogWrites.delete(write),
+      () => pendingRequestLogWrites.delete(write)
+    )
+  }
+
+  const scheduleRequestLogCheckpoint = (): void => {
+    if (closed || scheduledRequestLogCheckpoint) return
+    scheduledRequestLogCheckpoint = setTimeout(() => {
+      scheduledRequestLogCheckpoint = undefined
+      if (closed || !store.hasUncheckpointedLiveRequestLogs()) return
+      const checkpoint = store.checkpointLiveRequestLogs()
+        .then(() => undefined)
+        .catch((error: unknown) => {
+          console.error('Stone+ could not checkpoint live gateway request logs', error)
+        })
+      trackRequestLogWrite(checkpoint)
+      void checkpoint.finally(() => {
+        if (store.hasUncheckpointedLiveRequestLogs()) scheduleRequestLogCheckpoint()
+      })
+    }, requestLogCheckpointIntervalMs)
+    scheduledRequestLogCheckpoint.unref?.()
   }
 
   const scheduleOrphanedLogReconciliation = (): void => {
-    if (closed || orphanedLogReconciliationScheduled || gateway.getStatus().activeRequests !== 0) return
+    if (closed || orphanedLogReconciliationScheduled || gateway.getStatus().activeRequests !== 0
+      || pendingTerminalLogs.size > 0) return
     orphanedLogReconciliationScheduled = true
     const pendingLogs = [...pendingRequestLogWrites]
     void Promise.allSettled(pendingLogs).then(async () => {
       orphanedLogReconciliationScheduled = false
-      if (closed || gateway.getStatus().activeRequests !== 0) return
-      if (await store.finalizeOrphanedStreamingLogs()) publishRoutine(store.getSnapshot())
+      if (closed || gateway.getStatus().activeRequests !== 0 || pendingTerminalLogs.size > 0) return
+      const finalized = await store.finalizeOrphanedStreamingLogs()
+      for (const log of finalized) {
+        scheduleRuntimeDelta({
+          gatewayStatus: true,
+          requestLog: log,
+          observability: true
+        })
+      }
     }).catch((error: unknown) => {
       orphanedLogReconciliationScheduled = false
       console.error('Stone+ could not reconcile an orphaned gateway request log', error)
     })
   }
 
-  const unsubscribeRuntimeState = gateway.onRuntimeState(() => {
-    scheduleLiveRuntimePublish()
+  const unsubscribeRuntimeState = gateway.onRuntimeState((update = { gatewayStatus: true, allAccounts: true }) => {
+    if (update.allAccounts) {
+      scheduleRuntimeDelta({ gatewayStatus: update.gatewayStatus === true, allAccounts: true })
+    } else if (update.accountIds?.length) {
+      for (const accountId of update.accountIds) scheduleRuntimeDelta({ accountId })
+      if (update.gatewayStatus) scheduleRuntimeDelta({ gatewayStatus: true })
+    } else if (update.gatewayStatus) {
+      scheduleRuntimeDelta({ gatewayStatus: true })
+    }
     scheduleOrphanedLogReconciliation()
   })
 
@@ -275,7 +416,7 @@ export function registerGatewayApi(
   const probeQuotaCooldownAccount = async (accountId: string): Promise<void> => {
     if (closed || quotaProbeFlights.has(accountId)) return
     const account = store.getRuntimeAccount(accountId)
-    if (!account || account.credentialType !== 'chatgpt-oauth' || account.cooldownReason !== 'quota') return
+    if (!account || (account.credentialType !== 'chatgpt-oauth' && account.credentialType !== 'chatgpt-agent-identity') || account.cooldownReason !== 'quota') return
     quotaProbeFlights.add(accountId)
     lastQuotaProbeAt.set(accountId, Date.now())
     try {
@@ -318,23 +459,56 @@ export function registerGatewayApi(
     return snapshot
   }
 
-  const probeAndPersistAccount = async (id: string): Promise<{
+  const accountProbeOwners = new Map<string, {
+    token: symbol
+    previousState?: ReturnType<typeof accountCheckState>
+  }>()
+  const probeAndPersistAccount = async (id: string, signal?: AbortSignal): Promise<{
     snapshot: AppSnapshot
     ok: boolean
     latencyMs?: number
     error?: string
   }> => {
-    const previous = store.getSnapshot().accounts.find((account) => account.id === id)
-    await store.setAccountCheckResult(id, { status: 'checking', lastError: undefined })
+    signal?.throwIfAborted()
+    const token = Symbol(id)
+    const currentOwner = accountProbeOwners.get(id)
+    const currentAccount = store.getRuntimeAccount(id)
+    const owner = {
+      token,
+      // A newer probe supersedes an older one. Keep the last stable state from
+      // before the whole probe chain so cancelling the newer probe cannot
+      // restore the transient `checking` state left by its predecessor.
+      previousState: currentOwner && currentAccount?.status === 'checking'
+        ? currentOwner.previousState
+        : (currentAccount ? accountCheckState(currentAccount) : undefined),
+    }
+    accountProbeOwners.set(id, owner)
+    await store.setAccountCheckResultIf(
+      id,
+      { status: 'checking', lastError: undefined },
+      () => accountProbeOwners.get(id)?.token === token && !signal?.aborted,
+    )
     publish(refreshRuntime())
     try {
-      const result = await checkAccount(store, outboundTransport, id)
+      const result = await checkAccount(store, outboundTransport, id, signal)
+      signal?.throwIfAborted()
       const now = Date.now()
       const exhausted = codexQuotaIsExhausted(result.codexQuota, now)
       const cooldownUntil = exhausted
         ? codexQuotaCooldownUntil(result.codexQuota, now) ?? now + 60_000
         : undefined
-      await store.setAccountCheckResult(id, {
+      // Only the newest probe for an account may publish health. This check is
+      // deliberately immediately before the durable write so a slow response
+      // cannot overwrite a newer probe's result.
+      if (accountProbeOwners.get(id)?.token !== token) {
+        return {
+          snapshot: store.getSnapshot(),
+          ok: !exhausted,
+          latencyMs: result.latencyMs,
+          ...(exhausted ? { error: 'ChatGPT Codex 额度已耗尽。' } : {}),
+        }
+      }
+      const persisted = await store.setAccountCheckResultIf(id, {
         status: exhausted ? 'cooldown' : 'active',
         circuitState: exhausted ? 'open' : 'closed',
         consecutiveFailures: 0,
@@ -344,7 +518,16 @@ export function registerGatewayApi(
         cooldownUntil,
         cooldownReason: exhausted ? 'quota' : undefined,
         ...(result.codexQuota ? { codexQuota: result.codexQuota } : {})
-      })
+      }, () => accountProbeOwners.get(id)?.token === token && !signal?.aborted)
+      signal?.throwIfAborted()
+      if (!persisted.applied || accountProbeOwners.get(id)?.token !== token) {
+        return {
+          snapshot: persisted.snapshot,
+          ok: !exhausted,
+          latencyMs: result.latencyMs,
+          ...(exhausted ? { error: 'ChatGPT Codex 额度已耗尽。' } : {}),
+        }
+      }
       if (exhausted && cooldownUntil !== undefined) scheduleQuotaProbe(id, cooldownUntil + 1_000)
       else gateway.resetAccountHealth(id)
       const snapshot = publish(refreshRuntime())
@@ -352,23 +535,94 @@ export function registerGatewayApi(
       return { snapshot, ok: !exhausted, latencyMs: result.latencyMs,
         ...(exhausted ? { error: 'ChatGPT Codex 额度已耗尽。' } : {}) }
     } catch (error: unknown) {
+      if (signal?.aborted) {
+        if (accountProbeOwners.get(id)?.token === token
+          && store.getRuntimeAccount(id)?.status === 'checking'
+          && owner.previousState) {
+          await store.setAccountCheckResultIf(
+            id,
+            owner.previousState,
+            () => accountProbeOwners.get(id)?.token === token
+              && store.getRuntimeAccount(id)?.status === 'checking',
+          )
+          publish(refreshRuntime())
+        }
+        throw abortReason(signal)
+      }
+      if (accountProbeOwners.get(id)?.token !== token) {
+        return { snapshot: store.getSnapshot(), ok: false,
+          error: error instanceof Error ? error.message : 'Account check failed.' }
+      }
       const failure = error instanceof AccountProbeError ? error.failure : undefined
       const shouldDisable = failure?.accountAction === 'disable'
       const shouldCooldown = failure?.accountAction === 'cooldown'
       const errorMessage = error instanceof Error ? error.message : 'Account check failed.'
-      await store.setAccountCheckResult(id, {
-        status: shouldDisable ? 'disabled' : shouldCooldown ? 'cooldown' : previous?.status ?? 'disabled',
-        circuitState: shouldDisable || shouldCooldown ? 'open' : previous?.circuitState,
+      const persisted = await store.setAccountCheckResultIf(id, {
+        status: shouldDisable ? 'disabled' : shouldCooldown ? 'cooldown' : owner.previousState?.status ?? 'disabled',
+        circuitState: shouldDisable || shouldCooldown ? 'open' : owner.previousState?.circuitState,
         consecutiveFailures: (store.getSnapshot().accounts.find((account) => account.id === id)?.consecutiveFailures ?? 0) + 1,
-        cooldownUntil: shouldCooldown ? Date.now() + (failure?.retryAfterMs ?? 30_000) : previous?.cooldownUntil,
-        cooldownReason: shouldCooldown ? 'failure' : previous?.cooldownReason,
+        cooldownUntil: shouldCooldown ? Date.now() + (failure?.retryAfterMs ?? 30_000) : owner.previousState?.cooldownUntil,
+        cooldownReason: shouldCooldown ? 'failure' : owner.previousState?.cooldownReason,
         lastError: errorMessage
-      })
+      }, () => accountProbeOwners.get(id)?.token === token)
+      if (!persisted.applied || accountProbeOwners.get(id)?.token !== token) {
+        return { snapshot: persisted.snapshot, ok: false, error: errorMessage }
+      }
       const snapshot = publish(refreshRuntime())
       evaluateAutomaticCooldownRefresh()
       return { snapshot, ok: false, error: errorMessage }
+    } finally {
+      if (accountProbeOwners.get(id)?.token === token) accountProbeOwners.delete(id)
     }
   }
+
+  const persistentTaskRunner = store.getPersistentTaskRunner()
+  const unregisterBulkAccountCheckTask = persistentTaskRunner.register<{
+    accountIds: string[]
+  }, { checked: number; succeeded: number; failed: number; skipped: number }>(
+    'account.bulk-check',
+    async ({ payload, progress, signal, checkpoint, waitIfPaused }) => {
+      const accountIds = [...new Set(payload.accountIds)]
+      let cursor = Math.max(0, Math.min(accountIds.length, Math.floor(progress.completed)))
+      let checked = taskProgressCount(progress.details?.checked)
+      let succeeded = taskProgressCount(progress.details?.succeeded)
+      let failed = taskProgressCount(progress.details?.failed)
+      let skipped = taskProgressCount(progress.details?.skipped)
+      await checkpoint({
+        total: accountIds.length,
+        completed: cursor,
+        details: { checked, succeeded, failed, skipped },
+        message: cursor > 0
+          ? nativeText(`正在从 ${cursor}/${accountIds.length} 恢复账号检测…`, `Resuming account checks at ${cursor}/${accountIds.length}…`)
+          : nativeText('准备批量检测账号…', 'Preparing bulk account checks…')
+      })
+      for (let index = cursor; index < accountIds.length; index += 1) {
+        const accountId = accountIds[index]
+        await waitIfPaused()
+        if (signal.aborted) throw signal.reason
+        const account = store.getRuntimeAccount(accountId)
+        if (!account) {
+          skipped += 1
+        } else {
+          const result = await probeAndPersistAccount(accountId, signal)
+          checked += 1
+          if (result.ok) succeeded += 1
+          else failed += 1
+        }
+        cursor = index + 1
+        await checkpoint({
+          completed: cursor,
+          total: accountIds.length,
+          details: { checked, succeeded, failed, skipped },
+          message: nativeText(
+            `账号检测 ${cursor}/${accountIds.length} · 成功 ${succeeded} · 失败 ${failed} · 跳过 ${skipped}`,
+            `Account checks ${cursor}/${accountIds.length} · ${succeeded} succeeded · ${failed} failed · ${skipped} skipped`
+          )
+        })
+      }
+      return { checked, succeeded, failed, skipped }
+    }
+  )
 
   evaluateAutomaticCooldownRefresh = (): void => {
     if (closed) return
@@ -405,6 +659,22 @@ export function registerGatewayApi(
       evaluateAutomaticCooldownRefresh()
     })
   }
+
+  const ownsOutboundReloadCoordinator = sharedOutboundReloadCoordinator === undefined
+  const outboundReloadCoordinator = sharedOutboundReloadCoordinator ?? new OutboundReloadCoordinator({
+    transport: outboundTransport,
+    collectTargets: () => gatewayConnectionTargets(store)
+  })
+  outboundReloadCoordinator.configureAccountRecheck({
+    getRuntimeAccounts: () => store.getRuntimeAccounts(),
+    getRuntimeAccount: (accountId) => store.getRuntimeAccount(accountId),
+    probeAccount: (accountId) => probeAndPersistAccount(accountId),
+    isQuotaExhausted: quotaExhausted,
+    onRecheckCycleStarted: () => {
+      automaticCooldownRefreshTriggered = false
+    },
+    onRecheckCycleSettled: evaluateAutomaticCooldownRefresh
+  })
 
   const detectImportedAccounts = async (
     accountIds: readonly string[],
@@ -481,7 +751,7 @@ export function registerGatewayApi(
         ? store.getSnapshot().proxies.find((candidate) => candidate.id === session.input.proxyId)
         : undefined
       if (session.input.proxyMode === 'proxy' && !proxy) {
-        lazyTransportFailure = '选择的出口代理已被删除，请重新开始 OAuth 授权。'
+        lazyTransportFailure = '选择的代理已被删除，请重新开始 OAuth 授权。'
         throw new Error(lazyTransportFailure)
       }
       try {
@@ -567,27 +837,122 @@ export function registerGatewayApi(
     sender.send('stone:account-import-progress', { progressId, ...progress } satisfies AccountImportProgress)
   }
 
-  gateway.onLog((log) => {
-    const write = store.appendLog(log).catch((error: unknown) => {
-      console.error('Stone+ could not persist a gateway request log', error)
-    })
-    pendingRequestLogWrites.add(write)
-    void write.finally(() => {
-      pendingRequestLogWrites.delete(write)
-      if (log.status === 'streaming') {
-        scheduleRuntimePublish()
+  const persistTerminalLog = (id: string): void => {
+    const pending = pendingTerminalLogs.get(id)
+    if (!pending || pending.flight || closed) return
+    const persistedLog = pending.log
+    const write = store.appendLog(persistedLog)
+    pending.flight = write
+    trackRequestLogWrite(write)
+    void write.then((safeLog) => {
+      const current = pendingTerminalLogs.get(id)
+      // The log may have been explicitly cleared while durability was in
+      // flight. Its ID is tombstoned by AppStore; do not publish or retry the
+      // stale completion after the clear operation.
+      if (!current) return
+      if (current?.log !== persistedLog) {
+        // This terminal version is already durable. Publish completion now;
+        // a newer title/metadata patch can follow independently and must not
+        // keep the renderer showing an otherwise finished request as live.
+        if (safeLog) {
+          scheduleRuntimeDelta({
+            gatewayStatus: true,
+            requestLog: safeLog,
+            observability: true
+          })
+        }
+        if (current) {
+          current.flight = undefined
+          persistTerminalLog(id)
+        }
         return
       }
-      // Terminal request state is durable application state, not disposable
-      // live telemetry. Hidden/minimized renderers must receive it as well;
-      // otherwise they retain a stale streaming row and keep its local elapsed
-      // clock running after the backend request has already completed.
-      store.setGatewayStatus(gateway.getStatus())
-      publish(store.getSnapshot(), { runtimeChanged: false })
+      if (!safeLog) {
+        // AppStore returns undefined for a lifecycle tombstoned by clearLogs.
+        // Treat that as an intentional drop, not a failed write; retrying it
+        // forever would keep shutdown and orphan reconciliation alive. An
+        // active cleared request may still have advanced the lifetime token
+        // ledger, so publish observability without recreating its row.
+        pendingTerminalLogs.delete(id)
+        scheduleRuntimeDelta({ gatewayStatus: true, observability: true })
+        return
+      }
+      pendingTerminalLogs.delete(id)
+      scheduleRuntimeDelta({
+        gatewayStatus: true,
+        requestLog: safeLog,
+        observability: true
+      })
+      scheduleOrphanedLogReconciliation()
+    }, (error: unknown) => {
+      const current = pendingTerminalLogs.get(id)
+      if (!current || closed) return
+      if (current.log !== persistedLog) {
+        current.flight = undefined
+        persistTerminalLog(id)
+        return
+      }
+      current.flight = undefined
+      current.attempts += 1
+      console.error(`Stone+ could not persist terminal request log; retry ${current.attempts}`, error)
+      const delay = Math.min(30_000, 250 * (2 ** Math.min(7, current.attempts - 1)))
+      current.retryTimer = setTimeout(() => {
+        current.retryTimer = undefined
+        persistTerminalLog(id)
+      }, delay)
+      current.retryTimer.unref?.()
+    })
+  }
+
+  /**
+   * Shutdown runs after the normal retry timers have been cancelled. Give each
+   * terminal lifecycle a short, bounded retry window so a transient SQLite/WAL
+   * busy error cannot silently discard the only terminal record before the
+   * AppStore closes. A tombstoned ID is considered intentionally handled.
+   */
+  const persistTerminalLogForShutdown = async (log: RequestLog): Promise<boolean> => {
+    const maxAttempts = 8
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+      try {
+        await store.appendLog(log)
+        return true
+      } catch (error) {
+        if (attempt === maxAttempts - 1) {
+          console.error('Stone+ could not persist terminal request log during shutdown', error)
+          return false
+        }
+        const delay = Math.min(1_000, 50 * (2 ** attempt))
+        await new Promise<void>((resolve) => setTimeout(resolve, delay))
+      }
+    }
+    return false
+  }
+
+  const unsubscribeLog = gateway.onLog((log) => {
+    if (log.status !== 'streaming') {
+      const previous = pendingTerminalLogs.get(log.id)
+      if (previous?.retryTimer) clearTimeout(previous.retryTimer)
+      pendingTerminalLogs.set(log.id, {
+        log,
+        attempts: previous?.attempts ?? 0,
+        flight: previous?.flight
+      })
+      if (!previous?.flight) persistTerminalLog(log.id)
+      return
+    }
+
+    const write = store.appendLog(log)
+    trackRequestLogWrite(write)
+    void write.then((safeLog) => {
+      if (!safeLog) return
+      scheduleRuntimeDelta({ gatewayStatus: true, requestLog: safeLog })
+      if (store.hasUncheckpointedLiveRequestLogs()) scheduleRequestLogCheckpoint()
+    }, (error: unknown) => {
+      console.error('Stone+ could not retain a live gateway request log', error)
     })
   })
 
-  const persistAccountState = async (state: GatewayAccountState): Promise<void> => {
+  const persistAccountState = async (state: GatewayAccountState, revision: number): Promise<void> => {
     const before = store.getRuntimeAccount(state.accountId)
     await store.updateAccountRuntimeState(state.accountId, {
       status: state.status,
@@ -601,8 +966,14 @@ export function registerGatewayApi(
       ...(state.quota ? { quota: state.quota } : {}),
       ...(state.codexQuota ? { codexQuota: state.codexQuota } : {})
     })
+    // Persistence is serialized per account below, but a newer lifecycle state
+    // may already be queued while this write is completing. Do not publish an
+    // obsolete cooldown, notification, or runtime patch in that interval; the
+    // newest queued state owns all post-commit side effects.
+    if (accountStateRevisions.get(state.accountId) !== revision) return
     const account = store.getRuntimeAccount(state.accountId)
-    if (account?.cooldownReason === 'quota' && account.credentialType === 'chatgpt-oauth') {
+    if (account?.cooldownReason === 'quota'
+      && (account.credentialType === 'chatgpt-oauth' || account.credentialType === 'chatgpt-agent-identity')) {
       const knownResetAt = codexQuotaCooldownUntil(account.codexQuota)
       const recentlyProbed = Date.now() - (lastQuotaProbeAt.get(account.id) ?? 0) < 30_000
       scheduleQuotaProbe(account.id, recentlyProbed && knownResetAt ? knownResetAt + 1_000 : Date.now() + 1_000)
@@ -613,10 +984,10 @@ export function registerGatewayApi(
     }
     const provider = account ? store.getRuntimeProvider(account.providerId) : undefined
     const event = account ? healthEventForTransition(before, account, provider?.name ?? 'Unknown provider') : undefined
+    let persistedEvent: AppSnapshot['healthEvents'][number] | undefined
     if (event && account) {
-      await store.appendHealthEvent(event)
-      const snapshot = store.getSnapshot()
-      if (snapshot.gateway.desktopNotifications && Notification.isSupported()) {
+      persistedEvent = await store.persistHealthEvent(event)
+      if (store.getRuntimeGatewaySettings().desktopNotifications && Notification.isSupported()) {
         const body = resolvedNativeLanguage() === 'zh-CN' || !/[\u3400-\u9fff]/u.test(event.message)
           ? event.message
           : event.kind === 'quota-exhausted'
@@ -631,73 +1002,138 @@ export function registerGatewayApi(
         new Notification({ title: `Stone+ · ${account.name}`, body }).show()
       }
     }
-    // Routine success telemetry (latency/lastUsedAt) must not rebuild the whole
-    // gateway configuration or tray menu. Only routing-affecting transitions do.
-    if (event || state.status !== 'active') {
-      publish(refreshRuntime())
-    } else if (state.quota) {
-      // Quota affects scheduling, but not the desktop tray. Refresh routing
-      // without triggering unrelated runtime UI side effects.
-      publish(refreshRuntime(), { runtimeChanged: false })
-    } else {
-      scheduleRuntimePublish()
-    }
+    // Quota and health are account-local runtime data. Patch the pinned gateway
+    // account rather than rebuilding every route/index and replaying retained
+    // performance history for each upstream response.
+    if (account) gateway.updateRuntimeAccounts([account])
+    if (event || state.status !== 'active') onRuntimeChanged?.()
+    scheduleRuntimeDelta({
+      gatewayStatus: true,
+      accountId: state.accountId,
+      ...(persistedEvent ? { healthEvent: persistedEvent } : {})
+    })
     evaluateAutomaticCooldownRefresh()
   }
 
-  const persistRoutineAccountState = async (state: GatewayAccountState): Promise<void> => {
-    const current = store.getRuntimeAccount(state.accountId)
-    // Coalesced success telemetry is stale-able by design. Never let it undo a
-    // user disable or a newer circuit-breaker transition.
-    if (!current || current.status !== 'active' || current.circuitState === 'open'
-      || current.circuitState === 'half-open' || (current.consecutiveFailures ?? 0) > 0) return
-    await store.updateAccountRuntimeState(state.accountId, {
-      latencyMs: state.latencyMs,
-      lastUsedAt: state.lastUsedAt,
-      ...(state.quota ? { quota: state.quota } : {}),
-      ...(state.codexQuota ? { codexQuota: state.codexQuota } : {})
+  const enqueueAccountStatePersistence = (state: GatewayAccountState, revision: number): void => {
+    const previous = accountStatePersistenceFlights.get(state.accountId)
+    const operation = (previous
+      ? previous.catch(() => undefined).then(() => persistAccountState(state, revision))
+      : persistAccountState(state, revision))
+      .catch((error: unknown) => {
+        console.error('Stone+ could not persist account health state', error)
+      })
+    accountStatePersistenceFlights.set(state.accountId, operation)
+    void operation.finally(() => {
+      if (accountStatePersistenceFlights.get(state.accountId) === operation) {
+        accountStatePersistenceFlights.delete(state.accountId)
+      }
     })
-    if (state.quota || state.codexQuota) publishRoutine(refreshRuntime())
-    else scheduleRuntimePublish()
   }
 
   const flushPendingAccountStates = async (): Promise<void> => {
     scheduledAccountStateFlush = undefined
     const pending = [...pendingActiveAccountStates.values()]
     pendingActiveAccountStates.clear()
-    await Promise.all(pending.map(async (state) => {
-      await persistRoutineAccountState(state).catch((error: unknown) => {
-        console.error('Stone+ could not persist account health state', error)
+    const eligible = pending.filter((state) => {
+      const current = store.getRuntimeAccount(state.accountId)
+      // Coalesced success telemetry is stale-able by design. Never let it undo
+      // a user disable or a newer circuit-breaker transition.
+      return current?.status === 'active'
+        && current.circuitState !== 'open'
+        && current.circuitState !== 'half-open'
+        && (current.consecutiveFailures ?? 0) === 0
+    })
+    if (eligible.length === 0) return
+    try {
+      await store.updateAccountRuntimeStates(eligible.map((state) => ({
+        id: state.accountId,
+        patch: {
+          latencyMs: state.latencyMs,
+          lastUsedAt: state.lastUsedAt,
+          ...(state.quota ? { quota: state.quota } : {}),
+          ...(state.codexQuota ? { codexQuota: state.codexQuota } : {})
+        }
+      })))
+      const refreshedAccounts = eligible
+        .filter((state) => state.quota || state.codexQuota)
+        .flatMap((state) => {
+        const account = store.getRuntimeAccount(state.accountId)
+        return account ? [account] : []
       })
-    }))
+      if (refreshedAccounts.length) gateway.updateRuntimeAccounts(refreshedAccounts)
+      for (const state of eligible) scheduleRuntimeDelta({
+        gatewayStatus: true,
+        accountId: state.accountId
+      })
+    } catch (error: unknown) {
+      console.error('Stone+ could not persist coalesced account health state', error)
+    }
   }
 
-  gateway.onAccountState((state) => {
-    const before = store.getRuntimeAccount(state.accountId)
+  const runAccountStateFlush = (): Promise<void> => {
+    if (accountStateFlushFlight) return accountStateFlushFlight
+    const flight = flushPendingAccountStates().finally(() => {
+      if (accountStateFlushFlight === flight) accountStateFlushFlight = undefined
+    })
+    accountStateFlushFlight = flight
+    return flight
+  }
+
+  const unsubscribeAccountState = gateway.onAccountState((state) => {
+    const persisted = store.getRuntimeAccount(state.accountId)
+    // A gateway callback can race a manual disable/delete that has already won
+    // the durable state. Runtime health telemetry must never revive it.
+    if (!persisted || persisted.status === 'disabled' || persisted.status === 'expired') {
+      pendingActiveAccountStates.delete(state.accountId)
+      latestObservedAccountStates.delete(state.accountId)
+      accountStateRevisions.set(
+        state.accountId,
+        (accountStateRevisions.get(state.accountId) ?? 0) + 1
+      )
+      return
+    }
+    const before = latestObservedAccountStates.get(state.accountId) ?? {
+      accountId: persisted.id,
+      status: persisted.status,
+      circuitState: persisted.circuitState,
+      consecutiveFailures: persisted.consecutiveFailures ?? 0,
+      cooldownUntil: persisted.cooldownUntil,
+      cooldownReason: persisted.cooldownReason,
+      latencyMs: persisted.latencyMs,
+      lastError: persisted.lastError,
+      lastUsedAt: persisted.lastUsedAt,
+      quota: persisted.quota,
+      codexQuota: persisted.codexQuota
+    }
+    latestObservedAccountStates.set(state.accountId, state)
     const routingTransition = state.status !== 'active'
-      || !before
       || before.status !== 'active'
       || before.circuitState === 'open'
       || before.circuitState === 'half-open'
       || (before.consecutiveFailures ?? 0) > 0
     if (routingTransition) {
+      const revision = (accountStateRevisions.get(state.accountId) ?? 0) + 1
+      accountStateRevisions.set(state.accountId, revision)
       pendingActiveAccountStates.delete(state.accountId)
-      void persistAccountState(state).catch((error: unknown) => {
-        console.error('Stone+ could not persist account health state', error)
-      })
+      enqueueAccountStatePersistence(state, revision)
       return
     }
     const pending = pendingActiveAccountStates.get(state.accountId)
     pendingActiveAccountStates.set(state.accountId, pending ? { ...pending, ...state } : state)
     if (!scheduledAccountStateFlush) {
       scheduledAccountStateFlush = setTimeout(() => {
-        void flushPendingAccountStates()
+        scheduledAccountStateFlush = undefined
+        void runAccountStateFlush().catch((error: unknown) => {
+          console.error('Stone+ could not flush account health state', error)
+        })
       }, accountStateFlushDelayMs)
     }
   })
 
   for (const account of store.getRuntimeAccounts()) {
-    if (account.credentialType === 'chatgpt-oauth' && account.cooldownReason === 'quota') {
+    if ((account.credentialType === 'chatgpt-oauth' || account.credentialType === 'chatgpt-agent-identity')
+      && account.cooldownReason === 'quota') {
       const resetAt = codexQuotaCooldownUntil(account.codexQuota)
       scheduleQuotaProbe(account.id, resetAt ? resetAt + 1_000 : Date.now() + 1_000)
     }
@@ -1224,31 +1660,67 @@ export function registerGatewayApi(
     const saved = await store.saveApiSource(input)
     if (saved.source.connectionChanged) gateway.resetAccountHealth(saved.source.accountId)
     const snapshot = publish(refreshRuntime())
-    if (gateway.getStatus().running) warmGatewayConnections(store, outboundTransport)
+    if (saved.source.connectionChanged && gateway.getStatus().running) {
+      warmGatewayConnections(store, outboundTransport)
+    }
     return snapshot
   })
   ipcMain.handle('stone:probe-api-source', async (event, input: Parameters<GatewayApi['probeApiSource']>[0]) => {
     assertTrustedSender(event)
     if (!input || typeof input !== 'object') throw new Error('API 来源测试参数无效。')
     const normalized = normalizeApiSourceProbeInput(input)
-    const existingAccount = input.id
-      ? store.getRuntimeAccounts().find((account) => account.providerId === input.id && account.credentialType !== 'chatgpt-oauth')
-      : undefined
-    const selectedProxyId = typeof normalized.proxyId === 'string' && normalized.proxyId.trim()
-      ? normalized.proxyId.trim()
-      : existingAccount?.proxyId
-    const proxy = selectedProxyId
-      ? store.getSnapshot().proxies.find((candidate) => candidate.id === selectedProxyId)
-      : undefined
-    if (selectedProxyId && !proxy) throw new Error('选择的出口代理已被删除。')
-    const fetchImplementation = outboundTransport.fetchFor(
-      proxy,
-      proxy ? store.getProxyPassword(proxy.id) : undefined
-    )
-    return runApiSourceProbe(normalized, {
-      storedCredential: input.id ? store.getApiSourceCredential(input.id) : undefined,
-      fetchImplementation,
-    })
+    const persistentSourceId = input.id?.trim() && input.persistCapabilities ? input.id.trim() : undefined
+    const probeOwner = persistentSourceId ? Symbol(persistentSourceId) : undefined
+    if (persistentSourceId && probeOwner) apiSourceCapabilityProbeOwners.set(persistentSourceId, probeOwner)
+    try {
+      const connectionFingerprint = persistentSourceId
+        ? store.getApiSourceProbeConnectionFingerprint(normalized)
+        : undefined
+      const existingAccount = input.id
+        ? store.getRuntimeAccounts().find((account) => account.providerId === input.id
+          && account.credentialType !== 'chatgpt-oauth'
+          && account.credentialType !== 'chatgpt-agent-identity')
+        : undefined
+      const selectedProxyId = typeof normalized.proxyId === 'string' && normalized.proxyId.trim()
+        ? normalized.proxyId.trim()
+        : existingAccount?.proxyId
+      const proxy = selectedProxyId
+        ? store.getSnapshot().proxies.find((candidate) => candidate.id === selectedProxyId)
+        : undefined
+      if (selectedProxyId && !proxy) throw new Error('选择的代理已被删除。')
+      const fetchImplementation = outboundTransport.fetchFor(
+        proxy,
+        proxy ? store.getProxyPassword(proxy.id) : undefined
+      )
+      const result = await runApiSourceProbe(normalized, {
+        storedCredential: input.id ? store.getApiSourceCredential(input.id) : undefined,
+        fetchImplementation,
+      })
+      if (persistentSourceId && result.ok && connectionFingerprint) {
+        if (apiSourceCapabilityProbeOwners.get(persistentSourceId) !== probeOwner) {
+          result.warnings.push(nativeText(
+            '更新的来源探测已启动，本次较旧的能力结果未保存。',
+            'A newer source probe superseded this result, so the older capability result was not saved.',
+          ))
+        } else {
+          const persisted = await store.saveApiSourceCapabilityProbe(
+            persistentSourceId,
+            result,
+            connectionFingerprint,
+          )
+          if (persisted) publish(persisted)
+          else result.warnings.push(nativeText(
+            '来源连接配置已在探测期间变化，本次能力结果未保存。',
+            'The source connection changed during probing, so this capability result was not saved.',
+          ))
+        }
+      }
+      return result
+    } finally {
+      if (persistentSourceId && apiSourceCapabilityProbeOwners.get(persistentSourceId) === probeOwner) {
+        apiSourceCapabilityProbeOwners.delete(persistentSourceId)
+      }
+    }
   })
   ipcMain.handle('stone:delete-api-source', (event, id: string) => {
     assertTrustedSender(event)
@@ -1289,54 +1761,66 @@ export function registerGatewayApi(
   ipcMain.handle('stone:ensure-gateway-running', async (event, input: Parameters<GatewayApi['ensureGatewayRunning']>[0] = {}) => {
     assertTrustedSender(event)
     if (!input || typeof input !== 'object') throw new Error('网关启动参数无效。')
-    const status = gateway.getStatus()
-    if (status.running) {
-      store.setGatewayStatus(status)
-      return { snapshot: publish(store.getSnapshot()), host: status.host, port: status.port, changedPort: false, started: false }
-    }
-    const current = store.getSnapshot().gateway
-    const host = typeof input.host === 'string' && input.host.trim() ? input.host.trim() : current.host
-    const requestedPort = normalizeSetupPort(input.port ?? current.port)
-    const candidates = [requestedPort, ...Array.from({ length: 19 }, (_, index) => 15722 + index)]
-      .filter((port, index, values) => values.indexOf(port) === index)
-    let lastError: unknown
-    for (const port of candidates) {
-      const settings = { ...current, host, port }
-      gateway.updateConfig(toGatewayConfig(store))
-      try {
-        await gateway.start(settings)
-        await store.updateGateway(settings)
-        outboundTransport.configureOutboundNetwork(settings.outboundNetworkMode ?? 'direct', settings.port)
-        gateway.updateConfig(toGatewayConfig(store))
-        warmGatewayConnections(store, outboundTransport)
-        store.setGatewayStatus(gateway.getStatus())
-        const wizard = store.getSetupWizardState()
-        if (wizard) await store.saveSetupWizardProgress({ sessionId: wizard.sessionId, step: 'verify' })
-        return {
-          snapshot: publish(store.getSnapshot()),
-          host,
-          port,
-          changedPort: port !== requestedPort,
-          started: true,
-        }
-      } catch (error) {
-        lastError = error
-        if (!isAddressInUseError(error)) break
+    return enqueueGatewayLifecycle(async () => {
+      const status = gateway.getStatus()
+      if (status.running) {
+        store.setGatewayStatus(status)
+        return { snapshot: publish(store.getSnapshot()), host: status.host, port: status.port, changedPort: false, started: false }
       }
-    }
-    gateway.updateConfig(toGatewayConfig(store))
-    store.setGatewayStatus(gateway.getStatus())
-    throw lastError instanceof Error ? lastError : new Error('无法启动本地网关。')
+      const current = store.getSnapshot().gateway
+      const host = typeof input.host === 'string' && input.host.trim() ? input.host.trim() : current.host
+      const requestedPort = normalizeSetupPort(input.port ?? current.port)
+      const candidates = [requestedPort, ...Array.from({ length: 19 }, (_, index) => 15722 + index)]
+        .filter((port, index, values) => values.indexOf(port) === index)
+      let lastError: unknown
+      for (const port of candidates) {
+        const settings = { ...current, host, port }
+        gateway.updateConfig(toGatewayConfig(store))
+        try {
+          await gateway.start(settings)
+          await store.updateGateway(settings)
+          outboundTransport.configureOutboundNetwork(settings.outboundNetworkMode ?? 'direct', settings.port)
+          gateway.updateConfig(toGatewayConfig(store))
+          warmGatewayConnections(store, outboundTransport)
+          store.setGatewayStatus(gateway.getStatus())
+          const wizard = store.getSetupWizardState()
+          if (wizard) await store.saveSetupWizardProgress({ sessionId: wizard.sessionId, step: 'verify' })
+          return {
+            snapshot: publish(store.getSnapshot()),
+            host,
+            port,
+            changedPort: port !== requestedPort,
+            started: true,
+          }
+        } catch (error) {
+          lastError = error
+          if (!isAddressInUseError(error)) break
+        }
+      }
+      gateway.updateConfig(toGatewayConfig(store))
+      store.setGatewayStatus(gateway.getStatus())
+      throw lastError instanceof Error ? lastError : new Error('无法启动本地网关。')
+    })
   })
   ipcMain.handle('stone:verify-setup-route', async (event, input: Parameters<GatewayApi['verifySetupRoute']>[0]) => {
     assertTrustedSender(event)
     if (!input || typeof input !== 'object') throw new Error('端到端验证参数无效。')
     assertRouteClient(input.client)
+    const sessionId = typeof input.sessionId === 'string' ? input.sessionId.trim() : ''
+    const routeId = typeof input.routeId === 'string' ? input.routeId.trim() : ''
     const model = typeof input.model === 'string' ? input.model.trim() : ''
+    if (!sessionId || !routeId) throw new Error('端到端验证缺少向导会话或路由绑定。')
     if (!model) throw new Error('请选择端到端验证模型。')
+    const wizard = store.getSetupWizardState()
+    if (!wizard || wizard.sessionId !== sessionId) throw new Error('配置向导会话不存在或已过期。')
+    if (wizard.routeId !== routeId || wizard.client !== input.client || wizard.model !== model) {
+      throw new Error('端到端验证目标与本次向导已应用的路由不一致。')
+    }
     const snapshot = store.getSnapshot()
-    const route = snapshot.routes.find((candidate) => candidate.client === input.client && candidate.enabled)
+    const route = snapshot.routes.find((candidate) => candidate.id === routeId
+      && candidate.client === input.client && candidate.enabled)
     if (!route) throw new Error('当前客户端路由未启用。')
+    const routeRevision = route.updatedAt
     const status = gateway.getStatus()
     if (!status.running) throw new Error('本地网关尚未运行。')
     const host = status.host.includes(':') ? `[${status.host}]` : status.host
@@ -1347,25 +1831,41 @@ export function registerGatewayApi(
       token: route.localToken,
       timeoutMs: Math.max(10_000, snapshot.gateway.requestTimeoutSeconds * 1_000),
     })
-    const wizard = store.getSetupWizardState()
-    if (wizard) {
-      if (result.ok) {
-        await store.markSetupWizardVerified(wizard.sessionId)
+    const currentWizard = store.getSetupWizardState()
+    const currentRoute = store.getSnapshot().routes.find((candidate) => candidate.id === routeId)
+    const targetUnchanged = currentWizard?.sessionId === sessionId
+      && currentWizard.routeId === routeId
+      && currentWizard.client === input.client
+      && currentWizard.model === model
+      && currentRoute?.updatedAt === routeRevision
+      && currentRoute.enabled
+    if (currentWizard?.sessionId === sessionId) {
+      if (result.ok && targetUnchanged) {
+        await store.markSetupWizardVerified(sessionId)
       } else {
         await store.saveSetupWizardProgress({
-          sessionId: wizard.sessionId,
+          sessionId,
           step: 'verify',
           client: input.client,
           model,
-          lastError: result.error,
+          lastError: result.ok ? '验证期间路由已变更，请重新运行端到端验证。' : result.error,
         })
       }
     }
-    return result
+    return result.ok && !targetUnchanged
+      ? { ...result, ok: false, error: '验证期间路由已变更，请重新运行端到端验证。' }
+      : result
   })
   ipcMain.handle('stone:update-route', (event, route: Route) => {
     assertTrustedSender(event)
     return mutate(() => store.updateRoute(route))
+  })
+  ipcMain.handle('stone:preview-route', (event, input: Parameters<GatewayApi['previewRoute']>[0]) => {
+    assertTrustedSender(event)
+    if (!input || typeof input !== 'object' || !input.route || typeof input.route !== 'object') {
+      throw new Error('Route preview input is invalid.')
+    }
+    return previewRoute(input, store.getSnapshot())
   })
   ipcMain.handle('stone:set-client-route-source', (
     event,
@@ -1390,52 +1890,69 @@ export function registerGatewayApi(
   })
   ipcMain.handle('stone:update-gateway', async (event, settings: GatewaySettings) => {
     assertTrustedSender(event)
-    const wasRunning = gateway.getStatus().running
-    const previousSettings = store.getSnapshot().gateway
-    const requiresRestart = wasRunning
-      && (previousSettings.host !== settings.host || previousSettings.port !== settings.port)
-    const outboundModeChanged = (previousSettings.outboundNetworkMode ?? 'direct')
-      !== (settings.outboundNetworkMode ?? 'direct')
-    await store.updateGateway(settings)
-    const savedGateway = store.getSnapshot().gateway
-    outboundTransport.configureOutboundNetwork(
-      savedGateway.outboundNetworkMode ?? 'direct',
-      savedGateway.port
-    )
-    if (outboundModeChanged && wasRunning) warmGatewayConnections(store, outboundTransport)
-    if (backups) {
-      await backups.setAutomaticRetention(settings.backupRetention ?? 10)
-      if (settings.automaticBackups === false) backups.stopAutomaticBackups()
-      else backups.startAutomaticBackups()
-    }
-    if (requiresRestart) await gateway.stop()
-    gateway.updateConfig(toGatewayConfig(store))
-    try {
-      if (requiresRestart) {
-        await gateway.start()
-        warmGatewayConnections(store, outboundTransport)
+    return enqueueGatewayLifecycle(async () => {
+      const wasRunning = gateway.getStatus().running
+      const previousSettings = store.getSnapshot().gateway
+      await store.updateGateway(settings)
+      const savedGateway = store.getSnapshot().gateway
+      const requiresRestart = wasRunning
+        && (previousSettings.host !== savedGateway.host || previousSettings.port !== savedGateway.port)
+      const outboundModeChanged = (previousSettings.outboundNetworkMode ?? 'direct')
+        !== (savedGateway.outboundNetworkMode ?? 'direct')
+      outboundTransport.configureOutboundNetwork(
+        savedGateway.outboundNetworkMode ?? 'direct',
+        savedGateway.port
+      )
+      if (outboundModeChanged && savedGateway.outboundNetworkMode === 'system') {
+        // Network failures recorded before this switch may have opened account
+        // circuits. Re-check only failure-cooled accounts that actually use the
+        // global system route; quota cooldowns and explicit proxies are left
+        // untouched.
+        await outboundReloadCoordinator.reloadExternalSystemRoute()
       }
-    } catch (error: unknown) {
+      if (outboundModeChanged && wasRunning) warmGatewayConnections(store, outboundTransport)
+      if (backups) {
+        if ((previousSettings.backupRetention ?? 10) !== (savedGateway.backupRetention ?? 10)) {
+          await backups.setAutomaticRetention(savedGateway.backupRetention ?? 10)
+        }
+        if ((previousSettings.automaticBackups !== false) !== (savedGateway.automaticBackups !== false)) {
+          if (savedGateway.automaticBackups === false) backups.stopAutomaticBackups()
+          else backups.startAutomaticBackups()
+        }
+      }
+      if (requiresRestart) await gateway.stop()
+      gateway.updateConfig(toGatewayConfig(store))
+      try {
+        if (requiresRestart) {
+          await gateway.start()
+          warmGatewayConnections(store, outboundTransport)
+        }
+      } catch (error: unknown) {
+        store.setGatewayStatus(gateway.getStatus())
+        publish(store.getSnapshot())
+        throw error
+      }
       store.setGatewayStatus(gateway.getStatus())
-      publish(store.getSnapshot())
-      throw error
-    }
-    store.setGatewayStatus(gateway.getStatus())
-    return publish(store.getSnapshot())
+      return publish(store.getSnapshot())
+    })
   })
   ipcMain.handle('stone:start-gateway', async (event) => {
     assertTrustedSender(event)
-    gateway.updateConfig(toGatewayConfig(store))
-    await gateway.start()
-    warmGatewayConnections(store, outboundTransport)
-    store.setGatewayStatus(gateway.getStatus())
-    return publish(store.getSnapshot())
+    return enqueueGatewayLifecycle(async () => {
+      gateway.updateConfig(toGatewayConfig(store))
+      await gateway.start()
+      warmGatewayConnections(store, outboundTransport)
+      store.setGatewayStatus(gateway.getStatus())
+      return publish(store.getSnapshot())
+    })
   })
   ipcMain.handle('stone:stop-gateway', async (event) => {
     assertTrustedSender(event)
-    await gateway.stop({ force: true })
-    store.setGatewayStatus(gateway.getStatus())
-    return publish(store.getSnapshot())
+    return enqueueGatewayLifecycle(async () => {
+      await gateway.stop({ force: true })
+      store.setGatewayStatus(gateway.getStatus())
+      return publish(store.getSnapshot())
+    })
   })
   ipcMain.handle('stone:rebuild-outbound-connections', async (event) => {
     assertTrustedSender(event)
@@ -1443,10 +1960,7 @@ export function registerGatewayApi(
   })
   ipcMain.handle('stone:detect-system-proxy', async (event) => {
     assertTrustedSender(event)
-    return outboundTransport.detectSystemProxy([
-      new URL(CHATGPT_CODEX_RESPONSES_URL).origin,
-      'https://api.openai.com'
-    ])
+    return outboundReloadCoordinator.detectExternalSystemProxy()
   })
   ipcMain.handle('stone:run-network-diagnostics', async (event, input: Parameters<GatewayApi['runNetworkDiagnostics']>[0] = {}) => {
     assertTrustedSender(event)
@@ -1470,6 +1984,28 @@ export function registerGatewayApi(
   ipcMain.handle('stone:check-account', async (event, id: string) => {
     assertTrustedSender(event)
     return (await probeAndPersistAccount(id)).snapshot
+  })
+  ipcMain.handle('stone:start-account-check-task', async (event, requestedIds?: string[]) => {
+    assertTrustedSender(event)
+    const existing = persistentTaskRunner.list(2_000).find((task) => (
+      task.kind === 'account.bulk-check' && (task.status === 'running' || task.status === 'paused')
+    ))
+    if (existing) return existing
+    const requested = Array.isArray(requestedIds) ? new Set(requestedIds.filter((id) => typeof id === 'string')) : undefined
+    const accountIds = store.getRuntimeAccounts()
+      .filter((account) => !requested || requested.has(account.id))
+      // Preserve the store order within each group while checking usable
+      // accounts first and quota-exhausted accounts afterwards.
+      .sort((left, right) => Number(accountCheckIsQuotaDeferred(left)) - Number(accountCheckIsQuotaDeferred(right)))
+      .map((account) => account.id)
+    if (accountIds.length === 0) throw new Error(nativeText('没有可检测的账号。', 'No accounts are available to check.'))
+    const task = await persistentTaskRunner.create({
+      kind: 'account.bulk-check',
+      payload: { accountIds },
+      total: accountIds.length,
+      resumable: true
+    })
+    return persistentTaskRunner.resume(task.id)
   })
   ipcMain.handle('stone:refresh-account-codex-quota', async (event, id: string) => {
     assertTrustedSender(event)
@@ -1511,7 +2047,38 @@ export function registerGatewayApi(
   })
   ipcMain.handle('stone:clear-logs', (event) => {
     assertTrustedSender(event)
-    return mutate(() => store.clearLogs())
+    const clearedPendingIds = [...pendingTerminalLogs.keys()]
+    for (const pending of pendingTerminalLogs.values()) {
+      if (pending.retryTimer) clearTimeout(pending.retryTimer)
+    }
+    pendingTerminalLogs.clear()
+    pendingRequestLogs.clear()
+    pendingRuntimeAccountIds.clear()
+    pendingHealthEvents.clear()
+    pendingObservability = false
+    pendingGatewayStatus = false
+    gateway.clearRequestReplays?.()
+    return mutate(() => store.clearLogs(clearedPendingIds))
+  })
+  ipcMain.handle('stone:get-request-replay-template', (event, id: string) => {
+    assertTrustedSender(event)
+    if (typeof id !== 'string' || !id.trim()) throw new Error('Invalid request ID.')
+    return gateway.getRequestReplayTemplate?.(id) ?? null
+  })
+  ipcMain.handle('stone:replay-request', async (event, id: string) => {
+    assertTrustedSender(event)
+    if (typeof id !== 'string' || !id.trim()) throw new Error('Invalid request ID.')
+    if (!gateway.replayRequest) throw new Error('Request replay is unavailable.')
+    return await gateway.replayRequest(id)
+  })
+  ipcMain.handle('stone:get-local-event-server-status', (event) => {
+    assertTrustedSender(event)
+    return localEvents?.getPublicStatus() ?? {
+      running: false,
+      discoveryFile: '',
+      authentication: 'bearer-token' as const,
+      connectedClients: 0
+    }
   })
   ipcMain.handle('stone:clear-health-events', (event) => {
     assertTrustedSender(event)
@@ -1569,25 +2136,96 @@ export function registerGatewayApi(
   ipcMain.handle('stone:restore-state-backup', async (event, path: string) => {
     assertTrustedSender(event)
     if (!backups) throw new Error('Database backup service is unavailable.')
-    const wasRunning = gateway.getStatus().running
-    if (wasRunning) await gateway.stop({ force: true })
-    try {
-      const result = await backups.restoreBackup(backupIdFromPath(path))
-      await store.sanitizePersistedData()
-      gateway.updateConfig(toGatewayConfig(store))
-      store.setGatewayStatus(gateway.getStatus())
-      return { restored: toBackupSummary(result.restoredBackup), restartRequired: true }
-    } catch (error) {
-      if (wasRunning) {
+    return enqueueGatewayLifecycle(async () => {
+      const wasRunning = gateway.getStatus().running
+      if (wasRunning) await gateway.stop({ force: true })
+      try {
+        const result = await backups.restoreBackup(backupIdFromPath(path))
+        await store.sanitizePersistedData()
         gateway.updateConfig(toGatewayConfig(store))
-        await gateway.start().catch((restartError: unknown) => {
-          console.error('Stone+ could not restart the gateway after a failed database restore', restartError)
-        })
+        store.setGatewayStatus(gateway.getStatus())
+        return { restored: toBackupSummary(result.restoredBackup), restartRequired: true }
+      } catch (error) {
+        if (wasRunning) {
+          gateway.updateConfig(toGatewayConfig(store))
+          await gateway.start().catch((restartError: unknown) => {
+            console.error('Stone+ could not restart the gateway after a failed database restore', restartError)
+          })
+        }
+        store.setGatewayStatus(gateway.getStatus())
+        publish(store.getSnapshot())
+        throw error
       }
-      store.setGatewayStatus(gateway.getStatus())
-      publish(store.getSnapshot())
-      throw error
+    })
+  })
+  ipcMain.handle('stone:export-portable-state-backup', async (event, password: string) => {
+    assertTrustedSender(event)
+    if (!backups) throw new Error('Database backup service is unavailable.')
+    assertPortableBackupPassword(password)
+    const owner = BrowserWindow.fromWebContents(event.sender)
+    const saveOptions: Electron.SaveDialogOptions = {
+      title: nativeText('导出加密迁移备份', 'Export encrypted portable backup'),
+      defaultPath: join(app.getPath('documents'), `StonePlus-state-${new Date().toISOString().slice(0, 10)}.stonebackup`),
+      filters: [{ name: 'Stone+ Portable Backup', extensions: ['stonebackup'] }]
     }
+    const result = owner ? await dialog.showSaveDialog(owner, saveOptions) : await dialog.showSaveDialog(saveOptions)
+    if (result.canceled || !result.filePath) return { cancelled: true }
+    const exported = await backups.exportPortableBackup(result.filePath, password)
+    return { cancelled: false, path: result.filePath, backup: toBackupSummary(exported.backup) }
+  })
+  ipcMain.handle('stone:import-portable-state-backup', async (event, password: string) => {
+    assertTrustedSender(event)
+    if (!backups) throw new Error('Database backup service is unavailable.')
+    assertPortableBackupPassword(password)
+    const owner = BrowserWindow.fromWebContents(event.sender)
+    const openOptions: Electron.OpenDialogOptions = {
+      title: nativeText('导入加密迁移备份', 'Import encrypted portable backup'),
+      properties: ['openFile'],
+      filters: [{ name: 'Stone+ Portable Backup', extensions: ['stonebackup'] }]
+    }
+    const result = owner ? await dialog.showOpenDialog(owner, openOptions) : await dialog.showOpenDialog(openOptions)
+    const path = result.filePaths[0]
+    if (result.canceled || !path) return { cancelled: true }
+    const backup = await backups.importPortableBackup(path, password)
+    return { cancelled: false, path, backup: toBackupSummary(backup) }
+  })
+  ipcMain.handle('stone:get-webdav-backup-configuration', (event) => {
+    assertTrustedSender(event)
+    return webDavBackups?.getConfiguration() ?? { baseUrl: '', username: '', hasPassword: false, configured: false }
+  })
+  ipcMain.handle('stone:save-webdav-backup-configuration', (event, input: Parameters<GatewayApi['saveWebDavBackupConfiguration']>[0]) => {
+    assertTrustedSender(event)
+    if (!webDavBackups) throw new Error('Database backup service is unavailable.')
+    if (!input || typeof input !== 'object') throw new Error('WebDAV backup configuration is invalid.')
+    return webDavBackups.saveConfiguration(input)
+  })
+  ipcMain.handle('stone:clear-webdav-backup-configuration', (event) => {
+    assertTrustedSender(event)
+    if (!webDavBackups) throw new Error('Database backup service is unavailable.')
+    return webDavBackups.clearConfiguration()
+  })
+  ipcMain.handle('stone:test-webdav-backup', async (event) => {
+    assertTrustedSender(event)
+    if (!webDavBackups) throw new Error('Database backup service is unavailable.')
+    await webDavBackups.test(AbortSignal.timeout(15_000))
+  })
+  ipcMain.handle('stone:list-webdav-backups', (event) => {
+    assertTrustedSender(event)
+    if (!webDavBackups) return []
+    return webDavBackups.list(AbortSignal.timeout(20_000))
+  })
+  ipcMain.handle('stone:upload-latest-webdav-backup', (event, password: string) => {
+    assertTrustedSender(event)
+    if (!webDavBackups) throw new Error('Database backup service is unavailable.')
+    assertPortableBackupPassword(password)
+    return webDavBackups.uploadLatest(password, AbortSignal.timeout(120_000))
+  })
+  ipcMain.handle('stone:download-webdav-backup', (event, name: string, password: string) => {
+    assertTrustedSender(event)
+    if (!webDavBackups) throw new Error('Database backup service is unavailable.')
+    assertPortableBackupPassword(password)
+    if (typeof name !== 'string' || !name.trim()) throw new Error('Choose a WebDAV backup to import.')
+    return webDavBackups.downloadAndImport(name, password, AbortSignal.timeout(120_000))
   })
   ipcMain.handle('stone:get-client-configs', async (event, profileId?: string) => {
     assertTrustedSender(event)
@@ -1707,10 +2345,51 @@ export function registerGatewayApi(
   })
   return async () => {
     closed = true
+    unregisterBulkAccountCheckTask()
+    await persistentTaskRunner.interruptAllForShutdown()
+    // Stop accepting new gateway callbacks before draining the work already
+    // observed below. Otherwise a late account/log event can be enqueued after
+    // the shutdown snapshots have been taken and race the store close.
+    unsubscribeLog()
+    unsubscribeAccountState()
+    unsubscribeRuntimeState()
+    unsubscribeBrowserImports?.()
+    if (scheduledAccountStateFlush) {
+      clearTimeout(scheduledAccountStateFlush)
+      scheduledAccountStateFlush = undefined
+    }
+    do {
+      await runAccountStateFlush()
+    } while (pendingActiveAccountStates.size > 0)
+    await Promise.allSettled([...accountStatePersistenceFlights.values()])
+    latestObservedAccountStates.clear()
+    accountStateRevisions.clear()
+    if (scheduledRequestLogCheckpoint) clearTimeout(scheduledRequestLogCheckpoint)
+    scheduledRequestLogCheckpoint = undefined
+    if (scheduledRuntimeDeltaPublish) clearTimeout(scheduledRuntimeDeltaPublish)
+    scheduledRuntimeDeltaPublish = undefined
+    for (const pending of pendingTerminalLogs.values()) {
+      if (pending.retryTimer) clearTimeout(pending.retryTimer)
+    }
     await Promise.allSettled([...pendingRequestLogWrites])
+    // One final retry window gives every observed terminal lifecycle a durable
+    // outcome before AppStore performs its forced live checkpoint. Clear stale
+    // rejected flights first; their callbacks intentionally stop scheduling
+    // timers once `closed` is true.
+    for (const pending of pendingTerminalLogs.values()) {
+      if (pending.retryTimer) clearTimeout(pending.retryTimer)
+      pending.retryTimer = undefined
+      pending.flight = undefined
+    }
+    await Promise.all([...pendingTerminalLogs.values()].map(({ log }) => (
+      persistTerminalLogForShutdown(log)
+    )))
+    pendingTerminalLogs.clear()
     if (automaticCooldownRefreshFlight) {
       await Promise.allSettled([automaticCooldownRefreshFlight])
     }
+    if (ownsOutboundReloadCoordinator) await outboundReloadCoordinator.close()
+    else await outboundReloadCoordinator.settle()
     const oauthCompletions = new Set<Promise<unknown>>(oauthCompletionFlights)
     for (const [sessionId, session] of [...oauthImportSessions]) {
       session.cancelled = true
@@ -1726,23 +2405,8 @@ export function registerGatewayApi(
       cleanupOAuthSession(sessionId, session, { cancelFlow: false, markCancelled: true })
     }
     chatGptOAuth.dispose()
-    unsubscribeRuntimeState()
-    unsubscribeBrowserImports?.()
     for (const timer of quotaProbeTimers.values()) clearTimeout(timer)
     quotaProbeTimers.clear()
-    if (scheduledSnapshotPublish) {
-      clearTimeout(scheduledSnapshotPublish)
-      scheduledSnapshotPublish = undefined
-    }
-    if (scheduledLiveRuntimePublish) {
-      clearTimeout(scheduledLiveRuntimePublish)
-      scheduledLiveRuntimePublish = undefined
-    }
-    if (scheduledAccountStateFlush) {
-      clearTimeout(scheduledAccountStateFlush)
-      scheduledAccountStateFlush = undefined
-    }
-    await flushPendingAccountStates()
   }
 }
 
@@ -1857,105 +2521,91 @@ function toGatewayConfig(store: AppStore): GatewayConfig {
 }
 
 export function warmGatewayConnections(store: AppStore, transport: OutboundTransportManager): void {
-  const configuration = store.getRuntimeConfiguration()
-  const targets = new Map<string, {
-    proxy: AppSnapshot['proxies'][number] | undefined
-    password: string | undefined
-    origin: string
-  }>()
-  for (const pool of configuration.pools) {
-    for (const member of pool.members) {
-      if (!member.enabled) continue
-      const account = configuration.accounts.find((candidate) => candidate.id === member.accountId)
-      if (!account || account.status === 'disabled' || account.status === 'expired') continue
-      const provider = configuration.providers.find((candidate) => candidate.id === account.providerId)
-      if (!provider) continue
-      const proxy = resolveEffectiveProxy(account, pool, configuration.proxies)
-      const origin = new URL(
-        account.credentialType === 'chatgpt-oauth' ? CHATGPT_CODEX_RESPONSES_URL : provider.baseUrl
-      ).origin
-      const key = `${proxy?.id ?? 'direct'}\0${origin}`
-      if (!targets.has(key)) {
-        targets.set(key, {
-          proxy,
-          password: proxy ? store.getProxyPassword(proxy.id) : undefined,
-          origin
-        })
-      }
-    }
-  }
+  const targets = gatewayConnectionTargets(store)
   void Promise.allSettled([...targets.values()].map((target) =>
-    transport.warmFor(target.proxy, target.password, target.origin)
+    transport.warmFor(target.proxy, target.password, target.targetUrl)
   ))
 }
 
 export async function rebuildGatewayConnections(store: AppStore, transport: OutboundTransportManager): Promise<void> {
+  if (store.getSnapshot().gateway.outboundNetworkMode === 'system') {
+    await transport.reloadSystemProxyConfiguration().catch((error) => {
+      // A slow/broken WPAD or PAC refresh must not prevent explicit-proxy
+      // sources from rebuilding. Chromium can continue with its last loaded
+      // proxy snapshot while the affected system targets report their own
+      // warmup failures below.
+      console.warn('[system-proxy] Could not refresh the operating-system proxy configuration before rebuild', error)
+    })
+  }
   transport.invalidateSystemProxyCache()
   const targets = gatewayConnectionTargets(store)
   const grouped = new Map<string, {
     proxy: AppSnapshot['proxies'][number] | undefined
     password: string | undefined
-    origins: Set<string>
+    targets: Set<string>
   }>()
   for (const target of targets.values()) {
     const key = target.proxy?.id ?? 'direct'
     const group = grouped.get(key) ?? {
       proxy: target.proxy,
       password: target.password,
-      origins: new Set<string>()
+      targets: new Set<string>()
     }
-    group.origins.add(target.origin)
+    group.targets.add(target.targetUrl)
     grouped.set(key, group)
   }
   await Promise.all([...grouped.values()].map((group) =>
-    transport.rebuild(group.proxy, group.password, [...group.origins])
+    transport.rebuild(group.proxy, group.password, [...group.targets])
   ))
 }
 
-function gatewayConnectionTargets(store: AppStore): Map<string, {
-  proxy: AppSnapshot['proxies'][number] | undefined
-  password: string | undefined
-  origin: string
-}> {
-  const configuration = store.getRuntimeConfiguration()
-  const targets = new Map<string, {
-    proxy: AppSnapshot['proxies'][number] | undefined
-    password: string | undefined
-    origin: string
-  }>()
-  for (const pool of configuration.pools) {
-    for (const member of pool.members) {
-      if (!member.enabled) continue
-      const account = configuration.accounts.find((candidate) => candidate.id === member.accountId)
-      if (!account || account.status === 'disabled' || account.status === 'expired') continue
-      const provider = configuration.providers.find((candidate) => candidate.id === account.providerId)
-      if (!provider) continue
-      const proxy = resolveEffectiveProxy(account, pool, configuration.proxies)
-      const origin = new URL(
-        account.credentialType === 'chatgpt-oauth' ? CHATGPT_CODEX_RESPONSES_URL : provider.baseUrl
-      ).origin
-      const key = `${proxy?.id ?? 'direct'}\0${origin}`
-      if (!targets.has(key)) targets.set(key, {
-        proxy,
-        password: proxy ? store.getProxyPassword(proxy.id) : undefined,
-        origin
-      })
-    }
+function gatewayConnectionTargets(store: AppStore): Map<string, EnabledOutboundTarget> {
+  return collectEnabledOutboundTargets(store)
+}
+
+async function resolveAgentIdentityForOperation(
+  store: AppStore,
+  account: Account,
+  fetchImplementation: typeof fetch,
+  signal?: AbortSignal
+): Promise<{ authorization: string; accountId: string; fedramp?: boolean }> {
+  const serialized = store.getCredential(account.credentialId)
+  if (!serialized) throw new Error('This Agent Identity account has no readable credential.')
+  const access = await resolveChatGptAgentIdentity(
+    serialized,
+    (rotated, expectedSource) => store.updateChatGptAgentIdentityCredential(account.id, rotated, expectedSource),
+    fetchImplementation,
+    { signal }
+  )
+  return {
+    authorization: access.authorization,
+    accountId: access.bundle.accountId,
+    fedramp: access.bundle.fedramp
   }
-  return targets
 }
 
 async function checkAccount(
   store: AppStore,
   outboundTransport: OutboundTransportManager,
-  accountId: string
+  accountId: string,
+  signal?: AbortSignal,
 ): Promise<{ latencyMs: number; codexQuota?: AppSnapshot['accounts'][number]['codexQuota'] }> {
+  signal?.throwIfAborted()
   const snapshot = store.getSnapshot()
   const account = store.getRuntimeAccount(accountId)
   if (!account) throw new Error('Account not found.')
   const provider = snapshot.providers.find((candidate) => candidate.id === account.providerId)
   if (!provider) throw new Error('The account provider no longer exists.')
   const fetchImplementation = accountFetchImplementation(store, outboundTransport, account)
+  if (account.credentialType === 'chatgpt-agent-identity') {
+    const authorization = await resolveAgentIdentityForOperation(store, account, fetchImplementation, signal)
+    const result = await checkChatGptAccountAuthorized(
+      account,
+      authorization, fetchImplementation, boundedAbortSignal(signal, 30_000)
+    )
+    if (!result.ok) throw new AccountProbeError(result.failure)
+    return { latencyMs: result.latencyMs, ...(result.quota ? { codexQuota: result.quota } : {}) }
+  }
   if (account.credentialType === 'chatgpt-oauth') {
     const serialized = store.getCredential(account.credentialId)
     if (!serialized) throw new Error('This ChatGPT account has no readable credential.')
@@ -1964,20 +2614,14 @@ async function checkAccount(
       (rotated, expectedSource) => store.updateChatGptCredential(account.id, rotated, expectedSource),
       fetchImplementation,
       Date.now(),
-      { refreshKey: account.id }
+      { refreshKey: account.id, signal }
     )
-    try {
-      const result = await queryChatGptCodexQuota(
-        resolved.bundle,
-        fetchImplementation,
-        AbortSignal.timeout(30_000)
-      )
-      return { latencyMs: result.latencyMs, codexQuota: result.quota }
-    } catch {
-      const result = await probeChatGptAccount(account, resolved.bundle, fetchImplementation, AbortSignal.timeout(30_000))
-      if (!result.ok) throw new AccountProbeError(result.failure)
-      return { latencyMs: result.latencyMs }
-    }
+    const result = await checkChatGptAccountAuthorized(account, {
+      authorization: `Bearer ${resolved.bundle.accessToken}`,
+      accountId: resolved.bundle.accountId
+    }, fetchImplementation, boundedAbortSignal(signal, 30_000))
+    if (!result.ok) throw new AccountProbeError(result.failure)
+    return { latencyMs: result.latencyMs, ...(result.quota ? { codexQuota: result.quota } : {}) }
   }
   const credential = store.getCredential(account.credentialId)
   if (!credential) throw new Error('This account has no readable credential.')
@@ -1986,10 +2630,37 @@ async function checkAccount(
     protocol: provider.protocol,
     credential,
     fetchImplementation,
+    signal,
     timeoutMs: 15_000
   })
   if (!result.ok) throw new AccountProbeError(result.failure)
   return { latencyMs: result.latencyMs }
+}
+
+function boundedAbortSignal(signal: AbortSignal | undefined, timeoutMs: number): AbortSignal {
+  const timeout = AbortSignal.timeout(timeoutMs)
+  return signal ? AbortSignal.any([signal, timeout]) : timeout
+}
+
+function abortReason(signal: AbortSignal): Error {
+  return signal.reason instanceof Error
+    ? signal.reason
+    : new DOMException('The operation was aborted.', 'AbortError')
+}
+
+function accountCheckState(account: Account): Parameters<AppStore['setAccountCheckResult']>[1] {
+  return {
+    status: account.status,
+    latencyMs: account.latencyMs,
+    lastError: account.lastError,
+    lastUsedAt: account.lastUsedAt,
+    cooldownUntil: account.cooldownUntil,
+    cooldownReason: account.cooldownReason,
+    circuitState: account.circuitState,
+    consecutiveFailures: account.consecutiveFailures,
+    quota: account.quota,
+    codexQuota: account.codexQuota,
+  }
 }
 
 export async function discoverProviderModels(
@@ -2004,7 +2675,8 @@ export async function discoverProviderModels(
     .filter((candidate) => candidate.providerId === providerId && candidate.status !== 'disabled')
   if (accounts.length === 0) throw new Error('Add an enabled account before refreshing provider models.')
 
-  const apiKeyAccount = accounts.find((candidate) => candidate.credentialType !== 'chatgpt-oauth')
+  const apiKeyAccount = accounts.find((candidate) => candidate.credentialType !== 'chatgpt-oauth'
+    && candidate.credentialType !== 'chatgpt-agent-identity')
   return discoverAccountModels(store, outboundTransport, (apiKeyAccount ?? accounts[0]).id)
 }
 
@@ -2019,6 +2691,13 @@ export async function discoverAccountModels(
   const provider = snapshot.providers.find((candidate) => candidate.id === account.providerId)
   if (!provider) throw new Error('The account provider no longer exists.')
   const fetchImplementation = accountFetchImplementation(store, outboundTransport, account)
+
+  if (account.credentialType === 'chatgpt-agent-identity') {
+    const authorization = await resolveAgentIdentityForOperation(store, account, fetchImplementation)
+    return queryChatGptCodexModelsAuthorized(
+      authorization, fetchImplementation, AbortSignal.timeout(15_000)
+    )
+  }
 
   if (account.credentialType !== 'chatgpt-oauth') {
     const credential = store.getCredential(account.credentialId)
@@ -2068,6 +2747,19 @@ export async function testAccountModel(
   const fetchImplementation = accountFetchImplementation(store, outboundTransport, account)
   const signal = AbortSignal.timeout(30_000)
 
+  if (account.credentialType === 'chatgpt-agent-identity') {
+    if (provider.protocol !== 'openai-responses') throw new Error('ChatGPT accounts require an OpenAI Responses provider.')
+    const authorization = await resolveAgentIdentityForOperation(store, account, fetchImplementation, signal)
+    const result = await probeChatGptAccountAuthorized(
+      { ...account, modelPolicy: 'selected', modelAllowlist: [model] },
+      authorization,
+      fetchImplementation,
+      signal
+    )
+    if (!result.ok) throw new AccountProbeError(result.failure)
+    return { ok: true, model, latencyMs: result.latencyMs, statusCode: result.statusCode }
+  }
+
   if (account.credentialType === 'chatgpt-oauth') {
     if (provider.protocol !== 'openai-responses') {
       throw new Error('ChatGPT accounts require an OpenAI Responses provider.')
@@ -2109,8 +2801,17 @@ async function refreshAccountCodexQuota(
 ) {
   const account = store.getRuntimeAccount(accountId)
   if (!account) throw new Error('Account not found.')
+  if (account.credentialType === 'chatgpt-agent-identity') {
+    const fetchImplementation = accountFetchImplementation(store, outboundTransport, account)
+    const authorization = await resolveAgentIdentityForOperation(store, account, fetchImplementation)
+    return (await queryChatGptCodexQuotaAuthorized(
+      authorization,
+      fetchImplementation,
+      AbortSignal.timeout(30_000)
+    )).quota
+  }
   if (account.credentialType !== 'chatgpt-oauth') {
-    throw new Error('Codex usage is only available for ChatGPT OAuth accounts.')
+    throw new Error('Codex usage is only available for ChatGPT accounts.')
   }
   const serialized = store.getCredential(account.credentialId)
   if (!serialized) throw new Error('This ChatGPT account has no readable credential.')
@@ -2184,10 +2885,15 @@ function healthEventForTransition(
 function quotaExhausted(account: AppSnapshot['accounts'][number] | undefined): boolean {
   if (!account) return false
   const now = Date.now()
+  if (account.quotaRemaining !== undefined && account.quotaRemaining <= 0) return true
   if (codexQuotaIsExhausted(account.codexQuota, now)) return true
   if (!account.quota) return false
   return [account.quota.requests, account.quota.tokens, account.quota.inputTokens, account.quota.outputTokens]
     .some((window) => window?.remaining === 0 && (window.resetAt === undefined || window.resetAt > now))
+}
+
+function accountCheckIsQuotaDeferred(account: AppSnapshot['accounts'][number]): boolean {
+  return account.cooldownReason === 'quota' || quotaExhausted(account)
 }
 
 function toBackupSummary(info: { id: string; createdAt: number; sizeBytes: number; valid: boolean; kind: string }) {
@@ -2206,6 +2912,12 @@ function backupIdFromPath(path: string): string {
   const expectedPath = join(app.getPath('userData'), 'backups', id)
   if (path !== id && path !== expectedPath) throw new Error('Backup path is outside Stone+ backup storage.')
   return id
+}
+
+function assertPortableBackupPassword(password: string): void {
+  if (typeof password !== 'string' || password.length < 8 || password.length > 1_024) {
+    throw new Error('Portable backup password must contain between 8 and 1024 characters.')
+  }
 }
 
 function emptyFileImportResult(
@@ -2250,6 +2962,10 @@ async function mapConcurrent<T, R>(
   }
   await Promise.all(Array.from({ length: Math.min(Math.max(1, concurrency), values.length) }, () => worker()))
   return results
+}
+
+function taskProgressCount(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? Math.floor(value) : 0
 }
 
 function importErrorMessage(error: unknown): string {

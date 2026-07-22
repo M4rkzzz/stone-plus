@@ -4,6 +4,7 @@ import type {
   ApiSourceProbeStage,
   ProviderKind
 } from '@shared/types'
+import { buildModelCatalog, inferUpstreamCapabilities } from '@shared/source-capabilities'
 import {
   AccountModelProbeError,
   getProviderAdapter,
@@ -42,6 +43,11 @@ export async function probeApiSource(
   const startedAt = now()
   const stages: ApiSourceProbeStage[] = []
   const warnings: string[] = []
+  let capabilityProfile = inferUpstreamCapabilities({
+    protocol: input.protocol,
+    sourceType: input.sourceType,
+    responsesCompactMode: input.responsesCompactMode,
+  })
   const credential = resolveCredential(input.credential, dependencies.storedCredential)
   const secrets = [credential, input.credential, dependencies.storedCredential]
 
@@ -49,24 +55,33 @@ export async function probeApiSource(
     stages.push(skippedStage('network', '尚未发起网络请求。'))
     stages.push(errorStage('authentication', '请输入 API Key；编辑已有来源时可留空以保留原 Key。'))
     appendSkippedStages(stages, ['models', 'generation'], '缺少可用凭据，未继续检测。')
-    return failedResult(stages, [], warnings, '缺少可用凭据。', now, startedAt)
+    return failedResult(stages, [], warnings, '缺少可用凭据。', now, startedAt, capabilityProfile)
   }
 
   const baseUrlError = validateBaseUrl(input.baseUrl)
   if (baseUrlError) {
     stages.push(errorStage('network', baseUrlError))
     appendSkippedStages(stages, ['authentication', 'models', 'generation'], '来源地址无效，未继续检测。')
-    return failedResult(stages, [], warnings, baseUrlError, now, startedAt)
+    return failedResult(stages, [], warnings, baseUrlError, now, startedAt, capabilityProfile)
   }
 
   const adapter = (dependencies.getAdapter ?? getProviderAdapter)(input.kind)
-  if (!adapter.capabilities.protocols[input.protocol]) {
+  const protocolCapabilities = adapter.capabilities.protocols[input.protocol]
+  capabilityProfile = inferUpstreamCapabilities({
+    protocol: input.protocol,
+    sourceType: input.sourceType,
+    responsesCompactMode: input.responsesCompactMode,
+    modelDiscovery: adapter.capabilities.modelDiscovery,
+    streaming: protocolCapabilities?.streaming,
+    toolCalls: protocolCapabilities?.toolCalls,
+  })
+  if (!protocolCapabilities) {
     const message = '所选供应商类型不支持当前协议。'
     stages.push(skippedStage('network', '协议配置无效，尚未发起网络请求。'))
     stages.push(skippedStage('authentication', '协议配置无效，未检测认证。'))
     stages.push(errorStage('models', message))
     stages.push(skippedStage('generation', '协议配置无效，未发起生成请求。'))
-    return failedResult(stages, [], warnings, message, now, startedAt)
+    return failedResult(stages, [], warnings, message, now, startedAt, capabilityProfile)
   }
 
   const fetchImplementation = dependencies.fetchImplementation ?? fetch
@@ -96,7 +111,7 @@ export async function probeApiSource(
         const message = safeFailureMessage(healthFailure, secrets, '无法连接上游服务。')
         stages.push(errorStage('network', message, health.latencyMs))
         appendSkippedStages(stages, ['authentication', 'models', 'generation'], '网络连接失败，未继续检测。')
-        return failedResult(stages, [], warnings, message, now, startedAt)
+        return failedResult(stages, [], warnings, message, now, startedAt, capabilityProfile)
       }
 
       stages.push(successStage('network', '上游端点已返回 HTTP 响应。', health.latencyMs))
@@ -104,7 +119,7 @@ export async function probeApiSource(
         const message = safeFailureMessage(healthFailure, secrets, '上游拒绝了 API Key。')
         stages.push(errorStage('authentication', message, health.latencyMs))
         appendSkippedStages(stages, ['models', 'generation'], '认证未通过，未继续检测。')
-        return failedResult(stages, [], warnings, message, now, startedAt)
+        return failedResult(stages, [], warnings, message, now, startedAt, capabilityProfile)
       }
 
       const message = safeFailureMessage(healthFailure, secrets, '上游基础检测未通过。')
@@ -116,7 +131,7 @@ export async function probeApiSource(
     const message = '来源基础检测未能完成。'
     stages.push(errorStage('network', message))
     appendSkippedStages(stages, ['authentication', 'models', 'generation'], '基础检测失败，未继续检测。')
-    return failedResult(stages, [], warnings, message, now, startedAt)
+    return failedResult(stages, [], warnings, message, now, startedAt, capabilityProfile)
   }
 
   let models: string[] = []
@@ -144,7 +159,7 @@ export async function probeApiSource(
           replaceStage(stages, 'authentication', errorStage('authentication', message, discovery.latencyMs))
           stages.push(errorStage('models', message, discovery.latencyMs))
           stages.push(skippedStage('generation', '模型发现时认证失败，未发起生成请求。'))
-          return failedResult(stages, models, warnings, message, now, startedAt)
+          return failedResult(stages, models, warnings, message, now, startedAt, capabilityProfile)
         }
         stages.push(warningStage('models', message, discovery.latencyMs))
         warnings.push(message)
@@ -160,7 +175,7 @@ export async function probeApiSource(
   if (!model) {
     const message = '未提供测试模型，且无法从上游发现可用模型。'
     stages.push(errorStage('generation', message))
-    return failedResult(stages, models, warnings, message, now, startedAt)
+    return failedResult(stages, models, warnings, message, now, startedAt, capabilityProfile)
   }
 
   try {
@@ -182,12 +197,15 @@ export async function probeApiSource(
         successStage('authentication', '真实生成请求已确认 API Key 可用。', generation.latencyMs)
       )
     }
+    capabilityProfile = { ...capabilityProfile, origin: 'probed', checkedAt: now() }
     return {
       ok: true,
       stages,
       models,
       latencyMs: elapsed(now, startedAt),
-      warnings: unique(warnings)
+      warnings: unique(warnings),
+      capabilityProfile,
+      modelCatalog: buildModelCatalog(models, capabilityProfile, capabilityProfile.checkedAt),
     }
   } catch (error) {
     const failure = error instanceof AccountModelProbeError ? error.failure : undefined
@@ -198,7 +216,7 @@ export async function probeApiSource(
       replaceStage(stages, 'authentication', errorStage('authentication', message))
     }
     stages.push(errorStage('generation', message))
-    return failedResult(stages, models, warnings, message, now, startedAt)
+    return failedResult(stages, models, warnings, message, now, startedAt, capabilityProfile)
   }
 }
 
@@ -361,15 +379,19 @@ function failedResult(
   warnings: string[],
   error: string,
   now: () => number,
-  startedAt: number
+  startedAt: number,
+  capabilityProfile: ApiSourceProbeResult['capabilityProfile'],
 ): ApiSourceProbeResult {
+  const checkedProfile = { ...capabilityProfile, checkedAt: now() }
   return {
     ok: false,
     stages,
     models,
     latencyMs: elapsed(now, startedAt),
     error,
-    warnings: unique(warnings)
+    warnings: unique(warnings),
+    capabilityProfile: checkedProfile,
+    modelCatalog: buildModelCatalog(models, checkedProfile, checkedProfile.checkedAt),
   }
 }
 

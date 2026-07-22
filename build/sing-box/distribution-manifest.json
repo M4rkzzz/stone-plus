@@ -1,0 +1,66 @@
+{
+  "schemaVersion": 1,
+  "component": "sing-box",
+  "version": "1.13.14",
+  "upstream": {
+    "repository": "https://github.com/SagerNet/sing-box",
+    "release": "https://github.com/SagerNet/sing-box/releases/tag/v1.13.14",
+    "tag": "v1.13.14",
+    "commit": "25a600db24f7680ad9806ce5427bd0ab8afe1114",
+    "license": "GPL-3.0-or-later",
+    "cronetGoCommit": "98d539ce67568fb911654e66a14cf4247ed833ec",
+    "naiveProxyCommit": "888e114241c89b05fac4e4ee01482d7bd89ca15a"
+  },
+  "targets": {
+    "win-x64": {
+      "platform": "win32",
+      "arch": "x64",
+      "archive": {
+        "name": "sing-box-1.13.14-windows-amd64.zip",
+        "url": "https://github.com/SagerNet/sing-box/releases/download/v1.13.14/sing-box-1.13.14-windows-amd64.zip",
+        "size": 20961591,
+        "sha256": "f580782c6dd10f7691c66cea1d7c421813c5fbf7e305d1ee7ce0c3a40d196341"
+      }
+    },
+    "linux-x64": {
+      "platform": "linux",
+      "arch": "x64",
+      "archive": {
+        "name": "sing-box-1.13.14-linux-amd64.tar.gz",
+        "url": "https://github.com/SagerNet/sing-box/releases/download/v1.13.14/sing-box-1.13.14-linux-amd64.tar.gz",
+        "size": 23832905,
+        "sha256": "f48703461a15476951ac4967cdad339d986f4b8096b4eb3ff0829a500502d697"
+      }
+    },
+    "linux-arm64": {
+      "platform": "linux",
+      "arch": "arm64",
+      "archive": {
+        "name": "sing-box-1.13.14-linux-arm64.tar.gz",
+        "url": "https://github.com/SagerNet/sing-box/releases/download/v1.13.14/sing-box-1.13.14-linux-arm64.tar.gz",
+        "size": 22028804,
+        "sha256": "4742df6a4314e8ecc41736849fca6d73b8f9e91b6e8b06ee794ff17ba180579e"
+      }
+    },
+    "mac-x64": {
+      "platform": "darwin",
+      "arch": "x64",
+      "archive": {
+        "name": "sing-box-1.13.14-darwin-amd64.tar.gz",
+        "url": "https://github.com/SagerNet/sing-box/releases/download/v1.13.14/sing-box-1.13.14-darwin-amd64.tar.gz",
+        "size": 20308662,
+        "sha256": "5245d645e847f90bb708da74bc020ae078c28489690756419685c04f56b4e3bb"
+      }
+    },
+    "mac-arm64": {
+      "platform": "darwin",
+      "arch": "arm64",
+      "archive": {
+        "name": "sing-box-1.13.14-darwin-arm64.tar.gz",
+        "url": "https://github.com/SagerNet/sing-box/releases/download/v1.13.14/sing-box-1.13.14-darwin-arm64.tar.gz",
+        "size": 18646813,
+        "sha256": "73e8967b0fc08e17bce4263ca56ebc394822401a16497a1c4e02316c888202ab"
+      }
+    }
+  }
+}

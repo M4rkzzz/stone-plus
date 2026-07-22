@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { RequestLog } from '../../src/shared/types'
+import type { Account, RequestLog } from '../../src/shared/types'
 
 vi.mock('electron', () => ({
   safeStorage: {
@@ -14,7 +14,7 @@ vi.mock('electron', () => ({
   }
 }))
 
-import { AppStore } from '../../src/main/store/app-store'
+import { AppStore, summarizeAppObservability } from '../../src/main/store/app-store'
 import {
   LEGACY_JSON_FILENAME,
   SQLITE_DATABASE_FILENAME,
@@ -300,6 +300,63 @@ describe('AppStore', () => {
     })).rejects.toThrow(/loopback/)
   })
 
+  it('persists validated relay Responses compact capabilities and rejects invalid save-provider input', async () => {
+    const store = createStore()
+    await store.initialize()
+    const input = {
+      name: 'Compact-aware relay',
+      sourceType: 'relay' as const,
+      kind: 'openai-compatible' as const,
+      baseUrl: 'https://relay.example.test/v1',
+      protocol: 'openai-responses' as const,
+      models: [],
+      responsesCompactMode: 'passthrough'
+    } as Parameters<AppStore['saveProvider']>[0]
+    const saved = await store.saveProvider(input)
+    const providerId = saved.providers.find((provider) => provider.name === input.name)!.id
+    expect(store.getRuntimeProvider(providerId)).toMatchObject({ responsesCompactMode: 'passthrough' })
+
+    // An older renderer omits the new optional field when editing unrelated
+    // provider settings. Preserve the existing explicit capability.
+    await store.saveProvider({ ...input, id: providerId, name: 'Renamed relay', responsesCompactMode: undefined })
+    expect(store.getRuntimeProvider(providerId)).toMatchObject({ responsesCompactMode: 'passthrough' })
+
+    await expect(store.saveProvider({
+      ...input,
+      name: 'Invalid mode relay',
+      responsesCompactMode: 'future-mode'
+    } as Parameters<AppStore['saveProvider']>[0])).rejects.toThrow(/must be legacy, passthrough, or native/)
+    await expect(store.saveProvider({
+      ...input,
+      name: 'Invalid official override',
+      sourceType: 'official-api',
+      kind: 'openai',
+      baseUrl: 'https://api.openai.com/v1',
+      responsesCompactMode: 'native'
+    } as Parameters<AppStore['saveProvider']>[0])).rejects.toThrow(/only for OpenAI Responses relay/)
+
+    await store.close()
+    const restarted = createStore()
+    await restarted.initialize()
+    expect(restarted.getRuntimeProvider(providerId)).toMatchObject({ responsesCompactMode: 'passthrough' })
+  })
+
+  it('strips unknown or inapplicable compact capabilities while importing legacy provider JSON', async () => {
+    const legacy = legacyJsonState() as ReturnType<typeof legacyJsonState> & {
+      providers: Array<Record<string, unknown>>
+    }
+    Object.assign(legacy.providers[0], {
+      sourceType: 'relay',
+      protocol: 'openai-responses',
+      responsesCompactMode: 'future-mode'
+    })
+    await writeFile(join(directory, LEGACY_JSON_FILENAME), `${JSON.stringify(legacy)}\n`, 'utf8')
+
+    const store = createStore()
+    await store.initialize()
+    expect(store.getRuntimeProvider('legacy-provider')).not.toHaveProperty('responsesCompactMode')
+  })
+
   it('defaults legacy outbound networking to direct and persists system proxy mode', async () => {
     const store = createStore()
     await store.initialize()
@@ -507,6 +564,37 @@ describe('AppStore', () => {
     })
   })
 
+  it('commits an account probe result only while its owner guard is current', async () => {
+    const store = createStore()
+    await store.initialize()
+    const created = await store.saveAccount({
+      providerId: 'provider-openai',
+      name: 'Guarded probe',
+      credential: 'sk-guarded-probe',
+      priority: 1,
+      weight: 1,
+      maxConcurrency: 1,
+      modelAllowlist: [],
+    })
+    const accountId = created.accounts[0].id
+
+    const stale = await store.setAccountCheckResultIf(
+      accountId,
+      { status: 'disabled', lastError: 'stale result' },
+      () => false,
+    )
+    expect(stale.applied).toBe(false)
+    expect(store.getRuntimeAccount(accountId)).not.toMatchObject({ lastError: 'stale result' })
+
+    const current = await store.setAccountCheckResultIf(
+      accountId,
+      { status: 'active', lastError: undefined },
+      () => true,
+    )
+    expect(current.applied).toBe(true)
+    expect(store.getRuntimeAccount(accountId)).toMatchObject({ status: 'active' })
+  })
+
   it('allows disabled client routes to remain unassigned during setup', async () => {
     const store = createStore()
     await store.initialize()
@@ -517,6 +605,27 @@ describe('AppStore', () => {
       enabled: false,
       poolId: ''
     })
+  })
+
+  it('defaults legacy routes to standard mode and persists high-concurrency mode', async () => {
+    await writeFile(join(directory, LEGACY_JSON_FILENAME), `${JSON.stringify(legacyJsonState())}\n`, 'utf8')
+    const store = createStore()
+    await store.initialize()
+    const route = store.getSnapshot().routes.find((candidate) => candidate.client === 'codex')!
+    expect(route.highConcurrencyMode).toBe(false)
+
+    const updated = await store.updateRoute({ ...route, highConcurrencyMode: true })
+    expect(updated.routes.find((candidate) => candidate.id === route.id)?.highConcurrencyMode).toBe(true)
+
+    const legacyCallerRoute = { ...updated.routes.find((candidate) => candidate.id === route.id)! }
+    delete legacyCallerRoute.highConcurrencyMode
+    const legacyUpdated = await store.updateRoute(legacyCallerRoute)
+    expect(legacyUpdated.routes.find((candidate) => candidate.id === route.id)?.highConcurrencyMode).toBe(true)
+
+    await store.close()
+    const restarted = createStore()
+    await restarted.initialize()
+    expect(restarted.getSnapshot().routes.find((candidate) => candidate.id === route.id)?.highConcurrencyMode).toBe(true)
   })
 
   it('keeps every coding client route on its native inbound protocol', async () => {
@@ -650,6 +759,57 @@ describe('AppStore', () => {
       protocol: 'gemini', models: [], credential: 'secret', priority: 1, weight: 1, maxConcurrency: 1
     })).rejects.toThrow(/does not support/)
     expect(store.getSnapshot().providers).toHaveLength(before.providers.length + 1)
+  })
+
+  it('persists probed capabilities only while the source connection and probe revision still match', async () => {
+    const store = createStore()
+    await store.initialize()
+    const input = {
+      name: 'Fingerprint relay',
+      sourceType: 'relay' as const,
+      kind: 'openai-compatible' as const,
+      baseUrl: 'https://relay-a.example/v1',
+      protocol: 'openai-chat' as const,
+      models: ['model-a'],
+      credential: 'relay-a-secret',
+      priority: 10,
+      weight: 10,
+      maxConcurrency: 4,
+    }
+    const saved = await store.saveApiSource(input)
+    const probeInput = { ...input, id: saved.source.sourceId, model: 'model-a' }
+    const fingerprint = store.getApiSourceProbeConnectionFingerprint(probeInput)
+    const probeResult = {
+      capabilityProfile: { version: 1 as const, origin: 'probed' as const, streaming: true },
+      modelCatalog: [],
+      models: ['model-a'],
+    }
+
+    await expect(store.saveApiSourceCapabilityProbe(saved.source.sourceId, probeResult, fingerprint))
+      .resolves.toBeDefined()
+
+    await expect(store.saveApiSourceCapabilityProbe(saved.source.sourceId, {
+      ...probeResult,
+      models: ['stale-model'],
+    }, fingerprint)).resolves.toBeUndefined()
+    expect(store.getRuntimeProvider(saved.source.sourceId)).toMatchObject({
+      models: ['model-a'],
+      capabilityProfile: expect.objectContaining({ origin: 'probed' }),
+    })
+
+    await store.saveApiSource({
+      ...input,
+      id: saved.source.sourceId,
+      baseUrl: 'https://relay-b.example/v1',
+      credential: 'relay-b-secret',
+      models: ['model-b'],
+    })
+    await expect(store.saveApiSourceCapabilityProbe(saved.source.sourceId, probeResult, fingerprint))
+      .resolves.toBeUndefined()
+    const provider = store.getRuntimeProvider(saved.source.sourceId)!
+    expect(provider.baseUrl).toBe('https://relay-b.example/v1')
+    expect(provider.models).toEqual(['model-b'])
+    expect(provider.capabilityProfile?.origin).not.toBe('probed')
   })
 
   it('routes directly through an API source using a runtime-only virtual pool', async () => {
@@ -860,6 +1020,51 @@ describe('AppStore', () => {
     expect(restarted.poolId).toBeUndefined()
     expect(restarted.proxyId).toBeUndefined()
     expect(restarted.model).toBeUndefined()
+  })
+
+  it('restores an existing route and removes wizard-created resources when setup is discarded', async () => {
+    const store = createStore()
+    await store.initialize()
+    const oldAccountSnapshot = await store.saveAccount({
+      providerId: 'provider-openai', name: 'Old route account', credential: 'sk-old-route',
+      priority: 1, weight: 1, maxConcurrency: 1, modelAllowlist: [],
+    })
+    const oldAccount = oldAccountSnapshot.accounts.find((account) => account.name === 'Old route account')!
+    const oldPoolSnapshot = await store.savePool({
+      name: 'Existing pool', protocol: 'openai-responses', strategy: 'priority', accountIds: [oldAccount.id],
+      stickySessions: false, stickyTtlMinutes: 30, maxRetries: 0,
+    })
+    const oldPool = oldPoolSnapshot.pools.find((pool) => pool.name === 'Existing pool')!
+    const originalRoute = oldPoolSnapshot.routes.find((route) => route.client === 'codex')!
+    const routed = await store.updateRoute({
+      ...originalRoute, enabled: true, highConcurrencyMode: true, poolId: oldPool.id,
+      modelMap: { original: 'original-upstream' }, localToken: 'stable-route-token',
+    })
+    const before = routed.routes.find((route) => route.client === 'codex')!
+
+    const newAccountSnapshot = await store.saveAccount({
+      providerId: 'provider-openai', name: 'Wizard route account', credential: 'sk-wizard-route',
+      priority: 1, weight: 1, maxConcurrency: 1, modelAllowlist: [],
+    })
+    const newAccount = newAccountSnapshot.accounts.find((account) => account.name === 'Wizard route account')!
+    const wizard = await store.saveSetupWizardProgress({ step: 'routing' })
+    const applied = await store.applySetupRouting({
+      sessionId: wizard.sessionId, sourceId: newAccount.id, client: 'codex', model: 'wizard-model',
+    })
+    expect(applied.routeId).toBe(before.id)
+    expect(applied.poolId).not.toBe(oldPool.id)
+
+    await store.discardSetupWizard()
+    const after = store.getSnapshot()
+    expect(after.routes.find((route) => route.id === before.id)).toMatchObject({
+      enabled: before.enabled,
+      poolId: before.poolId,
+      inboundProtocol: before.inboundProtocol,
+      highConcurrencyMode: true,
+      modelMap: before.modelMap,
+      localToken: 'stable-route-token',
+    })
+    expect(after.pools.some((pool) => pool.id === applied.poolId)).toBe(false)
   })
 
   it('overwrites or clears the selected tag on every OAuth reimport', async () => {
@@ -1266,7 +1471,7 @@ describe('AppStore', () => {
       }),
       proxyMode: 'proxy',
       proxyId
-    })).rejects.toThrow('出口代理已被删除')
+    })).rejects.toThrow('代理已被删除')
 
     expect(store.getSnapshot().accounts).toEqual(before)
     expect(JSON.stringify(store.getSnapshot())).not.toContain('not-saved-private-token')
@@ -1508,6 +1713,20 @@ describe('AppStore', () => {
 
       now += 1_001
       expect(store.getSnapshot().observability.last24Hours.requestCount).toBe(1)
+      const internals = store as unknown as { observabilityCache?: object }
+      const stableCache = internals.observabilityCache
+      await store.appendLog({
+        ...requestLog(2, 'live-does-not-invalidate-observability'),
+        timestamp: now,
+        status: 'streaming'
+      })
+      now += 5_000
+      store.getSnapshot()
+      expect(internals.observabilityCache).toBe(stableCache)
+
+      now += 55_001
+      store.getSnapshot()
+      expect(internals.observabilityCache).not.toBe(stableCache)
       await store.close()
     } finally {
       nowSpy.mockRestore()
@@ -2067,6 +2286,228 @@ describe('AppStore', () => {
     expect(snapshot.observability.tokenCosts.allTime.totalCostUsd).toBeCloseTo(3.1062, 10)
   })
 
+  it('keeps all-time token costs across log clearing, continues accumulating, and survives restart', async () => {
+    let now = new Date(2026, 6, 23, 12, 0, 0).getTime()
+    const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => now)
+    try {
+      const store = createStore()
+      await store.initialize()
+      await store.appendLog({
+        ...requestLog(1, 'lifetime-before-clear'),
+        timestamp: now,
+        model: 'gpt-5.6-sol',
+        inputTokens: 1_000,
+        cachedInputTokens: 400,
+        outputTokens: 100
+      })
+
+      now += 1_001
+      const beforeClear = store.getSnapshot().observability.tokenCosts
+      expect(beforeClear.today.totalTokens).toBe(1_100)
+      expect(beforeClear.allTime).toMatchObject({
+        totalTokens: 1_100,
+        inputTokens: 1_000,
+        outputTokens: 100,
+        standardInputTokens: 600,
+        cachedInputTokens: 400,
+        pricedRequestCount: 1
+      })
+
+      await store.clearLogs()
+      now += 1_001
+      const afterClear = store.getSnapshot().observability.tokenCosts
+      expect(afterClear.allTime).toEqual(beforeClear.allTime)
+      // "Today" deliberately remains a view of the currently retained logs;
+      // clearing request history only preserves the separate lifetime ledger.
+      expect(afterClear.today.totalTokens).toBe(0)
+
+      await store.appendLog({
+        ...requestLog(2, 'lifetime-after-clear'),
+        timestamp: now,
+        model: 'gpt-5.6-sol',
+        inputTokens: 200,
+        cachedInputTokens: 50,
+        outputTokens: 20
+      })
+      now += 1_001
+      const afterAppend = store.getSnapshot().observability.tokenCosts
+      expect(afterAppend.today).toMatchObject({
+        totalTokens: 220,
+        inputTokens: 200,
+        outputTokens: 20,
+        standardInputTokens: 150,
+        cachedInputTokens: 50,
+        pricedRequestCount: 1
+      })
+      expect(afterAppend.allTime).toMatchObject({
+        totalTokens: 1_320,
+        inputTokens: 1_200,
+        outputTokens: 120,
+        standardInputTokens: 750,
+        cachedInputTokens: 450,
+        pricedRequestCount: 2
+      })
+      expect(afterAppend.allTime.totalCostUsd).toBeGreaterThan(beforeClear.allTime.totalCostUsd)
+
+      await store.close()
+      const restarted = createStore()
+      await restarted.initialize()
+      const afterRestart = restarted.getSnapshot().observability.tokenCosts
+      expect(afterRestart.allTime).toEqual(afterAppend.allTime)
+      expect(afterRestart.today).toEqual(afterAppend.today)
+    } finally {
+      nowSpy.mockRestore()
+    }
+  })
+
+  it('seeds the lifetime ledger from retained logs when upgrading a database without ledger metadata', async () => {
+    const store = createStore()
+    await store.initialize()
+    await store.appendLog({
+      ...requestLog(1, 'pre-ledger-token-log'),
+      model: 'gpt-5.6-sol',
+      inputTokens: 1_000,
+      cachedInputTokens: 400,
+      outputTokens: 100
+    })
+    await store.close()
+
+    const database = new DatabaseSync(join(directory, SQLITE_DATABASE_FILENAME))
+    database.prepare("DELETE FROM app_metadata WHERE key = 'lifetime_token_costs_v1'").run()
+    database.close()
+
+    const upgraded = createStore()
+    await upgraded.initialize()
+    expect(upgraded.getSnapshot().observability.tokenCosts.allTime).toMatchObject({
+      totalTokens: 1_100,
+      inputTokens: 1_000,
+      outputTokens: 100,
+      standardInputTokens: 600,
+      cachedInputTokens: 400,
+      pricedRequestCount: 1
+    })
+  })
+
+  it('does not silently replace a corrupted lifetime ledger with only the retained log fragment', async () => {
+    const store = createStore()
+    await store.initialize()
+    await store.appendLog({
+      ...requestLog(1, 'corrupt-ledger-token-log'),
+      model: 'gpt-5.6-sol',
+      inputTokens: 100,
+      outputTokens: 10
+    })
+    await store.close()
+
+    const database = new DatabaseSync(join(directory, SQLITE_DATABASE_FILENAME))
+    database.prepare(`
+      UPDATE app_metadata SET value = '{}' WHERE key = 'lifetime_token_costs_v1'
+    `).run()
+    database.close()
+
+    const corrupted = createStore()
+    await expect(corrupted.initialize()).rejects.toThrow(/lifetime token ledger metadata is invalid/i)
+  })
+
+  it('replaces a same-id streaming checkpoint with its terminal token contribution', async () => {
+    const now = Date.now()
+    const store = createStore()
+    await store.initialize()
+    await store.appendLog({
+      ...requestLog(1, 'lifetime-lifecycle'),
+      timestamp: now,
+      status: 'streaming',
+      statusCode: undefined,
+      model: 'gpt-5.6-sol',
+      inputTokens: 10,
+      cachedInputTokens: 4,
+      outputTokens: 2
+    })
+    await expect(store.checkpointLiveRequestLogs()).resolves.toBe(1)
+    await store.appendLog({
+      ...requestLog(2, 'lifetime-lifecycle'),
+      timestamp: now,
+      model: 'gpt-5.6-sol',
+      inputTokens: 100,
+      cachedInputTokens: 40,
+      outputTokens: 20
+    })
+
+    const costs = store.getSnapshot().observability.tokenCosts
+    expect(costs.today).toMatchObject({
+      totalTokens: 120,
+      inputTokens: 100,
+      outputTokens: 20,
+      standardInputTokens: 60,
+      cachedInputTokens: 40,
+      pricedRequestCount: 1
+    })
+    expect(costs.allTime).toMatchObject({
+      totalTokens: 120,
+      inputTokens: 100,
+      outputTokens: 20,
+      standardInputTokens: 60,
+      cachedInputTokens: 40,
+      pricedRequestCount: 1
+    })
+  })
+
+  it('counts the terminal delta of an active request after history is cleared without resurrecting its row', async () => {
+    let now = Date.now()
+    const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => now)
+    try {
+      const store = createStore()
+      await store.initialize()
+      await store.appendLog({
+        ...requestLog(1, 'cleared-lifetime-lifecycle'),
+        timestamp: now,
+        status: 'streaming',
+        statusCode: undefined,
+        model: 'gpt-5.6-sol',
+        inputTokens: 10,
+        cachedInputTokens: 4,
+        outputTokens: 2
+      })
+      // Start clearing while a checkpoint is still queued. The clear operation
+      // must capture that just-committed baseline before deleting the row.
+      const checkpoint = store.checkpointLiveRequestLogs()
+      const clearing = store.clearLogs()
+      await expect(checkpoint).resolves.toBe(1)
+      await clearing
+      now += 1_001
+      expect(store.getSnapshot().observability.tokenCosts.allTime.totalTokens).toBe(12)
+      const terminal = {
+        ...requestLog(2, 'cleared-lifetime-lifecycle'),
+        timestamp: now,
+        model: 'gpt-5.6-sol',
+        inputTokens: 100,
+        cachedInputTokens: 40,
+        outputTokens: 20
+      }
+      await expect(store.appendLog(terminal)).resolves.toBeUndefined()
+      expect(store.getSnapshot().requestLogs).toEqual([])
+      expect(store.getSnapshot().observability.tokenCosts).toMatchObject({
+        today: { totalTokens: 0 },
+        allTime: {
+          totalTokens: 120,
+          inputTokens: 100,
+          outputTokens: 20,
+          standardInputTokens: 60,
+          cachedInputTokens: 40,
+          pricedRequestCount: 1
+        }
+      })
+
+      // A duplicated terminal callback is harmless even though the visible row
+      // no longer exists to provide normal upsert idempotency.
+      await expect(store.appendLog(terminal)).resolves.toBeUndefined()
+      now += 1_001
+      expect(store.getSnapshot().observability.tokenCosts.allTime.totalTokens).toBe(120)
+    } finally {
+      nowSpy.mockRestore()
+    }
+  })
+
   it('upserts a pending request lifecycle in place and persists only its terminal row', async () => {
     const store = createStore()
     await store.initialize()
@@ -2106,6 +2547,269 @@ describe('AppStore', () => {
     expect(JSON.parse(rows[0].payload)).toMatchObject({ status: 'error', failureStage: 'scheduler' })
   })
 
+  it('keeps rapid live progress memory-only with a 20k history until an explicit checkpoint', async () => {
+    const legacy = legacyState()
+    legacy.requestLogs = Array.from({ length: 20_000 }, (_, index) => requestLog(index))
+    await writeFile(join(directory, LEGACY_JSON_FILENAME), JSON.stringify(legacy), 'utf8')
+    const store = createStore()
+    await store.initialize()
+    const repository = store.getStateRepository()
+    const persist = vi.spyOn(repository, 'appendRequestLog')
+
+    await Promise.all(Array.from({ length: 250 }, (_, index) => store.appendLog({
+      ...requestLog(20_001 + index, 'live-on-large-history'),
+      status: 'streaming',
+      latencyMs: index,
+      progressStage: 'streaming'
+    })))
+
+    expect(persist).not.toHaveBeenCalled()
+    expect(repository.select((state) => state.requestLogs.length)).toBe(20_000)
+    expect(store.getSnapshot().requestLogs).toHaveLength(500)
+    expect(store.getSnapshot().requestLogs[0]).toMatchObject({
+      id: 'live-on-large-history', status: 'streaming', latencyMs: 249
+    })
+
+    await expect(store.checkpointLiveRequestLogs()).resolves.toBe(1)
+    expect(persist).toHaveBeenCalledOnce()
+    expect(repository.select((state) => state.requestLogs[0])).toMatchObject({
+      id: 'live-on-large-history', status: 'streaming', latencyMs: 249
+    })
+    await store.appendLog({
+      ...requestLog(20_250, 'live-on-large-history'),
+      status: 'streaming',
+      latencyMs: 250,
+      progressStage: 'streaming'
+    })
+    await expect(store.checkpointLiveRequestLogs()).resolves.toBe(1)
+    expect(persist).toHaveBeenCalledTimes(2)
+    expect(repository.select((state) => state.requestLogs[0])).toMatchObject({
+      id: 'live-on-large-history', status: 'streaming', latencyMs: 250
+    })
+
+    await store.appendLog({
+      ...requestLog(20_300, 'live-on-large-history'),
+      status: 'success',
+      statusCode: 200,
+      latencyMs: 300
+    })
+    expect(store.hasLiveRequestLogs()).toBe(false)
+    expect(repository.select((state) => state.requestLogs[0])).toMatchObject({
+      id: 'live-on-large-history', status: 'success', latencyMs: 300
+    })
+  })
+
+  it('does not mark a newer progress version checkpointed by an older in-flight write', async () => {
+    const store = createStore()
+    await store.initialize()
+    const repository = store.getStateRepository()
+    const original = repository.appendRequestLog.bind(repository)
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    vi.spyOn(repository, 'appendRequestLog').mockImplementationOnce(async (log, maxRows) => {
+      await gate
+      return original(log, maxRows)
+    })
+    await store.appendLog({ ...requestLog(1, 'versioned-checkpoint'), status: 'streaming', latencyMs: 1 })
+    const firstCheckpoint = store.checkpointLiveRequestLogs()
+    await store.appendLog({ ...requestLog(2, 'versioned-checkpoint'), status: 'streaming', latencyMs: 2 })
+    release()
+    await expect(firstCheckpoint).resolves.toBe(1)
+
+    expect(store.hasUncheckpointedLiveRequestLogs()).toBe(true)
+    await expect(store.checkpointLiveRequestLogs()).resolves.toBe(1)
+    expect(repository.select((state) => state.requestLogs[0])).toMatchObject({
+      id: 'versioned-checkpoint', status: 'streaming', latencyMs: 2
+    })
+  })
+
+  it('keeps the last live row until a failed terminal write is retried durably', async () => {
+    const store = createStore()
+    await store.initialize()
+    const repository = store.getStateRepository()
+    vi.spyOn(repository, 'appendRequestLog').mockRejectedValueOnce(new Error('temporary disk failure'))
+    await store.appendLog({ ...requestLog(1, 'terminal-retry'), status: 'streaming', latencyMs: 10 })
+    await expect(store.appendLog({
+      ...requestLog(2, 'terminal-retry'), status: 'success', statusCode: 200, latencyMs: 20
+    })).rejects.toThrow('temporary disk failure')
+    expect(store.getSnapshot().requestLogs[0]).toMatchObject({
+      id: 'terminal-retry', status: 'streaming', latencyMs: 10
+    })
+
+    // The durable terminal retry owns the lifecycle guard, so delayed progress
+    // cannot overwrite the last known live row while SQLite is unavailable.
+    await store.appendLog({ ...requestLog(3, 'terminal-retry'), status: 'streaming', latencyMs: 30 })
+    expect(store.getSnapshot().requestLogs[0]).toMatchObject({ status: 'streaming', latencyMs: 10 })
+    await store.appendLog({
+      ...requestLog(4, 'terminal-retry'), status: 'success', statusCode: 200, latencyMs: 20
+    })
+    expect(store.getSnapshot().requestLogs[0]).toMatchObject({
+      id: 'terminal-retry', status: 'success', latencyMs: 20
+    })
+    await store.appendLog({
+      ...requestLog(5, 'terminal-retry'), status: 'streaming', latencyMs: 40
+    })
+    expect(store.getSnapshot().requestLogs[0]).toMatchObject({
+      id: 'terminal-retry', status: 'success', latencyMs: 20
+    })
+  })
+
+  it('does not resurrect cleared logs from delayed progress, terminal, or title callbacks', async () => {
+    const store = createStore()
+    await store.initialize()
+    const persisted = {
+      ...requestLog(1, 'cleared-persisted'),
+      conversationId: 'conversation-cleared',
+      conversationName: '对话 cleared',
+      status: 'success' as const
+    }
+    await store.appendLog(persisted)
+    await store.appendLog({
+      ...requestLog(2, 'cleared-live'),
+      status: 'streaming',
+      progressStage: 'streaming'
+    })
+
+    await store.clearLogs(['cleared-pending'])
+
+    await expect(store.appendLog({
+      ...persisted,
+      conversationName: 'Resolved title'
+    })).resolves.toBeUndefined()
+    await expect(store.appendLog({
+      ...requestLog(3, 'cleared-live'),
+      status: 'success'
+    })).resolves.toBeUndefined()
+    await expect(store.appendLog({
+      ...requestLog(4, 'cleared-pending'),
+      status: 'success'
+    })).resolves.toBeUndefined()
+    expect(store.getSnapshot().requestLogs).toEqual([])
+  })
+
+  it('restores the active request generation when clearing durable history fails', async () => {
+    const store = createStore()
+    await store.initialize()
+    const repository = store.getStateRepository()
+    await store.appendLog({
+      ...requestLog(1, 'failed-clear-live'),
+      status: 'streaming',
+      model: 'gpt-5.6-sol',
+      inputTokens: 10,
+      outputTokens: 2
+    })
+    let rejectClear!: (error: Error) => void
+    vi.spyOn(repository, 'clearRequestLogs').mockImplementationOnce(() => new Promise((_, reject) => {
+      rejectClear = reject
+    }))
+
+    const clearing = store.clearLogs()
+    const terminal = store.appendLog({
+      ...requestLog(2, 'failed-clear-live'),
+      model: 'gpt-5.6-sol',
+      inputTokens: 100,
+      outputTokens: 20
+    })
+    rejectClear(new Error('temporary clear failure'))
+
+    await expect(clearing).rejects.toThrow('temporary clear failure')
+    await expect(terminal).resolves.toMatchObject({ id: 'failed-clear-live', status: 'success' })
+    expect(store.getSnapshot().requestLogs[0]).toMatchObject({
+      id: 'failed-clear-live', status: 'success'
+    })
+    expect(repository.readLifetimeTokenCosts().totalTokens).toBe(120)
+  })
+
+  it('keeps requests that start while the previous generation is being cleared', async () => {
+    const store = createStore()
+    await store.initialize()
+    const repository = store.getStateRepository()
+    await store.appendLog({
+      ...requestLog(1, 'old-generation-live'),
+      status: 'streaming'
+    })
+
+    const originalClear = repository.clearRequestLogs.bind(repository)
+    let releaseClear!: () => void
+    const clearGate = new Promise<void>((resolve) => { releaseClear = resolve })
+    vi.spyOn(repository, 'clearRequestLogs').mockImplementationOnce(async (trackedIds) => {
+      await clearGate
+      return originalClear(trackedIds)
+    })
+
+    const clearing = store.clearLogs()
+    await store.appendLog({
+      ...requestLog(2, 'new-generation-live'),
+      status: 'streaming'
+    })
+    releaseClear()
+    await clearing
+
+    expect(store.getSnapshot().requestLogs).toEqual([
+      expect.objectContaining({ id: 'new-generation-live', status: 'streaming' })
+    ])
+    await expect(store.appendLog({
+      ...requestLog(3, 'old-generation-live'),
+      status: 'success'
+    })).resolves.toBeUndefined()
+    expect(store.getSnapshot().requestLogs.map((log) => log.id)).toEqual(['new-generation-live'])
+  })
+
+  it('does not checkpoint or resurrect a cleared live generation when shutdown races the clear', async () => {
+    const store = createStore()
+    await store.initialize()
+    const repository = store.getStateRepository()
+    await store.appendLog({
+      ...requestLog(1, 'clear-shutdown-live'),
+      status: 'streaming',
+      model: 'gpt-5.6-sol',
+      inputTokens: 10,
+      outputTokens: 2
+    })
+    await expect(store.checkpointLiveRequestLogs()).resolves.toBe(1)
+    expect(repository.readLifetimeTokenCosts().totalTokens).toBe(12)
+
+    const originalClear = repository.clearRequestLogs.bind(repository)
+    let releaseClear!: () => void
+    const clearGate = new Promise<void>((resolve) => { releaseClear = resolve })
+    vi.spyOn(repository, 'clearRequestLogs').mockImplementationOnce(async (trackedIds) => {
+      await clearGate
+      return originalClear(trackedIds)
+    })
+
+    const clearing = store.clearLogs()
+    const closing = store.close()
+    releaseClear()
+    await clearing
+    await closing
+
+    const restarted = createStore()
+    await restarted.initialize()
+    expect(restarted.getSnapshot().requestLogs).toEqual([])
+    expect(restarted.getStateRepository().readLifetimeTokenCosts().totalTokens).toBe(12)
+  })
+
+  it('checkpoints a failed terminal lifecycle during close so restart can terminate it explicitly', async () => {
+    const store = createStore()
+    await store.initialize()
+    const repository = store.getStateRepository()
+    vi.spyOn(repository, 'appendRequestLog').mockRejectedValueOnce(new Error('temporary shutdown write failure'))
+    await store.appendLog({ ...requestLog(1, 'shutdown-terminal-fallback'), status: 'streaming' })
+    await expect(store.appendLog({
+      ...requestLog(2, 'shutdown-terminal-fallback'), status: 'success', latencyMs: 20
+    })).rejects.toThrow('temporary shutdown write failure')
+
+    await store.close()
+    const restarted = createStore()
+    await restarted.initialize()
+    expect(restarted.getSnapshot().requestLogs).toContainEqual(expect.objectContaining({
+      id: 'shutdown-terminal-fallback',
+      status: 'error',
+      statusCode: 499,
+      error: 'Gateway stopped before the request completed'
+    }))
+  })
+
   it('terminates a stale streaming lifecycle when the app restarts', async () => {
     const store = createStore()
     await store.initialize()
@@ -2133,8 +2837,10 @@ describe('AppStore', () => {
       progressStage: 'streaming'
     })
 
-    expect(await store.finalizeOrphanedStreamingLogs(4_000)).toBe(true)
-    expect(await store.finalizeOrphanedStreamingLogs(5_000)).toBe(false)
+    await expect(store.finalizeOrphanedStreamingLogs(4_000)).resolves.toEqual([
+      expect.objectContaining({ id: 'orphaned-lifecycle', status: 'error', statusCode: 499 })
+    ])
+    await expect(store.finalizeOrphanedStreamingLogs(5_000)).resolves.toEqual([])
     expect(store.getSnapshot().requestLogs).toContainEqual(expect.objectContaining({
       id: 'orphaned-lifecycle',
       timestamp: 4_000,
@@ -2165,6 +2871,152 @@ describe('AppStore', () => {
       'batch-first'
     ])
     await restarted.close()
+  })
+
+  it('deduplicates same-id durable writes in one burst and resolves every waiter at the final state', async () => {
+    const store = createStateStore(legacyState())
+    await store.initialize()
+    await Promise.all(Array.from({ length: 100 }, (_, index) => store.appendRequestLog({
+      ...requestLog(index, 'one-durable-row'),
+      status: index === 99 ? 'success' : 'streaming',
+      latencyMs: index
+    }, 500)))
+
+    expect(store.read().requestLogs.filter((log) => log.id === 'one-durable-row')).toHaveLength(1)
+    expect(store.read().requestLogs.find((log) => log.id === 'one-durable-row')).toMatchObject({
+      status: 'success', latencyMs: 99
+    })
+    const database = new DatabaseSync(join(directory, SQLITE_DATABASE_FILENAME), { readOnly: true })
+    const rows = database.prepare('SELECT payload FROM request_logs WHERE id = ?').all('one-durable-row') as Array<{
+      payload: string
+    }>
+    database.close()
+    expect(rows).toHaveLength(1)
+    expect(JSON.parse(rows[0].payload)).toMatchObject({ status: 'success', latencyMs: 99 })
+  })
+
+  it('keeps the retained request-log array and index incremental across upserts and retention', async () => {
+    const initial = legacyState()
+    initial.requestLogs = [
+      { ...requestLog(3, 'old-third'), error: 'stale error' },
+      requestLog(2, 'old-second'),
+      requestLog(1, 'old-first')
+    ]
+    const store = createStateStore(initial)
+    await store.initialize()
+    const internals = store as unknown as {
+      data: PersistedState
+      requestLogsById: Map<string, RequestLog>
+    }
+    const retainedArray = internals.data.requestLogs
+    const existingRow = retainedArray.find((log) => log.id === 'old-third')
+    expect(existingRow).toBeDefined()
+
+    await store.appendRequestLog({
+      ...requestLog(30, 'old-third'),
+      status: 'success'
+    }, 3)
+    expect(internals.data.requestLogs).toBe(retainedArray)
+    expect(internals.data.requestLogs.find((log) => log.id === 'old-third')).toBe(existingRow)
+    expect(existingRow).not.toHaveProperty('error')
+    expect(internals.requestLogsById.get('old-third')).toBe(existingRow)
+
+    await store.appendRequestLog(requestLog(31, 'newest'), 3)
+    expect(internals.data.requestLogs).toBe(retainedArray)
+    expect(internals.data.requestLogs.map((log) => log.id)).toEqual(['newest', 'old-third', 'old-second'])
+    expect(internals.requestLogsById.has('old-first')).toBe(false)
+    expect(internals.requestLogsById.size).toBe(3)
+  })
+
+  it('does not subtract lifetime tokens when bounded history evicts an old row', async () => {
+    const initial = legacyState()
+    initial.requestLogs = []
+    const store = createStateStore(initial)
+    await store.initialize()
+    for (const [index, inputTokens] of [100, 200, 300].entries()) {
+      await store.appendRequestLog({
+        ...requestLog(index, `retained-token-${index}`),
+        model: 'gpt-5.6-sol',
+        inputTokens,
+        outputTokens: 10
+      }, 2)
+    }
+
+    expect(store.read().requestLogs.map((log) => log.id)).toEqual([
+      'retained-token-2',
+      'retained-token-1'
+    ])
+    expect(store.readLifetimeTokenCosts()).toMatchObject({
+      totalTokens: 630,
+      inputTokens: 600,
+      outputTokens: 30,
+      pricedRequestCount: 3
+    })
+  })
+
+  it('keeps the lifetime ledger consistent when low-level request-log mutations are used', async () => {
+    const initial = legacyState()
+    initial.requestLogs = []
+    const store = createStateStore(initial)
+    await store.initialize()
+    await store.mutate((state) => {
+      state.requestLogs = [{
+        ...requestLog(1, 'mutated-token-log'),
+        model: 'gpt-5.6-sol',
+        inputTokens: 100,
+        outputTokens: 10
+      }]
+    }, ['requestLogs'])
+    expect(store.readLifetimeTokenCosts().totalTokens).toBe(110)
+
+    await store.mutate((state) => {
+      state.requestLogs = [{
+        ...requestLog(2, 'mutated-token-log'),
+        model: 'gpt-5.6-sol',
+        inputTokens: 200,
+        outputTokens: 20
+      }]
+    }, ['requestLogs'])
+    expect(store.readLifetimeTokenCosts().totalTokens).toBe(220)
+
+    await store.mutate((state) => { state.requestLogs = [] }, ['requestLogs'])
+    expect(store.readLifetimeTokenCosts().totalTokens).toBe(220)
+  })
+
+  it('keeps account id lookups current across runtime patches and section mutations', async () => {
+    const store = createStateStore(legacyState())
+    await store.initialize()
+    expect(store.selectAccount<Account>('legacy-account')).toMatchObject({ id: 'legacy-account' })
+
+    await store.updateAccounts<Account>(['legacy-account'], (account) => {
+      account.latencyMs = 321
+    })
+    expect(store.selectAccount<Account>('legacy-account')).toMatchObject({
+      id: 'legacy-account', latencyMs: 321
+    })
+
+    await store.mutate((state) => {
+      state.accounts = []
+    }, ['accounts'])
+    expect(store.selectAccount<Account>('legacy-account')).toBeUndefined()
+  })
+
+  it('derives all observability series with one request-log traversal', () => {
+    const logs = [requestLog(1, 'single-pass')]
+    let iteratorCalls = 0
+    const iterable = new Proxy(logs, {
+      get(target, property, receiver) {
+        if (property === Symbol.iterator) {
+          return function* (): Generator<RequestLog> {
+            iteratorCalls += 1
+            yield* target
+          }
+        }
+        return Reflect.get(target, property, receiver)
+      }
+    })
+    summarizeAppObservability(iterable, Date.now())
+    expect(iteratorCalls).toBe(1)
   })
 
   it('rolls back a failed snapshot transaction and accepts the next queued update', async () => {
@@ -2218,7 +3070,7 @@ describe('AppStore', () => {
     database.close()
   })
 
-  it('migrates schema four through schema six with proxy, quota, and account tag storage', async () => {
+  it('migrates schema four through the current schema with proxy, quota, tags, and persistent tasks', async () => {
     const store = createStore()
     await store.initialize()
     const created = await store.saveAccount({
@@ -2242,7 +3094,7 @@ describe('AppStore', () => {
     await restarted.close()
 
     const database = new DatabaseSync(databasePath)
-    expect(readSchemaVersion(database)).toBe(6)
+    expect(readSchemaVersion(database)).toBe(SQLITE_SCHEMA_VERSION)
     expect(database.prepare('SELECT COUNT(*) AS count FROM schema_migrations WHERE version = 5').get())
       .toEqual({ count: 1 })
     expect(database.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = 'proxies'").get())
@@ -2252,6 +3104,12 @@ describe('AppStore', () => {
     expect(database.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'index' AND name = 'account_codex_quota_samples_observed'").get())
       .toEqual({ count: 1 })
     expect(database.prepare('SELECT COUNT(*) AS count FROM schema_migrations WHERE version = 6').get())
+      .toEqual({ count: 1 })
+    expect(database.prepare('SELECT COUNT(*) AS count FROM schema_migrations WHERE version = 7').get())
+      .toEqual({ count: 1 })
+    expect(database.prepare('SELECT COUNT(*) AS count FROM schema_migrations WHERE version = 8').get())
+      .toEqual({ count: 1 })
+    expect(database.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = 'persistent_tasks'").get())
       .toEqual({ count: 1 })
     expect(database.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = 'account_tags'").get())
       .toEqual({ count: 1 })

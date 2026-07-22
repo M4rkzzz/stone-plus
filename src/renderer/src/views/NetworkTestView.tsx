@@ -18,9 +18,9 @@ import type {
   NetworkDiagnosticStatus,
   NetworkDiagnosticTargetResult
 } from '@shared/types'
-import { listRouteSources } from '@shared/route-sources'
-import { localizeBackendError, localizeBackendMessage } from '../backend-message'
+import { localizeBackendError } from '../backend-message'
 import { useI18n, type UiLanguage } from '../i18n'
+import { buildLocalChecks } from '../network-test-local-checks'
 import { Badge, durationLabel, PageHeader } from '../ui'
 
 const statusTones: Record<NetworkDiagnosticStatus, 'success' | 'warning' | 'danger' | 'neutral'> = {
@@ -51,6 +51,9 @@ export function NetworkTestView({ snapshot, api }: { snapshot: AppSnapshot; api:
 
   const metrics = useMemo(() => reportMetrics(report), [report])
   const localChecks = useMemo(() => buildLocalChecks(snapshot, proxyId, language, t), [language, proxyId, snapshot, t])
+  const defaultRouteLabel = snapshot.gateway.outboundNetworkMode === 'system'
+    ? t('系统代理（全局）', 'System proxy (global)')
+    : t('直连（系统网络）', 'Direct (system network)')
   return <div className="page-stack network-test-page">
     <PageHeader
       title={t('诊断', 'Diagnostics')}
@@ -65,7 +68,7 @@ export function NetworkTestView({ snapshot, api }: { snapshot: AppSnapshot; api:
         <span className="network-test-route__icon"><Route size={19} /></span>
         <div><strong>{t('测试网络出口', 'Network route to test')}</strong><span>{t('使用 Stone+ 实际出站链路，不会发送账号凭据', 'Uses Stone+’s actual outbound route without sending account credentials')}</span></div>
         <select aria-label={t('测试网络出口', 'Network route to test')} value={proxyId} disabled={running} onChange={(event) => setProxyId(event.target.value)}>
-          <option value="">{t('直连（系统网络）', 'Direct (system network)')}</option>
+          <option value="">{defaultRouteLabel}</option>
           {snapshot.proxies.map((proxy) => <option value={proxy.id} key={proxy.id}>{proxy.name} · {proxy.protocol.toUpperCase()}</option>)}
         </select>
       </div>
@@ -165,65 +168,6 @@ function diagnosticRouteName(report: NetworkDiagnosticReport, language: UiLangua
   if (report.route.kind === 'direct') return language === 'zh-CN' ? '直连' : 'Direct'
   if (report.route.kind === 'system') return language === 'zh-CN' ? '跟随系统代理' : 'System proxy'
   return report.route.name
-}
-
-interface LocalDiagnosticCheck {
-  id: string
-  label: string
-  status: NetworkDiagnosticStatus
-  message: string
-}
-
-function buildLocalChecks(snapshot: AppSnapshot, proxyId: string, language: UiLanguage, t: Translator): LocalDiagnosticCheck[] {
-  const now = Date.now()
-  const activeAccounts = snapshot.accounts.filter((account) => account.status === 'active').length
-  const unavailableAccounts = snapshot.accounts.filter((account) => account.status === 'disabled' || account.status === 'expired').length
-  const exhaustedAccounts = snapshot.accounts.filter((account) =>
-    account.cooldownReason === 'quota' && (account.cooldownUntil === undefined || account.cooldownUntil > now)).length
-  const enabledRoutes = snapshot.routes.filter((route) => route.enabled)
-  const availableSourceIds = new Set(listRouteSources(snapshot).map((source) => source.id))
-  const invalidRoutes = enabledRoutes.filter((route) => !availableSourceIds.has(route.poolId)).length
-  const emptyPools = snapshot.pools.filter((pool) => !pool.members.some((member) =>
-    member.enabled && snapshot.accounts.some((account) => account.id === member.accountId))).length
-  const expiringOAuth = snapshot.accounts.filter((account) => account.credentialType === 'chatgpt-oauth'
-    && account.credentialExpiresAt !== undefined && account.credentialExpiresAt <= now + 15 * 60_000
-    && account.renewable !== true).length
-  const proxy = proxyId ? snapshot.proxies.find((candidate) => candidate.id === proxyId) : undefined
-  return [
-    {
-      id: 'gateway', label: t('本地网关', 'Local gateway'),
-      status: snapshot.gatewayStatus.running ? 'success' : 'warning',
-      message: snapshot.gatewayStatus.running
-        ? t(`运行中 · ${snapshot.gatewayStatus.host}:${snapshot.gatewayStatus.port} · ${snapshot.gatewayStatus.activeRequests} 个活跃请求`, `Running · ${snapshot.gatewayStatus.host}:${snapshot.gatewayStatus.port} · ${snapshot.gatewayStatus.activeRequests} active requests`)
-        : t('当前未启动；网络诊断仍可运行，但客户端暂时无法通过 Stone+ 请求。', 'Not running. Diagnostics remain available, but clients cannot currently send requests through Stone+.')
-    },
-    {
-      id: 'accounts', label: t('上游账号', 'Upstream accounts'),
-      status: activeAccounts > 0 ? unavailableAccounts > 0 || exhaustedAccounts > 0 ? 'warning' : 'success' : 'error',
-      message: t(`${activeAccounts} 个可用 · ${unavailableAccounts} 个停用/过期 · ${exhaustedAccounts} 个额度冷却`, `${activeAccounts} available · ${unavailableAccounts} disabled/expired · ${exhaustedAccounts} quota cooldown`)
-    },
-    {
-      id: 'routing', label: t('源与客户端路由', 'Sources and client routes'),
-      status: invalidRoutes > 0 || emptyPools > 0 ? 'error' : enabledRoutes.length > 0 ? 'success' : 'warning',
-      message: invalidRoutes > 0 || emptyPools > 0
-        ? t(`${invalidRoutes} 条路由缺少可用源 · ${emptyPools} 个号池没有启用成员`, `${invalidRoutes} routes lack a usable source · ${emptyPools} pools have no enabled members`)
-        : t(`${snapshot.pools.length} 个号池/聚合中转 · ${enabledRoutes.length} 条已启用路由`, `${snapshot.pools.length} pools/aggregates · ${enabledRoutes.length} enabled routes`)
-    },
-    {
-      id: 'oauth', label: t('ChatGPT OAuth 会话', 'ChatGPT OAuth sessions'),
-      status: expiringOAuth > 0 ? 'warning' : 'success',
-      message: expiringOAuth > 0
-        ? t(`${expiringOAuth} 个不可续期会话将在 15 分钟内过期，需要重新导入。`, `${expiringOAuth} non-renewable sessions expire within 15 minutes and must be imported again.`)
-        : t('未发现即将到期且无法自动续期的 ChatGPT 会话。', 'No ChatGPT sessions are both near expiry and unable to renew automatically.')
-    },
-    {
-      id: 'proxy', label: t('本次测试出口', 'Route used for this test'),
-      status: proxyId && !proxy ? 'error' : proxy?.status === 'error' ? 'warning' : 'success',
-      message: proxy
-        ? `${proxy.name} · ${proxy.protocol.toUpperCase()} · ${proxy.status === 'available' ? t(`已验证${proxy.exitIp ? ` · ${proxy.exitIp}` : ''}`, `Verified${proxy.exitIp ? ` · ${proxy.exitIp}` : ''}`) : proxy.status === 'error' ? localizeBackendMessage(proxy.lastError, language, t('上次检测失败', 'Last proxy check failed.')) : t('尚未单独检测', 'Not tested separately')}`
-        : proxyId ? t('所选代理已不存在。', 'The selected proxy no longer exists.') : t('直连（系统网络）', 'Direct (system network)')
-    }
-  ]
 }
 
 const diagnosticEnglishLabels: Record<string, string> = {

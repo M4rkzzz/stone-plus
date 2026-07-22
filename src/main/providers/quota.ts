@@ -57,7 +57,9 @@ export function extractRateLimitSignals(
   now = Date.now()
 ): NormalizedQuotaSignals {
   if (!source) return {}
-  const headers = new Headers(source)
+  // Fetch responses already expose a Headers instance. Reusing it avoids
+  // copying every upstream header on the per-request quota/health path.
+  const headers = source instanceof Headers ? source : new Headers(source)
   const anthropic = protocol === 'anthropic-messages'
 
   const requests = quotaWindow(headers, now, {

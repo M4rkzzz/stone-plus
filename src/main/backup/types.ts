@@ -34,4 +34,5 @@ export interface DatabaseBackupServiceOptions<T> {
   now?: () => number
   randomId?: () => string
   onAutomaticBackupError?: (error: Error) => void
+  portableSecretVault?: import('./portable-secrets').PortableSecretVault
 }

@@ -16,6 +16,8 @@ import {
 import { supportsFastServiceTier } from '@shared/types'
 import type { AppSnapshot, GatewayApi, ModelPolicy, Pool, PoolInput, PoolStrategy, Protocol } from '@shared/types'
 import type { ActionRunner } from '../App'
+import { accountSourceLabel } from '../account-source-label'
+import { BUILT_IN_PROXY_BINDING_NOTICE, useBuiltInProxyInterlock } from '../built-in-proxy-interlocks'
 import { useI18n } from '../i18n'
 import { buildPoolModelCoverage, effectiveAccountModels, effectivePoolModels, isAccountModelWildcard, isPoolModelWildcard, pruneModelSelection } from '../model-policy'
 import {
@@ -137,6 +139,7 @@ function emptyDraft(): PoolDraft {
     hedgedRequests: false,
     hedgeDelayMs: 2500,
     firstBodyTimeoutMs: 8000,
+    quotaProtection: undefined,
     proxyId: '',
   }
 }
@@ -153,6 +156,7 @@ export function PoolsView({
   busyKeys: Set<string>
 }) {
   const { t } = useI18n()
+  const builtInProxyInterlocked = useBuiltInProxyInterlock(snapshot, api)
   const [modalOpen, setModalOpen] = useState(false)
   const [draft, setDraft] = useState<PoolDraft>(emptyDraft())
   const [errors, setErrors] = useState<Record<string, string>>({})
@@ -206,6 +210,7 @@ export function PoolsView({
       hedgedRequests: pool.hedgedRequests ?? false,
       hedgeDelayMs: pool.hedgeDelayMs ?? 2500,
       firstBodyTimeoutMs: pool.firstBodyTimeoutMs ?? 8000,
+      quotaProtection: pool.quotaProtection ? { ...pool.quotaProtection } : undefined,
       proxyId: pool.proxyId ?? '',
     } : emptyDraft())
     setErrors({})
@@ -243,7 +248,7 @@ export function PoolsView({
 
   const toggleTagMembers = (tagId: string) => {
     const matchingIds = snapshot.accounts
-      .filter((account) => account.credentialType === 'chatgpt-oauth' && account.tagId === tagId)
+      .filter((account) => (account.credentialType === 'chatgpt-oauth' || account.credentialType === 'chatgpt-agent-identity') && account.tagId === tagId)
       .filter((account) => providerById.get(account.providerId)?.protocol === draft.protocol)
       .map((account) => account.id)
     if (!matchingIds.length) return
@@ -322,18 +327,19 @@ export function PoolsView({
                   {members.map((account, index) => {
                     if (!account) return null
                     const provider = providerById.get(account.providerId)
+                    const sourceLabel = accountSourceLabel(account.credentialType, provider?.name)
                     return (
                       <div className="pool-member" key={account.id}>
                         <span className="pool-member__order">{index + 1}</span>
-                        <span className="provider-avatar" style={{ '--provider-color': provider?.color ?? '#61736f' } as React.CSSProperties}>{provider?.name.slice(0, 1)}</span>
-                        <div><strong>{account.name}</strong><span>{provider?.name} · {t('权重', 'Weight')} {account.weight}{account.proxyId ? t(` · 账号代理：${proxyById.get(account.proxyId)?.name ?? '已删除'}`, ` · Account proxy: ${proxyById.get(account.proxyId)?.name ?? 'Deleted'}`) : ''}</span></div>
+                        <span className="provider-avatar" style={{ '--provider-color': provider?.color ?? '#61736f' } as React.CSSProperties}>{sourceLabel.slice(0, 1)}</span>
+                        <div><strong>{account.name}</strong><span>{sourceLabel} · {t('权重', 'Weight')} {account.weight}{account.proxyId ? t(` · 账号代理：${proxyById.get(account.proxyId)?.name ?? '已删除'}`, ` · Account proxy: ${proxyById.get(account.proxyId)?.name ?? 'Deleted'}`) : ''}</span></div>
                         <AccountStatusBadge status={account.status} circuitState={account.circuitState} />
                       </div>
                     )
                   })}
                 </div>
 
-                <footer className="pool-card__footer"><span>{t(`失败重试 ${pool.maxRetries} 次`, `${pool.maxRetries} failure ${pool.maxRetries === 1 ? 'retry' : 'retries'}`)} · {pool.proxyId ? t(`默认出口 ${proxyById.get(pool.proxyId)?.name ?? '代理已删除'}`, `Default proxy: ${proxyById.get(pool.proxyId)?.name ?? 'Deleted proxy'}`) : t('默认直连', 'Direct by default')}</span>{pool.kind === 'standard' ? <button type="button" className="text-button" onClick={() => openPool(pool)}>{t('编辑配置', 'Edit configuration')}</button> : <button type="button" className="text-button" onClick={() => { window.location.hash = '#providers' }}>{t('前往“账号与中转”管理', 'Manage in Accounts & Relays')}</button>}</footer>
+                <footer className="pool-card__footer"><span>{t(`失败重试 ${pool.maxRetries} 次`, `${pool.maxRetries} failure ${pool.maxRetries === 1 ? 'retry' : 'retries'}`)} · {pool.proxyId ? t(`默认代理 ${proxyById.get(pool.proxyId)?.name ?? '代理已删除'}`, `Default proxy: ${proxyById.get(pool.proxyId)?.name ?? 'Deleted proxy'}`) : t('默认直连', 'Direct by default')}</span>{pool.kind === 'standard' ? <button type="button" className="text-button" onClick={() => openPool(pool)}>{t('编辑配置', 'Edit configuration')}</button> : <button type="button" className="text-button" onClick={() => { window.location.hash = '#providers' }}>{t('前往“账号与中转”管理', 'Manage in Accounts & Relays')}</button>}</footer>
               </article>
             )
           })}
@@ -446,11 +452,12 @@ export function PoolsView({
               </div>
             </label>
             <label className="field field--full">
-              <span className="field-label-with-help">{t('号池默认出口代理', 'Default pool proxy')}<InfoTip text={t('成员账号配置专属代理时优先使用账号代理。', 'An account-specific proxy takes precedence over the pool default.')} /></span>
-              <select value={draft.proxyId ?? ''} onChange={(event) => setDraft({ ...draft, proxyId: event.target.value })}>
+              <span className="field-label-with-help">{t('号池默认代理', 'Default pool proxy')}<InfoTip text={t('成员账号配置专属代理时优先使用账号代理。', 'An account-specific proxy takes precedence over the pool default.')} /></span>
+              <select value={draft.proxyId ?? ''} disabled={builtInProxyInterlocked} onChange={(event) => setDraft({ ...draft, proxyId: event.target.value })}>
                 <option value="">{t('直连', 'Direct')}</option>
                 {snapshot.proxies.map((proxy) => <option key={proxy.id} value={proxy.id}>{proxy.name} · {proxy.protocol.toUpperCase()} · {proxy.host}:{proxy.port}</option>)}
               </select>
+              {builtInProxyInterlocked && <small>{t(BUILT_IN_PROXY_BINDING_NOTICE.zh, BUILT_IN_PROXY_BINDING_NOTICE.en)}</small>}
             </label>
             <div className="field field--full">
               <span>{t('账号成员', 'Account members')}</span>
@@ -458,7 +465,7 @@ export function PoolsView({
                 <span>{t('Tag 快选', 'Quick tag selection')}</span>
                 {snapshot.accountTags.map((tag) => {
                   const matchingIds = snapshot.accounts
-                    .filter((account) => account.credentialType === 'chatgpt-oauth' && account.tagId === tag.id)
+                    .filter((account) => (account.credentialType === 'chatgpt-oauth' || account.credentialType === 'chatgpt-agent-identity') && account.tagId === tag.id)
                     .filter((account) => providerById.get(account.providerId)?.protocol === draft.protocol)
                     .map((account) => account.id)
                   const allSelected = matchingIds.length > 0 && matchingIds.every((id) => draft.accountIds.includes(id))
@@ -471,6 +478,7 @@ export function PoolsView({
                   const provider = providerById.get(account.providerId)
                   const compatible = provider?.protocol === draft.protocol
                   const wildcard = isAccountModelWildcard(account)
+                  const sourceLabel = accountSourceLabel(account.credentialType, provider?.name)
                   return (
                     <button
                       type="button"
@@ -481,8 +489,8 @@ export function PoolsView({
                       onClick={() => updateMemberIds(selected ? draft.accountIds.filter((id) => id !== account.id) : [...draft.accountIds, account.id])}
                     >
                       <span className="checkbox-mark">{selected && <Check size={13} />}</span>
-                      <span className="provider-avatar" style={{ '--provider-color': provider?.color ?? '#61736f' } as React.CSSProperties}>{provider?.name.slice(0, 1)}</span>
-                      <span><strong>{account.name}</strong><small>{provider?.name} · {protocolLabels[provider?.protocol ?? 'openai-chat']} · {wildcard ? t('待刷新 · 兼容通配', 'Refresh pending · Compatible wildcard') : t(`开放 ${effectiveAccountModels(account, provider?.models).length} 个模型`, `${effectiveAccountModels(account, provider?.models).length} models allowed`)}</small></span>
+                      <span className="provider-avatar" style={{ '--provider-color': provider?.color ?? '#61736f' } as React.CSSProperties}>{sourceLabel.slice(0, 1)}</span>
+                      <span><strong>{account.name}</strong><small>{sourceLabel} · {protocolLabels[provider?.protocol ?? 'openai-chat']} · {wildcard ? t('待刷新 · 兼容通配', 'Refresh pending · Compatible wildcard') : t(`开放 ${effectiveAccountModels(account, provider?.models).length} 个模型`, `${effectiveAccountModels(account, provider?.models).length} models allowed`)}</small></span>
                       {compatible ? <AccountStatusBadge status={account.status} circuitState={account.circuitState} /> : <Badge tone="neutral">{t('协议不匹配', 'Protocol mismatch')}</Badge>}
                     </button>
                   )
@@ -520,6 +528,16 @@ export function PoolsView({
               <div><strong>{t('会话粘性', 'Session stickiness')}<InfoTip text={t('同一会话优先复用已分配账号，减少上下文和缓存命中波动。', 'Prefer the assigned account for the same session to reduce context and cache-hit variability.')} /></strong></div>
               <button className={`toggle ${draft.stickySessions ? 'toggle--on' : ''}`} role="switch" aria-label={t('会话粘性', 'Session stickiness')} aria-checked={draft.stickySessions} type="button" onClick={() => setDraft({ ...draft, stickySessions: !draft.stickySessions })}><span /></button>
             </div>
+            <div className="field field--full inline-settings">
+              <div><strong>{t('额度保护线', 'Quota reserve guard')}<InfoTip text={t('达到保留额度后停止从该号池选择账号；不影响正在传输的请求。', 'Stop selecting accounts from this pool when its reserve is reached. In-flight requests are not interrupted.')} /></strong></div>
+              <button className={`toggle ${draft.quotaProtection ? 'toggle--on' : ''}`} role="switch" aria-label={t('额度保护线', 'Quota reserve guard')} aria-checked={Boolean(draft.quotaProtection)} type="button" onClick={() => setDraft({ ...draft, quotaProtection: draft.quotaProtection ? undefined : { fiveHourRemainingPercent: 10, sevenDayRemainingPercent: 10, unavailableBehavior: 'allow', staleAfterMinutes: 15 } })}><span /></button>
+            </div>
+            {draft.quotaProtection && <>
+              <label className="field"><span>{t('5 小时最低保留（%）', '5-hour minimum reserve (%)')}</span><input type="number" min={0} max={100} value={draft.quotaProtection.fiveHourRemainingPercent ?? ''} onChange={(event) => setDraft({ ...draft, quotaProtection: { ...draft.quotaProtection!, fiveHourRemainingPercent: event.target.value === '' ? undefined : Number(event.target.value) } })} /></label>
+              <label className="field"><span>{t('周额度最低保留（%）', 'Weekly minimum reserve (%)')}</span><input type="number" min={0} max={100} value={draft.quotaProtection.sevenDayRemainingPercent ?? ''} onChange={(event) => setDraft({ ...draft, quotaProtection: { ...draft.quotaProtection!, sevenDayRemainingPercent: event.target.value === '' ? undefined : Number(event.target.value) } })} /></label>
+              <label className="field"><span>{t('额度未知或过期', 'Unknown or stale quota')}</span><select value={draft.quotaProtection.unavailableBehavior ?? 'allow'} onChange={(event) => setDraft({ ...draft, quotaProtection: { ...draft.quotaProtection!, unavailableBehavior: event.target.value as 'allow' | 'block' } })}><option value="allow">{t('继续调度（兼容旧行为）', 'Continue scheduling (legacy behavior)')}</option><option value="block">{t('保守停用', 'Block conservatively')}</option></select></label>
+              <label className="field"><span>{t('快照有效期（分钟）', 'Snapshot validity (minutes)')}</span><input type="number" min={1} max={10080} value={draft.quotaProtection.staleAfterMinutes ?? ''} onChange={(event) => setDraft({ ...draft, quotaProtection: { ...draft.quotaProtection!, staleAfterMinutes: event.target.value === '' ? undefined : Number(event.target.value) } })} /></label>
+            </>}
             <div className="field field--full inline-settings">
               <div><strong>{t('极低延迟竞速', 'Low-latency hedging')}<InfoTip text={draft.protocol === 'openai-responses' ? t('响应头等待过久时发起备用请求，可能增加短时额度消耗。', 'Start a backup request when response headers take too long. This may briefly increase quota usage.') : t('仅 OpenAI Responses 协议支持此选项。', 'Only OpenAI Responses supports this option.')} /></strong></div>
               <button className={`toggle ${draft.hedgedRequests ? 'toggle--on' : ''}`} role="switch" aria-label={t('极低延迟竞速', 'Low-latency hedging')} aria-checked={draft.hedgedRequests} type="button" disabled={draft.protocol !== 'openai-responses'} onClick={() => setDraft({ ...draft, hedgedRequests: !draft.hedgedRequests })}><span /></button>

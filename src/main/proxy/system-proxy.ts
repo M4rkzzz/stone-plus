@@ -82,8 +82,8 @@ export function isLoopbackHostname(hostname: string): boolean {
 function proxyProtocol(keyword: string): ProxyProtocol {
   switch (keyword.toUpperCase()) {
     case 'HTTPS': return 'https'
-    case 'SOCKS4': return 'socks4'
     case 'SOCKS':
+    case 'SOCKS4': return 'socks4'
     case 'SOCKS5': return 'socks5'
     default: return 'http'
   }

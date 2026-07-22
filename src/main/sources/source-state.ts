@@ -1,5 +1,11 @@
 import { randomUUID } from 'node:crypto'
 import { supportsFastServiceTier } from '@shared/types'
+import {
+  buildModelCatalog,
+  inferUpstreamCapabilities,
+  normalizeCapabilityProfile,
+  normalizeModelCatalog,
+} from '@shared/source-capabilities'
 import type {
   Account,
   AggregateRelayInput,
@@ -8,6 +14,7 @@ import type {
   Protocol,
   ProviderDefinition,
   ProviderKind,
+  ResponsesCompactMode,
   RouteSourceFastModeInput
 } from '@shared/types'
 import type { PersistedState } from '../store/types'
@@ -98,13 +105,20 @@ export function saveApiSourceDraft(
   const existingAccounts = existingProvider
     ? state.accounts.filter((account) => account.providerId === existingProvider.id)
     : []
-  if (existingAccounts.some((account) => account.credentialType === 'chatgpt-oauth')) {
+  if (existingAccounts.some((account) => account.credentialType === 'chatgpt-oauth'
+    || account.credentialType === 'chatgpt-agent-identity')) {
     throw new Error('OAuth accounts cannot be converted into API-key sources.')
   }
   if (existingAccounts.length > 1) {
     throw new Error('This source has multiple accounts and must be migrated before it can be edited.')
   }
   const existingAccount = existingAccounts[0]
+  const responsesCompactMode = resolveResponsesCompactModeInput(
+    input.responsesCompactMode,
+    existingProvider?.responsesCompactMode,
+    input.sourceType,
+    sourceConfiguration.protocol
+  )
 
   const suppliedCredential = input.credential?.trim() || undefined
   if (!existingAccount && !suppliedCredential) throw new Error('An API Key is required for a new source.')
@@ -139,6 +153,30 @@ export function saveApiSourceDraft(
     || existingAccount.proxyId !== proxyId
     || credentialChanged
 
+  const inferredCapabilities = inferUpstreamCapabilities({
+    protocol: sourceConfiguration.protocol,
+    sourceType: input.sourceType,
+    responsesCompactMode,
+  })
+  // A newly created source may carry the successful probe performed against
+  // the exact unsaved draft. Connection edits still discard renderer-supplied
+  // evidence and must use the main-process persistent probe revision flow.
+  const acceptsInitialProbe = !existingProvider
+    && !existingAccount
+    && input.capabilityProfile?.origin === 'probed'
+    && typeof input.capabilityProfile.checkedAt === 'number'
+  const capabilityProfile = normalizeCapabilityProfile(
+    connectionChanged && !acceptsInitialProbe
+      ? undefined
+      : input.capabilityProfile ?? existingProvider?.capabilityProfile,
+    inferredCapabilities,
+  )
+  const modelCatalog = (acceptsInitialProbe || !connectionChanged) && input.modelCatalog
+    ? normalizeModelCatalog(input.modelCatalog, models, capabilityProfile)
+    : connectionChanged
+      ? buildModelCatalog(models, capabilityProfile)
+      : normalizeModelCatalog(existingProvider?.modelCatalog, models, capabilityProfile)
+
   const provider: ProviderDefinition = {
     id: providerId,
     name,
@@ -152,6 +190,9 @@ export function saveApiSourceDraft(
     forceFastMode: input.sourceType === 'relay'
       && supportsFastServiceTier(sourceConfiguration.protocol)
       && existingProvider?.forceFastMode === true,
+    ...(responsesCompactMode ? { responsesCompactMode } : {}),
+    capabilityProfile,
+    modelCatalog,
     createdAt: existingProvider?.createdAt ?? timestamp,
     updatedAt: timestamp
   }
@@ -231,7 +272,8 @@ export function deleteApiSourceDraft(
   if (!provider) throw new Error('API source not found.')
   if (provider.sourceType === 'oauth-system') throw new Error('The system OAuth source cannot be deleted here.')
   const accounts = state.accounts.filter((account) => account.providerId === sourceId)
-  if (accounts.some((account) => account.credentialType === 'chatgpt-oauth')) {
+  if (accounts.some((account) => account.credentialType === 'chatgpt-oauth'
+    || account.credentialType === 'chatgpt-agent-identity')) {
     throw new Error('OAuth accounts must be managed from the account page.')
   }
   const accountIds = accounts.map((account) => account.id)
@@ -315,6 +357,7 @@ export function saveAggregateRelayDraft(
     stickyTtlMinutes,
     maxRetries,
     forceFastMode: supportsFastServiceTier(input.protocol) && existing?.forceFastMode === true,
+    quotaProtection: input.quotaProtection ?? existing?.quotaProtection,
     proxyId,
     createdAt: existing?.createdAt ?? timestamp,
     updatedAt: timestamp
@@ -370,6 +413,31 @@ function assertFastProtocol(protocol: Protocol, enabled: boolean): void {
   if (enabled && !supportsFastServiceTier(protocol)) {
     throw new Error('FAST is supported only by OpenAI Responses and OpenAI Chat sources.')
   }
+}
+
+function isResponsesCompactMode(value: unknown): value is ResponsesCompactMode {
+  return value === 'legacy' || value === 'passthrough' || value === 'native'
+}
+
+function resolveResponsesCompactModeInput(
+  requested: unknown,
+  existing: unknown,
+  sourceType: ApiSourceInput['sourceType'],
+  protocol: Protocol
+): ResponsesCompactMode | undefined {
+  const supported = sourceType === 'relay' && protocol === 'openai-responses'
+  if (requested !== undefined) {
+    if (!isResponsesCompactMode(requested)) {
+      throw new Error('Responses compact mode must be legacy, passthrough, or native.')
+    }
+    if (!supported) {
+      throw new Error('Responses compact mode can be configured only for OpenAI Responses relay sources.')
+    }
+    return requested
+  }
+  // Preserve an existing explicit relay capability when an older renderer
+  // edits unrelated fields, while clearing it on a source/protocol change.
+  return supported && isResponsesCompactMode(existing) ? existing : undefined
 }
 
 function normalizeSourceConfiguration(input: ApiSourceInput): {
@@ -453,7 +521,7 @@ function normalizeAggregateMembers(input: AggregateRelayInput, state: PersistedS
     accountIds.add(accountId)
     const account = state.accounts.find((candidate) => candidate.id === accountId)
     if (!account) throw new Error('One of the selected aggregate relay members no longer exists.')
-    if (account.credentialType === 'chatgpt-oauth') {
+    if (account.credentialType === 'chatgpt-oauth' || account.credentialType === 'chatgpt-agent-identity') {
       throw new Error('OAuth accounts cannot be aggregate relay members.')
     }
     const provider = state.providers.find((candidate) => candidate.id === account.providerId)

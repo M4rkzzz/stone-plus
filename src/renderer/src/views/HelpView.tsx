@@ -101,7 +101,7 @@ const topics: Topic[] = [
     headings: [{ id: 'choose-source', label: '选择来源类型' }, { id: 'add-source', label: '添加与验证' }, { id: 'manage-accounts', label: '日常管理' }],
   },
   {
-    id: 'proxies', group: '配置链路', title: '出口代理', icon: Waypoints,
+    id: 'proxies', group: '配置链路', title: '代理', icon: Waypoints,
     summary: '按账号或号池指定代理，并用内置检测确认网络可达。', page: 'proxies',
     keywords: '代理 HTTP HTTPS SOCKS5 网络 出口 系统代理 直连 测试',
     headings: [{ id: 'proxy-needed', label: '什么时候需要代理' }, { id: 'proxy-create', label: '添加并测试' }, { id: 'proxy-assign', label: '绑定与排错' }],
@@ -196,7 +196,7 @@ const topicEnglish: Record<TopicId, TopicEnglishCopy> = {
     headings: [{ id: 'choose-source', label: 'Choose a source type' }, { id: 'add-source', label: 'Add and verify' }, { id: 'manage-accounts', label: 'Ongoing management' }],
   },
   proxies: {
-    title: 'Outbound proxies', summary: 'Assign proxies to accounts or pools and verify connectivity with built-in tests.',
+    title: 'Proxies', summary: 'Assign proxies to accounts or pools and verify connectivity with built-in tests.',
     keywords: 'proxy HTTP HTTPS SOCKS5 network exit system proxy direct connection test',
     headings: [{ id: 'proxy-needed', label: 'When a proxy is needed' }, { id: 'proxy-create', label: 'Add and test' }, { id: 'proxy-assign', label: 'Assignment and troubleshooting' }],
   },
@@ -361,13 +361,13 @@ const helpEnglish = new Map<string, string>([
   ['修改后如何确认生效', 'How to verify a change'], ['刷新账号状态，再到“号池”确认成员仍启用。发送一个测试请求，在请求记录中核对实际命中的账号。', 'Refresh account status, confirm the member is still enabled in its pool, then send a test request and verify which account was selected in Request History.'],
   ['管理账号与中转', 'Manage accounts and relays'],
 
-  // Outbound proxies.
+  // Proxies.
   ['代理是可选项。直连能稳定访问上游时不要为了“完整配置”而添加代理；只有网络受限、服务商要求固定出口或需要按账号隔离出口时才使用。', 'Proxies are optional. If direct access is stable, do not add one just to make the setup look complete. Use a proxy only for restricted networks, a provider-required fixed exit, or account-level exit isolation.'],
   ['什么时候需要代理', 'When a proxy is needed'], ['建议直连', 'Use direct connection'], ['诊断中目标均可达、延迟稳定，账号没有地域限制。', 'Diagnostic targets are reachable with stable latency and the account has no region restriction.'],
   ['建议代理', 'Use a proxy'], ['连接超时 / TLS 失败、上游区域受限，或不同账号必须固定不同出口。', 'Connections time out, TLS fails, the upstream is region-restricted, or accounts must use separate fixed exits.'],
   ['代理可连不等于上游可用', 'A reachable proxy does not prove the upstream works'], ['代理“测试成功”通常只证明代理服务器可握手。随后还要到“诊断”选择这个出口，检查真实 GPT / OAuth 目标。', 'A successful proxy test usually proves only that Stone+ can connect to the proxy server. Select the same exit in Diagnostics and test the real GPT/OAuth targets.'],
   ['添加并测试', 'Add and test'], ['准备连接信息', 'Prepare connection details'], ['确认协议（HTTP / HTTPS / SOCKS5）、主机、端口，以及可选的用户名和密码。', 'Confirm the protocol (HTTP/HTTPS/SOCKS5), host, port, and optional username and password.'],
-  ['新建出口代理', 'Create an outbound proxy'], ['不要把 http://、路径或 PAC 地址放进“主机”；只填写主机名或 IP。', 'Enter only a hostname or IP in Host; do not include http://, a path, or a PAC URL.'],
+  ['新建代理', 'Create a proxy'], ['不要把 http://、路径或 PAC 地址放进“主机”；只填写主机名或 IP。', 'Enter only a hostname or IP in Host; do not include http://, a path, or a PAC URL.'],
   ['运行连接测试', 'Run the connection test'], ['查看延迟、出口 IP 和最近错误。密码只显示是否已保存，不会明文回显。', 'Check latency, exit IP, and the latest error. Passwords are never shown again in plain text.'],
   ['到诊断页复测', 'Retest in Diagnostics'], ['选择刚建立的代理，确认 OpenAI、ChatGPT 与 OAuth 所需目标符合你的用途。', 'Select the new proxy and verify the OpenAI, ChatGPT, and OAuth targets required by your workflow.'],
   ['绑定与排错', 'Assignment and troubleshooting'], ['代理绑定在哪里', 'Where to assign a proxy'], ['精确到账号最稳妥，号池适合统一出口', 'Account-level assignment is most precise; use a pool for a shared exit'],
@@ -375,7 +375,7 @@ const helpEnglish = new Map<string, string>([
   ['同一批账号要求固定出口：逐账号绑定。', 'Accounts that require fixed exits: assign each account.'], ['整个号池共用一条稳定链路：号池绑定。', 'A whole pool sharing one stable path: assign the pool.'], ['想跟随 Windows / macOS 系统网络：设置中选择系统网络模式。', 'To follow Windows/macOS networking, choose System in outbound network settings.'],
   ['测试失败怎么排', 'Troubleshoot a failed test'], ['按从近到远的顺序检查', 'Check from the nearest component outward'],
   ['先检查代理软件是否运行、端口是否监听。', 'Confirm the proxy application is running and its port is listening.'], ['核对协议，SOCKS 端口不能按 HTTP 添加。', 'Verify the protocol; a SOCKS port cannot be configured as HTTP.'], ['核对用户名、密码与 IP 白名单。', 'Verify the username, password, and IP allowlist.'], ['在诊断页比较直连与代理结果；直连成功而代理失败说明问题在代理链路。', 'Compare direct and proxy results in Diagnostics. If direct works and the proxy fails, the proxy path is the problem.'], ['若只有 OAuth 失败，换支持该域名和 HTTPS CONNECT 的节点。', 'If only OAuth fails, use a node that supports the required domain and HTTPS CONNECT.'],
-  ['打开出口代理', 'Open outbound proxies'], ['用实际出口诊断', 'Diagnose with the actual exit'],
+  ['打开代理', 'Open proxies'], ['用实际出口诊断', 'Diagnose with the actual exit'],
 
   // Pools.
   ['号池把多个账号包装成一个稳定来源。客户端不需要知道本次用了哪个账号；Stone+ 会按策略选择可用成员，并在允许时切换或重试。', 'A pool presents several accounts as one stable source. The client does not need to know which account was selected; Stone+ chooses an available member and can switch or retry when allowed.'],
@@ -1013,7 +1013,7 @@ function ProxiesDoc({ navigate }: { navigate: (page: PageId) => void }) {
     <SectionHeading topic="proxies" id="proxy-create">添加并测试</SectionHeading>
     <Steps items={[
       { title: '准备连接信息', text: '确认协议（HTTP / HTTPS / SOCKS5）、主机、端口，以及可选的用户名和密码。' },
-      { title: '新建出口代理', text: '不要把 http://、路径或 PAC 地址放进“主机”；只填写主机名或 IP。' },
+      { title: '新建代理', text: '不要把 http://、路径或 PAC 地址放进“主机”；只填写主机名或 IP。' },
       { title: '运行连接测试', text: '查看延迟、出口 IP 和最近错误。密码只显示是否已保存，不会明文回显。' },
       { title: '到诊断页复测', text: '选择刚建立的代理，确认 OpenAI、ChatGPT 与 OAuth 所需目标符合你的用途。' },
     ]} />
@@ -1026,7 +1026,7 @@ function ProxiesDoc({ navigate }: { navigate: (page: PageId) => void }) {
     <Guide title="测试失败怎么排" summary="按从近到远的顺序检查">
       <ol><li>先检查代理软件是否运行、端口是否监听。</li><li>核对协议，SOCKS 端口不能按 HTTP 添加。</li><li>核对用户名、密码与 IP 白名单。</li><li>在诊断页比较直连与代理结果；直连成功而代理失败说明问题在代理链路。</li><li>若只有 OAuth 失败，换支持该域名和 HTTPS CONNECT 的节点。</li></ol>
     </Guide>
-    <div className="help-action-row"><OpenPageButton page="proxies" navigate={navigate}>打开出口代理</OpenPageButton><OpenPageButton page="diagnostics" navigate={navigate}>用实际出口诊断</OpenPageButton></div>
+    <div className="help-action-row"><OpenPageButton page="proxies" navigate={navigate}>打开代理</OpenPageButton><OpenPageButton page="diagnostics" navigate={navigate}>用实际出口诊断</OpenPageButton></div>
   </></LocalizedDoc>
 }
 

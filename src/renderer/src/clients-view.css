@@ -251,6 +251,59 @@
   white-space: nowrap;
 }
 
+.client-easy-setting {
+  display: flex;
+  min-height: 44px;
+  align-items: center;
+  gap: 12px;
+  margin: 0 14px 12px;
+  padding: 6px 9px 6px 11px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: #fbfcfb;
+}
+
+.client-easy-setting > label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--text);
+  font-size: 11px;
+}
+
+.client-easy-setting__control {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-left: auto;
+}
+
+.client-easy-setting__control input {
+  width: 78px;
+  height: 32px;
+  padding: 0 8px;
+  border: 1px solid #abc7bd;
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.client-easy-setting__control input[aria-invalid='true'] {
+  border-color: var(--danger);
+}
+
+.client-easy-setting__control > span {
+  color: var(--faint);
+  font-size: 9px;
+}
+
+.client-easy-setting__save {
+  min-height: 32px;
+  padding: 0 11px;
+}
+
 .client-easy-status {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -1561,6 +1614,15 @@
     grid-template-columns: minmax(0, 1fr);
   }
 
+  .client-easy-setting {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .client-easy-setting__control {
+    margin-left: 0;
+  }
+
   .client-easy-actions {
     align-items: stretch;
     flex-direction: column;
@@ -1665,3 +1727,31 @@
     flex-direction: column;
   }
 }
+.managed-instances { margin-top: 14px; overflow: hidden; }
+.managed-instances__header { display:flex; align-items:center; justify-content:space-between; padding:14px 18px; border-bottom:1px solid var(--border); }
+.managed-instances__header > div { display:flex; align-items:center; gap:10px; }
+.managed-instances__header span { display:flex; flex-direction:column; gap:2px; }
+.managed-instances__header small, .managed-instances__list small { color:var(--text-muted); }
+.managed-instances__list { display:grid; gap:1px; background:var(--border); }
+.managed-instances__list > .muted { padding:20px; background:var(--surface); }
+.managed-instances__list article { display:grid; grid-template-columns:auto minmax(0,1fr) auto auto auto auto; align-items:center; gap:10px; padding:11px 16px; background:var(--surface); }
+.managed-instances__list article > span { min-width:0; display:flex; flex-direction:column; }
+.managed-instance-brand { width:24px; height:24px; object-fit:contain; }
+.managed-instances__list article small { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.managed-instance-status { font-style:normal; font-size:12px; color:var(--text-muted); }
+.managed-instance-status.is-running { color:var(--success); }
+.managed-instance-status.is-failed { color:var(--danger); }
+.managed-instance-form { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+.managed-instance-form label { display:flex; flex-direction:column; gap:6px; }
+.managed-instance-form label:nth-of-type(n+3), .managed-instance-form footer { grid-column:1 / -1; }
+.managed-instance-form textarea { min-height:72px; resize:vertical; }
+.managed-instance-form footer { display:flex; justify-content:flex-end; gap:8px; }
+.persistent-task-center { margin-top:14px; overflow:hidden; }
+.persistent-task-center summary { display:flex; justify-content:space-between; align-items:center; padding:13px 17px; cursor:pointer; }
+.persistent-task-center summary small { color:var(--text-muted); }
+.persistent-task-center > div { border-top:1px solid var(--border); }
+.persistent-task-center > div > .muted { display:block; padding:18px; }
+.persistent-task-toolbar { display:flex; justify-content:space-between; align-items:center; gap:12px; padding:8px 16px; border-bottom:1px solid var(--border); }
+.persistent-task-toolbar .error-text { color:var(--danger); font-size:12px; overflow-wrap:anywhere; }
+.persistent-task-center article { display:grid; grid-template-columns:minmax(0,1fr) minmax(100px,220px) 45px auto auto; gap:10px; align-items:center; padding:10px 16px; border-bottom:1px solid var(--border); }
+.persistent-task-center article > span:first-child { display:flex; flex-direction:column; }

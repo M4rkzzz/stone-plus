@@ -77,4 +77,119 @@ describe('network diagnostics', () => {
       expect.stringContaining('HTTP 429')
     ]))
   })
+
+  it('classifies HTTP 407 as a proxy authentication transport failure', async () => {
+    const fetchImplementation = vi.fn(async () => new Response(null, { status: 407 }))
+    const report = await runNetworkDiagnostics({
+      fetchImplementation,
+      route: { kind: 'system', name: '系统代理' }
+    })
+
+    expect(report.summary).toBe('error')
+    expect(report.results.filter((result) => result.kind === 'http')).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          status: 'error',
+          httpStatus: 407,
+          errorCode: 'PROXY_AUTH_REQUIRED',
+          message: expect.stringContaining('代理认证失败')
+        })
+      ])
+    )
+    expect(report.diagnoses).toContain('代理要求身份认证（HTTP 407）：请检查代理配置中的用户名和密码。')
+  })
+
+  it('extracts actionable transport codes through a bounded nested cause chain', async () => {
+    const fetchImplementation = vi.fn(async () => {
+      throw Object.assign(new TypeError('fetch failed'), {
+        cause: Object.assign(new Error('request failed'), {
+          cause: Object.assign(new Error('socket failed'), { code: 'ECONNRESET' })
+        })
+      })
+    })
+    const report = await runNetworkDiagnostics({
+      fetchImplementation,
+      route: { kind: 'system', name: '系统代理' }
+    })
+
+    expect(report.results.filter((result) => result.kind === 'http')).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          status: 'error',
+          errorCode: 'ECONNRESET',
+          message: expect.stringContaining('连接被重置')
+        })
+      ])
+    )
+    expect(report.diagnoses).toContain('连接被中途重置：检查代理节点稳定性、防火墙、杀毒软件和 TLS 分流规则。')
+  })
+
+  it.each([
+    ['core_missing', '核心缺失'],
+    ['config_invalid', '配置无效'],
+    ['node_handshake', '节点握手失败'],
+    ['mixed_port', 'mixed 端口不可用'],
+    ['tun_elevation', 'TUN 启动未获得临时提权'],
+    ['subscription_update', '订阅更新失败']
+  ] as const)('classifies built-in proxy failures as %s', async (category, guidance) => {
+    const fetchImplementation = vi.fn(async () => {
+      throw Object.assign(new Error('Built-in route failed'), {
+        code: 'BUILT_IN_PROXY_FAIL_CLOSED',
+        category
+      })
+    })
+    const report = await runNetworkDiagnostics({
+      fetchImplementation,
+      route: { kind: 'system', name: '内置代理' }
+    })
+
+    expect(report.results.filter((result) => result.kind === 'http')).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          status: 'error',
+          errorCode: category,
+          message: expect.stringContaining(category)
+        })
+      ])
+    )
+    expect(report.diagnoses).toEqual(expect.arrayContaining([
+      expect.stringContaining(guidance)
+    ]))
+  })
+
+  it('normalizes a denied TUN elevation alias through a nested cause', async () => {
+    const fetchImplementation = vi.fn(async () => {
+      throw Object.assign(new TypeError('fetch failed'), {
+        cause: Object.assign(new Error('elevation denied'), { code: 'tun_elevation_denied' })
+      })
+    })
+    const report = await runNetworkDiagnostics({
+      fetchImplementation,
+      route: { kind: 'system', name: '内置代理' }
+    })
+
+    expect(report.results.filter((result) => result.kind === 'http')).toEqual(
+      expect.arrayContaining([expect.objectContaining({ errorCode: 'tun_elevation' })])
+    )
+  })
+
+  it('does not wait for a response body cancellation that never settles', async () => {
+    const cancel = vi.fn(() => new Promise<void>(() => undefined))
+    const fetchImplementation = vi.fn(async () => ({
+      status: 200,
+      body: { cancel }
+    }) as unknown as Response)
+
+    const diagnostic = runNetworkDiagnostics({
+      fetchImplementation,
+      route: { kind: 'system', name: '系统代理' }
+    })
+    const outcome = await Promise.race([
+      diagnostic,
+      new Promise<'timed-out'>((resolve) => setTimeout(() => resolve('timed-out'), 100))
+    ])
+
+    expect(outcome).not.toBe('timed-out')
+    expect(cancel).toHaveBeenCalledTimes(4)
+  })
 })

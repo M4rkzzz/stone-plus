@@ -4,7 +4,8 @@ import type {
   ApiSourceInput,
   GatewaySettings,
   Pool,
-  Protocol
+  Protocol,
+  ResponsesCompactMode
 } from '../../src/shared/types'
 import type { PersistedState } from '../../src/main/store/types'
 import {
@@ -57,6 +58,26 @@ describe('API source state changes', () => {
     })])
     expect(state.credentials).toEqual({ [saved.credentialId]: 'encrypted:sk-new-source-1234' })
     expect(encrypt).toHaveBeenCalledExactlyOnceWith('sk-new-source-1234')
+  })
+
+  it('retains a successful capability probe supplied with a newly tested source', () => {
+    const state = emptyState()
+    saveApiSourceDraft(state, relayInput({
+      credential: 'relay-key',
+      models: ['gpt-tested'],
+      capabilityProfile: {
+        version: 1, origin: 'probed', checkedAt: NOW - 1,
+        nonStreaming: true, streaming: false, toolCalls: false,
+      },
+      modelCatalog: [{ id: 'gpt-tested', capabilities: { nonStreaming: true, toolCalls: false } }],
+    }), (value) => `encrypted:${value}`, NOW)
+
+    expect(state.providers[0].capabilityProfile).toMatchObject({
+      origin: 'probed', checkedAt: NOW - 1, nonStreaming: true, streaming: false, toolCalls: false,
+    })
+    expect(state.providers[0].modelCatalog).toContainEqual(expect.objectContaining({
+      id: 'gpt-tested', capabilities: expect.objectContaining({ nonStreaming: true, toolCalls: false }),
+    }))
   })
 
   it('requires a key on create and leaves the state unchanged on failure', () => {
@@ -141,6 +162,94 @@ describe('API source state changes', () => {
     expect(state.providers[0].forceFastMode).toBe(false)
   })
 
+  it('persists only explicit OpenAI Responses relay compact capabilities and preserves them across legacy edits', () => {
+    const state = emptyState()
+    const encrypt = (value: string) => `encrypted:${value}`
+    const created = saveApiSourceDraft(state, withResponsesCompactMode(
+      relayInput({ credential: 'relay-key' }),
+      'passthrough'
+    ), encrypt, NOW)
+
+    expect(state.providers[0]).toMatchObject({ responsesCompactMode: 'passthrough' })
+
+    const unchanged = saveApiSourceDraft(state, relayInput({
+      id: created.sourceId,
+      credential: '',
+      name: 'Edited by an older renderer'
+    }), encrypt, NOW + 1)
+    expect(unchanged.connectionChanged).toBe(false)
+    expect(state.providers[0]).toMatchObject({ responsesCompactMode: 'passthrough' })
+
+    Object.assign(state.accounts[0], {
+      status: 'cooldown',
+      inFlight: 2,
+      availableModels: ['gpt-5.1'],
+      modelsRefreshedAt: NOW - 500,
+      quotaRemaining: 42,
+      quotaUnit: 'percent',
+      cooldownUntil: NOW + 60_000,
+      cooldownReason: 'failure',
+      circuitState: 'open',
+      consecutiveFailures: 3,
+      latencyMs: 875,
+      lastUsedAt: NOW - 100,
+      lastError: 'temporary upstream failure'
+    })
+    const changed = saveApiSourceDraft(state, withResponsesCompactMode(relayInput({
+      id: created.sourceId,
+      credential: ''
+    }), 'native'), encrypt, NOW + 2)
+    expect(changed.connectionChanged).toBe(false)
+    expect(state.providers[0]).toMatchObject({ responsesCompactMode: 'native' })
+    expect(state.accounts[0]).toMatchObject({
+      status: 'cooldown',
+      inFlight: 2,
+      availableModels: ['gpt-5.1'],
+      modelsRefreshedAt: NOW - 500,
+      quotaRemaining: 42,
+      quotaUnit: 'percent',
+      cooldownUntil: NOW + 60_000,
+      cooldownReason: 'failure',
+      circuitState: 'open',
+      consecutiveFailures: 3,
+      latencyMs: 875,
+      lastUsedAt: NOW - 100,
+      lastError: 'temporary upstream failure'
+    })
+
+    saveApiSourceDraft(state, relayInput({
+      id: created.sourceId,
+      credential: '',
+      protocol: 'openai-chat'
+    }), encrypt, NOW + 3)
+    expect(state.providers[0]).not.toHaveProperty('responsesCompactMode')
+  })
+
+  it('rejects compact modes outside the explicit relay Responses capability boundary', () => {
+    const encrypt = (value: string) => `encrypted:${value}`
+
+    expect(() => saveApiSourceDraft(
+      emptyState(),
+      withResponsesCompactMode(relayInput({ credential: 'relay-key', protocol: 'openai-chat' }), 'native'),
+      encrypt,
+      NOW
+    )).toThrow(/only for OpenAI Responses relay/)
+
+    expect(() => saveApiSourceDraft(
+      emptyState(),
+      withResponsesCompactMode(sourceInput({ credential: 'official-key' }), 'legacy'),
+      encrypt,
+      NOW
+    )).toThrow(/only for OpenAI Responses relay/)
+
+    expect(() => saveApiSourceDraft(
+      emptyState(),
+      withResponsesCompactMode(relayInput({ credential: 'relay-key' }), 'future-mode'),
+      encrypt,
+      NOW
+    )).toThrow(/must be legacy, passthrough, or native/)
+  })
+
   it('clears stale health and discovered models when URL, proxy, protocol, kind, or key changes', () => {
     const state = emptyState()
     state.proxies.push({
@@ -168,6 +277,10 @@ describe('API source state changes', () => {
       lastUsedAt: NOW + 10,
       lastError: 'old failure'
     })
+    state.providers[0].capabilityProfile = {
+      version: 1, origin: 'probed', checkedAt: NOW, streaming: true, webSearch: true,
+    }
+    state.providers[0].modelCatalog = [{ id: 'old-model', capabilities: { webSearch: true } }]
 
     const saved = saveApiSourceDraft(state, relayInput({
       id: created.sourceId,
@@ -175,11 +288,19 @@ describe('API source state changes', () => {
       baseUrl: 'https://relay-two.example/v1/',
       models: ['new-model'],
       defaultModel: 'new-model',
-      proxyId: 'proxy-1'
+      proxyId: 'proxy-1',
+      // A stale renderer draft must not attach the old probe to the new endpoint.
+      capabilityProfile: state.providers[0].capabilityProfile,
+      modelCatalog: state.providers[0].modelCatalog,
     }), encrypt, NOW + 100)
 
     expect(saved).toMatchObject({ credentialChanged: true, connectionChanged: true })
     expect(state.providers[0]).toMatchObject({ baseUrl: 'https://relay-two.example/v1', models: ['new-model'] })
+    expect(state.providers[0].capabilityProfile).toMatchObject({ origin: 'inferred' })
+    expect(state.providers[0].capabilityProfile?.checkedAt).toBeUndefined()
+    expect(state.providers[0].modelCatalog).toEqual([
+      expect.objectContaining({ id: 'new-model' }),
+    ])
     expect(state.credentials[created.credentialId]).toBe('encrypted:replacement-key-9876')
     expect(state.accounts[0]).toMatchObject({
       status: 'active',
@@ -495,6 +616,13 @@ function relayInput(overrides: Partial<ApiSourceInput> = {}): ApiSourceInput {
     protocol: 'openai-responses',
     ...overrides
   })
+}
+
+function withResponsesCompactMode(
+  input: ApiSourceInput,
+  mode: ResponsesCompactMode | 'future-mode'
+): ApiSourceInput {
+  return { ...input, responsesCompactMode: mode } as ApiSourceInput
 }
 
 function aggregateInput(members: AggregateRelayInput['members']): AggregateRelayInput {

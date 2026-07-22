@@ -105,6 +105,87 @@ describe('ClientConfigService', () => {
     expect(JSON.parse(await readFile(service.paths.codex.auth.path, 'utf8')).OPENAI_API_KEY).toBe('second-token')
   })
 
+  it('backs up both Codex files before restoring official login and cached sessions', async () => {
+    const originalConfig = [
+      'model = "gpt-5.6"',
+      'model_provider = "stone"',
+      'cli_auth_credentials_store = "file"',
+      '[features]',
+      'multi_agent = true',
+      'remote_compaction_v2 = false',
+      '[model_providers.stone]',
+      'base_url = "http://127.0.0.1:15721/v1"',
+      '',
+    ].join('\n')
+    const originalAuth = JSON.stringify({
+      auth_mode: 'apikey',
+      OPENAI_API_KEY: 'stone-token',
+      tokens: { refresh_token: 'official-refresh' },
+      keep: { value: true },
+    }, null, 2) + '\n'
+    await mkdir(service.paths.codex.directory, { recursive: true })
+    await writeFile(service.paths.codex.config.path, originalConfig)
+    await writeFile(service.paths.codex.auth.path, originalAuth)
+
+    const result = await service.restoreCodexOfficialLogin({ backupRetention: 10 })
+
+    expect(result.changedFiles).toEqual([
+      service.paths.codex.config.path,
+      service.paths.codex.auth.path,
+    ])
+    expect(result.backups).toHaveLength(2)
+    expect(new Set(result.backups.map((backup) => backup.groupId)).size).toBe(1)
+    const backupContents = Object.fromEntries(await Promise.all(result.backups.map(async (backup) => [
+      backup.role,
+      await readFile(backup.backupPath, 'utf8'),
+    ])))
+    expect(backupContents).toEqual({
+      'codex-config': originalConfig,
+      'codex-auth': originalAuth,
+    })
+    const config = await readFile(service.paths.codex.config.path, 'utf8')
+    const auth = JSON.parse(await readFile(service.paths.codex.auth.path, 'utf8'))
+    expect(config).toContain('model_provider = "openai"')
+    expect(config).toContain('model = "gpt-5.6"')
+    expect(config).toContain('multi_agent = true')
+    expect(config).not.toContain('model_providers.stone')
+    expect(auth).toEqual({
+      auth_mode: 'chatgpt',
+      tokens: { refresh_token: 'official-refresh' },
+      keep: { value: true },
+    })
+
+    const idempotent = await service.restoreCodexOfficialLogin()
+    expect(idempotent.changedFiles).toEqual([])
+    expect(idempotent.backups).toEqual([])
+  })
+
+  it('rolls back the Codex config if restoring the official auth file cannot be committed', async () => {
+    let writeSequence = 0
+    const sabotaged = new ClientConfigService({
+      homeDir,
+      platform: process.platform,
+      now: () => fixedDate,
+      randomId: () => {
+        writeSequence += 1
+        return writeSequence === 2 ? 'missing/subdirectory' : `official-${writeSequence}`
+      },
+    })
+    const originalConfig = 'model_provider = "stone"\n[model_providers.stone]\nbase_url = "http://localhost/v1"\n'
+    const originalAuth = '{"auth_mode":"apikey","OPENAI_API_KEY":"stone","tokens":{"refresh_token":"keep"}}\n'
+    await mkdir(sabotaged.paths.codex.directory, { recursive: true })
+    await writeFile(sabotaged.paths.codex.config.path, originalConfig)
+    await writeFile(sabotaged.paths.codex.auth.path, originalAuth)
+
+    await expect(sabotaged.restoreCodexOfficialLogin()).rejects.toBeDefined()
+
+    expect(await readFile(sabotaged.paths.codex.config.path, 'utf8')).toBe(originalConfig)
+    expect(await readFile(sabotaged.paths.codex.auth.path, 'utf8')).toBe(originalAuth)
+    const backups = await sabotaged.listBackups('codex')
+    expect(backups).toHaveLength(2)
+    expect(new Set(backups.map((backup) => backup.groupId)).size).toBe(1)
+  })
+
   it('scopes a profile to a custom directory without touching the default client path', async () => {
     const customDirectory = join(homeDir, 'profiles', 'work-claude')
     const scoped = service.withOverrides({ claudeDirectory: customDirectory })

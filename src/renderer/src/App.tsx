@@ -47,6 +47,7 @@ import {
   type UpdateAction,
 } from './UpdateDialog'
 import { useI18n } from './i18n'
+import { applyRuntimeDelta, shouldAcceptSnapshotRevision } from './runtime-delta'
 
 export type PageId = 'overview' | 'setup' | 'providers' | 'proxies' | 'pools' | 'routes' | 'clients' | 'session-repair' | 'tunnel' | 'browser' | 'diagnostics' | 'requests' | 'settings' | 'help'
 export type ActionRunner = (key: string, operation: () => Promise<AppSnapshot>) => Promise<boolean>
@@ -61,7 +62,7 @@ const desktopTunnelSupported = !window.stone || window.stonePlatform === 'win32'
 const allNavigation: Array<{ id: PageId; label: readonly [string, string]; icon: typeof Activity }> = [
   { id: 'overview', label: ['总览', 'Overview'], icon: CircleGauge },
   { id: 'providers', label: ['账号与中转', 'Accounts & Relays'], icon: Boxes },
-  { id: 'proxies', label: ['出口代理', 'Outbound Proxies'], icon: Waypoints },
+  { id: 'proxies', label: ['代理', 'Proxies'], icon: Waypoints },
   { id: 'pools', label: ['号池', 'Pools'], icon: Network },
   { id: 'routes', label: ['路由', 'Routes'], icon: RouteIcon },
   { id: 'clients', label: ['客户端配置', 'Client Configuration'], icon: MonitorCog },
@@ -107,6 +108,7 @@ export default function App() {
   const [updateError, setUpdateError] = useState<string | null>(null)
   const [updateDialogOpen, setUpdateDialogOpen] = useState(false)
   const updateRevision = useRef(-1)
+  const runtimeRevision = useRef(-1)
   const scrollbarHideTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
 
   const acceptUpdateState = useCallback((next: AppUpdateState) => {
@@ -115,19 +117,40 @@ export default function App() {
     setUpdateState(next)
   }, [])
 
+  const acceptSnapshot = useCallback((next: AppSnapshot) => {
+    if (next.runtimeRevision !== undefined) {
+      if (!shouldAcceptSnapshotRevision(runtimeRevision.current, next.runtimeRevision)) return
+      runtimeRevision.current = next.runtimeRevision
+    }
+    setSnapshot(next)
+  }, [])
+
   const load = useCallback(async () => {
     setError(null)
     try {
-      setSnapshot(await api.getSnapshot())
+      acceptSnapshot(await api.getSnapshot())
     } catch (cause) {
       setError(localizedError(cause, t('无法连接本地服务', 'Unable to connect to the local service'), language))
     }
-  }, [api, language, t])
+  }, [acceptSnapshot, api, language, t])
 
   useEffect(() => {
     void load()
-    return api.onSnapshot(setSnapshot)
-  }, [api, load])
+    const unsubscribeSnapshot = api.onSnapshot(acceptSnapshot)
+    const unsubscribeRuntime = api.onRuntimeDelta((delta) => {
+      if (delta.revision <= runtimeRevision.current) return
+      if (runtimeRevision.current < 0 || delta.revision !== runtimeRevision.current + 1) {
+        void load()
+        return
+      }
+      runtimeRevision.current = delta.revision
+      setSnapshot((current) => current ? applyRuntimeDelta(current, delta) : current)
+    })
+    return () => {
+      unsubscribeSnapshot()
+      unsubscribeRuntime()
+    }
+  }, [acceptSnapshot, api, load])
 
   useEffect(() => {
     const refreshVisibleSnapshot = () => {
@@ -179,7 +202,7 @@ export default function App() {
     setBusyKeys((current) => new Set(current).add(key))
     setError(null)
     try {
-      setSnapshot(await operation())
+      acceptSnapshot(await operation())
       return true
     } catch (cause) {
       setError(localizedError(cause, t('操作失败，请稍后重试', 'The operation failed. Please try again later.'), language))
@@ -191,7 +214,7 @@ export default function App() {
         return next
       })
     }
-  }, [language, t])
+  }, [acceptSnapshot, language, t])
 
   const repairSessionsAndRestartChatGpt = useCallback(async () => {
     const key = 'chatgpt-repair-restart'
@@ -200,7 +223,7 @@ export default function App() {
     try {
       await api.repairCodexSessionsAndRestartChatGpt()
     } catch (cause) {
-      setError(localizedError(cause, t('会话修复或 ChatGPT 重启失败', 'Session repair or ChatGPT restart failed'), language))
+      setError(localizedError(cause, t('关闭、修复或重新开启 Codex 失败', 'Closing, repairing, or reopening Codex failed'), language))
     } finally {
       setBusyKeys((current) => {
         const next = new Set(current)
@@ -486,8 +509,8 @@ export default function App() {
             <button
               className="topbar__chatgpt-restart"
               type="button"
-              aria-label={t('修复会话并重启 ChatGPT', 'Repair sessions and restart ChatGPT')}
-              title={t('修复 Codex 会话并重启 ChatGPT', 'Repair Codex sessions and restart ChatGPT')}
+              aria-label={t('关闭 Codex、修复会话、重新开启', 'Close Codex, repair sessions, and reopen it')}
+              title={t('关闭 Codex → 修复会话 → 重新开启', 'Close Codex → Repair sessions → Reopen')}
               disabled={chatGptRepairBusy}
               onClick={() => void repairSessionsAndRestartChatGpt()}
             >

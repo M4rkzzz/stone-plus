@@ -1,4 +1,5 @@
 export { createGatewayServer, GatewayServer } from './server'
+export { RequestReplayStore } from './request-replay'
 export {
   accountAllowsModel,
   poolAllowsModel,
@@ -7,6 +8,7 @@ export {
   PoolScheduler
 } from './scheduler'
 export {
+  analyzeProtocolConversion,
   convertRequest,
   convertResponse,
   getRequestModel,
@@ -37,8 +39,10 @@ export type {
   GatewayController,
   GatewayLogHandler,
   GatewayRuntimeStateHandler,
+  GatewayRuntimeStateUpdate,
   GatewayServerOptions,
   ProtocolRequest,
+  ResolvedGatewayCredential,
   ScheduledAccount,
   SchedulerSelectionInput
 } from './types'

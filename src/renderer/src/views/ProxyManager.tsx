@@ -91,7 +91,7 @@ export function ProxyManager({
   return (
     <>
       <div className="proxy-toolbar">
-        <div><strong>{t('可复用出口', 'Reusable proxies')}</strong></div>
+        <div><strong>{t('可复用代理', 'Reusable proxies')}</strong></div>
         <button className="button button--primary" type="button" onClick={() => openProxy()}><Plus size={16} />{t('添加代理', 'Add proxy')}</button>
       </div>
 
@@ -115,11 +115,11 @@ export function ProxyManager({
             </table>
           </div>
         </section>
-      ) : <section className="panel"><EmptyState icon={<Network size={25} />} title={t('尚未配置出口代理', 'No exit proxies configured')} action={<button className="button button--primary" type="button" onClick={() => openProxy()}><Plus size={16} />{t('添加代理', 'Add proxy')}</button>} /></section>}
+      ) : <section className="panel"><EmptyState icon={<Network size={25} />} title={t('尚未配置代理', 'No proxies configured')} action={<button className="button button--primary" type="button" onClick={() => openProxy()}><Plus size={16} />{t('添加代理', 'Add proxy')}</button>} /></section>}
 
       <Modal
         open={modalOpen}
-        title={draft.id ? t('编辑出口代理', 'Edit exit proxy') : t('添加出口代理', 'Add exit proxy')}
+        title={draft.id ? t('编辑代理', 'Edit proxy') : t('添加代理', 'Add proxy')}
         description={t('入口地址仅保存在本机；检测后显示代理的公网出口 IP', 'The endpoint is stored only on this device. A check reveals the proxy\'s public exit IP.')}
         onClose={closeProxy}
         width="large"
@@ -137,7 +137,7 @@ export function ProxyManager({
         </form>
       </Modal>
 
-      <ConfirmDialog open={Boolean(deleteTarget)} title={t('删除出口代理', 'Delete exit proxy')} message={t(`确定删除“${deleteTarget?.name ?? ''}”吗？被账号或号池引用时无法删除。`, `Delete “${deleteTarget?.name ?? ''}”? A proxy referenced by an account or pool cannot be deleted.`)} busy={busyKeys.has('delete-proxy')} onCancel={() => setDeleteTarget(null)} onConfirm={() => void remove()} />
+      <ConfirmDialog open={Boolean(deleteTarget)} title={t('删除代理', 'Delete proxy')} message={t(`确定删除“${deleteTarget?.name ?? ''}”吗？被账号或号池引用时无法删除。`, `Delete “${deleteTarget?.name ?? ''}”? A proxy referenced by an account or pool cannot be deleted.`)} busy={busyKeys.has('delete-proxy')} onCancel={() => setDeleteTarget(null)} onConfirm={() => void remove()} />
     </>
   )
 }

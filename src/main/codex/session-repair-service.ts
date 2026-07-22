@@ -11,6 +11,7 @@ import type {
   CodexSessionRepairTargetSource,
 } from '@shared/types'
 import { atomicWriteFile } from '../client-config/filesystem'
+import { acquireCodexSessionMaintenanceLock } from './session-maintenance-lock'
 
 const DEFAULT_PROVIDER = 'openai'
 const BACKUP_KEEP_COUNT = 5
@@ -18,6 +19,7 @@ const BACKUP_MARKER = 'Stone+ session repair'
 const PROVIDER_PATTERN = /^[A-Za-z0-9_.-]+$/
 const SQLITE_EXTENSIONS = new Set(['.db', '.sqlite', '.sqlite3'])
 const ROLLOUT_SCAN_BYTES = 1024 * 1024
+const GLOBAL_STATE_FILE = '.codex-global-state.json'
 
 interface SessionRepairServiceOptions {
   codexHome: string
@@ -61,12 +63,23 @@ interface DatabasePlan {
   changes: DatabaseThreadChange[]
 }
 
+interface GlobalStatePlan {
+  path: string
+  originalBytes: Buffer
+  originalHash: string
+  nextText: string
+  nextHash: string
+  changedFields: string[]
+  conflictingFields: string[]
+}
+
 interface RepairPlan {
   targetProvider: string
   currentProvider: string
   targets: CodexSessionRepairTarget[]
   rollouts: RolloutPlan[]
   databases: DatabasePlan[]
+  globalState?: GlobalStatePlan
   skippedFiles: string[]
   revision: string
 }
@@ -101,24 +114,34 @@ export class CodexSessionRepairService {
     }
     if (this.active) throw new Error('已有会话修复正在运行。')
     this.active = true
+    let releaseLock: (() => Promise<void>) | undefined
     try {
+      releaseLock = await acquireCodexSessionMaintenanceLock(this.codexHome, 'provider-sync', this.now(), this.randomId())
       const plan = await this.buildPlan(provider)
       if (plan.revision !== expectedRevision) {
         throw new Error('Codex 会话数据已在预览后发生变化；为避免覆盖新内容，本次修复已中止，请重新预览。')
       }
       const changedRollouts = plan.rollouts.filter((item) => item.rewriteNeeded)
       const changedDatabases = plan.databases.filter((item) => item.changes.length > 0)
-      if (!changedRollouts.length && !changedDatabases.length) {
+      const changedGlobalState = plan.globalState?.changedFields.length ? plan.globalState : undefined
+      if (!changedRollouts.length && !changedDatabases.length && !changedGlobalState) {
         return resultFor(plan, undefined)
       }
 
       await this.assertRolloutsUnchanged(changedRollouts)
-      const backupPath = await this.createBackup(plan, changedRollouts, changedDatabases)
+      if (changedGlobalState) await this.assertGlobalStateUnchanged(changedGlobalState)
+      const backupPath = await this.createBackup(plan, changedRollouts, changedDatabases, changedGlobalState)
       const writtenRollouts: RolloutPlan[] = []
       const writtenDatabases: DatabasePlan[] = []
+      let writtenGlobalState: GlobalStatePlan | undefined
       try {
         for (const rollout of changedRollouts) {
-          const rewritten = await rewriteRollout(rollout.path, plan.targetProvider)
+          const backupBytes = await readFile(join(backupPath, 'rollouts', rollout.relativePath))
+          const currentBytes = await readFile(rollout.path)
+          if (!currentBytes.equals(backupBytes)) {
+            throw new Error(`会话文件在备份后发生变化，未覆盖新内容：${rollout.relativePath}`)
+          }
+          const rewritten = rewriteRollout(decodeUtf8(currentBytes, rollout.relativePath), plan.targetProvider)
           rollout.nextHash = rewritten.nextHash
           await atomicWriteFile(rollout.path, rewritten.nextText, this.randomId)
           await preserveMtime(rollout)
@@ -128,8 +151,13 @@ export class CodexSessionRepairService {
           this.applyDatabasePlan(database)
           writtenDatabases.push(database)
         }
+        if (changedGlobalState) {
+          await this.assertGlobalStateUnchanged(changedGlobalState)
+          await atomicWriteFile(changedGlobalState.path, changedGlobalState.nextText, this.randomId)
+          writtenGlobalState = changedGlobalState
+        }
       } catch (error) {
-        const rollbackFailures = await this.rollback(writtenRollouts, writtenDatabases, backupPath)
+        const rollbackFailures = await this.rollback(writtenRollouts, writtenDatabases, writtenGlobalState, backupPath)
         const suffix = rollbackFailures.length
           ? `；部分自动回滚失败，请从备份目录恢复：${backupPath}`
           : `；已自动回滚，备份保留在：${backupPath}`
@@ -143,6 +171,7 @@ export class CodexSessionRepairService {
       }
       return { ...resultFor(plan, backupPath), ...(retentionWarning ? { retentionWarning } : {}) }
     } finally {
+      await releaseLock?.().catch(() => undefined)
       this.active = false
     }
   }
@@ -176,9 +205,10 @@ export class CodexSessionRepairService {
     const databases = (await this.findSessionDatabases()).map((path) => (
       this.readDatabasePlan(path, targetProvider, userEventThreadIds, cwdByThreadId)
     ))
+    const globalState = await this.readGlobalStatePlan()
     const targets = await this.buildTargets(currentProvider, rollouts, databases)
-    const revision = revisionFor(targetProvider, rollouts, databases)
-    return { targetProvider, currentProvider, targets, rollouts, databases, skippedFiles, revision }
+    const revision = revisionFor(targetProvider, rollouts, databases, globalState)
+    return { targetProvider, currentProvider, targets, rollouts, databases, globalState, skippedFiles, revision }
   }
 
   private async readCurrentProvider(): Promise<string> {
@@ -377,6 +407,36 @@ export class CodexSessionRepairService {
     }
   }
 
+  private async readGlobalStatePlan(): Promise<GlobalStatePlan | undefined> {
+    const path = join(this.codexHome, GLOBAL_STATE_FILE)
+    let originalBytes: Buffer
+    try {
+      originalBytes = await readFile(path)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+      throw new Error(`无法读取 Codex 全局状态：${messageOf(error)}`)
+    }
+    let value: unknown
+    const originalText = decodeUtf8(originalBytes, GLOBAL_STATE_FILE)
+    try {
+      value = JSON.parse(originalText)
+    } catch (error) {
+      throw new Error(`无法解析 Codex 全局状态：${messageOf(error)}`)
+    }
+    if (!isRecord(value)) throw new Error('Codex 全局状态必须是 JSON 对象。')
+    const normalized = normalizeGlobalWorkspaceState(value)
+    const nextText = stringifyJsonLikeOriginal(normalized.value, originalText)
+    return {
+      path,
+      originalBytes,
+      originalHash: sha256(originalBytes),
+      nextText,
+      nextHash: sha256(nextText),
+      changedFields: normalized.changedFields,
+      conflictingFields: normalized.conflictingFields,
+    }
+  }
+
   private async assertRolloutsUnchanged(rollouts: RolloutPlan[]): Promise<void> {
     for (const rollout of rollouts) {
       if (await fastRolloutFingerprint(rollout.path) !== rollout.originalHash) {
@@ -385,10 +445,23 @@ export class CodexSessionRepairService {
     }
   }
 
+  private async assertGlobalStateUnchanged(plan: GlobalStatePlan): Promise<void> {
+    let current: Buffer
+    try {
+      current = await readFile(plan.path)
+    } catch (error) {
+      throw new Error(`Codex 全局状态在修复前发生变化，请重新预览：${messageOf(error)}`)
+    }
+    if (!current.equals(plan.originalBytes)) {
+      throw new Error('Codex 全局状态已在预览后发生变化；为避免覆盖新工作区，本次修复已中止，请重新预览。')
+    }
+  }
+
   private async createBackup(
     plan: RepairPlan,
     rollouts: RolloutPlan[],
     databases: DatabasePlan[],
+    globalState?: GlobalStatePlan,
   ): Promise<string> {
     const backupRoot = join(this.codexHome, 'backups_state', 'stone-session-repair')
     const backupPath = join(backupRoot, `${timestampName(this.now())}-${this.randomId()}`)
@@ -409,9 +482,18 @@ export class CodexSessionRepairService {
         database.close()
       }
     }
-    for (const name of ['config.toml', '.codex-global-state.json']) {
+    for (const name of ['config.toml']) {
       try {
         await copyFile(join(this.codexHome, name), join(backupPath, name))
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      }
+    }
+    if (globalState) {
+      await writeFile(join(backupPath, GLOBAL_STATE_FILE), globalState.originalBytes, { mode: 0o600 })
+    } else {
+      try {
+        await copyFile(join(this.codexHome, GLOBAL_STATE_FILE), join(backupPath, GLOBAL_STATE_FILE))
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
       }
@@ -425,6 +507,8 @@ export class CodexSessionRepairService {
       revision: plan.revision,
       changedRolloutFiles: rollouts.map((item) => item.relativePath),
       changedDatabases: databases.map((item) => item.relativePath),
+      changedGlobalStateFields: globalState?.changedFields ?? [],
+      conflictingGlobalStateFields: globalState?.conflictingFields ?? [],
     }, null, 2), { encoding: 'utf8', mode: 0o600 })
     return backupPath
   }
@@ -495,8 +579,22 @@ export class CodexSessionRepairService {
     }
   }
 
-  private async rollback(rollouts: RolloutPlan[], databases: DatabasePlan[], backupPath: string): Promise<string[]> {
+  private async rollback(
+    rollouts: RolloutPlan[],
+    databases: DatabasePlan[],
+    globalState: GlobalStatePlan | undefined,
+    backupPath: string,
+  ): Promise<string[]> {
     const failures: string[] = []
+    if (globalState) {
+      try {
+        if (await sha256File(globalState.path) !== globalState.nextHash) {
+          failures.push(globalState.path)
+        } else {
+          await atomicWriteFile(globalState.path, await readFile(join(backupPath, GLOBAL_STATE_FILE)), this.randomId)
+        }
+      } catch { failures.push(globalState.path) }
+    }
     for (const database of [...databases].reverse()) {
       try { this.rollbackDatabasePlan(database) } catch { failures.push(database.path) }
     }
@@ -564,6 +662,8 @@ function previewFor(plan: RepairPlan, codexHome: string): CodexSessionRepairPrev
     sqliteProviderRowsToUpdate: providerRows,
     sqliteUserEventRowsToUpdate: userEventRows,
     sqliteCwdRowsToUpdate: cwdRows,
+    globalStateFieldsToUpdate: plan.globalState?.changedFields.length ?? 0,
+    globalStateConflictingFields: plan.globalState?.conflictingFields ?? [],
     encryptedSessionFiles: plan.rollouts.filter((item) => item.encryptedContent && item.providers.some((provider) => provider !== plan.targetProvider)).length,
     encryptedSourceProviders: [...encryptedProviders].sort(),
   }
@@ -577,6 +677,8 @@ function resultFor(plan: RepairPlan, backupPath: string | undefined): CodexSessi
     sqliteProviderRowsUpdated: preview.sqliteProviderRowsToUpdate,
     sqliteUserEventRowsUpdated: preview.sqliteUserEventRowsToUpdate,
     sqliteCwdRowsUpdated: preview.sqliteCwdRowsToUpdate,
+    globalStateFieldsUpdated: preview.globalStateFieldsToUpdate,
+    globalStateConflictingFields: preview.globalStateConflictingFields,
     skippedFiles: plan.skippedFiles,
     encryptedSessionFiles: preview.encryptedSessionFiles,
     encryptedSourceProviders: preview.encryptedSourceProviders,
@@ -584,7 +686,12 @@ function resultFor(plan: RepairPlan, backupPath: string | undefined): CodexSessi
   }
 }
 
-function revisionFor(targetProvider: string, rollouts: RolloutPlan[], databases: DatabasePlan[]): string {
+function revisionFor(
+  targetProvider: string,
+  rollouts: RolloutPlan[],
+  databases: DatabasePlan[],
+  globalState: GlobalStatePlan | undefined,
+): string {
   return sha256(JSON.stringify({
     targetProvider,
     rollouts: rollouts.map((item) => [item.relativePath, item.originalHash, item.rewriteNeeded]),
@@ -600,11 +707,16 @@ function revisionFor(targetProvider: string, rollouts: RolloutPlan[], databases:
         change.nextCwd,
       ]),
     ]),
+    globalState: globalState?.changedFields.length ? [
+      globalState.originalHash,
+      globalState.nextHash,
+      globalState.changedFields,
+      globalState.conflictingFields,
+    ] : null,
   }))
 }
 
-async function rewriteRollout(path: string, targetProvider: string): Promise<{ nextText: string; nextHash: string }> {
-  const originalText = await readFile(path, 'utf8')
+function rewriteRollout(originalText: string, targetProvider: string): { nextText: string; nextHash: string } {
   const output: string[] = []
   let offset = 0
   while (offset < originalText.length) {
@@ -707,8 +819,136 @@ function normalizeWorkspacePath(value: string): string | undefined {
   const path = value.trim()
   if (!path) return undefined
   if (path.toLowerCase().startsWith('\\\\?\\unc\\')) return `\\\\${path.slice(8).replaceAll('/', '\\')}`
-  if (path.startsWith('\\\\?\\')) return path.slice(4)
+  if (path.startsWith('\\\\?\\')) return path.slice(4).replaceAll('\\', '/')
   return path
+}
+
+function normalizeGlobalWorkspaceState(value: Record<string, unknown>): {
+  value: Record<string, unknown>
+  changedFields: string[]
+  conflictingFields: string[]
+} {
+  const next = { ...value }
+  const changedFields: string[] = []
+  const conflictingFields: string[] = []
+  const replace = (field: string, normalized: unknown) => {
+    if (!jsonEqual(value[field], normalized)) {
+      next[field] = normalized
+      changedFields.push(field)
+    }
+  }
+  for (const field of ['electron-saved-workspace-roots', 'project-order']) {
+    if (!Object.hasOwn(value, field)) continue
+    const paths = workspacePathArray(value[field])
+    if (!paths) {
+      conflictingFields.push(field)
+      continue
+    }
+    replace(field, dedupeWorkspacePaths(paths))
+  }
+  const activeField = 'active-workspace-roots'
+  if (Object.hasOwn(value, activeField)) {
+    const paths = workspacePathArray(value[activeField])
+    if (!paths) {
+      conflictingFields.push(activeField)
+    } else {
+      const normalized = dedupeWorkspacePaths(paths)
+      replace(activeField, Array.isArray(value[activeField]) ? normalized : (normalized[0] ?? value[activeField]))
+    }
+  }
+  const labelsField = 'electron-workspace-root-labels'
+  if (Object.hasOwn(value, labelsField)) {
+    if (!isRecord(value[labelsField])) {
+      conflictingFields.push(labelsField)
+    } else {
+      const normalized = normalizePathKeyedRecord(value[labelsField])
+      if (normalized.conflict) conflictingFields.push(labelsField)
+      else replace(labelsField, normalized.value)
+    }
+  }
+  const openTargetField = 'open-in-target-preferences'
+  if (Object.hasOwn(value, openTargetField) && isRecord(value[openTargetField])) {
+    const openTargets = value[openTargetField]
+    if (Object.hasOwn(openTargets, 'perPath')) {
+      const conflictField = `${openTargetField}.perPath`
+      if (!isRecord(openTargets.perPath)) {
+        conflictingFields.push(conflictField)
+      } else {
+        const normalized = normalizePathKeyedRecord(openTargets.perPath)
+        if (normalized.conflict) conflictingFields.push(conflictField)
+        else replace(openTargetField, { ...openTargets, perPath: normalized.value })
+      }
+    }
+  }
+  return {
+    value: next,
+    changedFields: [...new Set(changedFields)].sort(),
+    conflictingFields: [...new Set(conflictingFields)].sort(),
+  }
+}
+
+function workspacePathArray(value: unknown): string[] | undefined {
+  if (typeof value === 'string') return value.trim() ? [value] : []
+  if (!Array.isArray(value) || value.some((item) => typeof item !== 'string')) return undefined
+  return value.filter((item): item is string => typeof item === 'string' && Boolean(item.trim()))
+}
+
+function dedupeWorkspacePaths(paths: string[]): string[] {
+  const seen = new Set<string>()
+  const result: string[] = []
+  for (const path of paths) {
+    const normalized = normalizeWorkspacePath(path)
+    if (!normalized) continue
+    const comparable = normalized.replaceAll('/', '\\').replace(/\\+$/g, '').toLowerCase()
+    if (seen.has(comparable)) continue
+    seen.add(comparable)
+    result.push(normalized)
+  }
+  return result
+}
+
+function normalizePathKeyedRecord(value: Record<string, unknown>): {
+  value: Record<string, unknown>
+  conflict: boolean
+} {
+  const normalized: Record<string, unknown> = {}
+  const canonicalByComparable = new Map<string, string>()
+  for (const [path, item] of Object.entries(value)) {
+    const nextPath = normalizeWorkspacePath(path)
+    if (!nextPath) return { value, conflict: true }
+    const comparable = nextPath.replaceAll('/', '\\').replace(/\\+$/g, '').toLowerCase()
+    const existingKey = canonicalByComparable.get(comparable)
+    if (existingKey) {
+      if (!jsonEqual(normalized[existingKey], item)) return { value, conflict: true }
+      continue
+    }
+    canonicalByComparable.set(comparable, nextPath)
+    normalized[nextPath] = item
+  }
+  return { value: normalized, conflict: false }
+}
+
+function stringifyJsonLikeOriginal(value: Record<string, unknown>, original: string): string {
+  const newline = original.includes('\r\n') ? '\r\n' : '\n'
+  let text = JSON.stringify(value, null, 2)
+  if (newline === '\r\n') text = text.replaceAll('\n', '\r\n')
+  return original.endsWith('\n') ? text + newline : text
+}
+
+function decodeUtf8(value: Uint8Array, name: string): string {
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(value)
+  } catch {
+    throw new Error(`${name} 不是有效的 UTF-8 文件。`)
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+}
+
+function jsonEqual(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) === JSON.stringify(right)
 }
 
 function safeRelative(root: string, path: string): string {
@@ -733,8 +973,11 @@ function timestampName(date: Date): string {
   return date.toISOString().replace(/[-:TZ.]/g, '').slice(0, 17)
 }
 
-function sha256(value: string): string {
-  return createHash('sha256').update(value, 'utf8').digest('hex')
+function sha256(value: string | Uint8Array): string {
+  const hash = createHash('sha256')
+  if (typeof value === 'string') hash.update(value, 'utf8')
+  else hash.update(value)
+  return hash.digest('hex')
 }
 
 function isLockedError(error: unknown): boolean {

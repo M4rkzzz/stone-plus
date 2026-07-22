@@ -332,6 +332,38 @@ function setInlineTableChild(lines: string[], parent: string, key: string, value
   return true
 }
 
+function removeInlineTableChild(lines: string[], parent: string, key: string): boolean {
+  const assignment = locatedAssignments(lines)
+    .find((statement) => samePath(statement.absolutePath, [parent]))
+  if (!assignment) return false
+  const statement = lines.slice(assignment.start, assignment.end + 1).join('\n')
+  const bounds = inlineTableValueBounds(statement)
+  if (!bounds) return false
+  const inner = statement.slice(bounds.open + 1, bounds.close)
+  const child = inlineTableChildRange(inner, key)
+  if (!child) return false
+
+  let nextInner: string
+  if (inner[child.end] === ',') {
+    // The previous comma, when present, still separates the surrounding items.
+    nextInner = inner.slice(0, child.start) + inner.slice(child.end + 1)
+  } else {
+    // The last item has no following comma, so remove its preceding separator.
+    const before = inner.slice(0, child.start)
+    const separator = before.lastIndexOf(',')
+    const trailingWhitespace = inner.slice(child.start, child.end).match(/\s*$/)?.[0] ?? ''
+    nextInner = separator >= 0 && !before.slice(separator + 1).trim()
+      ? before.slice(0, separator) + trailingWhitespace + inner.slice(child.end)
+      : before + inner.slice(child.end)
+  }
+
+  const nextStatement = statement.slice(0, bounds.open + 1)
+    + nextInner
+    + statement.slice(bounds.close)
+  lines.splice(assignment.start, assignment.end - assignment.start + 1, ...nextStatement.split('\n'))
+  return true
+}
+
 function setPath(lines: string[], path: string[], value: TomlValue): void {
   const existing = locatedAssignments(lines).find((statement) => samePath(statement.absolutePath, path))
   if (existing) {
@@ -355,7 +387,37 @@ function setPath(lines: string[], path: string[], value: TomlValue): void {
 
 function removePath(lines: string[], path: string[]): void {
   const existing = locatedAssignments(lines).find((statement) => samePath(statement.absolutePath, path))
-  if (existing) lines.splice(existing.start, existing.end - existing.start + 1)
+  if (existing) {
+    lines.splice(existing.start, existing.end - existing.start + 1)
+    return
+  }
+  if (path.length === 2) removeInlineTableChild(lines, path[0], path[1])
+}
+
+function pathStartsWith(path: string[] | undefined, prefix: string[]): boolean {
+  return Boolean(path && path.length >= prefix.length && prefix.every((part, index) => path[index] === part))
+}
+
+/** Remove a TOML table in section, dotted-assignment, or inline-table form. */
+function removeTableTree(lines: string[], path: string[]): void {
+  const tableSections = analyzeStatements(lines)
+    .filter((statement) => statement.kind === 'header' && pathStartsWith(statement.path, path))
+    .map((header) => {
+      const nextHeader = analyzeStatements(lines)
+        .find((statement) => statement.kind === 'header' && statement.start > header.start)
+      return { start: header.start, end: nextHeader?.start ?? lines.length }
+    })
+    .sort((left, right) => right.start - left.start)
+  for (const section of tableSections) lines.splice(section.start, section.end - section.start)
+
+  const dottedAssignments = locatedAssignments(lines)
+    .filter((statement) => pathStartsWith(statement.absolutePath, path))
+    .sort((left, right) => right.start - left.start)
+  for (const assignment of dottedAssignments) {
+    lines.splice(assignment.start, assignment.end - assignment.start + 1)
+  }
+
+  if (path.length === 2) removeInlineTableChild(lines, path[0], path[1])
 }
 
 function replaceValue(line: string, value: TomlValue): string {
@@ -537,6 +599,33 @@ export function repairCodexToml(content: string | undefined, baseUrl: string): T
       throw error
     }
   }
+}
+
+/**
+ * Return Codex to its built-in OpenAI provider without disturbing models, MCP,
+ * projects, profiles, or unrelated providers. The compact override is removed
+ * only when it still has the exact value Stone+ writes.
+ */
+export function planCodexOfficialLoginToml(content: string | undefined): TextMutation {
+  const source = content ?? ''
+  const root = parseCodexToml(source)
+  const features = tomlObject(root.features)
+  const eol = source.includes('\r\n') ? '\r\n' : '\n'
+  const trailingNewline = content === undefined || /\r?\n$/.test(source)
+  const lines = source === '' ? [] : source.split(/\r?\n/)
+  if (lines.at(-1) === '') lines.pop()
+
+  setPath(lines, ['model_provider'], 'openai')
+  removePath(lines, ['cli_auth_credentials_store'])
+  if (features?.remote_compaction_v2 === false) {
+    removePath(lines, ['features', 'remote_compaction_v2'])
+  }
+  removeTableTree(lines, ['model_providers', 'stone'])
+
+  let next = lines.join(eol)
+  if (trailingNewline && next !== '') next += eol
+  parseCodexToml(next)
+  return { content: next, changed: next !== content }
 }
 
 function tomlObject(value: unknown): Record<string, unknown> | undefined {
