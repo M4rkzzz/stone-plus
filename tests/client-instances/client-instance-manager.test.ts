@@ -9,6 +9,8 @@ import {
   type ClientInstanceProcess,
 } from '../../src/main/client-instances'
 
+const expectedDefaultLaunchMode = process.platform === 'win32' ? 'terminal' : 'background'
+
 class MemoryMetadata {
   readonly values = new Map<string, string>()
   writes = 0
@@ -86,11 +88,16 @@ describe('ClientInstanceManager', () => {
     })
     const id = instances[0].id
     instances = await manager.start(id)
-    expect(instances[0]).toMatchObject({ status: 'running', pid: 4242, launchMode: 'terminal', processAlive: true })
+    expect(instances[0]).toMatchObject({
+      status: 'running',
+      pid: 4242,
+      launchMode: expectedDefaultLaunchMode,
+      processAlive: true
+    })
     expect(spawn).toHaveBeenCalledWith(executable, ['--search'], expect.objectContaining({
       cwd: workingDirectory,
       env: expect.objectContaining({ CODEX_HOME: configDirectory, OPENAI_BASE_URL: 'http://127.0.0.1:15721/v1' }),
-      launchMode: 'terminal'
+      launchMode: expectedDefaultLaunchMode
     }))
     await manager.stop(id)
     await vi.waitFor(() => expect(manager.list()[0].status).toBe('stopped'))
@@ -131,7 +138,7 @@ describe('ClientInstanceManager', () => {
     })
   })
 
-  it('keeps legacy definitions in background mode while new instances default to terminal mode', async () => {
+  it('keeps legacy definitions in background mode while new instances use the platform-safe default', async () => {
     const root = await mkdtemp(join(tmpdir(), 'stone-client-instance-legacy-'))
     directories.push(root)
     const metadata = new MemoryMetadata()
@@ -142,7 +149,7 @@ describe('ClientInstanceManager', () => {
     const manager = new ClientInstanceManager({ store: metadata })
     expect(manager.initialize()[0].launchMode).toBe('background')
     const created = await manager.save({ name: 'New', client: 'codex', configDirectory: root })
-    expect(created.find((item) => item.name === 'New')?.launchMode).toBe('terminal')
+    expect(created.find((item) => item.name === 'New')?.launchMode).toBe(expectedDefaultLaunchMode)
   })
 
   it('coalesces concurrent starts and ignores renderer listener failures', async () => {
