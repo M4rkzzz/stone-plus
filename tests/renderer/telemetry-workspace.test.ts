@@ -1,6 +1,6 @@
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
-import { describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ProxyConnectionSummary, ProxyTrafficSnapshot } from '../../src/shared/types'
 import { I18nProvider } from '../../src/renderer/src/i18n'
 import {
@@ -42,6 +42,14 @@ const connections: ProxyConnectionSummary[] = [
 ]
 
 describe('telemetry workspace model', () => {
+  beforeEach(() => {
+    vi.stubGlobal('navigator', { language: 'zh-CN' })
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
   it('combines search, target, network, and outbound filters without mutating input', () => {
     const originalOrder = connections.map((item) => item.id)
     const filters: TelemetryConnectionFilters = {
