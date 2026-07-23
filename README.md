@@ -319,7 +319,9 @@ npm run check
 npm run dist
 ```
 
-架构说明见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
+架构说明见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。发布维护者请使用
+[Release Guide](docs/release-guide.zh-CN.md)，并同时遵守
+[sing-box 分发合规清单](docs/distribution-compliance.md)。
 
 ## 使用边界
 

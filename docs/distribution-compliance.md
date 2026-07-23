@@ -1,5 +1,9 @@
 # sing-box Distribution Compliance
 
+The operator-facing release checklist is maintained in
+[`release-guide.zh-CN.md`](release-guide.zh-CN.md). This document defines the
+compliance invariants that checklist must preserve.
+
 Stone+ pins the built-in proxy core to sing-box v1.13.14. Runtime archives are
 downloaded only from the upstream GitHub release and are authenticated by the
 official release-asset SHA-256 digest recorded in
