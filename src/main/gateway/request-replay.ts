@@ -12,6 +12,11 @@ export interface RequestReplayCapture {
   path: string
   routeId: string
   body: JsonObject
+  /**
+   * Wire size already measured by the HTTP reader. Supplying it lets the hot
+   * gateway path reject an oversized replay before walking the parsed object.
+   */
+  sourceByteLength?: number
   headers?: Record<string, string | undefined>
   createdAt?: number
 }
@@ -55,7 +60,22 @@ export class RequestReplayStore {
   public capture(input: RequestReplayCapture): boolean {
     this.prune()
     if (!input.id.trim() || !input.path.startsWith('/')) return false
-    const serialized = JSON.stringify(input.body)
+    if (input.sourceByteLength !== undefined && input.sourceByteLength > this.maxPayloadBytes) return false
+    // JSON.stringify allocates the complete result before its byte length can
+    // be inspected. Preflight the JSON tree with a byte budget so a 64 MiB
+    // request cannot create another 64 MiB temporary string merely to discover
+    // that replay capture is capped at 1 MiB.
+    try {
+      if (!jsonFitsByteBudget(input.body, this.maxPayloadBytes)) return false
+    } catch {
+      return false
+    }
+    let serialized: string
+    try {
+      serialized = JSON.stringify(input.body)
+    } catch {
+      return false
+    }
     if (Buffer.byteLength(serialized, 'utf8') > this.maxPayloadBytes) return false
     const createdAt = input.createdAt ?? this.now()
     this.entries.delete(input.id)
@@ -153,6 +173,134 @@ export class RequestReplayStore {
       if (entry.expiresAt <= now) this.entries.delete(id)
     }
   }
+}
+
+function jsonFitsByteBudget(value: unknown, budget: number): boolean {
+  const ancestors = new Set<object>()
+  type Frame =
+    | { kind: 'value'; value: unknown; inArray: boolean }
+    | { kind: 'array'; value: unknown[]; index: number }
+    | { kind: 'object'; value: Record<string, unknown>; keys: string[]; index: number; emitted: boolean }
+  const frames: Frame[] = [{ kind: 'value', value, inArray: false }]
+  let used = 0
+  const add = (bytes: number): boolean => {
+    used += bytes
+    return used <= budget
+  }
+
+  while (frames.length > 0) {
+    const frame = frames[frames.length - 1]
+    if (frame.kind === 'array') {
+      if (frame.index >= frame.value.length) {
+        frames.pop()
+        ancestors.delete(frame.value)
+        if (!add(1)) return false // ]
+        continue
+      }
+      if (frame.index > 0 && !add(1)) return false // comma
+      const child = frame.value[frame.index]
+      frame.index += 1
+      frames.push({ kind: 'value', value: child, inArray: true })
+      continue
+    }
+    if (frame.kind === 'object') {
+      let pushed = false
+      while (frame.index < frame.keys.length) {
+        const key = frame.keys[frame.index]
+        frame.index += 1
+        const child = frame.value[key]
+        if (typeof child === 'undefined' || typeof child === 'function' || typeof child === 'symbol') continue
+        if (frame.emitted && !add(1)) return false // comma
+        const keyBytes = jsonStringByteLength(key, budget - used)
+        if (keyBytes === undefined || !add(keyBytes + 1)) return false // key and colon
+        frame.emitted = true
+        frames.push({ kind: 'value', value: child, inArray: false })
+        pushed = true
+        break
+      }
+      if (pushed) continue
+      frames.pop()
+      ancestors.delete(frame.value)
+      if (!add(1)) return false // }
+      continue
+    }
+
+    frames.pop()
+    const current = frame.value
+    if (current === null) {
+      if (!add(4)) return false
+      continue
+    }
+    if (typeof current === 'string') {
+      const bytes = jsonStringByteLength(current, budget - used)
+      if (bytes === undefined || !add(bytes)) return false
+      continue
+    }
+    if (typeof current === 'boolean') {
+      if (!add(current ? 4 : 5)) return false
+      continue
+    }
+    if (typeof current === 'number') {
+      const bytes = Number.isFinite(current)
+        ? Buffer.byteLength(Object.is(current, -0) ? '0' : String(current))
+        : 4
+      if (!add(bytes)) return false
+      continue
+    }
+    if (typeof current === 'undefined' || typeof current === 'function' || typeof current === 'symbol') {
+      if (frame.inArray && !add(4)) return false
+      continue
+    }
+    if (typeof current !== 'object' || typeof current === 'bigint' || ancestors.has(current)) return false
+    const prototype = Object.getPrototypeOf(current)
+    if (!Array.isArray(current) && prototype !== Object.prototype && prototype !== null) return false
+    ancestors.add(current)
+    if (!add(1)) return false // [ or {
+    if (Array.isArray(current)) {
+      frames.push({ kind: 'array', value: current, index: 0 })
+    } else {
+      frames.push({
+        kind: 'object',
+        value: current as Record<string, unknown>,
+        keys: Object.keys(current),
+        index: 0,
+        emitted: false
+      })
+    }
+  }
+  return true
+}
+
+function jsonStringByteLength(value: string, budget: number): number | undefined {
+  let bytes = 2 // surrounding quotes
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index)
+    if (code === 0x22 || code === 0x5c || code === 0x08 || code === 0x09
+      || code === 0x0a || code === 0x0c || code === 0x0d) {
+      bytes += 2
+    } else if (code < 0x20) {
+      bytes += 6
+    } else if (code <= 0x7f) {
+      bytes += 1
+    } else if (code <= 0x7ff) {
+      bytes += 2
+    } else if (code >= 0xd800 && code <= 0xdbff) {
+      const low = value.charCodeAt(index + 1)
+      if (low >= 0xdc00 && low <= 0xdfff) {
+        bytes += 4
+        index += 1
+      } else {
+        // JSON.stringify escapes unpaired surrogates as \udxxx.
+        bytes += 6
+      }
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      bytes += 6
+    } else {
+      bytes += 3
+    }
+    if (bytes > budget) return undefined
+  }
+  return bytes
 }
 
 interface StoredReplay {
@@ -600,6 +748,7 @@ async function consumeReplayResponse(
         previewChunks.push(Buffer.from(bytes))
         previewBytes += bytes.byteLength
       }
+      if (parser && canonicalDone) break
     }
     if (parser) {
       for (const event of parser.finish()) {

@@ -322,6 +322,20 @@ jobs:
           }
           Copy-Item -LiteralPath build/signing/StonePlus-CodeSigning.cer -Destination release/StonePlus-CodeSigning.cer
 
+      - name: Smoke packaged Windows application
+        if: matrix.id == 'windows-x64'
+        shell: pwsh
+        run: |
+          $env:STONE_ELECTRON_PATH = (Resolve-Path 'release/win-unpacked/Stone+.exe').Path
+          try {
+            npm run smoke:electron
+            if ($LASTEXITCODE -ne 0) {
+              throw "Packaged Electron smoke test failed with exit code $LASTEXITCODE."
+            }
+          } finally {
+            Remove-Item Env:\STONE_ELECTRON_PATH -ErrorAction SilentlyContinue
+          }
+
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:

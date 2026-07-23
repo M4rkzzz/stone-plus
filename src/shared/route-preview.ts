@@ -46,10 +46,13 @@ export function previewRoute(
     poolModelPolicy: source.pool.modelPolicy,
     poolModelAllowlist: source.pool.modelAllowlist,
     requiredCapabilities: input.requiredCapabilities,
+    requireProvider: true,
   })
   const modelEligible = eligibility.modelEligible
   if (upstreamModel && eligibleAccounts.length && !modelEligible.length) {
     issues.push(issue('model-unavailable', 'error', `没有可用成员声明支持模型 ${upstreamModel}。`))
+  } else if (!upstreamModel && eligibleAccounts.length && !modelEligible.length) {
+    issues.push(issue('source-unavailable', 'error', '来源成员缺少有效的供应商配置。'))
   }
 
   for (const capability of uniqueCapabilities(input.requiredCapabilities)) {
@@ -60,8 +63,12 @@ export function previewRoute(
       poolModelPolicy: source.pool.modelPolicy,
       poolModelAllowlist: source.pool.modelAllowlist,
       requiredCapabilities: [capability],
+      requireProvider: true,
     })
-    if (capabilityOnly.verified.length && !capabilityOnly.unknown.length) continue
+    // Runtime scheduling is verified-first: once one available member has
+    // proved the capability, legacy/unknown siblings are not candidates and
+    // therefore must not downgrade an otherwise runnable route to a warning.
+    if (capabilityOnly.verified.length) continue
     if (!capabilityOnly.verified.length && !capabilityOnly.unknown.length) {
       issues.push({
         ...issue('capability-unsupported', 'error', `来源不支持所需能力：${capability}。`),

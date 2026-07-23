@@ -11,8 +11,15 @@ import type {
 } from '../../shared/types'
 import type { DatabaseBackupInfo } from './types'
 import { normalizeWebDavUrl, WebDavBackupClient } from './webdav-backup-client'
+import {
+  isSecureCredentialVaultAvailable,
+  requireSecureCredentialVault,
+  type CredentialVaultLike,
+} from './credential-vault'
 
 const CONFIG_METADATA_KEY = 'webdav_backup_configuration_v1'
+const LEGACY_CLEANUP_ERROR_MESSAGE =
+  'Legacy WebDAV credentials could not be removed safely; save or clear the WebDAV configuration before creating database backups'
 
 interface PersistedWebDavConfiguration {
   version: 1
@@ -27,11 +34,7 @@ export interface WebDavMetadataStore {
   removeAppMetadata(key: string): Promise<void>
 }
 
-export interface WebDavSafeStorage {
-  isEncryptionAvailable(): boolean
-  encryptString(value: string): Buffer
-  decryptString(value: Buffer): string
-}
+export type WebDavSafeStorage = CredentialVaultLike
 
 export interface WebDavPortableBackupStore {
   exportPortableBackup(destinationPath: string, password: string): Promise<{ backup: DatabaseBackupInfo }>
@@ -54,6 +57,9 @@ export class WebDavBackupService {
   private readonly now: () => number
   private readonly randomId: () => string
   private configurationWrites: Promise<unknown> = Promise.resolve()
+  private pendingLegacyMigrationRaw: string | undefined
+  private pendingLegacyMigration: Promise<void> | undefined
+  private legacyMigrationFailure: Error | undefined
 
   constructor(private readonly options: WebDavBackupServiceOptions) {
     this.now = options.now ?? Date.now
@@ -65,12 +71,47 @@ export class WebDavBackupService {
     return publicConfiguration(configuration)
   }
 
+  /** Durable, retryable barrier shared by every raw SQLite backup path. */
+  async prepareForRawBackup(): Promise<void> {
+    // Reads keep surfacing the last failure, while an explicit backup/start
+    // request is the retry boundary. Re-read the durable value and enqueue the
+    // cleanup again rather than permanently wedging automatic backups.
+    if (this.legacyMigrationFailure) {
+      this.legacyMigrationFailure = undefined
+      this.pendingLegacyMigrationRaw = undefined
+      this.pendingLegacyMigration = undefined
+    }
+    this.readPersisted()
+    const migration = this.pendingLegacyMigration
+    if (migration) {
+      try {
+        await migration
+      } catch {
+        if (this.pendingLegacyMigration === migration) {
+          this.pendingLegacyMigration = undefined
+          this.pendingLegacyMigrationRaw = undefined
+        }
+        this.legacyMigrationFailure = new Error(LEGACY_CLEANUP_ERROR_MESSAGE)
+        throw new Error(LEGACY_CLEANUP_ERROR_MESSAGE)
+      }
+    }
+    await this.configurationWrites
+    if (this.legacyMigrationFailure) throw this.legacyMigrationFailure
+  }
+
+  async prepareForStartup(): Promise<void> {
+    await this.prepareForRawBackup()
+  }
+
   async saveConfiguration(input: WebDavBackupConfigurationInput): Promise<WebDavBackupConfiguration> {
     return await this.enqueueConfigurationWrite(() => this.saveConfigurationNow(input))
   }
 
   private async saveConfigurationNow(input: WebDavBackupConfigurationInput): Promise<WebDavBackupConfiguration> {
-    const previous = this.readPersisted()
+    // A user-provided replacement must remain available after a background
+    // legacy cleanup failed; this write supersedes the unsafe old value.
+    this.legacyMigrationFailure = undefined
+    const previous = this.readPersisted(false)
     const baseUrl = normalizeWebDavUrl(input.baseUrl).toString()
     const username = input.username?.trim() ?? ''
     const suppliedPassword = input.password ?? ''
@@ -101,6 +142,7 @@ export class WebDavBackupService {
 
   async clearConfiguration(): Promise<WebDavBackupConfiguration> {
     return await this.enqueueConfigurationWrite(async () => {
+      this.legacyMigrationFailure = undefined
       await this.options.metadata.removeAppMetadata(CONFIG_METADATA_KEY)
       return emptyConfiguration()
     })
@@ -161,7 +203,10 @@ export class WebDavBackupService {
     })
   }
 
-  private readPersisted(): PersistedWebDavConfiguration | undefined {
+  private readPersisted(scheduleMigration = true): PersistedWebDavConfiguration | undefined {
+    if (this.legacyMigrationFailure) {
+      throw this.legacyMigrationFailure
+    }
     const raw = this.options.metadata.readAppMetadata(CONFIG_METADATA_KEY)
     if (!raw) return undefined
     try {
@@ -169,29 +214,53 @@ export class WebDavBackupService {
       if (!isPersistedConfiguration(value)) return undefined
       // Migrate legacy URLs which embedded Basic credentials before URL
       // validation rejected them. The public value is sanitized immediately;
-      // persistence is best-effort and never exposes the embedded password.
+      // asynchronous cleanup failures are surfaced on every later read.
       let legacyUrl: URL
-      try { legacyUrl = new URL(value.baseUrl) } catch { return undefined }
-      const embeddedUsername = decodeURIComponent(legacyUrl.username)
-      const embeddedPassword = decodeURIComponent(legacyUrl.password)
+      try {
+        legacyUrl = new URL(value.baseUrl)
+      } catch {
+        if (scheduleMigration && value.baseUrl.includes('@')) this.scheduleLegacyRemoval(raw)
+        return undefined
+      }
+      const hadUserInfo = Boolean(legacyUrl.username || legacyUrl.password)
+      const embeddedUsername = decodeLegacyUrlCredential(legacyUrl.username)
+      const embeddedPassword = decodeLegacyUrlCredential(legacyUrl.password)
       legacyUrl.username = ''
       legacyUrl.password = ''
-      const baseUrl = normalizeWebDavUrl(legacyUrl.toString()).toString()
-      const username = value.username || embeddedUsername
+      const username = value.username || embeddedUsername.value
       let encryptedPassword = value.encryptedPassword
-      const embeddedIdentityMatches = !value.username || !embeddedUsername || value.username === embeddedUsername
-      if (!encryptedPassword && embeddedPassword && username && embeddedIdentityMatches
-        && this.options.safeStorage.isEncryptionAvailable()) {
-        encryptedPassword = this.encryptPassword(embeddedPassword)
+      const embeddedIdentityMatches = !value.username
+        || !embeddedUsername.value
+        || value.username === embeddedUsername.value
+      if (!encryptedPassword && embeddedPassword.valid && embeddedPassword.value && username && embeddedIdentityMatches
+        && isSecureCredentialVaultAvailable(this.options.safeStorage)) {
+        try {
+          encryptedPassword = this.encryptPassword(embeddedPassword.value)
+        } catch {
+          // Sanitizing the URL has priority over retaining unusable embedded
+          // plaintext. The public state will require the password again.
+          encryptedPassword = undefined
+        }
+      }
+      let baseUrl: string
+      try {
+        baseUrl = normalizeWebDavUrl(legacyUrl.toString()).toString()
+      } catch {
+        if (hadUserInfo && scheduleMigration) {
+          this.scheduleLegacyMigration(raw, JSON.stringify({
+            version: 1,
+            baseUrl: legacyUrl.toString(),
+            username,
+            ...(encryptedPassword ? { encryptedPassword } : {}),
+          }))
+        }
+        return undefined
       }
       const migrated = { version: 1 as const, baseUrl, username, ...(encryptedPassword ? { encryptedPassword } : {}) }
-      if (baseUrl !== value.baseUrl || username !== value.username || encryptedPassword !== value.encryptedPassword) {
+      if (hadUserInfo || baseUrl !== value.baseUrl || username !== value.username
+        || encryptedPassword !== value.encryptedPassword) {
         const serialized = JSON.stringify(migrated)
-        void this.enqueueConfigurationWrite(async () => {
-          if (this.options.metadata.readAppMetadata(CONFIG_METADATA_KEY) === raw) {
-            await this.options.metadata.writeAppMetadata(CONFIG_METADATA_KEY, serialized)
-          }
-        }).catch(() => undefined)
+        if (scheduleMigration) this.scheduleLegacyMigration(raw, serialized)
       }
       return migrated
     } catch {
@@ -199,17 +268,52 @@ export class WebDavBackupService {
     }
   }
 
+  private scheduleLegacyMigration(raw: string, sanitized: string): void {
+    this.scheduleLegacyCleanup(raw, async () => {
+      if (this.options.metadata.readAppMetadata(CONFIG_METADATA_KEY) === raw) {
+        await this.options.metadata.writeAppMetadata(CONFIG_METADATA_KEY, sanitized)
+      }
+    })
+  }
+
+  private scheduleLegacyRemoval(raw: string): void {
+    this.scheduleLegacyCleanup(raw, async () => {
+      if (this.options.metadata.readAppMetadata(CONFIG_METADATA_KEY) === raw) {
+        await this.options.metadata.removeAppMetadata(CONFIG_METADATA_KEY)
+      }
+    })
+  }
+
+  private scheduleLegacyCleanup(raw: string, operation: () => Promise<void>): void {
+    if (this.pendingLegacyMigrationRaw === raw) return
+    this.pendingLegacyMigrationRaw = raw
+    const migration = this.enqueueConfigurationWrite(operation)
+    this.pendingLegacyMigration = migration
+    void migration.then(
+      () => undefined,
+      () => {
+        this.legacyMigrationFailure = new Error(
+          LEGACY_CLEANUP_ERROR_MESSAGE,
+        )
+        console.error('Stone+ could not persist sanitized legacy WebDAV credentials')
+      },
+    ).finally(() => {
+      if (this.pendingLegacyMigration === migration) {
+        this.pendingLegacyMigrationRaw = undefined
+        this.pendingLegacyMigration = undefined
+      }
+    })
+  }
+
   private encryptPassword(password: string): string {
-    if (!this.options.safeStorage.isEncryptionAvailable()) {
-      throw new Error('System credential encryption is unavailable; the WebDAV password was not saved')
-    }
+    requireSecureCredentialVault(this.options.safeStorage,
+      'System credential encryption is unavailable; the WebDAV password was not saved')
     return this.options.safeStorage.encryptString(password).toString('base64')
   }
 
   private decryptPassword(encrypted: string): string {
-    if (!this.options.safeStorage.isEncryptionAvailable()) {
-      throw new Error('System credential encryption is unavailable; enter the WebDAV password again')
-    }
+    requireSecureCredentialVault(this.options.safeStorage,
+      'System credential encryption is unavailable; enter the WebDAV password again')
     try {
       return this.options.safeStorage.decryptString(Buffer.from(encrypted, 'base64'))
     } catch {
@@ -225,6 +329,16 @@ export class WebDavBackupService {
     const pending = this.configurationWrites.then(operation, operation)
     this.configurationWrites = pending.then(() => undefined, () => undefined)
     return pending
+  }
+}
+
+function decodeLegacyUrlCredential(value: string): { value: string; valid: boolean } {
+  try {
+    return { value: decodeURIComponent(value), valid: true }
+  } catch {
+    // Preserve a malformed username only as a visible identity hint. A
+    // malformed password is never encrypted or retained in sanitized metadata.
+    return { value, valid: false }
   }
 }
 

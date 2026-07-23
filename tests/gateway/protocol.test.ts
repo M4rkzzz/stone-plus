@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest'
 import { analyzeProtocolConversion, convertRequest, convertResponse, getRequestModel } from '../../src/main/gateway'
+import {
+  InvalidToolArgumentsError,
+  InvalidToolChoiceError,
+  ResponsesResponseFailedError
+} from '../../src/main/gateway/protocol'
 
 const timestamp = 1_700_000_000_000
 
@@ -48,6 +53,164 @@ describe('gateway protocol conversion', () => {
     })).toMatchObject({
       supported: false,
       issues: [{ path: 'text.format', capability: 'request-option' }]
+    })
+  })
+
+  it('rejects Responses conversation chaining before a cross-protocol conversion', () => {
+    expect(analyzeProtocolConversion('openai-responses', 'anthropic-messages', {
+      model: 'gpt',
+      previous_response_id: 'resp_previous',
+      input: 'continue'
+    })).toMatchObject({
+      supported: false,
+      issues: [{ path: 'previous_response_id', capability: 'request-option' }]
+    })
+  })
+
+  it('allows an explicit null previous_response_id because it does not chain history', () => {
+    const body = { model: 'gpt', previous_response_id: null, input: 'start fresh' }
+
+    expect(analyzeProtocolConversion('openai-responses', 'anthropic-messages', body))
+      .toEqual({ supported: true, issues: [] })
+    expect(convertRequest('openai-responses', 'anthropic-messages', body, 'claude').body)
+      .toMatchObject({ messages: [{ role: 'user', content: [{ type: 'text', text: 'start fresh' }] }] })
+  })
+
+  it('rejects invalid JSON tool arguments before an object-only conversion can erase them', () => {
+    const responses = {
+      model: 'gpt',
+      input: [{ type: 'function_call', call_id: 'call_1', name: 'lookup', arguments: '{broken' }]
+    }
+    expect(analyzeProtocolConversion('openai-responses', 'anthropic-messages', responses)).toMatchObject({
+      supported: false,
+      issues: [{ path: 'input[0].arguments', capability: 'content-part' }]
+    })
+    expect(() => convertRequest('openai-responses', 'anthropic-messages', responses, 'claude'))
+      .toThrow(InvalidToolArgumentsError)
+
+    const chat = {
+      model: 'gpt',
+      messages: [{
+        role: 'assistant',
+        tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'lookup', arguments: '[]' } }]
+      }]
+    }
+    expect(analyzeProtocolConversion('openai-chat', 'gemini', chat)).toMatchObject({
+      supported: false,
+      issues: [{ path: 'messages[0].tool_calls[0].function.arguments', capability: 'content-part' }]
+    })
+    expect(() => convertRequest('openai-chat', 'gemini', chat, 'gemini'))
+      .toThrow(InvalidToolArgumentsError)
+
+    expect(analyzeProtocolConversion('openai-chat', 'openai-responses', chat))
+      .toEqual({ supported: true, issues: [] })
+    expect(convertRequest('openai-chat', 'openai-responses', chat, 'gpt').body).toMatchObject({
+      input: [{ type: 'function_call', arguments: '[]' }]
+    })
+  })
+
+  it('rejects Gemini ANY tool choice when no callable function is declared', () => {
+    const body = {
+      contents: [{ role: 'user', parts: [{ text: 'hello' }] }],
+      tools: [{ functionDeclarations: [] }],
+      toolConfig: { functionCallingConfig: { mode: 'ANY' } }
+    }
+
+    expect(analyzeProtocolConversion('gemini', 'openai-chat', body)).toMatchObject({
+      supported: false,
+      issues: [{ path: 'toolConfig.functionCallingConfig.mode', capability: 'builtin-tool' }]
+    })
+    expect(() => convertRequest('gemini', 'openai-chat', body, 'gpt'))
+      .toThrow(InvalidToolChoiceError)
+  })
+
+  it('preserves image detail only between compatible OpenAI request protocols', () => {
+    const responses = {
+      model: 'gpt',
+      input: [{
+        type: 'message', role: 'user', content: [
+          { type: 'input_image', image_url: 'https://example.test/image.png', detail: 'high' }
+        ]
+      }]
+    }
+    expect(analyzeProtocolConversion('openai-responses', 'openai-chat', responses))
+      .toEqual({ supported: true, issues: [] })
+    expect(convertRequest('openai-responses', 'openai-chat', responses, 'gpt').body).toMatchObject({
+      messages: [{ content: [{ type: 'image_url', image_url: { url: 'https://example.test/image.png', detail: 'high' } }] }]
+    })
+    expect(analyzeProtocolConversion('openai-responses', 'anthropic-messages', responses)).toMatchObject({
+      supported: false,
+      issues: [{ path: 'input[0].content[0].detail', capability: 'request-option' }]
+    })
+
+    const chat = {
+      model: 'gpt', messages: [{ role: 'user', content: [{
+        type: 'image_url', image_url: { url: 'https://example.test/image.png', detail: 'low' }
+      }] }]
+    }
+    expect(convertRequest('openai-chat', 'openai-responses', chat, 'gpt').body).toMatchObject({
+      input: [{ content: [{ type: 'input_image', image_url: 'https://example.test/image.png', detail: 'low' }] }]
+    })
+    expect(analyzeProtocolConversion('openai-chat', 'gemini', chat)).toMatchObject({
+      supported: false,
+      issues: [{ path: 'messages[0].content[0].image_url.detail', capability: 'request-option' }]
+    })
+
+    expect(analyzeProtocolConversion('openai-responses', 'anthropic-messages', {
+      model: 'gpt',
+      input: [{
+        type: 'function_call_output', call_id: 'call_1', output: [{
+          type: 'input_image', image_url: 'https://example.test/tool.png', detail: 'high'
+        }]
+      }]
+    })).toMatchObject({
+      supported: false,
+      issues: [{ path: 'input[0].output[0].detail', capability: 'request-option' }]
+    })
+  })
+
+  it('preserves tool-result images only on verified lossless conversion paths', () => {
+    const body = {
+      model: 'claude',
+      messages: [{
+        role: 'user',
+        content: [{
+          type: 'tool_result',
+          tool_use_id: 'tool_1',
+          content: [
+            { type: 'text', text: 'screenshot' },
+            { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'YQ==' } }
+          ]
+        }]
+      }]
+    }
+
+    expect(analyzeProtocolConversion('anthropic-messages', 'openai-responses', body))
+      .toEqual({ supported: true, issues: [] })
+    const responsesBody = convertRequest('anthropic-messages', 'openai-responses', body, 'gpt').body
+    expect(responsesBody).toMatchObject({
+      input: [{
+        type: 'function_call_output',
+        output: [
+          { type: 'input_text', text: 'screenshot' },
+          { type: 'input_image', image_url: 'data:image/png;base64,YQ==' }
+        ]
+      }]
+    })
+    expect(analyzeProtocolConversion('openai-responses', 'anthropic-messages', responsesBody))
+      .toEqual({ supported: true, issues: [] })
+    expect(convertRequest('openai-responses', 'anthropic-messages', responsesBody, 'claude').body).toMatchObject({
+      messages: [{ role: 'user', content: [{
+        type: 'tool_result',
+        content: [
+          { type: 'text', text: 'screenshot' },
+          { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'YQ==' } }
+        ]
+      }] }]
+    })
+    expect(analyzeProtocolConversion('anthropic-messages', 'openai-chat', body)).toMatchObject({
+      supported: false,
+      issues: [{ path: 'messages[0].content[0].content[1]', capability: 'content-part' }]
     })
   })
 
@@ -202,6 +365,92 @@ describe('gateway protocol conversion', () => {
       .toMatchObject({ candidates: [{ finishReason: geminiReason }] })
   })
 
+  it('throws a typed credential-safe error instead of converting a failed Responses payload into success', () => {
+    const failed = {
+      id: 'resp-failed',
+      status: 'failed',
+      error: {
+        code: 'server_error',
+        message: 'Bearer secret-token must never be reflected'
+      },
+      output: []
+    }
+
+    for (const target of ['openai-chat', 'anthropic-messages', 'gemini'] as const) {
+      try {
+        convertResponse('openai-responses', target, failed, 'fallback-model')
+        throw new Error(`Expected ${target} conversion to fail`)
+      } catch (error) {
+        expect(error).toBeInstanceOf(ResponsesResponseFailedError)
+        expect(error).toMatchObject({ code: 'server_error' })
+        expect((error as Error).message).not.toContain('secret-token')
+      }
+    }
+  })
+
+  it('classifies an explicit Responses invalid-request failure as request-level', () => {
+    expect(() => convertResponse('openai-responses', 'openai-chat', {
+      id: 'resp-invalid-request',
+      status: 'failed',
+      error: {
+        type: 'invalid_request_error',
+        code: 'context_length_exceeded',
+        message: 'request-specific detail'
+      },
+      output: []
+    }, 'fallback-model')).toThrow(expect.objectContaining({
+      name: 'ResponsesResponseFailedError',
+      code: 'context_length_exceeded',
+      requestLevel: true
+    }))
+  })
+
+  it('does not erase invalid upstream tool arguments while converting a response', () => {
+    expect(() => convertResponse('openai-responses', 'anthropic-messages', {
+      status: 'completed',
+      output: [{ type: 'function_call', call_id: 'call_1', name: 'lookup', arguments: '{broken' }]
+    }, 'fallback-model')).toThrow(InvalidToolArgumentsError)
+
+    expect(() => convertResponse('openai-chat', 'gemini', {
+      choices: [{
+        finish_reason: 'tool_calls',
+        message: {
+          role: 'assistant',
+          tool_calls: [{ id: 'call_1', function: { name: 'lookup', arguments: '[]' } }]
+        }
+      }]
+    }, 'fallback-model')).toThrow(InvalidToolArgumentsError)
+  })
+
+  it('preserves normal Responses refusal content and the closest target refusal semantics', () => {
+    const refused = {
+      id: 'resp-refused',
+      model: 'source-model',
+      status: 'completed',
+      output: [{
+        type: 'message', role: 'assistant', status: 'completed',
+        content: [{ type: 'refusal', refusal: 'I cannot help with that.' }]
+      }]
+    }
+
+    expect(convertResponse('openai-responses', 'openai-chat', refused, 'fallback-model')).toMatchObject({
+      choices: [{
+        message: { content: null, refusal: 'I cannot help with that.' },
+        finish_reason: 'content_filter'
+      }]
+    })
+    expect(convertResponse('openai-responses', 'anthropic-messages', refused, 'fallback-model')).toMatchObject({
+      content: [{ type: 'text', text: 'I cannot help with that.' }],
+      stop_reason: 'refusal'
+    })
+    expect(convertResponse('openai-responses', 'gemini', refused, 'fallback-model')).toMatchObject({
+      candidates: [{
+        content: { parts: [{ text: 'I cannot help with that.' }] },
+        finishReason: 'SAFETY'
+      }]
+    })
+  })
+
   it.each([
     ['length', 'incomplete', 'max_output_tokens'],
     ['content_filter', 'incomplete', 'content_filter']
@@ -282,6 +531,17 @@ describe('gateway protocol conversion', () => {
     expect(chat).toMatchObject({ stop_reason: 'refusal' })
     expect(anthropic).toMatchObject({ choices: [{ finish_reason: 'content_filter' }] })
     expect(gemini).toMatchObject({ choices: [{ finish_reason: 'content_filter' }] })
+  })
+
+  it('maps Gemini promptFeedback blocks without candidates as content filtering', () => {
+    const blocked = { promptFeedback: { blockReason: 'SAFETY' }, candidates: [] }
+
+    expect(convertResponse('gemini', 'openai-chat', blocked, 'fallback-model'))
+      .toMatchObject({ choices: [{ finish_reason: 'content_filter' }] })
+    expect(convertResponse('gemini', 'anthropic-messages', blocked, 'fallback-model'))
+      .toMatchObject({ stop_reason: 'refusal' })
+    expect(convertResponse('gemini', 'openai-responses', blocked, 'fallback-model'))
+      .toMatchObject({ status: 'incomplete', incomplete_details: { reason: 'content_filter' } })
   })
 
   it('uses the injected clock for generated response identifiers and timestamps', () => {

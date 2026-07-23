@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { FolderCog, LoaderCircle, Play, Plus, Square, Trash2 } from 'lucide-react'
 import type { AppSnapshot, GatewayApi, ManagedClientInstance, ManagedClientInstanceInput, RouteClient } from '@shared/types'
 import { clientBrandMeta } from './brand-icons'
 import { useI18n } from './i18n'
 import { Modal } from './ui'
+import { ExclusiveAsyncOperation, StartOrderedAsyncValue } from './async-operation'
 
 const defaultManagedLaunchMode = !window.stone || window.stonePlatform === 'win32' ? 'terminal' : 'background'
 
@@ -13,24 +14,55 @@ export function ManagedClientInstancesPanel({ snapshot, api }: { snapshot: AppSn
   const [draft, setDraft] = useState<ManagedClientInstanceInput | null>(null)
   const [busy, setBusy] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
-  const load = useCallback(() => { void api.listManagedClientInstances().then(setInstances).catch(() => undefined) }, [api])
+  const instanceUpdates = useRef<StartOrderedAsyncValue<ManagedClientInstance[]> | null>(null)
+  const instanceMutation = useRef(new ExclusiveAsyncOperation())
+  if (!instanceUpdates.current) {
+    instanceUpdates.current = new StartOrderedAsyncValue<ManagedClientInstance[]>((next) => setInstances(next))
+  }
+  const load = useCallback(() => {
+    if (instanceMutation.current.busy) return
+    void instanceUpdates.current?.run(() => api.listManagedClientInstances()).catch(() => undefined)
+  }, [api])
   useEffect(() => {
     load()
-    const unsubscribe = api.onManagedClientInstancesChanged(setInstances)
+    const unsubscribe = api.onManagedClientInstancesChanged((next) => {
+      instanceUpdates.current?.push(next)
+    })
     const timer = setInterval(load, 2_000)
     return () => { unsubscribe(); clearInterval(timer) }
   }, [api, load])
 
+  useEffect(() => {
+    setDraft((current) => {
+      if (!current?.profileId) return current
+      const profile = snapshot.clientProfiles.find((candidate) => candidate.id === current.profileId && candidate.client === current.client)
+      if (!profile) return { ...current, profileId: undefined }
+      if (profile.directory && profile.directory !== current.configDirectory) {
+        return { ...current, configDirectory: profile.directory }
+      }
+      return current
+    })
+  }, [snapshot.clientProfiles])
+
   const perform = async (key: string, operation: () => Promise<ManagedClientInstance[]>) => {
-    setBusy(key); setError(null)
-    try { setInstances(await operation()); return true } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); return false }
-    finally { setBusy(null) }
+    const outcome = await instanceMutation.current.run(async () => {
+      setBusy(key); setError(null)
+      try {
+        await instanceUpdates.current?.run(operation)
+        return true
+      } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); return false }
+      finally { setBusy(null) }
+    })
+    return outcome.started ? outcome.value : false
   }
-  const create = (client: RouteClient = 'codex') => setDraft({
-    name: t('新客户端实例', 'New client instance'), client, configDirectory: '', launchArgs: [], launchMode: defaultManagedLaunchMode,
-    routeId: snapshot.routes.find((route) => route.client === client)?.id,
-    profileId: snapshot.clientProfiles.find((profile) => profile.client === client)?.id
-  })
+  const create = (client: RouteClient = 'codex') => {
+    const profile = snapshot.clientProfiles.find((candidate) => candidate.client === client)
+    setDraft({
+      name: t('新客户端实例', 'New client instance'), client, configDirectory: profile?.directory ?? '', launchArgs: [], launchMode: defaultManagedLaunchMode,
+      routeId: snapshot.routes.find((route) => route.client === client)?.id,
+      profileId: profile?.id,
+    })
+  }
 
   return <section className="managed-instances panel">
     <header className="managed-instances__header">
@@ -58,7 +90,7 @@ export function ManagedClientInstancesPanel({ snapshot, api }: { snapshot: AppSn
         void perform('save-instance', () => api.saveManagedClientInstance(draft)).then((saved) => { if (saved) setDraft(null) })
       }}>
         <label><span>{t('名称', 'Name')}</span><input value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} /></label>
-        <label><span>{t('客户端', 'Client')}</span><select value={draft.client} onChange={(event) => { const client = event.target.value as RouteClient; setDraft({ ...draft, client, routeId: snapshot.routes.find((route) => route.client === client)?.id, profileId: snapshot.clientProfiles.find((profile) => profile.client === client)?.id }) }}><option value="codex">Codex</option><option value="claude">Claude Code</option><option value="gemini">Gemini CLI</option></select></label>
+        <label><span>{t('客户端', 'Client')}</span><select value={draft.client} onChange={(event) => { const client = event.target.value as RouteClient; const profile = snapshot.clientProfiles.find((candidate) => candidate.client === client); setDraft({ ...draft, client, configDirectory: profile?.directory ?? '', routeId: snapshot.routes.find((route) => route.client === client)?.id, profileId: profile?.id }) }}><option value="codex">Codex</option><option value="claude">Claude Code</option><option value="gemini">Gemini CLI</option></select></label>
         <label><span>{t('独立配置目录', 'Isolated config directory')}</span><input value={draft.configDirectory} disabled={Boolean(draft.profileId && snapshot.clientProfiles.find((profile) => profile.id === draft.profileId)?.directory)} onChange={(event) => setDraft({ ...draft, configDirectory: event.target.value })} /></label>
         <label><span>{t('工作目录', 'Working directory')}</span><input value={draft.workingDirectory ?? ''} onChange={(event) => setDraft({ ...draft, workingDirectory: event.target.value })} /></label>
         <label><span>{t('可执行文件', 'Executable')}</span><input value={draft.executablePath ?? ''} onChange={(event) => setDraft({ ...draft, executablePath: event.target.value })} /></label>

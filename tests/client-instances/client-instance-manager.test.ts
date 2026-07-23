@@ -47,9 +47,6 @@ class FakeProcess extends EventEmitter implements ClientInstanceProcess {
     queueMicrotask(() => this.emit('exit', 0, null))
     return true
   }
-  override once(event: 'exit' | 'error', listener: (...args: never[]) => void): this {
-    return super.once(event, listener)
-  }
 }
 
 describe('ClientInstanceManager', () => {
@@ -116,7 +113,7 @@ describe('ClientInstanceManager', () => {
     await writeFile(executable, '')
     await mkdir(configDirectory)
     const signals: Array<NodeJS.Signals | number | undefined> = []
-    const child = new EventEmitter() as ClientInstanceProcess
+    const child = new EventEmitter() as unknown as ClientInstanceProcess & EventEmitter
     child.pid = 9191
     child.kill = (signal) => { signals.push(signal); return true }
     const manager = new ClientInstanceManager({
@@ -229,7 +226,7 @@ describe('ClientInstanceManager', () => {
     const configDirectory = join(root, 'config')
     await writeFile(executable, '')
     await mkdir(configDirectory)
-    const child = new EventEmitter() as ClientInstanceProcess
+    const child = new EventEmitter() as unknown as ClientInstanceProcess & EventEmitter
     child.pid = 5252
     child.kill = () => { throw new Error('signal failed') }
     const terminateTree = vi.fn(async () => { queueMicrotask(() => child.emit('exit', null, 'SIGKILL')) })
@@ -255,7 +252,7 @@ describe('ClientInstanceManager', () => {
     const configDirectory = join(root, 'config')
     await writeFile(executable, '')
     await mkdir(configDirectory)
-    const child = new EventEmitter() as ClientInstanceProcess
+    const child = new EventEmitter() as unknown as ClientInstanceProcess & EventEmitter
     child.pid = 6262
     child.kill = () => true
     const manager = new ClientInstanceManager({
@@ -294,6 +291,199 @@ describe('ClientInstanceManager', () => {
       windowsHide: false,
       detached: true,
       stdio: 'inherit',
+    })
+  })
+
+  it('rejects a new unavailable POSIX terminal mode at save and a legacy one at start', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'stone-client-instance-posix-terminal-'))
+    directories.push(root)
+    const executable = join(root, 'codex')
+    await writeFile(executable, '')
+    const metadata = new MemoryMetadata()
+    const spawn = vi.fn(() => new FakeProcess())
+    const manager = new ClientInstanceManager({
+      store: metadata,
+      processAdapter: { spawn },
+      platform: 'linux',
+      hasControllingTerminal: () => false,
+    })
+    manager.initialize()
+
+    await expect(manager.save({
+      name: 'Unsupported terminal', client: 'codex', configDirectory: root,
+      executablePath: executable, launchMode: 'terminal',
+    })).rejects.toThrow('no controlling terminal')
+
+    metadata.values.set('managed_client_instances_v1', JSON.stringify([{
+      id: 'legacy-terminal', name: 'Legacy terminal', client: 'codex', configDirectory: root,
+      executablePath: executable, launchArgs: [], launchMode: 'terminal', status: 'stopped',
+      createdAt: 1, updatedAt: 1,
+    }]))
+    manager.initialize()
+    await expect(manager.start('legacy-terminal')).rejects.toThrow('no controlling terminal')
+    expect(spawn).not.toHaveBeenCalled()
+    expect(manager.list()[0]).toMatchObject({ status: 'stopped', processAlive: false })
+  })
+
+  it('validates one immutable launch plan before changing state or spawning', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'stone-client-instance-launch-plan-'))
+    directories.push(root)
+    const executable = join(root, 'codex.exe')
+    const configDirectory = join(root, 'config')
+    await writeFile(executable, '')
+    await mkdir(configDirectory)
+    const spawn = vi.fn(() => new FakeProcess())
+    const validateLaunchPlan = vi.fn(async (plan) => {
+      expect(Object.isFrozen(plan)).toBe(true)
+      expect(Object.isFrozen(plan.args)).toBe(true)
+      expect(Object.isFrozen(plan.env)).toBe(true)
+      expect(plan).toMatchObject({
+        executable,
+        args: ['--search'],
+        env: expect.objectContaining({ CODEX_HOME: configDirectory, OPENAI_BASE_URL: 'http://127.0.0.1:15721/v1' }),
+        launchMode: 'background',
+      })
+      throw new Error('Gateway is not listening.')
+    })
+    const manager = new ClientInstanceManager({
+      store: new MemoryMetadata(),
+      processAdapter: { spawn },
+      baseEnvironment: {},
+      resolveBinding: () => ({ env: { OPENAI_BASE_URL: 'http://127.0.0.1:15721/v1' } }),
+      validateLaunchPlan,
+    })
+    manager.initialize()
+    const [instance] = await manager.save({
+      name: 'Validated', client: 'codex', configDirectory, executablePath: executable,
+      launchArgs: ['--search'], launchMode: 'background',
+    })
+
+    await expect(manager.start(instance.id)).rejects.toThrow('Gateway is not listening')
+
+    expect(validateLaunchPlan).toHaveBeenCalledOnce()
+    expect(spawn).not.toHaveBeenCalled()
+    expect(manager.list()[0]).toMatchObject({ status: 'stopped', processAlive: false })
+  })
+
+  it('reports every process that remains alive after stopAll', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'stone-client-instance-stop-all-'))
+    directories.push(root)
+    const executable = join(root, 'codex.exe')
+    await writeFile(executable, '')
+    const child = new EventEmitter() as unknown as ClientInstanceProcess & EventEmitter
+    child.pid = 8181
+    child.kill = () => true
+    const manager = new ClientInstanceManager({
+      store: new MemoryMetadata(),
+      processAdapter: { spawn: () => child, isAlive: async () => true },
+      stopTimeoutMs: 100,
+    })
+    manager.initialize()
+    const [instance] = await manager.save({
+      name: 'Still running', client: 'codex', configDirectory: root,
+      executablePath: executable, launchMode: 'background',
+    })
+    await manager.start(instance.id)
+
+    const summary = await manager.stopAll()
+
+    expect(summary.stopped).toEqual([])
+    expect(summary.stillRunning).toEqual([{
+      id: instance.id,
+      pid: 8181,
+      error: 'Client process did not exit after forced termination.',
+    }])
+  })
+
+  it('cancels a pending start during stopAll and never spawns after shutdown begins', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'stone-client-instance-shutdown-start-'))
+    directories.push(root)
+    const executable = join(root, 'codex.exe')
+    await writeFile(executable, '')
+    let releaseValidation!: () => void
+    const validationGate = new Promise<void>((resolve) => { releaseValidation = resolve })
+    const validateLaunchPlan = vi.fn(() => validationGate)
+    const spawn = vi.fn(() => new FakeProcess())
+    const manager = new ClientInstanceManager({
+      store: new MemoryMetadata(),
+      processAdapter: { spawn },
+      validateLaunchPlan,
+    })
+    manager.initialize()
+    const [instance] = await manager.save({
+      name: 'Pending start', client: 'codex', configDirectory: root,
+      executablePath: executable, launchMode: 'background',
+    })
+    const startOutcome = manager.start(instance.id).then(
+      () => ({ status: 'started' as const }),
+      (error: unknown) => ({ status: 'cancelled' as const, error }),
+    )
+    await vi.waitFor(() => expect(validateLaunchPlan).toHaveBeenCalledOnce())
+
+    const stopping = manager.stopAll()
+    const startSettledBeforeRelease = await Promise.race([
+      startOutcome.then(() => true),
+      new Promise<false>((resolve) => setTimeout(() => resolve(false), 200)),
+    ])
+    releaseValidation()
+    const [outcome, summary] = await Promise.all([startOutcome, stopping])
+    if (manager.list()[0]?.processAlive) await manager.stop(instance.id)
+
+    expect(startSettledBeforeRelease).toBe(true)
+    expect(outcome).toMatchObject({ status: 'cancelled' })
+    expect(summary).toEqual({ stopped: [instance.id], stillRunning: [] })
+    expect(spawn).not.toHaveBeenCalled()
+    expect(manager.list()[0]).toMatchObject({ status: 'stopped', processAlive: false })
+    await expect(manager.start(instance.id)).rejects.toThrow(/shutting down/i)
+    expect(spawn).not.toHaveBeenCalled()
+  })
+
+  it('kills a spawned client and bounds shutdown while its running-state persist is stuck', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'stone-client-instance-shutdown-persist-'))
+    directories.push(root)
+    const executable = join(root, 'codex.exe')
+    await writeFile(executable, '')
+    const metadata = new HeldMetadata()
+    const child = new FakeProcess()
+    child.pid = 7373
+    const spawn = vi.fn(() => child)
+    const manager = new ClientInstanceManager({
+      store: metadata,
+      processAdapter: { spawn },
+      stopTimeoutMs: 100,
+    })
+    manager.initialize()
+    const [instance] = await manager.save({
+      name: 'Persisting start', client: 'codex', configDirectory: root,
+      executablePath: executable, launchMode: 'background',
+    })
+    // save=1, starting=2, running=3. Hold the post-spawn durability write.
+    metadata.holdWrite = 3
+    const startOutcome = manager.start(instance.id).then(
+      () => ({ status: 'started' as const }),
+      (error: unknown) => ({ status: 'cancelled' as const, error }),
+    )
+    await metadata.heldStarted
+    expect(spawn).toHaveBeenCalledOnce()
+    expect(manager.list()[0]).toMatchObject({ status: 'running', pid: 7373, processAlive: true })
+
+    const stopping = manager.stopAll()
+    const bounded = await Promise.race([
+      Promise.all([startOutcome, stopping]).then(([start, summary]) => ({ settled: true as const, start, summary })),
+      new Promise<{ settled: false }>((resolve) => setTimeout(() => resolve({ settled: false }), 1_500)),
+    ])
+
+    expect(bounded).toMatchObject({
+      settled: true,
+      start: { status: 'cancelled' },
+      summary: { stopped: [instance.id], stillRunning: [] },
+    })
+    expect(child.killed).toBe(true)
+    expect(manager.list()[0]).toMatchObject({ status: 'stopped', processAlive: false })
+
+    metadata.release()
+    await vi.waitFor(() => {
+      expect(JSON.parse(metadata.values.get('managed_client_instances_v1')!)[0]).toMatchObject({ status: 'stopped' })
     })
   })
 

@@ -16,6 +16,14 @@ const DEFAULT_BYPASS_RULES = Object.freeze([
   '::1'
 ])
 
+/**
+ * Windows snapshot verification currently launches one bounded native read.
+ * Five seconds keeps takeover drift visible without continuously spawning a
+ * heavyweight registry reader. A successful check schedules the next one, so
+ * slow checks never overlap or build an unbounded queue.
+ */
+const DEFAULT_ACTIVE_LEASE_MONITOR_INTERVAL_MS = 5_000
+
 export interface SystemProxyEndpoint {
   host: string
   port: number
@@ -35,7 +43,7 @@ export interface NormalizedSystemProxyLeaseTarget {
   bypassRules: readonly string[]
 }
 
-export type SystemProxyCompareResult = 'applied' | 'mismatch'
+export type SystemProxyCompareResult = 'applied' | 'partial' | 'mismatch'
 
 /**
  * Platform-specific mutations live behind this interface. A snapshot must be
@@ -50,9 +58,19 @@ export interface SystemProxyPlatformAdapter {
   ): Promise<SystemProxySnapshot> | SystemProxySnapshot
   applySnapshot(snapshot: SystemProxySnapshot): Promise<void>
   /**
-   * Replaces `expected` with `replacement` only if every relevant native
-   * setting is still equal. Returning mismatch protects changes made by the
-   * user or another proxy application while Stone+ was running.
+   * Confirms that the operating system still exposes the applied takeover.
+   * Adapters which implement this must compare the effective native routing
+   * fields, rather than trusting a successful setter process exit code.
+   */
+  isSnapshotApplied?(snapshot: SystemProxySnapshot): Promise<boolean>
+  /**
+   * Restores fields still owned by `expected` while preserving independently
+   * changed native fields. `partial` means owned fields were restored while
+   * one or more user-managed fields were preserved. `mismatch` is reserved
+   * for the ownership marker itself being replaced, which means no Stone+
+   * endpoint remains active.
+   * Platform implementations should perform the ownership comparison and
+   * native mutation in one platform command wherever the OS permits it.
    */
   compareAndApplySnapshot(
     expected: SystemProxySnapshot,
@@ -94,6 +112,15 @@ export interface SystemProxyLeaseState {
   lastError?: { code: SystemProxyLeaseErrorCode; message: string }
 }
 
+/**
+ * Deliberately contains only the public lease projection. Native snapshots,
+ * PAC URLs and the user's previous proxy settings must never leave the lease.
+ */
+export interface SystemProxyLeaseEvent {
+  type: 'unexpected-drift'
+  state: SystemProxyLeaseState
+}
+
 export type SystemProxyRestoreStatus =
   | 'none'
   | 'restored'
@@ -109,6 +136,7 @@ export interface SystemProxyLeaseOptions {
   recoveryStore: SystemProxyLeaseRecoveryStore
   now?: () => number
   createLeaseId?: () => string
+  activeLeaseMonitorIntervalMs?: number
 }
 
 /**
@@ -122,17 +150,25 @@ export class SystemProxyLease {
   private readonly recoveryStore: SystemProxyLeaseRecoveryStore
   private readonly now: () => number
   private readonly createLeaseId: () => string
+  private readonly activeLeaseMonitorIntervalMs: number
+  private readonly listeners = new Set<(event: SystemProxyLeaseEvent) => void>()
   private operationTail: Promise<void> = Promise.resolve()
   private status: SystemProxyLeaseStatus = 'idle'
   private target?: NormalizedSystemProxyLeaseTarget
   private record?: SystemProxyLeaseRecoveryRecord
   private lastError?: { code: SystemProxyLeaseErrorCode; message: string }
+  private activeLeaseMonitor?: ReturnType<typeof setTimeout>
+  private activeLeaseMonitorEpoch = 0
 
   public constructor(options: SystemProxyLeaseOptions) {
     this.adapter = options.adapter
     this.recoveryStore = options.recoveryStore
     this.now = options.now ?? Date.now
     this.createLeaseId = options.createLeaseId ?? randomUUID
+    this.activeLeaseMonitorIntervalMs = Math.max(
+      1,
+      options.activeLeaseMonitorIntervalMs ?? DEFAULT_ACTIVE_LEASE_MONITOR_INTERVAL_MS
+    )
   }
 
   public getState(): SystemProxyLeaseState {
@@ -143,6 +179,11 @@ export class SystemProxyLease {
       recoveryPending: Boolean(this.record),
       ...(this.lastError ? { lastError: { ...this.lastError } } : {})
     }
+  }
+
+  public onEvent(listener: (event: SystemProxyLeaseEvent) => void): () => void {
+    this.listeners.add(listener)
+    return () => this.listeners.delete(listener)
   }
 
   /**
@@ -158,7 +199,9 @@ export class SystemProxyLease {
     return this.enqueue(async () => {
       const target = normalizeLeaseTarget(request)
       if (this.status === 'active' && this.record) {
-        if (sameTarget(this.target, target)) return this.getState()
+        if (sameTarget(this.target, target)) {
+          return this.verifyActiveExclusive(target)
+        }
         throw this.fail(
           'lease_already_active',
           'Release the current system-proxy lease before changing the mixed endpoint.'
@@ -167,6 +210,7 @@ export class SystemProxyLease {
 
       const staleRecord = this.record ?? await this.loadRecoveryRecord()
       if (staleRecord) {
+        this.stopActiveLeaseMonitor()
         this.record = staleRecord
         await this.restoreRecord(staleRecord, 'recovering')
       }
@@ -212,12 +256,20 @@ export class SystemProxyLease {
       this.record = record
       try {
         await this.adapter.applySnapshot(applied)
+        if (
+          this.adapter.isSnapshotApplied
+          && !await this.adapter.isSnapshotApplied(applied)
+        ) {
+          throw new Error(
+            'The operating system did not retain the Stone+ mixed proxy settings after applying them.'
+          )
+        }
       } catch (error) {
         // Keep both the in-memory and durable records. A partially applied
         // platform operation can then be restored by release() or next startup.
         throw this.fail(
           'apply_failed',
-          'Could not apply the Stone+ mixed proxy to the operating system.',
+          applyFailureMessage(error),
           error
         )
       }
@@ -226,7 +278,37 @@ export class SystemProxyLease {
     })
   }
 
+  /**
+   * Performs a final, non-mutating ownership proof before a route generation is
+   * published. On Windows the platform adapter reads the effective native
+   * settings again; a stale in-memory `active` state is never sufficient.
+   */
+  public verifyActive(
+    request: SystemProxyLeaseRequest,
+    expectedLeaseId: string
+  ): Promise<SystemProxyLeaseState> {
+    return this.enqueue(() => this.verifyActiveExclusive(
+      normalizeLeaseTarget(request),
+      expectedLeaseId
+    ))
+  }
+
+  /**
+   * Starts periodic native ownership checks after the orchestrator has
+   * atomically published this lease as the ready system-access owner.
+   * Candidate acquisition and final verification deliberately do not arm the
+   * timer: a pre-commit drift must abort/roll back, never trigger a second
+   * acquisition over a user's newly selected proxy.
+   */
+  public startMonitoring(): void {
+    if (!this.record) return
+    this.startActiveLeaseMonitor(this.record.leaseId)
+  }
+
   public release(): Promise<SystemProxyRestoreResult> {
+    // Invalidate an already-fired callback before release joins the operation
+    // queue. Its captured epoch/lease id can then never poison a later lease.
+    this.stopActiveLeaseMonitor()
     return this.enqueue(async () => {
       const record = this.record ?? await this.loadRecoveryRecord()
       if (!record) {
@@ -254,6 +336,7 @@ export class SystemProxyLease {
         'Cannot recover a stale system-proxy lease while the current lease is active.'
       )
     }
+    this.stopActiveLeaseMonitor()
     const record = this.record ?? await this.loadRecoveryRecord()
     if (!record) {
       this.finishIdle()
@@ -272,11 +355,12 @@ export class SystemProxyLease {
     let result: SystemProxyCompareResult
     try {
       result = await this.adapter.compareAndApplySnapshot(record.applied, record.original)
-      if (result !== 'applied' && result !== 'mismatch') {
+      if (result !== 'applied' && result !== 'partial' && result !== 'mismatch') {
         throw new Error(`Unsupported system-proxy compare result: ${String(result)}`)
       }
-      // A mismatch means the user already replaced Stone+'s values. Clearing
-      // the journal is safe and, crucially, does not overwrite those values.
+      // A mismatch means the user replaced Stone+'s ownership marker; partial
+      // means independently changed fields were preserved. Both are terminal
+      // safe outcomes, so the journal must not trigger a later overwrite.
       await this.recoveryStore.clear()
     } catch (error) {
       throw this.fail(
@@ -306,6 +390,7 @@ export class SystemProxyLease {
   }
 
   private finishIdle(): void {
+    this.stopActiveLeaseMonitor()
     this.status = 'idle'
     this.target = undefined
     this.record = undefined
@@ -317,9 +402,114 @@ export class SystemProxyLease {
     message: string,
     cause?: unknown
   ): SystemProxyLeaseError {
+    this.stopActiveLeaseMonitor()
     this.status = 'error'
     this.lastError = { code, message }
     return new SystemProxyLeaseError(code, message, cause === undefined ? undefined : { cause })
+  }
+
+  private async verifyActiveExclusive(
+    target: NormalizedSystemProxyLeaseTarget,
+    expectedLeaseId?: string
+  ): Promise<SystemProxyLeaseState> {
+    const record = this.record
+    if (
+      this.status !== 'active'
+      || !record
+      || !sameTarget(this.target, target)
+      || (expectedLeaseId !== undefined && record.leaseId !== expectedLeaseId)
+    ) {
+      throw this.fail(
+        'apply_failed',
+        'The active Stone+ system-proxy lease no longer owns the expected mixed endpoint. '
+        + 'Windows or another proxy application may have changed it.'
+      )
+    }
+
+    try {
+      if (
+        !this.adapter.isSnapshotApplied
+        || await this.adapter.isSnapshotApplied(record.applied)
+      ) {
+        return this.getState()
+      }
+    } catch (error) {
+      throw this.fail(
+        'apply_failed',
+        'Could not verify the active Stone+ system-proxy lease. '
+        + 'Windows or another proxy application may have changed it.',
+        error
+      )
+    }
+    throw this.fail(
+      'apply_failed',
+      'The operating-system proxy no longer points at the active Stone+ mixed endpoint. '
+      + 'Windows or another proxy application may have changed it.'
+    )
+  }
+
+  private startActiveLeaseMonitor(leaseId: string): void {
+    if (!this.adapter.isSnapshotApplied || this.status !== 'active') return
+    this.stopActiveLeaseMonitor()
+    const epoch = this.activeLeaseMonitorEpoch
+    const timer = setTimeout(() => {
+      if (this.activeLeaseMonitor === timer) this.activeLeaseMonitor = undefined
+      void this.enqueue(() => this.verifyActiveLeaseFromMonitor(leaseId, epoch)).catch(() => undefined)
+    }, this.activeLeaseMonitorIntervalMs)
+    timer.unref()
+    this.activeLeaseMonitor = timer
+  }
+
+  private stopActiveLeaseMonitor(): void {
+    this.activeLeaseMonitorEpoch += 1
+    if (this.activeLeaseMonitor) clearTimeout(this.activeLeaseMonitor)
+    this.activeLeaseMonitor = undefined
+  }
+
+  private async verifyActiveLeaseFromMonitor(leaseId: string, epoch: number): Promise<void> {
+    if (!this.monitorStillOwnsLease(leaseId, epoch) || !this.adapter.isSnapshotApplied) return
+
+    let applied: boolean
+    let verificationFailure: unknown
+    try {
+      applied = await this.adapter.isSnapshotApplied(this.record!.applied)
+    } catch (error) {
+      applied = false
+      verificationFailure = error
+    }
+
+    // release(), recovery, or a replacement can invalidate the monitor while
+    // the native read is in flight. Never publish that stale result.
+    if (!this.monitorStillOwnsLease(leaseId, epoch)) return
+    if (applied) {
+      this.startActiveLeaseMonitor(leaseId)
+      return
+    }
+
+    const message = verificationFailure === undefined
+      ? 'The operating-system proxy no longer points at the active Stone+ mixed endpoint. '
+        + 'Windows or another proxy application changed it after takeover.'
+      : 'The active Stone+ system-proxy lease could no longer be verified. '
+        + 'Windows or another proxy application may have changed it after takeover.'
+    this.fail('apply_failed', message, verificationFailure)
+    this.emit({ type: 'unexpected-drift', state: this.getState() })
+  }
+
+  private monitorStillOwnsLease(leaseId: string, epoch: number): boolean {
+    return this.activeLeaseMonitorEpoch === epoch
+      && this.status === 'active'
+      && this.record?.leaseId === leaseId
+  }
+
+  private emit(event: SystemProxyLeaseEvent): void {
+    for (const listener of this.listeners) {
+      try {
+        listener({ type: event.type, state: cloneState(event.state) })
+      } catch {
+        // A lifecycle observer must not turn a detected OS drift into an
+        // unhandled timer rejection or prevent other observers from reacting.
+      }
+    }
   }
 
   private enqueue<T>(operation: () => Promise<T>): Promise<T> {
@@ -404,4 +594,26 @@ function cloneTarget(target: NormalizedSystemProxyLeaseTarget): NormalizedSystem
     proxyUrl: target.proxyUrl,
     bypassRules: [...target.bypassRules]
   }
+}
+
+function cloneState(state: SystemProxyLeaseState): SystemProxyLeaseState {
+  return {
+    status: state.status,
+    ...(state.target ? { target: cloneTarget(state.target) } : {}),
+    ...(state.leaseId ? { leaseId: state.leaseId } : {}),
+    recoveryPending: state.recoveryPending,
+    ...(state.lastError ? { lastError: { ...state.lastError } } : {})
+  }
+}
+
+function applyFailureMessage(error: unknown): string {
+  const base = 'Could not apply the Stone+ mixed proxy to the operating system.'
+  if (!(error instanceof Error)) return base
+  if (
+    /did not retain|changed the Stone\+ proxy value|WinINet rejected|safe system-proxy restore/i
+      .test(error.message)
+  ) {
+    return `${base} Windows or another proxy application changed or rejected the settings before takeover could be confirmed.`
+  }
+  return base
 }

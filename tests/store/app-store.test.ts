@@ -36,6 +36,10 @@ function chatGptAccessToken(exp: number, accountId: string, userId: string): str
   })).toString('base64url'), 'signature'].join('.')
 }
 
+function credentialCache(store: AppStore): Map<string, string> {
+  return (store as unknown as { decryptedCredentialCache: Map<string, string> }).decryptedCredentialCache
+}
+
 describe('AppStore', () => {
   let directory: string
   const stores: AppStore[] = []
@@ -96,6 +100,84 @@ describe('AppStore', () => {
     expect(restartedAccount.maskedCredential).toBe('****alue')
     expect(restartedAccount).not.toHaveProperty('credentialId')
     expect(restarted.getCredential(restarted.getRuntimeAccount(restartedAccount.id)!.credentialId)).toBe('sk-secret-value')
+  })
+
+  it('evicts replaced and deleted account/proxy plaintext from the credential cache', async () => {
+    const store = createStore()
+    await store.initialize()
+    const accountSnapshot = await store.saveAccount({
+      providerId: 'provider-openai',
+      name: 'Cached account',
+      credential: 'first-account-secret',
+      priority: 1,
+      weight: 1,
+      maxConcurrency: 1,
+      modelAllowlist: [],
+    })
+    const account = accountSnapshot.accounts.find((candidate) => candidate.name === 'Cached account')!
+    const accountCredentialId = store.getRuntimeAccount(account.id)!.credentialId
+    const firstAccountCiphertext = store.getStateRepository().read().credentials[accountCredentialId]
+    expect(store.getCredential(accountCredentialId)).toBe('first-account-secret')
+    expect(credentialCache(store).has(firstAccountCiphertext)).toBe(true)
+
+    await store.saveAccount({
+      id: account.id,
+      providerId: 'provider-openai',
+      name: account.name,
+      credential: 'second-account-secret',
+      priority: account.priority,
+      weight: account.weight,
+      maxConcurrency: account.maxConcurrency,
+      modelAllowlist: [],
+    })
+    expect(credentialCache(store).has(firstAccountCiphertext)).toBe(false)
+    const secondAccountCiphertext = store.getStateRepository().read().credentials[accountCredentialId]
+    expect(store.getCredential(accountCredentialId)).toBe('second-account-secret')
+    await store.deleteAccount(account.id)
+    expect(credentialCache(store).has(secondAccountCiphertext)).toBe(false)
+
+    const proxySnapshot = await store.saveProxy({
+      name: 'Cached proxy', protocol: 'http', host: '127.0.0.1', port: 18080,
+      username: 'proxy-user', password: 'first-proxy-secret',
+    })
+    const proxy = proxySnapshot.proxies.find((candidate) => candidate.name === 'Cached proxy')!
+    const proxyCredentialId = store.getStateRepository().read().proxies
+      .find((candidate) => candidate.id === proxy.id)!.credentialId!
+    const firstProxyCiphertext = store.getStateRepository().read().credentials[proxyCredentialId]
+    expect(store.getProxyPassword(proxy.id)).toBe('first-proxy-secret')
+
+    await store.saveProxy({
+      id: proxy.id,
+      name: proxy.name,
+      protocol: proxy.protocol,
+      host: proxy.host,
+      port: proxy.port,
+      username: proxy.username,
+      password: 'second-proxy-secret',
+    })
+    expect(credentialCache(store).has(firstProxyCiphertext)).toBe(false)
+    const secondProxyCiphertext = store.getStateRepository().read().credentials[proxyCredentialId]
+    expect(store.getProxyPassword(proxy.id)).toBe('second-proxy-secret')
+    await store.deleteProxy(proxy.id)
+    expect(credentialCache(store).has(secondProxyCiphertext)).toBe(false)
+  })
+
+  it('clears every decrypted credential when explicitly invalidated or closed', async () => {
+    const store = createStore()
+    await store.initialize()
+    const snapshot = await store.saveAccount({
+      providerId: 'provider-openai', name: 'Clear cache', credential: 'cached-secret',
+      priority: 1, weight: 1, maxConcurrency: 1, modelAllowlist: [],
+    })
+    const credentialId = store.getRuntimeAccount(snapshot.accounts[0].id)!.credentialId
+    expect(store.getCredential(credentialId)).toBe('cached-secret')
+    expect(credentialCache(store).size).toBeGreaterThan(0)
+
+    store.invalidateCredentialCache()
+    expect(credentialCache(store).size).toBe(0)
+    expect(store.getCredential(credentialId)).toBe('cached-secret')
+    await store.close()
+    expect(credentialCache(store).size).toBe(0)
   })
 
   it('persists and clears an ignored update version outside snapshots and full persisted state', async () => {
@@ -810,6 +892,57 @@ describe('AppStore', () => {
     expect(provider.baseUrl).toBe('https://relay-b.example/v1')
     expect(provider.models).toEqual(['model-b'])
     expect(provider.capabilityProfile?.origin).not.toBe('probed')
+  })
+
+  it('accepts initial probe evidence only when the main process explicitly authorizes it', async () => {
+    const store = createStore()
+    await store.initialize()
+    const capabilityProfile = {
+      version: 1 as const,
+      origin: 'probed' as const,
+      checkedAt: Date.now(),
+      streaming: true,
+      webSearch: true,
+    }
+    const modelCatalog = [{ id: 'secure-model', capabilities: { streaming: true, webSearch: true } }]
+    const untrusted = await store.saveApiSource({
+      name: 'Unbound probe evidence',
+      sourceType: 'relay',
+      kind: 'openai-compatible',
+      baseUrl: 'https://unbound.example/v1',
+      protocol: 'openai-chat',
+      models: ['secure-model'],
+      credential: 'unbound-secret',
+      priority: 10,
+      weight: 10,
+      maxConcurrency: 4,
+      capabilityProfile,
+      modelCatalog,
+      probeEvidenceToken: 'renderer-controlled-token',
+    })
+    expect(store.getRuntimeProvider(untrusted.source.sourceId)?.capabilityProfile).toMatchObject({ origin: 'inferred' })
+    expect(store.getRuntimeProvider(untrusted.source.sourceId)?.modelCatalog)
+      .not.toContainEqual(expect.objectContaining({ capabilities: expect.objectContaining({ webSearch: true }) }))
+
+    const trusted = await store.saveApiSource({
+      name: 'Bound probe evidence',
+      sourceType: 'relay',
+      kind: 'openai-compatible',
+      baseUrl: 'https://bound.example/v1',
+      protocol: 'openai-chat',
+      models: ['secure-model'],
+      credential: 'bound-secret',
+      priority: 10,
+      weight: 10,
+      maxConcurrency: 4,
+      capabilityProfile,
+      modelCatalog,
+      probeEvidenceToken: 'still-not-forwarded-to-storage',
+    }, { acceptInitialProbeEvidence: true })
+    expect(store.getRuntimeProvider(trusted.source.sourceId)?.capabilityProfile).toMatchObject({
+      origin: 'probed',
+      webSearch: true,
+    })
   })
 
   it('routes directly through an API source using a runtime-only virtual pool', async () => {

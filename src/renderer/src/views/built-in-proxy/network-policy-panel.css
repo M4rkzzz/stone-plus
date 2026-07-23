@@ -1,0 +1,81 @@
+.built-in-policy {
+  display: grid;
+  gap: 14px;
+}
+
+.built-in-policy__heading,
+.built-in-policy__heading > div {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.built-in-policy__heading { justify-content: space-between; }
+.built-in-policy__heading > div { min-width: 0; }
+.built-in-policy__heading svg { flex: 0 0 auto; color: var(--accent); }
+.built-in-policy__heading span { display: grid; gap: 2px; }
+.built-in-policy__heading strong { font-size: 12px; }
+.built-in-policy__heading small { color: var(--muted); font-size: 9px; }
+
+.built-in-policy__managed {
+  display: inline-flex;
+  padding: 4px 8px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 9px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.built-in-policy__grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.built-in-policy__grid article {
+  display: flex;
+  min-width: 0;
+  gap: 9px;
+  padding: 11px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-subtle);
+}
+
+.built-in-policy__grid article > span {
+  display: grid;
+  width: 30px;
+  height: 30px;
+  flex: 0 0 auto;
+  place-items: center;
+  border-radius: 8px;
+  background: #fff;
+  color: var(--accent);
+}
+
+.built-in-policy__grid article > div { display: grid; min-width: 0; align-content: start; gap: 3px; }
+.built-in-policy__grid small { color: var(--muted); font-size: 8px; text-transform: uppercase; }
+.built-in-policy__grid strong { overflow-wrap: anywhere; font-size: 10px; }
+.built-in-policy__grid p,
+.built-in-policy__footnote { color: var(--muted); font-size: 9px; line-height: 1.5; }
+.built-in-policy__pending {
+  padding: 9px 10px;
+  border: 1px solid #ead8b8;
+  border-radius: 6px;
+  background: var(--amber-soft);
+  color: #79501d;
+  font-size: 9px;
+  line-height: 1.5;
+}
+.built-in-policy__footnote { padding-top: 10px; border-top: 1px solid var(--border); }
+
+@media (max-width: 920px) {
+  .built-in-policy__grid { grid-template-columns: minmax(0, 1fr); }
+}
+
+@media (max-width: 560px) {
+  .built-in-policy__heading { align-items: flex-start; }
+  .built-in-policy__managed { display: none; }
+}

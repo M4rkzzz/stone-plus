@@ -46,7 +46,8 @@ import type {
   SetupWizardStep,
 } from '@shared/types'
 import { isAvailableRouteAccount } from '@shared/route-sources'
-import { Badge, InfoTip, protocolLabels } from '../ui'
+import { Badge, ConfirmDialog, InfoTip, protocolLabels } from '../ui'
+import { ExclusiveAsyncOperation, SerializedAsyncOperation } from '../async-operation'
 import { BUILT_IN_PROXY_BINDING_NOTICE, useBuiltInProxyInterlock } from '../built-in-proxy-interlocks'
 import { useI18n } from '../i18n'
 import {
@@ -145,6 +146,7 @@ export function SetupWizardView({
   const [verification, setVerification] = useState<SetupRouteVerificationResult | null>(null)
   const [previewText, setPreviewText] = useState('')
   const [busy, setBusy] = useState('load')
+  const [discardConfirmOpen, setDiscardConfirmOpen] = useState(false)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const [oauthStage, setOauthStage] = useState<OAuthUiStage>('idle')
@@ -160,6 +162,15 @@ export function SetupWizardView({
   const [oauthImportedSnapshot, setOauthImportedSnapshot] = useState<AppSnapshot | null>(null)
   const oauthSessionIdRef = useRef<string | null>(null)
   const oauthAttemptRef = useRef(0)
+  const sourceDraftRef = useRef(sourceDraft)
+  const proxyIdRef = useRef(proxyId)
+  const modelRef = useRef(model)
+  const actionOperationRef = useRef(new ExclusiveAsyncOperation())
+  const progressOperationRef = useRef(new SerializedAsyncOperation())
+  const busyRef = useRef('load')
+  sourceDraftRef.current = sourceDraft
+  proxyIdRef.current = proxyId
+  modelRef.current = model
 
   const providerById = useMemo(() => new Map(snapshot.providers.map((provider) => [provider.id, provider])), [snapshot.providers])
   const availableAccounts = useMemo(() => snapshot.accounts.filter(isAvailableRouteAccount), [snapshot.accounts])
@@ -176,7 +187,7 @@ export function SetupWizardView({
   const currentStep = wizard?.step ?? 'scan'
   const currentIndex = Math.max(0, steps.findIndex((step) => step.id === currentStep))
   const oauthActive = oauthStage === 'starting' || oauthStage === 'waiting' || oauthStage === 'submitting' || oauthStage === 'exchanging' || oauthStage === 'cancelling'
-  const importConfigurationLocked = oauthActive || busy === 'import'
+  const importConfigurationLocked = oauthActive || Boolean(busy)
   const oauthExpiresInSeconds = oauthSession ? Math.max(0, Math.ceil((oauthSession.expiresAt - oauthNow) / 1_000)) : 0
   const modelOptions = useMemo(() => {
     const values = new Set<string>()
@@ -211,7 +222,10 @@ export function SetupWizardView({
         }
       })
       .catch((cause) => setError(messageOf(cause, t)))
-      .finally(() => setBusy(''))
+      .finally(() => {
+        busyRef.current = ''
+        setBusy('')
+      })
     return () => { cancelled = true }
   }, [api, t])
 
@@ -239,21 +253,27 @@ export function SetupWizardView({
   }, [client, clientProfileId, snapshot.clientProfiles])
 
   const run = async <T,>(key: string, operation: () => Promise<T>): Promise<T | undefined> => {
-    setBusy(key)
-    setError('')
-    setNotice('')
-    try {
-      return await operation()
-    } catch (cause) {
-      setError(messageOf(cause, t))
-      return undefined
-    } finally {
-      setBusy('')
-    }
+    if (busyRef.current) return undefined
+    const outcome = await actionOperationRef.current.run(async () => {
+      busyRef.current = key
+      setBusy(key)
+      setError('')
+      setNotice('')
+      try {
+        return await operation()
+      } catch (cause) {
+        setError(messageOf(cause, t))
+        return undefined
+      } finally {
+        busyRef.current = ''
+        setBusy('')
+      }
+    })
+    return outcome.started ? outcome.value : undefined
   }
 
   const move = async (step: SetupWizardStep, patch: WizardProgressPatch = {}): Promise<SetupWizardState | undefined> => {
-    const next = await run('progress', () => api.saveSetupWizardProgress({
+    const input: SetupWizardProgressInput = {
       sessionId: wizard?.sessionId,
       step,
       sourceType: patch.sourceType ?? wizard?.sourceType,
@@ -267,9 +287,12 @@ export function SetupWizardView({
       model: patch.model ?? (model || wizard?.model),
       proxyId: patch.proxyId !== undefined ? patch.proxyId : proxyId || null,
       lastError: patch.lastError,
-    }))
-    if (next) setWizard(next)
-    return next
+    }
+    return progressOperationRef.current.enqueue(async () => {
+      const next = await run('progress', () => api.saveSetupWizardProgress(input))
+      if (next) setWizard(next)
+      return next
+    })
   }
 
   const back = async () => {
@@ -619,30 +642,44 @@ export function SetupWizardView({
       google: { kind: 'google', baseUrl: 'https://generativelanguage.googleapis.com', protocol: 'gemini', name: 'Google Gemini API' },
     }
     if (kind !== 'openai' && kind !== 'anthropic' && kind !== 'google') return
-    setSourceDraft((current) => ({ ...current, ...presets[kind], responsesCompactMode: undefined }))
+    setSourceDraft((current) => {
+      const next = { ...current, ...presets[kind], responsesCompactMode: undefined }
+      sourceDraftRef.current = next
+      return next
+    })
   }
 
   const probeDraft = async () => {
-    if (!sourceDraft.name.trim() || !sourceDraft.baseUrl.trim() || !sourceDraft.credential?.trim()) {
+    const draft = sourceDraftRef.current
+    const selectedProxyId = proxyIdRef.current
+    const selectedModel = modelRef.current
+    if (!draft.name.trim() || !draft.baseUrl.trim() || !draft.credential?.trim()) {
       return setError(t('请填写名称、Base URL 和 API Key。', 'Enter a name, Base URL, and API key.'))
     }
+    setProbe(null)
+    setProbeBinding(null)
+    const requestBinding = captureSetupSourceProbeBinding(draft, selectedProxyId, selectedModel)
     const result = await run('probe', () => api.probeApiSource({
-      id: sourceDraft.id,
-      name: sourceDraft.name,
-      sourceType: sourceDraft.sourceType,
-      kind: sourceDraft.kind,
-      baseUrl: sourceDraft.baseUrl,
-      protocol: sourceDraft.protocol,
-      responsesCompactMode: sourceDraft.responsesCompactMode,
-      credential: sourceDraft.credential,
-      model: model || sourceDraft.defaultModel,
-      proxyId: proxyId || sourceDraft.proxyId,
+      id: draft.id,
+      name: draft.name,
+      sourceType: draft.sourceType,
+      kind: draft.kind,
+      baseUrl: draft.baseUrl,
+      protocol: draft.protocol,
+      responsesCompactMode: draft.responsesCompactMode,
+      credential: draft.credential,
+      model: selectedModel || draft.defaultModel,
+      proxyId: selectedProxyId || draft.proxyId,
     }))
     if (!result) return
+    if (!setupSourceProbeMatches(requestBinding, sourceDraftRef.current, proxyIdRef.current, modelRef.current)) {
+      setError(t('来源配置在测试期间发生了变化，本次结果已忽略，请重新测试。', 'The source changed while it was being tested. This result was ignored; test again.'))
+      return
+    }
     setProbe(result)
-    const testedModel = model || sourceDraft.defaultModel || result.models[0] || ''
-    if (!model && testedModel) setModel(testedModel)
-    setProbeBinding(captureSetupSourceProbeBinding(sourceDraft, proxyId, testedModel))
+    const testedModel = selectedModel || draft.defaultModel || result.models[0] || ''
+    if (!selectedModel && testedModel) setModel(testedModel)
+    setProbeBinding(captureSetupSourceProbeBinding(draft, selectedProxyId, testedModel))
     if (result.ok) setNotice(t('来源验证通过，可以安全保存。', 'Source verification passed. It is ready to save.'))
   }
 
@@ -655,6 +692,7 @@ export function SetupWizardView({
       models: currentProbe.models.length ? currentProbe.models : sourceDraft.models,
       capabilityProfile: currentProbe.capabilityProfile,
       modelCatalog: currentProbe.modelCatalog,
+      probeEvidenceToken: currentProbe.probeEvidenceToken,
     }))
     if (!result) return
     const provider = sourceDraft.id
@@ -776,6 +814,7 @@ export function SetupWizardView({
     if (oauthSessionIdRef.current && !await cancelWizardOAuth()) return
     const discarded = await run('discard', () => confirmSetupWizardAction(() => api.discardSetupWizard()))
     if (!discarded) return
+    setDiscardConfirmOpen(false)
     onExit()
   }
 
@@ -806,7 +845,7 @@ export function SetupWizardView({
     <div className="setup-wizard page-stack">
       <header className="setup-wizard__header">
         <div><span className="eyebrow">STONE+ QUICK START</span><h1>{t('配置向导', 'Setup wizard')}</h1><p>{t('逐步完成来源、号池、路由和真实请求验证。', 'Set up a source, pool, route, and a verified real request step by step.')}</p></div>
-        <button className="button button--secondary" type="button" disabled={oauthCommitLocked} onClick={() => void exitWizard()}>{oauthCommitLocked ? t('正在保存账号…', 'Saving account…') : t('暂时退出', 'Exit for now')}</button>
+        <button className="button button--secondary" type="button" disabled={oauthCommitLocked || Boolean(busy)} onClick={() => void exitWizard()}>{oauthCommitLocked ? t('正在保存账号…', 'Saving account…') : t('暂时退出', 'Exit for now')}</button>
       </header>
 
       <div className="setup-wizard__layout">
@@ -822,33 +861,33 @@ export function SetupWizardView({
 
           {currentStep === 'scan' && <WizardSection icon={<Gauge />} title={t('先检查当前环境', 'Check your environment first')} description={t('扫描本地配置、网络出口和已有资源，不会修改任何文件。', 'Scan local configuration, network exits, and existing resources without changing any files.')}>
             <ScanSummary snapshot={snapshot} />
-            <PrimaryAction busy={busy === 'scan'} onClick={() => void scan()} label={t('开始扫描', 'Start scan')} icon={<RefreshCw size={16} />} />
+            <PrimaryAction busy={busy === 'scan'} disabled={Boolean(busy)} onClick={() => void scan()} label={t('开始扫描', 'Start scan')} icon={<RefreshCw size={16} />} />
           </WizardSection>}
 
           {currentStep === 'source' && <WizardSection icon={<Waypoints />} title={t('你准备使用什么来源？', 'What kind of source will you use?')} description={t('可以导入订阅账号、添加 API，也可以复用已有配置。', 'Import a subscription account, add an API, or reuse an existing configuration.')}>
             <div className="setup-choice-grid">
-              <Choice icon={<ShieldCheck />} title="Codex OAuth / Sub2API CPA" description={t('浏览器 OAuth 授权，或使用 Token / JSON 兼容导入', 'Authorize with OAuth in your browser, or import a compatible Token / JSON file')} onClick={() => chooseMode('oauth-import')} />
-              <Choice icon={<Cloud />} title={t('官方 API', 'Official API')} description={t('OpenAI、Anthropic 或 Google Gemini', 'OpenAI, Anthropic, or Google Gemini')} onClick={() => chooseMode('official-api')} />
-              <Choice icon={<Server />} title={t('中转站', 'Relay')} description={t('配置兼容 Base URL 与单把 Key', 'Configure a compatible Base URL and one API key')} onClick={() => chooseMode('relay')} />
-              <Choice icon={<KeyRound />} title={t('已有来源', 'Existing source')} description={t(`${availableAccounts.length} 个可调度凭据`, `${availableAccounts.length} schedulable credential(s)`)} onClick={() => chooseMode('existing')} disabled={!availableAccounts.length} />
-              <Choice icon={<Network />} title={t('已有聚合中转', 'Existing aggregate relay')} description={t(`${aggregatePools.length} 个聚合配置`, `${aggregatePools.length} aggregate configuration(s)`)} onClick={() => chooseMode('aggregate')} disabled={!aggregatePools.length} />
+              <Choice icon={<ShieldCheck />} title="Codex OAuth / Sub2API CPA" description={t('浏览器 OAuth 授权，或使用 Token / JSON 兼容导入', 'Authorize with OAuth in your browser, or import a compatible Token / JSON file')} onClick={() => chooseMode('oauth-import')} disabled={Boolean(busy)} />
+              <Choice icon={<Cloud />} title={t('官方 API', 'Official API')} description={t('OpenAI、Anthropic 或 Google Gemini', 'OpenAI, Anthropic, or Google Gemini')} onClick={() => chooseMode('official-api')} disabled={Boolean(busy)} />
+              <Choice icon={<Server />} title={t('中转站', 'Relay')} description={t('配置兼容 Base URL 与单把 Key', 'Configure a compatible Base URL and one API key')} onClick={() => chooseMode('relay')} disabled={Boolean(busy)} />
+              <Choice icon={<KeyRound />} title={t('已有来源', 'Existing source')} description={t(`${availableAccounts.length} 个可调度凭据`, `${availableAccounts.length} schedulable credential(s)`)} onClick={() => chooseMode('existing')} disabled={Boolean(busy) || !availableAccounts.length} />
+              <Choice icon={<Network />} title={t('已有聚合中转', 'Existing aggregate relay')} description={t(`${aggregatePools.length} 个聚合配置`, `${aggregatePools.length} aggregate configuration(s)`)} onClick={() => chooseMode('aggregate')} disabled={Boolean(busy) || !aggregatePools.length} />
             </div>
           </WizardSection>}
 
           {currentStep === 'source-config' && sourceMode === 'existing' && <WizardSection icon={<KeyRound />} title={t('选择已有来源', 'Choose an existing source')} description={t('向导会重新检查账号状态和模型。', 'The wizard will check the account status and models again.')}>
-            <select className="setup-select" value={selectedAccountId} onChange={(event) => { setSelectedAccountId(event.target.value); setModel('') }}>
+            <select className="setup-select" value={selectedAccountId} disabled={Boolean(busy)} onChange={(event) => { setSelectedAccountId(event.target.value); setModel('') }}>
               <option value="">{t('选择来源', 'Choose a source')}</option>
               {availableAccounts.map((account) => <option value={account.id} key={account.id}>{account.name} · {providerById.get(account.providerId)?.name}</option>)}
             </select>
-            <PrimaryAction disabled={!selectedAccountId} busy={false} onClick={() => void selectExisting()} label={t('使用此来源', 'Use this source')} />
+            <PrimaryAction disabled={Boolean(busy) || !selectedAccountId} busy={false} onClick={() => void selectExisting()} label={t('使用此来源', 'Use this source')} />
           </WizardSection>}
 
           {currentStep === 'source-config' && sourceMode === 'aggregate' && <WizardSection icon={<Network />} title={t('选择聚合中转', 'Choose an aggregate relay')} description={t('路由将直接复用聚合中转的成员和策略。', 'The route will reuse the aggregate relay members and scheduling policy.')}>
-            <select className="setup-select" value={aggregatePoolId} onChange={(event) => { setAggregatePoolId(event.target.value); setModel('') }}>
+            <select className="setup-select" value={aggregatePoolId} disabled={Boolean(busy)} onChange={(event) => { setAggregatePoolId(event.target.value); setModel('') }}>
               <option value="">{t('选择聚合中转', 'Choose an aggregate relay')}</option>
               {aggregatePools.map((pool) => <option value={pool.id} key={pool.id}>{setupPoolDisplayName(pool.name, t)} · {protocolLabels[pool.protocol]} · {t(`${pool.members.length} 个成员`, `${pool.members.length} member(s)`)}</option>)}
             </select>
-            <PrimaryAction disabled={!aggregatePoolId} busy={false} onClick={() => void selectAggregate()} label={t('使用此聚合', 'Use this aggregate')} />
+            <PrimaryAction disabled={Boolean(busy) || !aggregatePoolId} busy={false} onClick={() => void selectAggregate()} label={t('使用此聚合', 'Use this aggregate')} />
           </WizardSection>}
 
           {currentStep === 'source-config' && sourceMode === 'oauth-import' && <WizardSection icon={<ShieldCheck />} title={t('添加 Codex 账号', 'Add a Codex account')} description={t('先完成 OAuth 授权或选择 JSON 文件；账号归类与网络设置可在下方按需展开。', 'Authorize with OAuth or select a JSON file. Expand the optional section to organize the account or choose its network exit.')}>
@@ -888,62 +927,89 @@ export function SetupWizardView({
             </section> : <section className="setup-token-import" role="tabpanel" aria-label={t('Token 或 JSON 导入账号', 'Import accounts from Token or JSON')}>
               <div className="setup-token-import__heading"><Files size={20} /><div><strong>{t('导入 Sub2API / CPA', 'Import Sub2API / CPA')}</strong><span>{t('支持多文件、JSON、逐行 JSON 和 Access Token；完成后立即检测并进入网络出口步骤。', 'Supports multiple files, JSON, line-delimited JSON, and access tokens. Imported accounts are checked before continuing to the network step.')}</span></div><button className="button button--primary" disabled={Boolean(busy)} type="button" onClick={() => void importTokenJson(true)}><FileJson2 size={16} />{t('选择多个 JSON', 'Choose JSON files')}</button></div>
               <label className="setup-field"><span>{t('粘贴 JSON / Token', 'Paste JSON / Token')}</span><textarea className="mono" rows={9} value={importContent} onChange={(event) => setImportContent(event.target.value)} placeholder={t('粘贴 CPA 对象、Sub2API 导出、数组、逐行 JSON 或 Access Token', 'Paste a CPA object, Sub2API export, array, line-delimited JSON, or access token')} /></label>
-              <PrimaryAction disabled={!importContent.trim()} busy={busy === 'import'} onClick={() => void importTokenJson(false)} label={t('导入并检测', 'Import and check')} />
+              <PrimaryAction disabled={Boolean(busy) || !importContent.trim()} busy={busy === 'import'} onClick={() => void importTokenJson(false)} label={t('导入并检测', 'Import and check')} />
             </section>}
           </WizardSection>}
 
           {currentStep === 'source-config' && (sourceMode === 'official-api' || sourceMode === 'relay') && <WizardSection icon={<Server />} title={sourceMode === 'official-api' ? t('配置官方 API', 'Configure official API') : t('配置中转站', 'Configure relay')} description={t('先完成真实请求测试，再保存到本机安全存储。', 'Run a real request test before saving the source to secure local storage.')}>
-            <ApiSourceForm draft={sourceDraft} proxyId={proxyId} proxies={snapshot.proxies} proxyInterlocked={builtInProxyInterlocked} onProxyChange={setProxyId} onChange={setSourceDraft} onVendor={applyOfficialVendor} official={sourceMode === 'official-api'} />
+            <ApiSourceForm
+              draft={sourceDraft}
+              proxyId={proxyId}
+              proxies={snapshot.proxies}
+              proxyInterlocked={builtInProxyInterlocked}
+              onProxyChange={(next) => {
+                proxyIdRef.current = next
+                setProxyId(next)
+              }}
+              onChange={(next) => {
+                sourceDraftRef.current = next
+                setSourceDraft(next)
+              }}
+              onVendor={applyOfficialVendor}
+              official={sourceMode === 'official-api'}
+            />
             {currentProbe && <ProbeResult result={currentProbe} />}
             {probe && !currentProbe && <div className="setup-message setup-message--error"><CircleAlert size={17} /><span>{t('来源配置已变更，原测试结果已失效。', 'The source changed, so the previous test result is no longer valid.')}</span></div>}
-            <div className="setup-actions"><button className="button button--secondary" type="button" disabled={Boolean(busy)} onClick={() => void probeDraft()}>{busy === 'probe' ? <LoaderCircle size={16} className="spin" /> : <ShieldCheck size={16} />}{t('测试连接', 'Test connection')}</button><PrimaryAction disabled={!currentProbe?.ok} busy={busy === 'save-source'} onClick={() => void saveDraft()} label={t('保存并继续', 'Save and continue')} /></div>
+            <div className="setup-actions"><button className="button button--secondary" type="button" disabled={Boolean(busy)} onClick={() => void probeDraft()}>{busy === 'probe' ? <LoaderCircle size={16} className="spin" /> : <ShieldCheck size={16} />}{t('测试连接', 'Test connection')}</button><PrimaryAction disabled={Boolean(busy) || !currentProbe?.ok} busy={busy === 'save-source'} onClick={() => void saveDraft()} label={t('保存并继续', 'Save and continue')} /></div>
           </WizardSection>}
 
           {currentStep === 'network' && <WizardSection icon={<Router />} title={t('检查网络出口', 'Check the network exit')} description={t('使用来源配置的实际出口运行网络诊断。', 'Run network diagnostics through the actual exit configured for this source.')}>
-            <label className="setup-field"><span>{t('代理', 'Proxy')}</span><select value={proxyId} disabled={builtInProxyInterlocked} onChange={(event) => setProxyId(event.target.value)}><option value="">{t('直连 / 跟随全局网络设置', 'Direct / use global network setting')}</option>{snapshot.proxies.map((proxy) => <option value={proxy.id} key={proxy.id}>{proxy.name} · {proxy.protocol.toUpperCase()}</option>)}</select>{builtInProxyInterlocked && <small>{t(BUILT_IN_PROXY_BINDING_NOTICE.zh, BUILT_IN_PROXY_BINDING_NOTICE.en)}</small>}</label>
-            <PrimaryAction busy={busy === 'network'} onClick={() => void checkNetwork()} label={t('检测此出口', 'Test this exit')} icon={<Network size={16} />} />
+            <label className="setup-field"><span>{t('代理', 'Proxy')}</span><select value={proxyId} disabled={builtInProxyInterlocked || Boolean(busy)} onChange={(event) => setProxyId(event.target.value)}><option value="">{t('直连 / 跟随全局网络设置', 'Direct / use global network setting')}</option>{snapshot.proxies.map((proxy) => <option value={proxy.id} key={proxy.id}>{proxy.name} · {proxy.protocol.toUpperCase()}</option>)}</select>{builtInProxyInterlocked && <small>{t(BUILT_IN_PROXY_BINDING_NOTICE.zh, BUILT_IN_PROXY_BINDING_NOTICE.en)}</small>}</label>
+            <PrimaryAction busy={busy === 'network'} disabled={Boolean(busy)} onClick={() => void checkNetwork()} label={t('检测此出口', 'Test this exit')} icon={<Network size={16} />} />
           </WizardSection>}
 
           {currentStep === 'upstream-test' && <WizardSection icon={<ShieldCheck />} title={t('验证账号与模型', 'Verify the account and model')} description={t('这一步会发送一次极小的真实模型请求。', 'This step sends one very small real model request.')}>
-            <ModelChoice value={model} options={modelOptions} onChange={setModel} />
-            <PrimaryAction busy={busy === 'upstream'} onClick={() => void verifyExistingSource()} label={t('发送真实测试', 'Send real test')} icon={<Play size={16} />} />
+            <ModelChoice value={model} options={modelOptions} disabled={Boolean(busy)} onChange={setModel} />
+            <PrimaryAction busy={busy === 'upstream'} disabled={Boolean(busy)} onClick={() => void verifyExistingSource()} label={t('发送真实测试', 'Send real test')} icon={<Play size={16} />} />
           </WizardSection>}
 
           {currentStep === 'client' && <WizardSection icon={<Settings2 />} title={t('选择主客户端', 'Choose your primary client')} description={t('向导一次配置一个客户端，完成后可以继续配置其他客户端。', 'The wizard configures one client at a time. You can add more after this setup.')}>
-            <div className="setup-choice-grid setup-choice-grid--clients">{(['codex', 'claude', 'gemini'] as RouteClient[]).map((item) => <Choice key={item} title={clientLabels[item]} description={item === 'codex' ? t('推荐用于 OAuth / Responses 来源', 'Recommended for OAuth / Responses sources') : t(`通过 Stone+ 协议转换接入 ${clientLabels[item]}`, `Connect ${clientLabels[item]} through Stone+ protocol conversion`)} selected={client === item} onClick={() => setClient(item)} />)}</div>
-            <PrimaryAction busy={false} onClick={() => void move('routing', { client, model })} label={t('继续配置路由', 'Continue to routing')} />
+            <div className="setup-choice-grid setup-choice-grid--clients">{(['codex', 'claude', 'gemini'] as RouteClient[]).map((item) => <Choice key={item} title={clientLabels[item]} description={item === 'codex' ? t('推荐用于 OAuth / Responses 来源', 'Recommended for OAuth / Responses sources') : t(`通过 Stone+ 协议转换接入 ${clientLabels[item]}`, `Connect ${clientLabels[item]} through Stone+ protocol conversion`)} selected={client === item} onClick={() => setClient(item)} disabled={Boolean(busy)} />)}</div>
+            <PrimaryAction busy={false} disabled={Boolean(busy)} onClick={() => void move('routing', { client, model })} label={t('继续配置路由', 'Continue to routing')} />
           </WizardSection>}
 
           {currentStep === 'routing' && <WizardSection icon={<Waypoints />} title={t('创建号池与路由', 'Create the pool and route')} description={t('Stone+ 会原子创建或复用号池，并启用对应客户端路由。', 'Stone+ atomically creates or reuses a pool and enables the matching client route.')}>
             <SummaryRows rows={[[t('来源', 'Source'), selectedAccount?.name ?? selectedAccountId], [t('客户端', 'Client'), clientLabels[client]], [t('模型', 'Model'), model || t('未选择', 'Not selected')], [t('目标号池', 'Target pool'), snapshot.pools.find((pool) => pool.id === (aggregatePoolId || poolId))?.name ?? t('自动创建或复用', 'Create or reuse automatically')]]} />
-            <PrimaryAction busy={busy === 'routing'} onClick={() => void createRouting()} label={t('应用号池与路由', 'Apply pool and route')} />
+            <PrimaryAction busy={busy === 'routing'} disabled={Boolean(busy)} onClick={() => void createRouting()} label={t('应用号池与路由', 'Apply pool and route')} />
           </WizardSection>}
 
           {currentStep === 'gateway' && <WizardSection icon={<Server />} title={t('启动本地网关', 'Start the local gateway')} description={t('默认监听 127.0.0.1:15721；端口冲突时会选择相邻可用端口。', 'The default is 127.0.0.1:15721. If that port is busy, Stone+ chooses a nearby available port.')}>
             <SummaryRows rows={[[t('监听地址', 'Listen address'), `${snapshot.gateway.host}:${snapshot.gateway.port}`], [t('当前状态', 'Current status'), snapshot.gatewayStatus.running ? t('运行中', 'Running') : t('已停止', 'Stopped')], [t('号池', 'Pool'), routing?.poolId ?? poolId ?? t('已配置', 'Configured')]]} />
-            <PrimaryAction busy={busy === 'gateway'} onClick={() => void startGateway()} label={t('确保网关运行', 'Ensure gateway is running')} />
+            <PrimaryAction busy={busy === 'gateway'} disabled={Boolean(busy)} onClick={() => void startGateway()} label={t('确保网关运行', 'Ensure gateway is running')} />
           </WizardSection>}
 
           {currentStep === 'verify' && <WizardSection icon={<Play />} title={t('完成端到端真实请求', 'Run a real end-to-end request')} description={t('验证本地鉴权、路由、调度、协议转换和上游响应。', 'Verify local authentication, routing, scheduling, protocol conversion, and the upstream response.')}>
-            <ModelChoice value={model} options={modelOptions} onChange={setModel} />
+            <ModelChoice value={model} options={modelOptions} disabled={Boolean(busy)} onChange={setModel} />
             {verification && <SummaryRows rows={[[t('结果', 'Result'), verification.ok ? t('成功', 'Success') : t('失败', 'Failed')], [t('耗时', 'Duration'), `${verification.latencyMs} ms`], [t('响应', 'Response'), verification.responsePreview ?? verification.error ?? '—']]} />}
-            <PrimaryAction busy={busy === 'verify'} onClick={() => void verifyRoute()} label={t('运行端到端验证', 'Run end-to-end test')} />
+            <PrimaryAction busy={busy === 'verify'} disabled={Boolean(busy)} onClick={() => void verifyRoute()} label={t('运行端到端验证', 'Run end-to-end test')} />
           </WizardSection>}
 
           {currentStep === 'client-config' && <WizardSection icon={<Settings2 />} title={t('连接客户端（可选）', 'Connect the client (optional)')} description={t('可以先预览并备份配置，也可以跳过后手动处理。', 'Preview and back up the configuration now, or skip this step and configure it manually later.')}>
-            {snapshot.clientProfiles.some((profile) => profile.client === client) && <label className="setup-field"><span>{t('配置目录', 'Configuration directory')}</span><select value={clientProfileId} onChange={(event) => { setClientProfileId(event.target.value); setPreviewText(''); void move('client-config', { profileId: event.target.value || null }) }}>{snapshot.clientProfiles.filter((profile) => profile.client === client).map((profile) => <option value={profile.id} key={profile.id}>{profile.name} · {profile.directory || t('默认目录', 'Default directory')}</option>)}</select><small>{t('向导只会写入所选目录的 Stone+ 受管连接字段；托管实例和高级字段请在客户端页配置。', 'The wizard writes only Stone+-managed connection fields in the selected directory. Configure managed instances and advanced fields on the Clients page.')}</small></label>}
+            {snapshot.clientProfiles.some((profile) => profile.client === client) && <label className="setup-field"><span>{t('配置目录', 'Configuration directory')}</span><select value={clientProfileId} disabled={Boolean(busy)} onChange={(event) => { setClientProfileId(event.target.value); setPreviewText(''); void move('client-config', { profileId: event.target.value || null }) }}>{snapshot.clientProfiles.filter((profile) => profile.client === client).map((profile) => <option value={profile.id} key={profile.id}>{profile.name} · {profile.directory || t('默认目录', 'Default directory')}</option>)}</select><small>{t('向导只会写入所选目录的 Stone+ 受管连接字段；托管实例和高级字段请在客户端页配置。', 'The wizard writes only Stone+-managed connection fields in the selected directory. Configure managed instances and advanced fields on the Clients page.')}</small></label>}
             {previewText && <pre className="setup-preview">{previewText}</pre>}
-            <div className="setup-actions"><button className="button button--secondary" type="button" disabled={Boolean(busy)} onClick={() => void previewClient()}>{t('预览配置', 'Preview configuration')}</button><button className="button button--secondary" type="button" disabled={Boolean(busy)} onClick={() => void finish()}>{t('暂时跳过', 'Skip for now')}</button><PrimaryAction busy={busy === 'apply-client'} onClick={() => void applyClient()} label={t('应用并备份', 'Apply and back up')} /></div>
+            <div className="setup-actions"><button className="button button--secondary" type="button" disabled={Boolean(busy)} onClick={() => void previewClient()}>{t('预览配置', 'Preview configuration')}</button><button className="button button--secondary" type="button" disabled={Boolean(busy)} onClick={() => void finish()}>{t('暂时跳过', 'Skip for now')}</button><PrimaryAction busy={busy === 'apply-client'} disabled={Boolean(busy)} onClick={() => void applyClient()} label={t('应用并备份', 'Apply and back up')} /></div>
           </WizardSection>}
 
           {currentStep === 'complete' && <WizardSection icon={<CheckCircle2 />} title={t('配置已经跑通', 'Setup is working')} description={t('Stone+ 已完成一次从本地网关到上游模型的真实请求。', 'Stone+ completed a real request from the local gateway to the upstream model.')}>
             <SummaryRows rows={[[t('客户端', 'Client'), clientLabels[client]], [t('模型', 'Model'), model], [t('号池', 'Pool'), poolId ?? routing?.poolId ?? '—'], [t('本地网关', 'Local gateway'), `http://${snapshot.gatewayStatus.host}:${snapshot.gatewayStatus.port}`], [t('测试耗时', 'Test duration'), verification ? `${verification.latencyMs} ms` : '—']]} />
-            <div className="setup-actions"><button className="button button--secondary" type="button" disabled={Boolean(busy)} onClick={() => void configureAnotherSource()}>{busy === 'restart' ? <LoaderCircle size={16} className="spin" /> : null}{t('继续配置另一个来源', 'Configure another source')}</button><button className="button button--primary" type="button" onClick={() => void exitWizard()}>{t('返回总览', 'Return to overview')}</button></div>
+            <div className="setup-actions"><button className="button button--secondary" type="button" disabled={Boolean(busy)} onClick={() => void configureAnotherSource()}>{busy === 'restart' ? <LoaderCircle size={16} className="spin" /> : null}{t('继续配置另一个来源', 'Configure another source')}</button><button className="button button--primary" type="button" disabled={Boolean(busy)} onClick={() => void exitWizard()}>{t('返回总览', 'Return to overview')}</button></div>
           </WizardSection>}
 
-          {currentStep !== 'complete' && <footer className="setup-wizard__footer"><button className="text-button" type="button" disabled={currentIndex === 0 || Boolean(busy) || oauthCommitLocked} onClick={() => void back()}><ArrowLeft size={15} />{t('上一步', 'Previous')}</button><button className="text-button danger" type="button" disabled={Boolean(busy) || oauthCommitLocked} onClick={() => void discard()}>{t('放弃本次向导', 'Discard this setup')}</button></footer>}
+          {currentStep !== 'complete' && <footer className="setup-wizard__footer"><button className="text-button" type="button" disabled={currentIndex === 0 || Boolean(busy) || oauthCommitLocked} onClick={() => void back()}><ArrowLeft size={15} />{t('上一步', 'Previous')}</button><button className="text-button danger" type="button" disabled={Boolean(busy) || oauthCommitLocked} onClick={() => setDiscardConfirmOpen(true)}>{t('放弃本次向导', 'Discard this setup')}</button></footer>}
         </main>
       </div>
+      <ConfirmDialog
+        open={discardConfirmOpen}
+        title={t('放弃本次配置向导？', 'Discard this setup?')}
+        message={t(
+          '这会回滚本次向导创建或修改的来源、号池和路由。已存在且未被本次向导修改的数据会保留。',
+          'This rolls back sources, pools, and routes created or changed by this setup. Existing data untouched by this setup is kept.',
+        )}
+        confirmLabel={t('确认放弃', 'Discard setup')}
+        busy={busy === 'discard'}
+        onCancel={() => setDiscardConfirmOpen(false)}
+        onConfirm={() => void discard()}
+      />
     </div>
   )
 }
@@ -1015,9 +1081,9 @@ function ProbeResult({ result }: { result: ApiSourceProbeResult }) {
   return <div className="setup-probe"><header><strong>{t('连接诊断', 'Connection diagnostics')}</strong><Badge tone={result.ok ? 'success' : 'danger'}>{result.ok ? t('通过', 'Passed') : t('未通过', 'Failed')}</Badge></header>{result.stages.map((stage) => <div key={stage.id}><span className={`status-dot status-dot--${stage.status}`} /><strong>{stageLabel(stage.id, t)}</strong><p>{localizedProbeMessage(stage.id, stage.status, stage.message, t)}</p><small>{stage.latencyMs === undefined ? '—' : `${stage.latencyMs} ms`}</small></div>)}</div>
 }
 
-function ModelChoice({ value, options, onChange }: { value: string; options: string[]; onChange: (value: string) => void }) {
+function ModelChoice({ value, options, disabled = false, onChange }: { value: string; options: string[]; disabled?: boolean; onChange: (value: string) => void }) {
   const { t } = useI18n()
-  return <label className="setup-field"><span>{t('测试模型', 'Test model')}</span><input list="setup-model-options" value={value} onChange={(event) => onChange(event.target.value)} placeholder={t('输入或选择模型', 'Enter or choose a model')} /><datalist id="setup-model-options">{options.map((model) => <option value={model} key={model} />)}</datalist></label>
+  return <label className="setup-field"><span>{t('测试模型', 'Test model')}</span><input list="setup-model-options" value={value} disabled={disabled} onChange={(event) => onChange(event.target.value)} placeholder={t('输入或选择模型', 'Enter or choose a model')} /><datalist id="setup-model-options">{options.map((model) => <option value={model} key={model} />)}</datalist></label>
 }
 
 function SummaryRows({ rows }: { rows: Array<[string, string]> }) {

@@ -2,6 +2,8 @@ import type { Protocol } from '../../shared/types'
 
 type JsonObject = Record<string, unknown>
 
+const DEFAULT_MAX_BUFFERED_STREAM_CHARACTERS = 16 * 1024 * 1024
+
 export type CanonicalStopReason =
   | 'stop'
   | 'length'
@@ -16,7 +18,7 @@ export type CanonicalStopReason =
  */
 export type CanonicalStreamEvent =
   | { type: 'start'; id?: string; model?: string; createdAt?: number }
-  | { type: 'text-delta'; text: string }
+  | { type: 'text-delta'; text: string; index?: number; contentType?: 'text' | 'refusal' }
   | { type: 'tool-call-delta'; index: number; id?: string; name?: string; arguments?: string }
   /** Lifecycle signal used to distinguish a consumable tool call from a partial client abort. */
   | { type: 'tool-call-complete'; index: number }
@@ -31,6 +33,15 @@ export interface StreamEncodingOptions {
   id?: string
   model?: string
   now?: () => number
+}
+
+export interface StreamParsingOptions {
+  /**
+   * Maximum UTF-16 characters retained for one unfinished SSE frame or JSON
+   * value. The limit resets after every complete event/value, so it does not
+   * cap the total length of a healthy streamed response.
+   */
+  maxBufferedCharacters?: number
 }
 
 export interface CanonicalStreamParser {
@@ -66,12 +77,16 @@ export interface CanonicalStreamEncoder {
   /** Encodes one canonical event; a protocol event may require multiple frames. */
   encode(event: CanonicalStreamEvent): Uint8Array[]
   finish(): Uint8Array[]
+  /** Reports a protocol-encoding failure that was emitted to the downstream stream. */
+  getFailure(): Extract<CanonicalStreamEvent, { type: 'error' }> | undefined
 }
 
 export interface OpenAiResponsesStreamResult {
   response?: JsonObject
   usage?: { input_tokens?: number; output_tokens?: number; total_tokens?: number; cached_input_tokens?: number; reasoning_tokens?: number }
   error?: string
+  errorCode?: string
+  errorType?: string
 }
 
 export interface OpenAiResponsesStreamCollector {
@@ -96,22 +111,46 @@ class SseFramer {
   private buffer = ''
   private eventName: string | undefined
   private dataLines: string[] = []
+  private frameCharacters = 0
+  private failed = false
 
-  constructor(private readonly onEvent: SseHandler) {}
+  constructor(
+    private readonly onEvent: SseHandler,
+    private readonly onError: (message: string) => void,
+    private readonly maxBufferedCharacters: number
+  ) {}
 
   push(text: string): void {
-    this.buffer += text
+    if (this.failed) return
+    let offset = 0
+    while (offset < text.length && !this.failed) {
+      const retained = this.frameCharacters + this.buffer.length
+      const take = Math.max(1, this.maxBufferedCharacters - retained + 1)
+      const end = Math.min(text.length, offset + take)
+      this.buffer += text.slice(offset, end)
+      offset = end
+      this.drain()
+    }
+  }
+
+  private drain(): void {
     while (true) {
       const newline = this.buffer.indexOf('\n')
-      if (newline < 0) return
+      if (newline < 0) {
+        this.ensureWithinLimit(this.frameCharacters + this.buffer.length)
+        return
+      }
       let line = this.buffer.slice(0, newline)
       this.buffer = this.buffer.slice(newline + 1)
       if (line.endsWith('\r')) line = line.slice(0, -1)
+      this.frameCharacters += line.length + 1
+      if (!this.ensureWithinLimit(this.frameCharacters)) return
       this.processLine(line)
     }
   }
 
   finish(): void {
+    if (this.failed) return
     if (this.buffer.length > 0) this.processLine(this.buffer.replace(/\r$/, ''))
     this.buffer = ''
     this.dispatch()
@@ -135,6 +174,18 @@ class SseFramer {
     if (this.dataLines.length > 0) this.onEvent(this.eventName, this.dataLines.join('\n'))
     this.eventName = undefined
     this.dataLines = []
+    this.frameCharacters = 0
+  }
+
+  private ensureWithinLimit(characters: number): boolean {
+    if (characters <= this.maxBufferedCharacters) return true
+    this.failed = true
+    this.buffer = ''
+    this.eventName = undefined
+    this.dataLines = []
+    this.frameCharacters = 0
+    this.onError(`SSE frame exceeded ${this.maxBufferedCharacters} buffered characters`)
+    return false
   }
 }
 
@@ -142,6 +193,13 @@ interface CollectedToolCall {
   id?: string
   name?: string
   argumentChunks: string[]
+  completed?: boolean
+}
+
+interface CollectedMessage {
+  chunks: string[]
+  completed?: boolean
+  contentType?: 'text' | 'refusal'
 }
 
 class ResponsesStreamCollector implements OpenAiResponsesStreamCollector {
@@ -151,12 +209,14 @@ class ResponsesStreamCollector implements OpenAiResponsesStreamCollector {
   private id?: string
   private model?: string
   private createdAt?: number
-  private readonly textChunks: string[] = []
+  private readonly messages = new Map<number, CollectedMessage>()
   private usage: NonNullable<OpenAiResponsesStreamResult['usage']> = {}
   private stopReason?: CanonicalStopReason
   private terminalResponse?: JsonObject
   private terminalType?: 'response.completed' | 'response.incomplete'
   private error?: string
+  private errorCode?: string
+  private errorType?: string
   private done = false
   private finished = false
   private result?: OpenAiResponsesStreamResult
@@ -189,7 +249,12 @@ class ResponsesStreamCollector implements OpenAiResponsesStreamCollector {
     const error = this.error
       ?? (!this.stopReason || !this.done ? 'Upstream Responses stream ended before a terminal response' : undefined)
     if (error) {
-      this.result = { ...(usage ? { usage } : {}), error }
+      this.result = {
+        ...(usage ? { usage } : {}),
+        error,
+        ...(this.errorCode ? { errorCode: this.errorCode } : {}),
+        ...(this.errorType ? { errorType: this.errorType } : {})
+      }
       return this.result
     }
 
@@ -206,13 +271,27 @@ class ResponsesStreamCollector implements OpenAiResponsesStreamCollector {
         this.model = event.model ?? this.model
         this.createdAt = event.createdAt ?? this.createdAt
       } else if (event.type === 'text-delta') {
-        this.textChunks.push(event.text)
+        const index = event.index ?? 0
+        const message = this.messages.get(index) ?? { chunks: [] }
+        message.chunks.push(event.text)
+        message.contentType = event.contentType === 'refusal' || message.contentType === 'refusal'
+          ? 'refusal'
+          : 'text'
+        this.messages.set(index, message)
       } else if (event.type === 'tool-call-delta') {
         const tool = this.tools.get(event.index) ?? { argumentChunks: [] }
         tool.id = event.id ?? tool.id
         tool.name = event.name ?? tool.name
         if (event.arguments) tool.argumentChunks.push(event.arguments)
         this.tools.set(event.index, tool)
+      } else if (event.type === 'tool-call-complete') {
+        const tool = this.tools.get(event.index) ?? { argumentChunks: [] }
+        tool.completed = true
+        this.tools.set(event.index, tool)
+      } else if (event.type === 'message-complete') {
+        const message = this.messages.get(event.index) ?? { chunks: [] }
+        message.completed = true
+        this.messages.set(event.index, message)
       } else if (event.type === 'usage') {
         if (event.inputTokens !== undefined) this.usage.input_tokens = event.inputTokens
         if (event.outputTokens !== undefined) this.usage.output_tokens = event.outputTokens
@@ -223,6 +302,8 @@ class ResponsesStreamCollector implements OpenAiResponsesStreamCollector {
         this.stopReason = event.reason
       } else if (event.type === 'error') {
         this.error ??= event.message
+        this.errorCode ??= event.code
+        this.errorType ??= event.errorType
       } else if (event.type === 'done') {
         this.done = true
       }
@@ -251,12 +332,18 @@ class ResponsesStreamCollector implements OpenAiResponsesStreamCollector {
     })
     const terminal = this.terminalResponse
     const terminalOutput = Array.isArray(terminal?.output) ? terminal.output : undefined
-    const status = this.terminalType === 'response.incomplete' || this.stopReason === 'length'
-      || this.stopReason === 'content_filter'
+    const status = this.terminalType === 'response.incomplete'
+      || (!this.terminalType && (this.stopReason === 'length' || this.stopReason === 'content_filter'))
       ? 'incomplete'
       : 'completed'
     const incompleteReason = this.stopReason === 'content_filter' ? 'content_filter' : 'max_output_tokens'
-    if (terminal && terminalOutput && terminalOutput.length > 0) {
+    const hasCollectedContent = [...this.messages.values()].some((message) => message.chunks.length > 0)
+    if (
+      terminal
+      && terminalOutput
+      && terminalOutput.length > 0
+      && (!hasCollectedContent || responsesOutputContainsText(terminalOutput))
+    ) {
       const terminalUsage = { ...(objectValue(terminal.usage) ?? {}) }
       delete terminalUsage.cached_input_tokens
       delete terminalUsage.reasoning_tokens
@@ -278,13 +365,17 @@ class ResponsesStreamCollector implements OpenAiResponsesStreamCollector {
     // Most Responses terminal payloads already contain the complete output.
     // Only materialize a second aggregate output when the terminal omitted it.
     const aggregateOutput: JsonObject[] = []
-    if (this.textChunks.length > 0) {
+    for (const [index, message] of [...this.messages.entries()].sort(([left], [right]) => left - right)) {
+      if (message.chunks.length === 0) continue
+      const text = message.chunks.join('')
       aggregateOutput.push({
-        id: `msg_${safeIdentifier(id)}`,
+        id: index === 0 ? `msg_${safeIdentifier(id)}` : `msg_${safeIdentifier(id)}_${index}`,
         type: 'message',
-        status,
+        status: message.completed ? 'completed' : status,
         role: 'assistant',
-        content: [{ type: 'output_text', text: this.textChunks.join(''), annotations: [] }]
+        content: message.contentType === 'refusal'
+          ? [{ type: 'refusal', refusal: text }]
+          : [{ type: 'output_text', text, annotations: [] }]
       })
     }
     for (const [index, tool] of [...this.tools.entries()].sort(([left], [right]) => left - right)) {
@@ -292,7 +383,7 @@ class ResponsesStreamCollector implements OpenAiResponsesStreamCollector {
       aggregateOutput.push({
         id: `fc_${safeIdentifier(id)}_${index}`,
         type: 'function_call',
-        status,
+        status: tool.completed ? 'completed' : status,
         call_id: callId,
         name: tool.name ?? '',
         arguments: tool.argumentChunks.join('')
@@ -312,7 +403,12 @@ class ResponsesStreamCollector implements OpenAiResponsesStreamCollector {
 
     if (!terminal) return aggregate
     const output = terminalOutput && (terminalOutput.length > 0 || aggregateOutput.length === 0)
-      ? terminalOutput
+      ? hasCollectedContent && !responsesOutputContainsText(terminalOutput)
+        ? [
+            ...terminalOutput,
+            ...aggregateOutput.filter((item) => item.type === 'message')
+          ]
+        : terminalOutput
       : aggregateOutput
     const terminalUsage = { ...(objectValue(terminal.usage) ?? {}) }
     delete terminalUsage.cached_input_tokens
@@ -328,16 +424,26 @@ class ResponsesStreamCollector implements OpenAiResponsesStreamCollector {
 
 class JsonFramer {
   private buffer = ''
-  private arrayMode: boolean | undefined
+  private mode: 'pending' | 'single' | 'array' | 'complete' = 'pending'
+  private arrayState: 'value-or-end' | 'value' | 'comma-or-end' = 'value-or-end'
+  private failed = false
 
   constructor(
     private readonly onValue: (value: unknown) => void,
-    private readonly onError: (message: string) => void
+    private readonly onError: (message: string) => void,
+    private readonly maxBufferedCharacters: number
   ) {}
 
   push(text: string): void {
-    this.buffer += text
-    this.drain(false)
+    if (this.failed) return
+    let offset = 0
+    while (offset < text.length && !this.failed) {
+      const take = Math.max(1, this.maxBufferedCharacters - this.buffer.length + 1)
+      const end = Math.min(text.length, offset + take)
+      this.buffer += text.slice(offset, end)
+      offset = end
+      this.drain(false)
+    }
   }
 
   finish(): void {
@@ -345,33 +451,72 @@ class JsonFramer {
   }
 
   private drain(final: boolean): void {
-    while (true) {
+    while (!this.failed) {
       this.buffer = this.buffer.trimStart()
-      if (this.arrayMode === undefined) {
+      if (this.mode === 'complete') {
+        if (this.buffer.length > 0) this.fail('Unexpected JSON value after the completed stream root')
+        return
+      }
+      if (this.mode === 'pending') {
         if (!this.buffer) return
-        this.arrayMode = this.buffer.startsWith('[')
-        if (this.arrayMode) this.buffer = this.buffer.slice(1)
+        if (this.buffer.startsWith('[')) {
+          this.mode = 'array'
+          this.arrayState = 'value-or-end'
+          this.buffer = this.buffer.slice(1)
+        } else {
+          this.mode = 'single'
+        }
       }
 
       this.buffer = this.buffer.trimStart()
-      if (this.arrayMode) {
-        if (this.buffer.startsWith(',')) {
-          this.buffer = this.buffer.slice(1).trimStart()
+      if (this.mode === 'array') {
+        if (this.arrayState === 'comma-or-end') {
+          if (this.buffer.startsWith(',')) {
+            this.buffer = this.buffer.slice(1)
+            this.arrayState = 'value'
+            continue
+          }
+          if (this.buffer.startsWith(']')) {
+            this.buffer = this.buffer.slice(1)
+            this.mode = 'complete'
+            continue
+          }
+          if (!this.buffer) return
+          this.fail('Expected a comma or closing bracket between JSON array values')
+          return
         }
-        if (this.buffer.startsWith(']')) {
+        if (this.arrayState === 'value-or-end' && this.buffer.startsWith(']')) {
           this.buffer = this.buffer.slice(1)
-          this.arrayMode = undefined
+          this.mode = 'complete'
           continue
         }
+        if (this.buffer.startsWith(',')) {
+          this.fail('Unexpected leading comma in JSON array')
+          return
+        }
+        if (this.arrayState === 'value' && this.buffer.startsWith(']')) {
+          this.fail('Unexpected trailing comma in JSON array')
+          return
+        }
       }
-      if (!this.buffer) return
+      if (!this.buffer) {
+        if (final) this.fail('Incomplete JSON value at end of stream')
+        return
+      }
 
       const boundary = findJsonValueBoundary(this.buffer)
       if (boundary < 0) {
-        if (final) {
-          this.onError('Incomplete JSON value at end of stream')
-          this.buffer = ''
+        if (this.buffer.length > this.maxBufferedCharacters) {
+          this.fail(`JSON value exceeded ${this.maxBufferedCharacters} buffered characters`)
+          return
         }
+        if (final) {
+          this.fail('Incomplete JSON value at end of stream')
+        }
+        return
+      }
+      if (boundary > this.maxBufferedCharacters) {
+        this.fail(`JSON value exceeded ${this.maxBufferedCharacters} buffered characters`)
         return
       }
       const raw = this.buffer.slice(0, boundary)
@@ -379,10 +524,19 @@ class JsonFramer {
       try {
         this.onValue(JSON.parse(raw) as unknown)
       } catch (error) {
-        this.onError(error instanceof Error ? error.message : 'Invalid JSON stream value')
+        this.fail(error instanceof Error ? error.message : 'Invalid JSON stream value')
+        return
       }
-      if (!this.arrayMode) this.arrayMode = undefined
+      if (this.mode === 'array') this.arrayState = 'comma-or-end'
+      else this.mode = 'complete'
     }
+  }
+
+  private fail(message: string): void {
+    if (this.failed) return
+    this.failed = true
+    this.buffer = ''
+    this.onError(message)
   }
 }
 
@@ -416,11 +570,8 @@ function findJsonValueBoundary(value: string): number {
 class ProtocolParser implements CanonicalStreamParser {
   private readonly decoder = new TextDecoder()
   private readonly events: CanonicalStreamEvent[] = []
-  private readonly sse = new SseFramer((eventName, data) => this.handleSse(eventName, data))
-  private readonly json = new JsonFramer(
-    (value) => this.handlePayload(undefined, value),
-    (message) => this.emitFramingError(message)
-  )
+  private readonly sse: SseFramer
+  private readonly json: JsonFramer
   private framing: 'sse' | 'json' | undefined
   private framingBuffer = ''
   private started = false
@@ -429,6 +580,7 @@ class ProtocolParser implements CanonicalStreamParser {
   private errored = false
   private finishing = false
   private sawToolCall = false
+  private sawRefusal = false
   private nextToolIndex = 0
   private readonly anthropicToolIndices = new Map<number, number>()
   private readonly responsesToolIndices = new Map<number, number>()
@@ -448,9 +600,23 @@ class ProtocolParser implements CanonicalStreamParser {
   private responsesLastEventType: string | undefined
   private responsesLastSequenceNumber: number | undefined
   private responsesTerminalResponse: JsonObject | undefined
+  private readonly responsesTextDeltaKeys = new Set<string>()
+  private readonly responsesTextDoneKeys = new Set<string>()
   private recognizedEventCount = 0
+  private responsesLastProgressUsage = ''
 
-  constructor(private readonly protocol: Protocol) {
+  constructor(private readonly protocol: Protocol, options: StreamParsingOptions = {}) {
+    const maxBufferedCharacters = normalizeBufferedCharacterLimit(options.maxBufferedCharacters)
+    this.sse = new SseFramer(
+      (eventName, data) => this.handleSse(eventName, data),
+      (message) => this.emitFramingError(message),
+      maxBufferedCharacters
+    )
+    this.json = new JsonFramer(
+      (value) => this.handlePayload(undefined, value),
+      (message) => this.emitFramingError(message),
+      maxBufferedCharacters
+    )
     if (protocol !== 'gemini') this.framing = 'sse'
   }
 
@@ -596,16 +762,47 @@ class ProtocolParser implements CanonicalStreamParser {
 
   private handleOpenAiResponses(eventName: string | undefined, payload: JsonObject): void {
     const type = stringValue(payload.type, eventName ?? '')
+    const recognized = type ? recognizedResponsesPayload(type, payload) : false
+    const terminalType: ResponsesTerminalEvent | undefined = type === 'response.completed'
+      || type === 'response.incomplete'
+      || type === 'response.failed'
+      ? type
+      : undefined
     if (type) {
       this.responsesEventCount += 1
-      if (responsesEventAdvancesProgress(type)) this.responsesProgressEventCount += 1
       this.responsesLastEventType = type
-      const sequenceNumber = numberValue(payload.sequence_number)
-      if (sequenceNumber !== undefined) this.responsesLastSequenceNumber = sequenceNumber
-      if (type === 'response.completed' || type === 'response.incomplete' || type === 'response.failed') {
-        this.responsesTerminalEvent = type
-        this.responsesTerminalResponse = objectValue(payload.response)
+      if (recognized && Object.hasOwn(payload, 'sequence_number')) {
+        const sequenceNumber = responsesSequenceNumber(payload.sequence_number)
+        if (sequenceNumber === undefined) {
+          this.emitResponsesProtocolError(
+            'Responses sequence_number must be a non-negative safe integer when present',
+            'invalid_sequence_number'
+          )
+          return
+        }
+        if (this.responsesLastSequenceNumber !== undefined
+          && sequenceNumber <= this.responsesLastSequenceNumber) {
+          // Replayed or out-of-order frames are ignored atomically, including
+          // their terminal state. Unsequenced compatibility events remain
+          // accepted and are deduplicated by item/content identity below.
+          return
+        }
+        this.responsesLastSequenceNumber = sequenceNumber
       }
+      if (recognized && this.responsesPayloadAdvancesProgress(type, payload)) {
+        this.responsesProgressEventCount += 1
+      }
+    }
+    if (terminalType) {
+      if (!recognized) {
+        this.emitResponsesProtocolError(
+          `Responses terminal event ${type} is missing its required response payload`,
+          'invalid_terminal_event'
+        )
+        return
+      }
+      this.responsesTerminalEvent = terminalType
+      this.responsesTerminalResponse = objectValue(payload.response)
     }
     if (type === 'error' || type === 'response.error') {
       this.emitErrorObject(payload.error ?? payload)
@@ -619,7 +816,67 @@ class ProtocolParser implements CanonicalStreamParser {
     this.emitStart(payload.response_id, response?.model, response?.created_at)
     if (type === 'response.output_text.delta') {
       const text = stringValue(payload.delta)
-      if (text) this.events.push({ type: 'text-delta', text })
+      if (text) {
+        const key = responsesTextKey(payload, 'text')
+        if (this.responsesTextDoneKeys.has(key)) return
+        this.responsesTextDeltaKeys.add(key)
+        this.events.push({
+          type: 'text-delta',
+          text,
+          index: responsesOutputIndex(payload),
+          contentType: 'text'
+        })
+      }
+      return
+    }
+    if (type === 'response.output_text.done') {
+      // Some Responses-compatible relays emit only the final text event. When
+      // deltas were already received, the done payload is the full duplicate
+      // and must not be appended again.
+      const text = optionalString(payload.text)
+      const key = responsesTextKey(payload, 'text')
+      if (!this.responsesTextDoneKeys.has(key)
+        && text && !this.responsesTextDeltaKeys.has(key)) {
+        this.events.push({
+          type: 'text-delta',
+          text,
+          index: responsesOutputIndex(payload),
+          contentType: 'text'
+        })
+      }
+      this.responsesTextDoneKeys.add(key)
+      return
+    }
+    if (type === 'response.refusal.delta') {
+      const refusal = stringValue(payload.delta)
+      if (refusal) {
+        const key = responsesTextKey(payload, 'refusal')
+        if (this.responsesTextDoneKeys.has(key)) return
+        this.sawRefusal = true
+        this.responsesTextDeltaKeys.add(key)
+        this.events.push({
+          type: 'text-delta',
+          text: refusal,
+          index: responsesOutputIndex(payload),
+          contentType: 'refusal'
+        })
+      }
+      return
+    }
+    if (type === 'response.refusal.done') {
+      const refusal = optionalString(payload.refusal)
+      const key = responsesTextKey(payload, 'refusal')
+      if (!this.responsesTextDoneKeys.has(key)
+        && refusal && !this.responsesTextDeltaKeys.has(key)) {
+        this.events.push({
+          type: 'text-delta',
+          text: refusal,
+          index: responsesOutputIndex(payload),
+          contentType: 'refusal'
+        })
+      }
+      if (refusal) this.sawRefusal = true
+      this.responsesTextDoneKeys.add(key)
       return
     }
     if (type === 'response.output_item.added') {
@@ -732,7 +989,8 @@ class ProtocolParser implements CanonicalStreamParser {
       }
       this.responsesToolMetadataSeen.add(outputIndex)
       if (includeArguments) this.responsesArgumentsSeen.add(outputIndex)
-      if (!this.responsesToolCompleted.has(outputIndex)) {
+      const status = optionalString(item.status)
+      if ((!status || status === 'completed') && !this.responsesToolCompleted.has(outputIndex)) {
         this.responsesToolCompleted.add(outputIndex)
         this.events.push({ type: 'tool-call-complete', index })
       }
@@ -747,9 +1005,14 @@ class ProtocolParser implements CanonicalStreamParser {
         ? normalizedReason === 'content_filter' || normalizedReason.includes('content_filter')
           ? 'content_filter'
           : normalizedReason.includes('max') ? 'length' : 'other'
-        : (this.sawToolCall ? 'tool_calls' : 'stop')
-      this.emitStop(reason, rawReason || undefined)
+        : this.sawRefusal ? 'content_filter' : (this.sawToolCall ? 'tool_calls' : 'stop')
+      this.emitStop(reason, rawReason || (this.sawRefusal ? 'refusal' : undefined))
       this.emitDone()
+      return
+    }
+    if (type.startsWith('response.usage')) {
+      const usage = objectValue(payload.usage) ?? objectValue(response?.usage)
+      this.emitUsage(usage, 'input_tokens', 'output_tokens', 'total_tokens')
       return
     }
     if (type === 'response.failed') {
@@ -757,6 +1020,22 @@ class ProtocolParser implements CanonicalStreamParser {
       this.emitStop('error', 'failed')
       this.emitDone()
     }
+  }
+
+  private responsesPayloadAdvancesProgress(type: string, payload: JsonObject): boolean {
+    if (!responsesEventAdvancesProgress(type)) return false
+    if (type.startsWith('response.usage')) {
+      const signature = responsesUsageProgressSignature(payload)
+      if (!signature || signature === this.responsesLastProgressUsage) return false
+      this.responsesLastProgressUsage = signature
+    }
+    return true
+  }
+
+  private emitResponsesProtocolError(message: string, code: string): void {
+    this.emitError(message, code, 'invalid_stream_event')
+    this.emitStop('error', code)
+    this.emitDone()
   }
 
   private handleAnthropic(eventName: string | undefined, payload: JsonObject): void {
@@ -960,6 +1239,11 @@ class ProtocolParser implements CanonicalStreamParser {
 
   private emitFramingError(message: string): void {
     if (message.startsWith('Incomplete JSON value')) this.emitIncompleteStream(message)
+    else if (message.includes('exceeded') && message.includes('buffered characters')) {
+      this.emitError(message, 'frame_too_large', 'frame_too_large')
+      this.emitStop('error', 'frame_too_large')
+      this.emitDone()
+    }
     else this.emitError(message, undefined, 'invalid_json')
   }
 
@@ -982,10 +1266,7 @@ class ProtocolParser implements CanonicalStreamParser {
 function recognizedProtocolPayload(protocol: Protocol, eventName: string | undefined, payload: JsonObject): boolean {
   if (protocol === 'openai-responses') {
     const type = stringValue(payload.type, eventName ?? '')
-    return type === 'response.created'
-      || type === 'response.queued'
-      || type === 'response.in_progress'
-      || responsesEventAdvancesProgress(type)
+    return recognizedResponsesPayload(type, payload)
   }
   if (protocol === 'openai-chat') {
     return Boolean(payload.error) || Array.isArray(payload.choices) || objectValue(payload.usage) !== undefined
@@ -999,6 +1280,112 @@ function recognizedProtocolPayload(protocol: Protocol, eventName: string | undef
     || objectValue(payload.promptFeedback ?? payload.prompt_feedback) !== undefined
 }
 
+function recognizedResponsesPayload(type: string, payload: JsonObject): boolean {
+  if (type === 'response.queued') return true
+  if (type === 'response.created' || type === 'response.in_progress') {
+    return objectValue(payload.response) !== undefined
+  }
+  if (type === 'response.completed' || type === 'response.incomplete') {
+    const response = objectValue(payload.response)
+    return response !== undefined && (response.status === undefined || stringValue(response.status) !== '')
+  }
+  if (type === 'response.failed') {
+    const response = objectValue(payload.response)
+    return response !== undefined && (objectValue(response.error) !== undefined || response.status === 'failed')
+  }
+  if (type === 'response.error' || type === 'error') {
+    return objectValue(payload.error) !== undefined || optionalString(payload.message) !== undefined
+  }
+  if (!responsesEventAdvancesProgress(type)) return false
+  if (type.startsWith('response.usage')) return responsesUsageProgressSignature(payload) !== undefined
+
+  if (type.endsWith('.delta')) return optionalString(payload.delta) !== undefined
+
+  if (type === 'response.output_text.done') {
+    return optionalString(payload.text) !== undefined
+  }
+  if (type === 'response.refusal.done') {
+    return optionalString(payload.refusal) !== undefined
+  }
+  if (type.startsWith('response.output_item.')) {
+    return objectValue(payload.item) !== undefined
+  }
+  if (type.startsWith('response.content_part.')) {
+    return objectValue(payload.part) !== undefined
+  }
+  if (type === 'response.function_call_arguments.done') {
+    return typeof payload.arguments === 'string'
+  }
+  if (type === 'response.custom_tool_call_input.done') {
+    return typeof payload.input === 'string'
+  }
+
+  // Tool/reasoning lifecycle events have multiple provider-specific payload
+  // shapes. Require a stable item identity or output index rather than trusting
+  // the event-name prefix alone.
+  return nonNegativeSafeInteger(payload.output_index) !== undefined
+    || optionalString(payload.item_id) !== undefined
+    || optionalString(payload.call_id) !== undefined
+    || objectValue(payload.item) !== undefined
+    || objectValue(payload.part) !== undefined
+}
+
+function responsesOutputIndex(payload: JsonObject): number {
+  return nonNegativeSafeInteger(payload.output_index) ?? 0
+}
+
+function responsesTextKey(payload: JsonObject, contentType: 'text' | 'refusal'): string {
+  return `${contentType}:${responsesOutputIndex(payload)}:${nonNegativeSafeInteger(payload.content_index) ?? 0}`
+}
+
+function responsesOutputContainsText(output: readonly unknown[]): boolean {
+  return output.some((value) => {
+    const item = objectValue(value)
+    if (!item || item.type !== 'message' || !Array.isArray(item.content)) return false
+    return item.content.some((partValue) => {
+      const part = objectValue(partValue)
+      return (part?.type === 'output_text' || part?.type === 'text')
+        && optionalString(part.text) !== undefined
+        || part?.type === 'refusal' && optionalString(part.refusal) !== undefined
+    })
+  })
+}
+
+function responsesSequenceNumber(value: unknown): number | undefined {
+  return nonNegativeSafeInteger(value)
+}
+
+function nonNegativeSafeInteger(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : undefined
+}
+
+function responsesUsageProgressSignature(payload: JsonObject): string | undefined {
+  const usage = objectValue(payload.usage) ?? objectValue(payload.response)?.usage
+  const usageObject = objectValue(usage)
+  if (!usageObject) return undefined
+  const inputDetails = objectValue(usageObject.input_tokens_details)
+  const outputDetails = objectValue(usageObject.output_tokens_details)
+  const values = [
+    nonNegativeFiniteNumber(usageObject.input_tokens),
+    nonNegativeFiniteNumber(usageObject.output_tokens),
+    nonNegativeFiniteNumber(usageObject.total_tokens),
+    nonNegativeFiniteNumber(inputDetails?.cached_tokens),
+    nonNegativeFiniteNumber(outputDetails?.reasoning_tokens)
+  ]
+  if (values.every((value) => value === undefined)) return undefined
+  return values.map((value) => value ?? '').join(':')
+}
+
+function nonNegativeFiniteNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined
+}
+
+function normalizeBufferedCharacterLimit(value: number | undefined): number {
+  return value !== undefined && Number.isSafeInteger(value) && value > 0
+    ? value
+    : DEFAULT_MAX_BUFFERED_STREAM_CHARACTERS
+}
+
 interface EncodedToolState {
   index: number
   id: string
@@ -1010,6 +1397,7 @@ interface EncodedToolState {
   contentIndex?: number
   emittedArguments: number
   emitted: boolean
+  completed: boolean
 }
 
 class ProtocolEncoder implements CanonicalStreamEncoder {
@@ -1023,6 +1411,7 @@ class ProtocolEncoder implements CanonicalStreamEncoder {
   private stopped = false
   private done = false
   private failed = false
+  private encodingFailure?: Extract<CanonicalStreamEvent, { type: 'error' }>
   private pendingStop: Extract<CanonicalStreamEvent, { type: 'stop' }> | undefined
   private usage: Extract<CanonicalStreamEvent, { type: 'usage' }> = { type: 'usage' }
   private readonly tools = new Map<number, EncodedToolState>()
@@ -1036,6 +1425,8 @@ class ProtocolEncoder implements CanonicalStreamEncoder {
   private responsesTextOutputIndex: number | undefined
   private responsesText = ''
   private responsesTextStarted = false
+  private readonly responsesTextSourceIndices = new Set<number>()
+  private readonly responsesCompletedMessageIndices = new Set<number>()
   private chatUsageEmitted = false
   private readonly chatToolIds = new Map<number, string>()
 
@@ -1063,6 +1454,10 @@ class ProtocolEncoder implements CanonicalStreamEncoder {
   finish(): Uint8Array[] {
     if (!this.done) return this.encode({ type: 'done' })
     return this.drainFrames()
+  }
+
+  getFailure(): Extract<CanonicalStreamEvent, { type: 'error' }> | undefined {
+    return this.encodingFailure
   }
 
   private encodeOpenAiChat(event: CanonicalStreamEvent): void {
@@ -1148,6 +1543,7 @@ class ProtocolEncoder implements CanonicalStreamEncoder {
       this.ensureResponsesStart()
       this.ensureResponsesTextStarted()
       this.responsesText += event.text
+      if (event.index !== undefined) this.responsesTextSourceIndices.add(event.index)
       this.frames.push(responsesSse('response.output_text.delta', {
         response_id: this.id,
         item_id: `${this.id}_message`,
@@ -1174,6 +1570,15 @@ class ProtocolEncoder implements CanonicalStreamEncoder {
           tool.emittedArguments = tool.arguments.length
         }
       }
+      return
+    }
+    if (event.type === 'tool-call-complete') {
+      const tool = this.tools.get(event.index)
+      if (tool) tool.completed = true
+      return
+    }
+    if (event.type === 'message-complete') {
+      this.responsesCompletedMessageIndices.add(event.index)
       return
     }
     if (event.type === 'usage') {
@@ -1287,8 +1692,12 @@ class ProtocolEncoder implements CanonicalStreamEncoder {
       return
     }
     if (event.type === 'tool-call-delta') {
-      const tool = this.updateTool(event)
-      this.emitGeminiToolIfReady(tool)
+      this.updateTool(event)
+      return
+    }
+    if (event.type === 'tool-call-complete') {
+      const tool = this.tools.get(event.index)
+      if (tool) this.emitGeminiTool(tool)
       return
     }
     if (event.type === 'usage') {
@@ -1325,7 +1734,8 @@ class ProtocolEncoder implements CanonicalStreamEncoder {
         arguments: '',
         started: false,
         emittedArguments: 0,
-        emitted: false
+        emitted: false,
+        completed: false
       }
       this.tools.set(event.index, tool)
     }
@@ -1424,10 +1834,12 @@ class ProtocolEncoder implements CanonicalStreamEncoder {
     const itemStatus = incompleteReason ? 'incomplete' : 'completed'
     const output: JsonObject[] = []
     if (this.responsesTextStarted) {
+      const allSourceMessagesCompleted = this.responsesTextSourceIndices.size > 0
+        && [...this.responsesTextSourceIndices].every((index) => this.responsesCompletedMessageIndices.has(index))
       const item = {
         id: `${this.id}_message`,
         type: 'message',
-        status: itemStatus,
+        status: allSourceMessagesCompleted ? 'completed' : itemStatus,
         role: 'assistant',
         content: [{ type: 'output_text', text: this.responsesText, annotations: [] }]
       }
@@ -1459,7 +1871,7 @@ class ProtocolEncoder implements CanonicalStreamEncoder {
       const item = {
         id: tool.itemId,
         type: 'function_call',
-        status: itemStatus,
+        status: tool.completed ? 'completed' : itemStatus,
         call_id: tool.id || tool.itemId,
         name: tool.name,
         arguments: tool.arguments
@@ -1585,15 +1997,27 @@ class ProtocolEncoder implements CanonicalStreamEncoder {
     })
   }
 
-  private emitGeminiToolIfReady(tool: EncodedToolState): void {
-    if (tool.emitted || !tool.name || !tool.arguments) return
-    if (parseJsonObject(tool.arguments)) this.emitGeminiTool(tool, false)
-  }
-
-  private emitGeminiTool(tool: EncodedToolState, force: boolean): void {
-    if (tool.emitted) return
+  private emitGeminiTool(tool: EncodedToolState): boolean {
+    if (tool.emitted) return true
     const args = parseJsonObject(tool.arguments)
-    if (!force && !args) return
+    if (!args) {
+      const message = `Tool call ${tool.name || tool.id || tool.index} arguments are not a valid JSON object`
+      this.failed = true
+      this.encodingFailure ??= {
+        type: 'error',
+        message,
+        errorType: 'invalid_tool_arguments',
+        code: 'invalid_tool_arguments'
+      }
+      this.frames.push(sseFrame({
+        error: {
+          message,
+          type: 'invalid_tool_arguments',
+          code: 'invalid_tool_arguments'
+        }
+      }))
+      return false
+    }
     tool.emitted = true
     this.frames.push(sseFrame({
       candidates: [{
@@ -1603,17 +2027,20 @@ class ProtocolEncoder implements CanonicalStreamEncoder {
             functionCall: omitUndefined({
               id: optionalString(tool.id),
               name: tool.name,
-              args: args ?? {}
+              args
             })
           }]
         }
       }],
       modelVersion: this.model || undefined
     }))
+    return true
   }
 
   private finalizeGemini(stop: Extract<CanonicalStreamEvent, { type: 'stop' }>): void {
-    for (const tool of this.tools.values()) this.emitGeminiTool(tool, true)
+    for (const tool of this.tools.values()) {
+      if (!this.emitGeminiTool(tool)) return
+    }
     this.stopped = true
     this.frames.push(sseFrame({
       candidates: [{
@@ -1630,8 +2057,11 @@ class ProtocolEncoder implements CanonicalStreamEncoder {
   }
 }
 
-export function createCanonicalStreamParser(protocol: Protocol): CanonicalStreamParser {
-  return new ProtocolParser(protocol)
+export function createCanonicalStreamParser(
+  protocol: Protocol,
+  options: StreamParsingOptions = {}
+): CanonicalStreamParser {
+  return new ProtocolParser(protocol, options)
 }
 
 export function createCanonicalStreamEncoder(

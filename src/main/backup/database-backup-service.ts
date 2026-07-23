@@ -17,12 +17,15 @@ import {
   type PortableBackupInfo,
 } from './portable-backup'
 import { preparePortableExportDatabase, preparePortableImportedDatabase } from './portable-secrets'
+import { requireSecureCredentialVault } from './credential-vault'
 
 const BACKUP_DIRECTORY_NAME = 'backups'
 const PORTABLE_REPLACE_JOURNAL_DIRECTORY_NAME = 'portable-replace-journals'
 const DEFAULT_AUTOMATIC_INTERVAL_MS = 24 * 60 * 60 * 1000
 const DEFAULT_AUTOMATIC_RETENTION = 7
 const DEFAULT_PRE_RESTORE_RETENTION = 3
+const RAW_BACKUP_SAFETY_ERROR_MESSAGE =
+  'Database backups are blocked until legacy WebDAV credentials can be removed safely'
 const BACKUP_PATTERN = /^stone-backup-(\d{13,16})-(manual|automatic|pre-restore)-([0-9a-f-]{8,})\.sqlite3$/
 const REQUIRED_SCHEMA_ONE_TABLES = [
   'accounts',
@@ -47,8 +50,17 @@ export class DatabaseBackupService<T> {
   private readonly randomId: () => string
   private readonly onAutomaticBackupError: (error: Error) => void
   private readonly portableSecretVault: DatabaseBackupServiceOptions<T>['portableSecretVault']
+  private readonly beforeRawBackup: NonNullable<DatabaseBackupServiceOptions<T>['beforeRawBackup']>
+  private readonly onRestoreCommitted: NonNullable<DatabaseBackupServiceOptions<T>['onRestoreCommitted']>
   private automaticTimer: NodeJS.Timeout | undefined
   private automaticRun: Promise<DatabaseBackupInfo | undefined> | undefined
+  private automaticStartGeneration = 0
+  private closing = false
+  private rawBackupPreparation: Promise<void> | undefined
+  private databaseOperationChain: Promise<unknown> = Promise.resolve()
+  private pendingRestoredState: T | undefined
+  private hasPendingRestoredState = false
+  private rawBackupBlockedReason: string | undefined
 
   public constructor(options: DatabaseBackupServiceOptions<T>) {
     this.backupDirectory = join(options.userDataPath, BACKUP_DIRECTORY_NAME)
@@ -75,10 +87,20 @@ export class DatabaseBackupService<T> {
       console.error('Stone+ automatic database backup failed', error)
     })
     this.portableSecretVault = options.portableSecretVault
+    this.beforeRawBackup = options.beforeRawBackup ?? (() => undefined)
+    this.onRestoreCommitted = options.onRestoreCommitted ?? (() => undefined)
   }
 
   public get directory(): string {
     return this.backupDirectory
+  }
+
+  public get automaticBackupsRunning(): boolean {
+    return this.automaticTimer !== undefined
+  }
+
+  public get backupBlockReason(): string | undefined {
+    return this.rawBackupBlockedReason
   }
 
   public async initialize(): Promise<void> {
@@ -95,6 +117,11 @@ export class DatabaseBackupService<T> {
   }
 
   public async createBackup(kind: DatabaseBackupKind = 'manual'): Promise<DatabaseBackupInfo> {
+    return await this.enqueueDatabaseOperation(() => this.performCreateBackup(kind))
+  }
+
+  private async performCreateBackup(kind: DatabaseBackupKind): Promise<DatabaseBackupInfo> {
+    await this.prepareForRawBackup()
     await this.ensureDirectory()
     const createdAt = this.now()
     const id = createBackupId(createdAt, kind, this.randomId())
@@ -185,26 +212,46 @@ export class DatabaseBackupService<T> {
 
   public async restoreBackup(id: string): Promise<DatabaseRestoreResult<T>> {
     this.assertIdleForRestore()
+    return await this.enqueueDatabaseOperation(() => this.performRestoreBackup(id))
+  }
+
+  private async performRestoreBackup(id: string): Promise<DatabaseRestoreResult<T>> {
     const resumeAutomaticBackups = this.automaticTimer !== undefined
     this.stopAutomaticBackups()
-    const sourcePath = await this.requireRegularBackup(id)
-    const sourceVerification = await this.verifyPath(sourcePath, id)
-    if (!sourceVerification.valid) {
-      throw new Error(`Cannot restore an invalid database backup: ${sourceVerification.issue ?? 'integrity check failed'}`)
-    }
-
-    const stagedPath = join(this.backupDirectory, `.${id}.${this.randomId()}.restore`)
-    const safetyCreatedAt = this.now()
-    const safetyId = createBackupId(safetyCreatedAt, 'pre-restore', this.randomId())
-    const safetyPath = this.pathForId(safetyId)
+    let stagedPath: string | undefined
+    let restoreCommitted = false
+    let safeToResumeAutomaticBackups = false
     try {
+      // restoreFrom creates its own raw pre-restore safety copy. It must not run
+      // before the same durable credential barrier used by createBackup.
+      await this.prepareForRawBackup()
+      safeToResumeAutomaticBackups = true
+      const sourcePath = await this.requireRegularBackup(id)
+      const sourceVerification = await this.verifyPath(sourcePath, id)
+      if (!sourceVerification.valid) {
+        throw new Error(`Cannot restore an invalid database backup: ${sourceVerification.issue ?? 'integrity check failed'}`)
+      }
+
+      stagedPath = join(this.backupDirectory, `.${id}.${this.randomId()}.restore`)
+      const safetyCreatedAt = this.now()
+      const safetyId = createBackupId(safetyCreatedAt, 'pre-restore', this.randomId())
+      const safetyPath = this.pathForId(safetyId)
       await copyFile(sourcePath, stagedPath)
       if (process.platform !== 'win32') await chmod(stagedPath, 0o600)
       const stagedVerification = await this.verifyPath(stagedPath, id)
       if (!stagedVerification.valid) {
         throw new Error(`Staged backup verification failed: ${stagedVerification.issue ?? 'integrity check failed'}`)
       }
+      this.validateRestoreCredentials(stagedPath)
+      // The next live generation came from the selected backup and has not yet
+      // completed its cache invalidation/sanitization/migration barrier.
+      safeToResumeAutomaticBackups = false
       const state = await this.store.restoreFrom(stagedPath, safetyPath)
+      restoreCommitted = true
+      this.pendingRestoredState = state
+      this.hasPendingRestoredState = true
+      await this.prepareForRawBackup()
+      safeToResumeAutomaticBackups = true
       const safetyVerification = await this.verifyPath(safetyPath, safetyId)
       if (!safetyVerification.valid) {
         throw new Error(`Pre-restore backup verification failed: ${safetyVerification.issue ?? 'integrity check failed'}`)
@@ -216,10 +263,75 @@ export class DatabaseBackupService<T> {
         state
       }
     } catch (error) {
+      if (restoreCommitted) {
+        throw new Error(
+          `Database backup was restored, but post-restore verification or cleanup failed: ${messageOf(error)}`,
+        )
+      }
       throw new Error(`Unable to restore database backup: ${messageOf(error)}`)
     } finally {
-      await rm(stagedPath, { force: true }).catch(() => undefined)
-      if (resumeAutomaticBackups) this.startAutomaticBackups()
+      if (stagedPath) await rm(stagedPath, { force: true }).catch(() => undefined)
+      if (resumeAutomaticBackups && safeToResumeAutomaticBackups) {
+        await this.startAutomaticBackups().catch((error: unknown) => {
+          this.onAutomaticBackupError(toError(error))
+        })
+      }
+    }
+  }
+
+  /**
+   * Shared, retryable gate for every live SQLite copy. If post-restore cleanup
+   * fails, the restored state remains pending and the next start/manual backup
+   * retries it before any bytes can be copied.
+   */
+  public async prepareForRawBackup(): Promise<void> {
+    if (this.rawBackupPreparation) return await this.rawBackupPreparation
+    const preparation = this.runRawBackupPreparation()
+    this.rawBackupPreparation = preparation
+    try {
+      await preparation
+    } finally {
+      if (this.rawBackupPreparation === preparation) this.rawBackupPreparation = undefined
+    }
+  }
+
+  private validateRestoreCredentials(databasePath: string): void {
+    const database = new DatabaseSync(databasePath, { readOnly: true })
+    try {
+      database.exec('PRAGMA trusted_schema = OFF')
+      const protectedValues = (database.prepare('SELECT id, encrypted_value FROM credentials').all() as Array<{
+        id: string
+        encrypted_value: string
+      }>).map((row) => ({ locator: `credential ${row.id}`, encrypted: row.encrypted_value }))
+      const webDav = database.prepare('SELECT value FROM app_metadata WHERE key = ?')
+        .get('webdav_backup_configuration_v1') as { value?: string } | undefined
+      if (webDav?.value) {
+        try {
+          const parsed = JSON.parse(webDav.value) as { encryptedPassword?: unknown }
+          if (typeof parsed.encryptedPassword === 'string') {
+            protectedValues.push({ locator: 'WebDAV password', encrypted: parsed.encryptedPassword })
+          }
+        } catch {
+          // Malformed non-schema metadata is handled by its owning feature. It
+          // cannot be mistaken for a credential without a string ciphertext.
+        }
+      }
+      if (protectedValues.length === 0) return
+      requireSecureCredentialVault(
+        this.portableSecretVault,
+        'The current system credential vault is unavailable; this backup cannot be restored safely',
+      )
+      for (const value of protectedValues) {
+        try {
+          this.portableSecretVault.decryptString(decodeCredentialCiphertext(value.encrypted))
+        } catch {
+          throw new Error(
+            `Backup ${value.locator} cannot be decrypted by the current system credential vault`,
+          )
+        }
+      }
+    } finally {
+      database.close()
     }
   }
 
@@ -234,16 +346,20 @@ export class DatabaseBackupService<T> {
     }
   }
 
-  public startAutomaticBackups(): void {
-    if (this.automaticTimer) return
-    void this.runAutomaticBackupIfDue().catch((error: unknown) => this.onAutomaticBackupError(toError(error)))
+  public async startAutomaticBackups(): Promise<void> {
+    if (this.automaticTimer || this.closing) return
+    const generation = this.automaticStartGeneration
+    await this.prepareForRawBackup()
+    if (this.automaticTimer || this.closing || generation !== this.automaticStartGeneration) return
     this.automaticTimer = setInterval(() => {
       void this.runAutomaticBackupIfDue().catch((error: unknown) => this.onAutomaticBackupError(toError(error)))
     }, this.automaticIntervalMs)
     this.automaticTimer.unref()
+    void this.runAutomaticBackupIfDue().catch((error: unknown) => this.onAutomaticBackupError(toError(error)))
   }
 
   public stopAutomaticBackups(): void {
+    this.automaticStartGeneration += 1
     if (this.automaticTimer) clearInterval(this.automaticTimer)
     this.automaticTimer = undefined
   }
@@ -254,8 +370,11 @@ export class DatabaseBackupService<T> {
   }
 
   public async close(): Promise<void> {
+    this.closing = true
     this.stopAutomaticBackups()
     await this.automaticRun
+    await this.databaseOperationChain
+    this.stopAutomaticBackups()
   }
 
   private async performAutomaticBackupIfDue(): Promise<DatabaseBackupInfo | undefined> {
@@ -263,6 +382,34 @@ export class DatabaseBackupService<T> {
     const latest = backups.find((backup) => backup.kind === 'automatic' && backup.valid)
     if (latest && this.now() - latest.createdAt < this.automaticIntervalMs) return undefined
     return this.createBackup('automatic')
+  }
+
+  private async performRawBackupPreparation(): Promise<void> {
+    if (this.hasPendingRestoredState) {
+      const restoredState = this.pendingRestoredState as T
+      await this.onRestoreCommitted(restoredState)
+      if (this.pendingRestoredState === restoredState) {
+        this.pendingRestoredState = undefined
+        this.hasPendingRestoredState = false
+      }
+    }
+    await this.beforeRawBackup()
+  }
+
+  private async runRawBackupPreparation(): Promise<void> {
+    try {
+      await this.performRawBackupPreparation()
+      this.rawBackupBlockedReason = undefined
+    } catch {
+      this.rawBackupBlockedReason = RAW_BACKUP_SAFETY_ERROR_MESSAGE
+      throw new Error(RAW_BACKUP_SAFETY_ERROR_MESSAGE)
+    }
+  }
+
+  private enqueueDatabaseOperation<R>(operation: () => Promise<R>): Promise<R> {
+    const pending = this.databaseOperationChain.then(operation, operation)
+    this.databaseOperationChain = pending.then(() => undefined, () => undefined)
+    return pending
   }
 
   private assertIdleForRestore(): void {
@@ -392,6 +539,15 @@ function readPragmaNumber(database: DatabaseSync, name: 'user_version'): number 
 function withoutIntegrityRows(verification: DatabaseBackupVerification): DatabaseBackupInfo {
   const { integrityCheck: _integrityCheck, ...info } = verification
   return info
+}
+
+function decodeCredentialCiphertext(value: string): Buffer {
+  if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) {
+    throw new Error('Credential ciphertext is not valid Base64')
+  }
+  const decoded = Buffer.from(value, 'base64')
+  if (decoded.length === 0) throw new Error('Credential ciphertext is empty')
+  return decoded
 }
 
 function positiveInteger(value: number, label: string): number {

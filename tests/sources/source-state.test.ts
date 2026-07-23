@@ -180,6 +180,11 @@ describe('API source state changes', () => {
     expect(unchanged.connectionChanged).toBe(false)
     expect(state.providers[0]).toMatchObject({ responsesCompactMode: 'passthrough' })
 
+    state.providers[0].capabilityProfile = {
+      version: 1, origin: 'probed', checkedAt: NOW, streaming: true, compact: true,
+    }
+    state.providers[0].modelCatalog = [{ id: 'gpt-5.1', capabilities: { compact: true } }]
+
     Object.assign(state.accounts[0], {
       status: 'cooldown',
       inFlight: 2,
@@ -201,6 +206,11 @@ describe('API source state changes', () => {
     }), 'native'), encrypt, NOW + 2)
     expect(changed.connectionChanged).toBe(false)
     expect(state.providers[0]).toMatchObject({ responsesCompactMode: 'native' })
+    expect(state.providers[0].capabilityProfile).toMatchObject({ origin: 'inferred' })
+    expect(state.providers[0].capabilityProfile?.checkedAt).toBeUndefined()
+    expect(state.providers[0].modelCatalog).not.toContainEqual(expect.objectContaining({
+      capabilities: expect.objectContaining({ compact: true }),
+    }))
     expect(state.accounts[0]).toMatchObject({
       status: 'cooldown',
       inFlight: 2,

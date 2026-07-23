@@ -4,6 +4,7 @@ import { Agent, fetch as undiciFetch, ProxyAgent, type Dispatcher } from 'undici
 import { socksDispatcher } from 'fetch-socks'
 import type {
   Account,
+  NetworkDiagnosticReport,
   OutboundNetworkMode,
   Pool,
   PublicProxyDefinition,
@@ -34,6 +35,9 @@ const OUTBOUND_KEEP_ALIVE_MAX_TIMEOUT_MS = 10 * 60_000
 const OUTBOUND_H2_PING_INTERVAL_MS = 30_000
 const DEFAULT_SYSTEM_PROXY_CACHE_TTL_MS = 30_000
 const DEFAULT_SYSTEM_PROXY_RELOAD_TIMEOUT_MS = 5_000
+const DEFAULT_SYSTEM_PROXY_RESOLVE_TIMEOUT_MS = 10_000
+const OUTBOUND_SHUTDOWN_GRACE_MS = 1_500
+const OUTBOUND_DESTROY_GRACE_MS = 500
 
 interface TransportGeneration {
   updatedAt: number
@@ -70,6 +74,9 @@ export interface OutboundTransportManagerOptions {
    * shutdown cannot wait forever on WinINET/WPAD. */
   systemProxyReloadTimeoutMs?: number
   resolveSystemProxy?: (url: string) => Promise<string>
+  /** Bounds Electron session.resolveProxy/PAC/WPAD independently from the
+   * request timeout. */
+  systemProxyResolveTimeoutMs?: number
   systemProxyCacheTtlMs?: number
   localGatewayPort?: number
   onSystemProxyWarning?: (message: string) => void
@@ -100,12 +107,14 @@ export class OutboundTransportManager {
   private readonly systemCache = new Map<string, TransportGeneration>()
   private readonly rotations = new Map<string, Promise<void>>()
   private readonly retirements = new Set<Promise<void>>()
+  private readonly retiringGenerations = new Set<TransportGeneration>()
   private readonly handles = new Map<string, TransportHandle>()
   private readonly connectionCountForOrigin: (origin: string) => number
   private readonly resolveSystemProxy?: (url: string) => Promise<string>
   private readonly systemProxyFetch?: typeof fetch
   private readonly reloadSystemProxy?: () => Promise<void>
   private readonly systemProxyReloadTimeoutMs: number
+  private readonly systemProxyResolveTimeoutMs: number
   private readonly systemProxyCacheTtlMs: number
   private readonly onSystemProxyWarning: (message: string) => void
   private readonly now: () => number
@@ -129,6 +138,7 @@ export class OutboundTransportManager {
     this.systemProxyFetch = options.systemProxyFetch
     this.reloadSystemProxy = options.reloadSystemProxy
     this.systemProxyReloadTimeoutMs = Math.max(1, options.systemProxyReloadTimeoutMs ?? DEFAULT_SYSTEM_PROXY_RELOAD_TIMEOUT_MS)
+    this.systemProxyResolveTimeoutMs = Math.max(1, options.systemProxyResolveTimeoutMs ?? DEFAULT_SYSTEM_PROXY_RESOLVE_TIMEOUT_MS)
     this.resolveSystemProxy = options.resolveSystemProxy
     this.systemProxyCacheTtlMs = Math.max(1_000, options.systemProxyCacheTtlMs ?? DEFAULT_SYSTEM_PROXY_CACHE_TTL_MS)
     this.localGatewayPort = options.localGatewayPort
@@ -258,21 +268,45 @@ export class OutboundTransportManager {
   public async close(): Promise<void> {
     this.closed = true
     await this.builtInRoutes.close({ force: true })
-    await Promise.allSettled(this.systemProxyReloadFlight ? [this.systemProxyReloadFlight] : [])
-    const generations = [
+    await settleWithin(
+      Promise.allSettled(this.systemProxyReloadFlight ? [this.systemProxyReloadFlight] : []),
+      OUTBOUND_SHUTDOWN_GRACE_MS
+    )
+    const generations = new Set([
       ...this.cache.values(),
       ...this.systemCache.values(),
-      ...(this.direct ? [this.direct] : [])
-    ]
+      ...(this.direct ? [this.direct] : []),
+      ...this.retiringGenerations
+    ])
     this.cache.clear()
     this.systemCache.clear()
     this.direct = undefined
-    await Promise.allSettled([...this.rotations.values()])
+    const pendingControlPlane = Promise.allSettled([
+      ...this.rotations.values(),
+      ...this.retirements
+    ])
     this.rotations.clear()
-    await Promise.all(generations.map(closeGeneration))
-    await Promise.allSettled([...this.retirements])
+    await shutdownGenerations([...generations], OUTBOUND_SHUTDOWN_GRACE_MS, OUTBOUND_DESTROY_GRACE_MS)
+    await settleWithin(pendingControlPlane, OUTBOUND_DESTROY_GRACE_MS)
     this.handles.clear()
     this.systemProxyCache.clear()
+    this.retiringGenerations.clear()
+  }
+
+  /** Describes the routing layer that fetchFor() will consult. Built-in
+   * routing owns every non-loopback request while active, even when an
+   * explicit account proxy was selected. */
+  public describeEffectiveDiagnosticRoute(
+    proxy?: Pick<PublicProxyDefinition, 'id' | 'name'>
+  ): NetworkDiagnosticReport['route'] {
+    const effective = this.builtInRoutes.getSnapshot().effectiveRoute
+    if (effective.kind === 'built-in-mixed') return { kind: 'system', name: '内置代理' }
+    if (effective.kind === 'built-in-tun') return { kind: 'system', name: '内置代理 · TUN' }
+    if (effective.kind === 'blocked') return { kind: 'system', name: '内置代理（不可用）' }
+    if (proxy) return { kind: 'proxy', name: proxy.name, proxyId: proxy.id }
+    return (effective.externalMode ?? this.outboundNetworkMode) === 'system'
+      ? { kind: 'system', name: '跟随系统代理' }
+      : { kind: 'direct', name: '直连' }
   }
 
   public configureOutboundNetwork(mode: OutboundNetworkMode, localGatewayPort?: number): void {
@@ -529,7 +563,10 @@ export class OutboundTransportManager {
       return this.directSystemProxyFallback('System proxy resolver is unavailable; using DIRECT.')
     }
     try {
-      const value = await this.resolveSystemProxy(target)
+      const value = await withBoundedSystemProxyResolution(
+        this.resolveSystemProxy(target),
+        this.systemProxyResolveTimeoutMs
+      )
       const directives = parseSystemProxyChain(value, {
         blockedLoopbackPorts: this.localGatewayPort ? [this.localGatewayPort] : []
       })
@@ -538,8 +575,12 @@ export class OutboundTransportManager {
         return { directives }
       }
       return this.directSystemProxyFallback('System proxy returned no usable route; using DIRECT.')
-    } catch {
-      return this.directSystemProxyFallback('System proxy resolution failed; using DIRECT.')
+    } catch (error) {
+      return this.directSystemProxyFallback(
+        explicitTransportErrorCode(error) === 'SYSTEM_PROXY_RESOLVE_TIMEOUT'
+          ? 'System proxy resolution timed out; using DIRECT.'
+          : 'System proxy resolution failed; using DIRECT.'
+      )
     }
   }
 
@@ -643,6 +684,15 @@ export class OutboundTransportManager {
           error: 'PROXY_AUTH_REQUIRED'
         }
       }
+      if (response.status >= 500) {
+        return {
+          target: url,
+          summary,
+          reachable: false,
+          latencyMs: Math.max(0, this.now() - startedAt),
+          error: `HTTP_${response.status}`
+        }
+      }
       return {
         target: url,
         summary,
@@ -671,6 +721,7 @@ export class OutboundTransportManager {
     })
     cancelResponseBody(response)
     if (response.status === 407) throw new Error('System proxy requires authentication.')
+    if (response.status >= 500) throw new Error(`System proxy warmup returned HTTP ${response.status}.`)
   }
 
   private createGeneration(
@@ -759,7 +810,10 @@ export class OutboundTransportManager {
         redirect: 'manual',
         signal
       })
-      await response.arrayBuffer()
+      // Warmup is headers-only control-plane work. An unexpected/infinite body
+      // must not retain a connection or block a rebuild/shutdown.
+      cancelResponseBody(response)
+      if (response.status >= 500) throw new Error(`Outbound warmup returned HTTP ${response.status}.`)
       pool.warmed = true
     } catch (error) {
       // A request may have started on this pool while the speculative HEAD was
@@ -827,8 +881,10 @@ export class OutboundTransportManager {
     for (const [key, handle] of this.handles) {
       if (handle.generation === generation) this.handles.delete(key)
     }
+    this.retiringGenerations.add(generation)
     const retirement = closeGeneration(generation).finally(() => {
       this.retirements.delete(retirement)
+      this.retiringGenerations.delete(generation)
     })
     this.retirements.add(retirement)
     void retirement.catch(() => undefined)
@@ -982,7 +1038,12 @@ function cancelResponseBody(response: Response): void {
   // The response status is already available. Initiate cancellation, but never
   // let a transport whose cancel promise does not settle hold up diagnostics,
   // warmup, shutdown, or the next real request.
-  void response.body?.cancel().catch(() => undefined)
+  try {
+    void response.body?.cancel().catch(() => undefined)
+  } catch {
+    // Already-locked or implementation-specific bodies may throw
+    // synchronously. Headers are sufficient for these control-plane calls.
+  }
 }
 
 function withBoundedSystemProxyReload(operation: Promise<void>, timeoutMs: number): Promise<void> {
@@ -999,6 +1060,52 @@ function withBoundedSystemProxyReload(operation: Promise<void>, timeoutMs: numbe
   return Promise.race([operation, timeout]).finally(() => {
     if (timer) clearTimeout(timer)
   })
+}
+
+function withBoundedSystemProxyResolution(operation: Promise<string>, timeoutMs: number): Promise<string> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      reject(Object.assign(
+        new Error(`System proxy resolution timed out after ${timeoutMs} ms.`),
+        { code: 'SYSTEM_PROXY_RESOLVE_TIMEOUT' }
+      ))
+    }, timeoutMs)
+    timer.unref?.()
+  })
+  return Promise.race([operation, timeout]).finally(() => {
+    if (timer) clearTimeout(timer)
+  })
+}
+
+async function shutdownGenerations(
+  generations: readonly TransportGeneration[],
+  closeGraceMs: number,
+  destroyGraceMs: number
+): Promise<void> {
+  const dispatchers = [...new Set(generations.flatMap((generation) => (
+    [...generation.originPools.values()].map(({ dispatcher }) => dispatcher)
+  )))]
+  if (dispatchers.length === 0) return
+  const gracefulClose = Promise.allSettled(dispatchers.map((dispatcher) => dispatcher.close()))
+  if (await settleWithin(gracefulClose, closeGraceMs)) return
+  const shutdownError = new Error('Stone+ outbound transport is shutting down.')
+  const forcedClose = Promise.allSettled(dispatchers.map((dispatcher) => dispatcher.destroy(shutdownError)))
+  await settleWithin(forcedClose, destroyGraceMs)
+}
+
+async function settleWithin(operation: Promise<unknown>, timeoutMs: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timedOut = Symbol('timed-out')
+  const outcome = await Promise.race([
+    operation.then(() => true),
+    new Promise<typeof timedOut>((resolve) => {
+      timer = setTimeout(() => resolve(timedOut), timeoutMs)
+      timer.unref?.()
+    })
+  ])
+  if (timer) clearTimeout(timer)
+  return outcome !== timedOut
 }
 
 function normalizeConnectionCount(value: number): number {
@@ -1037,19 +1144,24 @@ export async function probeProxy(
   let lastError: unknown
   for (const target of PROBE_TARGETS) {
     const startedAt = Date.now()
+    let response: Response | undefined
     try {
-      const response = await fetchImplementation(target.url, {
+      response = await fetchImplementation(target.url, {
         method: 'GET',
         headers: { accept: target.parse === parseJsonIp ? 'application/json' : 'text/plain' },
         redirect: 'error',
         signal
       })
-      if (!response.ok) throw new Error(`Probe returned HTTP ${response.status}`)
+      if (!response.ok) {
+        cancelResponseBody(response)
+        throw new Error(`Probe returned HTTP ${response.status}`)
+      }
       const body = await readLimitedText(response, 16 * 1024)
       const exitIp = target.parse(body)
       if (!exitIp) throw new Error('Probe response did not contain a public IP address')
       return { exitIp, latencyMs: Math.max(0, Date.now() - startedAt) }
     } catch (error) {
+      if (response) cancelResponseBody(response)
       lastError = error
       if (signal.aborted) break
     }
@@ -1126,7 +1238,7 @@ async function readLimitedText(response: Response, maximumBytes: number): Promis
       if (done) break
       total += value.byteLength
       if (total > maximumBytes) {
-        await reader.cancel()
+        void reader.cancel().catch(() => undefined)
         throw new Error('Proxy probe response is too large')
       }
       chunks.push(value)

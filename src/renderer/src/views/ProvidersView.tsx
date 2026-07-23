@@ -46,9 +46,11 @@ import type {
   PublicProxyDefinition,
 } from '@shared/types'
 import type { ActionRunner } from '../App'
+import { BoundAsyncOperation } from '../async-operation'
 import { normalizeAggregateRelayMembers, toggleAggregateRelayMember } from '../aggregate-relay-members'
 import { providerBrandIcon } from '../brand-icons'
 import { BUILT_IN_PROXY_BINDING_NOTICE, useBuiltInProxyInterlock } from '../built-in-proxy-interlocks'
+import { providerProbeDraftBinding } from '../provider-probe-binding'
 import {
   localizeBackendError,
   localizeBackendMessage,
@@ -87,6 +89,7 @@ import {
 import { CodexQuotaCompact, CodexQuotaModal } from './CodexQuotaModal'
 
 const HIDE_EXHAUSTED_ACCOUNTS_STORAGE_KEY = 'stone.providers.hide-exhausted-accounts'
+const ACCOUNT_TAG_FILTER_STORAGE_KEY = 'stone.providers.tag-filter'
 const ACCOUNT_COLUMN_STORAGE_KEY = 'stone:account-column-widths:v1'
 
 type AccountAddMethod = 'oauth' | 'token-json'
@@ -593,6 +596,10 @@ export function ProvidersView({
   const [providerDraft, setProviderDraft] = useState<ApiSourceDraft>(() => emptyApiSource('official-api'))
   const [providerProbe, setProviderProbe] = useState<ApiSourceProbeResult | null>(null)
   const [providerProbeBusy, setProviderProbeBusy] = useState(false)
+  const providerDraftRef = useRef(providerDraft)
+  const providerProbeOperation = useRef(new BoundAsyncOperation())
+  const providerModalSession = useRef(0)
+  providerDraftRef.current = providerDraft
   const [testingSourceId, setTestingSourceId] = useState('')
   const [aggregateModalOpen, setAggregateModalOpen] = useState(false)
   const [aggregateDraft, setAggregateDraft] = useState<AggregateRelayDraft>(emptyAggregateRelay)
@@ -642,7 +649,9 @@ export function ProvidersView({
   const [hideExhaustedAccounts, setHideExhaustedAccounts] = useState(() =>
     window.localStorage.getItem(HIDE_EXHAUSTED_ACCOUNTS_STORAGE_KEY) === 'true'
   )
-  const [tagFilter, setTagFilter] = useState<'all' | 'untagged' | string>('all')
+  const [tagFilter, setTagFilter] = useState<'all' | 'untagged' | string>(() =>
+    window.localStorage.getItem(ACCOUNT_TAG_FILTER_STORAGE_KEY)?.trim() || 'all'
+  )
   const [tagManagerOpen, setTagManagerOpen] = useState(false)
   const [tagAssignmentOpen, setTagAssignmentOpen] = useState(false)
   const [tagDraft, setTagDraft] = useState<{ id?: string; name: string }>({ name: '' })
@@ -776,6 +785,10 @@ export function ProvidersView({
     window.localStorage.setItem(HIDE_EXHAUSTED_ACCOUNTS_STORAGE_KEY, String(hideExhaustedAccounts))
   }, [hideExhaustedAccounts])
 
+  useEffect(() => {
+    window.localStorage.setItem(ACCOUNT_TAG_FILTER_STORAGE_KEY, tagFilter)
+  }, [tagFilter])
+
   useEffect(() => api.onAccountImportProgress((progress) => {
     if (progress.progressId === importProgressId.current) setImportProgress(progress)
   }), [api])
@@ -794,6 +807,15 @@ export function ProvidersView({
     if (sessionId) void api.cancelChatGptOAuth(sessionId).catch(() => undefined)
   }, [api])
 
+  useEffect(() => () => {
+    providerProbeOperation.current.invalidate()
+    providerDraftRef.current = {
+      ...providerDraftRef.current,
+      credential: '',
+      probeEvidenceToken: undefined,
+    }
+  }, [])
+
   useEffect(() => {
     const existingIds = new Set(snapshot.accounts.map((account) => account.id))
     setSelectedAccountIds((current) => current.filter((id) => existingIds.has(id)))
@@ -804,11 +826,60 @@ export function ProvidersView({
     if (tagFilter !== 'all' && tagFilter !== 'untagged' && !tagById.has(tagFilter)) setTagFilter('all')
   }, [tagById, tagFilter])
 
+  const showProviderDraft = (next: ApiSourceDraft) => {
+    providerModalSession.current += 1
+    providerProbeOperation.current.invalidate()
+    providerDraftRef.current = next
+    setProviderDraft(next)
+    setProviderProbe(null)
+    setProviderProbeBusy(false)
+    setErrors({})
+    setProviderModal(true)
+    setMenuOpen(null)
+  }
+
+  const closeProvider = () => {
+    providerModalSession.current += 1
+    providerProbeOperation.current.invalidate()
+    setProviderProbeBusy(false)
+    setProviderProbe(null)
+    setProviderModal(false)
+    const cleared = {
+      ...providerDraftRef.current,
+      credential: '',
+      probeEvidenceToken: undefined,
+    }
+    providerDraftRef.current = cleared
+    setProviderDraft(cleared)
+  }
+
+  const updateProviderDraft = (nextDraft: ApiSourceDraft) => {
+    const current = providerDraftRef.current
+    const connectionChanged = providerProbeDraftBinding(current, providerModalSession.current)
+      !== providerProbeDraftBinding(nextDraft, providerModalSession.current)
+    const next = connectionChanged ? {
+      ...nextDraft,
+      capabilityProfile: undefined,
+      modelCatalog: undefined,
+      probeEvidenceToken: undefined,
+    } : nextDraft
+    if (connectionChanged) {
+      providerProbeOperation.current.invalidate()
+      setProviderProbeBusy(false)
+      setProviderProbe(null)
+      setErrors((currentErrors) => currentErrors.sourceProbe
+        ? { ...currentErrors, sourceProbe: '' }
+        : currentErrors)
+    }
+    providerDraftRef.current = next
+    setProviderDraft(next)
+  }
+
   const openProvider = (sourceType: 'official-api' | 'relay', provider?: ProviderDefinition) => {
     const account = provider ? snapshot.accounts.find((candidate) => candidate.providerId === provider.id
       && candidate.credentialType !== 'chatgpt-oauth'
       && candidate.credentialType !== 'chatgpt-agent-identity') : undefined
-    setProviderDraft(provider ? {
+    showProviderDraft(provider ? {
       id: provider.id,
       name: provider.name,
       sourceType,
@@ -828,10 +899,6 @@ export function ProvidersView({
       maxConcurrency: account?.maxConcurrency ?? 4,
       proxyId: account?.proxyId ?? '',
     } : emptyApiSource(sourceType))
-    setProviderProbe(null)
-    setErrors({})
-    setProviderModal(true)
-    setMenuOpen(null)
   }
 
   const openAggregateRelay = (pool?: Pool) => {
@@ -972,29 +1039,49 @@ export function ProvidersView({
       unlinkIncompatiblePools,
       capabilityProfile: providerDraft.capabilityProfile,
       modelCatalog: providerDraft.modelCatalog,
+      probeEvidenceToken: providerDraft.probeEvidenceToken,
     }))
-    if (success) setProviderModal(false)
+    if (success) closeProvider()
   }
 
   const probeProvider = async () => {
+    const draft = providerDraftRef.current
     setProviderProbe(null)
+    if (!draft.id) {
+      const cleared = {
+        ...draft,
+        capabilityProfile: undefined,
+        modelCatalog: undefined,
+        probeEvidenceToken: undefined,
+      }
+      providerDraftRef.current = cleared
+      setProviderDraft(cleared)
+    }
     setErrors({})
     setProviderProbeBusy(true)
-    try {
-      const result = await api.probeApiSource({
-        id: providerDraft.id,
-        name: providerDraft.name.trim() || t('未命名来源', 'Unnamed source'),
-        sourceType: providerDraft.sourceType,
-        kind: providerDraft.kind,
-        baseUrl: providerDraft.baseUrl.replace(/\/$/, ''),
-        protocol: providerDraft.protocol,
-        responsesCompactMode: providerDraft.responsesCompactMode,
-        credential: providerDraft.credential?.trim() || undefined,
-        model: providerDraft.defaultModel.trim() || undefined,
-        proxyId: providerDraft.proxyId || undefined,
-      })
+    const modalSession = providerModalSession.current
+    const binding = providerProbeDraftBinding(draft, modalSession)
+    const outcome = await providerProbeOperation.current.run(
+      binding,
+      () => providerProbeDraftBinding(providerDraftRef.current, providerModalSession.current),
+      () => api.probeApiSource({
+        id: draft.id,
+        name: draft.name.trim() || t('未命名来源', 'Unnamed source'),
+        sourceType: draft.sourceType,
+        kind: draft.kind,
+        baseUrl: draft.baseUrl.replace(/\/$/, ''),
+        protocol: draft.protocol,
+        responsesCompactMode: draft.responsesCompactMode,
+        credential: draft.credential?.trim() || undefined,
+        model: draft.defaultModel.trim() || undefined,
+        proxyId: draft.proxyId || undefined,
+      }),
+    )
+    if (outcome.status === 'applied') {
+      const result = outcome.value
       setProviderProbe(result)
-      setProviderDraft((current) => ({
+      const current = providerDraftRef.current
+      const next = {
         ...current,
         ...(result.models.length ? {
           modelsText: result.models.join('\n'),
@@ -1003,13 +1090,15 @@ export function ProvidersView({
         ...(result.ok ? {
           capabilityProfile: result.capabilityProfile,
           modelCatalog: result.modelCatalog,
+          probeEvidenceToken: result.probeEvidenceToken,
         } : {}),
-      }))
-    } catch (cause) {
-      setErrors({ sourceProbe: localizeBackendError(cause, language, t('连接测试失败', 'Connection test failed.')) })
-    } finally {
-      setProviderProbeBusy(false)
+      }
+      providerDraftRef.current = next
+      setProviderDraft(next)
+    } else if (outcome.status === 'failed') {
+      setErrors({ sourceProbe: localizeBackendError(outcome.error, language, t('连接测试失败', 'Connection test failed.')) })
     }
+    if (providerProbeOperation.current.isLatest(outcome.token)) setProviderProbeBusy(false)
   }
 
   const testSavedSource = async (provider: ProviderDefinition, account: PublicAccount | undefined) => {
@@ -1046,7 +1135,7 @@ export function ProvidersView({
   }
 
   const copySourceConfiguration = (provider: ProviderDefinition, account: PublicAccount | undefined) => {
-    setProviderDraft({
+    showProviderDraft({
       ...emptyApiSource(provider.sourceType === 'relay' ? 'relay' : 'official-api'),
       name: t(`${provider.name} 副本`, `${provider.name} copy`),
       kind: provider.kind,
@@ -1062,13 +1151,7 @@ export function ProvidersView({
       maxConcurrency: account?.maxConcurrency ?? 4,
       proxyId: account?.proxyId ?? '',
       credential: '',
-      capabilityProfile: provider.capabilityProfile,
-      modelCatalog: provider.modelCatalog,
     })
-    setProviderProbe(null)
-    setErrors({})
-    setProviderModal(true)
-    setMenuOpen(null)
   }
 
   const submitAccount = async (event: React.FormEvent) => {
@@ -1412,9 +1495,9 @@ export function ProvidersView({
   }
 
   const checkAllAccounts = async () => {
-    if (!oauthAccounts.length || checkingAllAccounts) return
+    if (!visibleAccounts.length || checkingAllAccounts) return
     await runAction('check-all-accounts', async () => {
-      await api.startAccountCheckTask(oauthAccounts.map((account) => account.id))
+      await api.startAccountCheckTask(visibleAccounts.map((account) => account.id))
       return api.getSnapshot()
     })
   }
@@ -1567,7 +1650,7 @@ export function ProvidersView({
                   <button className="button button--secondary" type="button" disabled={!selectedAccountIds.length} onClick={() => setTagAssignmentOpen(true)}><Tag size={16} />{t('设置 Tag', 'Set tag')}</button>
                   <button className="button button--secondary" type="button" disabled={!oauthAccounts.length} onClick={openAccountExport}><Download size={16} />{t('导出账号', 'Export accounts')}</button>
                   <button className="button button--secondary button--danger-text" type="button" disabled={!selectedAccountIds.length} onClick={() => setBulkDeleteOpen(true)}><Trash2 size={16} />{t('删除所选', 'Delete selected')}</button>
-                  <button className="button button--secondary" type="button" disabled={checkingAllAccounts} onClick={() => void checkAllAccounts()}>{checkingAllAccounts ? <LoaderCircle size={16} className="spin" /> : <RefreshCw size={16} />}{checkingAllAccounts ? t('正在检测…', 'Checking…') : t('检测全部', 'Check all')}</button>
+                  <button className="button button--secondary" type="button" disabled={checkingAllAccounts || !visibleAccounts.length} onClick={() => void checkAllAccounts()}>{checkingAllAccounts ? <LoaderCircle size={16} className="spin" /> : <RefreshCw size={16} />}{checkingAllAccounts ? t('正在检测…', 'Checking…') : t('检测全部', 'Check all')}</button>
                 </div>
               </div>
               {visibleAccounts.length ? <div className="table-wrap">
@@ -1839,11 +1922,11 @@ export function ProvidersView({
       <Modal
         open={providerModal}
         title={providerDraft.id ? (providerDraft.sourceType === 'official-api' ? t('编辑官方 API', 'Edit official API') : t('编辑中转站', 'Edit relay')) : (providerDraft.sourceType === 'official-api' ? t('添加官方 API', 'Add official API') : t('添加中转站', 'Add relay'))}
-        onClose={() => setProviderModal(false)}
+        onClose={closeProvider}
         width="large"
-        footer={<><button type="button" className="button button--secondary" onClick={() => setProviderModal(false)}>{t('取消', 'Cancel')}</button><button type="button" className="button button--secondary" disabled={providerProbeBusy} onClick={() => void probeProvider()}>{providerProbeBusy ? <LoaderCircle size={16} className="spin" /> : <RefreshCw size={16} />}{t('测试连接', 'Test connection')}</button><button type="submit" form="provider-form" className="button button--primary" disabled={busyKeys.has('save-api-source')}>{busyKeys.has('save-api-source') ? <LoaderCircle size={16} className="spin" /> : <CheckCircle2 size={16} />}{t('保存来源', 'Save source')}</button></>}
+        footer={<><button type="button" className="button button--secondary" onClick={closeProvider}>{t('取消', 'Cancel')}</button><button type="button" className="button button--secondary" disabled={providerProbeBusy} onClick={() => void probeProvider()}>{providerProbeBusy ? <LoaderCircle size={16} className="spin" /> : <RefreshCw size={16} />}{t('测试连接', 'Test connection')}</button><button type="submit" form="provider-form" className="button button--primary" disabled={providerProbeBusy || busyKeys.has('save-api-source')}>{busyKeys.has('save-api-source') ? <LoaderCircle size={16} className="spin" /> : <CheckCircle2 size={16} />}{t('保存来源', 'Save source')}</button></>}
       >
-        <form id="provider-form" onSubmit={(event) => void submitProvider(event)}><ApiSourceForm draft={providerDraft} setDraft={setProviderDraft} proxies={snapshot.proxies} proxyInterlocked={builtInProxyInterlocked} errors={errors} /></form>
+        <form id="provider-form" onSubmit={(event) => void submitProvider(event)}><ApiSourceForm draft={providerDraft} setDraft={updateProviderDraft} proxies={snapshot.proxies} proxyInterlocked={builtInProxyInterlocked} errors={errors} /></form>
         {(providerProbe || errors.sourceProbe) && <div className={`source-probe-result ${providerProbe?.ok ? 'source-probe-result--ok' : 'source-probe-result--error'}`}>
           <strong>{providerProbe?.ok ? t('连接验证通过', 'Connection verified') : t('连接验证未通过', 'Connection verification failed')}</strong>
           {providerProbe?.stages.map((stage) => {

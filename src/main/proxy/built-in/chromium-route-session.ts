@@ -52,7 +52,11 @@ export async function createChromiumMixedSessionGeneration(
   try {
     await applyProxy()
   } catch (error) {
-    await electronSession.closeAllConnections().catch(() => undefined)
+    await bestEffortBounded(
+      electronSession.closeAllConnections(),
+      reloadTimeoutMs,
+      'Chromium proxy startup cleanup',
+    )
     throw error
   }
 
@@ -66,17 +70,29 @@ export async function createChromiumMixedSessionGeneration(
     fetchImplementation,
     refresh: async () => {
       if (disposed) throw new Error('The built-in Chromium proxy generation is closed.')
-      await electronSession.closeAllConnections()
+      await bounded(
+        electronSession.closeAllConnections(),
+        reloadTimeoutMs,
+        'Chromium proxy connection refresh',
+      )
       await applyProxy()
     },
     dispose: async () => {
       if (disposed) return
       disposed = true
-      await electronSession.closeAllConnections().catch(() => undefined)
+      await bestEffortBounded(
+        electronSession.closeAllConnections(),
+        reloadTimeoutMs,
+        'Chromium proxy connection cleanup',
+      )
       // This is a private in-memory partition. Resetting it prevents an
       // accidentally retained reference from sending traffic to a stopped
       // mixed listener; it does not touch the user's system proxy setting.
-      await electronSession.setProxy({ mode: 'direct' }).catch(() => undefined)
+      await bestEffortBounded(
+        electronSession.setProxy({ mode: 'direct' }),
+        reloadTimeoutMs,
+        'Chromium proxy reset',
+      )
     },
   }
 }
@@ -132,6 +148,10 @@ async function bounded<T>(operation: Promise<T>, timeoutMs: number, label: strin
   } finally {
     if (timer) clearTimeout(timer)
   }
+}
+
+async function bestEffortBounded(operation: Promise<unknown>, timeoutMs: number, label: string): Promise<void> {
+  await bounded(operation, timeoutMs, label).then(() => undefined, () => undefined)
 }
 
 export const BUILT_IN_CHROMIUM_PROXY_BYPASS_RULES = BUILT_IN_PROXY_BYPASS_RULES

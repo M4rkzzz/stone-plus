@@ -114,7 +114,8 @@ describe('ElevatedSingBoxTunAdapter lifecycle', () => {
       processRunner,
       fileSystem,
       randomId: () => 'fixed-session-id',
-      resolveHost: resolveTestHost
+      resolveHost: resolveTestHost,
+      fetchImplementation: healthyTunFetch
     })
 
     const session = await adapter.startTemporaryElevated({ bypass: sidecarBypass() })
@@ -193,7 +194,8 @@ describe('ElevatedSingBoxTunAdapter lifecycle', () => {
       commandRunner: async () => ({ exitCode: 0, stdout: '', stderr: '' }),
       processRunner,
       randomId: () => 'retry-stop-session',
-      resolveHost: resolveTestHost
+      resolveHost: resolveTestHost,
+      fetchImplementation: healthyTunFetch
     })
     const session = await adapter.startTemporaryElevated({ bypass: sidecarBypass() })
     const configPath = join(directory, 'built-in-proxy', 'tun-sidecar', 'sidecar-retry-stop-session.json')
@@ -202,6 +204,101 @@ describe('ElevatedSingBoxTunAdapter lifecycle', () => {
     await expect(readFile(configPath, 'utf8')).resolves.toContain('stone-tun-in')
     await expect(adapter.stopTemporary(session)).resolves.toBeUndefined()
     expect(processRunner.stop).toHaveBeenCalledTimes(2)
+    await expect(readFile(configPath, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  it('rejects an elevated process that exits before the authenticated health gate', async () => {
+    const directory = await temporaryDirectory()
+    const stop = vi.fn(async () => undefined)
+    const processRunner: TemporaryElevationProcessRunner = {
+      start: vi.fn(async () => ({
+        id: 'early-exit-sidecar',
+        pid: 9191,
+        exit: Promise.resolve({ code: 1, signal: null }),
+        stop,
+      })),
+    }
+    const adapter = new ElevatedSingBoxTunAdapter({
+      userDataPath: directory,
+      runtimeRoot: join(directory, 'bundled'),
+      platform: 'linux',
+      architecture: 'x64',
+      verifyRuntime: async () => verifiedRuntime(directory, 'linux'),
+      commandRunner: async () => ({ exitCode: 0, stdout: '', stderr: '' }),
+      processRunner,
+      randomId: () => 'early-exit-session',
+      resolveHost: resolveTestHost,
+      fetchImplementation: healthyTunFetch,
+    })
+    const configPath = join(directory, 'built-in-proxy', 'tun-sidecar', 'sidecar-early-exit-session.json')
+
+    await expect(adapter.startTemporaryElevated({ bypass: sidecarBypass() }))
+      .rejects.toMatchObject({ code: 'tun_start_failed' })
+    expect(stop).not.toHaveBeenCalled()
+    await expect(readFile(configPath, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  it('preserves a late native authorization refusal through the health gate', async () => {
+    const directory = await temporaryDirectory()
+    const stop = vi.fn(async () => undefined)
+    const processRunner: TemporaryElevationProcessRunner = {
+      start: vi.fn(async () => ({
+        id: 'late-denial-sidecar',
+        pid: 9193,
+        exit: Promise.resolve({
+          code: 1,
+          signal: null,
+          stderr: 'sudo: no password was provided'
+        }),
+        stop
+      }))
+    }
+    const adapter = new ElevatedSingBoxTunAdapter({
+      userDataPath: directory,
+      runtimeRoot: join(directory, 'bundled'),
+      platform: 'darwin',
+      architecture: 'arm64',
+      verifyRuntime: async () => verifiedRuntime(directory, 'darwin'),
+      commandRunner: async () => ({ exitCode: 0, stdout: '', stderr: '' }),
+      processRunner,
+      randomId: () => 'late-denial-session',
+      resolveHost: resolveTestHost,
+      fetchImplementation: healthyTunFetch
+    })
+    const configPath = join(directory, 'built-in-proxy', 'tun-sidecar', 'sidecar-late-denial-session.json')
+
+    await expect(adapter.startTemporaryElevated({ bypass: sidecarBypass() }))
+      .rejects.toBeInstanceOf(TunElevationDeniedError)
+    expect(stop).not.toHaveBeenCalled()
+    await expect(readFile(configPath, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  it('retains an unreturned sidecar when cleanup fails and removes it on a later cleanup retry', async () => {
+    const directory = await temporaryDirectory()
+    const stop = vi.fn()
+      .mockRejectedValueOnce(new Error('elevated process is still alive'))
+      .mockResolvedValueOnce(undefined)
+    const processRunner: TemporaryElevationProcessRunner = {
+      start: vi.fn(async () => ({ id: '', pid: 9192, stop })),
+    }
+    const adapter = new ElevatedSingBoxTunAdapter({
+      userDataPath: directory,
+      runtimeRoot: join(directory, 'bundled'),
+      platform: 'linux',
+      architecture: 'x64',
+      verifyRuntime: async () => verifiedRuntime(directory, 'linux'),
+      commandRunner: async () => ({ exitCode: 0, stdout: '', stderr: '' }),
+      processRunner,
+      randomId: () => 'pending-cleanup-session',
+      resolveHost: resolveTestHost,
+    })
+    const configPath = join(directory, 'built-in-proxy', 'tun-sidecar', 'sidecar-pending-cleanup-session.json')
+
+    await expect(adapter.startTemporaryElevated({ bypass: sidecarBypass() }))
+      .rejects.toMatchObject({ code: 'tun_cleanup_failed' })
+    await expect(readFile(configPath, 'utf8')).resolves.toContain('stone-tun-in')
+    await expect(adapter.cleanupPending()).resolves.toBeUndefined()
+    expect(stop).toHaveBeenCalledTimes(2)
     await expect(readFile(configPath, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
@@ -283,6 +380,11 @@ class FakeProcessRunner implements TemporaryElevationProcessRunner {
     }
   }
 }
+
+const healthyTunFetch = vi.fn(async () => new Response(
+  JSON.stringify({ version: 'sing-box 1.13.14' }),
+  { status: 200, headers: { 'content-type': 'application/json' } }
+)) as unknown as typeof fetch
 
 function sidecarBypass() {
   return createTunBypassPlan({

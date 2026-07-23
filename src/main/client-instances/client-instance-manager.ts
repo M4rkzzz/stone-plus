@@ -5,6 +5,8 @@ import { isAbsolute, resolve } from 'node:path'
 import type { ManagedClientInstance, ManagedClientInstanceInput, ManagedClientLaunchMode, RouteClient } from '@shared/types'
 
 const METADATA_KEY = 'managed_client_instances_v1'
+const SHUTDOWN_PERSIST_TIMEOUT_MS = 250
+const SHUTDOWN_START_DRAIN_TIMEOUT_MS = 1_000
 
 export interface ClientInstanceMetadataStore {
   readAppMetadata(key: string): string | undefined
@@ -32,11 +34,29 @@ export interface ClientInstanceLaunchBinding {
   env?: NodeJS.ProcessEnv
 }
 
+/**
+ * Immutable, fully-resolved launch input. Main-process integrations can use
+ * `validateLaunchPlan` to assert runtime prerequisites (notably that the local
+ * gateway is actually listening) before any lifecycle state is changed or a
+ * child process is spawned.
+ */
+export interface ClientInstanceLaunchPlan {
+  readonly instanceId: string
+  readonly executable: string
+  readonly args: readonly string[]
+  readonly cwd?: string
+  readonly env: Readonly<NodeJS.ProcessEnv>
+  readonly launchMode: ManagedClientLaunchMode
+}
+
 export interface ClientInstanceManagerOptions {
   store: ClientInstanceMetadataStore
   processAdapter?: ClientInstanceProcessAdapter
   resolveBinding?: (instance: ManagedClientInstance) => ClientInstanceLaunchBinding
+  validateLaunchPlan?: (plan: ClientInstanceLaunchPlan) => void | Promise<void>
   baseEnvironment?: NodeJS.ProcessEnv
+  platform?: NodeJS.Platform
+  hasControllingTerminal?: () => boolean
   now?: () => number
   stopTimeoutMs?: number
 }
@@ -55,6 +75,12 @@ interface ProcessExit {
   error?: Error
 }
 
+interface ShutdownSignal {
+  requested: boolean
+  promise: Promise<void>
+  request(): void
+}
+
 export class ClientInstanceManager {
   private definitions: ManagedClientInstance[] = []
   private readonly running = new Map<string, RunningInstance>()
@@ -64,6 +90,8 @@ export class ClientInstanceManager {
   private readonly processAdapter: ClientInstanceProcessAdapter
   private readonly now: () => number
   private readonly stopTimeoutMs: number
+  private readonly platform: NodeJS.Platform
+  private readonly shutdown = createShutdownSignal()
   private nextGeneration = 0
   private persistenceTail: Promise<void> = Promise.resolve()
 
@@ -71,6 +99,7 @@ export class ClientInstanceManager {
     this.processAdapter = options.processAdapter ?? new NodeClientInstanceProcessAdapter()
     this.now = options.now ?? (() => Date.now())
     this.stopTimeoutMs = Math.max(100, Math.min(30_000, options.stopTimeoutMs ?? 5_000))
+    this.platform = options.platform ?? process.platform
   }
 
   public initialize(): ManagedClientInstance[] {
@@ -106,6 +135,11 @@ export class ClientInstanceManager {
     }
     if (existing && this.running.has(existing.id)) throw new Error('Stop the client instance before editing it.')
     const timestamp = this.now()
+    const resolvedLaunchMode = launchMode(input.launchMode ?? existing?.launchMode ?? defaultLaunchMode(this.platform))
+    // Preserve an old explicit terminal definition so startup migrations and
+    // unrelated edits remain possible, but never allow a new unsupported mode
+    // to be selected. start() performs the same check unconditionally.
+    if (!existing || resolvedLaunchMode !== existing.launchMode) this.assertLaunchModeSupported(resolvedLaunchMode)
     const definition: ManagedClientInstance = {
       id: existing?.id ?? randomUUID(),
       name: requiredName(input.name),
@@ -118,7 +152,7 @@ export class ClientInstanceManager {
       // not make the default instance unlaunchable there until an external
       // terminal adapter is available; Windows keeps the visible-console
       // default, while explicit user choices are always preserved.
-      launchMode: launchMode(input.launchMode ?? existing?.launchMode ?? defaultLaunchMode()),
+      launchMode: resolvedLaunchMode,
       routeId: optionalIdentifier(input.routeId),
       profileId: optionalIdentifier(input.profileId),
       status: 'stopped',
@@ -149,6 +183,7 @@ export class ClientInstanceManager {
   }
 
   public start(id: string): Promise<ManagedClientInstance[]> {
+    if (this.shutdown.requested) return Promise.reject(new ClientInstanceStartCancelledError())
     const existing = this.startFlights.get(id)
     if (existing) return existing
     const flight = this.startInternal(id).finally(() => {
@@ -159,28 +194,46 @@ export class ClientInstanceManager {
   }
 
   private async startInternal(id: string): Promise<ManagedClientInstance[]> {
+    this.assertStartAllowed()
     const stopping = this.stopFlights.get(id)
-    if (stopping) await stopping
+    if (stopping) await this.awaitStartStep(stopping)
     if (this.running.has(id)) return this.list()
     const instance = this.required(id)
     if (!instance.executablePath) throw new Error('Choose an executable before starting this instance.')
-    await assertFile(instance.executablePath, 'Client executable')
-    if (instance.workingDirectory) await assertDirectory(instance.workingDirectory, 'Working directory')
-    await mkdir(instance.configDirectory, { recursive: true })
-    await assertDirectory(instance.configDirectory, 'Configuration directory')
+    this.assertLaunchModeSupported(instance.launchMode)
+    await this.awaitStartStep(assertFile(instance.executablePath, 'Client executable'))
+    if (instance.workingDirectory) {
+      await this.awaitStartStep(assertDirectory(instance.workingDirectory, 'Working directory'))
+    }
+    await this.awaitStartStep(mkdir(instance.configDirectory, { recursive: true }).then(() => undefined))
+    await this.awaitStartStep(assertDirectory(instance.configDirectory, 'Configuration directory'))
+    const binding = this.options.resolveBinding?.(structuredClone(instance))
+    const plan: ClientInstanceLaunchPlan = Object.freeze({
+      instanceId: instance.id,
+      executable: instance.executablePath,
+      args: Object.freeze([...instance.launchArgs]),
+      ...(instance.workingDirectory ? { cwd: instance.workingDirectory } : {}),
+      env: Object.freeze({
+        ...(this.options.baseEnvironment ?? process.env),
+        ...configDirectoryEnvironment(instance.client, instance.configDirectory),
+        ...(binding?.env ?? {}),
+      }),
+      launchMode: instance.launchMode,
+    })
+    if (this.options.validateLaunchPlan) {
+      await this.awaitStartStep(Promise.resolve(this.options.validateLaunchPlan(plan)))
+    }
+    this.assertStartAllowed()
     const timestamp = this.now()
     this.replace({ ...instance, status: 'starting', lastError: undefined, updatedAt: timestamp })
     let launched: RunningInstance | undefined
     try {
-      await this.persist()
-      const child = this.processAdapter.spawn(instance.executablePath, instance.launchArgs, {
-        cwd: instance.workingDirectory,
-        env: {
-          ...(this.options.baseEnvironment ?? process.env),
-          ...configDirectoryEnvironment(instance.client, instance.configDirectory),
-          ...(this.options.resolveBinding?.(instance).env ?? {})
-        },
-        launchMode: instance.launchMode
+      await this.awaitStartStep(this.persist())
+      this.assertStartAllowed()
+      const child = this.processAdapter.spawn(plan.executable, plan.args, {
+        cwd: plan.cwd,
+        env: plan.env as NodeJS.ProcessEnv,
+        launchMode: plan.launchMode
       })
       const generation = ++this.nextGeneration
       launched = this.trackRunning(id, generation, child, timestamp)
@@ -192,7 +245,7 @@ export class ClientInstanceManager {
         return this.list()
       }
       this.replace({ ...this.required(id), status: 'running', pid: child.pid, lastStartedAt: timestamp, updatedAt: timestamp })
-      await this.persist()
+      await this.awaitStartStep(this.persist())
       return this.list()
     } catch (error) {
       if (launched && this.isCurrent(id, launched.generation)) {
@@ -200,6 +253,20 @@ export class ClientInstanceManager {
         if (stopped && this.isCurrent(id, launched.generation)) this.running.delete(id)
       }
       const stillRunning = launched && this.isCurrent(id, launched.generation)
+      if (error instanceof ClientInstanceStartCancelledError && !stillRunning) {
+        this.replace({
+          ...this.required(id),
+          status: 'stopped',
+          pid: undefined,
+          processAlive: false,
+          lastError: undefined,
+          stopError: undefined,
+          lastStoppedAt: this.now(),
+          updatedAt: this.now(),
+        })
+        await this.persistForLifecycle().catch(() => undefined)
+        throw error
+      }
       this.replace({
         ...this.required(id),
         status: 'failed',
@@ -210,7 +277,7 @@ export class ClientInstanceManager {
         lastStoppedAt: this.now(),
         updatedAt: this.now()
       })
-      await this.persist().catch(() => undefined)
+      await this.persistForLifecycle().catch(() => undefined)
       throw error
     }
   }
@@ -227,18 +294,18 @@ export class ClientInstanceManager {
 
   private async stopInternal(id: string): Promise<ManagedClientInstance[]> {
     const starting = this.startFlights.get(id)
-    if (starting) await starting.catch(() => undefined)
+    if (starting && !this.shutdown.requested) await starting.catch(() => undefined)
     const instance = this.required(id)
     const active = this.running.get(id)
     if (!active) {
       if (instance.status !== 'stopped') {
         this.replace({ ...instance, status: 'stopped', pid: undefined, updatedAt: this.now() })
-        await this.persist()
+        await this.persistForLifecycle()
       }
       return this.list()
     }
     this.replace({ ...instance, status: 'stopping', updatedAt: this.now() })
-    await this.persist()
+    await this.persistBeforeTermination()
     let graceful = false
     try {
       active.child.kill('SIGTERM')
@@ -257,7 +324,7 @@ export class ClientInstanceManager {
           ...this.required(id), status: 'failed', pid: active.child.pid, processAlive: true,
           stopError: message, lastError: message, updatedAt: this.now()
         })
-        await this.persist()
+        await this.persistForLifecycle()
         return this.list()
       }
       const forcedExit = await waitForExit(active.exit, Math.min(1_000, this.stopTimeoutMs))
@@ -273,7 +340,7 @@ export class ClientInstanceManager {
           lastError: error.message,
           updatedAt: this.now()
         })
-        await this.persist()
+        await this.persistForLifecycle()
       }
     }
     return this.list()
@@ -283,15 +350,22 @@ export class ClientInstanceManager {
     stopped: string[]
     stillRunning: Array<{ id: string; pid?: number; error?: string }>
   }> {
-    const ids = [...this.running.keys()]
-    await Promise.all(ids.map((id) => this.stop(id).catch(() => undefined)))
-    const stillRunning = ids.flatMap((id) => {
+    const ids = new Set([...this.running.keys(), ...this.startFlights.keys()])
+    const pendingStarts = [...this.startFlights.values()]
+    this.shutdown.request()
+    for (const id of this.running.keys()) ids.add(id)
+    const stopping = [...this.running.keys()].map((id) => this.stop(id).catch(() => undefined))
+    await Promise.all([
+      ...stopping.map((flight) => settleWithin(flight, this.stopTimeoutMs + 2_000)),
+      settleWithin(Promise.allSettled(pendingStarts), SHUTDOWN_START_DRAIN_TIMEOUT_MS),
+    ])
+    const stillRunning = [...ids].flatMap((id) => {
       const active = this.running.get(id)
       const instance = this.definitions.find((candidate) => candidate.id === id)
       return active ? [{ id, pid: active.child.pid, error: instance?.stopError ?? instance?.lastError }] : []
     })
     const runningIds = new Set(stillRunning.map((item) => item.id))
-    return { stopped: ids.filter((id) => !runningIds.has(id)), stillRunning }
+    return { stopped: [...ids].filter((id) => !runningIds.has(id)), stillRunning }
   }
 
   private trackRunning(
@@ -348,7 +422,7 @@ export class ClientInstanceManager {
       stopError: instance.status === 'stopping' ? message : instance.stopError,
       updatedAt: this.now()
     })
-    await this.persist().catch(() => undefined)
+    await this.persistForLifecycle().catch(() => undefined)
   }
 
   private async confirmAlive(child: ClientInstanceProcess): Promise<boolean> {
@@ -381,7 +455,7 @@ export class ClientInstanceManager {
       lastStoppedAt: timestamp,
       updatedAt: timestamp
     })
-    await this.persist()
+    await this.persistForLifecycle()
   }
 
   private isCurrent(id: string, generation: number): boolean {
@@ -430,6 +504,48 @@ export class ClientInstanceManager {
     for (const listener of this.listeners) {
       try { listener(snapshot) } catch { /* Renderer notification failures must not corrupt process state. */ }
     }
+  }
+
+  private async persistForLifecycle(): Promise<void> {
+    const persistence = this.persist()
+    if (!this.shutdown.requested) {
+      await persistence
+      return
+    }
+    await settleWithin(persistence, SHUTDOWN_PERSIST_TIMEOUT_MS)
+  }
+
+  private async persistBeforeTermination(): Promise<void> {
+    const persistence = this.persist()
+    if (this.shutdown.requested) {
+      void persistence.catch(() => undefined)
+      return
+    }
+    await Promise.race([
+      persistence,
+      this.shutdown.promise,
+    ])
+  }
+
+  private assertLaunchModeSupported(mode: ManagedClientLaunchMode): void {
+    if (mode !== 'terminal' || this.platform === 'win32') return
+    const hasControllingTerminal = this.options.hasControllingTerminal?.()
+      ?? Boolean(process.stdin.isTTY && process.stdout.isTTY)
+    if (!hasControllingTerminal) {
+      throw new Error('Visible terminal launch is unavailable because Stone+ has no controlling terminal on this platform. Choose background mode instead.')
+    }
+  }
+
+  private assertStartAllowed(): void {
+    if (this.shutdown.requested) throw new ClientInstanceStartCancelledError()
+  }
+
+  private async awaitStartStep<T>(operation: Promise<T>): Promise<T> {
+    this.assertStartAllowed()
+    return Promise.race([
+      operation,
+      this.shutdown.promise.then(() => { throw new ClientInstanceStartCancelledError() }),
+    ])
   }
 }
 
@@ -520,6 +636,36 @@ async function waitForExit(exit: Promise<ProcessExit>, timeoutMs: number): Promi
   }
 }
 
+async function settleWithin(operation: Promise<unknown>, timeoutMs: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      operation.then(() => true, () => true),
+      new Promise<false>((resolve) => { timer = setTimeout(() => resolve(false), timeoutMs) }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
+function createShutdownSignal(): ShutdownSignal {
+  let resolveShutdown!: () => void
+  const signal: ShutdownSignal = {
+    requested: false,
+    promise: new Promise<void>((resolve) => { resolveShutdown = resolve }),
+    request: () => {
+      if (signal.requested) return
+      signal.requested = true
+      resolveShutdown()
+    },
+  }
+  return signal
+}
+
+class ClientInstanceStartCancelledError extends Error {
+  constructor() { super('Client instance start was cancelled because Stone+ is shutting down.') }
+}
+
 function parseDefinitions(raw: string | undefined): ManagedClientInstance[] {
   if (!raw) return []
   try {
@@ -592,8 +738,8 @@ function launchMode(value: ManagedClientLaunchMode): ManagedClientLaunchMode {
   return value
 }
 
-function defaultLaunchMode(): ManagedClientLaunchMode {
-  return process.platform === 'win32' ? 'terminal' : 'background'
+function defaultLaunchMode(platform: NodeJS.Platform): ManagedClientLaunchMode {
+  return platform === 'win32' ? 'terminal' : 'background'
 }
 
 function requiredAbsolutePath(value: string, label: string): string {

@@ -1,5 +1,5 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { supportsFastServiceTier } from '../../shared/types'
 import {
   extractProtocolUsage,
@@ -38,6 +38,7 @@ import {
   convertRequest,
   convertResponse,
   getRequestModel,
+  ResponsesResponseFailedError,
   UnsupportedProtocolConversionError
 } from './protocol'
 import {
@@ -65,10 +66,18 @@ import type {
   GatewayRuntimeStateHandler,
   OutboundFetchResolver,
   ConversationTitleResolver,
-  GatewayServerOptions
+  GatewayServerOptions,
+  ResolvedGatewayCredential
 } from './types'
 
 type JsonObject = Record<string, unknown>
+
+class CompactFallbackContextOverflowError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'CompactFallbackContextOverflowError'
+  }
+}
 
 interface IncomingRoute {
   protocol: Protocol
@@ -99,6 +108,11 @@ const QUOTA_EXHAUSTED_RECHECK_MS = 30_000
 // half-open streams. The configured idle timeout still wins when it is lower.
 const TRAILING_FRAME_DRAIN_MS = 2_000
 const RESPONSES_TERMINAL_IDLE_TIMEOUT_MS = 30_000
+// Search entitlement is attached to the concrete OAuth grant, not merely to
+// the account's broad credential type. Remember a proven endpoint capability
+// long enough to remove a guaranteed 401 from normal use, while periodically
+// re-probing so a backend entitlement rollout is picked up without a restart.
+const CODEX_SEARCH_CAPABILITY_TTL_MS = 6 * 60 * 60_000
 // A Responses connection can remain physically alive by emitting SSE comments
 // or lifecycle heartbeats after the model has stopped doing useful work. Track
 // protocol progress separately, but use the user's stream-idle setting as the
@@ -106,6 +120,10 @@ const RESPONSES_TERMINAL_IDLE_TIMEOUT_MS = 30_000
 const MAX_REQUEST_BODY_IDLE_TIMEOUT_MS = 15_000
 const CLIENT_WRITE_DRAIN_TIMEOUT_MS = 10_000
 const MAX_COMPACT_V2_STREAM_BYTES = 10 * 1024 * 1024
+// This is a per-uncommitted-frame/parser-buffer guard, not a response-size
+// limit. Once valid framed events arrive, an arbitrarily long normal response
+// continues to stream without being accumulated here.
+const MAX_STREAM_FRAME_BYTES = MAX_COMPACT_V2_STREAM_BYTES
 const STANDARD_REQUEST_BODY_LIMIT_BYTES = 10 * 1024 * 1024
 const CODEX_REQUEST_BODY_LIMIT_BYTES = 64 * 1024 * 1024
 const HEDGE_REQUEST_BODY_LIMIT_BYTES = 8 * 1024 * 1024
@@ -114,6 +132,11 @@ const HEDGE_REQUEST_BODY_LIMIT_BYTES = 8 * 1024 * 1024
 // or multiple smaller bodies can proceed without starving ordinary requests.
 const LARGE_REQUEST_BODY_BUDGET_BYTES = CODEX_REQUEST_BODY_LIMIT_BYTES
 const COMPACT_FALLBACK_USER_TEXT_BUDGET = 20_000
+// A context rejection happens before generation, so retrying the same relay is
+// not duplicate work. Keep the sequence short and progressively remove only
+// the oldest history; the final two attempts handle unusually long histories
+// without turning compaction into hundreds of upstream round trips.
+const MAX_COMPACT_CONTEXT_RETRIES = 7
 const CHATGPT_CODEX_COMPACT_URL = `${CHATGPT_CODEX_RESPONSES_URL}/compact`
 const COMPACT_SUMMARY_PROMPT = [
   'Create a concise handoff summary so another coding agent can continue this task.',
@@ -152,6 +175,21 @@ const RESPONSES_PASSTHROUGH_HEADERS = Object.freeze([
   'x-reasoning-included',
   'x-request-id'
 ] as const)
+
+type CodexSearchCapability = 'native' | 'responses-fallback'
+
+interface CodexSearchCapabilityCacheEntry {
+  credentialFingerprint: string
+  capability: CodexSearchCapability
+  expiresAt: number
+}
+
+function snapshotGatewayConfig(config: GatewayConfig): GatewayConfig {
+  // Config handoffs are control-plane events, not a per-request hot path.
+  // Clone once here so callers can safely keep editing their form/store object
+  // while every in-flight request retains one coherent topology version.
+  return structuredClone(config)
+}
 
 function buildGatewayConfigIndex(config: GatewayConfig): GatewayConfigIndex {
   const providersById = new Map<string, ProviderDefinition>()
@@ -223,6 +261,7 @@ export class GatewayServer implements GatewayController {
   private readonly logListeners = new Set<GatewayLogHandler>()
   private readonly accountStateListeners = new Set<GatewayAccountStateHandler>()
   private readonly runtimeStateListeners = new Set<GatewayRuntimeStateHandler>()
+  private readonly codexSearchCapabilities = new Map<string, CodexSearchCapabilityCacheEntry>()
   private readonly requestReplays: RequestReplayStore
   private requestReplayCaptureEnabled: boolean
   private requestReplayGeneration = 0
@@ -233,12 +272,13 @@ export class GatewayServer implements GatewayController {
   private startedAt?: number
   private activeRequests = 0
   private runtimeGeneration = 0
+  private configGeneration = 1
   private totalRequests = 0
   private successRequests = 0
 
   constructor(options: GatewayServerOptions) {
-    this.config = options.config
-    this.configIndex = buildGatewayConfigIndex(options.config)
+    this.config = snapshotGatewayConfig(options.config)
+    this.configIndex = buildGatewayConfigIndex(this.config)
     this.credentialResolver = options.credentialResolver
     this.fetchImplementation = options.fetchImplementation ?? fetch
     this.loopbackFetchImplementation = options.loopbackFetchImplementation ?? fetch
@@ -250,7 +290,7 @@ export class GatewayServer implements GatewayController {
       options.responsesProgressIdleTimeoutMs ?? Number.POSITIVE_INFINITY
     )
     this.requestReplays = new RequestReplayStore({ now: this.now })
-    this.requestReplayCaptureEnabled = options.config.settings.logPayloads === true
+    this.requestReplayCaptureEnabled = this.config.settings.logPayloads === true
     this.scheduler = new PoolScheduler(this.now, options.random)
     this.scheduler.hydrate(this.config.accounts, this.config.pools)
     this.scheduler.hydratePerformance(this.config.recentRequestLogs ?? [])
@@ -261,7 +301,7 @@ export class GatewayServer implements GatewayController {
   async start(settings?: GatewaySettings, credentialResolver?: CredentialResolver): Promise<void> {
     if (settings) {
       this.updateRequestReplayCaptureSetting(settings.logPayloads === true)
-      this.config = { ...this.config, settings }
+      this.config = { ...this.config, settings: structuredClone(settings) }
       this.configIndex = buildGatewayConfigIndex(this.config)
     }
     if (credentialResolver) this.credentialResolver = credentialResolver
@@ -362,19 +402,29 @@ export class GatewayServer implements GatewayController {
     }
   }
 
+  getConfigGeneration(): number {
+    return this.configGeneration
+  }
+
   updateConfig(config: GatewayConfig): void {
     const websocketWasEnabled = this.config.settings.responsesWebSocketEnabled === true
     this.updateRequestReplayCaptureSetting(config.settings.logPayloads === true)
-    this.config = config
-    if (websocketWasEnabled && config.settings.responsesWebSocketEnabled !== true) {
+    const snapshot = snapshotGatewayConfig(config)
+    this.config = snapshot
+    this.configGeneration += 1
+    if (websocketWasEnabled && snapshot.settings.responsesWebSocketEnabled !== true) {
       this.responsesWebSocket?.closeClients()
     }
     // Callers may deliberately mutate and resubmit the same config object.
     // Rebuild on every explicit version handoff rather than relying solely on
     // referential equality, then reuse the index for every request in that version.
-    this.configIndex = buildGatewayConfigIndex(config)
-    this.scheduler.hydrate(config.accounts, config.pools)
-    this.scheduler.hydratePerformance(config.recentRequestLogs ?? [])
+    this.configIndex = buildGatewayConfigIndex(snapshot)
+    const accountIds = new Set(snapshot.accounts.map((account) => account.id))
+    for (const accountId of this.codexSearchCapabilities.keys()) {
+      if (!accountIds.has(accountId)) this.codexSearchCapabilities.delete(accountId)
+    }
+    this.scheduler.hydrate(snapshot.accounts, snapshot.pools)
+    this.scheduler.hydratePerformance(snapshot.recentRequestLogs ?? [])
   }
 
   updateRuntimeAccounts(accounts: readonly Account[]): void {
@@ -416,8 +466,8 @@ export class GatewayServer implements GatewayController {
     }
   }
 
-  resetAccountHealth(accountId: string): void {
-    this.scheduler.resetHealth(accountId)
+  resetAccountHealth(accountId: string, options: { clearPerformance?: boolean } = {}): void {
+    this.scheduler.resetHealth(accountId, options)
   }
 
   getAccountFitness(accountIds?: readonly string[]): ReturnType<PoolScheduler['getFitness']> {
@@ -500,6 +550,7 @@ export class GatewayServer implements GatewayController {
     // mix old routes with new providers halfway through a retry chain.
     const requestConfig = this.config
     const requestIndex = this.configIndex
+    const requestConfigGeneration = this.configGeneration
     const requestReplayGeneration = this.requestReplayGeneration
     const requestReplayCaptureEnabled = this.requestReplayCaptureEnabled
     const pathname = requestPathname(request.url)
@@ -688,6 +739,8 @@ export class GatewayServer implements GatewayController {
       usage?: NormalizedTokenUsage
       accountFirstTokenMs?: number
       recordPerformance?: boolean
+      performanceRevision?: number
+      performanceResetEpoch?: number
     }): RequestLog | undefined => {
       if (!requestLogId || !logRoute || requestLogFinished) return undefined
       cancelScheduledProgressLog()
@@ -721,7 +774,17 @@ export class GatewayServer implements GatewayController {
         streamedChunks,
         ...streamDiagnostics
       })
-      if (input.status === 'success' && input.recordPerformance !== false) this.recordAccountPerformance(log)
+      if (
+        input.status === 'success'
+        && input.recordPerformance !== false
+        && input.performanceRevision !== undefined
+      ) {
+        this.recordAccountPerformance(
+          log,
+          input.performanceRevision,
+          input.performanceResetEpoch
+        )
+      }
       terminalRequestLog = log
       this.emitLog(log)
       return log
@@ -772,6 +835,7 @@ export class GatewayServer implements GatewayController {
           path: request.url ?? pathname,
           routeId: logRoute.id,
           body,
+          sourceByteLength: requestBodyByteLength,
           headers: Object.fromEntries(Object.entries(request.headers).map(([key, value]) => [
             key,
             Array.isArray(value) ? value.join(', ') : value
@@ -872,14 +936,20 @@ export class GatewayServer implements GatewayController {
         : pool
       const retryLimit = Number.isFinite(pool.maxRetries) ? Math.max(0, Math.floor(pool.maxRetries)) : 0
       // Retries share one response-start budget. A failed attempt must not reset
-      // the clock and multiply a 120-second timeout by maxRetries + 1.
+      // the clock and multiply a 120-second timeout by maxRetries + 1. Codex
+      // grants standalone compaction four times the ordinary request budget;
+      // mirror that contract so a valid native compact body is not cut off by
+      // Stone+ before the client itself would abandon it.
       const responseStartDeadlineAt = bodyReadyAt
-         + Math.max(1, requestConfig.settings.requestTimeoutSeconds) * 1000
+         + Math.max(1, requestConfig.settings.requestTimeoutSeconds) * 1000 * (codexCompact ? 4 : 1)
       let lastRetryableError: GatewayHttpError | undefined
       const failedAccountIds = new Set<string>()
       for (let attempt = 0; attempt <= retryLimit; attempt += 1) {
         let release: (() => void) | undefined
         let attemptedAccount: Account | undefined
+        let selectedHealthRevision: number | undefined
+        let selectedResetEpoch: number | undefined
+        let performanceRevision: number | undefined
         let upstreamDeadline: AbortDeadline | undefined
         let attemptSignal: AbortSignal | undefined
         let attemptActive = true
@@ -912,12 +982,18 @@ export class GatewayServer implements GatewayController {
               // accounts and applies per-account single-flight throttling, so
               // retry exhaustion can recover a stale sibling without turning
               // repeated 503s into a probe storm.
-              if (error.accountIds.length > 0) {
+              if (
+                error.accountIds.length > 0
+                && requestConfigGeneration === this.configGeneration
+              ) {
+                const noEligibleAccounts = {
+                  configGeneration: requestConfigGeneration,
+                  routeId: logRoute.id,
+                  poolId: pool.id,
+                  accountIds: error.accountIds,
+                }
                 this.emitRuntimeState({
-                  noEligibleAccounts: {
-                    poolId: pool.id,
-                    accountIds: error.accountIds,
-                  },
+                  noEligibleAccounts,
                 })
               }
               if (lastRetryableError) throw lastRetryableError
@@ -927,7 +1003,8 @@ export class GatewayServer implements GatewayController {
             schedulerSelectMs = Math.max(0, this.now() - schedulerSelectStarted)
           }
           const account = scheduled.account
-          const selectedHealthRevision = scheduled.healthRevision
+          selectedHealthRevision = scheduled.healthRevision
+          selectedResetEpoch = scheduled.resetEpoch
           attemptedAccount = account
           selectedAccount = account
           failureStage = 'credential'
@@ -986,12 +1063,20 @@ export class GatewayServer implements GatewayController {
             ? { secret: resolvedValue, kind: 'api-key' as const }
             : resolvedValue
           const credential = resolvedCredential.secret
+          const cachedSearchCapability = codexSearch && isChatGptCodexCredentialKind(resolvedCredential.kind)
+            ? this.getCodexSearchCapability(account.id, resolvedCredential)
+            : undefined
+          const preferSearchFallback = cachedSearchCapability === 'responses-fallback'
           const compactFallback = codexCompact
             && !supportsNativeCompact(provider, resolvedCredential.kind)
-          const upstreamStreaming = streaming
+          // Codex's local summarization path is an ordinary streaming Responses
+          // request. Many Responses-compatible relays only implement that path
+          // (or implement their buffered JSON path incompletely), so use the
+          // same proven transport for legacy compact fallback.
+          const upstreamStreaming = streaming || compactFallback
           scheduleProgressLog('connecting')
 
-          const upstreamHeaders = new Headers()
+          let upstreamHeaders = new Headers()
           if (isChatGptCodexCredentialKind(resolvedCredential.kind)) {
             if (provider.protocol !== 'openai-responses' || !resolvedCredential.accountId) {
               throw new GatewayHttpError(503, 'ChatGPT account requires an OpenAI Responses provider', 'account_unavailable')
@@ -1003,7 +1088,7 @@ export class GatewayServer implements GatewayController {
                 resolvedCredential.accountId,
                 resolvedCredential.fedramp,
                 request.headers,
-                codexSearch || codexCompact ? 'json' : 'stream'
+                (codexSearch && !preferSearchFallback) || codexCompact ? 'json' : 'stream'
               )
             } else {
               const credentialBundle = {
@@ -1011,7 +1096,7 @@ export class GatewayServer implements GatewayController {
                 accountId: resolvedCredential.accountId,
                 expiresAt: account.credentialExpiresAt ?? Number.MAX_SAFE_INTEGER
               }
-              if (codexSearch) {
+              if (codexSearch && !preferSearchFallback) {
                 applyChatGptCodexSearchHeaders(upstreamHeaders, credentialBundle, request.headers)
               } else {
                 applyChatGptCodexHeaders(upstreamHeaders, credentialBundle, request.headers)
@@ -1051,11 +1136,14 @@ export class GatewayServer implements GatewayController {
           const tieredOutboundBody = !codexSearch && !codexCompact && supportsFastServiceTier(provider.protocol)
             ? normalizeOpenAIServiceTier(outboundBody, pool.forceFastMode === true)
             : compactFallbackBody
-          const upstreamBody = isChatGptCodexCredentialKind(resolvedCredential.kind) && !codexSearch && !codexCompact
-            ? withChatGptCodexBody(tieredOutboundBody)
-            : tieredOutboundBody
+          const upstreamBody = preferSearchFallback
+            ? withChatGptCodexBody(buildChatGptSearchFallbackBody(body, targetModel))
+            : isChatGptCodexCredentialKind(resolvedCredential.kind) && !codexSearch && !codexCompact
+              ? withChatGptCodexBody(tieredOutboundBody)
+              : tieredOutboundBody
           const serializedBodyKey = `${provider.protocol}\0${targetModel}\0${resolvedCredential.kind}`
             + `\0${compactFallback ? 'compact-fallback' : 'native'}`
+            + `\0${preferSearchFallback ? 'search-fallback' : 'search-native'}`
             + `\0${pool.forceFastMode === true ? 'fast' : 'standard'}`
           let serializedUpstreamBody = serializedBodies.get(serializedBodyKey)
           if (serializedUpstreamBody === undefined) {
@@ -1064,7 +1152,7 @@ export class GatewayServer implements GatewayController {
           }
           const upstreamUrl = isChatGptCodexCredentialKind(resolvedCredential.kind)
             ? codexSearch
-              ? CHATGPT_CODEX_SEARCH_URL
+              ? preferSearchFallback ? CHATGPT_CODEX_RESPONSES_URL : CHATGPT_CODEX_SEARCH_URL
               : codexCompact && !compactFallback
                 ? CHATGPT_CODEX_COMPACT_URL
                 : CHATGPT_CODEX_RESPONSES_URL
@@ -1091,6 +1179,7 @@ export class GatewayServer implements GatewayController {
                 outboundFetch,
                 upstreamUrl,
                 upstreamInit,
+                provider.protocol,
                 streaming && !codexSearch && !compactSensitive
                   && !highConcurrencyMode
                   && pool.hedgedRequests === true
@@ -1130,11 +1219,102 @@ export class GatewayServer implements GatewayController {
           // an exhausted account behind a scheduler cooldown immediately so
           // concurrent requests cannot pile onto it; this does not mark the
           // current request successful or alter its body/stream handling.
-          this.applyExhaustedQuotaHeaders(account, headerSignals, headerObservedAt)
+          selectedHealthRevision = this.applyExhaustedQuotaHeaders(
+            account,
+            headerSignals,
+            headerObservedAt,
+            selectedHealthRevision,
+            selectedResetEpoch
+          )
 
           let errorPayload: JsonObject | undefined
+          let codexSearchFallbackPayload: JsonObject | undefined
+          const compactFallbackHistoryItems = compactFallback
+            ? compactFallbackHistoryLength(outboundBody)
+            : 0
+          let compactFallbackDroppedHistoryItems = 0
+          let compactFallbackContextRetries = 0
           if (!upstreamResponse.ok) {
             errorPayload = await readUpstreamJson(upstreamResponse, responseBodySignal)
+            if (compactFallback) {
+              while (compactFallbackContextRetries < MAX_COMPACT_CONTEXT_RETRIES
+                  && !upstreamResponse.ok
+                  && isCompactContextOverflow(upstreamResponse.status, errorPayload)) {
+                const nextDropCount = nextCompactFallbackDropCount(
+                  compactFallbackDroppedHistoryItems,
+                  compactFallbackHistoryItems,
+                  compactFallbackContextRetries
+                )
+                if (nextDropCount === undefined || this.now() >= responseStartDeadlineAt) break
+                compactFallbackDroppedHistoryItems = nextDropCount
+                compactFallbackContextRetries += 1
+                // Do not use `serializedBodies` here: every recovery request
+                // intentionally carries a smaller history than the first one.
+                serializedUpstreamBody = JSON.stringify(buildCompactFallbackBody(
+                  outboundBody,
+                  targetModel,
+                  compactFallbackDroppedHistoryItems
+                ))
+                failureStage = 'connect'
+                scheduleProgressLog('retrying')
+                let compactRetryFetched: Awaited<ReturnType<typeof fetchWithOptionalHedge>>
+                try {
+                  compactRetryFetched = await awaitWithAbortSignal(
+                    fetchWithOptionalHedge(
+                      outboundFetch,
+                      upstreamUrl,
+                      {
+                        method: 'POST',
+                        headers: upstreamHeaders,
+                        body: serializedUpstreamBody,
+                        signal: responseBodySignal
+                      },
+                      provider.protocol,
+                      undefined,
+                      firstBodyTimeoutMs,
+                      this.now,
+                      (headersAt) => {
+                        if (!attemptActive) return
+                        upstreamHeadersAt = headersAt
+                        failureStage = 'first-byte'
+                        scheduleProgressLog('waiting-first-byte')
+                      }
+                    ),
+                    responseBodySignal
+                  )
+                } catch (error) {
+                  throw gatewayErrorFromProviderFailure(adapter.classifyFailure({ error, now: this.now() }))
+                }
+                upstreamResponse = compactRetryFetched.response
+                upstreamHeadersAt = compactRetryFetched.headersAt
+                headerObservedAt = this.now()
+                headerSignals = extractRateLimitSignals(
+                  upstreamResponse.headers,
+                  provider.protocol,
+                  headerObservedAt
+                )
+                selectedHealthRevision = this.applyExhaustedQuotaHeaders(
+                  account,
+                  headerSignals,
+                  headerObservedAt,
+                  selectedHealthRevision,
+                  selectedResetEpoch
+                )
+                errorPayload = upstreamResponse.ok
+                  ? undefined
+                  : await readUpstreamJson(upstreamResponse, responseBodySignal)
+              }
+              if (
+                !upstreamResponse.ok
+                && isCompactContextOverflow(upstreamResponse.status, errorPayload)
+              ) {
+                throw new GatewayHttpError(
+                  400,
+                  'Compact fallback input still exceeds the upstream context window after trimming history',
+                  'context_length_exceeded'
+                )
+              }
+            }
             if (
               resolvedCredential.kind === 'chatgpt-agent-identity'
               && resolvedCredential.recoverInvalidTask
@@ -1144,7 +1324,30 @@ export class GatewayServer implements GatewayController {
               // once before scheduler failover. Persisting the replacement is
               // handled by the main-process credential resolver.
               resolvedCredential = await resolvedCredential.recoverInvalidTask()
-              upstreamHeaders.set('authorization', resolvedCredential.secret)
+              if (resolvedCredential.kind !== 'chatgpt-agent-identity' || !resolvedCredential.accountId) {
+                throw new GatewayHttpError(
+                  503,
+                  'Agent Identity recovery returned an incompatible credential',
+                  'account_unavailable'
+                )
+              }
+              // Rebuild rather than patching Authorization in place. A rotated
+              // registration may change account/FedRAMP identity, and retaining
+              // those old headers would sign one task while naming another.
+              upstreamHeaders = new Headers()
+              applyChatGptAgentIdentityHeaders(
+                upstreamHeaders,
+                resolvedCredential.secret,
+                resolvedCredential.accountId,
+                resolvedCredential.fedramp,
+                request.headers,
+                (codexSearch && !preferSearchFallback) || codexCompact ? 'json' : 'stream'
+              )
+              if (codexCompact) upstreamHeaders.set('accept', 'application/json')
+              if (sessionId && !upstreamHeaders.has('session-id')) upstreamHeaders.set('session-id', sessionId)
+              if ((codexCompact && !compactFallback) || compactResponsePassthrough) {
+                copyCompactRequestHeaders(request, upstreamHeaders)
+              }
               upstreamResponse = await awaitWithAbortSignal(
                 outboundFetch(upstreamUrl, {
                   method: 'POST', headers: upstreamHeaders,
@@ -1158,10 +1361,185 @@ export class GatewayServer implements GatewayController {
                 provider.protocol,
                 headerObservedAt
               )
-              this.applyExhaustedQuotaHeaders(account, headerSignals, headerObservedAt)
+              selectedHealthRevision = this.applyExhaustedQuotaHeaders(
+                account,
+                headerSignals,
+                headerObservedAt,
+                selectedHealthRevision,
+                selectedResetEpoch
+              )
               errorPayload = upstreamResponse.ok
                 ? undefined
                 : await readUpstreamJson(upstreamResponse, responseBodySignal)
+            }
+          }
+
+          let searchAccessPolicyRejected = codexSearch
+            && !preferSearchFallback
+            && !upstreamResponse.ok
+            && isChatGptCodexCredentialKind(resolvedCredential.kind)
+            && isChatGptSearchAccessPolicyRejection(upstreamResponse.status, errorPayload)
+          if (searchAccessPolicyRejected) {
+            // Treat one access-enforcement response as provisional. A backend
+            // policy edge can be stale or briefly inconsistent, so give the
+            // exact native Search request one more chance within the existing
+            // response-start deadline before remembering a capability gap.
+            failureStage = 'connect'
+            try {
+              const retryFetched = await awaitWithAbortSignal(
+                fetchWithOptionalHedge(
+                  outboundFetch,
+                  upstreamUrl,
+                  {
+                    method: 'POST',
+                    headers: upstreamHeaders,
+                    body: serializedUpstreamBody,
+                    signal: responseBodySignal
+                  },
+                  provider.protocol,
+                  undefined,
+                  firstBodyTimeoutMs,
+                  this.now,
+                  (headersAt) => {
+                    if (!attemptActive) return
+                    upstreamHeadersAt = headersAt
+                    failureStage = 'first-byte'
+                    scheduleProgressLog('waiting-first-byte')
+                  }
+                ),
+                responseBodySignal
+              )
+              upstreamResponse = retryFetched.response
+              upstreamHeadersAt = retryFetched.headersAt
+            } catch (error) {
+              throw gatewayErrorFromProviderFailure(adapter.classifyFailure({ error, now: this.now() }))
+            }
+            headerObservedAt = this.now()
+            headerSignals = extractRateLimitSignals(upstreamResponse.headers, provider.protocol, headerObservedAt)
+            selectedHealthRevision = this.applyExhaustedQuotaHeaders(
+              account,
+              headerSignals,
+              headerObservedAt,
+              selectedHealthRevision,
+              selectedResetEpoch
+            )
+            errorPayload = upstreamResponse.ok
+              ? undefined
+              : await readUpstreamJson(upstreamResponse, responseBodySignal)
+            searchAccessPolicyRejected = !upstreamResponse.ok
+              && isChatGptSearchAccessPolicyRejection(upstreamResponse.status, errorPayload)
+          }
+          if (searchAccessPolicyRejected) {
+            this.setCodexSearchCapability(account.id, resolvedCredential, 'responses-fallback')
+          } else if (
+            codexSearch
+            && !preferSearchFallback
+            && upstreamResponse.ok
+            && isChatGptCodexCredentialKind(resolvedCredential.kind)
+          ) {
+            this.setCodexSearchCapability(account.id, resolvedCredential, 'native')
+          }
+
+          if (
+            codexSearch
+            && (preferSearchFallback || searchAccessPolicyRejected)
+            && isChatGptCodexCredentialKind(resolvedCredential.kind)
+          ) {
+            // The standalone alpha/search endpoint is not enabled for every
+            // otherwise-valid ChatGPT Codex session. Its access-enforcement
+            // 401 is a capability boundary, not proof that the OAuth token is
+            // invalid. Transparently execute the same search through the
+            // generally available Responses web_search tool instead.
+            if (!preferSearchFallback) {
+              const fallbackHeaders = new Headers()
+              if (resolvedCredential.kind === 'chatgpt-agent-identity') {
+                applyChatGptAgentIdentityHeaders(
+                  fallbackHeaders,
+                  resolvedCredential.secret,
+                  resolvedCredential.accountId!,
+                  resolvedCredential.fedramp,
+                  request.headers,
+                  'stream'
+                )
+              } else {
+                applyChatGptCodexHeaders(fallbackHeaders, {
+                  accessToken: resolvedCredential.secret,
+                  accountId: resolvedCredential.accountId!,
+                  expiresAt: account.credentialExpiresAt ?? Number.MAX_SAFE_INTEGER
+                }, request.headers)
+              }
+              if (sessionId && !fallbackHeaders.has('session-id')) fallbackHeaders.set('session-id', sessionId)
+              const fallbackBody = withChatGptCodexBody(buildChatGptSearchFallbackBody(body, targetModel))
+              failureStage = 'connect'
+              try {
+                const fallbackFetched = await awaitWithAbortSignal(
+                  fetchWithOptionalHedge(
+                    outboundFetch,
+                    CHATGPT_CODEX_RESPONSES_URL,
+                    {
+                      method: 'POST',
+                      headers: fallbackHeaders,
+                      body: JSON.stringify(fallbackBody),
+                      signal: responseBodySignal
+                    },
+                    provider.protocol,
+                    undefined,
+                    firstBodyTimeoutMs,
+                    this.now,
+                    (headersAt) => {
+                      if (!attemptActive) return
+                      upstreamHeadersAt = headersAt
+                      failureStage = 'first-byte'
+                      scheduleProgressLog('waiting-first-byte')
+                    }
+                  ),
+                  responseBodySignal
+                )
+                upstreamResponse = fallbackFetched.response
+                upstreamHeadersAt = fallbackFetched.headersAt
+              } catch (error) {
+                throw gatewayErrorFromProviderFailure(adapter.classifyFailure({ error, now: this.now() }))
+              }
+              headerObservedAt = this.now()
+              headerSignals = extractRateLimitSignals(upstreamResponse.headers, provider.protocol, headerObservedAt)
+              selectedHealthRevision = this.applyExhaustedQuotaHeaders(
+                account,
+                headerSignals,
+                headerObservedAt,
+                selectedHealthRevision,
+                selectedResetEpoch
+              )
+              errorPayload = upstreamResponse.ok
+                ? undefined
+                : await readUpstreamJson(upstreamResponse, responseBodySignal)
+            }
+            if (upstreamResponse.ok) {
+              upstreamDeadline?.clear()
+              upstreamDeadline = undefined
+              const collected = await collectOpenAiResponsesUpstream(
+                upstreamResponse,
+                { id: randomUUID(), model: targetModel, now: this.now },
+                responseBodySignal,
+                firstBodyTimeoutMs,
+                streamIdleTimeoutMs,
+                responsesProgressIdleTimeoutMs
+              )
+              if (collected.error || !collected.response) {
+                throw new GatewayHttpError(
+                  502,
+                  redactSensitiveText(collected.error ?? 'Search fallback did not produce a response', sensitiveValues(resolvedCredential)),
+                  'upstream_search_fallback_error'
+                )
+              }
+              const output = responseOutputText(collected.response)
+              if (!output) {
+                throw new GatewayHttpError(502, 'Search fallback returned no result text', 'upstream_search_fallback_error')
+              }
+              codexSearchFallbackPayload = {
+                encrypted_output: null,
+                output,
+                results: null
+              }
             }
           }
 
@@ -1194,6 +1572,7 @@ export class GatewayServer implements GatewayController {
           // caller requested a buffered JSON response.
           const upstreamResponseIsStream = streaming
             || codexCompactV2
+            || (compactFallback && !isJsonUpstreamResponse(upstreamResponse))
             || (isChatGptCodexCredentialKind(resolvedCredential.kind) && !codexSearch && !codexCompact)
           if (upstreamResponseIsStream) {
             upstreamDeadline?.clear()
@@ -1201,11 +1580,13 @@ export class GatewayServer implements GatewayController {
           }
 
           if (codexSearch) {
-            const payload = sanitizeUpstreamPayload(
+            const payload = codexSearchFallbackPayload ?? sanitizeUpstreamPayload(
               await readUpstreamJson(upstreamResponse, responseBodySignal),
               sensitiveValues(resolvedCredential)
             )
-            this.reportAccountSuccess(account, attemptStarted, headerSignals, selectedHealthRevision)
+            performanceRevision = this.reportAccountSuccess(
+              account, attemptStarted, headerSignals, selectedHealthRevision, selectedResetEpoch
+            )
             release?.()
             release = undefined
             releaseCommittedRequestBody()
@@ -1228,7 +1609,152 @@ export class GatewayServer implements GatewayController {
             let payload: JsonObject
             let compactUsage: NormalizedTokenUsage | undefined
             if (compactFallback) {
-              const fallbackResponse = await readUpstreamJson(upstreamResponse, responseBodySignal)
+              let fallbackResponse: JsonObject | undefined
+              let compactFallbackReadSignal: AbortSignal | undefined = responseBodySignal
+              for (;;) {
+                try {
+                  fallbackResponse = await readCompactFallbackResponse(
+                    upstreamResponse,
+                    { id: randomUUID(), model: targetModel, now: this.now },
+                    compactFallbackReadSignal,
+                    streamIdleTimeoutMs,
+                    streamIdleTimeoutMs,
+                    responsesProgressIdleTimeoutMs,
+                    sensitiveValues(resolvedCredential)
+                  )
+                  upstreamDeadline?.clear()
+                  upstreamDeadline = undefined
+                  break
+                } catch (error) {
+                  if (!(error instanceof CompactFallbackContextOverflowError)) throw error
+                  let receivedSuccessfulHeaders = false
+                  while (!receivedSuccessfulHeaders) {
+                    const nextDropCount = compactFallbackContextRetries < MAX_COMPACT_CONTEXT_RETRIES
+                      ? nextCompactFallbackDropCount(
+                          compactFallbackDroppedHistoryItems,
+                          compactFallbackHistoryItems,
+                          compactFallbackContextRetries
+                        )
+                      : undefined
+                    if (nextDropCount === undefined) {
+                      throw new GatewayHttpError(
+                        400,
+                        'Compact fallback input still exceeds the upstream context window after trimming history',
+                        'context_length_exceeded'
+                      )
+                    }
+                    compactFallbackDroppedHistoryItems = nextDropCount
+                    compactFallbackContextRetries += 1
+                    serializedUpstreamBody = JSON.stringify(buildCompactFallbackBody(
+                      outboundBody,
+                      targetModel,
+                      compactFallbackDroppedHistoryItems
+                    ))
+                    upstreamDeadline?.clear()
+                    // Keep every context-recovery attempt inside the original
+                    // 4x standalone-compaction budget. This gives a trimmed
+                    // retry the same remaining allowance as native compact,
+                    // without multiplying the timeout once per trim.
+                    const compactRetryRemainingMs = responseStartDeadlineAt - this.now()
+                    if (compactRetryRemainingMs <= 0) {
+                      throw new GatewayHttpError(504, 'Upstream request timed out', 'timeout_error')
+                    }
+                    upstreamDeadline = createAbortDeadline(compactRetryRemainingMs)
+                    const compactRetrySignal = AbortSignal.any([
+                      clientAbortController.signal,
+                      upstreamDeadline.signal
+                    ])
+                    compactFallbackReadSignal = compactRetrySignal
+                    failureStage = 'connect'
+                    scheduleProgressLog('retrying')
+                    let retryFetched: Awaited<ReturnType<typeof fetchWithOptionalHedge>>
+                    try {
+                      retryFetched = await awaitWithAbortSignal(
+                        fetchWithOptionalHedge(
+                          outboundFetch,
+                          upstreamUrl,
+                          {
+                            method: 'POST',
+                            headers: upstreamHeaders,
+                            body: serializedUpstreamBody,
+                            signal: compactRetrySignal
+                          },
+                          provider.protocol,
+                          undefined,
+                          firstBodyTimeoutMs,
+                          this.now,
+                          (headersAt) => {
+                            if (!attemptActive) return
+                            upstreamHeadersAt = headersAt
+                            failureStage = 'first-byte'
+                            scheduleProgressLog('waiting-first-byte')
+                          }
+                        ),
+                        compactRetrySignal
+                      )
+                    } catch (retryError) {
+                      throw gatewayErrorFromProviderFailure(adapter.classifyFailure({
+                        error: retryError,
+                        now: this.now()
+                      }))
+                    }
+                    upstreamResponse = retryFetched.response
+                    upstreamHeadersAt = retryFetched.headersAt
+                    headerObservedAt = this.now()
+                    headerSignals = extractRateLimitSignals(
+                      upstreamResponse.headers,
+                      provider.protocol,
+                      headerObservedAt
+                    )
+                    selectedHealthRevision = this.applyExhaustedQuotaHeaders(
+                      account,
+                      headerSignals,
+                      headerObservedAt,
+                      selectedHealthRevision,
+                      selectedResetEpoch
+                    )
+                    if (upstreamResponse.ok) {
+                      errorPayload = undefined
+                      receivedSuccessfulHeaders = true
+                      if (!isJsonUpstreamResponse(upstreamResponse)) {
+                        upstreamDeadline.clear()
+                        upstreamDeadline = undefined
+                        compactFallbackReadSignal = clientAbortController.signal
+                      }
+                      continue
+                    }
+                    errorPayload = await readUpstreamJson(upstreamResponse, compactRetrySignal)
+                    if (isCompactContextOverflow(upstreamResponse.status, errorPayload)) continue
+                    const safePayload = sanitizeUpstreamPayload(
+                      errorPayload,
+                      sensitiveValues(resolvedCredential)
+                    )
+                    const providerFailure = adapter.classifyFailure({
+                      statusCode: upstreamResponse.status,
+                      headers: upstreamResponse.headers,
+                      now: this.now()
+                    })
+                    throw new GatewayHttpError(
+                      upstreamResponse.status,
+                      upstreamErrorMessage(safePayload),
+                      `provider_${providerFailure.category}`,
+                      safePayload,
+                      providerFailure,
+                      observedQuotaSignals(headerSignals, this.now())
+                    )
+                  }
+                }
+              }
+              if (!fallbackResponse) {
+                throw new GatewayHttpError(502, 'Compact fallback returned no response', 'upstream_compact_error')
+              }
+              if (compactFallbackResponseIsIncomplete(fallbackResponse)) {
+                throw new GatewayHttpError(
+                  502,
+                  'Compact fallback ended before the summary was complete',
+                  'upstream_compact_error'
+                )
+              }
               const summary = responseOutputText(fallbackResponse)
               if (!summary) {
                 throw new GatewayHttpError(
@@ -1251,7 +1777,9 @@ export class GatewayServer implements GatewayController {
               compactUsage = extractProtocolUsage('openai-responses', payload)
             }
             if (!compactFallback) copyResponsesResponseHeaders(upstreamResponse.headers, response)
-            this.reportAccountSuccess(account, attemptStarted, headerSignals, selectedHealthRevision)
+            performanceRevision = this.reportAccountSuccess(
+              account, attemptStarted, headerSignals, selectedHealthRevision, selectedResetEpoch
+            )
             release?.()
             release = undefined
             releaseCommittedRequestBody()
@@ -1281,7 +1809,9 @@ export class GatewayServer implements GatewayController {
               onChunk: recordStreamChunk
             })
             copyResponsesResponseHeaders(upstreamResponse.headers, response)
-            this.reportAccountSuccess(account, attemptStarted, headerSignals, selectedHealthRevision)
+            performanceRevision = this.reportAccountSuccess(
+              account, attemptStarted, headerSignals, selectedHealthRevision, selectedResetEpoch
+            )
             release?.()
             release = undefined
             releaseCommittedRequestBody()
@@ -1357,7 +1887,9 @@ export class GatewayServer implements GatewayController {
               )
             }
             const completedAt = this.now()
-            this.reportAccountSuccess(account, attemptStarted, headerSignals, selectedHealthRevision)
+            performanceRevision = this.reportAccountSuccess(
+              account, attemptStarted, headerSignals, selectedHealthRevision, selectedResetEpoch
+            )
             release?.()
             release = undefined
             this.successRequests += 1
@@ -1367,7 +1899,9 @@ export class GatewayServer implements GatewayController {
               status: 'success',
               statusCode: upstreamResponse.status,
               usage: normalizeLogUsage(streamResult.usage),
-              accountFirstTokenMs: firstTokenAt === undefined ? undefined : Math.max(0, firstTokenAt - attemptStarted)
+              accountFirstTokenMs: firstTokenAt === undefined ? undefined : Math.max(0, firstTokenAt - attemptStarted),
+              performanceRevision,
+              performanceResetEpoch: selectedResetEpoch
             })
             return
           }
@@ -1402,6 +1936,16 @@ export class GatewayServer implements GatewayController {
           } else {
             payload = await readUpstreamJson(upstreamResponse, responseBodySignal)
           }
+          // A Responses provider can encode a failed request inside an HTTP
+          // 200 JSON envelope. Reject that terminal state before the identity
+          // path reuses raw bytes or reports account/request success. Keep the
+          // client-facing error fixed so upstream diagnostics and credentials
+          // cannot be reflected through the local gateway.
+          if (provider.protocol === 'openai-responses' && payload.status === 'failed') {
+            const failure = new ResponsesResponseFailedError(payload)
+            if (failure.requestLevel) throw gatewayErrorFromResponsesFailure(failure)
+            throw new GatewayHttpError(502, failure.message, 'upstream_response_failed')
+          }
           // Same-protocol JSON can be sent byte-for-byte. Avoid a second
           // protocol walk/allocating a converted object when the wire shape is
           // already exactly what the client requested.
@@ -1412,7 +1956,9 @@ export class GatewayServer implements GatewayController {
           if (compactResponsePassthrough) {
             copyResponsesResponseHeaders(upstreamResponse.headers, response)
           }
-          this.reportAccountSuccess(account, attemptStarted, headerSignals, selectedHealthRevision)
+          performanceRevision = this.reportAccountSuccess(
+            account, attemptStarted, headerSignals, selectedHealthRevision, selectedResetEpoch
+          )
           release?.()
           release = undefined
           releaseCommittedRequestBody()
@@ -1424,7 +1970,9 @@ export class GatewayServer implements GatewayController {
           this.successRequests += 1
           finishRequestLog({
             account, finished: completedAt, status: 'success', statusCode: 200, usage,
-            accountFirstTokenMs: firstTokenAt === undefined ? undefined : Math.max(0, firstTokenAt - attemptStarted)
+            accountFirstTokenMs: firstTokenAt === undefined ? undefined : Math.max(0, firstTokenAt - attemptStarted),
+            performanceRevision,
+            performanceResetEpoch: selectedResetEpoch
           })
           return
         } catch (error) {
@@ -1478,25 +2026,29 @@ export class GatewayServer implements GatewayController {
               const health = this.scheduler.recordFailure(attemptedAccount.id, {
                 retryAfterMs,
                 maxConcurrency: attemptedAccount.maxConcurrency,
+                expectedRevision: selectedHealthRevision,
+                expectedResetEpoch: selectedResetEpoch,
                 reason: gatewayError.providerFailure?.category === 'rate_limit' || quotaExhausted
                   ? 'quota'
                   : 'failure'
               })
-              this.emitAccountState({
-                accountId: attemptedAccount.id,
-                status: accountAction === 'disable' ? 'disabled' : 'cooldown',
-                circuitState: health.circuitState,
-                consecutiveFailures: health.consecutiveFailures,
-                cooldownUntil: accountAction === 'disable' ? undefined : health.cooldownUntil,
-                cooldownReason: accountAction === 'disable'
-                  ? undefined
-                  : gatewayError.providerFailure?.category === 'rate_limit' || quotaExhausted
-                    ? 'quota'
-                    : 'failure',
-                lastError: gatewayError.message,
-                lastUsedAt: this.now(),
-                ...gatewayError.quotaSignals
-              })
+              if (health.applied) {
+                this.emitAccountState({
+                  accountId: attemptedAccount.id,
+                  status: accountAction === 'disable' ? 'disabled' : 'cooldown',
+                  circuitState: health.circuitState,
+                  consecutiveFailures: health.consecutiveFailures,
+                  cooldownUntil: accountAction === 'disable' ? undefined : health.cooldownUntil,
+                  cooldownReason: accountAction === 'disable'
+                    ? undefined
+                    : gatewayError.providerFailure?.category === 'rate_limit' || quotaExhausted
+                      ? 'quota'
+                      : 'failure',
+                  lastError: gatewayError.message,
+                  lastUsedAt: this.now(),
+                  ...gatewayError.quotaSignals
+                })
+              }
             }
           }
           const canRetry = attempt < retryLimit
@@ -1797,7 +2349,11 @@ export class GatewayServer implements GatewayController {
     }
   }
 
-  private recordAccountPerformance(log: RequestLog): void {
+  private recordAccountPerformance(
+    log: RequestLog,
+    expectedRevision: number,
+    expectedResetEpoch?: number
+  ): void {
     if (log.status !== 'success' || !log.accountId) return
     const previousAttemptsMs = log.firstTokenMs !== undefined && log.accountFirstTokenMs !== undefined
       ? Math.max(0, log.firstTokenMs - log.accountFirstTokenMs)
@@ -1812,7 +2368,7 @@ export class GatewayServer implements GatewayController {
     ) {
       // Reliability still learns from successful non-streaming responses even
       // when the upstream did not expose phase timings.
-      this.scheduler.recordPerformance(log.accountId, {})
+      this.scheduler.recordPerformance(log.accountId, {}, expectedRevision, expectedResetEpoch)
       return
     }
     const generationStartedMs = log.upstreamFirstByteMs
@@ -1826,26 +2382,33 @@ export class GatewayServer implements GatewayController {
       semanticFirstTokenMs,
       outputTokens: log.outputTokens,
       generationDurationMs: Math.max(0, log.latencyMs - generationStartedMs)
-    })
+    }, expectedRevision, expectedResetEpoch)
   }
 
   private applyExhaustedQuotaHeaders(
     account: Account,
     signals: NormalizedQuotaSignals,
-    observedAt: number
-  ): void {
+    observedAt: number,
+    selectedHealthRevision?: number,
+    selectedResetEpoch?: number
+  ): number | undefined {
     const quota = observedQuotaSignals(signals, observedAt)
     if (
       !codexQuotaIsExhausted(quota.codexQuota, observedAt)
       && !genericQuotaExhausted(quota.quota, observedAt)
-    ) return
+    ) return selectedHealthRevision
 
     const cooldownUntil = quotaSignalCooldownUntil(quota, observedAt)
       ?? (signals.retryAt !== undefined && signals.retryAt > observedAt
         ? signals.retryAt
         : observedAt + QUOTA_EXHAUSTED_RECHECK_MS)
-    this.scheduler.setCooldown(account.id, cooldownUntil)
-    const health = this.scheduler.getHealth(account.id)
+    const health = this.scheduler.setCooldown(
+      account.id,
+      cooldownUntil,
+      selectedHealthRevision,
+      selectedResetEpoch
+    )
+    if (!health.applied) return selectedHealthRevision
     this.emitAccountState({
       accountId: account.id,
       status: 'cooldown',
@@ -1856,26 +2419,35 @@ export class GatewayServer implements GatewayController {
       lastUsedAt: observedAt,
       ...quota
     })
+    // The cooldown transition belongs to this attempt. Carry its new revision
+    // into the later terminal success/failure CAS so the same attempt may
+    // finish its own state transition without letting concurrent older work in.
+    return health.revision
   }
 
   private reportAccountSuccess(
     account: Account,
     attemptStarted: number,
     signals: NormalizedQuotaSignals | undefined,
-    selectedHealthRevision: number
-  ): void {
+    selectedHealthRevision?: number,
+    selectedResetEpoch?: number
+  ): number | undefined {
     const now = this.now()
     const quota = observedQuotaSignals(signals, now)
     const quotaExhausted = codexQuotaIsExhausted(quota.codexQuota, now)
       || genericQuotaExhausted(quota.quota, now)
     // Exhausted headers were already committed synchronously when received.
     // Do not turn a successfully delivered body into an "active" transition.
-    if (quotaExhausted) return
+    if (quotaExhausted) return undefined
 
-    const health = this.scheduler.recordSuccess(account.id, selectedHealthRevision)
+    const health = this.scheduler.recordSuccess(
+      account.id,
+      selectedHealthRevision,
+      selectedResetEpoch
+    )
     // A newer request has already changed this account's health. This older
     // success must not overwrite its cooldown or persisted quota snapshot.
-    if (!health.applied) return
+    if (!health.applied) return undefined
     this.emitAccountState({
       accountId: account.id,
       status: 'active',
@@ -1888,6 +2460,7 @@ export class GatewayServer implements GatewayController {
       lastUsedAt: now,
       ...quota
     })
+    return health.revision
   }
 
   private emitAccountState(state: GatewayAccountState): void {
@@ -1917,6 +2490,34 @@ export class GatewayServer implements GatewayController {
     }
   }
 
+  private getCodexSearchCapability(
+    accountId: string,
+    credential: ResolvedGatewayCredential
+  ): CodexSearchCapability | undefined {
+    const cached = this.codexSearchCapabilities.get(accountId)
+    if (!cached) return undefined
+    if (
+      cached.expiresAt <= this.now()
+      || cached.credentialFingerprint !== codexSearchCredentialFingerprint(credential)
+    ) {
+      this.codexSearchCapabilities.delete(accountId)
+      return undefined
+    }
+    return cached.capability
+  }
+
+  private setCodexSearchCapability(
+    accountId: string,
+    credential: ResolvedGatewayCredential,
+    capability: CodexSearchCapability
+  ): void {
+    this.codexSearchCapabilities.set(accountId, {
+      credentialFingerprint: codexSearchCredentialFingerprint(credential),
+      capability,
+      expiresAt: this.now() + CODEX_SEARCH_CAPABILITY_TTL_MS
+    })
+  }
+
   private emitRuntimeState(update: Parameters<GatewayRuntimeStateHandler>[0]): void {
     for (const listener of this.runtimeStateListeners) {
       try {
@@ -1926,6 +2527,17 @@ export class GatewayServer implements GatewayController {
       }
     }
   }
+}
+
+function codexSearchCredentialFingerprint(credential: ResolvedGatewayCredential): string {
+  // Agent assertions contain a fresh timestamp and signature on every request;
+  // their stable account identity is the correct capability boundary. OAuth
+  // bearer tokens can rotate independently, so bind those entries to the
+  // concrete secret without ever storing or logging that secret itself.
+  const material = credential.kind === 'chatgpt-agent-identity'
+    ? `${credential.kind}\0${credential.accountId ?? ''}\0${credential.fedramp === true ? 'fedramp' : 'standard'}`
+    : `${credential.kind}\0${credential.accountId ?? ''}\0${credential.secret}`
+  return createHash('sha256').update(material).digest('base64url')
 }
 
 export function createGatewayServer(options: GatewayServerOptions): GatewayServer {
@@ -2389,9 +3001,9 @@ function hasCodexOpaqueCompactHistory(body: JsonObject): boolean {
   return body.input.some((item) => {
     const compactItem = objectValue(item)
     const type = compactItem?.type
+    if (type === 'context_compaction') return true
     const opaqueType = type === 'compaction'
       || type === 'compaction_summary'
-      || type === 'context_compaction'
     return opaqueType
       && typeof compactItem?.encrypted_content === 'string'
       && Boolean(compactItem.encrypted_content.trim())
@@ -2405,18 +3017,33 @@ function compactUpstreamUrl(generationEndpoint: string, compact: boolean): strin
   return url.toString()
 }
 
-function buildCompactFallbackBody(body: JsonObject, model: string): JsonObject {
+function buildCompactFallbackBody(
+  body: JsonObject,
+  model: string,
+  dropOldestHistoryItems = 0
+): JsonObject {
   const history = Array.isArray(body.input)
-    ? body.input.filter((item) => objectValue(item)?.type !== 'compaction_trigger')
+    ? body.input.filter((item) => {
+        const type = objectValue(item)?.type
+        // Neither item is conversation content. `additional_tools` is a Codex
+        // Responses-lite extension that ordinary compatible endpoints commonly
+        // reject, while the generated summary never calls tools.
+        return type !== 'compaction_trigger' && type !== 'additional_tools'
+      })
     : []
+  let retainedStart = Math.min(history.length, Math.max(0, Math.floor(dropOldestHistoryItems)))
+  // A progressive prefix trim can land between a tool call and its output.
+  // Drop leading outputs as part of the same oldest group so a retry never
+  // manufactures an orphaned call result that a strict relay will reject.
+  while (retainedStart < history.length && isCompactToolOutput(history[retainedStart])) retainedStart += 1
+  const retainedHistory = pruneCompactOrphanToolOutputs(history.slice(retainedStart))
   return {
-    ...body,
     model,
     instructions: typeof body.instructions === 'string' && body.instructions.trim()
       ? `${body.instructions.trim()}\n\n${COMPACT_FALLBACK_INSTRUCTIONS}`
       : COMPACT_FALLBACK_INSTRUCTIONS,
     input: [
-      ...history,
+      ...retainedHistory,
       {
         type: 'message',
         role: 'user',
@@ -2426,8 +3053,86 @@ function buildCompactFallbackBody(body: JsonObject, model: string): JsonObject {
     tools: [],
     parallel_tool_calls: false,
     store: false,
-    stream: false
+    stream: true
   }
+}
+
+function isCompactToolOutput(value: unknown): boolean {
+  const type = objectValue(value)?.type
+  return type === 'function_call_output'
+    || type === 'custom_tool_call_output'
+    || type === 'computer_call_output'
+    || type === 'tool_search_output'
+}
+
+function pruneCompactOrphanToolOutputs(history: readonly unknown[]): unknown[] {
+  const retainedCallIds = new Set<string>()
+  for (const value of history) {
+    const item = objectValue(value)
+    if (!item || !isCompactToolCallType(item.type)) continue
+    const callId = compactToolCallId(item)
+    if (callId) retainedCallIds.add(callId)
+  }
+  return history.filter((value) => {
+    if (!isCompactToolOutput(value)) return true
+    const item = objectValue(value)
+    const callId = item ? compactToolCallId(item) : undefined
+    // Unknown vendor-specific output shapes are left untouched. For canonical
+    // call ids, however, never send a result after its initiating call was
+    // removed by a prefix trim (including interleaved parallel calls).
+    return !callId || retainedCallIds.has(callId)
+  })
+}
+
+function isCompactToolCallType(type: unknown): boolean {
+  return type === 'function_call'
+    || type === 'custom_tool_call'
+    || type === 'computer_call'
+    || type === 'tool_search_call'
+}
+
+function compactToolCallId(item: JsonObject): string | undefined {
+  const value = typeof item.call_id === 'string' ? item.call_id : item.id
+  return typeof value === 'string' && value.trim() ? value : undefined
+}
+
+function compactFallbackHistoryLength(body: JsonObject): number {
+  if (!Array.isArray(body.input)) return 0
+  return body.input.filter((item) => {
+    const type = objectValue(item)?.type
+    return type !== 'compaction_trigger' && type !== 'additional_tools'
+  }).length
+}
+
+function nextCompactFallbackDropCount(current: number, historyLength: number, retry: number): number | undefined {
+  if (current >= historyLength) return undefined
+  if (retry >= MAX_COMPACT_CONTEXT_RETRIES - 2) {
+    // Preserve the newest item on the penultimate attempt, then allow the
+    // synthetic summary prompt alone. This mirrors Codex's local fallback,
+    // which removes oldest items until the request fits.
+    return retry === MAX_COMPACT_CONTEXT_RETRIES - 2
+      ? Math.max(current + 1, historyLength - 1)
+      : historyLength
+  }
+  return Math.min(historyLength, current === 0 ? 1 : current * 2 + 1)
+}
+
+function isCompactContextOverflow(statusCode: number, payload: JsonObject | undefined): boolean {
+  if (!payload || (statusCode !== 400 && statusCode !== 413 && statusCode !== 422)) return false
+  let description = ''
+  try {
+    description = JSON.stringify(payload).toLowerCase()
+  } catch {
+    return false
+  }
+  return /context[_ -]?(?:length|window)[_ -]?(?:exceeded|overflow)/.test(description)
+    || /(?:prompt|input|request)[_ -]?(?:too[_ -]?long|too[_ -]?large)/.test(description)
+    || /maximum context length/.test(description)
+    || /context window[^\n]{0,120}(?:exceed|too (?:long|large)|overflow)/.test(description)
+    || /(?:prompt|input)[^\n]{0,120}(?:exceeds?|over)[^\n]{0,80}(?:token|context|limit|maximum)/.test(description)
+    || /(?:too many|token count[^\n]{0,80}exceeds?)[^\n]{0,80}tokens?/.test(description)
+    || /上下文[^\n]{0,80}(?:过长|超出|溢出)/.test(description)
+    || /(?:输入|提示)[^\n]{0,80}(?:过长|超出)(?:限制|上限|窗口)?/.test(description)
 }
 
 function compactReplacementPayload(summary: string, input: unknown): JsonObject {
@@ -2460,6 +3165,25 @@ function isValidCompactReplacementHistory(output: unknown): boolean {
         || item.content.length === 0
         || item.content.some((part) => !isValidCompactMessageContent(part))
       ) return false
+      if (item.role === 'user' || item.role === 'assistant') hasReplacementAnchor = true
+      continue
+    }
+    if (item.type === 'agent_message') {
+      if (
+        typeof item.author !== 'string'
+        || typeof item.recipient !== 'string'
+        || !Array.isArray(item.content)
+        || item.content.length === 0
+        || item.content.some((value) => {
+          const part = objectValue(value)
+          return !part
+            || (part.type === 'input_text'
+              ? typeof part.text !== 'string'
+              : part.type === 'encrypted_content'
+                ? typeof part.encrypted_content !== 'string'
+                : true)
+        })
+      ) return false
       hasReplacementAnchor = true
       continue
     }
@@ -2468,6 +3192,14 @@ function isValidCompactReplacementHistory(output: unknown): boolean {
         (item.id !== undefined && (typeof item.id !== 'string' || !item.id.trim()))
         || typeof item.encrypted_content !== 'string'
         || !item.encrypted_content.trim()
+      ) return false
+      hasReplacementAnchor = true
+      continue
+    }
+    if (item.type === 'context_compaction') {
+      if (
+        (item.id !== undefined && item.id !== null && typeof item.id !== 'string')
+        || (item.encrypted_content !== undefined && typeof item.encrypted_content !== 'string')
       ) return false
       hasReplacementAnchor = true
       continue
@@ -2497,12 +3229,18 @@ function recentCompactUserMessages(input: unknown): JsonObject[] {
   // do not allocate/scan an intermediate candidate list for discarded history.
   for (let index = input.length - 1; index >= 0 && remaining > 0; index -= 1) {
     const item = objectValue(input[index])
-    if (item?.role !== 'user' || !Array.isArray(item.content)) continue
-    const textChunks: string[] = []
-    for (const value of item.content) {
-      const part = objectValue(value)
-      if (part?.type === 'input_text' && typeof part.text === 'string') textChunks.push(part.text)
-    }
+    if (item?.role !== 'user') continue
+    const textChunks: string[] = typeof item.content === 'string'
+      ? [item.content]
+      : Array.isArray(item.content)
+        ? item.content.flatMap((value) => {
+            const part = objectValue(value)
+            return (part?.type === 'input_text' || part?.type === 'output_text' || part?.type === 'text')
+              && typeof part.text === 'string'
+              ? [part.text]
+              : []
+          })
+        : []
     const text = textChunks.join('\n').trim()
     if (!text || text.startsWith(COMPACT_SUMMARY_PREFIX)) continue
     if (text.length <= remaining) {
@@ -2527,18 +3265,137 @@ function recentCompactUserMessages(input: unknown): JsonObject[] {
 }
 
 function responseOutputText(payload: JsonObject): string | undefined {
-  const text = (Array.isArray(payload.output) ? payload.output : [])
-    .flatMap((item) => {
-      const output = objectValue(item)
-      if (output?.type !== 'message' || !Array.isArray(output.content)) return []
-      return output.content
-        .map((part) => objectValue(part))
-        .filter((part) => part?.type === 'output_text' && typeof part.text === 'string')
-        .map((part) => part!.text as string)
+  const outputText = responseOutputArrayText(payload.output)
+  if (outputText) return outputText
+  if (typeof payload.output_text === 'string' && payload.output_text.trim()) return payload.output_text.trim()
+  if (typeof payload.output === 'string' && payload.output.trim()) return payload.output.trim()
+  const nested = objectValue(payload.response)
+  if (nested) {
+    const nestedText = responseOutputText(nested)
+    if (nestedText) return nestedText
+  }
+  const choiceText = (Array.isArray(payload.choices) ? payload.choices : [])
+    .map((value) => objectValue(value))
+    .map((choice) => {
+      const message = objectValue(choice?.message)
+      if (typeof message?.role === 'string' && message.role !== 'assistant') return ''
+      return responseContentText(message?.content) ?? (typeof choice?.text === 'string' ? choice.text.trim() : '')
     })
+    .filter(Boolean)
     .join('\n')
     .trim()
+  return choiceText || undefined
+}
+
+function responseOutputArrayText(value: unknown): string | undefined {
+  if (!Array.isArray(value)) return undefined
+  const text = value.flatMap((item) => {
+    if (typeof item === 'string') return item.trim() ? [item.trim()] : []
+    const output = objectValue(item)
+    if (!output) return []
+    if (output.type === undefined || output.type === 'message') {
+      if (typeof output.role === 'string' && output.role !== 'assistant') return []
+      const content = responseContentText(output.content)
+      if (content) return [content]
+    }
+    return (output.type === undefined || output.type === 'output_text' || output.type === 'text')
+      && typeof output.text === 'string' && output.text.trim()
+      ? [output.text.trim()]
+      : []
+  }).join('\n').trim()
   return text || undefined
+}
+
+function responseContentText(value: unknown): string | undefined {
+  if (typeof value === 'string') return value.trim() || undefined
+  if (!Array.isArray(value)) return undefined
+  const text = value.flatMap((item) => {
+    if (typeof item === 'string') return item.trim() ? [item.trim()] : []
+    const part = objectValue(item)
+    if (!part || (part.type !== 'output_text' && part.type !== 'text')) return []
+    return typeof part.text === 'string' && part.text.trim() ? [part.text.trim()] : []
+  }).join('\n').trim()
+  return text || undefined
+}
+
+function compactFallbackResponseIsIncomplete(payload: JsonObject): boolean {
+  if (payload.status === 'incomplete' || payload.status === 'failed') return true
+  if (objectValue(payload.incomplete_details)) return true
+  if (compactFallbackFinishReasonIsIncomplete(payload.finish_reason)) return true
+  if (Array.isArray(payload.output) && payload.output.some((value) => {
+    const status = objectValue(value)?.status
+    return status === 'incomplete' || status === 'failed'
+  })) return true
+  const nested = objectValue(payload.response)
+  if (nested && compactFallbackResponseIsIncomplete(nested)) return true
+  return (Array.isArray(payload.choices) ? payload.choices : []).some((value) => {
+    const reason = objectValue(value)?.finish_reason
+    return compactFallbackFinishReasonIsIncomplete(reason)
+  })
+}
+
+function compactFallbackFinishReasonIsIncomplete(value: unknown): boolean {
+  if (typeof value !== 'string') return false
+  const reason = value.trim().toLowerCase()
+  return reason === 'length'
+    || reason === 'max_tokens'
+    || reason === 'max_output_tokens'
+    || reason === 'content_filter'
+}
+
+function isChatGptSearchAccessPolicyRejection(statusCode: number, payload: JsonObject | undefined): boolean {
+  if (statusCode !== 401 || !payload) return false
+  const error = objectValue(payload.error) ?? payload
+  return error.type === 'rejected_by_access_enforcement'
+    && error.code === 'no_matching_rule'
+}
+
+function buildChatGptSearchFallbackBody(body: JsonObject, model: string): JsonObject {
+  const command = JSON.stringify({
+    commands: objectValue(body.commands) ?? {},
+    settings: objectValue(body.settings) ?? {}
+  })
+  const instruction: JsonObject = {
+    type: 'message',
+    role: 'user',
+    content: [{
+      type: 'input_text',
+      text: [
+        'Execute this standalone web-search request using the web_search tool.',
+        'Return concise findings with source URLs. Do not explain these instructions.',
+        command
+      ].join('\n')
+    }]
+  }
+  // Search requests can carry Codex's `additional_tools` control item. Passing
+  // that marker through `withChatGptCodexBody` would intentionally strip our
+  // explicit web_search tool, so retain the useful history but remove only the
+  // Responses-lite transport control record.
+  const sourceInput = Array.isArray(body.input)
+    ? body.input.filter((item) => objectValue(item)?.type !== 'additional_tools')
+    : body.input
+  const input = Array.isArray(sourceInput)
+    ? [...sourceInput, instruction]
+    : typeof sourceInput === 'string' && sourceInput.trim()
+      ? [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: sourceInput }] },
+          instruction
+        ]
+      : [instruction]
+  const requestedMax = typeof body.max_output_tokens === 'number' && Number.isFinite(body.max_output_tokens)
+    ? Math.floor(body.max_output_tokens)
+    : 2_500
+  return {
+    model,
+    instructions: 'Complete the requested web operation accurately and preserve useful source URLs.',
+    input,
+    tools: [{ type: 'web_search' }],
+    tool_choice: 'required',
+    max_output_tokens: Math.max(256, Math.min(8_192, requestedMax)),
+    ...(objectValue(body.reasoning) ? { reasoning: body.reasoning } : {}),
+    store: false,
+    stream: true
+  }
 }
 
 function copyResponsesResponseHeaders(source: Headers, target: ServerResponse): void {
@@ -2732,6 +3589,149 @@ async function readUpstreamJson(response: Response, signal?: AbortSignal): Promi
   return { error: { message: 'Upstream returned a non-object JSON response' } }
 }
 
+async function readCompactFallbackResponse(
+  upstream: Response,
+  options: StreamEncodingOptions,
+  signal: AbortSignal | undefined,
+  firstBodyTimeoutMs: number,
+  idleTimeoutMs: number,
+  progressIdleTimeoutMs: number,
+  secrets: readonly string[] = []
+): Promise<JsonObject> {
+  // Compatible relays frequently mislabel a streamed body as JSON (or a
+  // buffered JSON body as text/plain). Probe one duplicated chunk and route by
+  // actual framing; the forwarded branch remains streaming and unbuffered.
+  const inspected = await inspectCompactFallbackResponse(
+    upstream,
+    signal,
+    firstBodyTimeoutMs
+  )
+  upstream = inspected.response
+  if (inspected.kind === 'json') {
+    const payload = await readUpstreamJson(upstream, signal)
+    const failure = compactFallbackFailurePayload(payload)
+    if (failure && isCompactContextOverflow(400, failure)) {
+      throw new CompactFallbackContextOverflowError(
+        redactSensitiveText(upstreamErrorMessage(failure), secrets)
+      )
+    }
+    return payload
+  }
+  const result = await collectOpenAiResponsesUpstream(
+    upstream,
+    options,
+    signal,
+    firstBodyTimeoutMs,
+    idleTimeoutMs,
+    progressIdleTimeoutMs
+  )
+  if (result.error) {
+    const errorPayload: JsonObject = {
+      error: {
+        message: result.error,
+        ...(result.errorCode ? { code: result.errorCode } : {}),
+        ...(result.errorType ? { type: result.errorType } : {})
+      }
+    }
+    if (isCompactContextOverflow(400, errorPayload)) {
+      throw new CompactFallbackContextOverflowError(result.error)
+    }
+    const requestError = compactFallbackIsRequestError(result.errorType, result.errorCode)
+    throw new GatewayHttpError(
+      requestError ? 400 : 502,
+      redactSensitiveText(result.error, secrets),
+      'upstream_compact_error'
+    )
+  }
+  if (!result.response) {
+    throw new GatewayHttpError(
+      502,
+      'Compact fallback stream did not produce a completed response',
+      'upstream_compact_error'
+    )
+  }
+  return result.response
+}
+
+type CompactFallbackBodyKind = 'json' | 'sse'
+
+async function inspectCompactFallbackResponse(
+  upstream: Response,
+  signal: AbortSignal | undefined,
+  firstBodyTimeoutMs: number
+): Promise<{ response: Response, kind: CompactFallbackBodyKind }> {
+  if (!upstream.body) {
+    return { response: upstream, kind: isJsonUpstreamResponse(upstream) ? 'json' : 'sse' }
+  }
+  const [probeBody, forwardBody] = upstream.body.tee()
+  const probeReader = probeBody.getReader()
+  try {
+    const decoder = new TextDecoder()
+    let prefix = ''
+    let inspectedBytes = 0
+    const probeDeadlineAt = Date.now() + firstBodyTimeoutMs
+    let result = await readFirstStreamChunk(probeReader, firstBodyTimeoutMs, signal)
+    for (;;) {
+      if (result.done) {
+        prefix += decoder.decode()
+        break
+      }
+      if (result.value?.byteLength) {
+        inspectedBytes += result.value.byteLength
+        prefix += decoder.decode(result.value, { stream: true })
+      }
+      const significant = prefix.trimStart()
+      if (significant.length > 0 || inspectedBytes >= MAX_STREAM_FRAME_BYTES) break
+      const remainingMs = probeDeadlineAt - Date.now()
+      if (remainingMs <= 0) {
+        throw new GatewayHttpError(
+          504,
+          `Upstream stream produced no valid event within ${firstBodyTimeoutMs} ms`,
+          'upstream_first_body_timeout'
+        )
+      }
+      result = await readIdleStreamChunk(probeReader, remainingMs, signal)
+    }
+    prefix = prefix.trimStart()
+    cancelStreamReader(probeReader)
+    const kind: CompactFallbackBodyKind = prefix.startsWith('{') || prefix.startsWith('[')
+      ? 'json'
+      : /^(?:data|event|id|retry):|^:/.test(prefix)
+        ? 'sse'
+        : isJsonUpstreamResponse(upstream) ? 'json' : 'sse'
+    return {
+      response: new Response(forwardBody, {
+        status: upstream.status,
+        statusText: upstream.statusText,
+        headers: upstream.headers
+      }),
+      kind
+    }
+  } catch (error) {
+    void forwardBody.cancel().catch(() => undefined)
+    throw error
+  }
+}
+
+function compactFallbackFailurePayload(payload: JsonObject): JsonObject | undefined {
+  const directError = objectValue(payload.error)
+  if (directError) return { error: directError }
+  const response = objectValue(payload.response)
+  const responseError = objectValue(response?.error)
+  if (responseError) return { error: responseError }
+  if (payload.status === 'failed' || response?.status === 'failed') return payload
+  return undefined
+}
+
+function compactFallbackIsRequestError(errorType: string | undefined, errorCode: string | undefined): boolean {
+  const description = `${errorType ?? ''} ${errorCode ?? ''}`.toLowerCase()
+  return /invalid[_ -]?request|bad[_ -]?request|unsupported|unknown[_ -]?(?:parameter|model)|model[_ -]?not[_ -]?found/.test(description)
+}
+
+function isJsonUpstreamResponse(response: Response): boolean {
+  return (response.headers.get('content-type')?.toLowerCase() ?? '').includes('json')
+}
+
 async function collectOpenAiResponsesUpstream(
   upstream: Response,
   options: StreamEncodingOptions,
@@ -2741,6 +3741,7 @@ async function collectOpenAiResponsesUpstream(
   progressIdleTimeoutMs: number
 ): Promise<ReturnType<ReturnType<typeof createOpenAiResponsesStreamCollector>['finish']>> {
   const collector = createOpenAiResponsesStreamCollector(options)
+  const frameGuard = new DelimitedStreamFrameGuard(MAX_STREAM_FRAME_BYTES)
   if (!upstream.body) return collector.finish()
   const reader = upstream.body.getReader()
   let reachedEof = false
@@ -2765,6 +3766,7 @@ async function collectOpenAiResponsesUpstream(
         reachedEof = true
         break
       }
+      frameGuard.push(result.value)
       collector.push(result.value)
       if (collector.isComplete()) {
         dispose()
@@ -2836,6 +3838,11 @@ async function collectCodexCompactV2Upstream(
   }
   const reader = upstream.body.getReader()
   const validator = new CodexCompactV2SseValidator()
+  const frameGuard = new DelimitedStreamFrameGuard(
+    MAX_STREAM_FRAME_BYTES,
+    'Remote compaction stream frame exceeds the gateway safety limit',
+    'upstream_compact_error'
+  )
   let totalBytes = 0
   try {
     let result = await readFirstStreamChunk(reader, timing.firstBodyTimeoutMs, timing.signal)
@@ -2857,6 +3864,13 @@ async function collectCodexCompactV2Upstream(
         // must not make the outcome depend on packet boundaries.
         const inspected = value.subarray(0, Math.min(value.byteLength, remainingBytes + 1))
         validator.push(inspected)
+        const guardedBytes = validator.isTerminal()
+          ? inspected.subarray(0, Math.max(0, Math.min(
+              inspected.byteLength,
+              validator.terminalWireByteLength() - totalBytes
+            )))
+          : inspected
+        frameGuard.push(guardedBytes)
         const nextProgressEventCount = validator.getProgressEventCount()
         if (nextProgressEventCount > progressEventCount) {
           progressEventCount = nextProgressEventCount
@@ -3059,12 +4073,15 @@ class CodexCompactV2SseValidator {
     }
     if (type === 'response.output_item.done') {
       const item = objectValue(payload.item)
-      if (item?.type === 'compaction') {
-        if (typeof item.id !== 'string' || !item.id.trim()) {
-          this.failure ??= 'Remote compaction item is missing an item id'
-          return
-        }
-        if (typeof item.encrypted_content !== 'string' || !item.encrypted_content.trim()) {
+      if (item?.type === 'compaction' || item?.type === 'compaction_summary') {
+        // Codex models this id as optional and accepts the historical
+        // `compaction_summary` alias. Relays commonly omit the id while still
+        // returning a valid encrypted replacement item.
+        if (
+          (item.id !== undefined && item.id !== null && typeof item.id !== 'string')
+          || typeof item.encrypted_content !== 'string'
+          || !item.encrypted_content.trim()
+        ) {
           this.failure ??= 'Remote compaction item is missing encrypted_content'
           return
         }
@@ -3079,7 +4096,7 @@ class CodexCompactV2SseValidator {
       return
     }
     if (response.status !== 'completed') {
-      this.failure ??= 'Remote compaction response.completed has a non-completed status'
+      this.failure ??= 'Remote compaction response.completed has an invalid response status'
       return
     }
     if (this.completedResponse) {
@@ -3139,6 +4156,7 @@ async function fetchWithOptionalHedge(
   fetchImplementation: typeof fetch,
   input: Parameters<typeof fetch>[0],
   init: RequestInit,
+  protocol: Protocol,
   hedgeDelayMs?: number,
   firstBodyTimeoutMs?: number,
   now: () => number = Date.now,
@@ -3165,12 +4183,12 @@ async function fetchWithOptionalHedge(
     const headersAt = now()
     onHeaders?.(headersAt)
     successfulHeaders[source] = response.ok
-    // A successful streaming fetch resolves as soon as headers arrive. Peek the
-    // first non-empty body chunk so a fast header followed by a stalled body
-    // cannot defeat the hedge. The chunk is put back without decoding it.
+    // A successful streaming fetch resolves as soon as headers arrive. Wait for
+    // a real canonical event, rather than any non-empty transport byte, so an
+    // SSE comment/partial frame cannot cancel a useful competing lane.
     return {
       response: response.ok
-        ? await responseWithPrefetchedFirstBody(response, firstBodyTimeoutMs, signal)
+        ? await responseWithPrefetchedCanonicalEvent(response, protocol, firstBodyTimeoutMs, signal)
         : response,
       headersAt
     }
@@ -3233,8 +4251,9 @@ async function fetchWithOptionalHedge(
   return winner.result
 }
 
-async function responseWithPrefetchedFirstBody(
+async function responseWithPrefetchedCanonicalEvent(
   response: Response,
+  protocol: Protocol,
   timeoutMs = MAX_FIRST_BODY_TIMEOUT_MS,
   signal?: AbortSignal | null
 ): Promise<Response> {
@@ -3246,14 +4265,47 @@ async function responseWithPrefetchedFirstBody(
     )
   }
   const reader = response.body.getReader()
-  let first: ReadableStreamReadResult<Uint8Array>
+  const parser = createCanonicalStreamParser(protocol)
+  const prefetched: Uint8Array[] = []
+  const frameGuard = new ProtocolStreamFrameGuard(protocol, MAX_STREAM_FRAME_BYTES)
+  let prefetchedBytes = 0
+  let reachedEof = false
+  const canonicalDeadlineAt = Date.now() + timeoutMs
   try {
-    first = await readFirstStreamChunk(reader, timeoutMs, signal ?? undefined)
+    for (;;) {
+      const remainingMs = canonicalDeadlineAt - Date.now()
+      if (remainingMs <= 0) {
+        throw new GatewayHttpError(
+          504,
+          `Upstream stream produced no valid event within ${timeoutMs} ms`,
+          'upstream_first_body_timeout'
+        )
+      }
+      const next = await readFirstStreamChunk(reader, remainingMs, signal ?? undefined)
+      if (next.done) {
+        reachedEof = true
+        parser.finish()
+        break
+      }
+      if (!next.value?.byteLength) continue
+      frameGuard.push(next.value)
+      prefetchedBytes += next.value.byteLength
+      if (prefetchedBytes > MAX_STREAM_FRAME_BYTES) {
+        throw new GatewayHttpError(
+          502,
+          'Upstream stream produced too much data before its first valid event',
+          'upstream_stream_error'
+        )
+      }
+      prefetched.push(next.value)
+      parser.push(next.value)
+      if (parser.getRecognizedEventCount() > 0) break
+    }
   } catch (error) {
     cancelStreamReader(reader)
     throw error
   }
-  if (first.done) {
+  if (parser.getRecognizedEventCount() === 0) {
     try {
       reader.releaseLock()
     } catch {
@@ -3265,13 +4317,17 @@ async function responseWithPrefetchedFirstBody(
       'upstream_stream_error'
     )
   }
-  let firstPending = true
+  let prefetchedIndex = 0
   const body = new ReadableStream<Uint8Array>({
     async pull(controller) {
       try {
-        if (firstPending) {
-          firstPending = false
-          controller.enqueue(first.value!)
+        if (prefetchedIndex < prefetched.length) {
+          controller.enqueue(prefetched[prefetchedIndex++])
+          return
+        }
+        if (reachedEof) {
+          reader.releaseLock()
+          controller.close()
           return
         }
         const next = await reader.read()
@@ -3422,6 +4478,8 @@ async function pipeUpstreamResponse(
   let responseHeadersCommitted = false
   const pendingPrecommitChunks: Uint8Array[] = []
   let pendingPrecommitBytes = 0
+  let pendingPrecommitWireBytes = 0
+  const frameGuard = new ProtocolStreamFrameGuard(protocol, MAX_STREAM_FRAME_BYTES)
   const diagnostics: StreamTerminationDiagnostics = {}
   const pendingToolCalls = new Set<number>()
   const logicalCompletionObserved = (): boolean => (
@@ -3540,6 +4598,11 @@ async function pipeUpstreamResponse(
     }
     const consume = async (value: Uint8Array): Promise<boolean> => {
       timing.onChunk?.(value.byteLength)
+      // Validate framing before handing bytes to the canonical parser. This
+      // bounds an unfinished `data:` line/frame even when the secret redactor
+      // withholds output and pendingPrecommitBytes therefore stays small.
+      frameGuard.push(value)
+      if (!responseHeadersCommitted) pendingPrecommitWireBytes += value.byteLength
       if (protocol === 'openai-responses' && value.byteLength > 0) {
         responsesTransportActivityWithoutProgress = true
       }
@@ -3552,7 +4615,9 @@ async function pipeUpstreamResponse(
           pendingPrecommitChunks.push(chunk)
           pendingPrecommitBytes += chunk.byteLength
         }
-        if (pendingPrecommitBytes > MAX_COMPACT_V2_STREAM_BYTES) {
+        if (pendingPrecommitBytes > MAX_COMPACT_V2_STREAM_BYTES
+          || (parser.getRecognizedEventCount() === 0
+            && pendingPrecommitWireBytes > MAX_COMPACT_V2_STREAM_BYTES)) {
           throw new GatewayHttpError(
             502,
             'Upstream stream produced too much data before its first valid event',
@@ -3796,8 +4861,21 @@ async function pipeConvertedUpstreamResponse(
   let responseHeadersCommitted = false
   const pendingPrecommitChunks: Uint8Array[] = []
   let pendingPrecommitBytes = 0
+  const frameGuard = new ProtocolStreamFrameGuard(from, MAX_STREAM_FRAME_BYTES)
   const diagnostics: StreamTerminationDiagnostics = {}
   const pendingToolCalls = new Set<number>()
+  const syncEncoderFailure = (): void => {
+    const failure = encoder.getFailure()
+    if (!failure) return
+    const message = redactSensitiveText(failure.message, secrets)
+    streamError ??= message
+    streamFailure ??= new GatewayHttpError(
+      502,
+      message,
+      failure.errorType ?? 'upstream_stream_error'
+    )
+    diagnostics.streamEndReason = 'explicit-error'
+  }
   const logicalCompletionObserved = (): boolean => (
     terminalObserved
     || stopObserved
@@ -3890,6 +4968,7 @@ async function pipeConvertedUpstreamResponse(
       encoded.push(...encoder.encode(safeEvent))
     }
     syncResponsesState()
+    syncEncoderFailure()
     if (!responseHeadersCommitted) {
       for (const chunk of encoded) {
         pendingPrecommitChunks.push(chunk)
@@ -3924,6 +5003,7 @@ async function pipeConvertedUpstreamResponse(
     }
     timing.onChunk?.(first.value.byteLength)
     if (from === 'openai-responses') responsesTransportActivityWithoutProgress = true
+    frameGuard.push(first.value)
     if (!await forward(parser.push(first.value))) {
       cancelStreamReader(reader)
       diagnostics.streamEndReason = 'client-closed'
@@ -4022,6 +5102,7 @@ async function pipeConvertedUpstreamResponse(
         if (from === 'openai-responses' && value.byteLength > 0) {
           responsesTransportActivityWithoutProgress = true
         }
+        frameGuard.push(value)
         if (!await forward(parser.push(value))) {
           cancelStreamReader(reader)
           diagnostics.streamEndReason = 'client-closed'
@@ -4047,7 +5128,7 @@ async function pipeConvertedUpstreamResponse(
     }
     if (streamError && !protocolCompletionObserved()) {
       diagnostics.streamEndReason ??= 'explicit-error'
-      streamFailure = new GatewayHttpError(502, streamError, 'upstream_stream_error')
+      streamFailure ??= new GatewayHttpError(502, streamError, 'upstream_stream_error')
     } else if (!protocolCompletionObserved()) {
       const finishEvents = parser.finish()
       for (const event of finishEvents) {
@@ -4074,7 +5155,9 @@ async function pipeConvertedUpstreamResponse(
         'upstream_stream_error'
       )
     }
-    if (!await writeStreamChunks(response, encoder.finish(), timing.onClientWrite)) {
+    const finishChunks = encoder.finish()
+    syncEncoderFailure()
+    if (!await writeStreamChunks(response, finishChunks, timing.onClientWrite)) {
       diagnostics.streamEndReason = 'client-closed'
       return streamPipeResult(protocolCompletionObserved(), usage, streamError, undefined, diagnostics)
     }
@@ -4105,7 +5188,9 @@ async function pipeConvertedUpstreamResponse(
       { type: 'error', message: streamError, errorType: streamFailure?.type ?? 'upstream_stream_error' },
       { type: 'done' }
     ])
-    await writeStreamChunks(response, encoder.finish(), timing.onClientWrite)
+    const finishChunks = encoder.finish()
+    syncEncoderFailure()
+    await writeStreamChunks(response, finishChunks, timing.onClientWrite)
   } finally {
     if (terminalWaitStartedAt !== undefined && diagnostics.terminalWaitMs === undefined) {
       diagnostics.terminalWaitMs = Math.max(0, Date.now() - terminalWaitStartedAt)
@@ -4240,6 +5325,211 @@ async function readIdleStreamChunk(
   } finally {
     if (timer) clearTimeout(timer)
   }
+}
+
+class ProtocolStreamFrameGuard {
+  private framing: 'sse' | 'json' | undefined
+  private readonly pending: Uint8Array[] = []
+  private pendingBytes = 0
+  private readonly sse: DelimitedStreamFrameGuard
+  private readonly json: JsonStreamFrameGuard
+
+  constructor(
+    protocol: Protocol,
+    private readonly maxFrameBytes: number,
+    private readonly message = 'Upstream stream frame exceeds the parser safety limit',
+    private readonly errorType = 'upstream_stream_error'
+  ) {
+    this.framing = protocol === 'gemini' ? undefined : 'sse'
+    this.sse = new DelimitedStreamFrameGuard(maxFrameBytes, message, errorType)
+    this.json = new JsonStreamFrameGuard(maxFrameBytes, message, errorType)
+  }
+
+  push(chunk: Uint8Array): void {
+    if (this.framing === 'sse') {
+      this.sse.push(chunk)
+      return
+    }
+    if (this.framing === 'json') {
+      this.json.push(chunk)
+      return
+    }
+    this.pending.push(chunk)
+    this.pendingBytes += chunk.byteLength
+    for (const byte of chunk) {
+      if (isJsonPrefixByte(byte)) continue
+      this.framing = byte === 0x7b || byte === 0x5b ? 'json' : 'sse'
+      const target = this.framing === 'json' ? this.json : this.sse
+      for (const pending of this.pending) target.push(pending)
+      this.pending.length = 0
+      this.pendingBytes = 0
+      return
+    }
+    if (this.pendingBytes > this.maxFrameBytes) {
+      throw new GatewayHttpError(502, this.message, this.errorType)
+    }
+  }
+}
+
+class JsonStreamFrameGuard {
+  private root: 'single' | 'array' | undefined
+  private rootComplete = false
+  private valueKind: 'container' | 'string' | 'scalar' | undefined
+  private valueBytes = 0
+  private interstitialBytes = 0
+  private depth = 0
+  private inString = false
+  private escaped = false
+
+  constructor(
+    private readonly maxFrameBytes: number,
+    private readonly message: string,
+    private readonly errorType: string
+  ) {}
+
+  push(chunk: Uint8Array): void {
+    for (const byte of chunk) this.pushByte(byte)
+  }
+
+  private pushByte(byte: number): void {
+    if (this.rootComplete) {
+      if (!isAsciiWhitespaceByte(byte) && ++this.interstitialBytes > this.maxFrameBytes) this.fail()
+      return
+    }
+    if (!this.root) {
+      if (isJsonPrefixByte(byte)) {
+        if (++this.interstitialBytes > this.maxFrameBytes) this.fail()
+        return
+      }
+      this.interstitialBytes = 0
+      this.root = byte === 0x5b ? 'array' : 'single'
+      if (this.root === 'array') return
+      this.startValue(byte)
+      return
+    }
+    if (this.root === 'array' && !this.valueKind) {
+      if (isAsciiWhitespaceByte(byte) || byte === 0x2c) {
+        if (++this.interstitialBytes > this.maxFrameBytes) this.fail()
+        return
+      }
+      if (byte === 0x5d) {
+        this.rootComplete = true
+        return
+      }
+      this.interstitialBytes = 0
+      this.startValue(byte)
+      return
+    }
+    if (!this.valueKind) return
+
+    // A scalar ends before its comma/array terminator. Account for its final
+    // delimiter, reset the protected value, then consume the delimiter as
+    // array syntax rather than as the start of another frame.
+    if (this.valueKind === 'scalar' && (
+      isAsciiWhitespaceByte(byte) || byte === 0x2c || (this.root === 'array' && byte === 0x5d)
+    )) {
+      this.finishValue()
+      if (byte === 0x5d && this.root === 'array') this.rootComplete = true
+      return
+    }
+
+    this.valueBytes += 1
+    if (this.valueBytes > this.maxFrameBytes) this.fail()
+    if (this.valueKind === 'string') {
+      if (this.escaped) this.escaped = false
+      else if (byte === 0x5c) this.escaped = true
+      else if (byte === 0x22) this.finishValue()
+      return
+    }
+    if (this.valueKind !== 'container') return
+    if (this.inString) {
+      if (this.escaped) this.escaped = false
+      else if (byte === 0x5c) this.escaped = true
+      else if (byte === 0x22) this.inString = false
+      return
+    }
+    if (byte === 0x22) this.inString = true
+    else if (byte === 0x7b || byte === 0x5b) this.depth += 1
+    else if (byte === 0x7d || byte === 0x5d) {
+      this.depth -= 1
+      if (this.depth === 0) this.finishValue()
+    }
+  }
+
+  private startValue(byte: number): void {
+    this.valueBytes = 1
+    if (byte === 0x7b || byte === 0x5b) {
+      this.valueKind = 'container'
+      this.depth = 1
+      this.inString = false
+      this.escaped = false
+    } else if (byte === 0x22) {
+      this.valueKind = 'string'
+      this.escaped = false
+    } else {
+      this.valueKind = 'scalar'
+    }
+  }
+
+  private finishValue(): void {
+    this.valueKind = undefined
+    this.valueBytes = 0
+    this.depth = 0
+    this.inString = false
+    this.escaped = false
+    this.interstitialBytes = 0
+    if (this.root === 'single') this.rootComplete = true
+  }
+
+  private fail(): never {
+    throw new GatewayHttpError(502, this.message, this.errorType)
+  }
+}
+
+class DelimitedStreamFrameGuard {
+  private frameBytes = 0
+  private previous = -1
+  private beforePrevious = -1
+  private thirdPrevious = -1
+
+  constructor(
+    private readonly maxFrameBytes: number,
+    private readonly message = 'Upstream stream frame exceeds the parser safety limit',
+    private readonly errorType = 'upstream_stream_error'
+  ) {}
+
+  push(chunk: Uint8Array): void {
+    for (const byte of chunk) {
+      this.frameBytes += 1
+      const lfDelimiter = this.previous === 0x0a && byte === 0x0a
+      const crlfDelimiter = this.thirdPrevious === 0x0d
+        && this.beforePrevious === 0x0a
+        && this.previous === 0x0d
+        && byte === 0x0a
+      if (lfDelimiter || crlfDelimiter) this.frameBytes = 0
+      else if (this.frameBytes > this.maxFrameBytes) {
+        throw new GatewayHttpError(
+          502,
+          this.message,
+          this.errorType
+        )
+      }
+      this.thirdPrevious = this.beforePrevious
+      this.beforePrevious = this.previous
+      this.previous = byte
+    }
+  }
+}
+
+function isAsciiWhitespaceByte(byte: number): boolean {
+  return byte === 0x20 || byte === 0x09 || byte === 0x0a || byte === 0x0d
+}
+
+function isJsonPrefixByte(byte: number): boolean {
+  // UTF-8 BOM bytes are accepted only while choosing Gemini framing. The JSON
+  // parser performs the authoritative syntax validation after this raw-byte
+  // guard has bounded the uncommitted value.
+  return isAsciiWhitespaceByte(byte) || byte === 0xef || byte === 0xbb || byte === 0xbf
 }
 
 function cancelStreamReader(reader: ReadableStreamDefaultReader<Uint8Array>): void {
@@ -4557,11 +5847,20 @@ function gatewayErrorFromProviderFailure(failure: ProviderFailure): GatewayHttpE
   return new GatewayHttpError(statusCode, failure.message, `provider_${failure.category}`, undefined, failure)
 }
 
+function gatewayErrorFromResponsesFailure(failure: ResponsesResponseFailedError): GatewayHttpError {
+  const type = failure.requestLevel ? 'invalid_request_error' : 'upstream_response_failed'
+  const statusCode = failure.requestLevel ? 400 : 502
+  const error: JsonObject = { message: failure.message, type }
+  if (failure.code) error.code = failure.code
+  return new GatewayHttpError(statusCode, failure.message, type, { error })
+}
+
 function normalizeError(error: unknown): GatewayHttpError {
   if (error instanceof GatewayHttpError) return error
   if (error instanceof ModelNotExposedError) return new GatewayHttpError(404, error.message, 'model_not_found')
   if (error instanceof NoEligibleAccountError) return new GatewayHttpError(503, error.message, 'account_unavailable')
   if (error instanceof UnsupportedProtocolConversionError) return new GatewayHttpError(400, error.message, 'unsupported_conversion')
+  if (error instanceof ResponsesResponseFailedError) return gatewayErrorFromResponsesFailure(error)
   if (error instanceof Error && error.name === 'TimeoutError') return new GatewayHttpError(504, 'Upstream request timed out', 'timeout_error')
   return new GatewayHttpError(502, error instanceof Error ? error.message : 'Gateway request failed', 'gateway_error')
 }

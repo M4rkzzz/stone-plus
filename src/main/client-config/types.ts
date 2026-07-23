@@ -89,6 +89,12 @@ export interface BackupRecord {
   targetPath: string
   backupPath: string
   /**
+   * Whether the managed file existed when this snapshot was captured.
+   * New snapshots use an explicit tombstone when it did not; legacy backup
+   * files are interpreted as existing for backward compatibility.
+   */
+  existed: boolean
+  /**
    * Stable identifier shared by every file captured by one backup operation.
    *
    * Older backups did not persist a manifest.  Their group id is derived from
@@ -161,7 +167,10 @@ export interface RestoreBackupSetResult {
   client: SupportedClient
   groupId: string
   createdAt: number
+  /** Paths populated from value snapshots. */
   restoredFiles: string[]
+  /** Previously existing paths removed because the selected snapshot records that they did not exist. */
+  deletedFiles: string[]
   sourceBackups: BackupRecord[]
   safetyBackupSet?: ClientConfigBackupSet
 }

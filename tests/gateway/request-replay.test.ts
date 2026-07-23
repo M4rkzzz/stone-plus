@@ -2,6 +2,51 @@ import { describe, expect, it, vi } from 'vitest'
 import { RequestReplayStore } from '../../src/main/gateway/request-replay'
 
 describe('RequestReplayStore', () => {
+  it('rejects a known oversized wire payload before traversing or serializing it', () => {
+    const store = new RequestReplayStore({ maxPayloadBytes: 1_024 })
+    const body = Object.defineProperty({}, 'input', {
+      enumerable: true,
+      get() { throw new Error('oversized payload must not be inspected') }
+    }) as Record<string, unknown>
+
+    expect(store.capture({
+      id: 'oversized-wire',
+      path: '/v1/responses',
+      routeId: 'route',
+      body,
+      sourceByteLength: 2_048
+    })).toBe(false)
+    expect(store.get('oversized-wire')).toBeUndefined()
+  })
+
+  it('preflights direct captures before creating an oversized JSON string', () => {
+    const store = new RequestReplayStore({ maxPayloadBytes: 1_024 })
+    expect(store.capture({
+      id: 'oversized-object',
+      path: '/v1/responses',
+      routeId: 'route',
+      body: { model: 'gpt-5', input: 'x'.repeat(2_048) }
+    })).toBe(false)
+    expect(store.get('oversized-object')).toBeUndefined()
+  })
+
+  it('accepts a small valid JSON body deeper than the former 512-level preflight cap', () => {
+    const store = new RequestReplayStore()
+    const body: Record<string, unknown> = { model: 'gpt-5' }
+    let cursor = body
+    for (let depth = 0; depth < 600; depth += 1) {
+      const child: Record<string, unknown> = {}
+      cursor.child = child
+      cursor = child
+    }
+
+    expect(Buffer.byteLength(JSON.stringify(body))).toBeLessThan(16 * 1024)
+    expect(store.capture({
+      id: 'deep-valid-json', path: '/v1/responses', routeId: 'route', body
+    })).toBe(true)
+    expect(store.get('deep-valid-json')).toBeDefined()
+  })
+
   it('keeps raw payload memory-only while exporting a redacted diagnostic shape', () => {
     const store = new RequestReplayStore({ now: () => 100, ttlMs: 10_000 })
     expect(store.capture({
@@ -61,7 +106,8 @@ describe('RequestReplayStore', () => {
     const fetchImplementation = vi.fn(async () => new Response(new ReadableStream<Uint8Array>({
       start(controller) {
         controller.enqueue(new TextEncoder().encode(wire))
-        controller.close()
+        // A terminal protocol event is sufficient; a broken upstream may keep
+        // the HTTP body open forever after it.
       },
       cancel() { cancelled = true }
     }), { status: 200, headers: { 'content-type': 'text/event-stream' } })) as unknown as typeof fetch
@@ -72,7 +118,7 @@ describe('RequestReplayStore', () => {
     })
     expect(result.ok).toBe(true)
     expect(Buffer.byteLength(result.responsePreview)).toBeLessThanOrEqual(16 * 1024)
-    expect(cancelled).toBe(false)
+    expect(cancelled).toBe(true)
   })
 
   it.each([

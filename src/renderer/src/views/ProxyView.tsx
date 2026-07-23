@@ -22,7 +22,15 @@ export function ProxyView({
       <PageHeader
         title={t('代理', 'Proxies')}
       />
-      <BuiltInProxyView api={api} initialState={snapshot.builtInProxyRuntimeState}>
+      <BuiltInProxyView
+        api={api}
+        initialState={snapshot.builtInProxyRuntimeState}
+        externalContext={{
+          outboundMode: snapshot.gateway.outboundNetworkMode ?? 'direct',
+          accountBindingCount: snapshot.accounts.filter((account) => Boolean(account.proxyId)).length,
+          poolBindingCount: snapshot.pools.filter((pool) => Boolean(pool.proxyId)).length,
+        }}
+      >
         <ProxyManager snapshot={snapshot} api={api} runAction={runAction} busyKeys={busyKeys} />
       </BuiltInProxyView>
     </div>

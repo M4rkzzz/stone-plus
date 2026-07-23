@@ -57,6 +57,75 @@ describe('static route preview', () => {
     expect(result.issues).toContainEqual(expect.objectContaining({ code: 'capability-unknown' }))
   })
 
+  it('does not warn for unknown siblings when a verified member can serve the capability', () => {
+    const mixed = {
+      ...snapshot,
+      providers: [
+        {
+          ...snapshot.providers[0],
+          capabilityProfile: { ...snapshot.providers[0].capabilityProfile, webSearch: true },
+        },
+        { ...snapshot.providers[0], id: 'legacy-provider', capabilityProfile: undefined },
+      ],
+      accounts: [
+        snapshot.accounts[0],
+        { ...snapshot.accounts[0], id: 'legacy-account', providerId: 'legacy-provider' },
+      ],
+      pools: [{
+        id: 'mixed-pool', name: 'Mixed', kind: 'standard', protocol: 'openai-responses', strategy: 'balanced',
+        members: [{ accountId: 'account', enabled: true }, { accountId: 'legacy-account', enabled: true }],
+        modelPolicy: 'all', modelAllowlist: [], stickySessions: false, stickyTtlMinutes: 30, maxRetries: 0,
+        createdAt: 1, updatedAt: 1,
+      }],
+    } as unknown as Pick<AppSnapshot, 'providers' | 'accounts' | 'pools'>
+
+    const result = previewRoute({
+      route: { ...route, poolId: 'mixed-pool' },
+      requiredCapabilities: ['webSearch'],
+    }, mixed)
+    expect(result.status).toBe('ready')
+    expect(result.eligibleAccountCount).toBe(1)
+    expect(result.issues).not.toContainEqual(expect.objectContaining({ code: 'capability-unknown' }))
+  })
+
+  it('does not count an orphaned account as an eligible route source member', () => {
+    const orphaned = {
+      ...snapshot,
+      accounts: snapshot.accounts.map((account) => ({ ...account, providerId: 'missing-provider' })),
+    } as Pick<AppSnapshot, 'providers' | 'accounts' | 'pools'>
+    const result = previewRoute({ route, requestedModel: 'alias' }, orphaned)
+    expect(result.status).toBe('blocked')
+    expect(result.eligibleAccountCount).toBe(0)
+  })
+
+  it('blocks a persisted pool whose enabled active member has no provider metadata', () => {
+    const orphanedPool = {
+      providers: snapshot.providers,
+      accounts: [{
+        ...snapshot.accounts[0],
+        id: 'orphan-account',
+        providerId: 'missing-provider',
+        status: 'active' as const,
+      }],
+      pools: [{
+        id: 'persisted-orphan-pool', name: 'Orphan pool', kind: 'standard' as const,
+        protocol: 'openai-responses' as const, strategy: 'priority' as const,
+        members: [{ accountId: 'orphan-account', enabled: true }],
+        modelPolicy: 'all' as const, modelAllowlist: [], stickySessions: false,
+        stickyTtlMinutes: 30, maxRetries: 0, createdAt: 1, updatedAt: 1,
+      }],
+    } as unknown as Pick<AppSnapshot, 'providers' | 'accounts' | 'pools'>
+
+    const result = previewRoute({
+      route: { ...route, poolId: 'persisted-orphan-pool' },
+    }, orphanedPool)
+
+    expect(result.status).toBe('blocked')
+    expect(result.eligibleAccountCount).toBe(0)
+    expect(result.issues).toContainEqual(expect.objectContaining({ code: 'source-unavailable' }))
+    expect(result.issues).not.toContainEqual(expect.objectContaining({ code: 'source-missing' }))
+  })
+
   it('does not borrow a capability from an account that cannot serve the model', () => {
     const mixed = {
       providers: [

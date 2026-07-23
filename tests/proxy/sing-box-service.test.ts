@@ -166,25 +166,92 @@ describe('SingBoxService', () => {
     expect(harness.spawnProcess).toHaveBeenCalledTimes(2)
     expect(harness.reservePort).toHaveBeenNthCalledWith(1, 20_871, '127.0.0.1')
     expect(harness.reservePort).toHaveBeenNthCalledWith(2, 20_872, '127.0.0.1')
-    expect(harness.reservePort).toHaveBeenNthCalledWith(3, 20_871, '0.0.0.0')
-    expect(harness.reservePort).toHaveBeenNthCalledWith(4, 20_872, '127.0.0.1')
-    const written = JSON.parse(await readFile(join(directory, 'built-in-proxy', 'sing-box.runtime.json'), 'utf8'))
+    expect(harness.reservePort).toHaveBeenNthCalledWith(3, 0, '0.0.0.0')
+    expect(harness.reservePort).toHaveBeenNthCalledWith(4, 0, '127.0.0.1')
+    expect(harness.terminateProcess).not.toHaveBeenCalled()
+    const checkCalls = harness.execute.mock.calls.filter((call) => call[1][0] === 'check')
+    const replacementConfigPath = checkCalls[1][1][2] as string
+    const written = JSON.parse(await readFile(replacementConfigPath, 'utf8'))
     expect(written.inbounds).toEqual([expect.objectContaining({
       type: 'mixed',
       listen: '0.0.0.0',
-      listen_port: 20_871
+      listen_port: 20_903
     })])
     expect(written.experimental.clash_api).toEqual({
-      external_controller: '127.0.0.1:20872',
+      external_controller: '127.0.0.1:20904',
       secret: 's'.repeat(43)
     })
     expect(harness.service.getState()).toMatchObject({
       status: 'ready',
-      mixedEndpoint: 'http://127.0.0.1:20871',
-      controllerPort: 20_872,
+      mixedEndpoint: 'http://127.0.0.1:20903',
+      controllerPort: 20_904,
       generation: 2
     })
     expect(harness.fetchImplementation.mock.calls.every((call) => String(call[0]).startsWith('http://127.0.0.1:'))).toBe(true)
+    harness.service.retainGeneration(1)
+    harness.service.retainGeneration(2)
+    await harness.service.disposeGeneration(1)
+    expect(harness.terminateProcess).toHaveBeenCalledTimes(1)
+    expect(harness.terminateProcess).toHaveBeenCalledWith(harness.children[0], 'win32')
+    expect(harness.service.getState()).toMatchObject({ status: 'ready', generation: 2, pid: 4_243 })
+    await harness.service.close()
+    expect(harness.terminateProcess).toHaveBeenCalledTimes(2)
+  })
+
+  it('does not publish ready after the active process generation is explicitly disposed', async () => {
+    const directory = await temporaryDirectory()
+    const harness = createHarness(directory)
+    await harness.service.start({ config: {}, mixedPort: 20_875, controllerPort: 20_876 })
+    harness.service.retainGeneration(1)
+
+    await harness.service.disposeGeneration(1, { force: true })
+
+    expect(harness.children[0].exitCode).toBe(0)
+    expect(harness.service.getState()).toMatchObject({
+      desiredEnabled: true,
+      status: 'idle',
+      pid: undefined,
+      mixedPort: undefined,
+      mixedEndpoint: undefined,
+      controllerPort: undefined,
+    })
+    await harness.service.close()
+  })
+
+  it('re-promotes a retained route generation after a candidate is rolled back', async () => {
+    const directory = await temporaryDirectory()
+    const harness = createHarness(directory)
+    const first = await harness.service.start({ config: { route: 'first' }, mixedPort: 20_877, controllerPort: 20_878 })
+    harness.service.retainGeneration(first.generation)
+    const second = await harness.service.start({ config: { route: 'second' }, mixedPort: first.mixedPort, controllerPort: 20_878 })
+    harness.service.retainGeneration(second.generation)
+
+    await harness.service.restoreGeneration(first.generation)
+    await harness.service.disposeGeneration(second.generation, { force: true })
+
+    expect(harness.service.getState()).toMatchObject({
+      status: 'ready',
+      generation: first.generation,
+      mixedPort: first.mixedPort,
+      controllerPort: first.controllerPort,
+    })
+    expect(harness.terminateProcess).toHaveBeenCalledWith(harness.children[1], 'win32')
+    await harness.service.close()
+  })
+
+  it('reports a retained route-owner exit even while a candidate is childContext', async () => {
+    const directory = await temporaryDirectory()
+    const harness = createHarness(directory)
+    const crashes: Array<Extract<SingBoxRuntimeEvent, { type: 'crash' }>> = []
+    harness.service.onEvent((event) => { if (event.type === 'crash') crashes.push(event) })
+    const first = await harness.service.start({ config: { route: 'first' }, mixedPort: 20_879, controllerPort: 20_880 })
+    harness.service.retainGeneration(first.generation)
+    const second = await harness.service.start({ config: { route: 'second' }, mixedPort: first.mixedPort, controllerPort: 20_880 })
+
+    harness.children[0].finish(9, null)
+
+    expect(crashes).toContainEqual(expect.objectContaining({ generation: first.generation }))
+    expect(harness.service.getState()).toMatchObject({ status: 'ready', generation: second.generation })
     await harness.service.close()
   })
 
@@ -232,10 +299,199 @@ describe('SingBoxService', () => {
     })
 
     await expect(harness.service.start({ config: {}, mixedPort: 20_831, controllerPort: 20_832 }))
-      .rejects.toMatchObject({ code: 'health_check' })
+      .rejects.toMatchObject({
+        code: 'health_check',
+        message: expect.stringContaining('authenticated loopback controller')
+      })
     expect(harness.terminateProcess).toHaveBeenCalledTimes(1)
     expect(harness.service.getState()).toMatchObject({ status: 'error', error: { code: 'health_check' } })
+    expect(JSON.stringify(harness.service.getState())).not.toContain('controller refused connection')
     expect(harness.service.getState().generation).toBe(0)
+  })
+
+  it('reports a mixed-listener failure separately after authenticating the controller', async () => {
+    const directory = await temporaryDirectory()
+    const harness = createHarness(directory, {
+      probeTcp: vi.fn(async () => { throw new Error('mixed listener refused connection') }),
+      healthTimeoutMs: 3,
+      healthIntervalMs: 1,
+      sleep: vi.fn(async () => undefined)
+    })
+
+    await expect(harness.service.start({ config: {}, mixedPort: 20_833, controllerPort: 20_834 }))
+      .rejects.toMatchObject({
+        code: 'health_check',
+        message: expect.stringContaining('mixed loopback listener')
+      })
+    expect(harness.fetchImplementation).toHaveBeenCalled()
+    expect(harness.probeTcp).toHaveBeenCalled()
+    expect(harness.terminateProcess).toHaveBeenCalledTimes(1)
+    expect(JSON.stringify(harness.service.getState())).not.toContain('mixed listener refused connection')
+  })
+
+  it('rejects a wrong controller version before touching the mixed listener', async () => {
+    const directory = await temporaryDirectory()
+    const harness = createHarness(directory, {
+      fetchImplementation: vi.fn(async () => jsonResponse({ version: 'sing-box 1.13.13' })) as unknown as typeof fetch
+    })
+
+    await expect(harness.service.start({ config: {}, mixedPort: 20_837, controllerPort: 20_838 }))
+      .rejects.toMatchObject({
+        code: 'health_check',
+        message: expect.stringContaining('version does not match')
+      })
+    expect(harness.fetchImplementation).toHaveBeenCalledTimes(1)
+    expect(harness.probeTcp).not.toHaveBeenCalled()
+  })
+
+  it('rejects a controller authentication response without probing an unknown mixed service', async () => {
+    const directory = await temporaryDirectory()
+    const harness = createHarness(directory, {
+      fetchImplementation: vi.fn(async () => new Response(null, { status: 401 })) as unknown as typeof fetch
+    })
+
+    await expect(harness.service.start({ config: {}, mixedPort: 20_839, controllerPort: 20_840 }))
+      .rejects.toMatchObject({
+        code: 'health_check',
+        message: expect.stringContaining('rejected the authenticated startup health check')
+      })
+    expect(harness.fetchImplementation).toHaveBeenCalledTimes(1)
+    expect(harness.probeTcp).not.toHaveBeenCalled()
+  })
+
+  it('does not publish ready when the controller response arrives exactly at the deadline', async () => {
+    const directory = await temporaryDirectory()
+    let clock = 0
+    const now = vi.spyOn(Date, 'now').mockImplementation(() => clock)
+    const harness = createHarness(directory, {
+      fetchImplementation: vi.fn(async () => {
+        clock = 100
+        return jsonResponse({ version: `sing-box ${SING_BOX_VERSION}` })
+      }) as unknown as typeof fetch,
+      healthTimeoutMs: 100,
+      healthIntervalMs: 10
+    })
+    try {
+      await expect(harness.service.start({ config: {}, mixedPort: 20_843, controllerPort: 20_844 }))
+        .rejects.toMatchObject({
+          code: 'health_check',
+          message: expect.stringContaining('authenticated loopback controller')
+        })
+      expect(harness.probeTcp).not.toHaveBeenCalled()
+      expect(harness.service.getState().status).toBe('error')
+    } finally {
+      now.mockRestore()
+    }
+  })
+
+  it('allows the last millisecond but rejects a mixed probe completing at the deadline', async () => {
+    const directory = await temporaryDirectory()
+    let clock = 0
+    const now = vi.spyOn(Date, 'now').mockImplementation(() => clock)
+    const onTime = createHarness(directory, {
+      fetchImplementation: vi.fn(async () => {
+        clock = 99
+        return jsonResponse({ version: `sing-box ${SING_BOX_VERSION}` })
+      }) as unknown as typeof fetch,
+      probeTcp: vi.fn(async () => undefined),
+      healthTimeoutMs: 100,
+      healthIntervalMs: 10
+    })
+    try {
+      await expect(onTime.service.start({ config: {}, mixedPort: 20_845, controllerPort: 20_846 }))
+        .resolves.toMatchObject({ status: 'ready' })
+      expect(onTime.probeTcp).toHaveBeenCalledWith('127.0.0.1', 20_845, 1)
+      await onTime.service.close()
+
+      clock = 0
+      const lateMixed = createHarness(await temporaryDirectory(), {
+        fetchImplementation: vi.fn(async () => {
+          clock = 50
+          return jsonResponse({ version: `sing-box ${SING_BOX_VERSION}` })
+        }) as unknown as typeof fetch,
+        probeTcp: vi.fn(async () => { clock = 100 }),
+        healthTimeoutMs: 100,
+        healthIntervalMs: 10
+      })
+      await expect(lateMixed.service.start({ config: {}, mixedPort: 20_847, controllerPort: 20_848 }))
+        .rejects.toMatchObject({
+          code: 'health_check',
+          message: expect.stringContaining('mixed loopback listener')
+        })
+    } finally {
+      now.mockRestore()
+    }
+  })
+
+  it('does not start another probe after a retry sleep reaches the deadline', async () => {
+    const directory = await temporaryDirectory()
+    let clock = 0
+    const now = vi.spyOn(Date, 'now').mockImplementation(() => clock)
+    const fetchImplementation = vi.fn(async () => {
+      clock = 20
+      throw new Error('controller is still starting')
+    })
+    const harness = createHarness(directory, {
+      fetchImplementation,
+      healthTimeoutMs: 100,
+      healthIntervalMs: 100,
+      sleep: vi.fn(async () => { clock = 100 })
+    })
+    try {
+      await expect(harness.service.start({ config: {}, mixedPort: 20_849, controllerPort: 20_850 }))
+        .rejects.toMatchObject({ code: 'health_check' })
+      expect(fetchImplementation).toHaveBeenCalledTimes(1)
+      expect(harness.probeTcp).not.toHaveBeenCalled()
+    } finally {
+      now.mockRestore()
+    }
+  })
+
+  it('rejects a child exit between controller identity and mixed probing', async () => {
+    const directory = await temporaryDirectory()
+    const holder: { current?: ReturnType<typeof createHarness> } = {}
+    const fetchImplementation = vi.fn(async () => {
+      queueMicrotask(() => holder.current!.children[0].finish(9, null))
+      return jsonResponse({ version: `sing-box ${SING_BOX_VERSION}` })
+    }) as unknown as typeof fetch
+    const harness = createHarness(directory, { fetchImplementation })
+    holder.current = harness
+
+    await expect(harness.service.start({ config: {}, mixedPort: 20_853, controllerPort: 20_854 }))
+      .rejects.toMatchObject({
+        code: 'health_check',
+        message: expect.stringContaining('exited before its loopback endpoints')
+      })
+    expect(harness.probeTcp).not.toHaveBeenCalled()
+    expect(harness.service.getState().status).toBe('error')
+  })
+
+  it('keeps a cold but progressing core within the bounded startup window', async () => {
+    const directory = await temporaryDirectory()
+    let controllerAttempts = 0
+    const fetchImplementation = vi.fn(async (input: string | URL | Request) => {
+      const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input : input.url)
+      if (url.pathname === '/version') {
+        controllerAttempts += 1
+        // A cold rule-set download can keep both listeners unavailable beyond
+        // the former ten-second retry budget.  It is still bounded by the new
+        // startup deadline and must not weaken version/mixed verification.
+        if (controllerAttempts <= 101) throw new Error('controller not listening yet')
+        return jsonResponse({ version: `sing-box ${SING_BOX_VERSION}` })
+      }
+      return new Response(null, { status: 204 })
+    }) as unknown as typeof fetch
+    const harness = createHarness(directory, {
+      fetchImplementation,
+      healthTimeoutMs: undefined,
+      healthIntervalMs: 100,
+    })
+
+    await expect(harness.service.start({ config: {}, mixedPort: 20_835, controllerPort: 20_836 }))
+      .resolves.toMatchObject({ status: 'ready' })
+    expect(controllerAttempts).toBe(102)
+    expect(harness.probeTcp).toHaveBeenCalledWith('127.0.0.1', 20_835, expect.any(Number))
+    await harness.service.close()
   })
 
   it('fails closed on a crash, emits the crash event, and performs a bounded restart', async () => {
@@ -307,7 +563,32 @@ describe('SingBoxService', () => {
     })
     expect(harness.requestedPaths).toContain('/connections/connection-1')
     expect(harness.requestedPaths).toContain('/connections')
-    expect(harness.requestedPaths.some((path) => path.startsWith('/proxies/selected-node/delay?'))).toBe(true)
+    const latencyPaths = harness.requestedPaths.filter((path) => path.startsWith('/proxies/selected-node/delay?'))
+    expect(latencyPaths).toHaveLength(4)
+    const latencyQuery = new URL(`http://controller${latencyPaths[0]}`).searchParams
+    expect(latencyQuery.get('url')).toBe('http://www.gstatic.com/generate_204')
+    expect(latencyQuery.get('timeout')).toBe('5000')
+    await harness.service.close()
+  })
+
+  it('discards a warm-up latency probe and returns the median of three samples', async () => {
+    const directory = await temporaryDirectory()
+    const delays = [900, 82, 31, 47]
+    const fetchImplementation = vi.fn(async (input: string | URL | Request) => {
+      const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input : input.url)
+      if (url.pathname === '/version') return jsonResponse({ version: `sing-box ${SING_BOX_VERSION}` })
+      if (url.pathname.includes('/delay')) return jsonResponse({ delay: delays.shift() })
+      return new Response(null, { status: 204 })
+    }) as unknown as typeof fetch
+    const harness = createHarness(directory, { fetchImplementation, now: () => 4_000 })
+    await harness.service.start({ config: {}, mixedPort: 20_871, controllerPort: 20_872 })
+
+    await expect(harness.service.testLatency('selected-node')).resolves.toEqual({
+      proxyName: 'selected-node',
+      delayMs: 47,
+      testedAt: 4_000
+    })
+    expect(fetchImplementation).toHaveBeenCalledTimes(5)
     await harness.service.close()
   })
 
@@ -323,6 +604,32 @@ describe('SingBoxService', () => {
     expect(harness.terminateProcess).toHaveBeenCalledTimes(1)
     expect(harness.children[0].exitCode).toBe(0)
     await expect(harness.service.start(request)).rejects.toMatchObject({ code: 'closed' })
+  })
+
+  it('retains a generation whose termination fails so a later close can remove every child', async () => {
+    const directory = await temporaryDirectory()
+    let rejectFirstGenerationOnce = true
+    const terminateProcess = vi.fn(async (child: ChildProcess) => {
+      const fakeChild = child as unknown as FakeChild
+      if (fakeChild.pid === 4_242 && rejectFirstGenerationOnce) {
+        rejectFirstGenerationOnce = false
+        throw new Error('process tree is still alive')
+      }
+      fakeChild.finish(0, 'SIGTERM')
+    })
+    const harness = createHarness(directory, { terminateProcess })
+    const request = { config: {}, mixedPort: 20_881, controllerPort: 20_882 }
+    await harness.service.start(request)
+    await harness.service.start({ ...request, allowLan: true })
+
+    await expect(harness.service.close()).rejects.toMatchObject({ code: 'stop_failed' })
+    expect(harness.service.getState()).toMatchObject({ status: 'error', error: { code: 'stop_failed' } })
+    expect(harness.children[0].exitCode).toBeNull()
+    expect(harness.children[1].exitCode).toBe(0)
+
+    await expect(harness.service.close()).resolves.toBeUndefined()
+    expect(harness.children.every((child) => child.exitCode === 0)).toBe(true)
+    expect(terminateProcess).toHaveBeenCalledTimes(3)
   })
 })
 

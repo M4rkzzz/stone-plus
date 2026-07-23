@@ -10,6 +10,17 @@ const MAX_QUEUED_TURNS = 32
 const MAX_QUEUED_PAYLOAD_BYTES = 128 * 1024 * 1024
 const MAX_BUFFERED_SEND_BYTES = 8 * 1024 * 1024
 const RESUME_BUFFERED_SEND_BYTES = 2 * 1024 * 1024
+// A Responses event is normally small even when the overall response is large.
+// Bound only the event currently being assembled so long, valid streams remain
+// unlimited while a broken/malicious upstream cannot grow one unterminated SSE
+// frame without bound.
+const MAX_SSE_FRAME_BYTES = 16 * 1024 * 1024
+const SSE_FRAME_BOUNDARIES = [
+  Buffer.from('\r\n\r\n'),
+  Buffer.from('\r\n\n'),
+  Buffer.from('\n\r\n'),
+  Buffer.from('\n\n'),
+] as const
 
 export interface ResponsesWebSocketAuthentication {
   ok: boolean
@@ -109,9 +120,9 @@ export class ResponsesWebSocketAdapter {
             }
           }, controller.signal)
         })
-        .catch((error: unknown) => {
+        .catch(async (error: unknown) => {
           if (controller.signal.aborted || closed) return
-          void sendJson(webSocket, errorEvent(502, 'websocket_dispatch_error', safeErrorMessage(error)))
+          await sendJson(webSocket, dispatchErrorEvent(error), controller.signal)
         })
         .finally(() => {
           if (inFlight === controller) inFlight = undefined
@@ -195,29 +206,58 @@ export async function forwardResponsesSse(
   response: Response,
   onEvent: (event: JsonObject) => void | Promise<void>,
   signal?: AbortSignal,
+  maxFrameBytes = MAX_SSE_FRAME_BYTES,
 ): Promise<void> {
   if (!response.body) throw new Error('The Responses stream has no body.')
+  if (!Number.isSafeInteger(maxFrameBytes) || maxFrameBytes < 1) {
+    throw new Error('The Responses SSE frame limit is invalid.')
+  }
   const reader = response.body.getReader()
-  const decoder = new TextDecoder()
-  let buffer = ''
+  let buffer = Buffer.alloc(0)
+  let searchStart = 0
+  let firstFrame = true
   let reachedEof = false
   let failure: unknown
+
   try {
     while (true) {
-      if (signal?.aborted) throw signal.reason
-      const { done, value } = await reader.read()
+      if (signal?.aborted) throw responsesAbortReason(signal)
+      const read = reader.read()
+      const { done, value } = signal
+        ? await waitForResponsesRead(read, signal)
+        : await read
       if (done) {
         reachedEof = true
         break
       }
-      buffer += decoder.decode(value, { stream: true })
-      const consumed = consumeSseFrames(buffer)
-      buffer = consumed.remainder
-      for (const event of consumed.events) await onEvent(event)
+      const chunk = Buffer.from(value.buffer, value.byteOffset, value.byteLength)
+      buffer = buffer.byteLength === 0
+        ? chunk
+        : Buffer.concat([buffer, chunk], buffer.byteLength + chunk.byteLength)
+      let cursor = 0
+      let delimiter = findSseDelimiter(buffer, searchStart)
+      while (delimiter) {
+        const frameLength = delimiter.index - cursor
+        if (frameLength > maxFrameBytes) throw new ResponsesSseFrameTooLargeError(maxFrameBytes)
+        const event = parseSseFrame(buffer.subarray(cursor, delimiter.index), firstFrame)
+        firstFrame = false
+        if (event) await onEvent(event)
+        cursor = delimiter.index + delimiter.length
+        delimiter = findSseDelimiter(buffer, cursor)
+      }
+      if (cursor > 0) buffer = Buffer.from(buffer.subarray(cursor))
+      searchStart = Math.max(0, buffer.byteLength - 3)
+      // A delimiter may straddle chunks and is at most four bytes. Waiting
+      // for those few bytes avoids rejecting a frame exactly at the limit.
+      if (buffer.byteLength > maxFrameBytes + 3) {
+        throw new ResponsesSseFrameTooLargeError(maxFrameBytes)
+      }
     }
-    buffer += decoder.decode()
-    const consumed = consumeSseFrames(`${buffer}\n\n`)
-    for (const event of consumed.events) await onEvent(event)
+    if (buffer.byteLength > maxFrameBytes) throw new ResponsesSseFrameTooLargeError(maxFrameBytes)
+    if (buffer.byteLength > 0) {
+      const event = parseSseFrame(buffer, firstFrame)
+      if (event) await onEvent(event)
+    }
   } catch (error) {
     failure = error
     throw error
@@ -227,27 +267,60 @@ export async function forwardResponsesSse(
   }
 }
 
-function consumeSseFrames(buffer: string): { remainder: string; events: JsonObject[] } {
-  const events: JsonObject[] = []
-  let cursor = 0
-  while (true) {
-    const match = /\r?\n\r?\n/g.exec(buffer.slice(cursor))
-    if (!match) return { remainder: buffer.slice(cursor), events }
-    const boundary = cursor + match.index
-    const frame = buffer.slice(cursor, boundary)
-    cursor = boundary + match[0].length
-    const data = frame.split(/\r?\n/)
-      .filter((line) => line.startsWith('data:'))
-      .map((line) => line.slice(5).trimStart())
-      .join('\n')
-    if (!data || data === '[DONE]') continue
-    try {
-      const event: unknown = JSON.parse(data)
-      if (isJsonObject(event)) events.push(event)
-    } catch {
-      throw new Error('The Responses stream contained invalid JSON.')
-    }
+class ResponsesSseFrameTooLargeError extends Error {
+  public constructor(public readonly maxFrameBytes: number) {
+    super(`The Responses stream contained an SSE frame larger than ${maxFrameBytes} bytes.`)
+    this.name = 'ResponsesSseFrameTooLargeError'
   }
+}
+
+function findSseDelimiter(buffer: Uint8Array, start: number): { index: number; length: number } | undefined {
+  const source = Buffer.from(buffer.buffer, buffer.byteOffset, buffer.byteLength)
+  let best: { index: number; length: number } | undefined
+  for (const boundary of SSE_FRAME_BOUNDARIES) {
+    const index = source.indexOf(boundary, start)
+    if (index < 0 || (best && best.index <= index)) continue
+    best = { index, length: boundary.byteLength }
+  }
+  return best
+}
+
+function parseSseFrame(frame: Uint8Array, allowLeadingBom = false): JsonObject | undefined {
+  let text = Buffer.from(frame.buffer, frame.byteOffset, frame.byteLength).toString('utf8')
+  if (allowLeadingBom) text = text.replace(/^\uFEFF/, '')
+  const data = text.split(/\r?\n/)
+    .filter((line) => line.startsWith('data:'))
+    .map((line) => line.slice(5).trimStart())
+    .join('\n')
+  if (!data || data === '[DONE]') return undefined
+  try {
+    const event: unknown = JSON.parse(data)
+    return isJsonObject(event) ? event : undefined
+  } catch {
+    throw new Error('The Responses stream contained invalid JSON.')
+  }
+}
+
+async function waitForResponsesRead<T>(read: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) throw responsesAbortReason(signal)
+  let listener: (() => void) | undefined
+  try {
+    return await Promise.race([
+      read,
+      new Promise<never>((_resolve, reject) => {
+        listener = () => reject(responsesAbortReason(signal))
+        signal.addEventListener('abort', listener, { once: true })
+      })
+    ])
+  } finally {
+    if (listener) signal.removeEventListener('abort', listener)
+  }
+}
+
+function responsesAbortReason(signal: AbortSignal): unknown {
+  return signal.reason instanceof Error
+    ? signal.reason
+    : new DOMException('The Responses WebSocket request was aborted.', 'AbortError')
 }
 
 async function responseErrorEvent(response: Response): Promise<JsonObject> {
@@ -274,6 +347,17 @@ function errorEvent(status: number, code: string, message: string, param?: unkno
   }
 }
 
+function dispatchErrorEvent(error: unknown): JsonObject {
+  if (error instanceof ResponsesSseFrameTooLargeError) {
+    return errorEvent(
+      502,
+      'upstream_sse_frame_too_large',
+      `The upstream Responses stream emitted an SSE frame larger than ${error.maxFrameBytes} bytes.`,
+    )
+  }
+  return errorEvent(502, 'websocket_dispatch_error', safeErrorMessage(error))
+}
+
 async function sendJson(webSocket: WebSocket, payload: JsonObject, signal?: AbortSignal): Promise<boolean> {
   if (webSocket.readyState !== WebSocket.OPEN || signal?.aborted) return false
   const encoded = JSON.stringify(payload)
@@ -282,8 +366,12 @@ async function sendJson(webSocket: WebSocket, payload: JsonObject, signal?: Abor
     const writable = await waitForWebSocketCapacity(webSocket, signal)
     if (!writable) return false
   }
-  webSocket.send(encoded)
-  return true
+  try {
+    webSocket.send(encoded)
+    return true
+  } catch {
+    return false
+  }
 }
 
 async function waitForWebSocketCapacity(webSocket: WebSocket, signal?: AbortSignal): Promise<boolean> {

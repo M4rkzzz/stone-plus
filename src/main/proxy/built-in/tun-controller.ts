@@ -46,6 +46,15 @@ export interface TunPlatformSession {
   /** Process-scoped identifier; it must not name a persistent service. */
   id: string
   pid?: number
+  /** Resolves for early or late sidecar exits and never rejects. */
+  exit?: Promise<TunProcessExit>
+}
+
+export interface TunProcessExit {
+  code: number | null
+  signal: NodeJS.Signals | null
+  /** Bounded native-launcher diagnostics; renderer projection sanitizes it. */
+  stderr?: string
 }
 
 /**
@@ -56,6 +65,8 @@ export interface TunPlatformSession {
 export interface TunPlatformAdapter {
   startTemporaryElevated(request: TunPlatformStartRequest): Promise<TunPlatformSession>
   stopTemporary(session: TunPlatformSession): Promise<void>
+  /** Retries cleanup for a process that failed before a session could be returned. */
+  cleanupPending?(): Promise<void>
   isElevationDenied?(error: unknown): boolean
 }
 
@@ -105,6 +116,12 @@ export interface TunControllerOptions {
   now?: () => number
 }
 
+export type TunControllerEvent = {
+  type: 'unexpected-exit'
+  state: TunControllerState
+  exit: TunProcessExit
+}
+
 /** Serializes temporary TUN elevation, teardown, and retries. */
 export class TunController {
   private readonly adapter: TunPlatformAdapter
@@ -117,6 +134,7 @@ export class TunController {
   private bypass?: TunBypassPlan
   private lastRoutingContext?: TunRoutingContext
   private lastError?: { code: TunControllerErrorCode; message: string }
+  private readonly eventListeners = new Set<(event: TunControllerEvent) => void>()
 
   public constructor(options: TunControllerOptions) {
     this.adapter = options.adapter
@@ -128,11 +146,22 @@ export class TunController {
       status: this.status,
       desiredEnabled: this.desiredEnabled,
       ...(this.session && this.startedAt !== undefined
-        ? { session: { ...this.session, startedAt: this.startedAt } }
+        ? {
+            session: {
+              id: this.session.id,
+              ...(this.session.pid !== undefined ? { pid: this.session.pid } : {}),
+              startedAt: this.startedAt
+            }
+          }
         : {}),
       ...(this.bypass ? { bypass: cloneBypassPlan(this.bypass) } : {}),
       ...(this.lastError ? { lastError: { ...this.lastError } } : {})
     }
+  }
+
+  public onEvent(listener: (event: TunControllerEvent) => void): () => void {
+    this.eventListeners.add(listener)
+    return () => this.eventListeners.delete(listener)
   }
 
   public start(routing: TunRoutingContext): Promise<TunControllerState> {
@@ -171,6 +200,7 @@ export class TunController {
         this.session = session
         this.startedAt = this.now()
         this.status = 'ready'
+        this.observeSessionExit(session)
         return this.getState()
       } catch (error) {
         const denied = this.isElevationDenied(error)
@@ -202,8 +232,19 @@ export class TunController {
       this.desiredEnabled = false
       const session = this.session
       if (!session) {
-        this.finishStopped()
-        return this.getState()
+        this.status = 'stopping'
+        this.lastError = undefined
+        try {
+          await this.adapter.cleanupPending?.()
+          this.finishStopped()
+          return this.getState()
+        } catch (error) {
+          throw this.fail(
+            'tun_stop_failed',
+            'Could not clean up a pending temporary TUN session; retry is available.',
+            error
+          )
+        }
       }
       this.status = 'stopping'
       this.lastError = undefined
@@ -218,6 +259,19 @@ export class TunController {
           error
         )
       }
+      // The active session is gone even if cleanup of an earlier failed start
+      // still needs another retry.
+      this.session = undefined
+      this.startedAt = undefined
+      try {
+        await this.adapter.cleanupPending?.()
+      } catch (error) {
+        throw this.fail(
+          'tun_stop_failed',
+          'Could not clean up a pending temporary TUN session; retry is available.',
+          error
+        )
+      }
       this.finishStopped()
       return this.getState()
     })
@@ -229,6 +283,7 @@ export class TunController {
 
   public async close(): Promise<void> {
     await this.stop()
+    this.eventListeners.clear()
   }
 
   private finishStopped(): void {
@@ -244,9 +299,10 @@ export class TunController {
     message: string,
     cause?: unknown
   ): TunControllerError {
+    const diagnosticMessage = appendCauseDetails(message, cause)
     this.status = 'error'
-    this.lastError = { code, message }
-    return new TunControllerError(code, message, cause === undefined ? undefined : { cause })
+    this.lastError = { code, message: diagnosticMessage }
+    return new TunControllerError(code, diagnosticMessage, cause === undefined ? undefined : { cause })
   }
 
   private isElevationDenied(error: unknown): boolean {
@@ -265,6 +321,42 @@ export class TunController {
       'USER_CANCELLED',
       'TUN_ELEVATION_DENIED'
     ].includes(String(candidate.code ?? '').toUpperCase())
+  }
+
+  private observeSessionExit(session: TunPlatformSession): void {
+    if (!session.exit) return
+    const publish = (exit: TunProcessExit): void => {
+      if (
+        // Compare the validated session object, not only its runner-provided
+        // string ID. A launcher is allowed to reuse an ID after stop; a late
+        // exit notification from that retired process must never poison the
+        // replacement TUN session.
+        this.session !== session
+        || !this.desiredEnabled
+        || this.status === 'stopping'
+        || this.status === 'stopped'
+      ) return
+      const failure = {
+        code: 'tun_start_failed' as const,
+        message: describeUnexpectedExit(exit)
+      }
+      this.status = 'error'
+      this.lastError = failure
+      const event: TunControllerEvent = { type: 'unexpected-exit', state: this.getState(), exit }
+      for (const listener of this.eventListeners) {
+        try {
+          listener(event)
+        } catch {
+          // One observer must not suppress fail-closed notification to the
+          // remaining owners or create an unhandled promise rejection.
+        }
+      }
+    }
+    void session.exit.then(publish, (error) => publish({
+      code: null,
+      signal: null,
+      stderr: appendCauseDetails('The TUN process exit monitor failed.', error),
+    }))
   }
 
   private enqueue<T>(operation: () => Promise<T>): Promise<T> {
@@ -371,7 +463,41 @@ function validatePlatformSession(value: TunPlatformSession): TunPlatformSession 
   if (value.pid !== undefined && (!Number.isInteger(value.pid) || value.pid <= 0)) {
     throw new Error('The TUN platform adapter returned an invalid process ID.')
   }
-  return { id: value.id, ...(value.pid !== undefined ? { pid: value.pid } : {}) }
+  if (value.exit !== undefined && (typeof value.exit !== 'object' || typeof value.exit.then !== 'function')) {
+    throw new Error('The TUN platform adapter returned an invalid exit monitor.')
+  }
+  return {
+    id: value.id,
+    ...(value.pid !== undefined ? { pid: value.pid } : {}),
+    ...(value.exit ? { exit: value.exit } : {})
+  }
+}
+
+function appendCauseDetails(message: string, cause: unknown): string {
+  if (cause === undefined) return message
+  const details: string[] = []
+  const seen = new Set<object>()
+  let current: unknown = cause
+  while (current && typeof current === 'object' && details.length < 4 && !seen.has(current)) {
+    seen.add(current)
+    const record = current as { message?: unknown; cause?: unknown }
+    const detail = typeof record.message === 'string'
+      ? record.message.replace(/\s+/g, ' ').trim().slice(0, 500)
+      : ''
+    if (detail && detail !== message && !details.includes(detail)) details.push(detail)
+    current = record.cause
+  }
+  return details.length > 0 ? `${message} Detail: ${details.join(' → ')}` : message
+}
+
+function describeUnexpectedExit(exit: TunProcessExit): string {
+  const status = exit.code !== null
+    ? `exit code ${exit.code}`
+    : exit.signal
+      ? `signal ${exit.signal}`
+      : 'the process disappeared'
+  const detail = exit.stderr?.replace(/\s+/g, ' ').trim().slice(0, 500)
+  return `The temporary elevated TUN sidecar exited unexpectedly (${status}).${detail ? ` Detail: ${detail}` : ''}`
 }
 
 function invalidBypass(message: string): TunControllerError {

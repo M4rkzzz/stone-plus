@@ -8,6 +8,8 @@ export {
 } from './portable-backup'
 export type { PortableBackupInfo, PortableReplacementRecoveryResult } from './portable-backup'
 export type { PortableSecretVault } from './portable-secrets'
+export { isSecureCredentialVaultAvailable, requireSecureCredentialVault } from './credential-vault'
+export type { CredentialVaultLike } from './credential-vault'
 export { WebDavBackupClient } from './webdav-backup-client'
 export type { WebDavBackupClientOptions, WebDavBackupEntry } from './webdav-backup-client'
 export { WebDavBackupService, WEB_DAV_BACKUP_CONFIGURATION_METADATA_KEY } from './webdav-backup-service'

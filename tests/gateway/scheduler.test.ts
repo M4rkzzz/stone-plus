@@ -937,6 +937,41 @@ describe('PoolScheduler', () => {
     recoveredThird.release()
   })
 
+  it('clears adaptive performance only when a connection reset explicitly requests it', () => {
+    const scheduler = new PoolScheduler(() => timestamp)
+    const source = account('source')
+    scheduler.recordPerformance(source.id, { semanticFirstTokenMs: 2_000 })
+    expect(scheduler.getFitness([source])[source.id].sampleCount).toBe(1)
+
+    scheduler.resetHealth(source.id)
+    expect(scheduler.getFitness([source])[source.id].sampleCount).toBe(1)
+
+    scheduler.resetHealth(source.id, { clearPerformance: true })
+    expect(scheduler.getFitness([source])[source.id].sampleCount).toBe(0)
+
+    scheduler.hydratePerformance([
+      requestLog(source.id, { id: 'pre-reset-log', timestamp: timestamp - 1_000 })
+    ])
+    expect(scheduler.getFitness([source])[source.id].sampleCount).toBe(0)
+  })
+
+  it('rejects adaptive success samples selected before an explicit reset', () => {
+    const scheduler = new PoolScheduler(() => timestamp)
+    const source = account('source', { maxConcurrency: 2 })
+    const selected = scheduler.selectAndAcquire({ pool: pool(), accounts: [source], model: 'model' })
+
+    scheduler.resetHealth(source.id, { clearPerformance: true })
+
+    expect(scheduler.recordPerformance(
+      source.id,
+      { semanticFirstTokenMs: 500 },
+      selected.healthRevision,
+      selected.resetEpoch
+    )).toBe(false)
+    expect(scheduler.getFitness([source])[source.id].sampleCount).toBe(0)
+    selected.release()
+  })
+
   it('keeps a sticky session on its assigned eligible account', () => {
     const scheduler = new PoolScheduler(() => timestamp)
     const accounts = [account('a'), account('b')]
@@ -1410,6 +1445,104 @@ describe('PoolScheduler', () => {
     selected.release()
   })
 
+  it('applies only the first concurrent failure from one scheduler generation', () => {
+    const scheduler = new PoolScheduler(() => timestamp)
+    const onlyAccount = account('a', { maxConcurrency: 4 })
+    const firstAttempt = scheduler.selectAndAcquire({ pool: pool(), accounts: [onlyAccount], model: 'model' })
+    const secondAttempt = scheduler.selectAndAcquire({ pool: pool(), accounts: [onlyAccount], model: 'model' })
+
+    const first = scheduler.recordFailure('a', {
+      expectedRevision: firstAttempt.healthRevision,
+      baseDelayMs: 1_000,
+      maxConcurrency: 4,
+    })
+    const stale = scheduler.recordFailure('a', {
+      expectedRevision: secondAttempt.healthRevision,
+      baseDelayMs: 1_000,
+      maxConcurrency: 4,
+    })
+
+    expect(first).toMatchObject({ applied: true, consecutiveFailures: 1, revision: 1 })
+    expect(stale).toMatchObject({ applied: false, consecutiveFailures: 1, revision: 1 })
+    expect(scheduler.getFitness([onlyAccount]).a).toMatchObject({ failureCount: 1 })
+    firstAttempt.release()
+    secondAttempt.release()
+  })
+
+  it('monotonically merges concurrent quota cooldowns from one reset epoch', () => {
+    const scheduler = new PoolScheduler(() => timestamp)
+    const onlyAccount = account('a', { maxConcurrency: 4 })
+    const firstAttempt = scheduler.selectAndAcquire({ pool: pool(), accounts: [onlyAccount], model: 'model' })
+    const secondAttempt = scheduler.selectAndAcquire({ pool: pool(), accounts: [onlyAccount], model: 'model' })
+
+    expect(scheduler.setCooldown(
+      'a', timestamp + 30_000, firstAttempt.healthRevision, firstAttempt.resetEpoch
+    ))
+      .toMatchObject({ applied: true, revision: 1, cooldownUntil: timestamp + 30_000 })
+    expect(scheduler.setCooldown(
+      'a', timestamp + 60_000, secondAttempt.healthRevision, secondAttempt.resetEpoch
+    ))
+      .toMatchObject({ applied: true, revision: 2, cooldownUntil: timestamp + 60_000 })
+    firstAttempt.release()
+    secondAttempt.release()
+  })
+
+  it('extends a stale quota retry-after without applying a second failure penalty', () => {
+    const scheduler = new PoolScheduler(() => timestamp)
+    const onlyAccount = account('a', { maxConcurrency: 4 })
+    const firstAttempt = scheduler.selectAndAcquire({ pool: pool(), accounts: [onlyAccount], model: 'model' })
+    const secondAttempt = scheduler.selectAndAcquire({ pool: pool(), accounts: [onlyAccount], model: 'model' })
+
+    expect(scheduler.recordFailure('a', {
+      expectedRevision: firstAttempt.healthRevision,
+      expectedResetEpoch: firstAttempt.resetEpoch,
+      retryAfterMs: 30_000,
+      maxConcurrency: 4,
+      reason: 'quota'
+    })).toMatchObject({ applied: true, revision: 1, cooldownUntil: timestamp + 30_000 })
+    expect(scheduler.recordFailure('a', {
+      expectedRevision: secondAttempt.healthRevision,
+      expectedResetEpoch: secondAttempt.resetEpoch,
+      retryAfterMs: 60_000,
+      maxConcurrency: 4,
+      reason: 'quota'
+    })).toMatchObject({
+      applied: true,
+      revision: 2,
+      consecutiveFailures: 1,
+      cooldownUntil: timestamp + 60_000
+    })
+    expect(scheduler.getFitness([onlyAccount]).a).toMatchObject({
+      sampleCount: 1,
+      failureCount: 1,
+      successCount: 0
+    })
+    firstAttempt.release()
+    secondAttempt.release()
+  })
+
+  it('rejects a stale quota observation selected before an explicit reset', () => {
+    const scheduler = new PoolScheduler(() => timestamp)
+    const onlyAccount = account('a', { maxConcurrency: 2 })
+    const selected = scheduler.selectAndAcquire({ pool: pool(), accounts: [onlyAccount], model: 'model' })
+
+    scheduler.resetHealth('a', { clearPerformance: true })
+    expect(scheduler.recordFailure('a', {
+      expectedRevision: selected.healthRevision,
+      expectedResetEpoch: selected.resetEpoch,
+      retryAfterMs: 60_000,
+      maxConcurrency: 2,
+      reason: 'quota'
+    })).toMatchObject({
+      applied: false,
+      circuitState: 'closed',
+      consecutiveFailures: 0,
+      revision: 1
+    })
+    expect(scheduler.getFitness([onlyAccount]).a).toMatchObject({ sampleCount: 0 })
+    selected.release()
+  })
+
   it('requires an attempt revision to clear quota health after its cooldown expires', () => {
     let now = timestamp
     const scheduler = new PoolScheduler(() => now)
@@ -1539,5 +1672,61 @@ describe('PoolScheduler', () => {
       .toThrow(NoEligibleAccountError)
     now += 1_001
     expect(scheduler.selectAndAcquire({ pool: pool(), accounts: [exhausted], model: 'model' }).account.id).toBe('a')
+  })
+
+  it('rechecks a reset-less exhausted quota through one half-open request after a finite TTL', () => {
+    let now = timestamp
+    const scheduler = new PoolScheduler(() => now)
+    const exhausted = account('a', {
+      maxConcurrency: 4,
+      quota: { requests: { limit: 10, remaining: 0 }, observedAt: timestamp },
+    })
+
+    expect(() => scheduler.selectAndAcquire({ pool: pool(), accounts: [exhausted], model: 'model' }))
+      .toThrow(NoEligibleAccountError)
+    now += 30_001
+    const probe = scheduler.selectAndAcquire({ pool: pool(), accounts: [exhausted], model: 'model' })
+    expect(() => scheduler.selectAndAcquire({ pool: pool(), accounts: [exhausted], model: 'model' }))
+      .toThrow(NoEligibleAccountError)
+    expect(scheduler.recordSuccess('a', probe.healthRevision)).toMatchObject({ applied: true })
+    probe.release()
+    expect(scheduler.selectAndAcquire({ pool: pool(), accounts: [exhausted], model: 'model' }).account.id).toBe('a')
+  })
+
+  it('does not retain quota pressure after a quota window has reset', () => {
+    const scheduler = new PoolScheduler(() => timestamp)
+    const formerlyPressured = account('formerly-pressured', {
+      priority: 1,
+      quota: { requests: { limit: 100, remaining: 1, resetAt: timestamp - 1 }, observedAt: timestamp - 60_000 },
+    })
+    const healthy = account('healthy', { priority: 2 })
+
+    expect(scheduler.selectAndAcquire({
+      pool: pool({ strategy: 'priority' }),
+      accounts: [formerlyPressured, healthy],
+      model: 'model',
+    }).account.id).toBe('formerly-pressured')
+
+    const staleResetless = account('stale-resetless', {
+      priority: 1,
+      quota: { requests: { limit: 100, remaining: 1 }, observedAt: timestamp - 30_001 },
+    })
+    expect(scheduler.selectAndAcquire({
+      pool: pool({ strategy: 'priority' }),
+      accounts: [staleResetless, healthy],
+      model: 'model',
+    }).account.id).toBe('stale-resetless')
+  })
+
+  it('hard-excludes orphaned accounts when the caller supplies provider configuration', () => {
+    const scheduler = new PoolScheduler(() => timestamp)
+    const orphaned = account('orphaned', { providerId: 'missing-provider' })
+
+    expect(() => scheduler.selectAndAcquire({
+      pool: pool(), accounts: [orphaned], providers: [], model: 'model',
+    })).toThrow(ModelNotExposedError)
+    expect(scheduler.hasUsableAlternative(
+      [account('selected'), orphaned], 'model', 'selected', pool(), [],
+    )).toBe(false)
   })
 })

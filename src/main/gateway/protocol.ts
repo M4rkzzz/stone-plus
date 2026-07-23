@@ -10,6 +10,34 @@ export class UnsupportedProtocolConversionError extends Error {
   }
 }
 
+export class ResponsesResponseFailedError extends Error {
+  public readonly code?: string
+  public readonly requestLevel: boolean
+
+  constructor(body: JsonObject) {
+    const error = objectValue(body.error)
+    const code = safeProtocolErrorCode(error?.code ?? error?.type)
+    super(`Upstream Responses request failed${code ? ` (${code})` : ''}.`)
+    this.name = 'ResponsesResponseFailedError'
+    this.code = code
+    this.requestLevel = safeProtocolErrorCode(error?.type) === 'invalid_request_error'
+  }
+}
+
+export class InvalidToolArgumentsError extends Error {
+  constructor(public readonly path: string) {
+    super(`Tool arguments at ${path} must be a JSON object.`)
+    this.name = 'InvalidToolArgumentsError'
+  }
+}
+
+export class InvalidToolChoiceError extends Error {
+  constructor(public readonly path: string) {
+    super(`Required tool choice at ${path} has no compatible function declaration.`)
+    this.name = 'InvalidToolChoiceError'
+  }
+}
+
 export interface ProtocolConversionIssue {
   path: string
   capability: 'image-input' | 'builtin-tool' | 'content-part' | 'request-option'
@@ -63,6 +91,13 @@ export function analyzeProtocolConversion(
     }
   }
   if (from === 'openai-responses') {
+    if (body.previous_response_id !== null && body.previous_response_id !== undefined) {
+      add(
+        'previous_response_id',
+        'request-option',
+        `Responses conversation history cannot be expanded losslessly for ${to}`
+      )
+    }
     const text = objectValue(body.text)
     if (text && Object.hasOwn(text, 'format')) {
       const format = objectValue(text.format)
@@ -71,34 +106,99 @@ export function analyzeProtocolConversion(
       }
     }
   }
-  const hasDeclaredTools = arrayOfObjects(body.tools).some((tool) => {
-    const type = stringValue(tool.type)
-    return type === 'function' || (from === 'anthropic-messages' && !type && Boolean(optionalString(tool.name)))
-      || (from === 'gemini' && Array.isArray(tool.functionDeclarations))
-  })
-  const choice = body.tool_choice ?? body.toolChoice
-  const choiceRequiresTool = choice === 'required' || choice === 'any'
-    || (typeof choice === 'object' && choice !== null && !Array.isArray(choice)
-      && ['function', 'tool', 'any'].includes(stringValue((choice as JsonObject).type)))
+  const hasDeclaredTools = hasCompatibleFunctionDeclaration(from, body)
+  const requiredToolChoice = requiredToolChoicePath(from, body)
+  const choiceRequiresTool = requiredToolChoice !== undefined
   if (choiceRequiresTool && !hasDeclaredTools) {
-    add('tool_choice', 'builtin-tool', `A required tool choice cannot be converted without a compatible tool declaration`)
+    add(requiredToolChoice, 'builtin-tool', `A required tool choice cannot be converted without a compatible tool declaration`)
   }
   if (from === 'openai-responses' && Array.isArray(body.input)) {
     for (const [itemIndex, item] of arrayOfObjects(body.input).entries()) {
       const type = stringValue(item.type)
       if (type === 'message' || (!type && typeof item.role === 'string')) {
-        validateContentParts(item.content, `input[${itemIndex}].content`, new Set(['input_text', 'output_text', 'text', 'input_image']), add)
-      } else if (type !== 'function_call' && type !== 'function_call_output') {
+        validateContentParts(
+          'openai-responses',
+          to,
+          item.content,
+          `input[${itemIndex}].content`,
+          new Set(['input_text', 'output_text', 'text', 'input_image']),
+          add
+        )
+      } else if (type === 'function_call_output') {
+        validateToolResultContent(
+          'openai-responses',
+          to,
+          item.output,
+          `input[${itemIndex}].output`,
+          add
+        )
+      } else if (type === 'function_call') {
+        if (targetRequiresObjectToolArguments(to) && !isJsonObjectArgument(item.arguments)) {
+          add(
+            `input[${itemIndex}].arguments`,
+            'content-part',
+            `Function-call arguments must be a JSON object for ${to}`
+          )
+        }
+      } else {
         add(`input[${itemIndex}]`, 'content-part', `Input item type ${type || 'unknown'} has no lossless ${to} mapping`)
       }
     }
   } else if (from === 'openai-chat') {
     for (const [messageIndex, message] of arrayOfObjects(body.messages).entries()) {
-      validateContentParts(message.content, `messages[${messageIndex}].content`, new Set(['text', 'image_url']), add)
+      const role = stringValue(message.role)
+      if (role === 'tool' || role === 'function') {
+        validateToolResultContent('openai-chat', to, message.content, `messages[${messageIndex}].content`, add)
+      } else {
+        validateContentParts(
+          'openai-chat',
+          to,
+          message.content,
+          `messages[${messageIndex}].content`,
+          new Set(['text', 'image_url']),
+          add
+        )
+      }
+      if (targetRequiresObjectToolArguments(to)) {
+        for (const [toolIndex, toolCall] of chatMessageToolCalls(message).entries()) {
+          const definition = objectValue(toolCall.function)
+          if (isJsonObjectArgument(definition?.arguments)) continue
+          add(
+            `messages[${messageIndex}].tool_calls[${toolIndex}].function.arguments`,
+            'content-part',
+            `Function-call arguments must be a JSON object for ${to}`
+          )
+        }
+      }
     }
   } else if (from === 'anthropic-messages') {
     for (const [messageIndex, message] of arrayOfObjects(body.messages).entries()) {
-      validateContentParts(message.content, `messages[${messageIndex}].content`, new Set(['text', 'image', 'tool_use', 'tool_result']), add)
+      validateContentParts(
+        'anthropic-messages',
+        to,
+        message.content,
+        `messages[${messageIndex}].content`,
+        new Set(['text', 'image', 'tool_use', 'tool_result']),
+        add
+      )
+      for (const [blockIndex, block] of arrayOfObjects(message.content).entries()) {
+        const type = stringValue(block.type)
+        if (type === 'tool_result') {
+          validateToolResultContent(
+            'anthropic-messages',
+            to,
+            block.content,
+            `messages[${messageIndex}].content[${blockIndex}].content`,
+            add
+          )
+        } else if (type === 'tool_use' && to === 'gemini' && !isJsonObjectArgument(block.input)) {
+          add(
+            `messages[${messageIndex}].content[${blockIndex}].input`,
+            'content-part',
+            `Tool-use input must be a JSON object for ${to}`
+          )
+        }
+      }
     }
   } else if (from === 'gemini') {
     for (const [contentIndex, content] of arrayOfObjects(body.contents).entries()) {
@@ -112,13 +212,86 @@ export function analyzeProtocolConversion(
           && !geminiImagePartToUrl(part)) {
           add(`contents[${contentIndex}].parts[${partIndex}]`, 'image-input', 'Gemini image content is missing data or a file URI')
         }
+        const functionResponseKey = objectValue(part.functionResponse) ? 'functionResponse' : 'function_response'
+        const functionResponse = objectValue(part[functionResponseKey])
+        if (functionResponse && Array.isArray(functionResponse.parts) && functionResponse.parts.length > 0) {
+          add(
+            `contents[${contentIndex}].parts[${partIndex}].${functionResponseKey}.parts`,
+            'content-part',
+            `Multimodal Gemini function responses have no verified lossless ${to} mapping`
+          )
+        }
+        const functionCall = objectValue(part.functionCall) ?? objectValue(part.function_call)
+        if (functionCall && to === 'anthropic-messages' && !isJsonObjectArgument(functionCall.args)) {
+          add(
+            `contents[${contentIndex}].parts[${partIndex}].functionCall.args`,
+            'content-part',
+            `Function-call arguments must be a JSON object for ${to}`
+          )
+        }
       }
     }
   }
   return { supported: issues.length === 0, issues }
 }
 
+type ToolResultProtocol = 'openai-responses' | 'openai-chat' | 'anthropic-messages'
+
+function validateToolResultContent(
+  from: ToolResultProtocol,
+  to: Protocol,
+  value: unknown,
+  path: string,
+  add: (path: string, capability: ProtocolConversionIssue['capability'], reason: string) => void
+): void {
+  if (!Array.isArray(value)) return
+  for (const [index, item] of value.entries()) {
+    const part = objectValue(item)
+    if (!part) {
+      add(`${path}[${index}]`, 'content-part', `Tool-result content must be an object for ${to}`)
+      continue
+    }
+    const type = stringValue(part.type)
+    const textType = from === 'openai-responses'
+      ? type === 'input_text' || type === 'output_text' || type === 'text'
+      : type === 'text'
+    if (textType) continue
+
+    const image = from === 'openai-responses'
+      ? type === 'input_image' ? imageUrlValue(part) : undefined
+      : from === 'openai-chat'
+        ? type === 'image_url' ? chatImageUrl(part) : undefined
+        : type === 'image' ? anthropicImageUrl(part) : undefined
+    if (image) {
+      const targetSupportsImage = (from === 'anthropic-messages' && to === 'openai-responses')
+        || (from === 'openai-chat' && (to === 'openai-responses' || to === 'anthropic-messages'))
+        || (from === 'openai-responses' && to === 'anthropic-messages')
+      if (!targetSupportsImage) {
+        add(
+          `${path}[${index}]`,
+          'content-part',
+          `Tool-result images have no verified lossless ${to} mapping`
+        )
+      }
+      validateImageDetail(from, to, part, `${path}[${index}]`, add)
+      continue
+    }
+
+    if (type === 'input_image' || type === 'image_url' || type === 'image') {
+      add(`${path}[${index}]`, 'image-input', 'Tool-result image is missing a usable URL or base64 source')
+    } else {
+      add(
+        `${path}[${index}]`,
+        'content-part',
+        `Tool-result content type ${type || 'unknown'} has no lossless ${to} mapping`
+      )
+    }
+  }
+}
+
 function validateContentParts(
+  from: ToolResultProtocol,
+  to: Protocol,
   value: unknown,
   path: string,
   supportedTypes: ReadonlySet<string>,
@@ -135,6 +308,77 @@ function validateContentParts(
       || (type === 'image_url' && !chatImageUrl(part))
       || (type === 'image' && !anthropicImageUrl(part))
     if (imageMissing) add(`${path}[${index}]`, 'image-input', 'Image content is missing a usable URL or base64 source')
+    else if (type === 'input_image' || type === 'image_url' || type === 'image') {
+      validateImageDetail(from, to, part, `${path}[${index}]`, add)
+    }
+  }
+}
+
+function validateImageDetail(
+  from: ToolResultProtocol,
+  to: Protocol,
+  part: JsonObject,
+  path: string,
+  add: (path: string, capability: ProtocolConversionIssue['capability'], reason: string) => void
+): void {
+  const detailPath = from === 'openai-chat' ? `${path}.image_url.detail` : `${path}.detail`
+  const detail = from === 'openai-chat'
+    ? objectValue(part.image_url ?? part.imageUrl)?.detail
+    : from === 'openai-responses' ? part.detail : undefined
+  if (detail === undefined) return
+  if (typeof detail !== 'string' || !detail) {
+    add(detailPath, 'request-option', `Image detail must be a non-empty string for ${to}`)
+    return
+  }
+  const targetPreservesDetail = (from === 'openai-chat' && to === 'openai-responses')
+    || (from === 'openai-responses' && to === 'openai-chat')
+  if (!targetPreservesDetail) {
+    add(detailPath, 'request-option', `Image detail has no lossless ${to} mapping`)
+  }
+}
+
+function hasCompatibleFunctionDeclaration(from: Protocol, body: JsonObject): boolean {
+  return arrayOfObjects(body.tools).some((tool) => {
+    const type = stringValue(tool.type)
+    if (type === 'function') return true
+    if (from === 'anthropic-messages' && !type) return Boolean(optionalString(tool.name))
+    if (from !== 'gemini') return false
+    return arrayOfObjects(tool.functionDeclarations ?? tool.function_declarations)
+      .some((declaration) => Boolean(optionalString(declaration.name)))
+  })
+}
+
+function requiredToolChoicePath(from: Protocol, body: JsonObject): string | undefined {
+  if (from === 'gemini') {
+    const toolConfig = objectValue(body.toolConfig) ?? objectValue(body.tool_config)
+    const config = objectValue(toolConfig?.functionCallingConfig)
+      ?? objectValue(toolConfig?.function_calling_config)
+    return stringValue(config?.mode).trim().toUpperCase() === 'ANY'
+      ? (objectValue(toolConfig?.functionCallingConfig)
+          ? 'toolConfig.functionCallingConfig.mode'
+          : 'tool_config.function_calling_config.mode')
+      : undefined
+  }
+  const choice = body.tool_choice ?? body.toolChoice
+  if (choice === 'required' || choice === 'any') return 'tool_choice'
+  const choiceObject = objectValue(choice)
+  return choiceObject && ['function', 'tool', 'any'].includes(stringValue(choiceObject.type))
+    ? 'tool_choice'
+    : undefined
+}
+
+function targetRequiresObjectToolArguments(to: Protocol): boolean {
+  return to === 'anthropic-messages' || to === 'gemini'
+}
+
+function isJsonObjectArgument(value: unknown): boolean {
+  if (value === undefined) return true
+  if (objectValue(value)) return true
+  if (typeof value !== 'string') return false
+  try {
+    return objectValue(JSON.parse(value) as unknown) !== undefined
+  } catch {
+    return false
   }
 }
 
@@ -155,6 +399,10 @@ export function convertRequest(
 ): ProtocolRequest {
   if (from === to) {
     return { protocol: to, body: withModel(body, to, targetModel), model: targetModel }
+  }
+  const requiredChoice = requiredToolChoicePath(from, body)
+  if (requiredChoice && !hasCompatibleFunctionDeclaration(from, body)) {
+    throw new InvalidToolChoiceError(requiredChoice)
   }
 
   if (to === 'openai-chat') {
@@ -210,6 +458,9 @@ export function convertResponse(
   now = Date.now
 ): JsonObject {
   if (from === to) return body
+  if (from === 'openai-responses' && stringValue(body.status).trim().toLowerCase() === 'failed') {
+    throw new ResponsesResponseFailedError(body)
+  }
   if (to === 'openai-chat') {
     if (from === 'anthropic-messages') return anthropicResponseToChat(body, fallbackModel, now)
     if (from === 'openai-responses') return responsesResponseToChat(body, fallbackModel, now)
@@ -498,7 +749,7 @@ function responsesRequestToAnthropic(body: JsonObject, model: string): JsonObjec
           type: 'tool_use',
           id: stringValue(item.call_id, stringValue(item.id)),
           name: stringValue(item.name),
-          input: parseJsonObject(item.arguments)
+          input: parseJsonObject(item.arguments, 'Responses function_call.arguments')
         })
         continue
       }
@@ -672,7 +923,7 @@ function responsesRequestToGemini(body: JsonObject): JsonObject {
           functionCall: omitUndefined({
             id: optionalString(id),
             name,
-            args: parseJsonObject(item.arguments)
+            args: parseJsonObject(item.arguments, 'Responses function_call.arguments')
           })
         })
         continue
@@ -836,7 +1087,7 @@ function anthropicRequestToGemini(body: JsonObject): JsonObject {
             functionCall: omitUndefined({
               id: optionalString(id),
               name,
-              args: objectValue(block.input) ?? {}
+              args: parseJsonObject(block.input, 'Anthropic tool_use.input')
             })
           })
         }
@@ -928,7 +1179,12 @@ function geminiRequestToAnthropic(body: JsonObject, model: string): JsonObject {
         const ids = pendingCallIds.get(name) ?? []
         ids.push(id)
         pendingCallIds.set(name, ids)
-        blocks.push({ type: 'tool_use', id, name, input: objectValue(call.args) ?? {} })
+        blocks.push({
+          type: 'tool_use',
+          id,
+          name,
+          input: parseJsonObject(call.args, 'Gemini functionCall.args')
+        })
       }
       if (blocks.length === 0) blocks.push({ type: 'text', text: '' })
       messages.push({ role: 'assistant', content: blocks })
@@ -1217,13 +1473,15 @@ function responsesResponseToChat(body: JsonObject, fallbackModel: string, now: (
   const timestamp = now()
   const output = arrayOfObjects(body.output)
   const messageItem = output.find((item) => stringValue(item.type) === 'message')
-  const text = messageItem ? responsesContentToText(messageItem.content) : ''
+  const text = messageItem ? responsesContentToText(messageItem.content, false) : ''
+  const refusal = messageItem ? responsesRefusalToText(messageItem.content) : ''
   const toolCalls = output.filter((item) => stringValue(item.type) === 'function_call').map((item) => ({
     id: stringValue(item.call_id, stringValue(item.id)),
     type: 'function',
     function: { name: stringValue(item.name), arguments: stringValue(item.arguments, '{}') }
   }))
   const message: JsonObject = { role: 'assistant', content: text || null }
+  if (refusal) message.refusal = refusal
   if (toolCalls.length > 0) message.tool_calls = toolCalls
   const usage = objectValue(body.usage)
   const inputTokens = numberValue(usage?.input_tokens) ?? 0
@@ -1300,7 +1558,7 @@ function responsesResponseToAnthropic(
       type: 'tool_use',
       id: stringValue(item.call_id, stringValue(item.id)),
       name: stringValue(item.name),
-      input: parseJsonObject(item.arguments)
+      input: parseJsonObject(item.arguments, 'Responses function_call.arguments')
     })
   }
   if (content.length === 0) content.push({ type: 'text', text: '' })
@@ -1399,7 +1657,7 @@ function responsesResponseToGemini(
       functionCall: omitUndefined({
         id: optionalString(stringValue(item.call_id, stringValue(item.id))),
         name: stringValue(item.name),
-        args: parseJsonObject(item.arguments)
+        args: parseJsonObject(item.arguments, 'Responses function_call.arguments')
       })
     })
   }
@@ -1444,10 +1702,7 @@ function geminiResponseToResponses(
       status: 'completed'
     })
   }
-  const completion = responsesStatusFields(geminiCompletionReason(
-    stringValue(candidate.finishReason ?? candidate.finish_reason),
-    calls.length > 0
-  ))
+  const completion = responsesStatusFields(geminiResponseCompletionReason(body, candidate, calls.length > 0))
   for (const call of calls) call.status = completion.status
   // geminiResponseToChat historically generated missing call IDs before the
   // enclosing response ID. Preserve that deterministic clock ordering.
@@ -1502,7 +1757,7 @@ function anthropicResponseToGemini(body: JsonObject, fallbackModel: string): Jso
       functionCall: omitUndefined({
         id: optionalString(stringValue(block.id)),
         name: stringValue(block.name),
-        args: objectValue(block.input) ?? {}
+        args: parseJsonObject(block.input, 'Anthropic tool_use.input')
       })
     })
   }
@@ -1542,7 +1797,7 @@ function geminiResponseToAnthropic(
       type: 'tool_use',
       id,
       name: stringValue(call.name),
-      input: objectValue(call.args) ?? {}
+      input: parseJsonObject(call.args, 'Gemini functionCall.args')
     })
   }
   const responseId = `chatcmpl_${now()}`
@@ -1554,8 +1809,7 @@ function geminiResponseToAnthropic(
   const usage = objectValue(body.usageMetadata) ?? objectValue(body.usage_metadata)
   const inputTokens = numberValue(usage?.promptTokenCount) ?? 0
   const outputTokens = numberValue(usage?.candidatesTokenCount) ?? 0
-  const finishReason = stringValue(candidate.finishReason ?? candidate.finish_reason)
-  const completionReason = geminiCompletionReason(finishReason, calls.length > 0)
+  const completionReason = geminiResponseCompletionReason(body, candidate, calls.length > 0)
   return {
     id: responseId,
     type: 'message',
@@ -1595,10 +1849,7 @@ function geminiResponseToChat(body: JsonObject, fallbackModel: string, now: () =
     choices: [{
       index: 0,
       message,
-      finish_reason: geminiFinishReasonToChat(
-        stringValue(candidate.finishReason ?? candidate.finish_reason),
-        toolCalls.length > 0
-      )
+      finish_reason: completionReasonToChat(geminiResponseCompletionReason(body, candidate, toolCalls.length > 0))
     }],
     usage: { prompt_tokens: inputTokens, completion_tokens: outputTokens, total_tokens: inputTokens + outputTokens }
   }
@@ -1612,13 +1863,7 @@ function chatResponseToGemini(body: JsonObject, fallbackModel: string): JsonObje
   if (text) parts.push({ text })
   for (const toolCall of arrayOfObjects(message.tool_calls)) {
     const functionValue = objectValue(toolCall.function) ?? {}
-    let args: JsonObject = {}
-    try {
-      const parsed: unknown = JSON.parse(stringValue(functionValue.arguments, '{}'))
-      args = objectValue(parsed) ?? {}
-    } catch {
-      args = {}
-    }
+    const args = parseJsonObject(functionValue.arguments, 'Chat tool_call.function.arguments')
     parts.push({
       functionCall: omitUndefined({
         id: optionalString(toolCall.id),
@@ -1723,8 +1968,14 @@ function chatToolContentToAnthropic(value: unknown): unknown {
   if (Array.isArray(value)) {
     const blocks: JsonObject[] = []
     for (const part of arrayOfObjects(value)) {
-      const text = stringValue(part.text)
-      if (text) blocks.push({ type: 'text', text })
+      if (stringValue(part.type) === 'image_url') {
+        const url = chatImageUrl(part)
+        const image = url ? imageUrlToAnthropic(url) : undefined
+        if (image) blocks.push(image)
+      } else {
+        const text = stringValue(part.text)
+        if (text) blocks.push({ type: 'text', text })
+      }
     }
     if (blocks.length > 0) return blocks
   }
@@ -1760,8 +2011,14 @@ function responsesFunctionOutputToAnthropic(value: unknown): unknown {
   if (Array.isArray(value)) {
     const content: JsonObject[] = []
     for (const item of arrayOfObjects(value)) {
-      const text = stringValue(item.text)
-      if (text) content.push({ type: 'text', text })
+      if (stringValue(item.type) === 'input_image') {
+        const url = imageUrlValue(item)
+        const image = url ? imageUrlToAnthropic(url) : undefined
+        if (image) content.push(image)
+      } else {
+        const text = stringValue(item.text)
+        if (text) content.push({ type: 'text', text })
+      }
     }
     if (content.length > 0) return content
   }
@@ -1773,8 +2030,13 @@ function anthropicToolResultToResponses(value: unknown): unknown {
   if (Array.isArray(value)) {
     const output: JsonObject[] = []
     for (const part of arrayOfObjects(value)) {
-      const text = stringValue(part.text)
-      if (text) output.push({ type: 'input_text', text })
+      if (stringValue(part.type) === 'image') {
+        const url = anthropicImageUrl(part)
+        if (url) output.push({ type: 'input_image', image_url: url })
+      } else {
+        const text = stringValue(part.text)
+        if (text) output.push({ type: 'input_text', text })
+      }
     }
     if (output.length > 0) return output
   }
@@ -1850,8 +2112,19 @@ function chatToolOutputToResponses(value: unknown): unknown {
   if (Array.isArray(value)) {
     const output: JsonObject[] = []
     for (const part of arrayOfObjects(value)) {
-      const text = stringValue(part.text)
-      if (text) output.push({ type: 'input_text', text })
+      if (stringValue(part.type) === 'image_url') {
+        const url = chatImageUrl(part)
+        if (url) {
+          output.push(omitUndefined({
+            type: 'input_image',
+            image_url: url,
+            detail: chatImageDetail(part)
+          }))
+        }
+      } else {
+        const text = stringValue(part.text)
+        if (text) output.push({ type: 'input_text', text })
+      }
     }
     if (output.length > 0) return output
   }
@@ -2202,12 +2475,7 @@ function chatMessageToAnthropicContent(message: JsonObject): JsonObject[] {
   }
   for (const toolCall of chatMessageToolCalls(message)) {
     const functionValue = objectValue(toolCall.function) ?? {}
-    let input: JsonObject = {}
-    try {
-      input = objectValue(JSON.parse(stringValue(functionValue.arguments, '{}'))) ?? {}
-    } catch {
-      input = {}
-    }
+    const input = parseJsonObject(functionValue.arguments, 'Chat tool_call.function.arguments')
     blocks.push({ type: 'tool_use', id: stringValue(toolCall.id), name: stringValue(functionValue.name), input })
   }
   return blocks.length > 0 ? blocks : [{ type: 'text', text: '' }]
@@ -2231,12 +2499,7 @@ function chatMessageToGeminiParts(message: JsonObject): JsonObject[] {
   }
   for (const toolCall of arrayOfObjects(message.tool_calls)) {
     const definition = objectValue(toolCall.function) ?? {}
-    let args: JsonObject = {}
-    try {
-      args = objectValue(JSON.parse(stringValue(definition.arguments, '{}'))) ?? {}
-    } catch {
-      args = {}
-    }
+    const args = parseJsonObject(definition.arguments, 'Chat tool_call.function.arguments')
     parts.push({
       functionCall: omitUndefined({
         id: optionalString(toolCall.id),
@@ -2248,12 +2511,18 @@ function chatMessageToGeminiParts(message: JsonObject): JsonObject[] {
   return parts.length > 0 ? parts : [{ text: '' }]
 }
 
-function responsesContentToChat(value: unknown): string {
+function responsesContentToChat(value: unknown, includeRefusal = true): string {
   if (typeof value === 'string') return value
   const text: string[] = []
   for (const item of arrayValue(value)) {
     const object = objectValue(item)
-    if (object) text.push(stringValue(object.text) || stringValue(object.value))
+    if (object) {
+      text.push(
+        stringValue(object.text)
+        || stringValue(object.value)
+        || (includeRefusal ? stringValue(object.refusal) : '')
+      )
+    }
   }
   return text.join('')
 }
@@ -2265,9 +2534,14 @@ function responsesContentToChatContent(value: unknown): unknown {
     const type = stringValue(item.type)
     if (type === 'input_image') {
       const url = imageUrlValue(item)
-      if (url) parts.push({ type: 'image_url', image_url: { url } })
+      if (url) {
+        parts.push({
+          type: 'image_url',
+          image_url: omitUndefined({ url, detail: optionalString(item.detail) })
+        })
+      }
     } else {
-      const text = stringValue(item.text) || stringValue(item.value)
+      const text = stringValue(item.text) || stringValue(item.value) || stringValue(item.refusal)
       if (text) parts.push({ type: 'text', text })
     }
   }
@@ -2283,7 +2557,7 @@ function responsesContentToAnthropicContent(value: unknown): JsonObject[] {
       const block = image ? imageUrlToAnthropic(image) : undefined
       if (block) blocks.push(block)
     } else {
-      const text = stringValue(item.text) || stringValue(item.value)
+      const text = stringValue(item.text) || stringValue(item.value) || stringValue(item.refusal)
       if (text) blocks.push({ type: 'text', text })
     }
   }
@@ -2306,8 +2580,12 @@ function responsesContentToGeminiParts(value: unknown): JsonObject[] {
   return parts
 }
 
-function responsesContentToText(value: unknown): string {
-  return responsesContentToChat(value)
+function responsesContentToText(value: unknown, includeRefusal = true): string {
+  return responsesContentToChat(value, includeRefusal)
+}
+
+function responsesRefusalToText(value: unknown): string {
+  return arrayOfObjects(value).map((item) => stringValue(item.refusal)).join('')
 }
 
 function chatContentToResponses(value: unknown, output = false): JsonObject[] {
@@ -2316,7 +2594,13 @@ function chatContentToResponses(value: unknown, output = false): JsonObject[] {
   for (const part of arrayOfObjects(value)) {
     if (!output && stringValue(part.type) === 'image_url') {
       const url = chatImageUrl(part)
-      if (url) content.push({ type: 'input_image', image_url: url })
+      if (url) {
+        content.push(omitUndefined({
+          type: 'input_image',
+          image_url: url,
+          detail: chatImageDetail(part)
+        }))
+      }
       continue
     }
     const text = stringValue(part.text)
@@ -2352,6 +2636,11 @@ function imageUrlValue(item: JsonObject): string | undefined {
 function chatImageUrl(part: JsonObject): string | undefined {
   const image = part.image_url ?? part.imageUrl
   return typeof image === 'string' ? optionalString(image) : optionalString(objectValue(image)?.url)
+}
+
+function chatImageDetail(part: JsonObject): string | undefined {
+  const image = part.image_url ?? part.imageUrl
+  return optionalString(objectValue(image)?.detail)
 }
 
 function imageUrlToAnthropic(url: string): JsonObject | undefined {
@@ -2479,6 +2768,19 @@ function geminiCompletionReason(reason: string, hasToolCalls = false): Completio
   return 'stop'
 }
 
+function geminiResponseCompletionReason(
+  body: JsonObject,
+  candidate: JsonObject,
+  hasToolCalls = false
+): CompletionReason {
+  const finishReason = optionalString(candidate.finishReason ?? candidate.finish_reason)
+  if (finishReason) return geminiCompletionReason(finishReason, hasToolCalls)
+  const promptFeedback = objectValue(body.promptFeedback) ?? objectValue(body.prompt_feedback)
+  const blockReason = stringValue(promptFeedback?.blockReason ?? promptFeedback?.block_reason).trim().toUpperCase()
+  if (blockReason && blockReason !== 'BLOCK_REASON_UNSPECIFIED') return 'content_filter'
+  return hasToolCalls ? 'tool_calls' : 'stop'
+}
+
 function responsesCompletionReason(body: JsonObject, hasToolCalls = false): CompletionReason {
   const incomplete = objectValue(body.incomplete_details)
   if (stringValue(body.status) === 'incomplete' || incomplete) {
@@ -2487,7 +2789,17 @@ function responsesCompletionReason(body: JsonObject, hasToolCalls = false): Comp
       ? 'content_filter'
       : 'length'
   }
+  if (responsesHasRefusal(body)) return 'content_filter'
   return hasToolCalls ? 'tool_calls' : 'stop'
+}
+
+function responsesHasRefusal(body: JsonObject): boolean {
+  return arrayOfObjects(body.output).some((item) => {
+    if (stringValue(item.type) === 'refusal' && optionalString(item.refusal)) return true
+    return arrayOfObjects(item.content).some((part) => (
+      stringValue(part.type) === 'refusal' && Boolean(optionalString(part.refusal))
+    ))
+  })
 }
 
 function responsesStatusFields(reason: CompletionReason): ResponsesStatusFields {
@@ -2535,10 +2847,6 @@ function anthropicStopReasonToChat(reason: string, hasToolCalls = false): string
 
 function chatFinishReasonToAnthropic(reason: string, hasToolCalls = false): string {
   return completionReasonToAnthropic(chatCompletionReason(reason, hasToolCalls))
-}
-
-function geminiFinishReasonToChat(reason: string, hasToolCalls = false): string {
-  return completionReasonToChat(geminiCompletionReason(reason, hasToolCalls))
 }
 
 function chatFinishReasonToGemini(reason: string, hasToolCalls = false): string {
@@ -2592,6 +2900,11 @@ function optionalString(value: unknown): string | undefined {
   return typeof value === 'string' && value.length > 0 ? value : undefined
 }
 
+function safeProtocolErrorCode(value: unknown): string | undefined {
+  const code = optionalString(value)?.trim()
+  return code && /^[a-z][a-z0-9_]{0,95}$/i.test(code) ? code : undefined
+}
+
 function jsonString(value: unknown): string {
   try {
     return JSON.stringify(value) ?? ''
@@ -2600,13 +2913,16 @@ function jsonString(value: unknown): string {
   }
 }
 
-function parseJsonObject(value: unknown): JsonObject {
+function parseJsonObject(value: unknown, path = 'tool.arguments'): JsonObject {
+  if (value === undefined) return {}
   if (objectValue(value)) return value as JsonObject
-  if (typeof value !== 'string') return {}
+  if (typeof value !== 'string') throw new InvalidToolArgumentsError(path)
   try {
-    return objectValue(JSON.parse(value) as unknown) ?? {}
+    const parsed = objectValue(JSON.parse(value) as unknown)
+    if (!parsed) throw new InvalidToolArgumentsError(path)
+    return parsed
   } catch {
-    return {}
+    throw new InvalidToolArgumentsError(path)
   }
 }
 

@@ -303,6 +303,7 @@ export function ClientsView({
     [activeClient, backups],
   )
   const latestBackupGroup = backupGroups[0]
+  const restoreDeletionBackups = restoreTarget?.backups.filter((backup) => backup.existed === false) ?? []
   const selectedProfile = snapshot.clientProfiles.find((candidate) => candidate.id === activeProfileId)
   const activeDocument = workbench?.documents.find((document) => document.role === activeEditorRole)
     ?? workbench?.documents[0]
@@ -501,10 +502,18 @@ export function ClientsView({
     const result = await run(`restore-${activeClient}`, () => api.restoreClientConfigBackupSet(target.groupId, activeClient, activeProfileId))
     if (!result) return
     setRestoreTarget(null)
-    setNotice(t(
-      `${meta.name} 已完整恢复 ${result.restoredFiles.length} 个配置文件 · ${formatDateTime(target.createdAt, locale)}`,
-      `${meta.name} restored ${result.restoredFiles.length} configuration ${result.restoredFiles.length === 1 ? 'file' : 'files'} · ${formatDateTime(target.createdAt, locale)}`,
-    ))
+    const deletedFiles = result.deletedFiles
+      ?? result.sourceBackups.filter((backup) => backup.existed === false).map((backup) => backup.targetPath)
+    const restoredValueCount = result.restoredFiles.length
+    setNotice(deletedFiles.length > 0
+      ? t(
+          `${meta.name} 已恢复 ${restoredValueCount} 个文件快照，并按备份状态删除 ${deletedFiles.length} 个文件 · ${formatDateTime(target.createdAt, locale)}`,
+          `${meta.name} restored ${restoredValueCount} file ${restoredValueCount === 1 ? 'snapshot' : 'snapshots'} and deleted ${deletedFiles.length} ${deletedFiles.length === 1 ? 'file' : 'files'} to match the backup · ${formatDateTime(target.createdAt, locale)}`,
+        )
+      : t(
+          `${meta.name} 已完整恢复 ${result.restoredFiles.length} 个配置文件 · ${formatDateTime(target.createdAt, locale)}`,
+          `${meta.name} restored ${result.restoredFiles.length} configuration ${result.restoredFiles.length === 1 ? 'file' : 'files'} · ${formatDateTime(target.createdAt, locale)}`,
+        ))
     await loadWorkspace(activeClient, activeProfileId)
   }
 
@@ -525,10 +534,17 @@ export function ClientsView({
   const createBackup = async () => {
     const result = await run(`backup-${activeClient}`, () => api.createClientConfigBackup(activeClient, activeProfileId))
     if (!result) return
-    setNotice(t(
-      `${meta.name} 已备份 ${result.backups.length} 个配置文件，可随时一键恢复`,
-      `${meta.name} backed up ${result.backups.length} configuration ${result.backups.length === 1 ? 'file' : 'files'} for one-click recovery`,
-    ))
+    const deletionMarkers = result.backups.filter((backup) => backup.existed === false).length
+    const valueSnapshots = result.backups.length - deletionMarkers
+    setNotice(deletionMarkers > 0
+      ? t(
+          `${meta.name} 已保存 ${valueSnapshots} 个文件快照和 ${deletionMarkers} 个“不存在”标记，可精确恢复`,
+          `${meta.name} saved ${valueSnapshots} file ${valueSnapshots === 1 ? 'snapshot' : 'snapshots'} and ${deletionMarkers} absence ${deletionMarkers === 1 ? 'marker' : 'markers'} for an exact restore`,
+        )
+      : t(
+          `${meta.name} 已备份 ${valueSnapshots} 个配置文件，可随时一键恢复`,
+          `${meta.name} backed up ${valueSnapshots} configuration ${valueSnapshots === 1 ? 'file' : 'files'} for one-click recovery`,
+        ))
     await loadWorkspace(activeClient, activeProfileId)
   }
 
@@ -999,11 +1015,10 @@ export function ClientsView({
                       <div className="client-manager-backups__list">
                         {backupGroups.map((group, index) => (
                           <div key={group.groupId}>
-                            <FileCode2 size={15} />
-                            <span><strong>{group.backups.map((backup) => roleLabel(backup.role, language)).join(' + ')}{index === 0 ? t(' · 最近', ' · Latest') : ''}</strong><small>{formatDateTime(group.createdAt, locale)} · {t(
-                              `${group.backups.length} 个文件`,
-                              `${group.backups.length} ${group.backups.length === 1 ? 'file' : 'files'}`,
-                            )}</small></span>
+                            {group.backups.some((backup) => backup.existed === false) ? <Trash2 size={15} /> : <FileCode2 size={15} />}
+                            <span><strong>{group.backups.map((backup) => (
+                              `${roleLabel(backup.role, language)}${backup.existed === false ? t('（恢复时删除）', ' (delete on restore)') : ''}`
+                            )).join(' + ')}{index === 0 ? t(' · 最近', ' · Latest') : ''}</strong><small>{formatDateTime(group.createdAt, locale)} · {backupGroupContentsLabel(group, language)}</small></span>
                             <code>{group.backups[0]?.backupPath}{group.backups.length > 1 ? `  +${group.backups.length - 1}` : ''}</code>
                             <button className="button button--secondary" type="button" disabled={Boolean(busy) || isDirty} onClick={() => setRestoreTarget(group)}><RotateCcw size={14} />{t('整组恢复', 'Restore set')}</button>
                           </div>
@@ -1120,10 +1135,10 @@ export function ClientsView({
         open={Boolean(restoreTarget)}
         title={t('恢复客户端配置', 'Restore client configuration')}
         message={restoreTarget ? t(
-          `恢复到 ${formatDateTime(restoreTarget.createdAt, locale)} 的版本吗？恢复前会先把当前配置再次备份。`,
-          `Restore the version from ${formatDateTime(restoreTarget.createdAt, locale)}? The current configuration will be backed up first.`,
+          `恢复到 ${formatDateTime(restoreTarget.createdAt, locale)} 的版本吗？恢复前会先把当前配置再次备份。${restoreDeletionBackups.length > 0 ? ` 备份中 ${restoreDeletionBackups.map((backup) => roleLabel(backup.role, language)).join('、')} 当时不存在；继续将删除这些当前文件。` : ''}`,
+          `Restore the version from ${formatDateTime(restoreTarget.createdAt, locale)}? The current configuration will be backed up first.${restoreDeletionBackups.length > 0 ? ` ${restoreDeletionBackups.map((backup) => roleLabel(backup.role, language)).join(', ')} did not exist in this backup; continuing will delete the current files.` : ''}`,
         ) : ''}
-        confirmLabel={t('恢复', 'Restore')}
+        confirmLabel={restoreDeletionBackups.length > 0 ? t('恢复并删除', 'Restore and delete') : t('恢复', 'Restore')}
         busy={Boolean(restoreTarget && busy === `restore-${activeClient}`)}
         onCancel={() => setRestoreTarget(null)}
         onConfirm={() => void restore()}
@@ -1395,6 +1410,19 @@ function groupClientBackups(backups: ClientConfigBackup[]): ClientBackupGroup[] 
     else grouped.set(groupId, { groupId, createdAt: backup.createdAt, backups: [backup] })
   }
   return [...grouped.values()].sort((left, right) => right.createdAt - left.createdAt || right.groupId.localeCompare(left.groupId))
+}
+
+function backupGroupContentsLabel(group: ClientBackupGroup, language: UiLanguage): string {
+  const deletionMarkers = group.backups.filter((backup) => backup.existed === false).length
+  const valueSnapshots = group.backups.length - deletionMarkers
+  if (deletionMarkers === 0) {
+    return language === 'zh-CN'
+      ? `${valueSnapshots} 个文件`
+      : `${valueSnapshots} ${valueSnapshots === 1 ? 'file' : 'files'}`
+  }
+  return language === 'zh-CN'
+    ? `${valueSnapshots} 个文件快照 · ${deletionMarkers} 个删除标记`
+    : `${valueSnapshots} file ${valueSnapshots === 1 ? 'snapshot' : 'snapshots'} · ${deletionMarkers} deletion ${deletionMarkers === 1 ? 'marker' : 'markers'}`
 }
 
 function safeDomId(value: string): string {

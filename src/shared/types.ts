@@ -25,8 +25,43 @@ export type OutboundNetworkMode = 'direct' | 'system'
 
 export type BuiltInProxyAccessMode = 'system' | 'tun'
 export type BuiltInProxyRuleMode = 'rule' | 'global' | 'direct'
+export type BuiltInProxyRuleAction = 'proxy' | 'direct' | 'block'
+export type BuiltInProxyRuleCondition =
+  | 'domain'
+  | 'domain-suffix'
+  | 'domain-keyword'
+  | 'ip-cidr'
+  | 'port'
+  | 'port-range'
+  | 'network'
+  | 'protocol'
+  | 'private-network'
+  | 'mainland-china'
+
+/** One renderer-editable rule. Values within a rule are ORed; rules run from top to bottom. */
+export interface BuiltInProxyEditableRule {
+  id: string
+  condition: BuiltInProxyRuleCondition
+  values: string[]
+  action: BuiltInProxyRuleAction
+}
+
+/** Explicit visual rule override. An absent override keeps the imported/built-in profile policy. */
+export interface BuiltInProxyCustomRuleSet {
+  rules: BuiltInProxyEditableRule[]
+  finalAction: Exclude<BuiltInProxyRuleAction, 'block'>
+}
 export type BuiltInProxyProfileFormat = 'sing-box-json' | 'clash-meta-yaml' | 'uri-list'
 export type BuiltInProxyLifecycleStatus = 'disabled' | 'starting' | 'ready' | 'stopping' | 'error'
+
+/** Renderer-safe proof of the operating-system access resource owned by Stone+. */
+export interface BuiltInProxyAccessState {
+  mode: BuiltInProxyAccessMode
+  status: 'idle' | 'applying' | 'ready' | 'error'
+  /** The checked local mixed endpoint. No captured system-proxy settings are exposed. */
+  endpoint?: string
+  verifiedAt?: number
+}
 
 /** Durable built-in proxy preferences. External gateway routing remains independent. */
 export interface BuiltInProxySettings {
@@ -34,6 +69,7 @@ export interface BuiltInProxySettings {
   activeProfileId?: string
   accessMode: BuiltInProxyAccessMode
   ruleMode: BuiltInProxyRuleMode
+  customRules?: BuiltInProxyCustomRuleSet
   mixedPort: number
   lanEnabled: boolean
   autoStart: boolean
@@ -101,6 +137,8 @@ export interface BuiltInProxyRuntimeState {
   settings: BuiltInProxySettings
   profiles: BuiltInProxyProfileSummary[]
   effectiveRoute: EffectiveOutboundRoute
+  /** `ready` is published only while the selected system lease or TUN is verifiably active. */
+  accessState: BuiltInProxyAccessState
   coreVersion?: string
   startedAt?: number
   lastReadyAt?: number
@@ -393,6 +431,8 @@ export interface ClientConfigBackup {
   role: ClientConfigFileRole
   targetPath: string
   backupPath: string
+  /** False denotes an explicit absence marker: restoring this entry removes the target. Legacy senders omit it and are treated as true. */
+  existed?: boolean
   /** Stable id shared by files captured in the same backup operation. */
   groupId: string
   createdAt: number
@@ -415,7 +455,10 @@ export interface ClientConfigBackupSetRestoreResult {
   client: RouteClient
   groupId: string
   createdAt: number
+  /** Paths populated from value snapshots. */
   restoredFiles: string[]
+  /** Previously existing paths removed to reproduce explicit absence markers. Optional for older main processes. */
+  deletedFiles?: string[]
   sourceBackups: ClientConfigBackup[]
   safetyBackupSet?: ClientConfigBackupSet
 }
@@ -1269,6 +1312,8 @@ export interface ApiSourceInput {
   unlinkIncompatiblePools?: boolean
   capabilityProfile?: UpstreamCapabilityProfile
   modelCatalog?: ModelCapabilityDefinition[]
+  /** One-use main-process evidence binding returned by a successful unsaved-source probe. */
+  probeEvidenceToken?: string
 }
 
 export interface ApiSourceProbeInput {
@@ -1300,11 +1345,15 @@ export interface ApiSourceProbeResult {
   ok: boolean
   stages: ApiSourceProbeStage[]
   models: string[]
+  /** Exact model submitted to the real generation probe, when that stage ran. */
+  testedModel?: string
   latencyMs?: number
   error?: string
   warnings: string[]
   capabilityProfile: UpstreamCapabilityProfile
   modelCatalog: ModelCapabilityDefinition[]
+  /** Opaque, short-lived and one-use; never contains the connection fingerprint or credential. */
+  probeEvidenceToken?: string
 }
 
 export interface RoutePreviewInput {
@@ -1499,6 +1548,13 @@ export interface BackupRecordSummary {
   size: number
   integrity: 'valid' | 'invalid'
   automatic: boolean
+}
+
+export interface AutomaticBackupRuntimeState {
+  configuredEnabled: boolean
+  running: boolean
+  blocked: boolean
+  message?: string
 }
 
 export interface BackupOperationResult {
@@ -1779,6 +1835,8 @@ export interface GatewayApi {
   selectBuiltInProxyProfile(id: string): Promise<BuiltInProxyRuntimeState>
   selectBuiltInProxyNode(profileId: string, nodeId: string): Promise<BuiltInProxyRuntimeState>
   setBuiltInProxyRuleMode(mode: BuiltInProxySettings['ruleMode']): Promise<BuiltInProxyRuntimeState>
+  /** Null clears the visual override and restores the selected profile's rules. */
+  setBuiltInProxyCustomRules(rules: BuiltInProxyCustomRuleSet | null): Promise<BuiltInProxyRuntimeState>
   setBuiltInProxyAccessMode(mode: BuiltInProxySettings['accessMode']): Promise<BuiltInProxyRuntimeState>
   setBuiltInProxyLanEnabled(enabled: boolean): Promise<BuiltInProxyRuntimeState>
   setBuiltInProxyAutoStart(enabled: boolean): Promise<BuiltInProxyRuntimeState>
@@ -1849,6 +1907,7 @@ export interface GatewayApi {
   clearPersistentTasks(): Promise<PersistentTask[]>
   startAccountCheckTask(accountIds?: string[]): Promise<PersistentTask>
   listStateBackups(): Promise<BackupRecordSummary[]>
+  getAutomaticBackupRuntimeState(): Promise<AutomaticBackupRuntimeState>
   createStateBackup(): Promise<BackupOperationResult>
   verifyStateBackup(path: string): Promise<BackupRecordSummary>
   restoreStateBackup(path: string): Promise<BackupOperationResult>

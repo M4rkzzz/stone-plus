@@ -91,6 +91,49 @@ describe('BuiltInProxyRouteCoordinator', () => {
     expect(disposeFirst).toHaveBeenCalledTimes(1)
   })
 
+  it('forces retirement after the drain grace when a response body is abandoned', async () => {
+    const coordinator = trackCoordinator(new BuiltInProxyRouteCoordinator({
+      retirementDrainTimeoutMs: 10,
+      disposalTimeoutMs: 20,
+    }))
+    const dispose = vi.fn(async () => undefined)
+    const routed = coordinator.bind(fetchSpy('external'), fetchSpy('loopback'))
+    coordinator.requestEnable()
+    coordinator.activate({
+      fetchImplementation: vi.fn(async () => new Response(new ReadableStream({ start() {} }))) as unknown as typeof fetch,
+      mixedEndpoint: 'http://127.0.0.1:19110',
+      dispose,
+    })
+
+    const abandoned = await routed('https://api.example/abandoned')
+    coordinator.activate({
+      fetchImplementation: fetchSpy('replacement'),
+      mixedEndpoint: 'http://127.0.0.1:19111',
+    })
+    await coordinator.drainRetired()
+
+    expect(dispose).toHaveBeenCalledOnce()
+    await abandoned.body?.cancel()
+  })
+
+  it('bounds a generation disposer that never settles', async () => {
+    const coordinator = trackCoordinator(new BuiltInProxyRouteCoordinator({ disposalTimeoutMs: 10 }))
+    const dispose = vi.fn(() => new Promise<void>(() => undefined))
+    coordinator.requestEnable()
+    coordinator.activate({
+      fetchImplementation: fetchSpy('first'),
+      mixedEndpoint: 'http://127.0.0.1:19112',
+      dispose,
+    })
+    coordinator.activate({
+      fetchImplementation: fetchSpy('replacement'),
+      mixedEndpoint: 'http://127.0.0.1:19113',
+    })
+
+    await coordinator.drainRetired()
+    expect(dispose).toHaveBeenCalledOnce()
+  })
+
   it('fails closed immediately after a core crash without consulting any external route', async () => {
     const coordinator = trackCoordinator(new BuiltInProxyRouteCoordinator())
     const externalFetch = fetchSpy('external leak')
@@ -122,6 +165,16 @@ describe('BuiltInProxyRouteCoordinator', () => {
     // and remain direct even while internet traffic is blocked.
     expect(await (await routed('http://127.0.0.1:19093/health')).text()).toBe('loopback')
     expect(loopbackFetch).toHaveBeenCalledTimes(1)
+  })
+
+  it('normalizes underscore-form runtime error categories at the route boundary', () => {
+    const coordinator = trackCoordinator(new BuiltInProxyRouteCoordinator())
+    coordinator.failClosed({
+      category: 'core_crashed' as never,
+      message: 'core exited',
+      retryable: true,
+    })
+    expect(coordinator.getSnapshot().error?.category).toBe('core-crashed')
   })
 
   it('does not restore external routing until disable restoration commits', async () => {
@@ -164,6 +217,32 @@ describe('BuiltInProxyRouteCoordinator', () => {
       mixedEndpoint: 'http://192.0.2.1:1080'
     })).toThrow('loopback HTTP address')
     expect(coordinator.getSnapshot().effectiveRoute.kind).toBe('external')
+  })
+
+  it('releases generation-owned loopback ports when the generation is replaced or disabled', async () => {
+    const coordinator = trackCoordinator(new BuiltInProxyRouteCoordinator({ directLoopbackPorts: [15721] }))
+    const routed = coordinator.bind(fetchSpy('external'), fetchSpy('loopback'))
+
+    coordinator.requestEnable()
+    coordinator.activate({
+      fetchImplementation: fetchSpy('first'),
+      mixedEndpoint: 'http://127.0.0.1:19101',
+      directLoopbackPorts: [19102],
+    })
+    expect(await (await routed('http://127.0.0.1:19102/control')).text()).toBe('loopback')
+
+    coordinator.activate({
+      fetchImplementation: fetchSpy('second'),
+      mixedEndpoint: 'http://127.0.0.1:19103',
+      directLoopbackPorts: [19104],
+    })
+    expect(await (await routed('http://127.0.0.1:19102/control')).text()).toBe('second')
+    expect(await (await routed('http://127.0.0.1:19104/control')).text()).toBe('loopback')
+
+    coordinator.beginDisable()
+    coordinator.completeDisable()
+    expect(await (await routed('http://127.0.0.1:19104/control')).text()).toBe('external')
+    expect(await (await routed('http://127.0.0.1:15721/control')).text()).toBe('loopback')
   })
 })
 

@@ -193,7 +193,7 @@ async function deriveKey(password: string, salt: Buffer): Promise<Buffer> {
       salt,
       32,
       { N: 1 << 15, r: 8, p: 1, maxmem: 64 * 1024 * 1024 },
-      (error, key) => error ? reject(error) : resolve(Buffer.from(key))
+      (error, derivedKey) => error ? reject(error) : resolve(derivedKey)
     )
   })
 }

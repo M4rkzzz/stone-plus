@@ -1,4 +1,5 @@
 import { isIP } from 'node:net'
+import type { BuiltInProxyCustomRuleSet, BuiltInProxyEditableRule } from '@shared/types'
 import type {
   BuiltInProxyRuleMode,
   InternalProxyNode,
@@ -33,6 +34,8 @@ export interface BuildSingBoxConfigInput {
   mode: BuiltInProxyRuleMode
   /** Runtime listener ownership stays in SingBoxService; this controls policy only. */
   accessMode: BuiltInProxyAccessMode
+  /** Explicit visual override for rule mode. Undefined preserves profile rules/fallback behavior. */
+  customRules?: BuiltInProxyCustomRuleSet
   dnsServers?: string[]
 }
 
@@ -44,7 +47,7 @@ export interface BuildSingBoxConfigResult {
   /** Main-process-only node/tag map used by controller delay tests. */
   outboundTags: Record<string, string>
   requestedNodeMissing: boolean
-  routePolicy: 'preserved' | 'fallback' | 'global' | 'direct'
+  routePolicy: 'preserved' | 'fallback' | 'custom' | 'global' | 'direct'
   warnings: string[]
 }
 
@@ -90,12 +93,14 @@ export function buildSingBoxConfig(input: BuildSingBoxConfigInput): BuildSingBox
     ? 'direct'
     : input.mode === 'global'
       ? 'global'
+      : input.customRules !== undefined
+        ? 'custom'
       : input.profile.ruleStatus === 'preserved' && input.profile.rules.length > 0
         ? 'preserved'
         : 'fallback'
   if (selectedPolicy === 'fallback' && input.profile.ruleDowngrade?.message) warnings.push(input.profile.ruleDowngrade.message)
 
-  const route = buildRoute(input.profile.rules, selectedPolicy, activeTag)
+  const route = buildRoute(input.profile.rules, selectedPolicy, activeTag, input.customRules)
   return {
     config: {
       log: { level: 'warn', timestamp: true },
@@ -122,25 +127,50 @@ export function buildSingBoxConfig(input: BuildSingBoxConfigInput): BuildSingBox
 function buildRoute(
   importedRules: InternalProxyRule[],
   policy: BuildSingBoxConfigResult['routePolicy'],
-  proxyTag?: string
+  proxyTag?: string,
+  customRules?: BuiltInProxyCustomRuleSet
 ): SingBoxSourceConfiguration['route'] {
   const rules: Array<Record<string, SingBoxJson>> = [
     routeRule({ ip_cidr: ['127.0.0.0/8', '::1/128'] }, 'direct', proxyTag)
   ]
+  let sniffActionAdded = false
+  const pushPolicyRule = (
+    rule: Record<string, SingBoxJson>,
+    requiresSniff = false
+  ): void => {
+    if (requiresSniff && !sniffActionAdded) {
+      // Since sing-box 1.13, sniffing is a Stone-owned non-final route action,
+      // not an imported inbound option. Insert it only where a later rule
+      // needs inspected domain/protocol metadata so IP-only routes stay fast.
+      rules.push({ action: 'sniff', timeout: '300ms' })
+      sniffActionAdded = true
+    }
+    rules.push(rule)
+  }
   let final = policy === 'direct' ? DIRECT_TAG : requireProxyTag(proxyTag)
   let needsChinaRuleSets = false
 
   if (policy === 'fallback') {
-    rules.push(routeRule({ ip_is_private: true }, 'direct', proxyTag))
-    rules.push(routeRule({ rule_set: [GEOSITE_CN_TAG, GEOIP_CN_TAG] }, 'direct', proxyTag))
+    pushPolicyRule(routeRule({ ip_is_private: true }, 'direct', proxyTag))
+    pushPolicyRule(
+      routeRule({ rule_set: [GEOSITE_CN_TAG, GEOIP_CN_TAG] }, 'direct', proxyTag),
+      true
+    )
     needsChinaRuleSets = true
+  } else if (policy === 'custom') {
+    if (!customRules) throw new BuiltInProxyConfigError('invalid-profile', 'The custom proxy rule set is missing.')
+    for (const rule of customRules.rules) {
+      if (rule.condition === 'mainland-china') needsChinaRuleSets = true
+      pushPolicyRule(convertEditableRule(rule, proxyTag), editableRuleRequiresSniff(rule))
+    }
+    final = customRules.finalAction === 'direct' ? DIRECT_TAG : requireProxyTag(proxyTag)
   } else if (policy === 'preserved') {
     for (const rule of importedRules) {
       if (rule.ruleSetTags?.length) needsChinaRuleSets = true
       if (isCatchAll(rule) && rule.action !== 'block') {
         final = rule.action === 'direct' ? DIRECT_TAG : requireProxyTag(proxyTag)
       } else {
-        rules.push(convertRule(rule, proxyTag))
+        pushPolicyRule(convertRule(rule, proxyTag), importedRuleRequiresSniff(rule))
       }
     }
   }
@@ -148,9 +178,54 @@ function buildRoute(
   return {
     auto_detect_interface: true,
     rules,
-    ...(needsChinaRuleSets ? { rule_set: chinaRuleSets() } : {}),
+    // These Stone-owned rule sets live on GitHub, which is commonly
+    // unreachable on the very networks the built-in proxy is intended to
+    // repair.  Download them through the selected outbound instead of
+    // blocking core startup on an unavailable direct path.  Node-server and
+    // DNS bootstrap traffic remain direct and TUN-excluded elsewhere.
+    ...(needsChinaRuleSets ? { rule_set: chinaRuleSets(requireProxyTag(proxyTag)) } : {}),
     final
   }
+}
+
+function convertEditableRule(
+  rule: BuiltInProxyEditableRule,
+  proxyTag?: string
+): Record<string, SingBoxJson> {
+  const values = rule.values
+  let match: Record<string, SingBoxJson>
+  switch (rule.condition) {
+    case 'domain': match = { domain: values }; break
+    case 'domain-suffix': match = { domain_suffix: values }; break
+    case 'domain-keyword': match = { domain_keyword: values }; break
+    case 'ip-cidr': match = { ip_cidr: values }; break
+    case 'port': match = { port: values.map(Number) }; break
+    case 'port-range': match = { port_range: values }; break
+    case 'network': match = { network: values }; break
+    case 'protocol': match = { protocol: values }; break
+    case 'private-network': match = { ip_is_private: true }; break
+    case 'mainland-china': match = { rule_set: [GEOSITE_CN_TAG, GEOIP_CN_TAG] }; break
+    default: throw new BuiltInProxyConfigError('invalid-profile', 'The custom proxy rule set contains an unsupported condition.')
+  }
+  return routeRule(match, rule.action, proxyTag)
+}
+
+function editableRuleRequiresSniff(rule: BuiltInProxyEditableRule): boolean {
+  return rule.condition === 'domain'
+    || rule.condition === 'domain-suffix'
+    || rule.condition === 'domain-keyword'
+    || rule.condition === 'protocol'
+    || rule.condition === 'mainland-china'
+}
+
+function importedRuleRequiresSniff(rule: InternalProxyRule): boolean {
+  return Boolean(
+    rule.domains?.length
+    || rule.domainSuffixes?.length
+    || rule.domainKeywords?.length
+    || rule.protocols?.length
+    || rule.ruleSetTags?.includes('geosite-cn')
+  )
 }
 
 function convertRule(rule: InternalProxyRule, proxyTag?: string): Record<string, SingBoxJson> {
@@ -248,17 +323,17 @@ function transportConfig(transport: NonNullable<InternalProxyNode['transport']>)
   return result
 }
 
-function chinaRuleSets(): Array<Record<string, SingBoxJson>> {
+function chinaRuleSets(downloadDetour: string): Array<Record<string, SingBoxJson>> {
   return [
     {
       type: 'remote', tag: GEOSITE_CN_TAG, format: 'binary',
       url: 'https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs',
-      download_detour: DIRECT_TAG, update_interval: '168h'
+      download_detour: downloadDetour, update_interval: '168h'
     },
     {
       type: 'remote', tag: GEOIP_CN_TAG, format: 'binary',
       url: 'https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs',
-      download_detour: DIRECT_TAG, update_interval: '168h'
+      download_detour: downloadDetour, update_interval: '168h'
     }
   ]
 }

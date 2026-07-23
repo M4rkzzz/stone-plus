@@ -80,6 +80,202 @@ export function PageHeader({
   )
 }
 
+interface ModalStackEntry {
+  id: symbol
+  backdrop: HTMLDivElement
+  dialog: HTMLElement
+  closable: () => boolean
+  close: () => void
+  restoreFocusTo: HTMLElement | null
+}
+
+interface BackgroundIsolationSnapshot {
+  element: Element
+  inert: string | null
+  ariaHidden: string | null
+}
+
+const modalStack: ModalStackEntry[] = []
+const focusableSelector = [
+  'a[href]',
+  'area[href]',
+  'button:not([disabled])',
+  'input:not([disabled]):not([type="hidden"])',
+  'select:not([disabled])',
+  'textarea:not([disabled])',
+  'iframe',
+  'object',
+  'embed',
+  'audio[controls]',
+  'video[controls]',
+  'summary',
+  '[contenteditable="true"]',
+  '[tabindex]:not([tabindex="-1"])',
+].join(',')
+let isolatedBackground: BackgroundIsolationSnapshot[] = []
+let modalListenerDocument: Document | null = null
+
+function topModal(): ModalStackEntry | undefined {
+  return modalStack[modalStack.length - 1]
+}
+
+function isTopModal(id: symbol): boolean {
+  return topModal()?.id === id
+}
+
+function handleModalKeyDown(event: KeyboardEvent): void {
+  const modal = topModal()
+  if (!modal) return
+  if (event.key === 'Escape') {
+    event.preventDefault()
+    event.stopPropagation()
+    event.stopImmediatePropagation()
+    if (modal.closable()) modal.close()
+    return
+  }
+  if (event.key !== 'Tab') return
+  trapModalTabKey(event, modal.dialog)
+}
+
+function trapModalTabKey(event: KeyboardEvent, dialog: HTMLElement): void {
+  const focusable = focusableElements(dialog)
+  const activeElement = dialog.ownerDocument.activeElement
+  if (focusable.length === 0) {
+    event.preventDefault()
+    event.stopPropagation()
+    focusElement(dialog)
+    return
+  }
+  const activeIndex = focusable.findIndex((element) => element === activeElement)
+  if (activeIndex < 0) {
+    event.preventDefault()
+    event.stopPropagation()
+    focusElement(event.shiftKey ? focusable[focusable.length - 1] : focusable[0])
+    return
+  }
+  const atBoundary = event.shiftKey ? activeIndex === 0 : activeIndex === focusable.length - 1
+  if (!atBoundary) return
+  event.preventDefault()
+  event.stopPropagation()
+  focusElement(event.shiftKey ? focusable[focusable.length - 1] : focusable[0])
+}
+
+function focusableElements(dialog: HTMLElement): HTMLElement[] {
+  return Array.from(dialog.querySelectorAll<HTMLElement>(focusableSelector))
+    .map((element, index) => ({ element, index }))
+    .filter(({ element }) => canReceiveModalFocus(element))
+    .sort((left, right) => {
+      const leftOrder = left.element.tabIndex > 0 ? left.element.tabIndex : Number.MAX_SAFE_INTEGER
+      const rightOrder = right.element.tabIndex > 0 ? right.element.tabIndex : Number.MAX_SAFE_INTEGER
+      return leftOrder === rightOrder ? left.index - right.index : leftOrder - rightOrder
+    })
+    .map(({ element }) => element)
+}
+
+function canReceiveModalFocus(element: HTMLElement): boolean {
+  if (element.tabIndex < 0 || element.matches(':disabled')) return false
+  if (element.closest('[inert], [hidden], [aria-hidden="true"]')) return false
+  const view = element.ownerDocument.defaultView
+  const style = view?.getComputedStyle(element)
+  if (style?.display === 'none' || style?.visibility === 'hidden') return false
+  return typeof element.getClientRects !== 'function' || element.getClientRects().length > 0
+}
+
+function focusInitialModalElement(dialog: HTMLElement): void {
+  const activeElement = dialog.ownerDocument.activeElement
+  if (activeElement && dialog.contains(activeElement)) return
+  const explicitTarget = dialog.querySelector<HTMLElement>('[autofocus]')
+  const safeTarget = dialog.querySelector<HTMLElement>('[data-modal-initial-focus]')
+  const target = [explicitTarget, safeTarget].find((element): element is HTMLElement => (
+    Boolean(element && canReceiveModalFocus(element))
+  )) ?? focusableElements(dialog)[0] ?? dialog
+  focusElement(target)
+}
+
+function focusElement(element: HTMLElement): void {
+  try {
+    element.focus({ preventScroll: true })
+  } catch {
+    element.focus()
+  }
+}
+
+function registerModal(entry: ModalStackEntry): void {
+  modalStack.push(entry)
+  syncModalListener()
+  refreshBackgroundIsolation()
+  focusInitialModalElement(entry.dialog)
+}
+
+function unregisterModal(entry: ModalStackEntry): void {
+  const index = modalStack.findIndex((candidate) => candidate.id === entry.id)
+  if (index < 0) return
+  modalStack.splice(index, 1)
+  syncModalListener()
+  refreshBackgroundIsolation()
+  queueMicrotask(() => restoreModalFocus(entry))
+}
+
+function syncModalListener(): void {
+  const nextDocument = topModal()?.dialog.ownerDocument ?? null
+  if (modalListenerDocument === nextDocument) return
+  modalListenerDocument?.removeEventListener('keydown', handleModalKeyDown, true)
+  modalListenerDocument = nextDocument
+  modalListenerDocument?.addEventListener('keydown', handleModalKeyDown, true)
+}
+
+function refreshBackgroundIsolation(): void {
+  for (const snapshot of isolatedBackground) {
+    restoreAttribute(snapshot.element, 'inert', snapshot.inert)
+    restoreAttribute(snapshot.element, 'aria-hidden', snapshot.ariaHidden)
+  }
+  isolatedBackground = []
+
+  const modal = topModal()
+  if (!modal) return
+  let branch: Element = modal.backdrop
+  const body = modal.dialog.ownerDocument.body
+  while (branch.parentElement) {
+    const parent = branch.parentElement
+    for (const sibling of Array.from(parent.children)) {
+      if (sibling === branch) continue
+      isolatedBackground.push({
+        element: sibling,
+        inert: sibling.getAttribute('inert'),
+        ariaHidden: sibling.getAttribute('aria-hidden'),
+      })
+      sibling.setAttribute('inert', '')
+      sibling.setAttribute('aria-hidden', 'true')
+    }
+    if (parent === body) break
+    branch = parent
+  }
+}
+
+function restoreAttribute(element: Element, name: string, value: string | null): void {
+  if (value === null) element.removeAttribute(name)
+  else element.setAttribute(name, value)
+}
+
+function restoreModalFocus(entry: ModalStackEntry): void {
+  // React Strict Mode deliberately re-runs layout effects. A layer registered
+  // again with the same identity is still open and must retain focus.
+  if (modalStack.some((candidate) => candidate.id === entry.id)) return
+  const currentTop = topModal()
+  const target = entry.restoreFocusTo
+  if (target && canRestoreModalFocus(target) && (!currentTop || currentTop.dialog.contains(target))) {
+    focusElement(target)
+    return
+  }
+  if (currentTop) focusInitialModalElement(currentTop.dialog)
+}
+
+function canRestoreModalFocus(element: HTMLElement): boolean {
+  return element.isConnected
+    && !element.matches(':disabled')
+    && !element.closest('[inert], [hidden], [aria-hidden="true"]')
+}
+
 export function Modal({
   open,
   title,
@@ -89,6 +285,9 @@ export function Modal({
   onClose,
   width = 'medium',
   closable = true,
+  busy = false,
+  dialogRole = 'dialog',
+  describedBy,
 }: {
   open: boolean
   title: string
@@ -98,31 +297,80 @@ export function Modal({
   onClose: () => void
   width?: 'small' | 'medium' | 'large' | 'xlarge'
   closable?: boolean
+  busy?: boolean
+  dialogRole?: 'dialog' | 'alertdialog'
+  describedBy?: string
 }) {
   const { t } = useI18n()
   const titleId = useId()
+  const descriptionId = useId()
+  const backdropRef = useRef<HTMLDivElement>(null)
+  const dialogRef = useRef<HTMLElement>(null)
+  const modalIdRef = useRef<symbol | null>(null)
+  const restoreFocusRef = useRef<HTMLElement | null>(null)
+  const wasOpenRef = useRef(false)
+  const onCloseRef = useRef(onClose)
+  const closableRef = useRef(closable)
+  onCloseRef.current = onClose
+  closableRef.current = closable
+  if (!modalIdRef.current) modalIdRef.current = Symbol('modal')
+  const modalId = modalIdRef.current
+  const ariaDescribedBy = [description ? descriptionId : undefined, describedBy]
+    .filter((value): value is string => Boolean(value?.trim()))
+    .join(' ') || undefined
 
-  useEffect(() => {
-    if (!open || !closable) return
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') onClose()
+  // Capture the opener during the closed -> open render, before React applies
+  // a descendant's autoFocus during commit. The ref write is intentionally
+  // render-local and is refreshed for every later reopening of this instance.
+  if (open && !wasOpenRef.current && typeof document !== 'undefined') {
+    const activeElement = document.activeElement
+    restoreFocusRef.current = activeElement instanceof HTMLElement ? activeElement : null
+  }
+  wasOpenRef.current = open
+
+  useLayoutEffect(() => {
+    if (!open || !backdropRef.current || !dialogRef.current) return
+    const dialog = dialogRef.current
+    const activeElement = dialog.ownerDocument.activeElement
+    if (activeElement instanceof HTMLElement && !dialog.contains(activeElement)) restoreFocusRef.current = activeElement
+    else if (restoreFocusRef.current && !restoreFocusRef.current.isConnected) restoreFocusRef.current = null
+    const entry: ModalStackEntry = {
+      id: modalId,
+      backdrop: backdropRef.current,
+      dialog,
+      closable: () => closableRef.current,
+      close: () => onCloseRef.current(),
+      restoreFocusTo: restoreFocusRef.current,
     }
-    window.addEventListener('keydown', closeOnEscape)
-    return () => window.removeEventListener('keydown', closeOnEscape)
-  }, [closable, onClose, open])
+    registerModal(entry)
+    return () => unregisterModal(entry)
+  }, [modalId, open])
+
+  const requestClose = () => {
+    if (closableRef.current && isTopModal(modalId)) onCloseRef.current()
+  }
 
   if (!open) return null
-  return (
-    <div className="modal-backdrop" role="presentation" onMouseDown={(event) => closable && event.target === event.currentTarget && onClose()}>
-      <section className={`modal modal--${width}`} role="dialog" aria-modal="true" aria-labelledby={titleId}>
+  const modalContent = (
+    <div ref={backdropRef} className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && requestClose()}>
+      <section
+        ref={dialogRef}
+        className={`modal modal--${width}`}
+        role={dialogRole}
+        aria-modal="true"
+        aria-labelledby={titleId}
+        aria-describedby={ariaDescribedBy}
+        aria-busy={busy || undefined}
+        tabIndex={-1}
+      >
         <header className="modal__header">
           <div>
             <h2 id={titleId}>{title}</h2>
-            {description && <p>{description}</p>}
+            {description && <p id={descriptionId}>{description}</p>}
           </div>
           {closable && (
-            <button type="button" className="icon-button" onClick={onClose} title={t('关闭', 'Close')}>
-              <X size={18} />
+            <button type="button" className="icon-button" onClick={requestClose} title={t('关闭', 'Close')} aria-label={t('关闭', 'Close')}>
+              <X aria-hidden="true" size={18} />
             </button>
           )}
         </header>
@@ -131,6 +379,9 @@ export function Modal({
       </section>
     </div>
   )
+  return typeof document !== 'undefined' && document.body
+    ? createPortal(modalContent, document.body)
+    : modalContent
 }
 
 export function ConfirmDialog({
@@ -151,15 +402,20 @@ export function ConfirmDialog({
   onConfirm: () => void
 }) {
   const { t } = useI18n()
+  const messageId = useId()
   return (
     <Modal
       open={open}
       title={title}
       onClose={onCancel}
       width="small"
+      closable={!busy}
+      busy={busy}
+      dialogRole="alertdialog"
+      describedBy={messageId}
       footer={
         <>
-          <button type="button" className="button button--secondary" onClick={onCancel} disabled={busy}>
+          <button type="button" className="button button--secondary" data-modal-initial-focus onClick={onCancel} disabled={busy}>
             {t('取消', 'Cancel')}
           </button>
           <button type="button" className="button button--danger" onClick={onConfirm} disabled={busy}>
@@ -169,15 +425,15 @@ export function ConfirmDialog({
         </>
       }
     >
-      <div className="confirm-message">
-        <AlertCircle size={20} />
+      <div id={messageId} className="confirm-message">
+        <AlertCircle aria-hidden="true" size={20} />
         <p>{message}</p>
       </div>
     </Modal>
   )
 }
 
-export function Toggle({ checked, onChange, label }: { checked: boolean; onChange: (checked: boolean) => void; label: string }) {
+export function Toggle({ checked, onChange, label, disabled = false }: { checked: boolean; onChange: (checked: boolean) => void; label: string; disabled?: boolean }) {
   return (
     <button
       type="button"
@@ -185,6 +441,7 @@ export function Toggle({ checked, onChange, label }: { checked: boolean; onChang
       aria-checked={checked}
       aria-label={label}
       title={label}
+      disabled={disabled}
       className={`toggle ${checked ? 'toggle--on' : ''}`}
       onClick={() => onChange(!checked)}
     >

@@ -811,6 +811,7 @@ export function createMockApi(): GatewayApi {
     },
     profiles: [],
     effectiveRoute: { generation: 0, kind: 'external', externalMode: 'direct' },
+    accessState: { mode: 'system', status: 'idle' },
   }
   const oauthSessions = new Map<string, {
     input: Parameters<GatewayApi['startChatGptOAuth']>[0]
@@ -939,6 +940,15 @@ export function createMockApi(): GatewayApi {
         generation,
         kind: failClosed ? 'blocked' : 'external',
         ...(!failClosed ? { externalMode: snapshot.gateway.outboundNetworkMode ?? 'direct' } : {}),
+      },
+      accessState: ready ? {
+        mode: builtInProxyState.settings.accessMode,
+        status: 'ready',
+        endpoint: `http://127.0.0.1:${builtInProxyState.settings.mixedPort}`,
+        verifiedAt: timestamp,
+      } : {
+        mode: builtInProxyState.settings.accessMode,
+        status: failClosed ? 'error' : 'idle',
       },
       ...(ready || !builtInProxyState.desiredEnabled || awaitingFirstConfiguration ? { error: undefined } : {
         error: {
@@ -1494,6 +1504,13 @@ export function createMockApi(): GatewayApi {
       builtInProxyState = {
         ...builtInProxyState,
         settings: { ...builtInProxyState.settings, ruleMode },
+      }
+      return reconcileBuiltInProxyState()
+    },
+    async setBuiltInProxyCustomRules(customRules) {
+      builtInProxyState = {
+        ...builtInProxyState,
+        settings: { ...builtInProxyState.settings, customRules: customRules ? clone(customRules) : undefined },
       }
       return reconcileBuiltInProxyState()
     },
@@ -2114,6 +2131,10 @@ export function createMockApi(): GatewayApi {
     async clearPersistentTasks() { return [] },
     async startAccountCheckTask() { throw new Error('Persistent tasks are unavailable in mock mode.') },
     async listStateBackups() { return [] },
+    async getAutomaticBackupRuntimeState() {
+      const configuredEnabled = snapshot.gateway.automaticBackups !== false
+      return { configuredEnabled, running: configuredEnabled, blocked: false }
+    },
     async createStateBackup() { return {} },
     async verifyStateBackup(path) { return { path, createdAt: Date.now(), size: 0, integrity: 'valid', automatic: false } },
     async restoreStateBackup(path) { return { restored: { path, createdAt: Date.now(), size: 0, integrity: 'valid', automatic: false }, restartRequired: true } },

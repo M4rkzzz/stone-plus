@@ -25,6 +25,7 @@ interface SessionRepairServiceOptions {
   codexHome: string
   now?: () => Date
   randomId?: () => string
+  preserveRolloutMtime?: (path: string, atime: Date, mtime: Date) => Promise<void>
 }
 
 interface RolloutPlan {
@@ -88,12 +89,14 @@ export class CodexSessionRepairService {
   private readonly codexHome: string
   private readonly now: () => Date
   private readonly randomId: () => string
+  private readonly preserveRolloutMtime: (path: string, atime: Date, mtime: Date) => Promise<void>
   private active = false
 
   public constructor(options: SessionRepairServiceOptions) {
     this.codexHome = resolve(options.codexHome)
     this.now = options.now ?? (() => new Date())
     this.randomId = options.randomId ?? (() => randomUUID().slice(0, 12))
+    this.preserveRolloutMtime = options.preserveRolloutMtime ?? utimes
   }
 
   public async inspect(): Promise<CodexSessionRepairOverview> {
@@ -144,8 +147,11 @@ export class CodexSessionRepairService {
           const rewritten = rewriteRollout(decodeUtf8(currentBytes, rollout.relativePath), plan.targetProvider)
           rollout.nextHash = rewritten.nextHash
           await atomicWriteFile(rollout.path, rewritten.nextText, this.randomId)
-          await preserveMtime(rollout)
+          // Register the completed content replacement before restoring metadata.
+          // If utimes fails, rollback must still restore the bytes that were
+          // already committed by atomicWriteFile.
           writtenRollouts.push(rollout)
+          await this.preserveMtime(rollout)
         }
         for (const database of changedDatabases) {
           this.applyDatabasePlan(database)
@@ -606,7 +612,7 @@ export class CodexSessionRepairService {
           continue
         }
         await copyFile(join(backupPath, 'rollouts', rollout.relativePath), rollout.path)
-        await preserveMtime(rollout)
+        await this.preserveMtime(rollout)
       } catch { failures.push(rollout.path) }
     }
     return failures
@@ -630,6 +636,14 @@ export class CodexSessionRepairService {
           : right.createdAt - left.createdAt || right.path.localeCompare(left.path)
     ))
     for (const item of managed.slice(BACKUP_KEEP_COUNT)) await rm(item.path, { recursive: true, force: true })
+  }
+
+  private preserveMtime(rollout: RolloutPlan): Promise<void> {
+    return this.preserveRolloutMtime(
+      rollout.path,
+      new Date(rollout.originalAtimeMs),
+      new Date(rollout.originalMtimeMs)
+    )
   }
 }
 
@@ -965,9 +979,6 @@ function assertProvider(value: string): string {
   return provider
 }
 
-async function preserveMtime(rollout: RolloutPlan): Promise<void> {
-  await utimes(rollout.path, new Date(rollout.originalAtimeMs), new Date(rollout.originalMtimeMs))
-}
 
 function timestampName(date: Date): string {
   return date.toISOString().replace(/[-:TZ.]/g, '').slice(0, 17)

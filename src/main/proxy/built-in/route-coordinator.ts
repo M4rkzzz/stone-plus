@@ -48,6 +48,10 @@ export interface BuiltInProxyRouteCoordinatorOptions {
   now?: () => number
   retry?: () => Promise<void> | void
   directLoopbackPorts?: readonly number[]
+  /** Maximum grace period for a response body captured by a retired route. */
+  retirementDrainTimeoutMs?: number
+  /** Maximum time retirement waits for Chromium/core disposal callbacks. */
+  disposalTimeoutMs?: number
 }
 
 interface ExternalRouteGeneration {
@@ -62,10 +66,12 @@ interface BuiltInRouteGeneration {
   refresh?: (origins: readonly string[]) => Promise<void> | void
   dispose?: () => Promise<void> | void
   effectiveRoute: BuiltInProxyEffectiveRoute
+  directLoopbackPorts: ReadonlySet<number>
   inFlight: number
   retired: boolean
   disposalStarted: boolean
   finishRetirement?: () => void
+  retirementTimer?: ReturnType<typeof setTimeout>
 }
 
 interface BlockedRouteGeneration {
@@ -73,6 +79,7 @@ interface BlockedRouteGeneration {
   kind: 'blocked'
   error: BuiltInProxyRouteError
   effectiveRoute: BuiltInProxyEffectiveRoute
+  directLoopbackPorts: ReadonlySet<number>
 }
 
 type RouteGeneration = ExternalRouteGeneration | BuiltInRouteGeneration | BlockedRouteGeneration
@@ -106,6 +113,8 @@ export class BuiltInProxyRouteUnavailableError extends Error {
 export class BuiltInProxyRouteCoordinator {
   private externalMode: OutboundNetworkMode
   private readonly now: () => number
+  private readonly retirementDrainTimeoutMs: number
+  private readonly disposalTimeoutMs: number
   private retry?: () => Promise<void> | void
   private nextGeneration = 1
   private route: RouteGeneration = { generation: 0, kind: 'external' }
@@ -117,13 +126,15 @@ export class BuiltInProxyRouteCoordinator {
   private readonly retirements = new Set<Promise<void>>()
   private readonly retiredRoutes = new Set<BuiltInRouteGeneration>()
   private readonly pendingRebuildOrigins = new Set<string>()
-  private readonly directLoopbackPorts = new Set<number>()
+  private readonly permanentDirectLoopbackPorts = new Set<number>()
   private rebuildFlight?: Promise<void>
   private closed = false
 
   constructor(options: BuiltInProxyRouteCoordinatorOptions = {}) {
     this.externalMode = options.externalMode ?? 'direct'
     this.now = options.now ?? (() => Date.now())
+    this.retirementDrainTimeoutMs = Math.max(1, options.retirementDrainTimeoutMs ?? 5_000)
+    this.disposalTimeoutMs = Math.max(1, options.disposalTimeoutMs ?? 5_000)
     this.retry = options.retry
     this.addDirectLoopbackPorts(options.directLoopbackPorts ?? [])
   }
@@ -157,7 +168,7 @@ export class BuiltInProxyRouteCoordinator {
   /** Register only verified Stone+/sing-box control-plane listeners. */
   public addDirectLoopbackPorts(ports: readonly number[]): void {
     for (const port of ports) {
-      if (Number.isInteger(port) && port >= 1 && port <= 65_535) this.directLoopbackPorts.add(port)
+      if (Number.isInteger(port) && port >= 1 && port <= 65_535) this.permanentDirectLoopbackPorts.add(port)
     }
   }
 
@@ -178,11 +189,31 @@ export class BuiltInProxyRouteCoordinator {
     this.emit()
   }
 
+  /**
+   * Cancels a failed replacement without republishing or retiring the current
+   * healthy generation. Call only after its previous access resource has been
+   * restored and verified.
+   */
+  public restoreReady(): BuiltInProxyRouteSnapshot {
+    this.assertOpen()
+    if (this.route.kind !== 'built-in-mixed' && this.route.kind !== 'built-in-tun') {
+      throw new Error('There is no built-in proxy route generation to restore.')
+    }
+    this.desiredEnabled = true
+    this.status = 'ready'
+    this.error = undefined
+    this.emit()
+    return this.getSnapshot()
+  }
+
   /** Atomically publishes a checked, healthy dedicated Chromium mixed route. */
   public activate(activation: BuiltInProxyRouteActivation): BuiltInProxyRouteSnapshot {
     this.assertOpen()
     const mixedPort = validateMixedEndpoint(activation.mixedEndpoint)
-    this.addDirectLoopbackPorts([mixedPort, ...(activation.directLoopbackPorts ?? [])])
+    const generationDirectLoopbackPorts = validPortSet([
+      mixedPort,
+      ...(activation.directLoopbackPorts ?? [])
+    ])
     const generation = this.nextGeneration++
     const effectiveRoute: BuiltInProxyEffectiveRoute = {
       generation,
@@ -199,10 +230,12 @@ export class BuiltInProxyRouteCoordinator {
       refresh: activation.refresh,
       dispose: activation.dispose,
       effectiveRoute,
+      directLoopbackPorts: generationDirectLoopbackPorts,
       inFlight: 0,
       retired: false,
       disposalStarted: false,
-      finishRetirement: undefined
+      finishRetirement: undefined,
+      retirementTimer: undefined
     }
     this.publish(next)
     this.desiredEnabled = true
@@ -233,11 +266,15 @@ export class BuiltInProxyRouteCoordinator {
     const previousMetadata = this.route.kind === 'external'
       ? undefined
       : this.route.effectiveRoute
+    const directLoopbackPorts = this.route.kind === 'external'
+      ? new Set<number>()
+      : new Set(this.route.directLoopbackPorts)
     const generation = this.nextGeneration++
     this.publish({
       generation,
       kind: 'blocked',
       error: failure,
+      directLoopbackPorts,
       effectiveRoute: {
         generation,
         kind: 'blocked',
@@ -354,7 +391,10 @@ export class BuiltInProxyRouteCoordinator {
     if (this.closed) return
     this.closed = true
     this.pendingRebuildOrigins.clear()
-    await Promise.allSettled(this.rebuildFlight ? [this.rebuildFlight] : [])
+    await settleWithin(
+      Promise.allSettled(this.rebuildFlight ? [this.rebuildFlight] : []),
+      this.disposalTimeoutMs,
+    )
     if (this.route.kind === 'built-in-mixed' || this.route.kind === 'built-in-tun') {
       this.retire(this.route)
     }
@@ -443,13 +483,23 @@ export class BuiltInProxyRouteCoordinator {
     route.finishRetirement = finishRetirement
     this.retirements.add(retirement)
     void retirement.finally(() => this.retirements.delete(retirement)).catch(() => undefined)
-    if (route.inFlight === 0) this.startDisposal(route)
+    if (route.inFlight === 0) {
+      this.startDisposal(route)
+    } else {
+      route.retirementTimer = setTimeout(() => this.startDisposal(route), this.retirementDrainTimeoutMs)
+      route.retirementTimer.unref?.()
+    }
   }
 
   private startDisposal(route: BuiltInRouteGeneration): void {
     if (route.disposalStarted) return
     route.disposalStarted = true
-    void Promise.resolve().then(() => route.dispose?.()).finally(() => {
+    if (route.retirementTimer) {
+      clearTimeout(route.retirementTimer)
+      route.retirementTimer = undefined
+    }
+    const disposal = Promise.resolve().then(() => route.dispose?.())
+    void settleWithin(disposal, this.disposalTimeoutMs).finally(() => {
       this.retiredRoutes.delete(route)
       route.finishRetirement?.()
       route.finishRetirement = undefined
@@ -472,7 +522,8 @@ export class BuiltInProxyRouteCoordinator {
     try {
       const url = typeof input === 'string' || input instanceof URL ? new URL(input) : new URL(input.url)
       const port = Number(url.port || (url.protocol === 'https:' ? 443 : 80))
-      return this.directLoopbackPorts.has(port)
+      return this.permanentDirectLoopbackPorts.has(port)
+        || (this.route.kind !== 'external' && this.route.directLoopbackPorts.has(port))
     } catch {
       return false
     }
@@ -481,11 +532,32 @@ export class BuiltInProxyRouteCoordinator {
   private emit(): void {
     if (this.listeners.size === 0) return
     const snapshot = this.getSnapshot()
-    for (const listener of this.listeners) listener(snapshot)
+    for (const listener of this.listeners) {
+      try {
+        listener(snapshot)
+      } catch {
+        // State observers cannot participate in the atomic route commit.
+      }
+    }
   }
 
   private assertOpen(): void {
     if (this.closed) throw new Error('Built-in proxy route coordinator is closed.')
+  }
+}
+
+async function settleWithin(operation: Promise<unknown>, timeoutMs: number): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    await Promise.race([
+      operation.then(() => undefined, () => undefined),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, timeoutMs)
+        timer.unref?.()
+      }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
   }
 }
 
@@ -500,7 +572,7 @@ function normalizeRouteError(error: BuiltInProxyRouteError | Error | string): Bu
     return { category, message: error.message, retryable: true, cause: error }
   }
   return {
-    category: error.category,
+    category: builtInErrorCategory(error.category),
     message: error.message,
     retryable: error.retryable,
     ...(error.cause === undefined ? {} : { cause: error.cause })
@@ -508,7 +580,8 @@ function normalizeRouteError(error: BuiltInProxyRouteError | Error | string): Bu
 }
 
 function builtInErrorCategory(value: string): BuiltInProxyErrorCategory {
-  switch (value) {
+  const normalized = value.toLowerCase().replaceAll('_', '-')
+  switch (normalized) {
     case 'core-missing':
     case 'core-integrity':
     case 'configuration-invalid':
@@ -519,7 +592,7 @@ function builtInErrorCategory(value: string): BuiltInProxyErrorCategory {
     case 'system-proxy':
     case 'health-check':
     case 'core-crashed':
-      return value
+      return normalized
     default:
       return 'unknown'
   }
@@ -560,6 +633,10 @@ function normalizeWarmTargets(origins: readonly string[]): string[] {
     }
   }
   return [...targets]
+}
+
+function validPortSet(ports: readonly number[]): ReadonlySet<number> {
+  return new Set(ports.filter((port) => Number.isInteger(port) && port >= 1 && port <= 65_535))
 }
 
 function responseWithTrackedBody(response: Response, release: () => void): Response {

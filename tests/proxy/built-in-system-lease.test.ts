@@ -1,7 +1,7 @@
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   FileSystemProxyLeaseRecoveryStore,
   type SystemProxySnapshot
@@ -9,6 +9,7 @@ import {
 import {
   SystemProxyLease,
   SystemProxyLeaseError,
+  type SystemProxyLeaseEvent,
   type NormalizedSystemProxyLeaseTarget,
   type SystemProxyCompareResult,
   type SystemProxyPlatformAdapter
@@ -17,6 +18,7 @@ import {
 const temporaryDirectories: string[] = []
 
 afterEach(async () => {
+  vi.useRealTimers()
   await Promise.all(temporaryDirectories.splice(0).map((path) => (
     rm(path, { recursive: true, force: true })
   )))
@@ -99,6 +101,25 @@ describe('built-in system proxy lease', () => {
     await expect(store.load()).resolves.toBeUndefined()
   })
 
+  it('reports a field-level restore that preserved user settings as partial, not fully restored', async () => {
+    const { store } = await createRecoveryStore()
+    const adapter = new FakeSystemProxyAdapter(nativeSnapshot({
+      proxyEnable: false,
+      proxyServer: null,
+      pacUrl: 'https://original.example/proxy.pac',
+      autoDetect: true,
+      bypassRules: '<local>'
+    }))
+    const lease = new SystemProxyLease({ adapter, recoveryStore: store })
+    await lease.acquire({ mixed: { host: '127.0.0.1', port: 20805 } })
+    adapter.nextRestoreResult = 'partial'
+
+    await expect(lease.release()).resolves.toMatchObject({
+      status: 'preserved-user-settings'
+    })
+    await expect(store.load()).resolves.toBeUndefined()
+  })
+
   it('repairs a crash journal before normal startup networking', async () => {
     const { store } = await createRecoveryStore()
     const original = nativeSnapshot({
@@ -160,6 +181,44 @@ describe('built-in system proxy lease', () => {
     expect(adapter.current).toEqual(original)
   })
 
+  it('retries idempotently when native restore succeeded but journal clearing failed', async () => {
+    const { store } = await createRecoveryStore()
+    const original = nativeSnapshot({
+      proxyEnable: false,
+      proxyServer: null,
+      pacUrl: 'https://original.example/proxy.pac',
+      autoDetect: true,
+      bypassRules: '<local>'
+    })
+    const adapter = new FakeSystemProxyAdapter(original)
+    const lease = new SystemProxyLease({
+      adapter,
+      recoveryStore: store,
+      createLeaseId: () => 'clear-retry-lease'
+    })
+    await lease.acquire({ mixed: { host: '127.0.0.1', port: 20806 } })
+    const clear = store.clear.bind(store)
+    let failClear = true
+    store.clear = async () => {
+      if (failClear) {
+        failClear = false
+        throw new Error('simulated journal clear failure')
+      }
+      await clear()
+    }
+
+    await expect(lease.release()).rejects.toMatchObject({ code: 'restore_failed' })
+    expect(adapter.current).toEqual(original)
+    await expect(store.load()).resolves.toMatchObject({ leaseId: 'clear-retry-lease' })
+
+    await expect(lease.retryRelease()).resolves.toEqual({
+      status: 'restored',
+      leaseId: 'clear-retry-lease'
+    })
+    expect(adapter.current).toEqual(original)
+    await expect(store.load()).resolves.toBeUndefined()
+  })
+
   it('serializes duplicate acquisition and rejects a non-loopback mixed endpoint', async () => {
     const { store } = await createRecoveryStore()
     const adapter = new FakeSystemProxyAdapter(nativeSnapshot({
@@ -182,11 +241,399 @@ describe('built-in system proxy lease', () => {
       .rejects.toBeInstanceOf(SystemProxyLeaseError)
     expect(adapter.applyCalls).toHaveLength(1)
   })
+
+  it('does not report an active lease when a successful setter did not change the native route', async () => {
+    const { store } = await createRecoveryStore()
+    const original = nativeSnapshot({
+      proxyEnable: false,
+      proxyServer: null,
+      pacUrl: null,
+      autoDetect: false,
+      bypassRules: ''
+    })
+    const adapter = new FakeSystemProxyAdapter(original)
+    adapter.ignoreApply = true
+    const lease = new SystemProxyLease({
+      adapter,
+      recoveryStore: store,
+      createLeaseId: () => 'silent-noop-lease'
+    })
+
+    await expect(lease.acquire({ mixed: { host: '127.0.0.1', port: 20810 } }))
+      .rejects.toMatchObject({
+        code: 'apply_failed',
+        message: expect.stringContaining('another proxy application')
+      })
+    expect(lease.getState()).toMatchObject({
+      status: 'error',
+      leaseId: 'silent-noop-lease',
+      recoveryPending: true
+    })
+    expect(adapter.verificationCalls).toBe(1)
+    await expect(store.load()).resolves.toMatchObject({ leaseId: 'silent-noop-lease' })
+  })
+
+  it('reports an immediate competing proxy rewrite and never overwrites the competing settings on cleanup', async () => {
+    const { store } = await createRecoveryStore()
+    const original = nativeSnapshot({
+      proxyEnable: false,
+      proxyServer: null,
+      pacUrl: null,
+      autoDetect: false,
+      bypassRules: ''
+    })
+    const competing = nativeSnapshot({
+      proxyEnable: true,
+      proxyServer: 'http://127.0.0.1:7897',
+      pacUrl: null,
+      autoDetect: false,
+      bypassRules: '<local>;localhost'
+    })
+    const adapter = new FakeSystemProxyAdapter(original)
+    adapter.afterApply = () => {
+      // A competing proxy manager can react to WinINet's change notification
+      // before acquire() performs its mandatory native readback.
+      adapter.current = clone(competing)
+    }
+    const lease = new SystemProxyLease({
+      adapter,
+      recoveryStore: store,
+      createLeaseId: () => 'competing-manager-lease'
+    })
+
+    await expect(lease.acquire({ mixed: { host: '127.0.0.1', port: 20813 } }))
+      .rejects.toMatchObject({
+        code: 'apply_failed',
+        message: expect.stringContaining('another proxy application')
+      })
+    expect(lease.getState()).toMatchObject({
+      status: 'error',
+      leaseId: 'competing-manager-lease',
+      recoveryPending: true
+    })
+    expect(adapter.current).toEqual(competing)
+
+    await expect(lease.release()).resolves.toMatchObject({
+      status: 'preserved-user-settings',
+      leaseId: 'competing-manager-lease'
+    })
+    expect(adapter.current).toEqual(competing)
+    await expect(store.load()).resolves.toBeUndefined()
+  })
+
+  it('revalidates an active same-target lease instead of trusting stale in-memory ownership', async () => {
+    const { store } = await createRecoveryStore()
+    const original = nativeSnapshot({
+      proxyEnable: false,
+      proxyServer: null,
+      pacUrl: null,
+      autoDetect: false,
+      bypassRules: ''
+    })
+    const adapter = new FakeSystemProxyAdapter(original)
+    const lease = new SystemProxyLease({ adapter, recoveryStore: store })
+    const request = { mixed: { host: '127.0.0.1', port: 20811 } }
+    await lease.acquire(request)
+    expect(adapter.verificationCalls).toBe(1)
+
+    adapter.current = clone(original)
+    await expect(lease.acquire(request)).rejects.toMatchObject({ code: 'apply_failed' })
+    expect(lease.getState()).toMatchObject({ status: 'error', recoveryPending: true })
+    expect(adapter.verificationCalls).toBe(2)
+    expect(adapter.applyCalls).toHaveLength(1)
+  })
+
+  it('performs a non-mutating native readback for the expected lease immediately before publication', async () => {
+    const { store } = await createRecoveryStore()
+    const original = nativeSnapshot({
+      proxyEnable: false,
+      proxyServer: null,
+      pacUrl: null,
+      autoDetect: false,
+      bypassRules: ''
+    })
+    const adapter = new FakeSystemProxyAdapter(original)
+    const lease = new SystemProxyLease({
+      adapter,
+      recoveryStore: store,
+      createLeaseId: () => 'publication-proof-lease'
+    })
+    const request = { mixed: { host: '127.0.0.1', port: 20818 } }
+    await lease.acquire(request)
+
+    await expect(lease.verifyActive(request, 'publication-proof-lease')).resolves.toMatchObject({
+      status: 'active',
+      leaseId: 'publication-proof-lease'
+    })
+    expect(adapter.verificationCalls).toBe(2)
+    expect(adapter.applyCalls).toHaveLength(1)
+
+    adapter.current = clone(original)
+    await expect(lease.verifyActive(request, 'publication-proof-lease')).rejects.toMatchObject({
+      code: 'apply_failed',
+      message: expect.stringContaining('another proxy application')
+    })
+    expect(lease.getState()).toMatchObject({
+      status: 'error',
+      leaseId: 'publication-proof-lease',
+      recoveryPending: true
+    })
+    expect(adapter.verificationCalls).toBe(3)
+    expect(adapter.applyCalls).toHaveLength(1)
+  })
+
+  it('does not monitor or re-apply a candidate when final publication proof observes user drift', async () => {
+    vi.useFakeTimers()
+    const { store } = await createRecoveryStore()
+    const original = nativeSnapshot({
+      proxyEnable: false,
+      proxyServer: null,
+      pacUrl: null,
+      autoDetect: false,
+      bypassRules: ''
+    })
+    const competing = nativeSnapshot({
+      proxyEnable: true,
+      proxyServer: 'http://user-selected.example:7897',
+      pacUrl: null,
+      autoDetect: false,
+      bypassRules: 'user-selected.local'
+    })
+    const adapter = new FakeSystemProxyAdapter(original)
+    const lease = new SystemProxyLease({
+      adapter,
+      recoveryStore: store,
+      activeLeaseMonitorIntervalMs: 100,
+      createLeaseId: () => 'candidate-lease'
+    })
+    const listener = vi.fn()
+    lease.onEvent(listener)
+    const request = { mixed: { host: '127.0.0.1', port: 20819 } }
+    await lease.acquire(request)
+
+    adapter.current = clone(competing)
+    await vi.advanceTimersByTimeAsync(500)
+
+    expect(adapter.verificationCalls).toBe(1)
+    expect(adapter.applyCalls).toHaveLength(1)
+    expect(listener).not.toHaveBeenCalled()
+    expect(vi.getTimerCount()).toBe(0)
+
+    await expect(lease.verifyActive(request, 'candidate-lease')).rejects.toMatchObject({
+      code: 'apply_failed',
+      message: expect.stringContaining('another proxy application')
+    })
+    expect(adapter.current).toEqual(competing)
+    expect(adapter.applyCalls).toHaveLength(1)
+    await expect(lease.release()).resolves.toMatchObject({ status: 'preserved-user-settings' })
+    expect(adapter.current).toEqual(competing)
+  })
+
+  it('does not schedule polling when the platform has no native ownership readback', async () => {
+    vi.useFakeTimers()
+    const { store } = await createRecoveryStore()
+    const backing = new FakeSystemProxyAdapter(nativeSnapshot({
+      proxyEnable: false,
+      proxyServer: null,
+      pacUrl: null,
+      autoDetect: false,
+      bypassRules: ''
+    }))
+    const adapter: SystemProxyPlatformAdapter = {
+      captureSnapshot: () => backing.captureSnapshot(),
+      createMixedProxySnapshot: (original, target) => backing.createMixedProxySnapshot(original, target),
+      applySnapshot: (snapshot) => backing.applySnapshot(snapshot),
+      compareAndApplySnapshot: (expected, replacement) => (
+        backing.compareAndApplySnapshot(expected, replacement)
+      )
+    }
+    const lease = new SystemProxyLease({
+      adapter,
+      recoveryStore: store,
+      activeLeaseMonitorIntervalMs: 100
+    })
+
+    await lease.acquire({ mixed: { host: '127.0.0.1', port: 20820 } })
+    lease.startMonitoring()
+    await vi.advanceTimersByTimeAsync(500)
+
+    expect(vi.getTimerCount()).toBe(0)
+    expect(backing.verificationCalls).toBe(0)
+    await lease.release()
+  })
+
+  it('detects post-ready takeover drift and preserves the competing settings on release', async () => {
+    vi.useFakeTimers()
+    const { store } = await createRecoveryStore()
+    const original = nativeSnapshot({
+      proxyEnable: false,
+      proxyServer: 'http://remembered.example:8080',
+      pacUrl: 'https://original.example/private/proxy.pac?token=do-not-emit',
+      autoDetect: true,
+      bypassRules: '<local>'
+    })
+    const adapter = new FakeSystemProxyAdapter(original)
+    const lease = new SystemProxyLease({
+      adapter,
+      recoveryStore: store,
+      activeLeaseMonitorIntervalMs: 100,
+      createLeaseId: () => 'monitored-lease'
+    })
+    const events: SystemProxyLeaseEvent[] = []
+    lease.onEvent((event) => events.push(event))
+    await lease.acquire({ mixed: { host: '127.0.0.1', port: 20812 } })
+    lease.startMonitoring()
+
+    const competing = nativeSnapshot({
+      proxyEnable: false,
+      proxyServer: 'http://external-manager.example:7897',
+      pacUrl: null,
+      autoDetect: true,
+      bypassRules: 'external-manager.local'
+    })
+    adapter.current = clone(competing)
+    await vi.advanceTimersByTimeAsync(100)
+
+    expect(lease.getState()).toMatchObject({
+      status: 'error',
+      leaseId: 'monitored-lease',
+      recoveryPending: true,
+      lastError: {
+        code: 'apply_failed',
+        message: expect.stringContaining('another proxy application')
+      }
+    })
+    expect(events).toHaveLength(1)
+    expect(events[0]).toMatchObject({
+      type: 'unexpected-drift',
+      state: { status: 'error', leaseId: 'monitored-lease', recoveryPending: true }
+    })
+    expect(JSON.stringify(events[0])).not.toContain('do-not-emit')
+    expect(adapter.current).toEqual(competing)
+
+    await expect(lease.release()).resolves.toMatchObject({ status: 'preserved-user-settings' })
+    expect(adapter.current).toEqual(competing)
+    expect(adapter.applyCalls).toHaveLength(1)
+  })
+
+  it('keeps a stable active lease monitored without overlapping native reads', async () => {
+    vi.useFakeTimers()
+    const { store } = await createRecoveryStore()
+    const adapter = new FakeSystemProxyAdapter(nativeSnapshot({
+      proxyEnable: false,
+      proxyServer: null,
+      pacUrl: null,
+      autoDetect: false,
+      bypassRules: ''
+    }))
+    const lease = new SystemProxyLease({
+      adapter,
+      recoveryStore: store,
+      activeLeaseMonitorIntervalMs: 100
+    })
+    const listener = vi.fn()
+    lease.onEvent(listener)
+    await lease.acquire({ mixed: { host: '127.0.0.1', port: 20814 } })
+
+    await vi.advanceTimersByTimeAsync(300)
+
+    // Acquisition is also used for an uncommitted candidate. It must not arm
+    // post-ready supervision until the route owner explicitly publishes it.
+    expect(adapter.verificationCalls).toBe(1)
+    expect(vi.getTimerCount()).toBe(0)
+
+    lease.startMonitoring()
+    await vi.advanceTimersByTimeAsync(300)
+
+    expect(adapter.verificationCalls).toBe(4)
+    expect(adapter.maxConcurrentVerifications).toBe(1)
+    expect(listener).not.toHaveBeenCalled()
+    expect(lease.getState()).toMatchObject({ status: 'active', recoveryPending: true })
+    await lease.release()
+  })
+
+  it('cancels active monitoring before close and emits nothing afterwards', async () => {
+    vi.useFakeTimers()
+    const { store } = await createRecoveryStore()
+    const adapter = new FakeSystemProxyAdapter(nativeSnapshot({
+      proxyEnable: false,
+      proxyServer: null,
+      pacUrl: null,
+      autoDetect: false,
+      bypassRules: ''
+    }))
+    const lease = new SystemProxyLease({
+      adapter,
+      recoveryStore: store,
+      activeLeaseMonitorIntervalMs: 100
+    })
+    const listener = vi.fn()
+    lease.onEvent(listener)
+    await lease.acquire({ mixed: { host: '127.0.0.1', port: 20815 } })
+    lease.startMonitoring()
+    await lease.close()
+
+    await vi.advanceTimersByTimeAsync(500)
+
+    expect(adapter.verificationCalls).toBe(1)
+    expect(listener).not.toHaveBeenCalled()
+    expect(lease.getState()).toMatchObject({ status: 'idle', recoveryPending: false })
+  })
+
+  it('ignores an old monitor callback after release was requested and a new lease is acquired', async () => {
+    vi.useFakeTimers()
+    const { store } = await createRecoveryStore()
+    const adapter = new FakeSystemProxyAdapter(nativeSnapshot({
+      proxyEnable: false,
+      proxyServer: null,
+      pacUrl: null,
+      autoDetect: false,
+      bypassRules: ''
+    }))
+    const lease = new SystemProxyLease({
+      adapter,
+      recoveryStore: store,
+      activeLeaseMonitorIntervalMs: 100
+    })
+    const listener = vi.fn()
+    lease.onEvent(listener)
+    const firstRequest = { mixed: { host: '127.0.0.1', port: 20816 } }
+    await lease.acquire(firstRequest)
+    lease.startMonitoring()
+
+    const gate = deferred<void>()
+    adapter.verificationGate = gate.promise
+    const explicitVerification = lease.acquire(firstRequest)
+    await vi.waitFor(() => expect(adapter.verificationCalls).toBe(2))
+    await vi.advanceTimersByTimeAsync(100)
+    const release = lease.release()
+    adapter.verificationGate = undefined
+    gate.resolve()
+    await explicitVerification
+    await release
+
+    await lease.acquire({ mixed: { host: '127.0.0.1', port: 20817 } })
+
+    expect(adapter.verificationCalls).toBe(3)
+    expect(listener).not.toHaveBeenCalled()
+    expect(lease.getState()).toMatchObject({
+      status: 'active',
+      target: { mixed: { host: '127.0.0.1', port: 20817 } }
+    })
+    await lease.release()
+  })
 })
 
 class FakeSystemProxyAdapter implements SystemProxyPlatformAdapter {
   public current: SystemProxySnapshot
   public restoreFailures = 0
+  public nextRestoreResult?: SystemProxyCompareResult
+  public ignoreApply = false
+  public afterApply?: () => void
+  public verificationCalls = 0
+  public concurrentVerifications = 0
+  public maxConcurrentVerifications = 0
+  public verificationGate?: Promise<void>
   public readonly applyCalls: SystemProxySnapshot[] = []
 
   public constructor(initial: SystemProxySnapshot) {
@@ -213,7 +660,23 @@ class FakeSystemProxyAdapter implements SystemProxyPlatformAdapter {
 
   public async applySnapshot(snapshot: SystemProxySnapshot): Promise<void> {
     this.applyCalls.push(clone(snapshot))
-    this.current = clone(snapshot)
+    if (!this.ignoreApply) this.current = clone(snapshot)
+    this.afterApply?.()
+  }
+
+  public async isSnapshotApplied(snapshot: SystemProxySnapshot): Promise<boolean> {
+    this.verificationCalls += 1
+    this.concurrentVerifications += 1
+    this.maxConcurrentVerifications = Math.max(
+      this.maxConcurrentVerifications,
+      this.concurrentVerifications
+    )
+    try {
+      await this.verificationGate
+      return JSON.stringify(this.current) === JSON.stringify(snapshot)
+    } finally {
+      this.concurrentVerifications -= 1
+    }
   }
 
   public async compareAndApplySnapshot(
@@ -224,6 +687,13 @@ class FakeSystemProxyAdapter implements SystemProxyPlatformAdapter {
       this.restoreFailures -= 1
       throw new Error('simulated native restore failure')
     }
+    if (this.nextRestoreResult) {
+      const result = this.nextRestoreResult
+      this.nextRestoreResult = undefined
+      this.current = clone(replacement)
+      return result
+    }
+    if (JSON.stringify(this.current) === JSON.stringify(replacement)) return 'applied'
     if (JSON.stringify(this.current) !== JSON.stringify(expected)) return 'mismatch'
     this.current = clone(replacement)
     return 'applied'
@@ -250,4 +720,14 @@ async function createRecoveryStore(): Promise<{
 
 function clone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T
+}
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise
+    reject = rejectPromise
+  })
+  return { promise, resolve, reject }
 }

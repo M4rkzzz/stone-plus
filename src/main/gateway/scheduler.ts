@@ -71,6 +71,23 @@ export interface AccountFailureOptions {
   maxDelayMs?: number
   maxConcurrency?: number
   reason?: 'quota' | 'failure'
+  /**
+   * Scheduler generation captured when the upstream attempt was selected.
+   * Supplying it makes a concurrent outcome a compare-and-set: only the first
+   * transition from that generation may change health or adaptive state.
+   */
+  expectedRevision?: number
+  /**
+   * Explicit-reset generation captured with expectedRevision. A matching
+   * health revision is not sufficient on its own because a reset deliberately
+   * invalidates every outcome selected before it.
+   */
+  expectedResetEpoch?: number
+}
+
+export interface AccountFailureResult extends AccountRuntimeHealth {
+  applied: boolean
+  revision: number
 }
 
 export interface AccountPerformanceSample {
@@ -85,6 +102,8 @@ export interface AccountPerformanceSample {
 }
 
 interface AccountPerformanceState {
+  healthRevision: number
+  resetEpoch: number
   sampleCount: number
   successCount: number
   failureCount: number
@@ -126,6 +145,10 @@ const TRANSPORT_FALLBACK_FLOOR_MS = 3_000
 // making it a hard constraint. A clearly unhealthy/slow alternative may still
 // lose even when it currently owns fewer conversations.
 const CONCURRENT_STICKY_SESSION_PENALTY = 120
+// Upstreams occasionally report an exhausted generic quota without a reset
+// timestamp. Treat that observation as authoritative briefly, then admit one
+// half-open probe rather than permanently stranding the source.
+const UNKNOWN_RESET_QUOTA_RECHECK_MS = 30_000
 
 export class NoEligibleAccountError extends Error {
   constructor(
@@ -173,8 +196,14 @@ export class PoolScheduler {
   private readonly health = new Map<string, AccountRuntimeHealth>()
   /** Monotonic per-account generation guarding concurrent attempt outcomes. */
   private readonly healthRevisions = new Map<string, number>()
+  /** Explicit reset generation prevents ABA after health/performance clears. */
+  private readonly resetEpochs = new Map<string, number>()
   private readonly healthReasons = new Map<string, 'quota' | 'failure'>()
   private readonly performance = new Map<string, AccountPerformanceState>()
+  /** Persisted logs at or before this boundary must not undo an explicit clear. */
+  private readonly performanceResetAt = new Map<string, number>()
+  /** Last reset-less quota observation for which a half-open probe was admitted. */
+  private readonly quotaHalfOpenObservations = new Map<string, number>()
 
   constructor(
     private readonly now: () => number = () => Date.now(),
@@ -200,12 +229,14 @@ export class PoolScheduler {
     for (const accountId of this.health.keys()) {
       if (!accountIds.has(accountId)) {
         this.health.delete(accountId)
-        this.healthRevisions.delete(accountId)
         this.healthReasons.delete(accountId)
       }
     }
     for (const accountId of this.performance.keys()) {
       if (!accountIds.has(accountId)) this.performance.delete(accountId)
+    }
+    for (const accountId of this.quotaHalfOpenObservations.keys()) {
+      if (!accountIds.has(accountId)) this.quotaHalfOpenObservations.delete(accountId)
     }
     for (const account of accounts) {
       if (this.health.has(account.id)) continue
@@ -237,6 +268,7 @@ export class PoolScheduler {
         !log.accountId
         || log.status === 'streaming'
         || log.timestamp < cutoff
+        || log.timestamp <= (this.performanceResetAt.get(log.accountId) ?? Number.NEGATIVE_INFINITY)
       ) continue
       const samples = grouped.get(log.accountId) ?? []
       samples.push(log)
@@ -268,7 +300,10 @@ export class PoolScheduler {
     }
   }
 
-  selectAndAcquire(input: SchedulerSelectionInput): ScheduledAccount & { healthRevision: number } {
+  selectAndAcquire(input: SchedulerSelectionInput): ScheduledAccount & {
+    healthRevision: number
+    resetEpoch: number
+  } {
     const { pool, accounts, model, sessionId } = input
     const now = this.now()
     this.cleanupExpiredSticky(now)
@@ -290,6 +325,7 @@ export class PoolScheduler {
       poolModelPolicy: pool.modelPolicy,
       poolModelAllowlist: pool.modelAllowlist,
       requiredCapabilities: input.requiredCapabilities,
+      requireProvider: input.providers !== undefined,
     })
     if (sourceEligibility.modelEligible.length === 0) throw new ModelNotExposedError()
 
@@ -378,6 +414,7 @@ export class PoolScheduler {
       // later health transition therefore invalidates only attempts selected
       // before it, without relying on millisecond timestamps.
       healthRevision: this.getHealthRevision(selected.id),
+      resetEpoch: this.getResetEpoch(selected.id),
       release: () => {
         if (released) return
         released = true
@@ -400,18 +437,19 @@ export class PoolScheduler {
     model: string,
     accountId: string,
     pool?: Pool,
-    providers: readonly ProviderDefinition[] = [],
+    providers?: readonly ProviderDefinition[],
     requiredCapabilities: readonly UpstreamCapabilityRequirement[] = [],
     excludedAccountIds: readonly string[] = []
   ): boolean {
     const excluded = new Set([accountId, ...excludedAccountIds])
     const eligibility = evaluateSourceEligibility({
       accounts: accounts.filter((account) => !excluded.has(account.id)),
-      providers,
+      providers: providers ?? [],
       model,
       poolModelPolicy: pool?.modelPolicy,
       poolModelAllowlist: pool?.modelAllowlist,
-      requiredCapabilities
+      requiredCapabilities,
+      requireProvider: providers !== undefined,
     })
     const verifiedAvailable = eligibility.verified.some((account) => this.isAvailable(account, pool))
     if (verifiedAvailable) return true
@@ -440,20 +478,65 @@ export class PoolScheduler {
     return true
   }
 
-  setCooldown(accountId: string, until: number): void {
+  setCooldown(
+    accountId: string,
+    until: number,
+    expectedRevision?: number,
+    expectedResetEpoch?: number
+  ): AccountFailureResult {
+    const revision = this.getHealthRevision(accountId)
+    if (
+      expectedResetEpoch !== undefined
+      && expectedResetEpoch !== this.getResetEpoch(accountId)
+    ) {
+      return { ...this.getHealth(accountId), applied: false, revision }
+    }
+    if (expectedRevision !== undefined && expectedRevision !== revision) {
+      // Concurrent quota observations from the same explicit-reset epoch are
+      // monotonic facts. A later reset time may extend the circuit without
+      // replaying failure/adaptive penalties from the stale attempt.
+      if (expectedResetEpoch !== undefined) {
+        return this.mergeQuotaCooldown(accountId, until, revision)
+      }
+      return { ...this.getHealth(accountId), applied: false, revision }
+    }
     const existing = this.health.get(accountId)
-    this.health.set(accountId, {
+    const state: AccountRuntimeHealth = {
       accountId,
       circuitState: 'open',
       consecutiveFailures: existing?.consecutiveFailures ?? 0,
       cooldownUntil: Math.max(until, existing?.cooldownUntil ?? 0),
       lastFailureAt: existing?.lastFailureAt
-    })
+    }
+    this.health.set(accountId, state)
     this.healthReasons.set(accountId, 'quota')
-    this.bumpHealthRevision(accountId)
+    return { ...state, applied: true, revision: this.bumpHealthRevision(accountId) }
   }
 
-  recordFailure(accountId: string, options: AccountFailureOptions = {}): AccountRuntimeHealth {
+  recordFailure(accountId: string, options: AccountFailureOptions = {}): AccountFailureResult {
+    const revision = this.getHealthRevision(accountId)
+    if (
+      options.expectedResetEpoch !== undefined
+      && options.expectedResetEpoch !== this.getResetEpoch(accountId)
+    ) {
+      return { ...this.getHealth(accountId), applied: false, revision }
+    }
+    if (options.expectedRevision !== undefined && options.expectedRevision !== revision) {
+      if (options.reason === 'quota' && options.expectedResetEpoch !== undefined) {
+        const existing = this.health.get(accountId)
+        const consecutiveFailures = Math.max(1, existing?.consecutiveFailures ?? 0)
+        const baseDelayMs = positiveDuration(options.baseDelayMs, 30_000)
+        const maxDelayMs = positiveDuration(options.maxDelayMs, 15 * 60_000)
+        const exponent = Math.min(20, Math.max(0, consecutiveFailures - 1))
+        const retryAfterMs = Math.max(0, options.retryAfterMs ?? 0)
+        const cooldownUntil = this.now() + Math.max(
+          Math.min(maxDelayMs, baseDelayMs * 2 ** exponent),
+          retryAfterMs
+        )
+        return this.mergeQuotaCooldown(accountId, cooldownUntil, revision)
+      }
+      return { ...this.getHealth(accountId), applied: false, revision }
+    }
     // A proven runtime account failure is not session-local. Drop every
     // assignment that still points at it, while keeping one-shot per-session
     // avoidance so those conversations prefer a healthy peer next time.
@@ -496,7 +579,7 @@ export class PoolScheduler {
         ? 'quota'
         : options.reason ?? 'failure'
     )
-    this.bumpHealthRevision(accountId)
+    const nextRevision = this.bumpHealthRevision(accountId)
     const performance = this.performance.get(accountId)
     this.observeOutcome(accountId, false, {}, now, true)
     const updated = this.performance.get(accountId)
@@ -506,13 +589,21 @@ export class PoolScheduler {
       ))
       updated.successStreak = 0
     }
-    return { ...state }
+    return { ...state, applied: true, revision: nextRevision }
   }
 
-  recordSuccess(accountId: string, expectedRevision?: number): AccountSuccessResult {
+  recordSuccess(
+    accountId: string,
+    expectedRevision?: number,
+    expectedResetEpoch?: number
+  ): AccountSuccessResult {
     const revision = this.getHealthRevision(accountId)
     const existing = this.health.get(accountId)
-    const superseded = expectedRevision !== undefined && expectedRevision !== revision
+    const superseded = (
+      expectedRevision !== undefined && expectedRevision !== revision
+    ) || (
+      expectedResetEpoch !== undefined && expectedResetEpoch !== this.getResetEpoch(accountId)
+    )
     // A success without an attempt generation may still close an ordinary
     // failure circuit for backwards compatibility, but must never erase a
     // quota observation. Manual resets use resetHealth() explicitly.
@@ -535,9 +626,15 @@ export class PoolScheduler {
     return { ...state, applied: true, revision }
   }
 
-  resetHealth(accountId: string): AccountRuntimeHealth {
+  resetHealth(accountId: string, options: { clearPerformance?: boolean } = {}): AccountRuntimeHealth {
     this.health.delete(accountId)
     this.healthReasons.delete(accountId)
+    this.quotaHalfOpenObservations.delete(accountId)
+    if (options.clearPerformance) {
+      this.performance.delete(accountId)
+      this.performanceResetAt.set(accountId, this.now())
+    }
+    this.bumpResetEpoch(accountId)
     this.bumpHealthRevision(accountId)
     return { accountId, circuitState: 'closed', consecutiveFailures: 0 }
   }
@@ -546,8 +643,22 @@ export class PoolScheduler {
     return this.healthRevisions.get(accountId) ?? 0
   }
 
-  recordPerformance(accountId: string, sample: AccountPerformanceSample): void {
+  getResetEpoch(accountId: string): number {
+    return this.resetEpochs.get(accountId) ?? 0
+  }
+
+  recordPerformance(
+    accountId: string,
+    sample: AccountPerformanceSample,
+    expectedRevision?: number,
+    expectedResetEpoch?: number
+  ): boolean {
+    if (
+      (expectedRevision !== undefined && expectedRevision !== this.getHealthRevision(accountId))
+      || (expectedResetEpoch !== undefined && expectedResetEpoch !== this.getResetEpoch(accountId))
+    ) return false
     this.observeOutcome(accountId, true, sample, this.now(), true)
+    return true
   }
 
   private observeOutcome(
@@ -593,6 +704,8 @@ export class PoolScheduler {
       ? undefined
       : existing.dynamicConcurrency + (adaptConcurrency && success && successStreak >= 8 ? 1 : 0)
     this.performance.set(accountId, {
+      healthRevision: this.getHealthRevision(accountId),
+      resetEpoch: this.getResetEpoch(accountId),
       sampleCount: (existing?.sampleCount ?? 0) + 1,
       successCount: (existing?.successCount ?? 0) + (success ? 1 : 0),
       failureCount: (existing?.failureCount ?? 0) + (success ? 0 : 1),
@@ -701,6 +814,12 @@ export class PoolScheduler {
   }
 
   clear(): void {
+    const invalidatedAccountIds = new Set([
+      ...this.active.keys(),
+      ...this.health.keys(),
+      ...this.performance.keys(),
+      ...this.healthRevisions.keys(),
+    ])
     this.active.clear()
     this.roundRobinOffsets.clear()
     this.smoothWeighted.clear()
@@ -714,9 +833,10 @@ export class PoolScheduler {
     this.aggregatePoolIndexes = new WeakMap()
     this.accountModelIndexes = new WeakMap()
     this.health.clear()
-    this.healthRevisions.clear()
     this.healthReasons.clear()
     this.performance.clear()
+    this.quotaHalfOpenObservations.clear()
+    for (const accountId of invalidatedAccountIds) this.bumpHealthRevision(accountId)
   }
 
   private bumpHealthRevision(accountId: string): number {
@@ -725,15 +845,60 @@ export class PoolScheduler {
     return next
   }
 
+  private bumpResetEpoch(accountId: string): number {
+    const next = this.getResetEpoch(accountId) + 1
+    this.resetEpochs.set(accountId, next)
+    return next
+  }
+
+  private mergeQuotaCooldown(
+    accountId: string,
+    until: number,
+    revision = this.getHealthRevision(accountId)
+  ): AccountFailureResult {
+    const existing = this.health.get(accountId)
+    if (until <= (existing?.cooldownUntil ?? 0)) {
+      return { ...this.getHealth(accountId), applied: false, revision }
+    }
+    const state: AccountRuntimeHealth = {
+      accountId,
+      circuitState: 'open',
+      consecutiveFailures: existing?.consecutiveFailures ?? 0,
+      cooldownUntil: until,
+      lastFailureAt: existing?.lastFailureAt
+    }
+    this.health.set(accountId, state)
+    this.healthReasons.set(accountId, 'quota')
+    return { ...state, applied: true, revision: this.bumpHealthRevision(accountId) }
+  }
+
   private isEligible(account: Account, pool: Pool, adaptiveConcurrency: boolean, now = this.now()): boolean {
     if (!this.isAvailable(account, pool, now)) return false
     return this.inFlight(account) < this.concurrencyLimit(account, adaptiveConcurrency)
   }
 
   private isAvailable(account: Account, pool?: Pool, now = this.now()): boolean {
-    const health = this.health.get(account.id)
+    let health = this.health.get(account.id)
     if (health?.circuitState === 'open' && (health.cooldownUntil ?? 0) <= now) {
       health.circuitState = 'half-open'
+    }
+    const resetlessObservation = expiredResetlessQuotaObservation(account, now)
+    if (resetlessObservation === undefined) {
+      this.quotaHalfOpenObservations.delete(account.id)
+    } else if (this.quotaHalfOpenObservations.get(account.id) !== resetlessObservation) {
+      this.quotaHalfOpenObservations.set(account.id, resetlessObservation)
+      // An existing open circuit will naturally become half-open at its own
+      // cooldown boundary. Only synthesize one when the persisted observation
+      // itself was the sole blocker (for example after a restart).
+      if (!health) {
+        health = {
+          accountId: account.id,
+          circuitState: 'half-open',
+          consecutiveFailures: 0,
+        }
+        this.health.set(account.id, health)
+        this.healthReasons.set(account.id, 'quota')
+      }
     }
     const cooldownUntil = Math.max(account.cooldownUntil ?? 0, health?.cooldownUntil ?? 0)
     if (account.status === 'disabled' || account.status === 'expired' || account.status === 'checking') return false
@@ -748,15 +913,16 @@ export class PoolScheduler {
   private pick(pool: Pool, candidates: Account[], configuredAccounts: readonly Account[], stickyKey?: string): Account {
     const aggregate = isRelayAggregate(pool)
     const aggregateIndex = aggregate ? this.getAggregatePoolIndex(pool) : undefined
+    const now = this.now()
     switch (pool.strategy) {
       case 'priority':
         return selectMinimum(candidates, (account) => aggregateIndex
           ? aggregateIndex.orderByAccountId.get(account.id) ?? Number.MAX_SAFE_INTEGER
-          : effectivePriority(account), (a, b) => this.inFlight(a) - this.inFlight(b))
+          : effectivePriority(account, now), (a, b) => this.inFlight(a) - this.inFlight(b))
       case 'balanced':
         return selectMinimum(candidates,
           (account) => this.inFlight(account) / this.concurrencyLimit(account, false),
-          (a, b) => quotaPressure(a) - quotaPressure(b)
+          (a, b) => quotaPressure(a, now) - quotaPressure(b, now)
             || a.priority - b.priority
             || a.id.localeCompare(b.id))
       case 'autobalanced':
@@ -771,13 +937,13 @@ export class PoolScheduler {
         return selected
       }
       case 'weighted-round-robin':
-        return this.pickSmoothWeighted(pool, candidates, configuredAccounts)
+        return this.pickSmoothWeighted(pool, candidates, configuredAccounts, now)
       case 'weighted-random': {
-        const total = candidates.reduce((sum, account) => sum + effectiveWeight(account), 0)
+        const total = candidates.reduce((sum, account) => sum + effectiveWeight(account, now), 0)
         if (total <= 0) return candidates[Math.floor(this.random() * candidates.length)]
         let threshold = this.random() * total
         for (const account of candidates) {
-          threshold -= effectiveWeight(account)
+          threshold -= effectiveWeight(account, now)
           if (threshold < 0) return account
         }
         return candidates[candidates.length - 1]
@@ -791,7 +957,12 @@ export class PoolScheduler {
    * while spreading high-weight members across the window instead of serving
    * them in one burst.
    */
-  private pickSmoothWeighted(pool: Pool, candidates: Account[], configuredAccounts: readonly Account[]): Account {
+  private pickSmoothWeighted(
+    pool: Pool,
+    candidates: Account[],
+    configuredAccounts: readonly Account[],
+    now = this.now()
+  ): Account {
     const aggregate = isRelayAggregate(pool)
     const aggregateIndex = aggregate ? this.getAggregatePoolIndex(pool) : undefined
     const ordered = aggregateIndex ? orderAggregateCandidates(aggregateIndex, candidates) : candidates
@@ -799,10 +970,10 @@ export class PoolScheduler {
     const aggregateConfiguration = aggregateIndex?.smoothConfiguration
     const configurationChanged = aggregateConfiguration
       ? !state || !orderedMapEqual(state.configuration, aggregateConfiguration)
-      : !state || !configurationMatchesAccounts(state.configuration, configuredAccounts)
+      : !state || !configurationMatchesAccounts(state.configuration, configuredAccounts, now)
     if (configurationChanged) {
       const configuration = aggregateConfiguration ?? new Map(
-        configuredAccounts.map((account) => [account.id, effectiveWeight(account)])
+        configuredAccounts.map((account) => [account.id, effectiveWeight(account, now)])
       )
       state = { configuration, current: new Map() }
       this.smoothWeighted.set(pool.id, state)
@@ -811,7 +982,7 @@ export class PoolScheduler {
 
     const weightFor = (account: Account): number => aggregateIndex
       ? aggregateIndex.weightByAccountId.get(account.id) ?? 1
-      : effectiveWeight(account)
+      : effectiveWeight(account, now)
     let hasPositiveWeight = false
     for (const account of ordered) {
       if (weightFor(account) > 0) {
@@ -948,7 +1119,7 @@ export class PoolScheduler {
     const performanceEstimate = estimatedPerformanceCost(performance, unmeasuredPrior, now)
     return utilization * 1_000
       + this.activeStickySessionCount(account.id, stickyKey) * CONCURRENT_STICKY_SESSION_PENALTY
-      + quotaPressure(account) * 200
+      + quotaPressure(account, now) * 200
       + performanceEstimate * 10
       + account.priority
   }
@@ -1310,24 +1481,45 @@ function quotaWindows(account: Account) {
 function quotaExhausted(account: Account, now: number): boolean {
   return codexQuotaIsExhausted(account.codexQuota, now)
     || quotaWindows(account).some((window) =>
-      window?.remaining === 0 && (window.resetAt === undefined || window.resetAt > now))
+      window?.remaining === 0 && (
+        window.resetAt !== undefined
+          ? window.resetAt > now
+          : now < quotaObservedAt(account) + UNKNOWN_RESET_QUOTA_RECHECK_MS
+      ))
 }
 
-function quotaPressure(account: Account): number {
+function expiredResetlessQuotaObservation(account: Account, now: number): number | undefined {
+  if (!quotaWindows(account).some((window) => window?.remaining === 0 && window.resetAt === undefined)) {
+    return undefined
+  }
+  const observedAt = quotaObservedAt(account)
+  return now >= observedAt + UNKNOWN_RESET_QUOTA_RECHECK_MS ? observedAt : undefined
+}
+
+function quotaObservedAt(account: Account): number {
+  const observedAt = account.quota?.observedAt
+  return typeof observedAt === 'number' && Number.isFinite(observedAt)
+    ? observedAt
+    : account.updatedAt
+}
+
+function quotaPressure(account: Account, now: number): number {
   let pressure = 0
   for (const window of quotaWindows(account)) {
+    if (window?.resetAt !== undefined && window.resetAt <= now) continue
+    if (window?.resetAt === undefined && now >= quotaObservedAt(account) + UNKNOWN_RESET_QUOTA_RECHECK_MS) continue
     if (window?.limit === undefined || window.limit <= 0 || window.remaining === undefined) continue
     pressure = Math.max(pressure, Math.max(0, Math.min(1, 1 - window.remaining / window.limit)))
   }
   return pressure
 }
 
-function effectivePriority(account: Account): number {
-  return account.priority + Math.round(quotaPressure(account) * 1000)
+function effectivePriority(account: Account, now: number): number {
+  return account.priority + Math.round(quotaPressure(account, now) * 1000)
 }
 
-function effectiveWeight(account: Account): number {
-  return Math.max(0, account.weight) * Math.max(0.05, 1 - quotaPressure(account))
+function effectiveWeight(account: Account, now: number): number {
+  return Math.max(0, account.weight) * Math.max(0.05, 1 - quotaPressure(account, now))
 }
 
 function isRelayAggregate(pool: Pool): boolean {
@@ -1365,13 +1557,14 @@ function orderedMapEqual(left: Map<string, number>, right: Map<string, number>):
 
 function configurationMatchesAccounts(
   configuration: Map<string, number>,
-  accounts: readonly Account[]
+  accounts: readonly Account[],
+  now: number
 ): boolean {
   if (configuration.size !== accounts.length) return false
   const entries = configuration.entries()
   for (const account of accounts) {
     const entry = entries.next()
-    if (entry.done || entry.value[0] !== account.id || entry.value[1] !== effectiveWeight(account)) return false
+    if (entry.done || entry.value[0] !== account.id || entry.value[1] !== effectiveWeight(account, now)) return false
   }
   return entries.next().done === true
 }

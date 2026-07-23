@@ -26,34 +26,43 @@ const originalClaudeSettings = `${JSON.stringify({
   env: { STONE_SMOKE_KEEP: 'yes' }
 }, null, 2)}\n`
 const executablePath = process.env.STONE_ELECTRON_PATH ?? defaultElectronPath(projectRoot)
-const upstream = await startMockUpstream()
-const upstreamPort = upstream.address().port
-const gatewayPort = await findAvailablePort()
 
 await rm(artifacts, { recursive: true, force: true })
 await mkdir(claudeDirectory, { recursive: true })
 await writeFile(claudeSettingsPath, originalClaudeSettings)
-const electronApp = await electron.launch({
-  executablePath,
-  args: ['.'],
-  cwd: projectRoot,
-  env: {
-    ...process.env,
-    STONE_USER_DATA_DIR: userData,
-    STONE_CLIENT_CONFIG_HOME: clientConfigHome
-  },
-  timeout: 30_000
-})
+const upstream = await startMockUpstream()
+let electronApp
 
 try {
+  const upstreamPort = upstream.address().port
+  const gatewayPort = await findAvailablePort()
+  electronApp = await electron.launch({
+    executablePath,
+    args: ['.'],
+    cwd: projectRoot,
+    env: {
+      ...process.env,
+      STONE_USER_DATA_DIR: userData,
+      STONE_CLIENT_CONFIG_HOME: clientConfigHome
+    },
+    timeout: 30_000
+  })
+
+  const pageErrors = []
+  const observedWindows = new WeakSet()
+  const observeWindow = (page) => {
+    if (observedWindows.has(page)) return
+    observedWindows.add(page)
+    page.on('pageerror', (error) => pageErrors.push(error.message))
+    page.on('console', (message) => {
+      if (message.type() === 'error') pageErrors.push(message.text())
+    })
+  }
+  electronApp.on('window', observeWindow)
   const window = await electronApp.firstWindow({ timeout: 30_000 })
+  observeWindow(window)
   await window.evaluate(() => window.localStorage.setItem('stone.ui.language', 'zh-CN'))
   await window.reload({ waitUntil: 'domcontentloaded' })
-  const pageErrors = []
-  window.on('pageerror', (error) => pageErrors.push(error.message))
-  window.on('console', (message) => {
-    if (message.type() === 'error') pageErrors.push(message.text())
-  })
   await window.locator('.app-shell').waitFor({ timeout: 30_000 })
   const chatGptRepairRestartButton = window.getByRole('button', { name: '关闭 Codex、修复会话、重新开启' })
   const chatGptRepairRestartButtonVisible = await chatGptRepairRestartButton.isVisible()
@@ -65,6 +74,56 @@ try {
   const sessionRepairLoaded = await providerRepairPanel.isVisible()
 
   const bootSnapshot = await window.evaluate(() => window.stone.getSnapshot())
+  const originalOutboundNetworkMode = bootSnapshot.gateway.outboundNetworkMode ?? 'direct'
+  const initialBuiltInProxyState = await window.evaluate(() => window.stone.getBuiltInProxyState())
+  await window.locator('.nav-item').filter({ hasText: /^代理$/ }).click()
+  await window.getByRole('heading', { name: '代理', exact: true }).waitFor()
+  const externalProxySurfaceVisible = await window.locator('.proxy-toolbar').getByText('可复用代理', { exact: true }).isVisible()
+    && await window.getByText('尚未配置代理', { exact: true }).isVisible()
+  const enableBuiltInProxy = window.getByRole('switch', { name: '开启内置代理' })
+  await enableBuiltInProxy.click()
+  const builtInProxyMaster = window.locator('.built-in-proxy-master')
+  await builtInProxyMaster.getByText('等待配置', { exact: true }).waitFor()
+  await window.locator('.built-in-proxy-guide').getByText('尚未接管', { exact: true }).waitFor()
+  await window.getByRole('heading', { name: '导入第一份有效配置' }).waitFor()
+  const disableBuiltInProxy = window.getByRole('switch', { name: '关闭内置代理' })
+  await disableBuiltInProxy.waitFor()
+  await window.waitForFunction((outboundMode) => Promise.all([
+    window.stone.getBuiltInProxyState(),
+    window.stone.getSnapshot(),
+  ]).then(([runtime, snapshot]) => (
+    runtime.desiredEnabled
+      && runtime.status === 'disabled'
+      && runtime.profiles.length === 0
+      && !runtime.settings.hasEverActivated
+      && runtime.effectiveRoute.kind === 'external'
+      && (snapshot.gateway.outboundNetworkMode ?? 'direct') === outboundMode
+  )), originalOutboundNetworkMode)
+  const enabledWithoutProfileState = await window.evaluate(() => window.stone.getBuiltInProxyState())
+  const enabledWithoutProfileSnapshot = await window.evaluate(() => window.stone.getSnapshot())
+  const builtInProxySafeImportVisible = await window.locator('.built-in-proxy-import').getByText(
+    '只解析受支持的节点、分组与规则，不运行外来 inbound、脚本或文件路径。',
+    { exact: true },
+  ).isVisible()
+    && await window.getByRole('button', { name: '校验并导入' }).isVisible()
+    && await window.locator('#built-in-proxy-workspace-panel').count() === 0
+    && await window.locator('.proxy-toolbar').count() === 0
+  await disableBuiltInProxy.click()
+  await enableBuiltInProxy.waitFor()
+  await window.waitForFunction((outboundMode) => Promise.all([
+    window.stone.getBuiltInProxyState(),
+    window.stone.getSnapshot(),
+  ]).then(([runtime, snapshot]) => (
+    !runtime.desiredEnabled
+      && runtime.status === 'disabled'
+      && runtime.profiles.length === 0
+      && runtime.effectiveRoute.kind === 'external'
+      && (snapshot.gateway.outboundNetworkMode ?? 'direct') === outboundMode
+  )), originalOutboundNetworkMode)
+  const disabledBuiltInProxyState = await window.evaluate(() => window.stone.getBuiltInProxyState())
+  const disabledBuiltInProxySnapshot = await window.evaluate(() => window.stone.getSnapshot())
+  const externalProxySurfaceRestored = await window.locator('.proxy-toolbar').getByText('可复用代理', { exact: true }).isVisible()
+    && await window.getByText('尚未配置代理', { exact: true }).isVisible()
   const initial = await window.evaluate(({ settings, port }) => window.stone.updateGateway({
     ...settings,
     port,
@@ -281,6 +340,7 @@ try {
   try {
     const fastResponse = await fetch(`http://${fastGateway.gatewayStatus.host}:${fastGateway.gatewayStatus.port}/v1/responses`, {
       method: 'POST',
+      signal: AbortSignal.timeout(15_000),
       headers: {
         authorization: `Bearer ${fastRoute?.localToken ?? ''}`,
         'content-type': 'application/json',
@@ -345,7 +405,7 @@ try {
   await window.getByRole('heading', { name: '总览' }).waitFor()
   await window.evaluate(() => { window.location.hash = '#setup' })
   await window.getByRole('heading', { name: '配置已经跑通' }).waitFor({ timeout: 15_000 })
-  const setupSuccessVisible = true
+  const setupSuccessVisible = await window.getByRole('heading', { name: '配置已经跑通' }).isVisible()
   const profileBundle = await window.evaluate(() => window.stone.exportClientProfile('default-claude'))
   const diagnostics = JSON.parse(await window.evaluate(() => window.stone.exportDiagnostics()))
   const backupCreated = await window.evaluate(() => window.stone.createStateBackup())
@@ -401,10 +461,12 @@ try {
   }, null, 2)}\n`)
   await window.evaluate((profileId) => window.stone.applyClientConfig('claude', profileId), profile?.id)
   const profileBackups = await window.evaluate((profileId) => window.stone.listClientConfigBackups('claude', profileId), profile?.id)
+  const profileSettingsBackup = profileBackups.find((backup) => backup.targetPath === profileSettingsPath)
   const profileRestored = await window.evaluate(
     ({ backupPath, profileId }) => window.stone.restoreClientConfig(backupPath, 'claude', profileId),
-    { backupPath: profileBackups[0]?.backupPath, profileId: profile?.id }
+    { backupPath: profileSettingsBackup?.backupPath, profileId: profile?.id }
   )
+  const restoredProfileSettings = JSON.parse(await readFile(profileSettingsPath, 'utf8'))
   const clientEditor = await window.evaluate((profileId) => window.stone.getClientConfigEditor('claude', profileId), profile?.id)
   const profileToken = profileWritten.env?.ANTHROPIC_AUTH_TOKEN
   const clientEditorSafe = Boolean(
@@ -443,7 +505,10 @@ try {
     ? await readFile(codexRepair.backups[0].backupPath, 'utf8')
     : ''
   const started = await window.evaluate(() => window.stone.startGateway())
-  const probe = await fetch(`http://${started.gatewayStatus.host}:${started.gatewayStatus.port}/health`)
+  const probe = await fetch(`http://${started.gatewayStatus.host}:${started.gatewayStatus.port}/health`, {
+    signal: AbortSignal.timeout(5_000),
+  })
+  await probe.arrayBuffer()
   await window.locator('.nav-item').filter({ hasText: '客户端配置' }).click()
   await window.locator('.client-easy-card').waitFor()
   await window.getByText('连接配置正常').waitFor()
@@ -515,6 +580,10 @@ try {
   const languageSwitchWorks = switchedToChinese && await languageSelect.inputValue() === 'en'
   await window.screenshot({ path: join(artifacts, 'english-settings.png') })
   const stopped = await window.evaluate(() => window.stone.stopGateway())
+  const gatewayPortReleased = await portAvailable(
+    started.gatewayStatus.host,
+    started.gatewayStatus.port,
+  )
   await window.screenshot({ path: join(artifacts, 'window.png') })
 
   const result = {
@@ -525,6 +594,26 @@ try {
     vaultAvailable: initial.vaultAvailable,
     vaultBackend: initial.vaultBackend,
     clientConfigCount: clientConfigs.length,
+    externalProxySurfaceVisible: initialBuiltInProxyState.desiredEnabled === false
+      && initialBuiltInProxyState.status === 'disabled'
+      && initialBuiltInProxyState.profiles.length === 0
+      && initialBuiltInProxyState.effectiveRoute.kind === 'external'
+      && externalProxySurfaceVisible,
+    builtInProxyFirstRunSafe: enabledWithoutProfileState.desiredEnabled
+      && enabledWithoutProfileState.status === 'disabled'
+      && enabledWithoutProfileState.profiles.length === 0
+      && !enabledWithoutProfileState.settings.hasEverActivated
+      && enabledWithoutProfileState.effectiveRoute.kind === 'external'
+      && enabledWithoutProfileState.effectiveRoute.generation === initialBuiltInProxyState.effectiveRoute.generation
+      && (enabledWithoutProfileSnapshot.gateway.outboundNetworkMode ?? 'direct') === originalOutboundNetworkMode
+      && builtInProxySafeImportVisible,
+    builtInProxyDisabledCleanly: !disabledBuiltInProxyState.desiredEnabled
+      && disabledBuiltInProxyState.status === 'disabled'
+      && disabledBuiltInProxyState.profiles.length === 0
+      && disabledBuiltInProxyState.effectiveRoute.kind === 'external'
+      && disabledBuiltInProxyState.effectiveRoute.generation === initialBuiltInProxyState.effectiveRoute.generation
+      && (disabledBuiltInProxySnapshot.gateway.outboundNetworkMode ?? 'direct') === originalOutboundNetworkMode
+      && externalProxySurfaceRestored,
     proxySnapshotSafe: Boolean(proxy?.hasPassword)
       && !Object.hasOwn(proxy, 'credentialId')
       && !Object.hasOwn(proxy, 'password')
@@ -610,9 +699,11 @@ try {
       && profileApplied.changedFiles[0] === profileSettingsPath
       && profileWritten.custom === undefined
       && profileWritten.env?.ANTHROPIC_AUTH_TOKEN === claudeRoute?.localToken,
-    profileBackupRestored: profileBackups.length === 1
-      && profileRestored.sourceBackup === profileBackups[0]?.backupPath
-      && profileRestored.restoredFile === profileSettingsPath,
+    profileBackupRestored: Boolean(profileSettingsBackup)
+      && profileRestored.sourceBackup === profileSettingsBackup?.backupPath
+      && profileRestored.restoredFile === profileSettingsPath
+      && restoredProfileSettings.env?.ANTHROPIC_BASE_URL === 'http://127.0.0.1:1'
+      && restoredProfileSettings.env?.ANTHROPIC_AUTH_TOKEN === profileToken,
     clientEditorSafe,
     clientEditorSaved: clientEditorSaved.changedFiles.includes(profileSettingsPath)
       && editorWrittenProfile.model === 'claude-smoke-model'
@@ -654,8 +745,8 @@ try {
     clientConfigSafetyBackup: Boolean(restored.safetyBackup)
       && backupsAfterRestore.length === 2
       && backupsAfterRestore.every((backup) => isPathInside(clientConfigHome, backup.backupPath)),
-    clientConfigBackupSet: manualClientBackup.backups.length === 1
-      && manualClientBackup.backups[0]?.groupId === manualClientBackup.groupId
+    clientConfigBackupSet: manualClientBackup.backups.some((backup) => backup.targetPath === claudeSettingsPath)
+      && manualClientBackup.backups.every((backup) => backup.groupId === manualClientBackup.groupId)
       && manualClientRestore.groupId === manualClientBackup.groupId
       && manualClientRestore.restoredFiles.includes(claudeSettingsPath)
       && manualClientRestoredSettings === restoredClaudeSettings,
@@ -671,7 +762,7 @@ try {
     clientConfigEasyUiWorks,
     gatewayStarted: started.gatewayStatus.running,
     gatewayProbeStatus: probe.status,
-    gatewayStopped: !stopped.gatewayStatus.running,
+    gatewayStopped: !stopped.gatewayStatus.running && gatewayPortReleased,
     helpCenterUiWorks,
     englishUiWorks,
     languageSwitchWorks,
@@ -687,6 +778,9 @@ try {
     result.routes !== 3 ||
     result.credentialsExposed ||
     result.clientConfigCount !== 3 ||
+    !result.externalProxySurfaceVisible ||
+    !result.builtInProxyFirstRunSafe ||
+    !result.builtInProxyDisabledCleanly ||
     !result.proxySnapshotSafe ||
     !result.chatGptAccountImported ||
     !result.tagImportApplied ||
@@ -752,8 +846,11 @@ try {
     process.exitCode = 1
   }
 } finally {
-  await electronApp.close()
-  await new Promise((resolvePromise, reject) => upstream.close((error) => error ? reject(error) : resolvePromise()))
+  try {
+    if (electronApp) await electronApp.close()
+  } finally {
+    await new Promise((resolvePromise, reject) => upstream.close((error) => error ? reject(error) : resolvePromise()))
+  }
 }
 
 function isPathInside(root, candidate) {
@@ -786,6 +883,16 @@ async function readFileIfExists(path) {
     if (error?.code === 'ENOENT') return undefined
     throw error
   }
+}
+
+async function portAvailable(host, port) {
+  const server = createServer()
+  return new Promise((resolvePromise) => {
+    server.once('error', () => resolvePromise(false))
+    server.listen(port, host, () => {
+      server.close((error) => resolvePromise(!error))
+    })
+  })
 }
 
 async function findAvailablePort() {

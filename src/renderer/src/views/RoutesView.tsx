@@ -1,3 +1,4 @@
+/* eslint-disable react-refresh/only-export-components -- regression-tested editor state helpers live beside the component. */
 import { useEffect, useRef, useState } from 'react'
 import {
   Check,
@@ -19,11 +20,67 @@ import { listRouteSources, resolveRouteSource, type RouteSourceKind } from '@sha
 import type { AppSnapshot, GatewayApi, Route, RouteClient, RoutePreviewIssue, RoutePreviewResult } from '@shared/types'
 import type { ActionRunner } from '../App'
 import { clientBrandMeta as clientMeta } from '../brand-icons'
+import { ExclusiveAsyncOperation } from '../async-operation'
 import { useI18n } from '../i18n'
-import { Badge, EmptyState, gatewayBaseUrl, PageHeader, protocolLabels, Toggle } from '../ui'
+import { Badge, EmptyState, FieldError, gatewayBaseUrl, PageHeader, protocolLabels, Toggle } from '../ui'
 import { setupPoolDisplayName } from '../system-generated-text'
 
 type MappingRow = { id: string; source: string; target: string }
+
+export type RouteMappingValidation = {
+  valid: true
+  modelMap: Record<string, string>
+} | {
+  valid: false
+  reason: 'incomplete' | 'duplicate-source'
+}
+
+/** Validate without silently dropping rows the user can still see in the editor. */
+export function validateRouteMappings(rows: readonly Pick<MappingRow, 'source' | 'target'>[]): RouteMappingValidation {
+  const modelMap: Record<string, string> = {}
+  for (const row of rows) {
+    const source = row.source.trim()
+    const target = row.target.trim()
+    if (!source || !target) return { valid: false, reason: 'incomplete' }
+    if (Object.hasOwn(modelMap, source)) return { valid: false, reason: 'duplicate-source' }
+    modelMap[source] = target
+  }
+  return { valid: true, modelMap }
+}
+
+/** Enabling/disabling is an isolated persisted mutation, never a draft save. */
+export function routeEnabledPayload(route: Route, enabled: boolean): Route {
+  return { ...route, enabled }
+}
+
+/** Signature of every persisted route field except the server-owned timestamp. */
+export function routeToggleAcknowledgementSignature(route: Route): string {
+  return JSON.stringify({
+    id: route.id,
+    client: route.client,
+    enabled: route.enabled,
+    highConcurrencyMode: route.highConcurrencyMode === true,
+    poolId: route.poolId,
+    inboundProtocol: route.inboundProtocol,
+    modelMap: route.modelMap,
+    localToken: route.localToken,
+    createdAt: route.createdAt,
+  })
+}
+
+export function routeEditorHasChanges(
+  draft: Route,
+  mappings: readonly Pick<MappingRow, 'source' | 'target'>[],
+  persisted: Route,
+): boolean {
+  const { modelMap: _draftModelMap, updatedAt: _draftUpdatedAt, ...draftFields } = draft
+  const { modelMap: _persistedModelMap, updatedAt: _persistedUpdatedAt, ...persistedFields } = persisted
+  return JSON.stringify({ fields: draftFields, mappings: mappings.map(({ source, target }) => ({ source, target })) })
+    !== JSON.stringify({
+      fields: persistedFields,
+      mappings: Object.entries(persisted.modelMap).map(([source, target]) => ({ source, target })),
+    })
+}
 
 function randomToken(client: RouteClient) {
   const bytes = crypto.getRandomValues(new Uint8Array(8))
@@ -75,13 +132,20 @@ function RouteEditor({
 }) {
   const { t } = useI18n()
   const [draft, setDraft] = useState(route)
-  const [mappings, setMappings] = useState<MappingRow[]>([])
+  const [mappings, setMappings] = useState<MappingRow[]>(() => Object.entries(route.modelMap)
+    .map(([source, target]) => ({ id: crypto.randomUUID(), source, target })))
   const [showToken, setShowToken] = useState(false)
   const [copied, setCopied] = useState<string | null>(null)
   const [previewModel, setPreviewModel] = useState('')
   const [preview, setPreview] = useState<RoutePreviewResult | null>(null)
   const [previewBusy, setPreviewBusy] = useState(false)
+  const [mappingValidationAttempted, setMappingValidationAttempted] = useState(false)
   const syncedRouteSignature = useRef('')
+  const pendingToggle = useRef<{ token: symbol; signature: string } | undefined>(undefined)
+  const persistedRoute = useRef(route)
+  const mutation = useRef(new ExclusiveAsyncOperation())
+  const [localMutation, setLocalMutation] = useState<'save' | 'toggle' | null>(null)
+  persistedRoute.current = route
   const meta = clientMeta[route.client]
   const routeSignature = JSON.stringify(route)
 
@@ -90,8 +154,17 @@ function RouteEditor({
     // has not changed. Do not let those refreshes overwrite an in-progress edit.
     if (syncedRouteSignature.current === routeSignature) return
     syncedRouteSignature.current = routeSignature
+    if (pendingToggle.current?.signature === routeToggleAcknowledgementSignature(route)) {
+      pendingToggle.current = undefined
+      // Preserve every unsaved field and mapping. The incoming snapshot is
+      // only the acknowledgement of the isolated enabled-state mutation.
+      setDraft((current) => ({ ...current, enabled: route.enabled, updatedAt: route.updatedAt }))
+      return
+    }
+    pendingToggle.current = undefined
     setDraft(route)
     setMappings(Object.entries(route.modelMap).map(([source, target]) => ({ id: crypto.randomUUID(), source, target })))
+    setMappingValidationAttempted(false)
   }, [route, routeSignature])
 
   const source = resolveRouteSource(draft.poolId, snapshot)
@@ -112,17 +185,38 @@ function RouteEditor({
     window.setTimeout(() => setCopied(null), 1400)
   }
 
+  const updateMappings = (next: MappingRow[]) => {
+    setMappings(next)
+    if (validateRouteMappings(next).valid) setMappingValidationAttempted(false)
+  }
+
   const save = async () => {
-    const modelMap = Object.fromEntries(mappings.filter((row) => row.source.trim() && row.target.trim()).map((row) => [row.source.trim(), row.target.trim()]))
-    await runAction(`save-route-${route.id}`, () => api.updateRoute({ ...draft, modelMap }))
+    const validation = validateRouteMappings(mappings)
+    if (!validation.valid) {
+      setMappingValidationAttempted(true)
+      return
+    }
+    setMappingValidationAttempted(false)
+    await mutation.current.run(async () => {
+      setLocalMutation('save')
+      try {
+        return await runAction(`save-route-${route.id}`, () => api.updateRoute({ ...draft, modelMap: validation.modelMap }))
+      } finally {
+        setLocalMutation(null)
+      }
+    })
   }
 
   const runPreview = async () => {
+    const validation = validateRouteMappings(mappings)
+    if (!validation.valid) {
+      setMappingValidationAttempted(true)
+      return
+    }
     setPreviewBusy(true)
     try {
-      const modelMap = Object.fromEntries(mappings.filter((row) => row.source.trim() && row.target.trim()).map((row) => [row.source.trim(), row.target.trim()]))
       setPreview(await api.previewRoute({
-        route: { ...draft, modelMap },
+        route: { ...draft, modelMap: validation.modelMap },
         requestedModel: previewModel.trim() || undefined,
       }))
     } finally {
@@ -131,22 +225,40 @@ function RouteEditor({
   }
 
   const toggleEnabled = async (enabled: boolean) => {
-    const modelMap = Object.fromEntries(mappings.filter((row) => row.source.trim() && row.target.trim()).map((row) => [row.source.trim(), row.target.trim()]))
-    const previous = draft
-    const next = { ...draft, enabled, modelMap }
-    setDraft(next)
-    const success = await runAction(`toggle-route-${route.id}`, () => api.updateRoute(next))
-    if (!success) setDraft(previous)
+    await mutation.current.run(async () => {
+      const requestToken = Symbol('route-toggle')
+      const previousEnabled = draft.enabled
+      const persistedNext = routeEnabledPayload(persistedRoute.current, enabled)
+      pendingToggle.current = {
+        token: requestToken,
+        signature: routeToggleAcknowledgementSignature(persistedNext),
+      }
+      setDraft((current) => ({ ...current, enabled }))
+      setLocalMutation('toggle')
+      try {
+        const success = await runAction(`toggle-route-${route.id}`, () => api.updateRoute(persistedNext))
+        if (!success && pendingToggle.current?.token === requestToken) {
+          pendingToggle.current = undefined
+          setDraft((current) => current.enabled === enabled
+            ? { ...current, enabled: previousEnabled }
+            : current)
+        }
+        return success
+      } finally {
+        setLocalMutation(null)
+      }
+    })
   }
 
-  const hasChanges = JSON.stringify({ ...draft, modelMap: Object.fromEntries(mappings.map((row) => [row.source, row.target])) }) !== JSON.stringify(route)
+  const mappingValidation = validateRouteMappings(mappings)
+  const hasChanges = routeEditorHasChanges(draft, mappings, route)
 
   return (
     <article className={`route-editor ${!draft.enabled ? 'route-editor--disabled' : ''}`}>
       <header className="route-editor__header">
         <span className="client-logo route-client-brand"><img src={meta.icon} alt="" /></span>
         <div><h2>{meta.name}</h2><span>{protocolLabels[draft.inboundProtocol]}</span></div>
-        <div className="route-editor__state"><span>{draft.enabled ? t('已启用', 'Enabled') : t('已停用', 'Disabled')}</span><Toggle checked={draft.enabled} onChange={(value) => void toggleEnabled(value)} label={draft.enabled ? t(`停用 ${meta.name} 路由`, `Disable ${meta.name} route`) : t(`启用 ${meta.name} 路由`, `Enable ${meta.name} route`)} /></div>
+        <div className="route-editor__state"><span>{draft.enabled ? t('已启用', 'Enabled') : t('已停用', 'Disabled')}</span><Toggle checked={draft.enabled} disabled={busy || localMutation !== null} onChange={(value) => void toggleEnabled(value)} label={draft.enabled ? t(`停用 ${meta.name} 路由`, `Disable ${meta.name} route`) : t(`启用 ${meta.name} 路由`, `Enable ${meta.name} route`)} /></div>
       </header>
 
       <div className="route-editor__body">
@@ -207,19 +319,22 @@ function RouteEditor({
         </div>
 
         <div className="mapping-section">
-          <div className="mapping-section__heading"><div><strong>{t('模型映射', 'Model mapping')}</strong><span>{mappings.length ? t(`${mappings.length} 条规则`, `${mappings.length} ${mappings.length === 1 ? 'rule' : 'rules'}`) : t('直接使用请求中的模型标识', 'Use the requested model identifier directly')}</span></div><button className="text-button" type="button" onClick={() => setMappings([...mappings, { id: crypto.randomUUID(), source: '', target: '' }])}><Plus size={15} />{t('添加规则', 'Add rule')}</button></div>
+          <div className="mapping-section__heading"><div><strong>{t('模型映射', 'Model mapping')}</strong><span>{mappings.length ? t(`${mappings.length} 条规则`, `${mappings.length} ${mappings.length === 1 ? 'rule' : 'rules'}`) : t('直接使用请求中的模型标识', 'Use the requested model identifier directly')}</span></div><button className="text-button" type="button" onClick={() => { updateMappings([...mappings, { id: crypto.randomUUID(), source: '', target: '' }]); setMappingValidationAttempted(false) }}><Plus size={15} />{t('添加规则', 'Add rule')}</button></div>
           {mappings.length > 0 && (
             <div className="mapping-list">
               {mappings.map((row) => (
                 <div className="mapping-row" key={row.id}>
-                  <input className="mono" value={row.source} onChange={(event) => setMappings(mappings.map((item) => item.id === row.id ? { ...item, source: event.target.value } : item))} placeholder={t('请求模型', 'Requested model')} />
+                  <input className="mono" value={row.source} onChange={(event) => updateMappings(mappings.map((item) => item.id === row.id ? { ...item, source: event.target.value } : item))} placeholder={t('请求模型', 'Requested model')} />
                   <span>→</span>
-                  <input className="mono" value={row.target} onChange={(event) => setMappings(mappings.map((item) => item.id === row.id ? { ...item, target: event.target.value } : item))} placeholder={t('上游模型', 'Upstream model')} />
-                  <button className="icon-button" type="button" title={t('删除映射', 'Delete mapping')} onClick={() => setMappings(mappings.filter((item) => item.id !== row.id))}><Trash2 size={15} /></button>
+                  <input className="mono" value={row.target} onChange={(event) => updateMappings(mappings.map((item) => item.id === row.id ? { ...item, target: event.target.value } : item))} placeholder={t('上游模型', 'Upstream model')} />
+                  <button className="icon-button" type="button" title={t('删除映射', 'Delete mapping')} onClick={() => updateMappings(mappings.filter((item) => item.id !== row.id))}><Trash2 size={15} /></button>
                 </div>
               ))}
             </div>
           )}
+          {mappingValidationAttempted && !mappingValidation.valid && <FieldError>{mappingValidation.reason === 'duplicate-source'
+            ? t('同一个请求模型只能设置一条映射。', 'Each requested model can have only one mapping.')
+            : t('请填写完整的请求模型和上游模型，或删除未完成的规则。', 'Complete both model fields or remove the unfinished rule.')}</FieldError>}
         </div>
 
         <details className="client-config route-preview">
@@ -238,7 +353,7 @@ function RouteEditor({
 
       <footer className="route-editor__footer">
         <span>{hasChanges ? t('有未保存的更改', 'Unsaved changes') : t('配置已同步', 'Configuration synced')}</span>
-        <button className="button button--primary" type="button" onClick={() => void save()} disabled={busy || !hasChanges || (draft.enabled && !draft.poolId)}>{busy ? <LoaderCircle size={16} className="spin" /> : <Save size={16} />}{t('保存路由', 'Save route')}</button>
+        <button className="button button--primary" type="button" onClick={() => void save()} disabled={busy || localMutation !== null || !hasChanges || (draft.enabled && !draft.poolId)}>{busy || localMutation === 'save' ? <LoaderCircle size={16} className="spin" /> : <Save size={16} />}{t('保存路由', 'Save route')}</button>
       </footer>
     </article>
   )

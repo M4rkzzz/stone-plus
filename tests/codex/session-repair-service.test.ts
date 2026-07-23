@@ -1,5 +1,5 @@
 import { DatabaseSync } from 'node:sqlite'
-import { appendFile, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -149,6 +149,26 @@ describe('CodexSessionRepairService', () => {
     expect(after.sqliteProviderRowsToUpdate).toBe(0)
     expect(after.sqliteUserEventRowsToUpdate).toBe(0)
     expect(after.sqliteCwdRowsToUpdate).toBe(0)
+  })
+
+  it('rolls back committed rollout bytes when restoring the original mtime fails', async () => {
+    const { codexHome, activeRollout, activeLines } = await createFixture()
+    let preserveCalls = 0
+    const service = new CodexSessionRepairService({
+      codexHome,
+      now: () => new Date('2026-07-18T13:00:00Z'),
+      randomId: () => 'mtime-rollback',
+      preserveRolloutMtime: async (path, atime, mtime) => {
+        preserveCalls += 1
+        if (preserveCalls === 1) throw new Error('simulated utimes failure')
+        await utimes(path, atime, mtime)
+      }
+    })
+    const preview = await service.preview('stone')
+
+    await expect(service.repair('stone', preview.revision)).rejects.toThrow('已自动回滚')
+    expect(await readFile(activeRollout, 'utf8')).toBe(activeLines)
+    expect(preserveCalls).toBe(2)
   })
 
   it('rejects a stale preview before writing any repair changes', async () => {

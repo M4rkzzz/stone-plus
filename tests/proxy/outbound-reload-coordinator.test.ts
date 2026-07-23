@@ -102,6 +102,31 @@ describe('outbound reload coordinator', () => {
     )
   })
 
+  it('preserves the legacy external route result when the bounded reload fails', async () => {
+    const reloadError = new Error('Chromium retained the retired mixed proxy')
+    const warning = vi.fn()
+    const harness = coordinatorHarness({
+      reload: vi.fn(async () => { throw reloadError }),
+      detect: vi.fn(async () => ({ detectedAt: 1, targets: [] })),
+      logger: { warn: warning, error: vi.fn() },
+    })
+
+    await expect(harness.coordinator.reloadExternalSystemRoute()).resolves.toBeUndefined()
+    expect(warning).toHaveBeenCalledWith(
+      expect.stringContaining('operating-system proxy configuration'),
+      reloadError,
+    )
+  })
+
+  it('propagates reload failure only through the built-in disable commit barrier', async () => {
+    const reloadError = new Error('Chromium retained the retired mixed proxy')
+    const harness = coordinatorHarness({
+      reload: vi.fn(async () => { throw reloadError }),
+    })
+
+    await expect(harness.coordinator.reloadExternalSystemRouteStrict()).rejects.toBe(reloadError)
+  })
+
   it('detects every enabled built-in target and rechecks failure cooldowns including paused explicit bindings', async () => {
     const accounts = [
       coolingAccount('direct-account'),
@@ -160,6 +185,98 @@ describe('outbound reload coordinator', () => {
     }
   })
 
+  it('does not probe an account whose enabled target disappeared while detection was running', async () => {
+    const cooling = coolingAccount('stale-account')
+    const probe = vi.fn(async () => undefined)
+    const harness = coordinatorHarness({
+      accounts: [cooling],
+      probe,
+      targets: [outboundTarget('stale', undefined, [cooling.id])],
+    })
+    const detector = vi.fn(async () => {
+      harness.targets.clear()
+      return undefined
+    })
+
+    const result = await harness.coordinator.coordinateBuiltInRouteChange(detector)
+
+    expect(result.recheckedAccountIds).toEqual([])
+    expect(probe).not.toHaveBeenCalled()
+  })
+
+  it('settles every overlapping debounced flight instead of only the latest one', async () => {
+    vi.useFakeTimers()
+    try {
+      let releaseFirst!: () => void
+      const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve })
+      const firstDetector = vi.fn(async () => firstGate)
+      const latestDetector = vi.fn(async () => undefined)
+      const harness = coordinatorHarness({ debounceMs: 0 })
+
+      harness.coordinator.scheduleBuiltInRouteChange(firstDetector)
+      await vi.advanceTimersByTimeAsync(0)
+      expect(firstDetector).toHaveBeenCalledOnce()
+      harness.coordinator.scheduleBuiltInRouteChange(latestDetector)
+      await vi.advanceTimersByTimeAsync(0)
+      await Promise.resolve()
+      expect(latestDetector).toHaveBeenCalledOnce()
+
+      let settled = false
+      const settling = harness.coordinator.settle().then(() => { settled = true })
+      await Promise.resolve()
+      expect(settled).toBe(false)
+      releaseFirst()
+      await settling
+      expect(settled).toBe(true)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not report a failed recheck batch settled while another worker is still running', async () => {
+    const first = coolingAccount('first-account')
+    const second = coolingAccount('second-account')
+    let releaseSecond!: () => void
+    const secondGate = new Promise<void>((resolve) => { releaseSecond = resolve })
+    const probe = vi.fn(async (accountId: string) => {
+      if (accountId === first.id) throw new Error('first probe failed')
+      await secondGate
+    })
+    const harness = coordinatorHarness({
+      accounts: [first, second],
+      probe,
+      targets: [outboundTarget('both', undefined, [first.id, second.id])],
+    })
+
+    let finished = false
+    const coordination = harness.coordinator.coordinateBuiltInRouteChange(async () => undefined)
+      .finally(() => { finished = true })
+    await vi.waitFor(() => expect(probe).toHaveBeenCalledTimes(2))
+    await Promise.resolve()
+    expect(finished).toBe(false)
+    releaseSecond()
+    await expect(coordination).rejects.toThrow('first probe failed')
+  })
+
+  it('continues claiming queued rechecks after every active worker fails', async () => {
+    const accounts = Array.from({ length: 5 }, (_, index) => coolingAccount(`account-${index + 1}`))
+    const probe = vi.fn(async (accountId: string) => {
+      if (accountId === 'account-1' || accountId === 'account-2') {
+        throw new Error(`${accountId} probe failed`)
+      }
+    })
+    const harness = coordinatorHarness({
+      accounts,
+      probe,
+      targets: [outboundTarget('all', undefined, accounts.map((account) => account.id))],
+      recheckConcurrency: 2,
+    })
+
+    await expect(harness.coordinator.coordinateBuiltInRouteChange(async () => undefined))
+      .rejects.toThrow('account-1 probe failed')
+    expect(probe.mock.calls.map(([accountId]) => accountId)).toEqual(accounts.map((account) => account.id))
+  })
+
   it('keeps concurrent reloads on the transport-owned single flight', async () => {
     let release!: () => void
     const gate = new Promise<void>((resolve) => { release = resolve })
@@ -194,6 +311,7 @@ function coordinatorHarness(options: {
   probe?: (accountId: string) => Promise<unknown>
   quotaAccountIds?: Set<string>
   debounceMs?: number
+  recheckConcurrency?: number
   logger?: Pick<Console, 'warn' | 'error'>
 } = {}) {
   const accounts = options.accounts ?? []
@@ -211,9 +329,10 @@ function coordinatorHarness(options: {
     probeAccount: options.probe ?? (async () => undefined),
     isQuotaExhausted: (candidate) => options.quotaAccountIds?.has(candidate.id) ?? false,
     debounceMs: options.debounceMs,
+    recheckConcurrency: options.recheckConcurrency,
     logger: options.logger
   })
-  return { coordinator, reload, detect }
+  return { coordinator, reload, detect, targets }
 }
 
 function outboundTarget(

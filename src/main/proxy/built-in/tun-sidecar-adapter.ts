@@ -1,12 +1,18 @@
-import { randomUUID } from 'node:crypto'
+import { randomBytes, randomUUID } from 'node:crypto'
 import { lookup } from 'node:dns/promises'
 import { mkdir, rename, rm, writeFile } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
 import { isIP } from 'node:net'
 import {
+  SING_BOX_VERSION,
   verifyBundledSingBoxRuntime,
   type VerifiedSingBoxRuntime
 } from './binary-manifest'
+import {
+  reserveLoopbackPort,
+  type LoopbackPortLease,
+  type ReserveLoopbackPort
+} from './sing-box-service'
 import {
   NativeTemporaryElevationProcessRunner,
   defaultPlatformCommandRunner,
@@ -82,6 +88,12 @@ export interface ElevatedSingBoxTunAdapterOptions {
   randomId?: () => string
   /** Resolved before TUN activation so node/DNS addresses can bypass auto-route. */
   resolveHost?: (host: string) => Promise<readonly string[]>
+  reservePort?: ReserveLoopbackPort
+  fetchImplementation?: typeof fetch
+  createSecret?: () => string
+  sleep?: (milliseconds: number) => Promise<void>
+  healthTimeoutMs?: number
+  healthIntervalMs?: number
 }
 
 export interface BuildElevatedTunSidecarConfigOptions {
@@ -89,13 +101,18 @@ export interface BuildElevatedTunSidecarConfigOptions {
   executablePath: string
   executableName?: string
   tunAddresses?: readonly string[]
+  controllerPort?: number
+  controllerSecret?: string
 }
 
 interface ActiveTunSidecar {
   handle: TemporaryElevatedProcessHandle
   configPath: string
   processStopped: boolean
+  exit?: Promise<{ code: number | null; signal: NodeJS.Signals | null }>
 }
+
+type ElevatedProcessExit = Awaited<NonNullable<TemporaryElevatedProcessHandle['exit']>>
 
 /**
  * A directly constructible TUN adapter for main. It verifies the complete
@@ -113,8 +130,15 @@ export class ElevatedSingBoxTunAdapter implements TunPlatformAdapter {
   private readonly fileSystem: TunSidecarFileSystem
   private readonly randomId: () => string
   private readonly resolveHost: (host: string) => Promise<readonly string[]>
+  private readonly reservePort: ReserveLoopbackPort
+  private readonly fetchImplementation: typeof fetch
+  private readonly createSecret: () => string
+  private readonly sleep: (milliseconds: number) => Promise<void>
+  private readonly healthTimeoutMs: number
+  private readonly healthIntervalMs: number
   private readonly configDirectory: string
   private readonly sessions = new Map<string, ActiveTunSidecar>()
+  private readonly pendingCleanup = new Set<ActiveTunSidecar>()
 
   public constructor(private readonly options: ElevatedSingBoxTunAdapterOptions) {
     if (!options.userDataPath.trim()) throw new Error('A user data path is required for the TUN sidecar.')
@@ -130,6 +154,12 @@ export class ElevatedSingBoxTunAdapter implements TunPlatformAdapter {
     this.fileSystem = options.fileSystem ?? DEFAULT_FILE_SYSTEM
     this.randomId = options.randomId ?? randomUUID
     this.resolveHost = options.resolveHost ?? resolveAllAddresses
+    this.reservePort = options.reservePort ?? reserveLoopbackPort
+    this.fetchImplementation = options.fetchImplementation ?? fetch
+    this.createSecret = options.createSecret ?? (() => randomBytes(32).toString('base64url'))
+    this.sleep = options.sleep ?? ((milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)))
+    this.healthTimeoutMs = Math.max(250, options.healthTimeoutMs ?? 10_000)
+    this.healthIntervalMs = Math.max(10, options.healthIntervalMs ?? 100)
     this.configDirectory = join(options.userDataPath, 'built-in-proxy', 'tun-sidecar')
     elevationLauncher(this.platform)
   }
@@ -166,12 +196,34 @@ export class ElevatedSingBoxTunAdapter implements TunPlatformAdapter {
 
     const id = validateRandomId(this.randomId())
     const configPath = join(this.configDirectory, `sidecar-${id}.json`)
+    let controllerLease: LoopbackPortLease
+    try {
+      controllerLease = await this.reservePort(0, '127.0.0.1')
+    } catch (error) {
+      throw new ElevatedSingBoxTunError(
+        'tun_start_failed',
+        'Could not reserve the temporary TUN health-controller port.',
+        { cause: error }
+      )
+    }
+    const controllerSecret = this.createSecret()
+    if (!/^[A-Za-z0-9_-]{32,256}$/.test(controllerSecret)) {
+      await controllerLease.release().catch(() => undefined)
+      throw new ElevatedSingBoxTunError('tun_start_failed', 'Could not create the TUN controller secret.')
+    }
     const configuration = buildElevatedTunSidecarConfig({
       bypass,
       executablePath: runtime.executablePath,
-      executableName: runtime.executable
+      executableName: runtime.executable,
+      controllerPort: controllerLease.port,
+      controllerSecret
     })
-    await this.writeConfiguration(configPath, configuration)
+    try {
+      await this.writeConfiguration(configPath, configuration)
+    } catch (error) {
+      await controllerLease.release().catch(() => undefined)
+      throw error
+    }
     const environment = runtimeEnvironment(runtime, this.environment, this.platform)
 
     try {
@@ -184,10 +236,22 @@ export class ElevatedSingBoxTunAdapter implements TunPlatformAdapter {
         operation: 'tun.sidecar.check'
       })
     } catch (error) {
+      await controllerLease.release().catch(() => undefined)
       await this.removeConfiguration(configPath)
       throw new ElevatedSingBoxTunError(
         'tun_config_invalid',
         'The generated sing-box TUN configuration failed validation.',
+        { cause: error }
+      )
+    }
+
+    try {
+      await controllerLease.release()
+    } catch (error) {
+      await this.removeConfiguration(configPath)
+      throw new ElevatedSingBoxTunError(
+        'tun_start_failed',
+        'Could not release the temporary TUN controller reservation.',
         { cause: error }
       )
     }
@@ -210,17 +274,57 @@ export class ElevatedSingBoxTunAdapter implements TunPlatformAdapter {
         { cause: error }
       )
     }
+    const active: ActiveTunSidecar = {
+      handle,
+      configPath,
+      processStopped: false,
+      ...(handle.exit ? { exit: handle.exit } : {})
+    }
+    this.observeExit(active)
     if (!handle.id?.trim() || this.sessions.has(handle.id)) {
-      await handle.stop().catch(() => undefined)
-      await this.removeConfiguration(configPath)
+      try {
+        await this.cleanupSidecar(active)
+      } catch (error) {
+        this.pendingCleanup.add(active)
+        throw new ElevatedSingBoxTunError(
+          'tun_cleanup_failed',
+          'The invalid TUN sidecar handle could not be cleaned up; retry is available.',
+          { cause: error }
+        )
+      }
       throw new ElevatedSingBoxTunError(
         'tun_start_failed',
         'The elevation runner returned an invalid or duplicate TUN sidecar handle.'
       )
     }
 
-    this.sessions.set(handle.id, { handle, configPath, processStopped: false })
-    return { id: handle.id, ...(handle.pid !== undefined ? { pid: handle.pid } : {}) }
+    try {
+      await this.waitUntilHealthy(controllerLease.port, controllerSecret, handle.exit)
+    } catch (error) {
+      try {
+        await this.cleanupSidecar(active)
+      } catch (cleanupError) {
+        this.pendingCleanup.add(active)
+        throw new ElevatedSingBoxTunError(
+          'tun_cleanup_failed',
+          'The unhealthy TUN sidecar could not be cleaned up; retry is available.',
+          { cause: cleanupError }
+        )
+      }
+      if (isElevationDenied(error)) throw error
+      throw new ElevatedSingBoxTunError(
+        'tun_start_failed',
+        'The elevated sing-box TUN sidecar did not become healthy.',
+        { cause: error }
+      )
+    }
+
+    this.sessions.set(handle.id, active)
+    return {
+      id: handle.id,
+      ...(handle.pid !== undefined ? { pid: handle.pid } : {}),
+      ...(handle.exit ? { exit: handle.exit } : {})
+    }
   }
 
   public async stopTemporary(session: TunPlatformSession): Promise<void> {
@@ -231,32 +335,108 @@ export class ElevatedSingBoxTunAdapter implements TunPlatformAdapter {
         `Temporary TUN sidecar '${session.id}' is no longer owned by Stone+.`
       )
     }
-    if (!active.processStopped) {
-      try {
-        await active.handle.stop()
-        active.processStopped = true
-      } catch (error) {
-        throw new ElevatedSingBoxTunError(
-          'tun_cleanup_failed',
-          'Could not stop the elevated sing-box TUN sidecar; retry is available.',
-          { cause: error }
-        )
-      }
-    }
     try {
-      await this.fileSystem.rm(active.configPath, { force: true })
+      await this.cleanupSidecar(active)
     } catch (error) {
       throw new ElevatedSingBoxTunError(
         'tun_cleanup_failed',
-        'The TUN sidecar stopped, but its temporary configuration could not be removed; retry is available.',
+        'Could not fully clean up the elevated TUN sidecar; retry is available.',
         { cause: error }
       )
     }
     this.sessions.delete(session.id)
   }
 
+  public async cleanupPending(): Promise<void> {
+    const results = await Promise.allSettled([...this.pendingCleanup].map(async (active) => {
+      await this.cleanupSidecar(active)
+      this.pendingCleanup.delete(active)
+    }))
+    const failure = results.find((result): result is PromiseRejectedResult => result.status === 'rejected')
+    if (failure) {
+      throw new ElevatedSingBoxTunError(
+        'tun_cleanup_failed',
+        'Could not clean up every pending elevated TUN sidecar; retry is available.',
+        { cause: failure.reason }
+      )
+    }
+  }
+
   public isElevationDenied(error: unknown): boolean {
     return isElevationDenied(error)
+  }
+
+  private observeExit(active: ActiveTunSidecar): void {
+    if (!active.exit) return
+    void active.exit.then(() => { active.processStopped = true })
+  }
+
+  private async cleanupSidecar(active: ActiveTunSidecar): Promise<void> {
+    if (!active.processStopped) {
+      await active.handle.stop()
+      active.processStopped = true
+    }
+    await this.fileSystem.rm(active.configPath, { force: true })
+  }
+
+  private async waitUntilHealthy(
+    controllerPort: number,
+    controllerSecret: string,
+    exit: TemporaryElevatedProcessHandle['exit']
+  ): Promise<void> {
+    const deadline = Date.now() + this.healthTimeoutMs
+    let lastError: unknown
+    let exitResult: ElevatedProcessExit | undefined
+    if (exit) void exit.then((result) => { exitResult = result })
+    await Promise.resolve()
+    while (Date.now() < deadline) {
+      if (exitResult) throw elevatedProcessExitError(exitResult)
+      try {
+        const attemptTimeoutMs = Math.max(1, Math.min(1_000, deadline - Date.now()))
+        const response = await rejectAfter(
+          this.fetchImplementation(`http://127.0.0.1:${controllerPort}/version`, {
+            headers: { Authorization: `Bearer ${controllerSecret}` },
+            redirect: 'error',
+            signal: AbortSignal.timeout(attemptTimeoutMs)
+          }),
+          attemptTimeoutMs,
+          'The TUN controller health request timed out.'
+        )
+        if (!response.ok) {
+          await response.body?.cancel().catch(() => undefined)
+          throw new Error(`TUN controller returned HTTP ${response.status}.`)
+        }
+        const payload = await response.json()
+        const version = payload && typeof payload === 'object'
+          ? (payload as { version?: unknown }).version
+          : undefined
+        const versionMatch = typeof version === 'string'
+          ? /(?:^|\s)(\d+\.\d+\.\d+)(?:$|[-+\s])/.exec(version)
+          : null
+        if (
+          !payload
+          || typeof payload !== 'object'
+          || versionMatch?.[1] !== SING_BOX_VERSION
+        ) {
+          throw new Error('TUN controller did not identify the verified sing-box version.')
+        }
+        if (exitResult) throw elevatedProcessExitError(exitResult)
+        return
+      } catch (error) {
+        if (exitResult) throw elevatedProcessExitError(exitResult)
+        lastError = error
+      }
+      if (exit) {
+        const exitedDuringDelay = await Promise.race([
+          exit,
+          this.sleep(Math.min(this.healthIntervalMs, Math.max(1, deadline - Date.now()))).then(() => undefined)
+        ])
+        if (exitedDuringDelay) throw elevatedProcessExitError(exitedDuringDelay)
+      } else {
+        await this.sleep(Math.min(this.healthIntervalMs, Math.max(1, deadline - Date.now())))
+      }
+    }
+    throw new Error('Timed out waiting for the elevated TUN controller.', { cause: lastError })
   }
 
   private async writeConfiguration(
@@ -350,6 +530,13 @@ export function buildElevatedTunSidecarConfig(
   const addresses = options.tunAddresses?.length
     ? options.tunAddresses.map(validateCidr)
     : [...DEFAULT_TUN_ADDRESSES]
+  if (
+    (options.controllerPort === undefined) !== (options.controllerSecret === undefined)
+    || (options.controllerPort !== undefined && !validPort(options.controllerPort))
+    || (options.controllerSecret !== undefined && !/^[A-Za-z0-9_-]{32,256}$/.test(options.controllerSecret))
+  ) {
+    throw new ElevatedSingBoxTunError('tun_config_invalid', 'The TUN health controller is invalid.')
+  }
   return {
     log: { level: 'warn', timestamp: true },
     inbounds: [{
@@ -375,7 +562,17 @@ export function buildElevatedTunSidecarConfig(
       auto_detect_interface: true,
       rules: directRules,
       final: MIXED_OUTBOUND
-    }
+    },
+    ...(options.controllerPort !== undefined && options.controllerSecret !== undefined
+      ? {
+          experimental: {
+            clash_api: {
+              external_controller: `127.0.0.1:${options.controllerPort}`,
+              secret: options.controllerSecret
+            }
+          }
+        }
+      : {})
   }
 }
 
@@ -463,12 +660,34 @@ async function runChecked(
 function isElevationDenied(error: unknown): boolean {
   if (error instanceof TunElevationDeniedError) return true
   if (!error || typeof error !== 'object') return false
-  const candidate = error as { code?: unknown; errno?: unknown; message?: unknown; cause?: unknown }
+  const candidate = error as {
+    code?: unknown
+    errno?: unknown
+    message?: unknown
+    stderr?: unknown
+    cause?: unknown
+  }
   return candidate.errno === 1223
+    || candidate.code === 126
+    || candidate.code === 127
     || ['EACCES', 'EPERM', 'ERROR_CANCELLED', 'USER_CANCELLED', 'TUN_ELEVATION_DENIED']
       .includes(String(candidate.code ?? '').toUpperCase())
-    || /cancel(?:led|ed)|declined|not authorized|dismissed/i.test(String(candidate.message ?? ''))
+    || /cancel(?:led|ed)|declined|not authorized|dismissed|no password|password.*required|authentication fail/i
+      .test(`${String(candidate.message ?? '')}\n${String(candidate.stderr ?? '')}`)
     || (candidate.cause !== undefined && isElevationDenied(candidate.cause))
+}
+
+function elevatedProcessExitError(exit: ElevatedProcessExit): Error {
+  const detail = exit.stderr?.trim()
+  if (isElevationDenied({ code: exit.code, stderr: detail })) {
+    return new TunElevationDeniedError(detail || undefined)
+  }
+  const status = exit.code !== null
+    ? `code ${exit.code}`
+    : exit.signal
+      ? `signal ${exit.signal}`
+      : 'an unknown status'
+  return new Error(`The elevated TUN sidecar exited with ${status}${detail ? `: ${detail}` : '.'}`)
 }
 
 async function resolveTunEndpointAddresses(
@@ -499,4 +718,19 @@ async function resolveTunEndpointAddresses(
 
 async function resolveAllAddresses(host: string): Promise<readonly string[]> {
   return (await lookup(host, { all: true, verbatim: true })).map((entry) => entry.address)
+}
+
+async function rejectAfter<T>(operation: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), timeoutMs)
+        timer.unref?.()
+      })
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
 }

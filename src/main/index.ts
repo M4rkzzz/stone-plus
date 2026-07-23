@@ -7,7 +7,7 @@ import { ClientConfigService } from './client-config'
 import { rebuildGatewayConnections, registerGatewayApi, warmGatewayConnections } from './ipc/gateway-api'
 import { registerUpdateApi } from './ipc/update-api'
 import { AppStore } from './store/app-store'
-import { DatabaseBackupService } from './backup'
+import { DatabaseBackupService, WebDavBackupService } from './backup'
 import { resolveChatGptCredential } from './providers'
 import { resolveChatGptAgentIdentity } from './auth'
 import {
@@ -33,9 +33,9 @@ import { registerClientInstanceApi } from './ipc/client-instance-api'
 import { registerCodexSessionManagerApi } from './ipc/session-manager-api'
 import { registerPersistentTaskApi } from './ipc/persistent-task-api'
 import { BROWSER_SESSION_PARTITION, BrowserImportQueue } from './browser-import-queue'
-import { LocalEventServer } from './events'
+import { LocalEventServer, startLocalEventServerForBootstrap } from './events'
 import { SystemLifecycleCoordinator } from './system-lifecycle'
-import { registerBuiltInProxyApi } from './ipc/built-in-proxy-api'
+import { registerBuiltInProxyApi, shutdownBuiltInProxyBoundary } from './ipc/built-in-proxy-api'
 import { SingBoxService } from './proxy/built-in/sing-box-service'
 import { BuiltInProxyOrchestrator } from './proxy/built-in/orchestrator'
 import { createChromiumMixedSessionGeneration } from './proxy/built-in/chromium-route-session'
@@ -54,6 +54,7 @@ let tray: Tray | undefined
 let store: AppStore
 let gateway: GatewayServer
 let backups: DatabaseBackupService<import('./store/types').PersistedState>
+let webDavBackups: WebDavBackupService
 let outboundTransport: OutboundTransportManager
 let outboundReloadCoordinator: OutboundReloadCoordinator
 let builtInProxy: BuiltInProxyOrchestrator
@@ -74,7 +75,7 @@ let storeClosed = false
 let shutdownForUpdate = false
 let shutdownPromise: Promise<void> | undefined
 let flushGatewayApiState: (() => Promise<void>) | undefined
-let disposeBuiltInProxyApi: (() => void) | undefined
+let disposeBuiltInProxyApi: (() => Promise<void>) | undefined
 let focusMainWindowOnReady = false
 let builtInChromiumGeneration = 0
 
@@ -93,9 +94,11 @@ if (ownsSingleInstanceLock) {
 
 async function bootstrap(): Promise<void> {
   await app.whenReady()
+  if (bootstrapShouldStop()) return
 
   store = new AppStore(app.getPath('userData'))
   await store.initialize()
+  if (bootstrapShouldStop()) return
   const gatewaySettings = store.getSnapshot().gateway
   const singBoxRuntimeRoot = app.isPackaged
     ? join(process.resourcesPath, 'sing-box')
@@ -113,6 +116,7 @@ async function bootstrap(): Promise<void> {
   await systemProxyLease.recoverStaleLease().catch((error) => {
     console.error('[built-in-proxy] Could not repair the previous system-proxy lease before startup', error)
   })
+  if (bootstrapShouldStop()) return
   singBoxService = new SingBoxService({
     userDataPath: app.getPath('userData'),
     runtimeRoot: singBoxRuntimeRoot,
@@ -143,6 +147,7 @@ async function bootstrap(): Promise<void> {
     await outboundTransport.reloadSystemProxyConfiguration().catch((error) => {
       console.warn('[system-proxy] Could not refresh the saved system proxy configuration at startup', error)
     })
+    if (bootstrapShouldStop()) return
   }
   outboundReloadCoordinator = createOutboundReloadCoordinator(store, outboundTransport)
   builtInProxy = new BuiltInProxyOrchestrator({
@@ -162,7 +167,7 @@ async function bootstrap(): Promise<void> {
     }),
     subscriptionFetch: outboundTransport.fetchFor(undefined),
     localGateway: { host: '127.0.0.1', port: gatewaySettings.port, transport: 'tcp' },
-    reloadExternalSystemProxy: () => outboundReloadCoordinator.reloadExternalSystemRoute(),
+    reloadExternalSystemProxy: () => outboundReloadCoordinator.reloadExternalSystemRouteStrict(),
     detectBuiltInTargets: async (targets) => {
       await outboundTransport.builtInRoutes.warm(targets)
       return { targets: [...targets] }
@@ -182,14 +187,46 @@ async function bootstrap(): Promise<void> {
     codexSessionIndexCleanup,
   )
   await store.refreshRequestConversationTitles((conversationId) => codexConversationTitles.resolve(conversationId))
+  if (bootstrapShouldStop()) return
   backups = new DatabaseBackupService({
     userDataPath: app.getPath('userData'),
     store: store.getStateRepository(),
     automaticRetention: store.getSnapshot().gateway.backupRetention ?? 10,
     portableSecretVault: safeStorage,
+    beforeRawBackup: async () => {
+      if (!webDavBackups) throw new Error('WebDAV backup safety checks are not ready')
+      await webDavBackups.prepareForRawBackup()
+    },
+    onRestoreCommitted: async () => {
+      // The old generation's plaintext cache must disappear before any read of
+      // restored state, then persisted transient data is normalized before the
+      // shared WebDAV migration gate permits another raw SQLite copy.
+      store.invalidateCredentialCache()
+      await store.sanitizePersistedData()
+    },
   })
   await backups.initialize()
-  if (store.getSnapshot().gateway.automaticBackups !== false) backups.startAutomaticBackups()
+  webDavBackups = new WebDavBackupService({
+    metadata: store.getStateRepository(),
+    safeStorage,
+    backups,
+    backupDirectory: backups.directory,
+    temporaryDirectory: join(app.getPath('userData'), 'webdav-transfer'),
+  })
+  try {
+    if (store.getSnapshot().gateway.automaticBackups !== false) {
+      await backups.startAutomaticBackups()
+    } else {
+      // Even with automatic backups disabled, eagerly remove legacy userinfo;
+      // manual/export paths will retry the same gate if this attempt fails.
+      await webDavBackups.prepareForRawBackup()
+    }
+  } catch {
+    // Do not include the migration error here: a legacy error can contain the
+    // credential-bearing URL that this startup barrier is protecting.
+    console.warn('[backup] Raw database backups remain safety-blocked because legacy WebDAV credentials could not be removed safely.')
+  }
+  if (bootstrapShouldStop()) return
   gateway = new GatewayServer({
     config: toGatewayConfig(store),
     credentialResolver: async (account, fetchImplementation = fetch, signal) => {
@@ -248,18 +285,19 @@ async function bootstrap(): Promise<void> {
     conversationTitleResolver: (conversationId) => codexConversationTitles.resolve(conversationId)
   })
   localEventServer = new LocalEventServer({ userDataPath: app.getPath('userData') })
-  try {
-    await localEventServer.start()
+  const eventServerStart = await startLocalEventServerForBootstrap(localEventServer, bootstrapShouldStop)
+  if (eventServerStart.status === 'stopping' || bootstrapShouldStop()) return
+  if (eventServerStart.status === 'ready') {
     gateway.onLog((log) => localEventServer.publish('request.log', log))
     gateway.onAccountState((state) => localEventServer.publish('account.state', state))
     gateway.onRuntimeState((state) => {
       localEventServer.publish('gateway.runtime', state)
       if (state.gatewayStatus) localEventServer.publish('gateway.status', gateway.getStatus())
     })
-  } catch (error) {
+  } else {
     // The event stream is an optional local integration surface. A port or
     // filesystem failure must never prevent the gateway itself from starting.
-    console.warn('Stone+ local event stream is unavailable', error)
+    console.warn('Stone+ local event stream is unavailable', eventServerStart.error)
   }
   const clientConfigHome = process.env.STONE_CLIENT_CONFIG_HOME
   const clientConfig = new ClientConfigService({
@@ -268,6 +306,15 @@ async function bootstrap(): Promise<void> {
   })
   clientInstanceManager = new ClientInstanceManager({
     store: store.getStateRepository(),
+    validateLaunchPlan: async () => {
+      const expected = store.getSnapshot().gateway
+      if (!gateway.getStatus().running) await gateway.start(expected)
+      const status = gateway.getStatus()
+      if (!status.running) throw new Error('The local gateway could not be started.')
+      if (status.host !== expected.host || status.port !== expected.port) {
+        throw new Error('The local gateway is running on a different address. Restart it before launching this client.')
+      }
+    },
     resolveBinding: (instance) => {
       const snapshot = store.getSnapshot()
       const route = instance.routeId
@@ -306,6 +353,7 @@ async function bootstrap(): Promise<void> {
       await clientInstanceManager.save({ ...instance, routeId, profileId })
     }
   }
+  if (bootstrapShouldStop()) return
 
   updateService = new UpdateService({
     currentVersion: app.getVersion(),
@@ -318,10 +366,17 @@ async function bootstrap(): Promise<void> {
     prepareToInstall: async () => {
       isQuitting = true
       shutdownForUpdate = true
-      await shutdownServices()
+      try {
+        await shutdownServices()
+      } catch (error) {
+        isQuitting = false
+        shutdownForUpdate = false
+        throw error
+      }
     }
   })
   await updateService.initialize()
+  if (bootstrapShouldStop()) return
 
   tunnelService = new FrpTunnelService({
     userDataPath: app.getPath('userData'),
@@ -330,6 +385,7 @@ async function bootstrap(): Promise<void> {
       : resolve('build/frp/frpc.exe')
   })
   await tunnelService.initialize()
+  if (bootstrapShouldStop()) return
 
   browserImportQueue = new BrowserImportQueue(
     join(app.getPath('temp'), 'stone-plus-browser-imports'),
@@ -354,7 +410,7 @@ async function bootstrap(): Promise<void> {
 
   flushGatewayApiState = registerGatewayApi(
     store, gateway, clientConfig, outboundTransport, backups,
-    updateTrayMenu, browserImportQueue, undefined, localEventServer, outboundReloadCoordinator
+    updateTrayMenu, browserImportQueue, undefined, localEventServer, outboundReloadCoordinator, webDavBackups
   )
   disposeBuiltInProxyApi = registerBuiltInProxyApi(builtInProxy, builtInProxy)
   await builtInProxy.initialize().catch((error) => {
@@ -363,6 +419,7 @@ async function bootstrap(): Promise<void> {
     // have already moved to the coordinator's fail-closed generation.
     console.error('[built-in-proxy] Automatic initialization failed', error)
   })
+  if (bootstrapShouldStop()) return
   systemLifecycle = new SystemLifecycleCoordinator({
     rebuildConnections: () => rebuildGatewayConnections(store, outboundTransport),
     isOnline: () => net.isOnline()
@@ -386,13 +443,15 @@ async function bootstrap(): Promise<void> {
   if (store.getSnapshot().gateway.autoStart) {
     try {
       await gateway.start()
+      if (bootstrapShouldStop()) return
       warmGatewayConnections(store, outboundTransport)
     } catch (error: unknown) {
-      console.error('Stone+ could not auto-start the gateway', error)
+      if (!bootstrapShouldStop()) console.error('Stone+ could not auto-start the gateway', error)
     } finally {
-      store.setGatewayStatus(gateway.getStatus())
+      if (!bootstrapShouldStop()) store.setGatewayStatus(gateway.getStatus())
     }
   }
+  if (bootstrapShouldStop()) return
 
   app.on('activate', () => {
     if (!mainWindow || mainWindow.isDestroyed()) {
@@ -401,6 +460,10 @@ async function bootstrap(): Promise<void> {
       showMainWindow()
     }
   })
+}
+
+function bootstrapShouldStop(): boolean {
+  return isQuitting || storeClosed
 }
 
 function createWindow(): void {
@@ -607,7 +670,17 @@ app.on('before-quit', (event) => {
   isQuitting = true
   if (storeClosed) return
   event.preventDefault()
-  void shutdownServices().finally(() => app.quit())
+  void shutdownServices().then(
+    () => app.quit(),
+    (error: unknown) => {
+      // Access restoration is a hard exit boundary: keeping the app and core
+      // alive is safer than orphaning sing-box or leaving the OS on a dead
+      // mixed endpoint. A later quit retries the durable lease cleanup.
+      isQuitting = false
+      console.error('Stone+ cancelled shutdown because built-in proxy cleanup is incomplete', error)
+      showMainWindow()
+    },
+  )
 })
 
 app.on('window-all-closed', () => {
@@ -619,6 +692,7 @@ if (!ownsSingleInstanceLock) {
   app.quit()
 } else {
   void bootstrap().catch((error: unknown) => {
+    if (bootstrapShouldStop()) return
     console.error('Stone+ failed to start', error)
     app.quit()
   })
@@ -627,7 +701,29 @@ if (!ownsSingleInstanceLock) {
 function shutdownServices(): Promise<void> {
   if (storeClosed) return Promise.resolve()
   if (shutdownPromise) return shutdownPromise
-  shutdownPromise = (async () => {
+  const flight = (async () => {
+    // Quiesce and drain renderer mutations before touching any process-owned
+    // network state. This critical phase is intentionally not best-effort.
+    const disposeApi = disposeBuiltInProxyApi
+    await shutdownBuiltInProxyBoundary({
+      quiesceIpc: async () => {
+        if (!disposeApi) return
+        const drain = disposeApi()
+        disposeBuiltInProxyApi = undefined
+        await drain
+      },
+      closeProxy: async () => {
+        if (builtInProxy) await builtInProxy.close()
+      },
+      // close() leaves the live core supervised when access restoration fails.
+      // Restore IPC admission so the user can retry without restarting.
+      resumeIpc: () => {
+        if (builtInProxy && !disposeBuiltInProxyApi) {
+          disposeBuiltInProxyApi = registerBuiltInProxyApi(builtInProxy, builtInProxy)
+        }
+      },
+    })
+
     // Every service gets its own best-effort shutdown step. In particular, a
     // failed gateway stop must not skip pending-state flushes, backup cleanup,
     // transport teardown, or the durable store close. The store is
@@ -654,13 +750,6 @@ function shutdownServices(): Promise<void> {
     await shutdownStep('gateway state flush', async () => {
       if (flushGatewayApiState) await flushGatewayApiState()
     })
-    await shutdownStep('built-in proxy IPC', () => {
-      disposeBuiltInProxyApi?.()
-      disposeBuiltInProxyApi = undefined
-    })
-    await shutdownStep('built-in proxy', async () => {
-      if (builtInProxy) await builtInProxy.close()
-    })
     await shutdownStep('outbound reload coordinator', async () => {
       if (outboundReloadCoordinator) await outboundReloadCoordinator.close()
     })
@@ -684,7 +773,11 @@ function shutdownServices(): Promise<void> {
     })
     storeClosed = true
   })()
-  return shutdownPromise
+  shutdownPromise = flight
+  void flight.catch(() => {
+    if (shutdownPromise === flight) shutdownPromise = undefined
+  })
+  return flight
 }
 
 async function shutdownStep(name: string, operation: () => void | Promise<void>): Promise<void> {

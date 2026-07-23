@@ -1,4 +1,4 @@
-import { readdir, readFile, rm } from 'node:fs/promises'
+import { mkdir, open, readdir, readFile, rm } from 'node:fs/promises'
 import { basename, dirname, resolve } from 'node:path'
 import { allClientFiles, clientDirectory, clientFiles, resolveClientConfigPaths } from './paths'
 import { planClientConfig, planClientConfigRepair, planCodexOfficialLoginConfig } from './planners'
@@ -13,6 +13,7 @@ import type {
   ClientConfigEditorChanges,
   ClientConfigEditorSnapshot,
   ClientConfigFilePath,
+  ClientConfigFileRole,
   ClientConfigPlan,
   ClientConfigPathOverrides,
   ClientConfigServiceOptions,
@@ -29,8 +30,25 @@ import type {
 import { ClientConfigValidationError } from './types'
 
 const backupMarker = '.stone-backup.'
+const missingBackupMarker = '.missing'
+const backupManifestMarker = '.stone-backup-set.'
+const backupManifestSuffix = '.manifest.json'
 const timestampPattern = /^(\d{8}T\d{9}Z)(?:\.(\d+))?$/
 const maximumBackupSequence = 999
+
+interface BackupSetManifestMember {
+  role: ClientConfigFileRole
+  existed: boolean
+  backupName: string
+}
+
+interface BackupSetManifestV1 {
+  version: 1
+  client: SupportedClient
+  groupId: string
+  createdAt: number
+  members: BackupSetManifestMember[]
+}
 // Profile-scoped services are short-lived wrappers around the same filesystem.
 // Keep one process-wide mutation queue so read/plan/backup/write/rollback cannot
 // interleave across wrappers that address the same client files.
@@ -67,7 +85,7 @@ function backupGroupId(createdAt: number, sequence: number): string {
 
 function validateBackupRetention(retention: number): void {
   if (!Number.isInteger(retention) || retention < 1 || retention > 100) {
-    throw new ClientConfigValidationError('Backup retention must be between 1 and 100 per file')
+    throw new ClientConfigValidationError('Backup retention must be between 1 and 100 backup groups')
   }
 }
 
@@ -245,7 +263,10 @@ export class ClientConfigService {
     await this.assertExpectedFiles(changes, expected)
     // Capture one timestamp and collision sequence for the complete operation.
     // This keeps config/auth and settings/env backups in an unambiguous set.
-    const backups = await this.backupFiles(changes, this.now())
+    // Capture explicit missing-file tombstones, including a first-run apply
+    // where every managed file is new. An exact restore can then recover the
+    // pre-apply state instead of leaving newly-created credentials behind.
+    const backups = await this.backupFiles(changes, this.now(), true)
 
     const written: ClientConfigFilePath[] = []
     try {
@@ -297,16 +318,29 @@ export class ClientConfigService {
   private async pruneBackupsUnlocked(client: SupportedClient, retention: number): Promise<string[]> {
     validateBackupRetention(retention)
     const backups = await this.listBackups(client)
-    const retainedByRole = new Map<ClientConfigFilePath['role'], number>()
-    const removed: string[] = []
+    const groups = new Map<string, BackupRecord[]>()
     for (const backup of backups) {
-      const retained = retainedByRole.get(backup.role) ?? 0
-      if (retained < retention) {
-        retainedByRole.set(backup.role, retained + 1)
-        continue
+      const group = groups.get(backup.groupId)
+      if (group) group.push(backup)
+      else groups.set(backup.groupId, [backup])
+    }
+
+    const removed: string[] = []
+    for (const [groupId, group] of [...groups].slice(retention)) {
+      // Invalidate a manifested set before unlinking any member. If the process
+      // stops halfway through pruning, a remaining tombstone cannot masquerade
+      // as a complete destructive snapshot.
+      const manifestPath = backupManifestPathForGroup(this.paths, client, groupId)
+      if (manifestPath) await rm(manifestPath, { force: true })
+
+      // Remove value snapshots before tombstones. Any interrupted group that
+      // still has a deletion marker is therefore incomplete and restore rejects
+      // it; a value-only legacy remainder is non-destructive.
+      const deletionOrder = [...group].sort((left, right) => Number(right.existed) - Number(left.existed))
+      for (const backup of deletionOrder) {
+        await rm(backup.backupPath)
+        removed.push(backup.backupPath)
       }
-      await rm(backup.backupPath)
-      removed.push(backup.backupPath)
     }
     return removed
   }
@@ -321,8 +355,9 @@ export class ClientConfigService {
   }
 
   /**
-   * Back up every currently existing managed file for a client as one set.
-   * Partial sets are removed when any copy fails.
+   * Back up the complete managed-file state for a client as one set. Missing
+   * roles become tombstones once at least one client file exists. Partial sets
+   * and their manifest are removed when any capture fails.
    */
   async createBackupSet(
     client: SupportedClient,
@@ -422,18 +457,19 @@ export class ClientConfigService {
     if (restoreFiles.length !== sourceBackups.length) {
       throw new Error(`Backup set ${selectedGroupId} contains an unsupported client configuration file.`)
     }
+    await this.assertRestorableBackupGroup(client, selectedGroupId, sourceBackups, eligibleFiles)
 
     // Read every source before touching current configuration. A missing or
     // unreadable source therefore cannot leave a half-restored client.
     const sourceContents = new Map<ClientConfigFilePath['role'], Buffer>()
     await Promise.all(restoreFiles.map(async (file) => {
       const source = sourceByRole.get(file.role)!
-      sourceContents.set(file.role, await readFile(source.backupPath))
+      if (source.existed) sourceContents.set(file.role, await readFile(source.backupPath))
     }))
 
     // The safety snapshot includes all current files, not only files present in
     // the source set. This gives rollback one coherent pre-restore state.
-    const safetyBackups = await this.backupFiles(eligibleFiles, this.now())
+    const safetyBackups = await this.backupFiles(eligibleFiles, this.now(), true)
     const safetyBackupSet = safetyBackups.length > 0
       ? backupSetFromRecords(client, safetyBackups)
       : undefined
@@ -441,8 +477,13 @@ export class ClientConfigService {
     const written: ClientConfigFilePath[] = []
     try {
       for (const file of restoreFiles) {
+        const source = sourceByRole.get(file.role)!
         await this.assertMatchesBackup(file, safetyBackups.find((backup) => backup.role === file.role))
-        await atomicWriteFile(file.path, sourceContents.get(file.role)!, this.randomId, file.containsCredential)
+        if (source.existed) {
+          await atomicWriteFile(file.path, sourceContents.get(file.role)!, this.randomId, file.containsCredential)
+        } else {
+          await rm(file.path, { force: true })
+        }
         written.push(file)
       }
     } catch (error) {
@@ -450,13 +491,18 @@ export class ClientConfigService {
         client,
         files: restoreFiles.map((file) => ({
           ...file,
-          content: sourceContents.get(file.role)!.toString('utf8'),
+          content: sourceContents.get(file.role)?.toString('utf8') ?? '',
           changed: true,
           existed: Boolean(safetyBackups.find((backup) => backup.role === file.role)),
           managedFields: ['complete document'],
         })),
       }
-      const rollbackFailures = await this.rollback(written, safetyBackups, expectedPlan)
+      const rollbackFailures = await this.rollback(
+        written,
+        safetyBackups,
+        expectedPlan,
+        new Map(restoreFiles.map((file) => [file.role, sourceContents.get(file.role)])),
+      )
       if (rollbackFailures.length) {
         throw new Error(`${messageOf(error)}; rollback was incomplete for: ${rollbackFailures.join(', ')}`)
       }
@@ -468,7 +514,15 @@ export class ClientConfigService {
       client,
       groupId: selectedGroupId,
       createdAt: first.createdAt,
-      restoredFiles: restoreFiles.map((file) => file.path),
+      restoredFiles: restoreFiles
+        .filter((file) => sourceByRole.get(file.role)!.existed)
+        .map((file) => file.path),
+      deletedFiles: restoreFiles
+        .filter((file) => (
+          !sourceByRole.get(file.role)!.existed
+          && safetyBackups.find((backup) => backup.role === file.role)?.existed
+        ))
+        .map((file) => file.path),
       sourceBackups,
       ...(safetyBackupSet ? { safetyBackupSet } : {}),
     }
@@ -480,7 +534,8 @@ export class ClientConfigService {
 
   private async restoreUnlocked(backupPath: string, client?: SupportedClient): Promise<RestoreBackupResult> {
     const normalized = this.normalizedPath(backupPath)
-    const record = (await this.listBackups(client)).find((candidate) =>
+    const managedBackups = await this.listBackups(client)
+    const record = managedBackups.find((candidate) =>
       this.normalizedPath(candidate.backupPath) === normalized)
     if (!record) throw new Error('Backup is not managed by this client configuration service')
 
@@ -488,10 +543,22 @@ export class ClientConfigService {
     const file = eligibleFiles.find((candidate) =>
       candidate.client === record.client && candidate.role === record.role)
     if (!file) throw new Error('Backup target is no longer configured')
+    const clientEligibleFiles = clientFiles(this.paths, record.client)
+    const sourceBackups = managedBackups.filter((candidate) => candidate.client === record.client && candidate.groupId === record.groupId)
+    const sourceRoles = new Set<ClientConfigFileRole>()
+    for (const source of sourceBackups) {
+      if (sourceRoles.has(source.role)) throw new Error(`Backup set ${record.groupId} contains duplicate ${source.role} files.`)
+      sourceRoles.add(source.role)
+    }
+    if (sourceBackups.some((source) => !clientEligibleFiles.some((candidate) => candidate.role === source.role))) {
+      throw new Error(`Backup set ${record.groupId} contains an unsupported client configuration file.`)
+    }
+    await this.assertRestorableBackupGroup(record.client, record.groupId, sourceBackups, clientEligibleFiles)
     const safetyBackup = await this.backupFile(file)
-    const content = await readFile(record.backupPath)
+    const content = record.existed ? await readFile(record.backupPath) : undefined
     await this.assertMatchesBackup(file, safetyBackup)
-    await atomicWriteFile(record.targetPath, content, this.randomId, file.containsCredential)
+    if (content) await atomicWriteFile(record.targetPath, content, this.randomId, file.containsCredential)
+    else await rm(record.targetPath, { force: true })
     return {
       client: record.client,
       role: record.role,
@@ -507,7 +574,7 @@ export class ClientConfigService {
   }
 
   private async backupFile(file: ClientConfigFilePath): Promise<BackupRecord | undefined> {
-    return (await this.backupFiles([file], this.now()))[0]
+    return (await this.backupFiles([file], this.now(), true))[0]
   }
 
   /**
@@ -518,22 +585,27 @@ export class ClientConfigService {
   private async backupFiles(
     requestedFiles: ClientConfigFilePath[],
     operationDate: Date,
+    includeAllMissing = false,
   ): Promise<BackupRecord[]> {
-    return this.backupFilesUnlocked(requestedFiles, operationDate)
+    return this.backupFilesUnlocked(requestedFiles, operationDate, includeAllMissing)
   }
 
   private async backupFilesUnlocked(
     requestedFiles: ClientConfigFilePath[],
     operationDate: Date,
+    includeAllMissing: boolean,
   ): Promise<BackupRecord[]> {
-    const existingFiles = (await Promise.all(requestedFiles.map(async (file) => ({
+    const capturedFiles = await Promise.all(requestedFiles.map(async (file) => ({
       file,
       info: await pathStat(file.path),
-    })))).filter((candidate) => candidate.info?.isFile())
-    if (existingFiles.length === 0) return []
+    })))
+    const existingFiles = capturedFiles.filter((candidate) => candidate.info?.isFile())
+    if (!includeAllMissing && existingFiles.length === 0) return []
+    const filesToCapture = capturedFiles
+    if (filesToCapture.length === 0) return []
 
-    const client = existingFiles[0].file.client
-    if (existingFiles.some((candidate) => candidate.file.client !== client)) {
+    const client = filesToCapture[0].file.client
+    if (filesToCapture.some((candidate) => candidate.file.client !== client)) {
       throw new Error('A backup set cannot contain configuration files from multiple clients.')
     }
 
@@ -543,18 +615,24 @@ export class ClientConfigService {
     for (let sequence = 0; sequence <= maximumBackupSequence; sequence += 1) {
       // Do not accidentally merge a single-file safety backup into another
       // role's group created during the same millisecond.
-      const occupied = (await Promise.all(managedFiles.map((file) =>
-        pathStat(backupPathFor(file, stamp, sequence))))).some(Boolean)
+      const occupied = (await Promise.all(managedFiles.flatMap((file) => [
+        pathStat(backupPathFor(file, stamp, sequence)),
+        pathStat(missingBackupPathFor(file, stamp, sequence)),
+      ]))).some(Boolean) || Boolean(await pathStat(backupManifestPathFor(this.paths, client, stamp, sequence)))
       if (occupied) continue
 
       const createdPaths: string[] = []
       const records: BackupRecord[] = []
       let collided = false
       try {
-        for (const { file, info } of existingFiles) {
-          const backupPath = backupPathFor(file, stamp, sequence)
+        for (const { file, info } of filesToCapture) {
+          const existed = Boolean(info?.isFile())
+          const backupPath = existed
+            ? backupPathFor(file, stamp, sequence)
+            : missingBackupPathFor(file, stamp, sequence)
           try {
-            await copyExclusive(file.path, backupPath)
+            if (existed) await copyExclusive(file.path, backupPath)
+            else await createExclusiveTombstone(backupPath)
           } catch (error) {
             if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
               collided = true
@@ -569,10 +647,31 @@ export class ClientConfigService {
             role: file.role,
             targetPath: file.path,
             backupPath,
+            existed,
             groupId: backupGroupId(createdAt, sequence),
             createdAt,
-            size: backupInfo?.size ?? info!.size,
+            size: backupInfo?.size ?? info?.size ?? 0,
           })
+        }
+        if (!collided) {
+          const manifestPath = backupManifestPathFor(this.paths, client, stamp, sequence)
+          try {
+            await createExclusiveManifest(manifestPath, {
+              version: 1,
+              client,
+              groupId: backupGroupId(createdAt, sequence),
+              createdAt,
+              members: records.map((record) => ({
+                role: record.role,
+                existed: record.existed,
+                backupName: basename(record.backupPath),
+              })),
+            })
+            createdPaths.push(manifestPath)
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === 'EEXIST') collided = true
+            else throw error
+          }
         }
       } catch (error) {
         await Promise.all(createdPaths.map((path) => rm(path, { force: true }).catch(() => undefined)))
@@ -600,7 +699,9 @@ export class ClientConfigService {
     const records: BackupRecord[] = []
     for (const entry of entries) {
       if (!entry.isFile() || !entry.name.startsWith(prefix)) continue
-      const createdAt = dateFromTimestamp(entry.name.slice(prefix.length))
+      const isTombstone = entry.name.endsWith(missingBackupMarker)
+      const timestampEnd = isTombstone ? -missingBackupMarker.length : undefined
+      const createdAt = dateFromTimestamp(entry.name.slice(prefix.length, timestampEnd))
       if (createdAt === undefined) continue
       const backupPath = resolve(dirname(file.path), entry.name)
       const info = await pathStat(backupPath)
@@ -610,6 +711,7 @@ export class ClientConfigService {
         role: file.role,
         targetPath: file.path,
         backupPath,
+        existed: !isTombstone,
         groupId: backupGroupId(createdAt, backupSequence(backupPath)),
         createdAt,
         size: info.size,
@@ -627,6 +729,52 @@ export class ClientConfigService {
     }
   }
 
+  private async assertRestorableBackupGroup(
+    client: SupportedClient,
+    groupId: string,
+    sourceBackups: BackupRecord[],
+    eligibleFiles: ClientConfigFilePath[],
+  ): Promise<void> {
+    const manifestPath = backupManifestPathForGroup(this.paths, client, groupId)
+    const manifest = manifestPath ? await readBackupManifest(manifestPath, groupId) : undefined
+    if (manifest) {
+      const membersByRole = new Map<ClientConfigFileRole, BackupSetManifestMember>()
+      for (const member of manifest.members) {
+        if (membersByRole.has(member.role)) {
+          throw new Error(`Backup set ${groupId} has an invalid manifest and cannot be restored.`)
+        }
+        membersByRole.set(member.role, member)
+      }
+      const supportedRoles = new Set(eligibleFiles.map((file) => file.role))
+      const exactMembers = manifest.client === client
+        && manifest.groupId === groupId
+        && manifest.createdAt === sourceBackups[0]?.createdAt
+        && manifest.members.length === sourceBackups.length
+        && manifest.members.every((member) => supportedRoles.has(member.role))
+        && sourceBackups.every((backup) => {
+          const member = membersByRole.get(backup.role)
+          return member?.existed === backup.existed && member.backupName === basename(backup.backupPath)
+        })
+      if (!exactMembers) {
+        throw new Error(`Backup set ${groupId} is incomplete or does not match its manifest; no files were changed.`)
+      }
+      return
+    }
+
+    // Backups produced before manifests existed contain only value snapshots
+    // and remain restorable as partial, non-destructive legacy groups. A
+    // transitional tombstone group is safe only when all supported roles are
+    // still present; otherwise it may be the residue of interrupted pruning.
+    if (sourceBackups.some((backup) => !backup.existed)) {
+      const sourceRoles = new Set(sourceBackups.map((backup) => backup.role))
+      const complete = sourceBackups.length === eligibleFiles.length
+        && eligibleFiles.every((file) => sourceRoles.has(file.role))
+      if (!complete) {
+        throw new Error(`Backup set ${groupId} is an incomplete deletion snapshot; no files were changed.`)
+      }
+    }
+  }
+
   private async assertMatchesBackup(file: ClientConfigFilePath, backup: BackupRecord | undefined): Promise<void> {
     const current = await readFile(file.path).catch((error: NodeJS.ErrnoException) => {
       if (error.code === 'ENOENT') return undefined
@@ -634,6 +782,12 @@ export class ClientConfigService {
     })
     if (!backup) {
       if (current !== undefined) throw new ClientConfigValidationError('Client configuration changed while Stone+ was preparing the update.')
+      return
+    }
+    if (!backup.existed) {
+      if (current !== undefined) {
+        throw new ClientConfigValidationError('Client configuration changed while Stone+ was preparing the update.')
+      }
       return
     }
     const expected = await readFile(backup.backupPath)
@@ -646,18 +800,25 @@ export class ClientConfigService {
     written: ClientConfigFilePath[],
     backups: BackupRecord[],
     plan: ClientConfigPlan,
+    expectedContents?: Map<ClientConfigFilePath['role'], Buffer | undefined>,
   ): Promise<string[]> {
     const failures: string[] = []
     for (const file of [...written].reverse()) {
       const planned = plan.files.find((candidate) => candidate.role === file.role)
       const backup = backups.find((candidate) => candidate.role === file.role)
       try {
-        const current = await readFile(file.path)
-        if (!planned || !current.equals(Buffer.from(planned.content, 'utf8'))) {
+        const current = await readFile(file.path).catch((error: NodeJS.ErrnoException) => {
+          if (error.code === 'ENOENT') return undefined
+          throw error
+        })
+        const expected = expectedContents?.has(file.role)
+          ? expectedContents.get(file.role)
+          : planned ? Buffer.from(planned.content, 'utf8') : undefined
+        if (!planned || (expected ? !current?.equals(expected) : current !== undefined)) {
           failures.push(file.path)
           continue
         }
-        if (backup) {
+        if (backup?.existed) {
           const content = await readFile(backup.backupPath)
           await atomicWriteFile(file.path, content, this.randomId, file.containsCredential)
         } else await rm(file.path, { force: true })
@@ -672,12 +833,97 @@ function messageOf(error: unknown): string {
 }
 
 function backupSequence(path: string): number {
-  const match = /\.stone-backup\.\d{8}T\d{9}Z(?:\.(\d+))?$/.exec(path)
+  const match = /\.stone-backup\.\d{8}T\d{9}Z(?:\.(\d+))?(?:\.missing)?$/.exec(path)
   return match?.[1] ? Number(match[1]) : 0
 }
 
 function backupPathFor(file: ClientConfigFilePath, stamp: string, sequence: number): string {
   return `${file.path}${backupMarker}${stamp}${sequence === 0 ? '' : `.${sequence}`}`
+}
+
+function missingBackupPathFor(file: ClientConfigFilePath, stamp: string, sequence: number): string {
+  return `${backupPathFor(file, stamp, sequence)}${missingBackupMarker}`
+}
+
+function backupManifestPathFor(
+  paths: ResolvedClientConfigPaths,
+  client: SupportedClient,
+  stamp: string,
+  sequence: number,
+): string {
+  const suffix = sequence === 0 ? '' : `.${sequence}`
+  return resolve(clientDirectory(paths, client), `${backupManifestMarker}${stamp}${suffix}${backupManifestSuffix}`)
+}
+
+function backupManifestPathForGroup(
+  paths: ResolvedClientConfigPaths,
+  client: SupportedClient,
+  groupId: string,
+): string | undefined {
+  const match = /^(\d+):(\d+)$/.exec(groupId)
+  if (!match) return undefined
+  const createdAt = Number(match[1])
+  const sequence = Number(match[2])
+  if (!Number.isSafeInteger(createdAt) || !Number.isInteger(sequence) || sequence < 0) return undefined
+  const date = new Date(createdAt)
+  if (Number.isNaN(date.getTime())) return undefined
+  return backupManifestPathFor(paths, client, timestampForFile(date), sequence)
+}
+
+async function createExclusiveTombstone(path: string): Promise<void> {
+  await createExclusiveFile(path, Buffer.alloc(0))
+}
+
+async function createExclusiveManifest(path: string, manifest: BackupSetManifestV1): Promise<void> {
+  await createExclusiveFile(path, Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`, 'utf8'))
+}
+
+async function createExclusiveFile(path: string, content: Buffer): Promise<void> {
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 })
+  const handle = await open(path, 'wx', 0o600)
+  let closed = false
+  try {
+    if (content.length > 0) await handle.writeFile(content)
+    await handle.sync()
+    await handle.close()
+    closed = true
+  } catch (error) {
+    if (!closed) await handle.close().catch(() => undefined)
+    await rm(path, { force: true }).catch(() => undefined)
+    throw error
+  }
+}
+
+async function readBackupManifest(path: string, groupId: string): Promise<BackupSetManifestV1 | undefined> {
+  let content: string
+  try {
+    content = await readFile(path, 'utf8')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+    throw error
+  }
+
+  try {
+    const manifest = JSON.parse(content) as Partial<BackupSetManifestV1>
+    if (
+      manifest.version !== 1
+      || typeof manifest.client !== 'string'
+      || typeof manifest.groupId !== 'string'
+      || typeof manifest.createdAt !== 'number'
+      || !Array.isArray(manifest.members)
+      || manifest.members.some((member) => (
+        !member
+        || typeof member.role !== 'string'
+        || typeof member.existed !== 'boolean'
+        || typeof member.backupName !== 'string'
+      ))
+    ) {
+      throw new Error('invalid manifest shape')
+    }
+    return manifest as BackupSetManifestV1
+  } catch {
+    throw new Error(`Backup set ${groupId} has an invalid manifest and cannot be restored.`)
+  }
 }
 
 function backupSetFromRecords(

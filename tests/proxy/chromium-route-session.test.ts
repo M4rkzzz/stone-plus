@@ -52,4 +52,26 @@ describe('built-in Chromium mixed session generation', () => {
     })).rejects.toThrow(/did not resolve/)
     expect(closeAllConnections).toHaveBeenCalledOnce()
   })
+
+  it('bounds disposal even when Chromium never closes connections or resets the proxy', async () => {
+    const never = new Promise<void>(() => undefined)
+    const setProxy = vi.fn()
+      .mockResolvedValueOnce(undefined)
+      .mockReturnValueOnce(never)
+    const closeAllConnections = vi.fn(() => never)
+    const generation = await createChromiumMixedSessionGeneration({
+      mixedEndpoint: 'http://127.0.0.1:23457',
+      reloadTimeoutMs: 5,
+      createSession: () => ({
+        setProxy,
+        forceReloadProxyConfig: vi.fn(async () => undefined),
+        resolveProxy: vi.fn(async () => 'PROXY 127.0.0.1:23457'),
+        closeAllConnections,
+      }) as never,
+    })
+
+    await expect(generation.dispose()).resolves.toBeUndefined()
+    expect(closeAllConnections).toHaveBeenCalledOnce()
+    expect(setProxy).toHaveBeenLastCalledWith({ mode: 'direct' })
+  })
 })

@@ -36,18 +36,19 @@ describe('built-in sing-box config builder', () => {
     expect(result.config.dns.servers[0]).toMatchObject({ detour: 'stone-direct' })
   })
 
-  it('generates private/China direct fallback rules with rule-set downloads forced direct', () => {
+  it('generates private/China direct fallback rules while bootstrapping rule data through the selected proxy', () => {
     const profile = parseBuiltInProxyProfile(`trojan://password@edge.example.com:443#Node`)
     const result = buildSingBoxConfig({ profile, mode: 'rule', accessMode: 'tun' })
 
-    expect(result.config.route.rules).toEqual(expect.arrayContaining([
+    expect(result.config.route.rules).toEqual([
       expect.objectContaining({ ip_cidr: ['127.0.0.0/8', '::1/128'], outbound: 'stone-direct' }),
       expect.objectContaining({ ip_is_private: true, outbound: 'stone-direct' }),
+      { action: 'sniff', timeout: '300ms' },
       expect.objectContaining({ rule_set: ['stone-geosite-cn', 'stone-geoip-cn'], outbound: 'stone-direct' })
-    ]))
+    ])
     expect(result.config.route.rule_set).toEqual([
-      expect.objectContaining({ tag: 'stone-geosite-cn', download_detour: 'stone-direct' }),
-      expect.objectContaining({ tag: 'stone-geoip-cn', download_detour: 'stone-direct' })
+      expect.objectContaining({ tag: 'stone-geosite-cn', download_detour: result.activeOutboundTag }),
+      expect.objectContaining({ tag: 'stone-geoip-cn', download_detour: result.activeOutboundTag })
     ])
     expect(result.config.route.final).toBe(result.activeOutboundTag)
   })
@@ -69,10 +70,155 @@ describe('built-in sing-box config builder', () => {
 
     expect(result.routePolicy).toBe('preserved')
     expect(result.config.route.rules.slice(1)).toEqual([
+      { action: 'sniff', timeout: '300ms' },
       { domain: ['ads.example'], action: 'reject', method: 'default' },
       { domain_suffix: ['internal.example'], action: 'route', outbound: 'stone-direct' }
     ])
     expect(result.config.route.final).toBe(result.activeOutboundTag)
+  })
+
+  it('compiles visual rules in order and completely replaces profile rules', () => {
+    const profile = parseBuiltInProxyProfile(JSON.stringify({
+      outbounds: [
+        { type: 'trojan', tag: 'Node', server: 'edge.example.com', server_port: 443, password: 'password' },
+        { type: 'direct', tag: 'direct' }
+      ],
+      route: { rules: [{ domain: ['must-not-survive.example'], outbound: 'direct' }] }
+    }))
+    const result = buildSingBoxConfig({
+      profile,
+      mode: 'rule',
+      accessMode: 'system',
+      customRules: {
+        rules: [
+          { id: 'private', condition: 'private-network', values: [], action: 'direct' },
+          { id: 'china', condition: 'mainland-china', values: [], action: 'direct' },
+          { id: 'ports', condition: 'port', values: ['80', '443'], action: 'proxy' },
+          { id: 'ads', condition: 'domain-suffix', values: ['ads.example'], action: 'block' }
+        ],
+        finalAction: 'direct'
+      }
+    })
+
+    expect(result.routePolicy).toBe('custom')
+    expect(result.config.route.rules).toEqual([
+      expect.objectContaining({ ip_cidr: ['127.0.0.0/8', '::1/128'], outbound: 'stone-direct' }),
+      expect.objectContaining({ ip_is_private: true, outbound: 'stone-direct' }),
+      { action: 'sniff', timeout: '300ms' },
+      expect.objectContaining({ rule_set: ['stone-geosite-cn', 'stone-geoip-cn'], outbound: 'stone-direct' }),
+      expect.objectContaining({ port: [80, 443], outbound: result.activeOutboundTag }),
+      { domain_suffix: ['ads.example'], action: 'reject', method: 'default' }
+    ])
+    expect(result.config.route.rule_set).toHaveLength(2)
+    expect(result.config.route.rule_set).toEqual([
+      expect.objectContaining({ download_detour: result.activeOutboundTag }),
+      expect.objectContaining({ download_detour: result.activeOutboundTag })
+    ])
+    expect(result.config.route.final).toBe('stone-direct')
+    expect(JSON.stringify(result.config)).not.toContain('must-not-survive.example')
+  })
+
+  it('distinguishes an explicit empty visual rule set and ignores it outside rule mode', () => {
+    const profile = parseBuiltInProxyProfile(`trojan://password@edge.example.com:443#Node`)
+    const customRules = { rules: [], finalAction: 'direct' as const }
+    const rule = buildSingBoxConfig({ profile, mode: 'rule', accessMode: 'system', customRules })
+    const global = buildSingBoxConfig({ profile, mode: 'global', accessMode: 'system', customRules })
+    const direct = buildSingBoxConfig({ profile, mode: 'direct', accessMode: 'system', customRules })
+
+    expect(rule.routePolicy).toBe('custom')
+    expect(rule.config.route.rules).toHaveLength(1)
+    expect(rule.config.route.final).toBe('stone-direct')
+    expect(global.routePolicy).toBe('global')
+    expect(global.config.route.final).toBe(global.activeOutboundTag)
+    expect(direct.routePolicy).toBe('direct')
+    expect(direct.config.route.final).toBe('stone-direct')
+  })
+
+  it('maps every generic visual condition without changing its rule order', () => {
+    const profile = parseBuiltInProxyProfile(`trojan://password@edge.example.com:443#Node`)
+    const result = buildSingBoxConfig({
+      profile,
+      mode: 'rule',
+      accessMode: 'system',
+      customRules: {
+        rules: [
+          { id: 'domain', condition: 'domain', values: ['api.example.com'], action: 'proxy' },
+          { id: 'suffix', condition: 'domain-suffix', values: ['example.org'], action: 'direct' },
+          { id: 'keyword', condition: 'domain-keyword', values: ['video'], action: 'block' },
+          { id: 'cidr', condition: 'ip-cidr', values: ['198.51.100.0/24'], action: 'proxy' },
+          { id: 'port', condition: 'port', values: ['443'], action: 'direct' },
+          { id: 'range', condition: 'port-range', values: ['1000:2000'], action: 'proxy' },
+          { id: 'network', condition: 'network', values: ['tcp', 'udp'], action: 'direct' },
+          { id: 'protocol', condition: 'protocol', values: ['http', 'tls'], action: 'block' },
+          { id: 'private', condition: 'private-network', values: [], action: 'direct' },
+          { id: 'china', condition: 'mainland-china', values: [], action: 'proxy' },
+        ],
+        finalAction: 'proxy',
+      },
+    })
+
+    expect(result.config.route.rules.slice(1)).toEqual([
+      { action: 'sniff', timeout: '300ms' },
+      { domain: ['api.example.com'], action: 'route', outbound: result.activeOutboundTag },
+      { domain_suffix: ['example.org'], action: 'route', outbound: 'stone-direct' },
+      { domain_keyword: ['video'], action: 'reject', method: 'default' },
+      { ip_cidr: ['198.51.100.0/24'], action: 'route', outbound: result.activeOutboundTag },
+      { port: [443], action: 'route', outbound: 'stone-direct' },
+      { port_range: ['1000:2000'], action: 'route', outbound: result.activeOutboundTag },
+      { network: ['tcp', 'udp'], action: 'route', outbound: 'stone-direct' },
+      { protocol: ['http', 'tls'], action: 'reject', method: 'default' },
+      { ip_is_private: true, action: 'route', outbound: 'stone-direct' },
+      { rule_set: ['stone-geosite-cn', 'stone-geoip-cn'], action: 'route', outbound: result.activeOutboundTag },
+    ])
+  })
+
+  it('does not add sniffing when every visual rule can be matched from packet metadata', () => {
+    const profile = parseBuiltInProxyProfile(`trojan://password@edge.example.com:443#Node`)
+    const result = buildSingBoxConfig({
+      profile,
+      mode: 'rule',
+      accessMode: 'tun',
+      customRules: {
+        rules: [
+          { id: 'private', condition: 'private-network', values: [], action: 'direct' },
+          { id: 'cidr', condition: 'ip-cidr', values: ['198.51.100.0/24'], action: 'proxy' },
+          { id: 'port', condition: 'port', values: ['443'], action: 'direct' },
+          { id: 'network', condition: 'network', values: ['tcp'], action: 'proxy' },
+        ],
+        finalAction: 'proxy',
+      },
+    })
+
+    expect(result.config.route.rules).not.toContainEqual(expect.objectContaining({ action: 'sniff' }))
+  })
+
+  it('keeps loopback and packet-metadata rules ahead of the first required sniff action', () => {
+    const profile = parseBuiltInProxyProfile(`trojan://password@edge.example.com:443#Node`)
+    const result = buildSingBoxConfig({
+      profile,
+      mode: 'rule',
+      accessMode: 'tun',
+      customRules: {
+        rules: [
+          { id: 'private', condition: 'private-network', values: [], action: 'direct' },
+          { id: 'cidr', condition: 'ip-cidr', values: ['198.51.100.0/24'], action: 'direct' },
+          { id: 'port', condition: 'port', values: ['443'], action: 'direct' },
+          { id: 'domain', condition: 'domain-suffix', values: ['example.com'], action: 'proxy' },
+          { id: 'protocol', condition: 'protocol', values: ['tls'], action: 'proxy' },
+        ],
+        finalAction: 'proxy',
+      },
+    })
+
+    expect(result.config.route.rules).toEqual([
+      expect.objectContaining({ ip_cidr: ['127.0.0.0/8', '::1/128'], outbound: 'stone-direct' }),
+      { ip_is_private: true, action: 'route', outbound: 'stone-direct' },
+      { ip_cidr: ['198.51.100.0/24'], action: 'route', outbound: 'stone-direct' },
+      { port: [443], action: 'route', outbound: 'stone-direct' },
+      { action: 'sniff', timeout: '300ms' },
+      { domain_suffix: ['example.com'], action: 'route', outbound: result.activeOutboundTag },
+      { protocol: ['tls'], action: 'route', outbound: result.activeOutboundTag },
+    ])
   })
 
   it('supports global/direct modes without allowing loopback into the proxy', () => {
@@ -83,10 +229,15 @@ describe('built-in sing-box config builder', () => {
     expect(global.config.route.rules).toEqual([
       expect.objectContaining({ ip_cidr: ['127.0.0.0/8', '::1/128'], outbound: 'stone-direct' })
     ])
+    expect(global.config.route.rules).not.toContainEqual(expect.objectContaining({ action: 'sniff' }))
     expect(global.config.route.final).toBe(global.activeOutboundTag)
     expect(direct.config.outbounds).toEqual([
       expect.objectContaining({ type: 'direct', tag: 'stone-direct' })
     ])
+    expect(direct.config.route.rules).toEqual([
+      expect.objectContaining({ ip_cidr: ['127.0.0.0/8', '::1/128'], outbound: 'stone-direct' })
+    ])
+    expect(direct.config.route.rules).not.toContainEqual(expect.objectContaining({ action: 'sniff' }))
     expect(direct.config.route.final).toBe('stone-direct')
     expect(JSON.stringify(direct.config)).not.toContain('password')
   })

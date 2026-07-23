@@ -1,6 +1,20 @@
 import { createReadStream } from 'node:fs'
 import { createHash, randomUUID } from 'node:crypto'
-import { copyFile, lstat, mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
+import {
+  copyFile,
+  lstat,
+  mkdir,
+  open,
+  readFile,
+  readdir,
+  realpath,
+  rename,
+  rm,
+  stat,
+  writeFile,
+  type FileHandle,
+} from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { createInterface } from 'node:readline'
 import { basename, dirname, join, relative, resolve, sep } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
@@ -37,6 +51,24 @@ interface CachedSession {
   kind: CodexSessionKind
   session: CodexManagedSession
 }
+
+interface TokenUsageSnapshot {
+  inputTokens: number
+  outputTokens: number
+  cachedInputTokens: number
+  reasoningTokens: number
+  totalTokens: number
+}
+
+type PartialTokenUsageSnapshot = Partial<TokenUsageSnapshot>
+
+const TOKEN_USAGE_FIELDS = [
+  'inputTokens',
+  'outputTokens',
+  'cachedInputTokens',
+  'reasoningTokens',
+  'totalTokens',
+] as const satisfies readonly (keyof TokenUsageSnapshot)[]
 
 interface TrashManifest {
   version: 1
@@ -90,9 +122,20 @@ export class CodexSessionManager {
     await this.assertSessionRevision(session, expectedRevision)
     const destination = resolve(destinationPath)
     if (source === destination) throw new Error('Choose a different export destination.')
-    if (this.isManagedPath(destination)) throw new Error('Export Codex sessions outside the managed session directories.')
-    await mkdir(dirname(destination), { recursive: true })
-    const temporary = `${destination}.${process.pid}.${randomUUID()}.tmp`
+    await this.assertExportDestination(destination)
+    const requestedParent = dirname(destination)
+    await mkdir(requestedParent, { recursive: true })
+    // Revalidate after creating the directory so a junction or symlink in the
+    // requested path cannot redirect the export into a managed session root.
+    await this.assertExportDestination(destination)
+    const fixedParent = await realpath(requestedParent)
+    const fixedDestination = join(fixedParent, basename(destination))
+    await this.assertExportDestination(fixedDestination)
+    await this.assertExportParentsStable(requestedParent, fixedParent)
+    // Verify the source in a private, unpredictable staging path. The final
+    // destination is updated through an already-open file handle below; no
+    // rename operand is ever resolved through a mutable junction after this.
+    const temporary = join(tmpdir(), `stone-session-export-${process.pid}-${randomUUID()}.tmp`)
     try {
       for (let attempt = 0; attempt < 2; attempt += 1) {
         await copyFile(source, temporary)
@@ -100,7 +143,13 @@ export class CodexSessionManager {
         const [sourceHash, copiedHash] = await Promise.all([sha256File(source), sha256File(temporary)])
         const currentRevision = sessionRevision(session.id, session.relativePath, session.kind, Number(after.size), sourceHash)
         if (currentRevision === expectedRevision && copiedHash === sourceHash) {
-          await rename(temporary, destination)
+          await this.commitExportThroughBoundHandle(
+            temporary,
+            destination,
+            requestedParent,
+            fixedParent,
+            fixedDestination,
+          )
           return
         }
         await rm(temporary, { force: true })
@@ -337,11 +386,161 @@ export class CodexSessionManager {
     return path
   }
 
-  private isManagedPath(path: string): boolean {
-    return ['sessions', 'archived_sessions', TRASH_DIRECTORY].some((directory) => {
+  private async assertExportDestination(path: string): Promise<void> {
+    const candidatePaths = [resolve(path), await canonicalPathForContainment(path)]
+    for (const directory of ['sessions', 'archived_sessions', TRASH_DIRECTORY]) {
       const root = resolve(this.codexHome, directory)
-      return path === root || path.startsWith(`${root}${sep}`)
-    })
+      const rootPaths = [root, await canonicalPathForContainment(root)]
+      if (candidatePaths.some((candidate) => rootPaths.some((managedRoot) => pathIsWithin(candidate, managedRoot)))) {
+        throw new Error('Export Codex sessions outside the managed session directories.')
+      }
+    }
+  }
+
+  private async assertExportParentsStable(requestedParent: string, fixedParent: string): Promise<void> {
+    let currentRequested: string
+    let currentFixed: string
+    try {
+      [currentRequested, currentFixed] = await Promise.all([
+        realpath(requestedParent),
+        realpath(fixedParent),
+      ])
+    } catch {
+      throw new Error('The export destination changed while the session was being exported. Try again.')
+    }
+    const expected = normalizedPathForComparison(fixedParent)
+    if (normalizedPathForComparison(currentRequested) !== expected
+      || normalizedPathForComparison(currentFixed) !== expected) {
+      throw new Error('The export destination changed while the session was being exported. Try again.')
+    }
+  }
+
+  private async commitExportThroughBoundHandle(
+    stagedPath: string,
+    requestedDestination: string,
+    requestedParent: string,
+    fixedParent: string,
+    fixedDestination: string,
+  ): Promise<void> {
+    const parentHandle = await open(fixedParent, 'r')
+    try {
+      const parentIdentity = identityFromStat(await parentHandle.stat({ bigint: true }))
+      await this.assertExportParentsStableByIdentity(requestedParent, fixedParent, parentIdentity)
+      await this.assertExportDestination(requestedDestination)
+      await this.assertExportDestination(fixedDestination)
+      const opened = await this.openExportDestination(fixedDestination)
+      const destinationIdentity = identityFromStat(await opened.handle.stat({ bigint: true }))
+      const backupPath = `${stagedPath}.previous`
+      let backupCreated = false
+      let destinationMutated = false
+      try {
+        await this.assertOpenExportDestination(
+          opened.handle,
+          fixedDestination,
+          requestedParent,
+          fixedParent,
+          parentIdentity,
+          destinationIdentity,
+        )
+        if (!opened.created) {
+          await copyOpenFileToPath(opened.handle, backupPath)
+          backupCreated = true
+        }
+        destinationMutated = true
+        await replaceOpenFileFromPath(opened.handle, stagedPath)
+        await this.assertOpenExportDestination(
+          opened.handle,
+          fixedDestination,
+          requestedParent,
+          fixedParent,
+          parentIdentity,
+          destinationIdentity,
+        )
+      } catch (error) {
+        let rollbackError: unknown
+        if (destinationMutated && backupCreated) {
+          try { await replaceOpenFileFromPath(opened.handle, backupPath) } catch (caught) { rollbackError = caught }
+        }
+        if (opened.created) {
+          await removeCreatedExportIfStillOwned(fixedDestination, destinationIdentity).catch(() => undefined)
+        }
+        if (rollbackError) {
+          throw new Error(
+            `${errorMessage(error)} The previous export destination could not be restored: ${errorMessage(rollbackError)}`,
+            { cause: error },
+          )
+        }
+        throw error
+      } finally {
+        await opened.handle.close().catch(() => undefined)
+        await rm(backupPath, { force: true }).catch(() => undefined)
+      }
+    } finally {
+      await parentHandle.close().catch(() => undefined)
+    }
+  }
+
+  private async openExportDestination(path: string): Promise<{ handle: FileHandle; created: boolean }> {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        return { handle: await open(path, 'wx+', 0o600), created: true }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+      }
+      try {
+        return { handle: await open(path, 'r+'), created: false }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT' || attempt === 2) throw error
+      }
+    }
+    throw new Error('The export destination changed while it was being opened. Try again.')
+  }
+
+  private async assertExportParentsStableByIdentity(
+    requestedParent: string,
+    fixedParent: string,
+    expected: FileIdentity,
+  ): Promise<void> {
+    await this.assertExportParentsStable(requestedParent, fixedParent)
+    try {
+      const [requestedInfo, fixedInfo] = await Promise.all([
+        stat(requestedParent, { bigint: true }),
+        stat(fixedParent, { bigint: true }),
+      ])
+      if (!sameFileIdentity(identityFromStat(requestedInfo), expected)
+        || !sameFileIdentity(identityFromStat(fixedInfo), expected)) {
+        throw exportDestinationChangedError()
+      }
+    } catch (error) {
+      if (error instanceof ExportDestinationChangedError) throw error
+      throw exportDestinationChangedError()
+    }
+  }
+
+  private async assertOpenExportDestination(
+    handle: FileHandle,
+    path: string,
+    requestedParent: string,
+    fixedParent: string,
+    parentIdentity: FileIdentity,
+    destinationIdentity: FileIdentity,
+  ): Promise<void> {
+    await this.assertExportParentsStableByIdentity(requestedParent, fixedParent, parentIdentity)
+    await this.assertExportDestination(path)
+    try {
+      const [linked, opened] = await Promise.all([
+        lstat(path, { bigint: true }),
+        handle.stat({ bigint: true }),
+      ])
+      if (!linked.isFile() || linked.isSymbolicLink()
+        || !sameFileIdentity(identityFromStat(linked), destinationIdentity)
+        || !sameFileIdentity(identityFromStat(opened), destinationIdentity)) {
+        throw exportDestinationChangedError()
+      }
+    } catch (error) {
+      if (error instanceof ExportDestinationChangedError) throw error
+      throw exportDestinationChangedError()
+    }
   }
 
   private async createTrashManifest(id: string, originalRelativePath: string): Promise<TrashManifest> {
@@ -552,6 +751,8 @@ async function parseRollout(path: string): Promise<ParsedRollout> {
   const input = createReadStream(path)
   input.on('data', (chunk: string | Buffer) => hash.update(chunk))
   const lines = createInterface({ input, crlfDelay: Infinity })
+  let cumulativeUsage: PartialTokenUsageSnapshot | undefined
+  const incrementalUsage = emptyUsageSnapshot()
   for await (const line of lines) {
     let record: Record<string, unknown>
     try {
@@ -572,36 +773,111 @@ async function parseRollout(path: string): Promise<ParsedRollout> {
       }
     }
     const usage = findUsage(record)
-    if (usage) {
-      parsed.inputTokens = Math.max(parsed.inputTokens, numeric(usage.input_tokens))
-      parsed.outputTokens = Math.max(parsed.outputTokens, numeric(usage.output_tokens))
-      parsed.cachedInputTokens = Math.max(parsed.cachedInputTokens, numeric(usage.cached_input_tokens))
-      parsed.reasoningTokens = Math.max(parsed.reasoningTokens,
-        numeric(usage.reasoning_output_tokens) || numeric(usage.reasoning_tokens))
-      parsed.totalTokens = Math.max(parsed.totalTokens, numeric(usage.total_tokens))
-    }
+    if (usage.cumulative) cumulativeUsage = mergeCumulativeUsage(cumulativeUsage, usage.cumulative)
+    if (usage.incremental) addUsage(incrementalUsage, usage.incremental)
   }
+  const selectedUsage = selectUsageByField(cumulativeUsage, incrementalUsage)
+  parsed.inputTokens = selectedUsage.inputTokens
+  parsed.outputTokens = selectedUsage.outputTokens
+  parsed.cachedInputTokens = selectedUsage.cachedInputTokens
+  parsed.reasoningTokens = selectedUsage.reasoningTokens
+  parsed.totalTokens = selectedUsage.totalTokens
   parsed.contentSha256 = hash.digest('hex')
   return parsed
 }
 
-function findUsage(record: Record<string, unknown>): Record<string, unknown> | undefined {
+function findUsage(record: Record<string, unknown>): {
+  cumulative?: PartialTokenUsageSnapshot
+  incremental?: PartialTokenUsageSnapshot
+} {
   const payload = isRecord(record.payload) ? record.payload : undefined
   const info = payload && isRecord(payload.info) ? payload.info : undefined
-  const candidates = [
+  const cumulative = mergeUsageCandidates([
     info && isRecord(info.total_token_usage) ? info.total_token_usage : undefined,
-    payload && isRecord(payload.total_token_usage) ? payload.total_token_usage : undefined,
+    payload && isRecord(payload.total_token_usage) ? payload.total_token_usage : undefined
+  ])
+  const incremental = mergeUsageCandidates([
     payload && isRecord(payload.usage) ? payload.usage : undefined,
     isRecord(record.usage) ? record.usage : undefined
-  ]
-  return candidates.find((candidate) => candidate && [
-    candidate.input_tokens,
-    candidate.output_tokens,
-    candidate.cached_input_tokens,
-    candidate.reasoning_output_tokens,
-    candidate.reasoning_tokens,
-    candidate.total_tokens
-  ].some((value) => typeof value === 'number' && Number.isFinite(value)))
+  ])
+  return {
+    ...(cumulative ? { cumulative } : {}),
+    ...(incremental ? { incremental } : {}),
+  }
+}
+
+function usageSnapshot(candidate: Record<string, unknown> | undefined): PartialTokenUsageSnapshot | undefined {
+  if (!candidate) return undefined
+  const snapshot = {
+    inputTokens: optionalTokenCount(candidate.input_tokens),
+    outputTokens: optionalTokenCount(candidate.output_tokens),
+    cachedInputTokens: optionalTokenCount(candidate.cached_input_tokens),
+    reasoningTokens: optionalTokenCount(candidate.reasoning_output_tokens)
+      ?? optionalTokenCount(candidate.reasoning_tokens),
+    totalTokens: optionalTokenCount(candidate.total_tokens)
+  }
+  const defined = Object.fromEntries(
+    Object.entries(snapshot).filter(([, value]) => value !== undefined),
+  ) as PartialTokenUsageSnapshot
+  return TOKEN_USAGE_FIELDS.some((field) => defined[field] !== undefined) ? defined : undefined
+}
+
+function emptyUsageSnapshot(): TokenUsageSnapshot {
+  return { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, reasoningTokens: 0, totalTokens: 0 }
+}
+
+function mergeUsageCandidates(
+  candidates: Array<Record<string, unknown> | undefined>
+): PartialTokenUsageSnapshot | undefined {
+  const parsed = candidates.map(usageSnapshot)
+    .filter((candidate): candidate is PartialTokenUsageSnapshot => candidate !== undefined)
+  if (!parsed.length) return undefined
+  // Empty placeholder objects are common next to a populated fallback. Ignore
+  // those placeholders without discarding an explicit zero inside an otherwise
+  // meaningful partial snapshot.
+  const meaningful = parsed.filter((candidate) => TOKEN_USAGE_FIELDS.some((field) => (candidate[field] ?? 0) > 0))
+  const selected = meaningful.length ? meaningful : parsed
+  const merged: PartialTokenUsageSnapshot = {}
+  for (const candidate of selected) {
+    for (const field of TOKEN_USAGE_FIELDS) merged[field] ??= candidate[field]
+  }
+  return merged
+}
+
+function mergeCumulativeUsage(
+  current: PartialTokenUsageSnapshot | undefined,
+  candidate: PartialTokenUsageSnapshot,
+): PartialTokenUsageSnapshot {
+  const merged = { ...(current ?? {}) }
+  // Cumulative events are chronological corrections. Update only fields that
+  // are actually present so a later partial event cannot zero unrelated data.
+  for (const field of TOKEN_USAGE_FIELDS) {
+    if (candidate[field] !== undefined) merged[field] = candidate[field]
+  }
+  return merged
+}
+
+function addUsage(target: TokenUsageSnapshot, usage: PartialTokenUsageSnapshot): void {
+  for (const field of TOKEN_USAGE_FIELDS) {
+    if (usage[field] !== undefined) target[field] = safeTokenSum(target[field], usage[field])
+  }
+}
+
+function selectUsageByField(
+  cumulative: PartialTokenUsageSnapshot | undefined,
+  incremental: TokenUsageSnapshot,
+): TokenUsageSnapshot {
+  return {
+    inputTokens: cumulative?.inputTokens ?? incremental.inputTokens,
+    outputTokens: cumulative?.outputTokens ?? incremental.outputTokens,
+    cachedInputTokens: cumulative?.cachedInputTokens ?? incremental.cachedInputTokens,
+    reasoningTokens: cumulative?.reasoningTokens ?? incremental.reasoningTokens,
+    totalTokens: cumulative?.totalTokens ?? incremental.totalTokens,
+  }
+}
+
+function safeTokenSum(left: number, right: number): number {
+  return Math.min(Number.MAX_SAFE_INTEGER, left + right)
 }
 
 async function collectRollouts(
@@ -637,6 +913,110 @@ function boundedLimit(value: number | undefined): number {
   return Number.isFinite(value) ? Math.max(1, Math.min(10_000, Math.floor(value!))) : 1_000
 }
 
+async function canonicalPathForContainment(path: string): Promise<string> {
+  let cursor = resolve(path)
+  const missingSegments: string[] = []
+  while (true) {
+    try {
+      return resolve(await realpath(cursor), ...missingSegments)
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code
+      if (code !== 'ENOENT' && code !== 'ENOTDIR') throw error
+      const parent = dirname(cursor)
+      if (parent === cursor) return resolve(path)
+      missingSegments.unshift(basename(cursor))
+      cursor = parent
+    }
+  }
+}
+
+interface FileIdentity {
+  dev: bigint
+  ino: bigint
+  birthtimeNs: bigint
+}
+
+class ExportDestinationChangedError extends Error {
+  public constructor() {
+    super('The export destination changed while the session was being exported. Try again.')
+  }
+}
+
+function exportDestinationChangedError(): ExportDestinationChangedError {
+  return new ExportDestinationChangedError()
+}
+
+function identityFromStat(info: { dev: bigint; ino: bigint; birthtimeNs: bigint }): FileIdentity {
+  return { dev: info.dev, ino: info.ino, birthtimeNs: info.birthtimeNs }
+}
+
+function sameFileIdentity(left: FileIdentity, right: FileIdentity): boolean {
+  if (left.dev !== right.dev) return false
+  if (left.ino !== 0n || right.ino !== 0n) return left.ino === right.ino
+  return left.birthtimeNs === right.birthtimeNs
+}
+
+async function copyOpenFileToPath(source: FileHandle, destination: string): Promise<void> {
+  const target = await open(destination, 'wx+', 0o600)
+  try {
+    await copyOpenFile(source, target)
+    await target.sync()
+  } finally {
+    await target.close().catch(() => undefined)
+  }
+}
+
+async function replaceOpenFileFromPath(destination: FileHandle, sourcePath: string): Promise<void> {
+  const source = await open(sourcePath, 'r')
+  try {
+    await destination.truncate(0)
+    await copyOpenFile(source, destination)
+    await destination.sync()
+  } finally {
+    await source.close().catch(() => undefined)
+  }
+}
+
+async function copyOpenFile(source: FileHandle, destination: FileHandle): Promise<void> {
+  const buffer = Buffer.allocUnsafe(64 * 1024)
+  let position = 0
+  while (true) {
+    const { bytesRead } = await source.read(buffer, 0, buffer.byteLength, position)
+    if (bytesRead === 0) break
+    let written = 0
+    while (written < bytesRead) {
+      const result = await destination.write(buffer, written, bytesRead - written, position + written)
+      if (result.bytesWritten <= 0) throw new Error('The export destination stopped accepting data.')
+      written += result.bytesWritten
+    }
+    position += bytesRead
+  }
+  await destination.truncate(position)
+}
+
+async function removeCreatedExportIfStillOwned(path: string, expected: FileIdentity): Promise<boolean> {
+  try {
+    const current = await lstat(path, { bigint: true })
+    if (!current.isFile() || current.isSymbolicLink()
+      || !sameFileIdentity(identityFromStat(current), expected)) return false
+    await rm(path, { force: true })
+    return true
+  } catch {
+    return false
+  }
+}
+
+function pathIsWithin(candidate: string, root: string): boolean {
+  const normalizedCandidate = normalizedPathForComparison(candidate)
+  const normalizedRoot = normalizedPathForComparison(root)
+  return normalizedCandidate === normalizedRoot || normalizedCandidate.startsWith(`${normalizedRoot}${sep}`)
+}
+
+function normalizedPathForComparison(path: string): string {
+  const normalized = resolve(path)
+  return process.platform === 'win32' ? normalized.toLowerCase() : normalized
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
 }
@@ -645,8 +1025,10 @@ function text(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined
 }
 
-function numeric(value: unknown): number {
-  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : 0
+function optionalTokenCount(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0
+    ? Math.min(Number.MAX_SAFE_INTEGER, Math.floor(value))
+    : undefined
 }
 
 function parseTimestamp(value: unknown): number | undefined {

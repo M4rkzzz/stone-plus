@@ -1,5 +1,5 @@
 import { app, BrowserWindow, dialog, ipcMain, Notification, safeStorage, shell, type WebContents } from 'electron'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { lstat, readFile, writeFile } from 'node:fs/promises'
 import { basename, extname, join } from 'node:path'
 import { clientNativeProtocols } from '@shared/types'
@@ -57,9 +57,10 @@ export interface GatewayController {
   start(settings?: GatewaySettings): Promise<void>
   stop(options?: { force?: boolean; drainTimeoutMs?: number }): Promise<void>
   getStatus(): GatewayStatus
+  getConfigGeneration?(): number
   updateConfig(config: GatewayConfig): void
   updateRuntimeAccounts(accounts: ReadonlyArray<GatewayConfig['accounts'][number]>): void
-  resetAccountHealth(accountId: string): void
+  resetAccountHealth(accountId: string, options?: { clearPerformance?: boolean }): void
   getAccountFitness(accountIds?: readonly string[]): Record<string, AccountFitnessSnapshot>
   getAccountInFlight(accountIds?: readonly string[]): Record<string, number>
   getRequestReplayTemplate?(id: string): RequestReplayTemplate | undefined
@@ -82,15 +83,16 @@ export function registerGatewayApi(
     openExternal: (url) => shell.openExternal(url)
   }),
   localEvents?: LocalEventServer,
-  sharedOutboundReloadCoordinator?: OutboundReloadCoordinator
+  sharedOutboundReloadCoordinator?: OutboundReloadCoordinator,
+  sharedWebDavBackups?: WebDavBackupService,
 ): () => Promise<void> {
-  const webDavBackups = backups ? new WebDavBackupService({
+  const webDavBackups = sharedWebDavBackups ?? (backups ? new WebDavBackupService({
     metadata: store.getStateRepository(),
     safeStorage,
     backups,
     backupDirectory: backups.directory,
     temporaryDirectory: join(app.getPath('userData'), 'webdav-transfer'),
-  }) : undefined
+  }) : undefined)
   const runtimeDeltaPublishIntervalMs = 50
   const accountStateFlushDelayMs = 250
   const requestLogCheckpointIntervalMs = 10_000
@@ -116,13 +118,80 @@ export function registerGatewayApi(
   const quotaProbeFlights = new Set<string>()
   const lastQuotaProbeAt = new Map<string, number>()
   const apiSourceCapabilityProbeOwners = new Map<string, symbol>()
+  const unsavedApiSourceProbeEvidence = new Map<string, {
+    draftId: string
+    connectionFingerprint: string
+    testedModel: string
+    discoveredModels: readonly string[]
+    expiresAt: number
+    capabilityProfile: Awaited<ReturnType<GatewayApi['probeApiSource']>>['capabilityProfile']
+    modelCatalog: Awaited<ReturnType<GatewayApi['probeApiSource']>>['modelCatalog']
+  }>()
+  const unsavedApiSourceProbeEvidenceTtlMs = 5 * 60_000
+  const maximumUnsavedApiSourceProbeEvidence = 128
+  const issueUnsavedApiSourceProbeEvidence = (
+    input: Parameters<GatewayApi['probeApiSource']>[0],
+    result: Awaited<ReturnType<GatewayApi['probeApiSource']>>,
+  ): string => {
+    const now = Date.now()
+    for (const [token, evidence] of unsavedApiSourceProbeEvidence) {
+      if (evidence.expiresAt <= now) unsavedApiSourceProbeEvidence.delete(token)
+    }
+    while (unsavedApiSourceProbeEvidence.size >= maximumUnsavedApiSourceProbeEvidence) {
+      const oldest = unsavedApiSourceProbeEvidence.keys().next().value as string | undefined
+      if (!oldest) break
+      unsavedApiSourceProbeEvidence.delete(oldest)
+    }
+    const token = randomUUID()
+    unsavedApiSourceProbeEvidence.set(token, {
+      draftId: apiSourceDraftIdentity(input),
+      connectionFingerprint: apiSourceProbeConnectionFingerprint(input),
+      testedModel: normalizeApiSourceEvidenceModel(result.testedModel)
+        ?? normalizeApiSourceEvidenceModel(input.model)
+        ?? normalizeApiSourceEvidenceModel(result.models[0])
+        ?? '',
+      discoveredModels: normalizeApiSourceEvidenceModels(result.models),
+      expiresAt: now + unsavedApiSourceProbeEvidenceTtlMs,
+      capabilityProfile: structuredClone(result.capabilityProfile),
+      modelCatalog: structuredClone(result.modelCatalog),
+    })
+    return token
+  }
+  const consumeUnsavedApiSourceProbeEvidence = (
+    token: unknown,
+    input: Parameters<GatewayApi['saveApiSource']>[0],
+  ): { capabilityProfile: typeof unsavedApiSourceProbeEvidence extends Map<string, infer T>
+      ? T extends { capabilityProfile: infer P } ? P : never
+      : never
+    modelCatalog: typeof unsavedApiSourceProbeEvidence extends Map<string, infer T>
+      ? T extends { modelCatalog: infer M } ? M : never
+      : never
+  } | undefined => {
+    if (typeof token !== 'string' || !token) return undefined
+    const evidence = unsavedApiSourceProbeEvidence.get(token)
+    // A token is single-use even when the caller presents it with a modified
+    // draft. This prevents probing A, trying B, then replaying it for A.
+    unsavedApiSourceProbeEvidence.delete(token)
+    if (!evidence || evidence.expiresAt <= Date.now()) return undefined
+    try {
+      if (evidence.draftId !== apiSourceDraftIdentity(input)) return undefined
+      if (evidence.connectionFingerprint !== apiSourceProbeConnectionFingerprint(input)) return undefined
+      if (!apiSourceSaveMatchesProbeModels(input, evidence.testedModel, evidence.discoveredModels)) return undefined
+      return {
+        capabilityProfile: structuredClone(evidence.capabilityProfile),
+        modelCatalog: structuredClone(evidence.modelCatalog),
+      }
+    } catch {
+      return undefined
+    }
+  }
   let automaticCooldownRefreshTriggered = false
   let automaticCooldownRefreshFlight: Promise<void> | undefined
   const noEligibleProbeFlights = new Map<string, Promise<void>>()
   const noEligibleProbeLastStartedAt = new Map<string, number>()
   const noEligibleRefreshFlights = new Set<Promise<void>>()
   let evaluateAutomaticCooldownRefresh = (): void => undefined
-  let refreshNoEligibleAccounts = (_accountIds: readonly string[]): void => undefined
+  let refreshNoEligibleAccounts = (_context: NonNullable<GatewayRuntimeStateUpdate['noEligibleAccounts']>): void => undefined
   let gatewayLifecycleTail: Promise<void> = Promise.resolve()
   const enqueueGatewayLifecycle = <T>(operation: () => Promise<T>): Promise<T> => {
     const result = gatewayLifecycleTail.then(operation, operation)
@@ -389,7 +458,7 @@ export function registerGatewayApi(
 
   const unsubscribeRuntimeState = gateway.onRuntimeState((update = { gatewayStatus: true, allAccounts: true }) => {
     if (update.noEligibleAccounts?.accountIds.length) {
-      refreshNoEligibleAccounts(update.noEligibleAccounts.accountIds)
+      refreshNoEligibleAccounts(update.noEligibleAccounts)
     }
     if (update.allAccounts) {
       scheduleRuntimeDelta({ gatewayStatus: update.gatewayStatus === true, allAccounts: true })
@@ -406,6 +475,12 @@ export function registerGatewayApi(
     gateway.updateConfig(toGatewayConfig(store))
     store.setGatewayStatus(gateway.getStatus())
     return store.getSnapshot()
+  }
+
+  const publishRuntimeAccount = (accountId: string): AppSnapshot => {
+    const account = store.getRuntimeAccount(accountId)
+    if (account) gateway.updateRuntimeAccounts([account])
+    return publish(store.getSnapshot())
   }
 
   const scheduleQuotaProbe = (accountId: string, at: number): void => {
@@ -496,7 +571,7 @@ export function registerGatewayApi(
       { status: 'checking', lastError: undefined },
       () => accountProbeOwners.get(id)?.token === token && !signal?.aborted,
     )
-    publish(refreshRuntime())
+    publishRuntimeAccount(id)
     try {
       const result = await checkAccount(store, outboundTransport, id, signal)
       signal?.throwIfAborted()
@@ -538,7 +613,7 @@ export function registerGatewayApi(
       }
       if (exhausted && cooldownUntil !== undefined) scheduleQuotaProbe(id, cooldownUntil + 1_000)
       else gateway.resetAccountHealth(id)
-      const snapshot = publish(refreshRuntime())
+      const snapshot = publishRuntimeAccount(id)
       evaluateAutomaticCooldownRefresh()
       return { snapshot, ok: !exhausted, latencyMs: result.latencyMs,
         ...(exhausted ? { error: 'ChatGPT Codex 额度已耗尽。' } : {}) }
@@ -553,7 +628,7 @@ export function registerGatewayApi(
             () => accountProbeOwners.get(id)?.token === token
               && store.getRuntimeAccount(id)?.status === 'checking',
           )
-          publish(refreshRuntime())
+          publishRuntimeAccount(id)
         }
         throw abortReason(signal)
       }
@@ -576,7 +651,7 @@ export function registerGatewayApi(
       if (!persisted.applied || accountProbeOwners.get(id)?.token !== token) {
         return { snapshot: persisted.snapshot, ok: false, error: errorMessage }
       }
-      const snapshot = publish(refreshRuntime())
+      const snapshot = publishRuntimeAccount(id)
       evaluateAutomaticCooldownRefresh()
       return { snapshot, ok: false, error: errorMessage }
     } finally {
@@ -668,10 +743,34 @@ export function registerGatewayApi(
     })
   }
 
-  refreshNoEligibleAccounts = (accountIds: readonly string[]): void => {
+  const currentNoEligibleAccountIds = (
+    context: NonNullable<GatewayRuntimeStateUpdate['noEligibleAccounts']>,
+  ): Set<string> => {
+    const currentGeneration = gateway.getConfigGeneration?.()
+    if (!Number.isSafeInteger(context.configGeneration)
+      || typeof context.routeId !== 'string'
+      || !context.routeId.trim()
+      || currentGeneration === undefined
+      || context.configGeneration !== currentGeneration) return new Set()
+    const configuration = store.getRuntimeConfiguration()
+    const route = configuration.routes.find((candidate) => candidate.id === context.routeId)
+    if (!route?.enabled || route.poolId !== context.poolId) return new Set()
+    const source = resolveRouteSource(context.poolId, {
+      // Persisted pools, rather than runtime-only leftovers, decide whether a
+      // scheduler event still belongs to a live source.
+      pools: store.getSnapshot().pools,
+      providers: configuration.providers,
+      accounts: configuration.accounts,
+    })
+    if (!source) return new Set()
+    const liveMembers = new Set(source.accounts.map((account) => account.id))
+    return new Set(context.accountIds.filter((accountId) => liveMembers.has(accountId)))
+  }
+
+  refreshNoEligibleAccounts = (context): void => {
     if (closed) return
     const now = Date.now()
-    const candidates = [...new Set(accountIds)].filter((accountId) => {
+    const candidates = [...currentNoEligibleAccountIds(context)].filter((accountId) => {
       const account = store.getRuntimeAccount(accountId)
       if (!account || account.status === 'expired' || account.status === 'checking') return false
       // Active sources can be absent only because of concurrency or an
@@ -688,6 +787,7 @@ export function registerGatewayApi(
     if (candidates.length === 0) return
 
     const refreshFlight = mapConcurrent(candidates, 3, async (accountId) => {
+      if (!currentNoEligibleAccountIds(context).has(accountId)) return
       const existing = noEligibleProbeFlights.get(accountId)
       if (existing) return existing
       noEligibleProbeLastStartedAt.set(accountId, Date.now())
@@ -1706,8 +1806,22 @@ export function registerGatewayApi(
   ipcMain.handle('stone:save-api-source', async (event, input: Parameters<GatewayApi['saveApiSource']>[0]) => {
     assertTrustedSender(event)
     if (!input || typeof input !== 'object') throw new Error('API 来源参数无效。')
-    const saved = await store.saveApiSource(input)
-    if (saved.source.connectionChanged) gateway.resetAccountHealth(saved.source.accountId)
+    const initialProbeEvidence = !input.id?.trim()
+      ? consumeUnsavedApiSourceProbeEvidence(input.probeEvidenceToken, input)
+      : undefined
+    const sourceInput = initialProbeEvidence
+      ? {
+          ...input,
+          capabilityProfile: initialProbeEvidence.capabilityProfile,
+          modelCatalog: initialProbeEvidence.modelCatalog,
+        }
+      : input
+    const saved = await store.saveApiSource(sourceInput, {
+      acceptInitialProbeEvidence: Boolean(initialProbeEvidence),
+    })
+    if (saved.source.connectionChanged) {
+      gateway.resetAccountHealth(saved.source.accountId, { clearPerformance: true })
+    }
     const snapshot = publish(refreshRuntime())
     if (saved.source.connectionChanged && gateway.getStatus().running) {
       warmGatewayConnections(store, outboundTransport)
@@ -1745,6 +1859,9 @@ export function registerGatewayApi(
         storedCredential: input.id ? store.getApiSourceCredential(input.id) : undefined,
         fetchImplementation,
       })
+      if (!input.id?.trim() && result.ok) {
+        result.probeEvidenceToken = issueUnsavedApiSourceProbeEvidence(normalized, result)
+      }
       if (persistentSourceId && result.ok && connectionFingerprint) {
         if (apiSourceCapabilityProbeOwners.get(persistentSourceId) !== probeOwner) {
           result.warnings.push(nativeText(
@@ -1942,8 +2059,26 @@ export function registerGatewayApi(
     return enqueueGatewayLifecycle(async () => {
       const wasRunning = gateway.getStatus().running
       const previousSettings = store.getSnapshot().gateway
+      const enablingAutomaticBackups = backups
+        && previousSettings.automaticBackups === false
+        && settings.automaticBackups !== false
+      if (enablingAutomaticBackups) await backups.prepareForRawBackup()
       await store.updateGateway(settings)
       const savedGateway = store.getSnapshot().gateway
+      if (backups
+        && (previousSettings.automaticBackups !== false) !== (savedGateway.automaticBackups !== false)) {
+        if (savedGateway.automaticBackups === false) {
+          backups.stopAutomaticBackups()
+        } else {
+          try {
+            await backups.startAutomaticBackups()
+          } catch (error) {
+            backups.stopAutomaticBackups()
+            await store.updateGateway(previousSettings).catch(() => undefined)
+            throw error
+          }
+        }
+      }
       const requiresRestart = wasRunning
         && (previousSettings.host !== savedGateway.host || previousSettings.port !== savedGateway.port)
       const outboundModeChanged = (previousSettings.outboundNetworkMode ?? 'direct')
@@ -1963,10 +2098,6 @@ export function registerGatewayApi(
       if (backups) {
         if ((previousSettings.backupRetention ?? 10) !== (savedGateway.backupRetention ?? 10)) {
           await backups.setAutomaticRetention(savedGateway.backupRetention ?? 10)
-        }
-        if ((previousSettings.automaticBackups !== false) !== (savedGateway.automaticBackups !== false)) {
-          if (savedGateway.automaticBackups === false) backups.stopAutomaticBackups()
-          else backups.startAutomaticBackups()
         }
       }
       if (requiresRestart) await gateway.stop()
@@ -2023,11 +2154,7 @@ export function registerGatewayApi(
     )
     return runNetworkDiagnostics({
       fetchImplementation,
-      route: proxy
-        ? { kind: 'proxy', name: proxy.name, proxyId: proxy.id }
-        : store.getSnapshot().gateway.outboundNetworkMode === 'system'
-          ? { kind: 'system', name: '跟随系统代理' }
-          : { kind: 'direct', name: '直连' }
+      route: outboundTransport.describeEffectiveDiagnosticRoute(proxy)
     })
   })
   ipcMain.handle('stone:check-account', async (event, id: string) => {
@@ -2172,6 +2299,33 @@ export function registerGatewayApi(
     if (!backups) return []
     return Promise.all((await backups.listBackups()).map(toBackupSummary))
   })
+  ipcMain.handle('stone:get-automatic-backup-runtime-state', async (event) => {
+    assertTrustedSender(event)
+    return enqueueGatewayLifecycle(async () => {
+      if (!backups) {
+        return {
+          configuredEnabled: false,
+          running: false,
+          blocked: true,
+          message: 'Database backup service is unavailable.',
+        }
+      }
+      if (store.getSnapshot().gateway.automaticBackups !== false && !backups.automaticBackupsRunning) {
+        await backups.startAutomaticBackups().catch(() => undefined)
+      }
+      const configuredEnabled = store.getSnapshot().gateway.automaticBackups !== false
+      const blocked = configuredEnabled && !backups.automaticBackupsRunning
+      return {
+        configuredEnabled,
+        running: backups.automaticBackupsRunning,
+        blocked,
+        ...(blocked ? {
+          message: backups.backupBlockReason
+            ?? 'Automatic database backups are blocked by the credential safety check.',
+        } : {}),
+      }
+    })
+  })
   ipcMain.handle('stone:create-state-backup', async (event) => {
     assertTrustedSender(event)
     if (!backups) throw new Error('Database backup service is unavailable.')
@@ -2190,7 +2344,6 @@ export function registerGatewayApi(
       if (wasRunning) await gateway.stop({ force: true })
       try {
         const result = await backups.restoreBackup(backupIdFromPath(path))
-        await store.sanitizePersistedData()
         gateway.updateConfig(toGatewayConfig(store))
         store.setGatewayStatus(gateway.getStatus())
         return { restored: toBackupSummary(result.restoredBackup), restartRequired: true }
@@ -2560,6 +2713,74 @@ function normalizeApiSourceProbeInput(
   throw new Error('官方 API 仅支持 OpenAI、Anthropic 和 Google Gemini。')
 }
 
+function apiSourceProbeConnectionFingerprint(input: Pick<
+  Parameters<GatewayApi['probeApiSource']>[0],
+  'id' | 'sourceType' | 'kind' | 'baseUrl' | 'protocol' | 'responsesCompactMode' | 'credential' | 'proxyId'
+>): string {
+  const normalized = normalizeApiSourceProbeInput({
+    ...input,
+    name: '',
+  })
+  const baseUrl = normalized.sourceType === 'relay'
+    ? normalizeApiSourceEvidenceUrl(normalized.baseUrl)
+    : normalized.baseUrl
+  return createHash('sha256').update(JSON.stringify({
+    version: 1,
+    draftId: normalizedApiSourceDraftId(normalized.id),
+    sourceType: normalized.sourceType,
+    kind: normalized.kind,
+    baseUrl,
+    protocol: normalized.protocol,
+    responsesCompactMode: normalized.responsesCompactMode ?? null,
+    credential: normalized.credential?.trim() ?? '',
+    proxyId: normalized.proxyId?.trim() || null,
+  })).digest('base64url')
+}
+
+function normalizedApiSourceDraftId(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : ''
+}
+
+function apiSourceDraftIdentity(input: { id?: string; name: string }): string {
+  const sourceId = normalizedApiSourceDraftId(input.id)
+  return sourceId ? `source:${sourceId}` : `draft:${input.name.trim()}`
+}
+
+function normalizeApiSourceEvidenceModel(value: unknown): string | undefined {
+  const normalized = typeof value === 'string' ? value.trim() : ''
+  return normalized || undefined
+}
+
+function normalizeApiSourceEvidenceModels(values: readonly string[]): string[] {
+  return [...new Set(values.map((value) => value.trim()).filter(Boolean))].sort()
+}
+
+function apiSourceSaveMatchesProbeModels(
+  input: Parameters<GatewayApi['saveApiSource']>[0],
+  testedModel: string,
+  discoveredModels: readonly string[],
+): boolean {
+  const savedModels = normalizeApiSourceEvidenceModels(input.models)
+  if (discoveredModels.length > 0
+    && JSON.stringify(savedModels) !== JSON.stringify(discoveredModels)) return false
+  const savedDefaultModel = normalizeApiSourceEvidenceModel(input.defaultModel)
+  const effectiveDefaultModel = savedDefaultModel ?? savedModels[0]
+  if (!testedModel || effectiveDefaultModel !== testedModel) return false
+  // saveApiSourceDraft promotes a manually tested default into the persisted
+  // model list. Mirror that normalization here so a successful manual probe is
+  // not rejected merely because model discovery returned an empty/partial list.
+  return savedModels.includes(testedModel) || savedDefaultModel === testedModel
+}
+
+function normalizeApiSourceEvidenceUrl(value: string): string {
+  const url = new URL(value.trim())
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') throw new Error('API source URL is invalid.')
+  const loopback = url.hostname === '127.0.0.1' || url.hostname === 'localhost' || url.hostname === '[::1]'
+  if (url.protocol === 'http:' && !loopback) throw new Error('API source URL is invalid.')
+  if (url.username || url.password || url.search || url.hash) throw new Error('API source URL is invalid.')
+  return url.toString().replace(/\/$/, '')
+}
+
 function toGatewayConfig(store: AppStore): GatewayConfig {
   const configuration = store.getRuntimeConfiguration()
   return {
@@ -2581,6 +2802,18 @@ export function warmGatewayConnections(store: AppStore, transport: OutboundTrans
 }
 
 export async function rebuildGatewayConnections(store: AppStore, transport: OutboundTransportManager): Promise<void> {
+  const targets = gatewayConnectionTargets(store)
+  if (transport.builtInRoutes.isIntercepting()) {
+    // Built-in routing owns every non-loopback target regardless of its saved
+    // explicit binding. Rotate the mixed/TUN generation once with the complete
+    // enabled target set; external PAC/cache state remains untouched.
+    await transport.rebuild(
+      undefined,
+      undefined,
+      [...new Set([...targets.values()].map((target) => target.targetUrl))],
+    )
+    return
+  }
   if (store.getSnapshot().gateway.outboundNetworkMode === 'system') {
     await transport.reloadSystemProxyConfiguration().catch((error) => {
       // A slow/broken WPAD or PAC refresh must not prevent explicit-proxy
@@ -2591,7 +2824,6 @@ export async function rebuildGatewayConnections(store: AppStore, transport: Outb
     })
   }
   transport.invalidateSystemProxyCache()
-  const targets = gatewayConnectionTargets(store)
   const grouped = new Map<string, {
     proxy: AppSnapshot['proxies'][number] | undefined
     password: string | undefined

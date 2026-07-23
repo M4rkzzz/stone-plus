@@ -168,6 +168,7 @@ describe('API source probe service', () => {
 
     expect(result.ok).toBe(true)
     expect(result.models).toEqual([])
+    expect(result.testedModel).toBe('manually-configured-model')
     expect(result.stages).toEqual([
       expect.objectContaining({ id: 'network', status: 'success' }),
       expect.objectContaining({ id: 'authentication', status: 'success' }),
@@ -176,6 +177,25 @@ describe('API source probe service', () => {
     ])
     expect(result.warnings).toHaveLength(1)
     expect(fetchImplementation).toHaveBeenCalledTimes(2)
+  })
+
+  it('reports the discovered model actually used without sorting the catalog', async () => {
+    const fetchImplementation = vi.fn(async (_request: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === 'POST') {
+        const body = JSON.parse(String(init.body)) as { model?: string }
+        expect(body.model).toBe('z-first-model')
+        return jsonResponse({ choices: [{ message: { content: 'OK' } }] })
+      }
+      return jsonResponse({ data: [{ id: 'z-first-model' }, { id: 'a-second-model' }] })
+    }) as typeof fetch
+
+    const result = await probeApiSource(sourceInput(probeCases[1]), { fetchImplementation })
+
+    expect(result).toMatchObject({
+      ok: true,
+      models: ['z-first-model', 'a-second-model'],
+      testedModel: 'z-first-model',
+    })
   })
 
   it('classifies transport failures and never surfaces a thrown message containing the key', async () => {

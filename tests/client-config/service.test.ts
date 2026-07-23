@@ -89,7 +89,8 @@ describe('ClientConfigService', () => {
       token: 'first-token',
     })
 
-    expect(first.backups).toEqual([])
+    expect(first.backups).toHaveLength(2)
+    expect(first.backups.every((backup) => !backup.existed && backup.backupPath.endsWith('.missing'))).toBe(true)
     expect(first.changedFiles).toHaveLength(2)
     expect(await readFile(service.paths.codex.config.path, 'utf8')).toContain('wire_api = "responses"')
     expect(JSON.parse(await readFile(service.paths.codex.auth.path, 'utf8')).OPENAI_API_KEY).toBe('first-token')
@@ -103,6 +104,100 @@ describe('ClientConfigService', () => {
     expect(second.backups).toHaveLength(1)
     expect(second.backups[0].role).toBe('codex-auth')
     expect(JSON.parse(await readFile(service.paths.codex.auth.path, 'utf8')).OPENAI_API_KEY).toBe('second-token')
+  })
+
+  it('restores an all-new apply back to an exactly empty client configuration', async () => {
+    const applied = await service.apply('codex', {
+      gatewayBaseUrl: 'http://127.0.0.1:15721',
+      token: 'temporary-token',
+    })
+    expect(applied.backups).toHaveLength(2)
+    expect(applied.backups.every((backup) => backup.existed === false)).toBe(true)
+
+    const restored = await service.restoreBackupSet('codex', applied.backups[0].groupId)
+
+    expect(restored.restoredFiles).toEqual([])
+    expect(restored.deletedFiles).toEqual([
+      service.paths.codex.config.path,
+      service.paths.codex.auth.path,
+    ])
+    await expect(readFile(service.paths.codex.config.path)).rejects.toMatchObject({ code: 'ENOENT' })
+    await expect(readFile(service.paths.codex.auth.path)).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  it('uses tombstones for missing roles while legacy partial backup groups remain non-destructive', async () => {
+    await mkdir(service.paths.codex.directory, { recursive: true })
+    await writeFile(service.paths.codex.config.path, 'model = "snapshot"\n')
+    const exact = await service.createBackupSet('codex')
+    expect(exact.backups.find((backup) => backup.role === 'codex-auth')).toMatchObject({ existed: false })
+    await writeFile(service.paths.codex.auth.path, '{"OPENAI_API_KEY":"created-later"}\n')
+
+    const exactRestored = await service.restoreBackupSet('codex', exact.groupId)
+    expect(exactRestored.restoredFiles).toEqual([service.paths.codex.config.path])
+    expect(exactRestored.deletedFiles).toEqual([service.paths.codex.auth.path])
+    await expect(readFile(service.paths.codex.auth.path)).rejects.toMatchObject({ code: 'ENOENT' })
+
+    const legacyPath = `${service.paths.codex.config.path}.stone-backup.20260713T010203456Z`
+    await writeFile(legacyPath, 'model = "legacy"\n')
+    await writeFile(service.paths.codex.auth.path, '{"OPENAI_API_KEY":"must-survive"}\n')
+    await service.restoreBackupSet('codex', Date.parse('2026-07-13T01:02:03.456Z'))
+
+    expect(await readFile(service.paths.codex.config.path, 'utf8')).toBe('model = "legacy"\n')
+    expect(await readFile(service.paths.codex.auth.path, 'utf8')).toBe('{"OPENAI_API_KEY":"must-survive"}\n')
+  })
+
+  it('refuses to restore an incomplete unmanifested group that still contains a tombstone', async () => {
+    await mkdir(service.paths.codex.directory, { recursive: true })
+    await writeFile(service.paths.codex.config.path, 'model = "current"\n')
+    await writeFile(service.paths.codex.auth.path, '{"OPENAI_API_KEY":"must-survive"}\n')
+    const createdAt = Date.parse('2026-07-13T02:03:04.567Z')
+    const orphanedTombstone = `${service.paths.codex.auth.path}.stone-backup.20260713T020304567Z.missing`
+    await writeFile(orphanedTombstone, '')
+
+    await expect(service.restoreBackupSet('codex', `${createdAt}:0`))
+      .rejects.toThrow('incomplete deletion snapshot')
+    await expect(service.restore(orphanedTombstone, 'codex'))
+      .rejects.toThrow('incomplete deletion snapshot')
+
+    expect(await readFile(service.paths.codex.config.path, 'utf8')).toBe('model = "current"\n')
+    expect(await readFile(service.paths.codex.auth.path, 'utf8')).toBe('{"OPENAI_API_KEY":"must-survive"}\n')
+  })
+
+  it('rejects a manifested deletion snapshot when any declared member is missing', async () => {
+    await mkdir(service.paths.codex.directory, { recursive: true })
+    await writeFile(service.paths.codex.config.path, 'model = "snapshot"\n')
+    const source = await service.createBackupSet('codex')
+    const configBackup = source.backups.find((backup) => backup.role === 'codex-config')!
+    expect(source.backups.find((backup) => backup.role === 'codex-auth')).toMatchObject({ existed: false })
+    await rm(configBackup.backupPath)
+    await writeFile(service.paths.codex.config.path, 'model = "must-survive"\n')
+    await writeFile(service.paths.codex.auth.path, '{"OPENAI_API_KEY":"must-survive"}\n')
+
+    await expect(service.restoreBackupSet('codex', source.groupId))
+      .rejects.toThrow('does not match its manifest')
+
+    expect(await readFile(service.paths.codex.config.path, 'utf8')).toBe('model = "must-survive"\n')
+    expect(await readFile(service.paths.codex.auth.path, 'utf8')).toBe('{"OPENAI_API_KEY":"must-survive"}\n')
+  })
+
+  it('rolls back a tombstone deletion when a later restore write fails', async () => {
+    await mkdir(service.paths.codex.directory, { recursive: true })
+    await writeFile(service.paths.codex.auth.path, '{"OPENAI_API_KEY":"snapshot"}\n')
+    const source = await service.createBackupSet('codex')
+    await writeFile(service.paths.codex.config.path, 'model = "current"\n')
+    await writeFile(service.paths.codex.auth.path, '{"OPENAI_API_KEY":"current"}\n')
+    let writes = 0
+    const sabotaged = new ClientConfigService({
+      homeDir,
+      platform: process.platform,
+      now: () => fixedDate,
+      randomId: () => ++writes === 1 ? 'missing/subdirectory' : `rollback-${writes}`,
+    })
+
+    await expect(sabotaged.restoreBackupSet('codex', source.groupId)).rejects.toBeDefined()
+
+    expect(await readFile(service.paths.codex.config.path, 'utf8')).toBe('model = "current"\n')
+    expect(await readFile(service.paths.codex.auth.path, 'utf8')).toBe('{"OPENAI_API_KEY":"current"}\n')
   })
 
   it('backs up both Codex files before restoring official login and cached sessions', async () => {
@@ -201,7 +296,7 @@ describe('ClientConfigService', () => {
     await expect(readFile(service.paths.claude.settings.path, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
-  it('retains only the configured number of backups per managed file', async () => {
+  it('retains only the configured number of backup groups', async () => {
     let current = fixedDate.getTime()
     const rotating = new ClientConfigService({
       homeDir,
@@ -227,6 +322,23 @@ describe('ClientConfigService', () => {
     expect(latest?.removedBackups).toHaveLength(1)
     expect(JSON.stringify(latest)).not.toContain('token-4')
   }, 15_000)
+
+  it('prunes retention by whole group so an older tombstone cannot survive alone', async () => {
+    await mkdir(service.paths.codex.directory, { recursive: true })
+    const olderConfig = `${service.paths.codex.config.path}.stone-backup.20260710T010203456Z`
+    const olderAuthTombstone = `${service.paths.codex.auth.path}.stone-backup.20260710T010203456Z.missing`
+    const newerConfig = `${service.paths.codex.config.path}.stone-backup.20260711T010203456Z`
+    await writeFile(olderConfig, 'model = "older"\n')
+    await writeFile(olderAuthTombstone, '')
+    await writeFile(newerConfig, 'model = "newer"\n')
+
+    const removed = await service.pruneBackups('codex', 1)
+
+    expect(new Set(removed)).toEqual(new Set([olderConfig, olderAuthTombstone]))
+    expect((await service.listBackups('codex')).map((backup) => backup.backupPath)).toEqual([newerConfig])
+    await expect(readFile(olderConfig)).rejects.toMatchObject({ code: 'ENOENT' })
+    await expect(readFile(olderAuthTombstone)).rejects.toMatchObject({ code: 'ENOENT' })
+  })
 
   it('backs up and updates both Gemini files without touching unrelated settings', async () => {
     await mkdir(service.paths.gemini.directory, { recursive: true })
@@ -413,7 +525,7 @@ describe('ClientConfigService', () => {
     expect(await service.listBackups('claude')).toEqual(claudeBackupsBefore)
     expect(JSON.parse(await readFile(service.paths.codex.auth.path, 'utf8')).OPENAI_API_KEY)
       .toBe('codex-updated')
-    expect(await service.listBackups('codex')).toHaveLength(1)
+    expect(await service.listBackups('codex')).toHaveLength(2)
 
     const restored = await service.restore(codexBackup!.backupPath, 'codex')
     expect(restored.client).toBe('codex')

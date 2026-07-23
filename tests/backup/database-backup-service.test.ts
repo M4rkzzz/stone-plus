@@ -13,7 +13,11 @@ vi.mock('electron', () => ({
   }
 }))
 
-import { DatabaseBackupService, encryptPortableBackup } from '../../src/main/backup'
+import {
+  DatabaseBackupService,
+  encryptPortableBackup,
+  WEB_DAV_BACKUP_CONFIGURATION_METADATA_KEY,
+} from '../../src/main/backup'
 import { AppStore } from '../../src/main/store/app-store'
 import { SQLITE_DATABASE_FILENAME, SQLITE_SCHEMA_VERSION } from '../../src/main/store/sqlite-state-store'
 import type { PersistedState } from '../../src/main/store/types'
@@ -104,6 +108,7 @@ describe('DatabaseBackupService', () => {
       .find((account) => account.name === 'Portable account')!.credentialId
     const sourceVault = {
       isEncryptionAvailable: () => true,
+      getSelectedStorageBackend: () => 'gnome_libsecret',
       encryptString: (value: string) => Buffer.from(`vault:${value}`),
       decryptString: (value: Buffer) => {
         const text = value.toString('utf8')
@@ -119,6 +124,7 @@ describe('DatabaseBackupService', () => {
 
     const destinationVault = {
       isEncryptionAvailable: () => true,
+      getSelectedStorageBackend: () => 'gnome_libsecret',
       encryptString: (value: string) => Buffer.from(`destination:${value}`),
       decryptString: (value: Buffer) => {
         const text = value.toString('utf8')
@@ -139,6 +145,78 @@ describe('DatabaseBackupService', () => {
     expect((await readFile(portablePath)).includes(Buffer.from('portable-api-secret'))).toBe(false)
   })
 
+  it('removes legacy WebDAV URL credentials and rewraps the password during portable transfer', async () => {
+    await store.getStateRepository().writeAppMetadata(
+      WEB_DAV_BACKUP_CONFIGURATION_METADATA_KEY,
+      JSON.stringify({
+        version: 1,
+        baseUrl: 'https://legacy%20user:legacy%20password@dav.example/stone/',
+        username: '',
+      }),
+    )
+    const sourceVault = {
+      isEncryptionAvailable: () => true,
+      getSelectedStorageBackend: () => 'gnome_libsecret',
+      encryptString: (value: string) => Buffer.from(`source:${value}`),
+      decryptString: (value: Buffer) => value.toString('utf8').replace(/^source:/, ''),
+    }
+    await service.close()
+    service = createService({ portableSecretVault: sourceVault })
+    await service.initialize()
+    const portablePath = join(directory, 'legacy-webdav.stonebackup')
+    await service.exportPortableBackup(portablePath, 'portable backup password')
+
+    const destinationVault = {
+      isEncryptionAvailable: () => true,
+      getSelectedStorageBackend: () => 'gnome_libsecret',
+      encryptString: (value: string) => Buffer.from(`destination:${value}`),
+      decryptString: (value: Buffer) => value.toString('utf8').replace(/^destination:/, ''),
+    }
+    await service.close()
+    service = createService({ portableSecretVault: destinationVault })
+    await service.initialize()
+    const imported = await service.importPortableBackup(portablePath, 'portable backup password')
+    const database = new DatabaseSync(join(service.directory, imported.id), { readOnly: true })
+    const row = database.prepare('SELECT value FROM app_metadata WHERE key = ?')
+      .get(WEB_DAV_BACKUP_CONFIGURATION_METADATA_KEY) as { value: string }
+    database.close()
+    const migrated = JSON.parse(row.value) as { baseUrl: string; username: string; encryptedPassword: string }
+    expect(migrated.baseUrl).toBe('https://dav.example/stone/')
+    expect(migrated.username).toBe('legacy user')
+    expect(Buffer.from(migrated.encryptedPassword, 'base64').toString('utf8'))
+      .toBe('destination:legacy password')
+    expect(row.value).not.toContain('legacy%20password')
+  })
+
+  it('rewraps an empty WebDAV password without retaining portable ciphertext', async () => {
+    await store.getStateRepository().writeAppMetadata(
+      WEB_DAV_BACKUP_CONFIGURATION_METADATA_KEY,
+      JSON.stringify({
+        version: 1,
+        baseUrl: 'https://dav.example/stone/',
+        username: 'empty-password-user',
+        encryptedPassword: Buffer.from('source:').toString('base64'),
+      }),
+    )
+    await service.close()
+    service = createService({ portableSecretVault: credentialVault('source:') })
+    await service.initialize()
+    const portablePath = join(directory, 'empty-webdav-password.stonebackup')
+    await service.exportPortableBackup(portablePath, 'portable backup password')
+
+    await service.close()
+    service = createService({ portableSecretVault: credentialVault('destination:') })
+    await service.initialize()
+    const imported = await service.importPortableBackup(portablePath, 'portable backup password')
+    const database = new DatabaseSync(join(service.directory, imported.id), { readOnly: true })
+    const row = database.prepare('SELECT value FROM app_metadata WHERE key = ?')
+      .get(WEB_DAV_BACKUP_CONFIGURATION_METADATA_KEY) as { value: string }
+    database.close()
+    const migrated = JSON.parse(row.value) as { encryptedPassword: string }
+    expect(migrated.encryptedPassword).not.toContain('stoneportable:')
+    expect(Buffer.from(migrated.encryptedPassword, 'base64').toString('utf8')).toBe('destination:')
+  })
+
   it('rejects a legacy v1 archive outside its original OS vault', async () => {
     await store.saveAccount({
       providerId: 'provider-openai', name: 'Legacy account', credential: 'legacy-secret',
@@ -153,6 +231,7 @@ describe('DatabaseBackupService', () => {
     service = createService({
       portableSecretVault: {
         isEncryptionAvailable: () => true,
+        getSelectedStorageBackend: () => 'gnome_libsecret',
         encryptString: (value) => Buffer.from(`other:${value}`),
         decryptString: () => { throw new Error('foreign vault') },
       },
@@ -176,6 +255,222 @@ describe('DatabaseBackupService', () => {
     const recovered = await service.restoreBackup(result.safetyBackup.id)
     expect(recovered.state.gateway.port).toBe(16002)
     expect(store.getSnapshot().gateway.port).toBe(16002)
+  })
+
+  it('rejects a raw restore whose credentials cannot be decrypted by the current vault', async () => {
+    await store.saveAccount({
+      providerId: 'provider-openai', name: 'Foreign credential', credential: 'local-secret',
+      priority: 1, weight: 1, maxConcurrency: 1, modelAllowlist: [],
+    })
+    const backup = await service.createBackup()
+    const database = new DatabaseSync(join(service.directory, backup.id))
+    database.prepare('UPDATE credentials SET encrypted_value = ?')
+      .run(Buffer.from('foreign:ciphertext').toString('base64'))
+    database.close()
+    await store.updateGateway(gatewaySettings(16555))
+
+    await expect(service.restoreBackup(backup.id)).rejects.toThrow(/cannot be decrypted.*current.*vault/i)
+    expect(store.getSnapshot().gateway.port).toBe(16555)
+  })
+
+  it('rejects a raw restore whose saved WebDAV password belongs to another vault', async () => {
+    await store.getStateRepository().writeAppMetadata(
+      WEB_DAV_BACKUP_CONFIGURATION_METADATA_KEY,
+      JSON.stringify({
+        version: 1,
+        baseUrl: 'https://dav.example/stone/',
+        username: 'alice',
+        encryptedPassword: Buffer.from('foreign:webdav-password').toString('base64'),
+      }),
+    )
+    const backup = await service.createBackup()
+    await store.updateGateway(gatewaySettings(16556))
+
+    await expect(service.restoreBackup(backup.id)).rejects.toThrow(/WebDAV password.*current.*vault/i)
+    expect(store.getSnapshot().gateway.port).toBe(16556)
+  })
+
+  it('reports failures after the restore commit without claiming the restore rolled back', async () => {
+    await store.updateGateway(gatewaySettings(16001))
+    const backup = await service.createBackup()
+    await store.updateGateway(gatewaySettings(16002))
+    const repository = store.getStateRepository()
+    await service.close()
+    service = createService({
+      store: {
+        backupTo: repository.backupTo.bind(repository),
+        restoreFrom: async (stagedPath, rollbackPath) => {
+          const state = await repository.restoreFrom(stagedPath, rollbackPath)
+          await rm(rollbackPath, { force: true })
+          return state
+        },
+      },
+    })
+    await service.initialize()
+
+    await expect(service.restoreBackup(backup.id)).rejects.toThrow(/was restored.*post-restore/i)
+    expect(store.getSnapshot().gateway.port).toBe(16001)
+  })
+
+  it('resumes automatic backups when source verification rejects before staging', async () => {
+    const backup = await service.createBackup()
+    await writeFile(join(service.directory, backup.id), Buffer.from('damaged backup'))
+    await service.startAutomaticBackups()
+    await service.runAutomaticBackupIfDue()
+
+    await expect(service.restoreBackup(backup.id)).rejects.toThrow(/invalid database backup/)
+    expect((service as unknown as { automaticTimer?: NodeJS.Timeout }).automaticTimer).toBeDefined()
+  })
+
+  it('notifies the owner immediately after a restore commits', async () => {
+    const backup = await service.createBackup()
+    const onRestoreCommitted = vi.fn()
+    await service.close()
+    service = createService({ onRestoreCommitted })
+    await service.initialize()
+
+    await service.restoreBackup(backup.id)
+    expect(onRestoreCommitted).toHaveBeenCalledTimes(1)
+  })
+
+  it('applies one retryable safety barrier to every raw live-database copy', async () => {
+    let blocked = true
+    const beforeRawBackup = vi.fn(async () => {
+      if (blocked) throw new Error('disk error echoed legacy-secret')
+    })
+    await service.close()
+    service = createService({ beforeRawBackup })
+    await service.initialize()
+
+    const error = await service.createBackup().catch((cause: unknown) => cause)
+    expect(String(error)).toMatch(/backups are blocked.*WebDAV credentials/i)
+    expect(String(error)).not.toContain('legacy-secret')
+    expect(service.backupBlockReason).toMatch(/backups are blocked/i)
+    expect(await service.listBackups()).toEqual([])
+
+    blocked = false
+    const source = await service.createBackup()
+    await service.exportPortableBackup(join(directory, 'barrier-export.stonebackup'), 'portable password')
+    await service.runAutomaticBackupIfDue()
+    await service.restoreBackup(source.id)
+
+    // Failed manual, successful manual, portable's raw manual, automatic,
+    // restore safety snapshot, and the restored generation.
+    expect(beforeRawBackup).toHaveBeenCalledTimes(6)
+    expect(service.backupBlockReason).toBeUndefined()
+  })
+
+  it('singleflights concurrent safety failures without exposing the hook error', async () => {
+    let rejectBarrier!: (error: Error) => void
+    const barrier = new Promise<void>((_resolve, reject) => { rejectBarrier = reject })
+    const beforeRawBackup = vi.fn(() => barrier)
+    await service.close()
+    service = createService({ beforeRawBackup })
+    await service.initialize()
+
+    const first = service.createBackup().catch((cause: unknown) => cause)
+    const second = service.createBackup().catch((cause: unknown) => cause)
+    await vi.waitFor(() => expect(beforeRawBackup).toHaveBeenCalledOnce())
+    rejectBarrier(new Error('legacy-secret appeared in the storage failure'))
+    const errors = await Promise.all([first, second])
+
+    for (const error of errors) {
+      expect(String(error)).toMatch(/backups are blocked.*WebDAV credentials/i)
+      expect(String(error)).not.toContain('legacy-secret')
+    }
+    expect(await service.listBackups()).toEqual([])
+  })
+
+  it('keeps automatic backups stopped until failed post-restore preparation is retried', async () => {
+    const source = await service.createBackup()
+    let preparationAttempts = 0
+    const onRestoreCommitted = vi.fn(async () => {
+      preparationAttempts += 1
+      if (preparationAttempts === 1) throw new Error('transient sanitize failure with legacy-secret')
+    })
+    await service.close()
+    service = createService({ onRestoreCommitted, automaticIntervalMs: 60_000 })
+    await service.initialize()
+    await service.startAutomaticBackups()
+    await service.runAutomaticBackupIfDue()
+
+    const error = await service.restoreBackup(source.id).catch((cause: unknown) => cause)
+    expect(String(error)).toMatch(/was restored.*post-restore/i)
+    expect(String(error)).not.toContain('legacy-secret')
+    expect(service.automaticBackupsRunning).toBe(false)
+    expect(service.backupBlockReason).toMatch(/backups are blocked/i)
+
+    await service.startAutomaticBackups()
+    expect(onRestoreCommitted).toHaveBeenCalledTimes(2)
+    expect(service.automaticBackupsRunning).toBe(true)
+    expect(service.backupBlockReason).toBeUndefined()
+  })
+
+  it('serializes restore with a concurrent manual copy so the restored generation is prepared first', async () => {
+    await store.updateGateway(gatewaySettings(16001))
+    const source = await service.createBackup()
+    await store.updateGateway(gatewaySettings(16002))
+    const repository = store.getStateRepository()
+    const events: string[] = []
+    await service.close()
+    service = createService({
+      store: {
+        backupTo: async (path) => {
+          events.push(`copy:${store.getSnapshot().gateway.port}`)
+          return repository.backupTo(path)
+        },
+        restoreFrom: async (stagedPath, rollbackPath) => {
+          events.push('restore')
+          return repository.restoreFrom(stagedPath, rollbackPath)
+        },
+      },
+      beforeRawBackup: () => { events.push(`gate:${store.getSnapshot().gateway.port}`) },
+      onRestoreCommitted: (state) => { events.push(`sanitize:${state.gateway.port}`) },
+    })
+    await service.initialize()
+
+    const restoring = service.restoreBackup(source.id)
+    const manual = service.createBackup()
+    await Promise.all([restoring, manual])
+
+    expect(events).toEqual([
+      'gate:16002',
+      'restore',
+      'sanitize:16001',
+      'gate:16001',
+      'gate:16001',
+      'copy:16001',
+    ])
+  })
+
+  it('keeps telemetry usable when SQLite restore preparation fails', async () => {
+    const backup = await service.createBackup()
+    const originalExec = DatabaseSync.prototype.exec
+    const execSpy = vi.spyOn(DatabaseSync.prototype, 'exec').mockImplementation(function (
+      this: DatabaseSync,
+      sql: string,
+    ): void {
+      if (sql === 'PRAGMA wal_checkpoint(TRUNCATE)') throw new Error('injected checkpoint failure')
+      originalExec.call(this, sql)
+    })
+    try {
+      await expect(service.restoreBackup(backup.id)).rejects.toThrow(/Unable to prepare SQLite restore/)
+    } finally {
+      execSpy.mockRestore()
+    }
+
+    const repository = store.getStateRepository()
+    await repository.appendCodexQuotaSample({
+      accountId: 'telemetry-after-restore-failure',
+      observedAt: 1_800_000_000_000,
+      fiveHourUsedPercent: 10,
+      source: 'response-headers',
+    })
+    expect(repository.readCodexQuotaHistory(
+      'telemetry-after-restore-failure',
+      1_799_999_000_000,
+      1_800_001_000_000,
+    )).toHaveLength(1)
   })
 
   it('restores account catalogs and pool model exposure policies', async () => {
@@ -329,10 +624,24 @@ describe('DatabaseBackupService', () => {
       store: store.getStateRepository(),
       now: () => 1_800_000_000_000,
       randomId: () => (++randomCounter).toString(16).padStart(8, '0'),
+      portableSecretVault: credentialVault('vault:'),
       ...overrides
     })
   }
 })
+
+function credentialVault(prefix: string) {
+  return {
+    isEncryptionAvailable: () => true,
+    getSelectedStorageBackend: () => 'gnome_libsecret',
+    encryptString: (value: string) => Buffer.from(`${prefix}${value}`),
+    decryptString: (value: Buffer) => {
+      const text = value.toString('utf8')
+      if (!text.startsWith(prefix)) throw new Error('foreign vault ciphertext')
+      return text.slice(prefix.length)
+    },
+  }
+}
 
 function gatewaySettings(port: number) {
   return {

@@ -31,6 +31,30 @@ describe('Responses WebSocket message adapter', () => {
     expect(events).toEqual([{ type: 'response.created' }, { type: 'response.completed' }])
   })
 
+  it('accepts a UTF-8 BOM before the first SSE data field', async () => {
+    const events: Record<string, unknown>[] = []
+    const response = new Response('\uFEFFdata: {"type":"response.created"}\n\ndata: {"type":"response.completed"}\n\n')
+
+    await forwardResponsesSse(response, (event) => events.push(event))
+
+    expect(events.map((event) => event.type)).toEqual(['response.created', 'response.completed'])
+  })
+
+  it('recognizes a CRLF frame boundary split across upstream chunks', async () => {
+    const events: Record<string, unknown>[] = []
+    const response = new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('data: {"type":"response.created"}\r\n\r'))
+        controller.enqueue(new TextEncoder().encode('\ndata: {"type":"response.completed"}\r\n\r\n'))
+        controller.close()
+      }
+    }))
+
+    await forwardResponsesSse(response, (event) => events.push(event))
+
+    expect(events.map((event) => event.type)).toEqual(['response.created', 'response.completed'])
+  })
+
   it('cancels the SSE reader when a malformed event aborts forwarding', async () => {
     let cancelled = false
     const response = new Response(new ReadableStream<Uint8Array>({
@@ -41,6 +65,52 @@ describe('Responses WebSocket message adapter', () => {
     }), { headers: { 'content-type': 'text/event-stream' } })
     await expect(forwardResponsesSse(response, () => undefined)).rejects.toThrow(/invalid JSON/)
     await waitFor(() => cancelled)
+  })
+
+  it('aborts a pending upstream read instead of waiting for EOF', async () => {
+    let cancelled = false
+    const response = new Response(new ReadableStream<Uint8Array>({
+      start() { /* keep the first read pending */ },
+      cancel() { cancelled = true }
+    }), { headers: { 'content-type': 'text/event-stream' } })
+    const controller = new AbortController()
+    const forwarding = forwardResponsesSse(response, () => undefined, controller.signal)
+    await Promise.resolve()
+
+    controller.abort(new DOMException('test abort', 'AbortError'))
+
+    await expect(forwarding).rejects.toMatchObject({ name: 'AbortError' })
+    await waitFor(() => cancelled)
+  })
+
+  it('limits the current SSE frame by raw bytes and cancels an unterminated oversized stream', async () => {
+    let cancelled = false
+    const response = new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        // The character count is below the limit, but its UTF-8 wire size is
+        // above it. Keep the stream open to model a stuck upstream frame.
+        controller.enqueue(new TextEncoder().encode(`data: "${'界'.repeat(40)}"`))
+      },
+      cancel() { cancelled = true }
+    }), { headers: { 'content-type': 'text/event-stream' } })
+
+    await expect(forwardResponsesSse(response, () => undefined, undefined, 96))
+      .rejects.toThrow(/SSE frame larger than 96 bytes/)
+    await waitFor(() => cancelled)
+  })
+
+  it('does not apply the frame limit to the complete multi-event response', async () => {
+    const events: Record<string, unknown>[] = []
+    const wire = [
+      'data: {"type":"response.created"}\n\n',
+      'data: {"type":"response.completed"}\n\n',
+      'data: [DONE]\n\n',
+    ].join('')
+    expect(Buffer.byteLength(wire)).toBeGreaterThan(48)
+
+    await forwardResponsesSse(new Response(wire), (event) => events.push(event), undefined, 48)
+
+    expect(events.map((event) => event.type)).toEqual(['response.created', 'response.completed'])
   })
 })
 

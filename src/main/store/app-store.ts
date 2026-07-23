@@ -1,5 +1,6 @@
 import { safeStorage } from 'electron'
 import { createHash, randomUUID } from 'node:crypto'
+import { isIP } from 'node:net'
 import { isAbsolute, join, normalize } from 'node:path'
 import { valid as validSemver } from 'semver'
 import { clientNativeProtocols, supportsFastServiceTier } from '@shared/types'
@@ -35,6 +36,8 @@ import type {
   ApiSourceProbeResult,
   AppSnapshot,
   BuiltInProxyNodeSummary,
+  BuiltInProxyCustomRuleSet,
+  BuiltInProxyEditableRule,
   BuiltInProxyProfileSummary,
   BuiltInProxySettings,
   ClientConfigProfile,
@@ -246,6 +249,9 @@ export class AppStore {
   }
 
   public async close(): Promise<void> {
+    // Plaintext credentials are an in-memory optimization only. Drop them as
+    // soon as shutdown starts, including when later persistence cleanup fails.
+    this.invalidateCredentialCache()
     // A clear keeps the old live generation in memory until its SQLite delete
     // commits so it can roll back safely. Do not checkpoint that generation
     // behind the delete during shutdown, or it would resurrect cleared rows.
@@ -266,11 +272,20 @@ export class AppStore {
     this.clearedLiveRequestLogBaselines.clear()
     this.clearedLifetimeTokenWrites.clear()
     this.requestLogClearBarrier = undefined
-    await this.store.close()
+    try {
+      await this.store.close()
+    } finally {
+      this.invalidateCredentialCache()
+    }
   }
 
   public getStateRepository(): SqliteStateStore<PersistedState> {
     return this.store
+  }
+
+  /** Restore/lifecycle hook: discard every plaintext derived from old state. */
+  public invalidateCredentialCache(): void {
+    this.decryptedCredentialCache.clear()
   }
 
   public getPersistentTaskRunner(): PersistentTaskRunner {
@@ -515,11 +530,19 @@ export class AppStore {
     return this.getSnapshot()
   }
 
-  public async saveApiSource(input: ApiSourceInput): Promise<{ snapshot: AppSnapshot; source: SavedApiSourceDraft }> {
+  public async saveApiSource(
+    input: ApiSourceInput,
+    options: { acceptInitialProbeEvidence?: boolean } = {},
+  ): Promise<{ snapshot: AppSnapshot; source: SavedApiSourceDraft }> {
+    const { probeEvidenceToken: _probeEvidenceToken, ...sourceInput } = input
+    const authorizedInput: ApiSourceInput = !sourceInput.id && !options.acceptInitialProbeEvidence
+      ? { ...sourceInput, capabilityProfile: undefined, modelCatalog: undefined }
+      : sourceInput
     let saved: SavedApiSourceDraft | undefined
     await this.store.mutate((state) => {
-      saved = saveApiSourceDraft(state, input, (credential) => this.encrypt(credential))
+      saved = saveApiSourceDraft(state, authorizedInput, (credential) => this.encrypt(credential))
     }, ['providers', 'accounts', 'credentials', 'pools', 'routes'])
+    this.pruneCredentialCache()
     if (!saved) throw new Error('API source could not be saved.')
     return { snapshot: this.getSnapshot(), source: saved }
   }
@@ -588,6 +611,7 @@ export class AppStore {
     await this.store.mutate((state) => {
       deleteApiSourceDraft(state, id)
     }, ['providers', 'accounts', 'credentials', 'pools', 'routes'])
+    this.pruneCredentialCache()
     return this.getSnapshot()
   }
 
@@ -736,6 +760,7 @@ export class AppStore {
         reconcilePoolModelAllowlists(state, timestamp, new Set([account.id]))
       }
     }, ['providers', 'accounts', 'credentials', 'pools'])
+    this.pruneCredentialCache()
     return this.getSnapshot()
   }
 
@@ -947,6 +972,7 @@ export class AppStore {
         importedAccountIds.push(accountId)
       }
     }, ['providers', 'accounts', 'credentials'])
+    this.pruneCredentialCache()
     const parsedAccessTokenWarning = chatGptAccessTokenOnlyWarning(parsed.accessTokenOnlyCount)
     const warnings = [
       ...parsed.warnings.filter((warning) => warning !== parsedAccessTokenWarning),
@@ -1118,6 +1144,7 @@ export class AppStore {
         : route)
       reconcilePoolModelAllowlists(state, timestamp)
     }, ['providers', 'accounts', 'credentials', 'pools', 'routes'])
+    this.pruneCredentialCache()
     await Promise.all(selectedIds.map((id) => this.store.deleteCodexQuotaHistory(id)))
     return this.getSnapshot()
   }
@@ -1180,6 +1207,7 @@ export class AppStore {
       if (existing) replaceById(state.proxies, proxy)
       else state.proxies.push(proxy)
     }, ['proxies', 'credentials'])
+    this.pruneCredentialCache()
     return this.getSnapshot()
   }
 
@@ -1196,6 +1224,7 @@ export class AppStore {
       if (proxy.credentialId) delete state.credentials[proxy.credentialId]
       state.proxies = state.proxies.filter((candidate) => candidate.id !== id)
     }, ['proxies', 'credentials'])
+    this.pruneCredentialCache()
     return this.getSnapshot()
   }
 
@@ -1328,6 +1357,7 @@ export class AppStore {
       }
       state.builtInProxySettings = settings
     }, ['proxyProfiles', 'credentials', 'builtInProxySettings'])
+    this.pruneCredentialCache()
 
     const saved = this.getBuiltInProxyProfile(savedId)
     if (!saved) throw new Error('Built-in proxy profile could not be saved.')
@@ -1355,6 +1385,7 @@ export class AppStore {
       }
       state.builtInProxySettings = settings
     }, ['proxyProfiles', 'credentials', 'builtInProxySettings'])
+    this.pruneCredentialCache()
   }
 
   public async selectBuiltInProxyProfile(id: string): Promise<BuiltInProxySettings> {
@@ -1390,7 +1421,7 @@ export class AppStore {
   public async updateBuiltInProxySettings(
     patch: Partial<Pick<
       BuiltInProxySettings,
-      'desiredEnabled' | 'activeProfileId' | 'accessMode' | 'ruleMode' | 'mixedPort' | 'lanEnabled' | 'autoStart'
+      'desiredEnabled' | 'activeProfileId' | 'accessMode' | 'ruleMode' | 'customRules' | 'mixedPort' | 'lanEnabled' | 'autoStart'
     >>
   ): Promise<BuiltInProxySettings> {
     const timestamp = Date.now()
@@ -1405,12 +1436,16 @@ export class AppStore {
       if (patch.ruleMode !== undefined && !['rule', 'global', 'direct'].includes(patch.ruleMode)) {
         throw new Error('Unsupported built-in proxy rule mode.')
       }
+      const customRules = Object.prototype.hasOwnProperty.call(patch, 'customRules')
+        ? normalizeBuiltInProxyCustomRules(patch.customRules, true)
+        : state.builtInProxySettings?.customRules
       if (patch.mixedPort !== undefined && !isBuiltInProxyPort(patch.mixedPort)) {
         throw new Error('Built-in proxy mixed port must be zero or between 1024 and 65535.')
       }
       state.builtInProxySettings = normalizeBuiltInProxySettings({
         ...state.builtInProxySettings,
         ...patch,
+        ...(customRules ? { customRules } : { customRules: undefined }),
         updatedAt: timestamp
       }, profiles, timestamp)
     }, ['builtInProxySettings'])
@@ -2205,6 +2240,14 @@ export class AppStore {
     }
   }
 
+  private pruneCredentialCache(): void {
+    if (this.decryptedCredentialCache.size === 0) return
+    const retained = new Set(this.store.select((state) => Object.values(state.credentials)))
+    for (const encrypted of this.decryptedCredentialCache.keys()) {
+      if (!retained.has(encrypted)) this.decryptedCredentialCache.delete(encrypted)
+    }
+  }
+
   private sensitiveCredentialValues(
     state: Pick<PersistedState, 'accounts' | 'credentials' | 'proxies' | 'routes'>
   ): string[] {
@@ -2467,6 +2510,7 @@ function normalizeBuiltInProxySettings(
     && profiles.some((profile) => profile.id === candidate.activeProfileId)
     ? candidate.activeProfileId
     : profiles[0]?.id
+  const customRules = normalizeBuiltInProxyCustomRules(candidate.customRules)
   return {
     desiredEnabled: candidate.desiredEnabled === true,
     ...(activeProfileId ? { activeProfileId } : {}),
@@ -2474,6 +2518,7 @@ function normalizeBuiltInProxySettings(
     ruleMode: candidate.ruleMode === 'global' || candidate.ruleMode === 'direct'
       ? candidate.ruleMode
       : 'rule',
+    ...(customRules ? { customRules } : {}),
     mixedPort: isBuiltInProxyPort(candidate.mixedPort) ? candidate.mixedPort : 0,
     lanEnabled: candidate.lanEnabled === true,
     autoStart: candidate.autoStart !== false,
@@ -2481,6 +2526,153 @@ function normalizeBuiltInProxySettings(
     ...(hasEverActivated && lastActivatedAt !== undefined ? { lastActivatedAt } : {}),
     updatedAt: normalizeTimestamp(candidate.updatedAt) ?? timestamp
   }
+}
+
+const BUILT_IN_PROXY_RULE_CONDITIONS = new Set([
+  'domain', 'domain-suffix', 'domain-keyword', 'ip-cidr', 'port', 'port-range',
+  'network', 'protocol', 'private-network', 'mainland-china'
+])
+const MAX_BUILT_IN_PROXY_EDITABLE_RULES = 500
+const MAX_BUILT_IN_PROXY_RULE_VALUES = 128
+const MAX_BUILT_IN_PROXY_RULE_TOTAL_VALUES = 5_000
+
+function normalizeBuiltInProxyCustomRules(
+  value: unknown,
+  strict = false
+): BuiltInProxyCustomRuleSet | undefined {
+  if (value === undefined) return undefined
+  try {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Custom proxy rules must be an object.')
+    const raw = value as Record<string, unknown>
+    if (Object.keys(raw).some((key) => key !== 'rules' && key !== 'finalAction')) {
+      throw new Error('Custom proxy rules contain unsupported fields.')
+    }
+    if (!Array.isArray(raw.rules) || raw.rules.length > MAX_BUILT_IN_PROXY_EDITABLE_RULES) {
+      throw new Error(`Custom proxy rules must contain at most ${MAX_BUILT_IN_PROXY_EDITABLE_RULES} rules.`)
+    }
+    if (raw.finalAction !== 'proxy' && raw.finalAction !== 'direct') {
+      throw new Error('Custom proxy rules require a direct or proxy final action.')
+    }
+    const totalValues = raw.rules.reduce((total, candidate) => {
+      if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return total
+      const values = (candidate as Record<string, unknown>).values
+      return total + (Array.isArray(values) ? values.length : 0)
+    }, 0)
+    if (totalValues > MAX_BUILT_IN_PROXY_RULE_TOTAL_VALUES) {
+      throw new Error(`Custom proxy rules must contain at most ${MAX_BUILT_IN_PROXY_RULE_TOTAL_VALUES} values.`)
+    }
+    const ids = new Set<string>()
+    const rules = raw.rules.map((candidate, index) => {
+      const rule = normalizeBuiltInProxyEditableRule(candidate, index)
+      if (ids.has(rule.id)) throw new Error('Custom proxy rule ids must be unique.')
+      ids.add(rule.id)
+      return rule
+    })
+    return { rules, finalAction: raw.finalAction }
+  } catch (error) {
+    if (strict) throw error
+    return undefined
+  }
+}
+
+function normalizeBuiltInProxyEditableRule(value: unknown, index: number): BuiltInProxyEditableRule {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`Custom proxy rule ${index + 1} is invalid.`)
+  }
+  const raw = value as Record<string, unknown>
+  if (Object.keys(raw).some((key) => !['id', 'condition', 'values', 'action'].includes(key))) {
+    throw new Error(`Custom proxy rule ${index + 1} contains unsupported fields.`)
+  }
+  const id = typeof raw.id === 'string' ? raw.id.trim() : ''
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(id)) {
+    throw new Error(`Custom proxy rule ${index + 1} has an invalid id.`)
+  }
+  const condition = typeof raw.condition === 'string' ? raw.condition : ''
+  if (!BUILT_IN_PROXY_RULE_CONDITIONS.has(condition)) {
+    throw new Error(`Custom proxy rule ${index + 1} has an unsupported condition.`)
+  }
+  if (raw.action !== 'proxy' && raw.action !== 'direct' && raw.action !== 'block') {
+    throw new Error(`Custom proxy rule ${index + 1} has an unsupported action.`)
+  }
+  if (!Array.isArray(raw.values) || raw.values.length > MAX_BUILT_IN_PROXY_RULE_VALUES) {
+    throw new Error(`Custom proxy rule ${index + 1} has invalid values.`)
+  }
+  const typedCondition = condition as BuiltInProxyEditableRule['condition']
+  const fixedCondition = typedCondition === 'private-network' || typedCondition === 'mainland-china'
+  if (fixedCondition && raw.values.length !== 0) {
+    throw new Error(`Custom proxy rule ${index + 1} does not accept values.`)
+  }
+  if (!fixedCondition && raw.values.length === 0) {
+    throw new Error(`Custom proxy rule ${index + 1} requires at least one value.`)
+  }
+  const values = raw.values.map((entry) => normalizeBuiltInProxyRuleValue(entry, typedCondition, index))
+  if (new Set(values).size !== values.length) {
+    throw new Error(`Custom proxy rule ${index + 1} contains duplicate values.`)
+  }
+  return { id, condition: typedCondition, values, action: raw.action }
+}
+
+function normalizeBuiltInProxyRuleValue(
+  value: unknown,
+  condition: BuiltInProxyEditableRule['condition'],
+  index: number
+): string {
+  if (typeof value !== 'string') throw new Error(`Custom proxy rule ${index + 1} contains a non-text value.`)
+  const trimmed = value.trim()
+  if (!trimmed || trimmed.length > 253 || hasAsciiControlCharacter(trimmed)) {
+    throw new Error(`Custom proxy rule ${index + 1} contains an invalid value.`)
+  }
+  if (condition === 'domain' || condition === 'domain-suffix') {
+    const domain = trimmed.toLowerCase().replace(condition === 'domain-suffix' ? /^\./ : /$^/, '')
+    if (isIP(domain) || !/^(?=.{1,253}$)(?:[a-z0-9*](?:[a-z0-9_*-]{0,61}[a-z0-9*])?\.)*[a-z0-9*](?:[a-z0-9_*-]{0,61}[a-z0-9*])?$/i.test(domain)) {
+      throw new Error(`Custom proxy rule ${index + 1} contains an invalid domain.`)
+    }
+    return domain
+  }
+  if (condition === 'domain-keyword') {
+    if (trimmed.length > 128) throw new Error(`Custom proxy rule ${index + 1} contains an invalid keyword.`)
+    return trimmed
+  }
+  if (condition === 'ip-cidr') {
+    const [address, prefix, extra] = trimmed.split('/')
+    const version = isIP(address)
+    const bits = prefix === undefined ? (version === 4 ? 32 : 128) : Number(prefix)
+    if (!version || extra !== undefined || !Number.isInteger(bits) || bits < 0 || bits > (version === 4 ? 32 : 128)) {
+      throw new Error(`Custom proxy rule ${index + 1} contains an invalid CIDR.`)
+    }
+    return `${address}/${bits}`
+  }
+  if (condition === 'port') {
+    const port = Number(trimmed)
+    if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error(`Custom proxy rule ${index + 1} contains an invalid port.`)
+    return String(port)
+  }
+  if (condition === 'port-range') {
+    const match = /^(\d+):(\d+)$/.exec(trimmed)
+    const start = Number(match?.[1]); const end = Number(match?.[2])
+    if (!match || !Number.isInteger(start) || start < 1 || end > 65535 || start > end) {
+      throw new Error(`Custom proxy rule ${index + 1} contains an invalid port range.`)
+    }
+    return `${start}:${end}`
+  }
+  if (condition === 'network') {
+    const network = trimmed.toLowerCase()
+    if (network !== 'tcp' && network !== 'udp') throw new Error(`Custom proxy rule ${index + 1} contains an invalid network.`)
+    return network
+  }
+  if (condition === 'protocol') {
+    const protocol = trimmed.toLowerCase()
+    if (!/^[a-z0-9_-]{1,32}$/.test(protocol)) throw new Error(`Custom proxy rule ${index + 1} contains an invalid protocol.`)
+    return protocol
+  }
+  throw new Error(`Custom proxy rule ${index + 1} does not accept values.`)
+}
+
+function hasAsciiControlCharacter(value: string): boolean {
+  return Array.from(value).some((character) => {
+    const code = character.charCodeAt(0)
+    return code < 32 || code === 127
+  })
 }
 
 function normalizePersistedBuiltInProxyProfiles(

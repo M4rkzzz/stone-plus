@@ -198,6 +198,92 @@ describe('built-in proxy persistence', () => {
     expect(restarted.getBuiltInProxySettings().desiredEnabled).toBe(true)
   })
 
+  it('normalizes, persists, and explicitly clears global visual proxy rules', async () => {
+    const store = createStore()
+    await store.initialize()
+    expect(store.getBuiltInProxySettings().customRules).toBeUndefined()
+
+    await store.updateBuiltInProxySettings({
+      customRules: {
+        rules: [
+          { id: 'china', condition: 'mainland-china', values: [], action: 'direct' },
+          { id: 'site', condition: 'domain-suffix', values: ['.Example.COM'], action: 'proxy' },
+          { id: 'cidr', condition: 'ip-cidr', values: ['10.20.0.1'], action: 'block' }
+        ],
+        finalAction: 'direct'
+      }
+    })
+    expect(store.getBuiltInProxySettings().customRules).toEqual({
+      rules: [
+        { id: 'china', condition: 'mainland-china', values: [], action: 'direct' },
+        { id: 'site', condition: 'domain-suffix', values: ['example.com'], action: 'proxy' },
+        { id: 'cidr', condition: 'ip-cidr', values: ['10.20.0.1/32'], action: 'block' }
+      ],
+      finalAction: 'direct'
+    })
+
+    await store.close()
+    const restarted = createStore()
+    await restarted.initialize()
+    expect(restarted.getBuiltInProxySettings().customRules?.rules.map((rule) => rule.id))
+      .toEqual(['china', 'site', 'cidr'])
+
+    await restarted.updateBuiltInProxySettings({ customRules: { rules: [], finalAction: 'direct' } })
+    await restarted.close()
+    const emptyRestarted = createStore()
+    await emptyRestarted.initialize()
+    expect(emptyRestarted.getBuiltInProxySettings().customRules).toEqual({ rules: [], finalAction: 'direct' })
+
+    await emptyRestarted.updateBuiltInProxySettings({ customRules: undefined })
+    expect(emptyRestarted.getBuiltInProxySettings()).not.toHaveProperty('customRules')
+  })
+
+  it('rejects malformed or oversized visual proxy rules without changing settings', async () => {
+    const store = createStore()
+    await store.initialize()
+    const before = store.getBuiltInProxySettings()
+
+    await expect(store.updateBuiltInProxySettings({
+      customRules: {
+        rules: [{ id: 'bad-cidr', condition: 'ip-cidr', values: ['10.0.0.1/99'], action: 'direct' }],
+        finalAction: 'proxy'
+      }
+    })).rejects.toThrow(/CIDR/)
+    await expect(store.updateBuiltInProxySettings({
+      customRules: {
+        rules: Array.from({ length: 501 }, (_, index) => ({
+          id: `rule-${index}`, condition: 'private-network' as const, values: [], action: 'direct' as const
+        })),
+        finalAction: 'proxy'
+      }
+    })).rejects.toThrow(/at most 500/)
+    expect(store.getBuiltInProxySettings()).toEqual(before)
+  })
+
+  it('drops malformed visual rules from a legacy JSON payload without a schema bump', async () => {
+    const original = createStore()
+    await original.initialize()
+    await original.close()
+    const databasePath = join(directory, SQLITE_DATABASE_FILENAME)
+    const database = new DatabaseSync(databasePath)
+    const row = database.prepare('SELECT payload FROM built_in_proxy_settings WHERE singleton = 1').get() as { payload: string }
+    database.prepare('UPDATE built_in_proxy_settings SET payload = ? WHERE singleton = 1').run(JSON.stringify({
+      ...JSON.parse(row.payload),
+      customRules: {
+        rules: [{ id: 'unsafe', condition: 'port', values: ['99999'], action: 'direct' }],
+        finalAction: 'proxy'
+      }
+    }))
+    database.close()
+
+    const restarted = createStore()
+    await restarted.initialize()
+    expect(SQLITE_SCHEMA_VERSION).toBe(9)
+    expect(restarted.getBuiltInProxySettings().customRules).toBeUndefined()
+    const normalized = restarted.getStateRepository().read().builtInProxySettings
+    expect(normalized).not.toHaveProperty('customRules')
+  })
+
   it('keeps node ids stable, falls back when the active node disappears, and cleans credentials on delete', async () => {
     const store = createStore()
     await store.initialize()
@@ -236,6 +322,49 @@ describe('built-in proxy persistence', () => {
     expect(store.getBuiltInProxySettings()).toMatchObject({ desiredEnabled: true })
     expect(store.getBuiltInProxySettings()).not.toHaveProperty('activeProfileId')
     expect(store.getStateRepository().read().credentials).not.toHaveProperty(credentialId!)
+  })
+
+  it('persists the selected profile and node across an application restart', async () => {
+    const firstRun = createStore()
+    await firstRun.initialize()
+    await firstRun.saveBuiltInProxyProfile(profileInput())
+    const selected = await firstRun.saveBuiltInProxyProfile(profileInput({
+      name: 'Selected built-in profile',
+    }))
+    await firstRun.selectBuiltInProxyNode(selected.id, 'node-stable-b')
+    await firstRun.close()
+
+    const restarted = createStore()
+    await restarted.initialize()
+    expect(restarted.getBuiltInProxySettings().activeProfileId).toBe(selected.id)
+    expect(restarted.getBuiltInProxyProfile(selected.id)?.activeNodeId).toBe('node-stable-b')
+  })
+
+  it('evicts replaced and deleted profile secrets from the plaintext cache', async () => {
+    const store = createStore()
+    await store.initialize()
+    const created = await store.saveBuiltInProxyProfile(profileInput())
+    const credentialId = store.getStateRepository().read().proxyProfiles?.[0].credentialId
+    if (!credentialId) throw new Error('Expected an encrypted profile credential')
+    const firstCiphertext = store.getStateRepository().read().credentials[credentialId]
+    expect(store.getBuiltInProxyProfileSecrets(created.id)?.configuration)
+      .toEqual({ nodes: [{ password: 'opaque-node-secret' }] })
+    expect(credentialCache(store).has(firstCiphertext)).toBe(true)
+
+    await store.saveBuiltInProxyProfile(profileInput({
+      id: created.id,
+      secrets: {
+        subscriptionUrl: 'https://subscriber.example/private?token=replacement-token',
+        subscriptionToken: 'replacement-token',
+        configuration: { nodes: [{ password: 'replacement-node-secret' }] },
+      },
+    }))
+    expect(credentialCache(store).has(firstCiphertext)).toBe(false)
+    const secondCiphertext = store.getStateRepository().read().credentials[credentialId]
+    expect(store.getBuiltInProxyProfileSecrets(created.id)?.subscriptionToken).toBe('replacement-token')
+
+    await store.deleteBuiltInProxyProfile(created.id)
+    expect(credentialCache(store).has(secondCiphertext)).toBe(false)
   })
 
   it('persists activation history independently and rolls back invalid profile replacements', async () => {
@@ -321,4 +450,8 @@ function profileInput(
     },
     ...overrides
   }
+}
+
+function credentialCache(store: AppStore): Map<string, string> {
+  return (store as unknown as { decryptedCredentialCache: Map<string, string> }).decryptedCredentialCache
 }

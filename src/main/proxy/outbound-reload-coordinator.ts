@@ -178,7 +178,7 @@ export class OutboundReloadCoordinator {
   private recheckTail: Promise<void> = Promise.resolve()
   private scheduledBuiltInTimer?: ReturnType<typeof setTimeout>
   private scheduledBuiltInDetector?: (targets: readonly string[]) => Promise<unknown>
-  private scheduledBuiltInFlight?: Promise<void>
+  private readonly scheduledBuiltInFlights = new Set<Promise<void>>()
   private closed = false
 
   constructor(options: OutboundReloadCoordinatorOptions) {
@@ -237,6 +237,13 @@ export class OutboundReloadCoordinator {
     this.triggerFailureCooldownRecheck('external-system')
   }
 
+  /** Built-in disable commit barrier: the old mixed generation remains live
+   * unless Chromium has definitely accepted the restored external route. */
+  public async reloadExternalSystemRouteStrict(): Promise<void> {
+    await this.reloadSystemProxyStrict()
+    this.triggerFailureCooldownRecheck('external-system')
+  }
+
   /**
    * Runs built-in source detection immediately. All enabled targets are
    * included, including accounts whose explicit proxy binding is currently
@@ -266,11 +273,11 @@ export class OutboundReloadCoordinator {
       this.scheduledBuiltInDetector = undefined
       if (!detector || this.closed) return
       const flight = this.coordinateBuiltInRouteChange(detector).then(() => undefined)
-      this.scheduledBuiltInFlight = flight
+      this.scheduledBuiltInFlights.add(flight)
       void flight.catch((error: unknown) => {
         this.logger?.error('[built-in-proxy] Could not refresh enabled sources after the route changed', error)
       }).finally(() => {
-        if (this.scheduledBuiltInFlight === flight) this.scheduledBuiltInFlight = undefined
+        this.scheduledBuiltInFlights.delete(flight)
       })
     }, this.debounceMs)
     this.scheduledBuiltInTimer.unref?.()
@@ -311,7 +318,7 @@ export class OutboundReloadCoordinator {
     }
 
     const recheckedAccountIds = options.recheckFailureCooledAccounts
-      ? await this.enqueueFailureCooldownRecheck(selectedTargets)
+      ? await this.enqueueFailureCooldownRecheck(selectedTargets, options.mode)
       : []
     if (detectionError !== undefined) throw detectionError
     return {
@@ -322,10 +329,12 @@ export class OutboundReloadCoordinator {
   }
 
   public async settle(): Promise<void> {
-    await Promise.allSettled([
-      this.recheckTail,
-      ...(this.scheduledBuiltInFlight ? [this.scheduledBuiltInFlight] : [])
-    ])
+    while (true) {
+      const recheckTail = this.recheckTail
+      const flights = [...this.scheduledBuiltInFlights]
+      await Promise.allSettled([recheckTail, ...flights])
+      if (recheckTail === this.recheckTail && this.scheduledBuiltInFlights.size === 0) return
+    }
   }
 
   public async close(): Promise<void> {
@@ -341,13 +350,14 @@ export class OutboundReloadCoordinator {
     if (this.closed) return
     const targets = [...this.collectTargets().values()]
       .filter((target) => mode === 'built-in' || target.proxy === undefined)
-    void this.enqueueFailureCooldownRecheck(targets).catch((error: unknown) => {
+    void this.enqueueFailureCooldownRecheck(targets, mode).catch((error: unknown) => {
       this.logger?.error('Stone+ could not refresh failure-cooled accounts after the network route changed', error)
     })
   }
 
   private enqueueFailureCooldownRecheck(
-    targets: readonly EnabledOutboundTarget[]
+    targets: readonly EnabledOutboundTarget[],
+    mode: OutboundReloadMode,
   ): Promise<string[]> {
     const getRuntimeAccounts = this.getRuntimeAccounts
     const getRuntimeAccount = this.getRuntimeAccount
@@ -367,8 +377,8 @@ export class OutboundReloadCoordinator {
       .map((account) => account.id)
 
     const run = this.recheckTail.then(
-      () => this.runFailureCooldownRecheck(accountIds, { getRuntimeAccount, probeAccount, isQuotaExhausted }),
-      () => this.runFailureCooldownRecheck(accountIds, { getRuntimeAccount, probeAccount, isQuotaExhausted })
+      () => this.runFailureCooldownRecheck(accountIds, mode, { getRuntimeAccount, probeAccount, isQuotaExhausted }),
+      () => this.runFailureCooldownRecheck(accountIds, mode, { getRuntimeAccount, probeAccount, isQuotaExhausted })
     )
     this.recheckTail = run.then(() => undefined, () => undefined)
     return run
@@ -376,6 +386,7 @@ export class OutboundReloadCoordinator {
 
   private async runFailureCooldownRecheck(
     accountIds: readonly string[],
+    mode: OutboundReloadMode,
     recheck: Pick<
       OutboundReloadAccountRecheckOptions,
       'getRuntimeAccount' | 'probeAccount' | 'isQuotaExhausted'
@@ -386,6 +397,7 @@ export class OutboundReloadCoordinator {
       const rechecked: string[] = []
       await mapConcurrent([...accountIds], this.recheckConcurrency, async (accountId) => {
         if (this.closed) return
+        if (!this.currentlyEnabledAccountIds(mode).has(accountId)) return
         const account = recheck.getRuntimeAccount(accountId)
         if (!account || account.status !== 'cooldown' || account.cooldownReason !== 'failure') return
         if (recheck.isQuotaExhausted(account)) return
@@ -396,6 +408,15 @@ export class OutboundReloadCoordinator {
     } finally {
       this.onRecheckCycleSettled()
     }
+  }
+
+  private currentlyEnabledAccountIds(mode: OutboundReloadMode): Set<string> {
+    const accountIds = new Set<string>()
+    for (const target of this.collectTargets().values()) {
+      if (mode === 'external-system' && target.proxy !== undefined) continue
+      for (const accountId of target.accountIds) accountIds.add(accountId)
+    }
+    return accountIds
   }
 
   private async reloadSystemProxySafely(warning: string): Promise<void> {
@@ -410,6 +431,12 @@ export class OutboundReloadCoordinator {
     }
   }
 
+  private async reloadSystemProxyStrict(): Promise<void> {
+    // OutboundTransportManager owns the bounded single-flight and late-result
+    // semantics. Do not layer another timeout here.
+    await this.transport.reloadSystemProxyConfiguration()
+  }
+
   private assertOpen(): void {
     if (this.closed) throw new Error('Outbound reload coordinator is closed.')
   }
@@ -421,15 +448,21 @@ async function mapConcurrent<T>(
   operation: (value: T) => Promise<void>
 ): Promise<void> {
   let nextIndex = 0
+  let firstFailure: { reason: unknown } | undefined
   const worker = async (): Promise<void> => {
     while (nextIndex < values.length) {
       const index = nextIndex
       nextIndex += 1
-      await operation(values[index])
+      try {
+        await operation(values[index])
+      } catch (reason) {
+        firstFailure ??= { reason }
+      }
     }
   }
   await Promise.all(Array.from(
     { length: Math.min(Math.max(1, concurrency), values.length) },
     () => worker()
   ))
+  if (firstFailure) throw firstFailure.reason
 }

@@ -152,6 +152,8 @@ export function saveApiSourceDraft(
     || existingProvider.protocol !== sourceConfiguration.protocol
     || existingAccount.proxyId !== proxyId
     || credentialChanged
+  const capabilityConfigurationChanged = connectionChanged
+    || existingProvider?.responsesCompactMode !== responsesCompactMode
 
   const inferredCapabilities = inferUpstreamCapabilities({
     protocol: sourceConfiguration.protocol,
@@ -166,14 +168,14 @@ export function saveApiSourceDraft(
     && input.capabilityProfile?.origin === 'probed'
     && typeof input.capabilityProfile.checkedAt === 'number'
   const capabilityProfile = normalizeCapabilityProfile(
-    connectionChanged && !acceptsInitialProbe
+    capabilityConfigurationChanged && !acceptsInitialProbe
       ? undefined
       : input.capabilityProfile ?? existingProvider?.capabilityProfile,
     inferredCapabilities,
   )
-  const modelCatalog = (acceptsInitialProbe || !connectionChanged) && input.modelCatalog
+  const modelCatalog = (acceptsInitialProbe || !capabilityConfigurationChanged) && input.modelCatalog
     ? normalizeModelCatalog(input.modelCatalog, models, capabilityProfile)
-    : connectionChanged
+    : capabilityConfigurationChanged
       ? buildModelCatalog(models, capabilityProfile)
       : normalizeModelCatalog(existingProvider?.modelCatalog, models, capabilityProfile)
 

@@ -35,4 +35,8 @@ export interface DatabaseBackupServiceOptions<T> {
   randomId?: () => string
   onAutomaticBackupError?: (error: Error) => void
   portableSecretVault?: import('./portable-secrets').PortableSecretVault
+  /** Durable safety barrier invoked before every copy of the live SQLite file. */
+  beforeRawBackup?: () => void | Promise<void>
+  /** Runs after restore commit and before any raw backup may resume. */
+  onRestoreCommitted?: (state: T) => void | Promise<void>
 }

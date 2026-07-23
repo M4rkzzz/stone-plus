@@ -202,6 +202,7 @@ export async function probeApiSource(
       ok: true,
       stages,
       models,
+      testedModel: model,
       latencyMs: elapsed(now, startedAt),
       warnings: unique(warnings),
       capabilityProfile,
@@ -216,7 +217,7 @@ export async function probeApiSource(
       replaceStage(stages, 'authentication', errorStage('authentication', message))
     }
     stages.push(errorStage('generation', message))
-    return failedResult(stages, models, warnings, message, now, startedAt, capabilityProfile)
+    return failedResult(stages, models, warnings, message, now, startedAt, capabilityProfile, model)
   }
 }
 
@@ -381,12 +382,14 @@ function failedResult(
   now: () => number,
   startedAt: number,
   capabilityProfile: ApiSourceProbeResult['capabilityProfile'],
+  testedModel?: string,
 ): ApiSourceProbeResult {
   const checkedProfile = { ...capabilityProfile, checkedAt: now() }
   return {
     ok: false,
     stages,
     models,
+    ...(testedModel ? { testedModel } : {}),
     latencyMs: elapsed(now, startedAt),
     error,
     warnings: unique(warnings),

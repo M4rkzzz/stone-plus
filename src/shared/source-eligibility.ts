@@ -33,6 +33,8 @@ export function evaluateSourceEligibility<T extends SourceAccount>(input: {
   poolModelPolicy?: 'all' | 'selected'
   poolModelAllowlist?: readonly string[]
   requiredCapabilities?: readonly UpstreamCapabilityRequirement[]
+  /** Require every account to resolve to provider metadata. */
+  requireProvider?: boolean
 }): SourceEligibilityResult<T> {
   const required = [...new Set(input.requiredCapabilities ?? [])]
   const providerById = new Map(input.providers.map((provider) => [provider.id, provider]))
@@ -42,6 +44,7 @@ export function evaluateSourceEligibility<T extends SourceAccount>(input: {
     providerById.get(account.providerId),
     input.poolModelPolicy,
     input.poolModelAllowlist,
+    input.requireProvider,
   ))
   const verified: T[] = []
   const unknown: T[] = []
@@ -51,6 +54,7 @@ export function evaluateSourceEligibility<T extends SourceAccount>(input: {
       providerById.get(account.providerId),
       input.model,
       required,
+      input.requireProvider,
     )
     if (status === 'verified') verified.push(account)
     else if (status === 'unknown') unknown.push(account)
@@ -68,10 +72,16 @@ export function evaluateSourceEligibility<T extends SourceAccount>(input: {
 export function accountSupportsModel(
   account: SourceAccount,
   model: string | undefined,
-  _provider: ProviderDefinition | undefined,
+  provider: ProviderDefinition | undefined,
   poolModelPolicy?: 'all' | 'selected',
   poolModelAllowlist?: readonly string[],
+  requireProvider = false,
 ): boolean {
+  // An orphaned account cannot be executed: the gateway needs provider
+  // protocol, endpoint and adapter metadata even when the request has no
+  // explicit model/capability constraint. Do not let it inflate preview counts
+  // or reach the scheduler only to fail as a 503 after acquiring a slot.
+  if (requireProvider && !provider) return false
   if (!model) return true
   if (poolModelPolicy === 'selected' && !(poolModelAllowlist ?? []).includes(model)) return false
   if (account.modelPolicy === 'selected' && !account.modelAllowlist.includes(model)) return false
@@ -87,9 +97,10 @@ export function accountCapabilityEligibility(
   provider: ProviderDefinition | undefined,
   model: string | undefined,
   requiredCapabilities: readonly UpstreamCapabilityRequirement[],
+  requireProvider = false,
 ): CapabilityEligibility {
+  if (!provider) return requireProvider ? 'unsupported' : requiredCapabilities.length ? 'unknown' : 'verified'
   if (!requiredCapabilities.length) return 'verified'
-  if (!provider) return 'unknown'
   const capabilities = providerModelCapabilities(provider, model)
   let unknown = false
   for (const capability of requiredCapabilities) {

@@ -1039,9 +1039,9 @@ export class SqliteStateStore<T extends SqlitePersistedShape> {
         if (process.platform !== 'win32') await chmod(rollbackTemporaryPath, 0o600)
         assertDatabaseIntegrity(rollbackTemporaryPath)
         await rename(rollbackTemporaryPath, rollbackDatabasePath)
+        database.exec('PRAGMA wal_checkpoint(TRUNCATE)')
         this.telemetryDatabase?.close()
         this.telemetryDatabase = undefined
-        database.exec('PRAGMA wal_checkpoint(TRUNCATE)')
         database.close()
         this.database = undefined
         databaseClosed = true
@@ -1050,6 +1050,18 @@ export class SqliteStateStore<T extends SqlitePersistedShape> {
       } catch (restoreError) {
         await rm(rollbackTemporaryPath, { force: true }).catch(() => undefined)
         if (!databaseClosed) {
+          if (!this.telemetryDatabase) {
+            try {
+              const telemetryDatabase = new DatabaseSync(this.options.databasePath)
+              configureTelemetryDatabase(telemetryDatabase)
+              this.telemetryDatabase = telemetryDatabase
+            } catch (telemetryError) {
+              throw new Error(
+                `Unable to prepare SQLite restore (${messageOf(restoreError)}); `
+                + `telemetry recovery also failed (${messageOf(telemetryError)})`
+              )
+            }
+          }
           throw new Error(`Unable to prepare SQLite restore: ${messageOf(restoreError)}`)
         }
         this.database = undefined

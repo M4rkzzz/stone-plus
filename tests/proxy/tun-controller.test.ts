@@ -66,7 +66,8 @@ describe('built-in TUN controller', () => {
     const controller = new TunController({ adapter })
 
     await expect(controller.start(routingContext())).rejects.toMatchObject({
-      code: 'tun_elevation_denied'
+      code: 'tun_elevation_denied',
+      message: expect.stringContaining('The user declined temporary TUN elevation.'),
     })
     expect(controller.getState()).toMatchObject({
       status: 'error',
@@ -77,6 +78,27 @@ describe('built-in TUN controller', () => {
 
     await expect(controller.retryStart()).resolves.toMatchObject({ status: 'ready' })
     expect(adapter.startTemporaryElevated).toHaveBeenCalledTimes(2)
+  })
+
+  it('retries adapter-owned cleanup when startup failed before returning a session', async () => {
+    const cleanupPending = vi.fn()
+      .mockRejectedValueOnce(new Error('privileged child is still alive'))
+      .mockResolvedValueOnce(undefined)
+    const adapter: TunPlatformAdapter = {
+      startTemporaryElevated: vi.fn(async () => { throw new Error('health gate failed') }),
+      stopTemporary: vi.fn(async () => undefined),
+      cleanupPending,
+    }
+    const controller = new TunController({ adapter })
+    await expect(controller.start(routingContext())).rejects.toMatchObject({
+      code: 'tun_start_failed',
+      message: expect.stringContaining('health gate failed'),
+    })
+
+    await expect(controller.stop()).rejects.toMatchObject({ code: 'tun_stop_failed' })
+    expect(controller.getState()).toMatchObject({ status: 'error', desiredEnabled: false })
+    await expect(controller.retryStop()).resolves.toEqual({ status: 'stopped', desiredEnabled: false })
+    expect(cleanupPending).toHaveBeenCalledTimes(2)
   })
 
   it('retains a failed teardown handle so stopping can be retried', async () => {
@@ -121,6 +143,97 @@ describe('built-in TUN controller', () => {
     await expect(controller.start(routingContext())).rejects.toMatchObject({
       code: 'tun_elevation_denied'
     })
+  })
+
+  it('moves to an observable error state when a ready sidecar exits late', async () => {
+    let publishExit!: (exit: { code: number | null; signal: NodeJS.Signals | null }) => void
+    const exit = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+      publishExit = resolve
+    })
+    const adapter: TunPlatformAdapter = {
+      startTemporaryElevated: vi.fn(async () => ({ id: 'watched-sidecar', pid: 7100, exit })),
+      stopTemporary: vi.fn(async () => undefined),
+    }
+    const controller = new TunController({ adapter })
+    const listener = vi.fn()
+    controller.onEvent(listener)
+    await controller.start(routingContext())
+
+    publishExit({ code: 9, signal: null })
+    await vi.waitFor(() => expect(controller.getState()).toMatchObject({
+      status: 'error',
+      desiredEnabled: true,
+      lastError: {
+        code: 'tun_start_failed',
+        message: expect.stringContaining('exit code 9'),
+      },
+    }))
+    expect(listener).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'unexpected-exit',
+      exit: { code: 9, signal: null },
+    }))
+
+    await controller.stop()
+    expect(adapter.stopTemporary).toHaveBeenCalledOnce()
+    expect(controller.getState()).toEqual({ status: 'stopped', desiredEnabled: false })
+  })
+
+  it('ignores a retired sidecar exit after a replacement reuses the same runner ID', async () => {
+    type Exit = { code: number | null; signal: NodeJS.Signals | null }
+    const exits: Array<(exit: Exit) => void> = []
+    const adapter: TunPlatformAdapter = {
+      startTemporaryElevated: vi.fn(async () => ({
+        id: 'reused-runner-id',
+        pid: 7200 + exits.length,
+        exit: new Promise<Exit>((resolve) => { exits.push(resolve) }),
+      })),
+      stopTemporary: vi.fn(async () => undefined),
+    }
+    const controller = new TunController({ adapter })
+    const listener = vi.fn()
+    controller.onEvent(listener)
+
+    await controller.start(routingContext())
+    await controller.stop()
+    await controller.start(routingContext())
+    expect(controller.getState()).toMatchObject({
+      status: 'ready',
+      desiredEnabled: true,
+      session: { id: 'reused-runner-id', pid: 7201 },
+    })
+
+    exits[0]({ code: 9, signal: null })
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(controller.getState().status).toBe('ready')
+    expect(listener).not.toHaveBeenCalled()
+
+    exits[1]({ code: 9, signal: null })
+    await vi.waitFor(() => expect(controller.getState().status).toBe('error'))
+    expect(listener).toHaveBeenCalledOnce()
+  })
+
+  it('fails closed on a broken exit monitor and still notifies after another observer throws', async () => {
+    let rejectExit!: (error: Error) => void
+    const exit = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((_resolve, reject) => {
+      rejectExit = reject
+    })
+    const adapter: TunPlatformAdapter = {
+      startTemporaryElevated: vi.fn(async () => ({ id: 'broken-monitor', pid: 7300, exit })),
+      stopTemporary: vi.fn(async () => undefined),
+    }
+    const controller = new TunController({ adapter })
+    const survivingListener = vi.fn()
+    controller.onEvent(() => { throw new Error('observer failed') })
+    controller.onEvent(survivingListener)
+    await controller.start(routingContext())
+
+    rejectExit(new Error('native process watcher closed'))
+    await vi.waitFor(() => expect(controller.getState()).toMatchObject({
+      status: 'error',
+      lastError: { message: expect.stringContaining('native process watcher closed') },
+    }))
+    expect(survivingListener).toHaveBeenCalledOnce()
   })
 })
 

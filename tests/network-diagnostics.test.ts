@@ -76,6 +76,12 @@ describe('network diagnostics', () => {
       expect.stringContaining('HTTP 403'),
       expect.stringContaining('HTTP 429')
     ]))
+    expect(report.diagnoses).not.toEqual(expect.arrayContaining([
+      expect.stringContaining('无法访问全部 GPT 端点')
+    ]))
+    expect(report.diagnoses).not.toEqual(expect.arrayContaining([
+      expect.stringContaining('全部 GPT HTTP 端点均不可达')
+    ]))
   })
 
   it('classifies HTTP 407 as a proxy authentication transport failure', async () => {
@@ -97,6 +103,26 @@ describe('network diagnostics', () => {
       ])
     )
     expect(report.diagnoses).toContain('代理要求身份认证（HTTP 407）：请检查代理配置中的用户名和密码。')
+  })
+
+  it('never reports an all-502 route as a healthy network path', async () => {
+    const fetchImplementation = vi.fn(async () => new Response(null, { status: 502 }))
+    const report = await runNetworkDiagnostics({
+      fetchImplementation,
+      route: { kind: 'system', name: '系统代理' }
+    })
+
+    expect(report.summary).toBe('warning')
+    expect(report.results.filter((result) => result.kind === 'http').every((result) => (
+      result.status === 'warning'
+    ))).toBe(true)
+    expect(report.diagnoses).toEqual(expect.arrayContaining([
+      expect.stringContaining('HTTP 5xx'),
+      expect.stringContaining('全部 GPT HTTP 端点均不可达')
+    ]))
+    expect(report.diagnoses).not.toContain(
+      '基础网络链路正常。若账号请求仍失败，优先检查凭据有效期、账号权限、额度和模型访问资格。'
+    )
   })
 
   it('extracts actionable transport codes through a bounded nested cause chain', async () => {
@@ -173,6 +199,26 @@ describe('network diagnostics', () => {
     )
   })
 
+  it.each([
+    ['configuration-invalid', 'config_invalid'],
+    ['core-integrity', 'core_integrity'],
+    ['system-proxy', 'system_proxy'],
+    ['health-check', 'health_check'],
+    ['core-crashed', 'core_crashed']
+  ] as const)('normalizes runtime built-in category %s as %s', async (runtimeCategory, expectedCategory) => {
+    const fetchImplementation = vi.fn(async () => {
+      throw Object.assign(new Error('Built-in route failed'), { category: runtimeCategory })
+    })
+    const report = await runNetworkDiagnostics({
+      fetchImplementation,
+      route: { kind: 'system', name: '内置代理' }
+    })
+
+    expect(report.results.filter((result) => result.kind === 'http')).toEqual(
+      expect.arrayContaining([expect.objectContaining({ errorCode: expectedCategory })])
+    )
+  })
+
   it('does not wait for a response body cancellation that never settles', async () => {
     const cancel = vi.fn(() => new Promise<void>(() => undefined))
     const fetchImplementation = vi.fn(async () => ({
@@ -191,5 +237,30 @@ describe('network diagnostics', () => {
 
     expect(outcome).not.toBe('timed-out')
     expect(cancel).toHaveBeenCalledTimes(4)
+  })
+
+  it('enforces a hard HTTP deadline when a fetch implementation ignores AbortSignal', async () => {
+    vi.useFakeTimers()
+    try {
+      const fetchImplementation = vi.fn(() => new Promise<Response>(() => undefined))
+      const diagnostic = runNetworkDiagnostics({
+        fetchImplementation,
+        route: { kind: 'system', name: '系统代理' }
+      })
+
+      await vi.advanceTimersByTimeAsync(10_000)
+      const report = await diagnostic
+
+      expect(report.results.filter((result) => result.kind === 'http')).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ status: 'error', errorCode: 'HTTP_TIMEOUT' })
+        ])
+      )
+      expect(report.diagnoses).toContain(
+        '存在连接超时：常见原因是节点不可用、链路拥塞、目标被阻断或代理规则没有命中。'
+      )
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

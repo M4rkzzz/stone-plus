@@ -33,6 +33,7 @@ import type {
   WebDavBackupEntry,
 } from '@shared/types'
 import type { ActionRunner } from '../App'
+import { redactSensitiveText } from '../async-operation'
 import { localizeBackendError, localizeBackendMessage } from '../backend-message'
 import { Badge, FieldError, gatewayBaseUrl, InfoTip, PageHeader, Toggle } from '../ui'
 import { StoneMark } from '../StoneMark'
@@ -189,6 +190,7 @@ export function SettingsView({
   const [connectionNotice, setConnectionNotice] = useState('')
   const [systemProxyStatus, setSystemProxyStatus] = useState<SystemProxyDetectionResult>()
   const [portablePassword, setPortablePassword] = useState('')
+  const [portableBusy, setPortableBusy] = useState('')
   const [webDavConfiguration, setWebDavConfiguration] = useState<WebDavBackupConfiguration>({ baseUrl: '', username: '', hasPassword: false, configured: false })
   const [webDavDraft, setWebDavDraft] = useState({ baseUrl: '', username: '', password: '' })
   const [webDavEntries, setWebDavEntries] = useState<WebDavBackupEntry[]>([])
@@ -203,9 +205,15 @@ export function SettingsView({
   const apiRef = useRef(api)
   const runActionRef = useRef(runAction)
   const languageRef = useRef(language)
+  const portablePasswordRef = useRef(portablePassword)
+  const webDavPasswordRef = useRef(webDavDraft.password)
+  const portableBusyRef = useRef('')
+  const webDavBusyRef = useRef('')
   apiRef.current = api
   runActionRef.current = runAction
   languageRef.current = language
+  portablePasswordRef.current = portablePassword
+  webDavPasswordRef.current = webDavDraft.password
 
   const autosaveRef = useRef<LatestAutosaveScheduler<PendingGatewaySave, GatewaySaveResult> | null>(null)
   if (!autosaveRef.current) {
@@ -272,17 +280,56 @@ export function SettingsView({
     mountedRef.current = true
     return () => {
       mountedRef.current = false
+      portablePasswordRef.current = ''
+      webDavPasswordRef.current = ''
+      portableBusyRef.current = ''
+      webDavBusyRef.current = ''
       void autosaveRef.current?.flush()
     }
   }, [])
-  useEffect(() => { void api.listStateBackups().then(setBackups).catch(() => undefined) }, [api])
+  useEffect(() => {
+    void api.listStateBackups().then(setBackups).catch((cause: unknown) => {
+      setOperationNotice(localizeBackendError(
+        cause,
+        language,
+        translate(language, '无法读取本地备份列表。', 'Unable to read local backups.'),
+      ))
+    })
+  }, [api, language])
+  useEffect(() => {
+    void api.getAutomaticBackupRuntimeState().then((state) => {
+      if (!state.blocked) return
+      setOperationNotice(localizeBackendMessage(
+        state.message ?? '',
+        language,
+        translate(
+          language,
+          '自动备份已安全阻断；请保存或清除 WebDAV 配置后重试。',
+          'Automatic backups are safely blocked. Save or clear the WebDAV configuration, then retry.',
+        ),
+      ))
+    }).catch((cause: unknown) => {
+      setOperationNotice(localizeBackendError(
+        cause,
+        language,
+        translate(language, '无法确认自动备份运行状态。', 'Unable to confirm automatic backup status.'),
+      ))
+    })
+  }, [api, language])
   useEffect(() => {
     void api.getWebDavBackupConfiguration().then((configuration) => {
       setWebDavConfiguration(configuration)
+      webDavPasswordRef.current = ''
       setWebDavDraft({ baseUrl: configuration.baseUrl, username: configuration.username, password: '' })
       if (configuration.configured) void api.listWebDavBackups().then(setWebDavEntries).catch(() => undefined)
-    }).catch(() => undefined)
-  }, [api])
+    }).catch((cause: unknown) => {
+      setOperationNotice(localizeBackendError(
+        cause,
+        language,
+        translate(language, 'WebDAV 配置需要修复后才能继续备份。', 'Repair the WebDAV configuration before continuing backups.'),
+      ))
+    })
+  }, [api, language])
   useEffect(() => { void api.getLocalEventServerStatus().then(setLocalEvents).catch(() => undefined) }, [api])
   useEffect(() => {
     setErrors(dirtyRef.current ? validateGatewayDraft(latestDraftRef.current, language) : {})
@@ -352,6 +399,51 @@ export function SettingsView({
             ? t('已自动保存', 'Autosaved')
             : t('更改自动保存', 'Changes autosave')
 
+  const clearPortablePassword = () => {
+    portablePasswordRef.current = ''
+    setPortablePassword('')
+  }
+
+  const beginPortableOperation = (key: string): boolean => {
+    if (portableBusyRef.current) return false
+    portableBusyRef.current = key
+    setPortableBusy(key)
+    return true
+  }
+
+  const finishPortableOperation = (key: string) => {
+    if (portableBusyRef.current !== key) return
+    portableBusyRef.current = ''
+    setPortableBusy('')
+  }
+
+  const beginWebDavOperation = (key: string): boolean => {
+    if (webDavBusyRef.current) return false
+    webDavBusyRef.current = key
+    setWebDavBusy(key)
+    return true
+  }
+
+  const finishWebDavOperation = (key: string) => {
+    if (webDavBusyRef.current !== key) return
+    webDavBusyRef.current = ''
+    setWebDavBusy('')
+  }
+
+  const beginPortableWebDavOperation = (key: string): boolean => {
+    if (portableBusyRef.current || webDavBusyRef.current) return false
+    portableBusyRef.current = key
+    webDavBusyRef.current = key
+    setPortableBusy(key)
+    setWebDavBusy(key)
+    return true
+  }
+
+  const sensitiveOperationError = (cause: unknown, fallback: string, secrets: readonly string[]) => redactSensitiveText(
+    localizeBackendError(cause, language, fallback),
+    secrets,
+  )
+
   const createBackup = async () => {
     const result = await api.createStateBackup()
     setBackups(await api.listStateBackups())
@@ -360,105 +452,188 @@ export function SettingsView({
 
   const restoreBackup = async (backup: BackupRecordSummary) => {
     if (!window.confirm(t('恢复会替换当前本地数据并需要重启 Stone+，是否继续？', 'Restoring will replace the current local data and requires restarting Stone+. Continue?'))) return
-    const result = await api.restoreStateBackup(backup.path)
-    setOperationNotice(result.restartRequired ? t('数据已恢复，请退出并重新启动 Stone+。', 'Data restored. Quit and restart Stone+.') : t('数据已恢复。', 'Data restored.'))
+    try {
+      const result = await api.restoreStateBackup(backup.path)
+      const runtime = await api.getAutomaticBackupRuntimeState()
+      setOperationNotice(runtime.blocked
+        ? localizeBackendMessage(
+            runtime.message ?? '',
+            language,
+            t('数据已恢复，但自动备份仍处于安全阻断状态。', 'Data was restored, but automatic backups remain safely blocked.'),
+          )
+        : result.restartRequired
+          ? t('数据已恢复，请退出并重新启动 Stone+。', 'Data restored. Quit and restart Stone+.')
+          : t('数据已恢复。', 'Data restored.'))
+    } catch (cause) {
+      const runtime = await api.getAutomaticBackupRuntimeState().catch(() => undefined)
+      setOperationNotice(localizeBackendError(
+        cause,
+        language,
+        runtime?.blocked
+          ? t('恢复后的安全清理尚未完成，自动备份保持阻断；请修复 WebDAV 配置后重试。', 'Post-restore safety cleanup is incomplete and automatic backups remain blocked. Repair WebDAV and retry.')
+          : t('恢复失败；如果提示数据已恢复，请重启 Stone+ 后核对状态。', 'Restore failed. If the message says data was restored, restart Stone+ and verify its state.'),
+      ))
+    }
   }
 
   const exportPortableBackup = async () => {
-    if (portablePassword.length < 8) {
+    const password = portablePasswordRef.current
+    if (password.length < 8) {
       setOperationNotice(t('迁移备份密码至少需要 8 个字符。', 'Portable backup passwords require at least 8 characters.'))
       return
     }
+    if (!beginPortableOperation('export')) return
     try {
-      const result = await api.exportPortableStateBackup(portablePassword)
+      const result = await api.exportPortableStateBackup(password)
       if (!result.cancelled) setOperationNotice(t(`加密迁移备份已导出：${result.path ?? ''}`, `Encrypted portable backup exported: ${result.path ?? ''}`))
+      clearPortablePassword()
     } catch (cause) {
-      setOperationNotice(localizeBackendError(cause, language, t('迁移备份导出失败', 'Failed to export portable backup')))
-    }
+      setOperationNotice(sensitiveOperationError(cause, t('迁移备份导出失败', 'Failed to export portable backup'), [password]))
+    } finally { finishPortableOperation('export') }
   }
 
   const importPortableBackup = async () => {
-    if (portablePassword.length < 8) {
+    const password = portablePasswordRef.current
+    if (password.length < 8) {
       setOperationNotice(t('请输入备份文件使用的密码。', 'Enter the password used by the backup file.'))
       return
     }
+    if (!beginPortableOperation('import')) return
     try {
-      const result = await api.importPortableStateBackup(portablePassword)
-      if (result.cancelled) return
-      setBackups(await api.listStateBackups())
-      setOperationNotice(t('加密迁移备份已导入，请在下方备份列表中确认并恢复。', 'Encrypted portable backup imported. Review and restore it from the backup list below.'))
+      const result = await api.importPortableStateBackup(password)
+      clearPortablePassword()
+      if (result.cancelled) {
+        return
+      }
+      try {
+        setBackups(await api.listStateBackups())
+        setOperationNotice(t('加密迁移备份已导入，请在下方备份列表中确认并恢复。', 'Encrypted portable backup imported. Review and restore it from the backup list below.'))
+      } catch {
+        setOperationNotice(t('加密迁移备份已导入，但备份列表刷新失败；重新打开设置页即可刷新。', 'The encrypted portable backup was imported, but the backup list could not be refreshed. Reopen Settings to refresh it.'))
+      }
     } catch (cause) {
-      setOperationNotice(localizeBackendError(cause, language, t('迁移备份导入失败', 'Failed to import portable backup')))
-    }
+      setOperationNotice(sensitiveOperationError(cause, t('迁移备份导入失败', 'Failed to import portable backup'), [password]))
+    } finally { finishPortableOperation('import') }
   }
 
   const saveWebDav = async () => {
-    setWebDavBusy('save')
+    const password = webDavPasswordRef.current
+    if (!beginWebDavOperation('save')) return
     try {
       const configuration = await api.saveWebDavBackupConfiguration({
         baseUrl: webDavDraft.baseUrl.trim(),
         username: webDavDraft.username.trim() || undefined,
-        password: webDavDraft.password || undefined,
+        password: password || undefined,
       })
       setWebDavConfiguration(configuration)
       setWebDavDraft((current) => ({ ...current, baseUrl: configuration.baseUrl, username: configuration.username, password: '' }))
-      setOperationNotice(t('WebDAV 配置已安全保存。', 'WebDAV configuration saved securely.'))
+      webDavPasswordRef.current = ''
+      try {
+        const runtime = await api.getAutomaticBackupRuntimeState()
+        setBackups(await api.listStateBackups())
+        setOperationNotice(runtime.blocked
+          ? localizeBackendMessage(
+              runtime.message ?? '',
+              language,
+              t('WebDAV 配置已保存，但自动备份仍处于安全阻断状态。', 'WebDAV was saved, but automatic backups remain safely blocked.'),
+            )
+          : t('WebDAV 配置已安全保存。', 'WebDAV configuration saved securely.'))
+      } catch (cause) {
+        setOperationNotice(localizeBackendError(
+          cause,
+          language,
+          t('WebDAV 配置已保存，但备份状态刷新失败。', 'WebDAV was saved, but the backup status could not be refreshed.'),
+        ))
+      }
     } catch (cause) {
-      setOperationNotice(localizeBackendError(cause, language, t('WebDAV 配置保存失败', 'Failed to save WebDAV configuration')))
-    } finally { setWebDavBusy('') }
+      setOperationNotice(sensitiveOperationError(cause, t('WebDAV 配置保存失败', 'Failed to save WebDAV configuration'), [password]))
+    } finally { finishWebDavOperation('save') }
   }
 
   const testWebDav = async () => {
-    setWebDavBusy('test')
+    if (!beginWebDavOperation('test')) return
     try {
       await api.testWebDavBackup()
       setOperationNotice(t('WebDAV 连接测试通过。', 'WebDAV connection test passed.'))
     } catch (cause) {
       setOperationNotice(localizeBackendError(cause, language, t('WebDAV 连接测试失败', 'WebDAV connection test failed')))
-    } finally { setWebDavBusy('') }
+    } finally { finishWebDavOperation('test') }
   }
 
   const refreshWebDav = async () => {
-    setWebDavBusy('list')
+    if (!beginWebDavOperation('list')) return
     try { setWebDavEntries(await api.listWebDavBackups()) }
     catch (cause) { setOperationNotice(localizeBackendError(cause, language, t('无法读取远端备份', 'Unable to list remote backups'))) }
-    finally { setWebDavBusy('') }
+    finally { finishWebDavOperation('list') }
   }
 
   const uploadWebDav = async () => {
-    if (portablePassword.length < 8) return setOperationNotice(t('请先输入至少 8 个字符的迁移备份密码。', 'Enter a portable backup password with at least 8 characters.'))
-    setWebDavBusy('upload')
+    const password = portablePasswordRef.current
+    if (password.length < 8) return setOperationNotice(t('请先输入至少 8 个字符的迁移备份密码。', 'Enter a portable backup password with at least 8 characters.'))
+    if (!beginPortableWebDavOperation('upload')) return
     try {
-      const result = await api.uploadLatestWebDavBackup(portablePassword)
-      setBackups(await api.listStateBackups())
-      setWebDavEntries(await api.listWebDavBackups())
-      setOperationNotice(t(`加密备份已上传：${result.entry.name}`, `Encrypted backup uploaded: ${result.entry.name}`))
+      const result = await api.uploadLatestWebDavBackup(password)
+      clearPortablePassword()
+      const [localBackups, remoteBackups] = await Promise.allSettled([
+        api.listStateBackups(),
+        api.listWebDavBackups(),
+      ])
+      if (localBackups.status === 'fulfilled') setBackups(localBackups.value)
+      if (remoteBackups.status === 'fulfilled') setWebDavEntries(remoteBackups.value)
+      const refreshFailed = localBackups.status === 'rejected' || remoteBackups.status === 'rejected'
+      setOperationNotice(refreshFailed
+        ? t(`加密备份已上传：${result.entry.name}；列表刷新失败。`, `Encrypted backup uploaded: ${result.entry.name}; the backup list could not be refreshed.`)
+        : t(`加密备份已上传：${result.entry.name}`, `Encrypted backup uploaded: ${result.entry.name}`))
     } catch (cause) {
-      setOperationNotice(localizeBackendError(cause, language, t('WebDAV 上传失败；本地备份不受影响', 'WebDAV upload failed; the local backup is unaffected')))
-    } finally { setWebDavBusy('') }
+      setOperationNotice(sensitiveOperationError(cause, t('WebDAV 上传失败；本地备份不受影响', 'WebDAV upload failed; the local backup is unaffected'), [password]))
+    } finally { finishWebDavOperation('upload'); finishPortableOperation('upload') }
   }
 
   const downloadWebDav = async (entry: WebDavBackupEntry) => {
-    if (portablePassword.length < 8) return setOperationNotice(t('请先输入至少 8 个字符的迁移备份密码。', 'Enter a portable backup password with at least 8 characters.'))
-    setWebDavBusy(`download:${entry.name}`)
+    const password = portablePasswordRef.current
+    if (password.length < 8) return setOperationNotice(t('请先输入至少 8 个字符的迁移备份密码。', 'Enter a portable backup password with at least 8 characters.'))
+    const key = `download:${entry.name}`
+    if (!beginPortableWebDavOperation(key)) return
     try {
-      await api.downloadWebDavBackup(entry.name, portablePassword)
-      setBackups(await api.listStateBackups())
-      setOperationNotice(t(`远端备份已下载并导入：${entry.name}`, `Remote backup downloaded and imported: ${entry.name}`))
+      await api.downloadWebDavBackup(entry.name, password)
+      clearPortablePassword()
+      try {
+        setBackups(await api.listStateBackups())
+        setOperationNotice(t(`远端备份已下载并导入：${entry.name}`, `Remote backup downloaded and imported: ${entry.name}`))
+      } catch {
+        setOperationNotice(t(`远端备份已下载并导入：${entry.name}；列表刷新失败。`, `Remote backup downloaded and imported: ${entry.name}; the backup list could not be refreshed.`))
+      }
     } catch (cause) {
-      setOperationNotice(localizeBackendError(cause, language, t('远端备份下载或导入失败', 'Failed to download or import the remote backup')))
-    } finally { setWebDavBusy('') }
+      setOperationNotice(sensitiveOperationError(cause, t('远端备份下载或导入失败', 'Failed to download or import the remote backup'), [password]))
+    } finally { finishWebDavOperation(key); finishPortableOperation(key) }
   }
 
   const clearWebDav = async () => {
-    setWebDavBusy('clear')
+    if (!beginWebDavOperation('clear')) return
     try {
       const configuration = await api.clearWebDavBackupConfiguration()
       setWebDavConfiguration(configuration)
+      webDavPasswordRef.current = ''
       setWebDavDraft({ baseUrl: '', username: '', password: '' })
       setWebDavEntries([])
-      setOperationNotice(t('WebDAV 配置已清除。', 'WebDAV configuration cleared.'))
-    } finally { setWebDavBusy('') }
+      try {
+        const runtime = await api.getAutomaticBackupRuntimeState()
+        setBackups(await api.listStateBackups())
+        setOperationNotice(runtime.blocked
+          ? localizeBackendMessage(
+              runtime.message ?? '',
+              language,
+              t('WebDAV 配置已清除，但自动备份仍处于安全阻断状态。', 'WebDAV was cleared, but automatic backups remain safely blocked.'),
+            )
+          : t('WebDAV 配置已清除。', 'WebDAV configuration cleared.'))
+      } catch (cause) {
+        setOperationNotice(localizeBackendError(
+          cause,
+          language,
+          t('WebDAV 配置已清除，但备份状态刷新失败。', 'WebDAV was cleared, but the backup status could not be refreshed.'),
+        ))
+      }
+    } finally { finishWebDavOperation('clear') }
   }
 
   const exportDiagnostics = async () => {
@@ -568,20 +743,20 @@ export function SettingsView({
           <label className="field backup-retention"><span>{t('最多保留备份', 'Maximum backups')}</span><div className="input-suffix"><input type="number" min={1} max={100} value={draft.backupRetention ?? 10} onChange={(event) => updateDraft({ backupRetention: Number(event.target.value) })} /><span>{t('份', 'files')}</span></div><FieldError>{errors.backupRetention}</FieldError></label>
           <div className="settings-actions"><button className="button button--secondary" type="button" onClick={() => void createBackup()}><Archive size={16} />{t('立即备份', 'Back Up Now')}</button><button className="button button--secondary" type="button" onClick={() => void exportDiagnostics()}><FileDown size={16} />{t('复制诊断报告', 'Copy Diagnostics Report')}</button><button className="button button--secondary" type="button" onClick={() => void api.clearHealthEvents()}><BellRing size={16} />{t('清除健康事件', 'Clear Health Events')}</button></div>
           <div className="portable-backup-actions">
-            <label className="field"><span><LockKeyhole size={14} />{t('迁移备份密码', 'Portable backup password')}</span><input type="password" value={portablePassword} autoComplete="new-password" maxLength={1024} placeholder={t('至少 8 个字符', 'At least 8 characters')} onChange={(event) => setPortablePassword(event.target.value)} /></label>
-            <button className="button button--secondary" type="button" onClick={() => void exportPortableBackup()}><FileDown size={16} />{t('导出加密备份', 'Export encrypted')}</button>
-            <button className="button button--secondary" type="button" onClick={() => void importPortableBackup()}><Upload size={16} />{t('导入加密备份', 'Import encrypted')}</button>
+            <label className="field"><span><LockKeyhole size={14} />{t('迁移备份密码', 'Portable backup password')}</span><input type="password" value={portablePassword} disabled={Boolean(portableBusy)} autoComplete="new-password" maxLength={1024} placeholder={t('至少 8 个字符', 'At least 8 characters')} onChange={(event) => { portablePasswordRef.current = event.target.value; setPortablePassword(event.target.value) }} /></label>
+            <button className="button button--secondary" type="button" disabled={Boolean(portableBusy)} onClick={() => void exportPortableBackup()}>{portableBusy === 'export' ? <LoaderCircle size={16} className="spin" /> : <FileDown size={16} />}{t('导出加密备份', 'Export encrypted')}</button>
+            <button className="button button--secondary" type="button" disabled={Boolean(portableBusy)} onClick={() => void importPortableBackup()}>{portableBusy === 'import' ? <LoaderCircle size={16} className="spin" /> : <Upload size={16} />}{t('导入加密备份', 'Import encrypted')}</button>
           </div>
           <div className="webdav-backup-panel">
             <div className="webdav-backup-panel__header"><span><Cloud size={16} /><strong>WebDAV</strong><small>{t('可选的端到端加密迁移备份同步', 'Optional end-to-end encrypted portable backup sync')}</small></span>{webDavConfiguration.configured && <Badge tone="success">{t('已配置', 'Configured')}</Badge>}</div>
             <div className="form-grid">
-              <label className="field field--full"><span>WebDAV URL</span><input className="mono" value={webDavDraft.baseUrl} placeholder="https://dav.example/StonePlus/" onChange={(event) => setWebDavDraft({ ...webDavDraft, baseUrl: event.target.value })} /></label>
-              <label className="field"><span>{t('用户名', 'Username')}</span><input value={webDavDraft.username} autoComplete="username" onChange={(event) => setWebDavDraft({ ...webDavDraft, username: event.target.value })} /></label>
-              <label className="field"><span>{t('密码', 'Password')}</span><input type="password" value={webDavDraft.password} autoComplete="new-password" placeholder={webDavConfiguration.hasPassword ? t('留空保留已保存密码', 'Leave blank to keep saved password') : t('系统安全存储', 'Stored by the system')} onChange={(event) => setWebDavDraft({ ...webDavDraft, password: event.target.value })} /></label>
+              <label className="field field--full"><span>WebDAV URL</span><input className="mono" value={webDavDraft.baseUrl} disabled={Boolean(webDavBusy)} placeholder="https://dav.example/StonePlus/" onChange={(event) => setWebDavDraft({ ...webDavDraft, baseUrl: event.target.value })} /></label>
+              <label className="field"><span>{t('用户名', 'Username')}</span><input value={webDavDraft.username} disabled={Boolean(webDavBusy)} autoComplete="username" onChange={(event) => setWebDavDraft({ ...webDavDraft, username: event.target.value })} /></label>
+              <label className="field"><span>{t('密码', 'Password')}</span><input type="password" value={webDavDraft.password} disabled={Boolean(webDavBusy)} autoComplete="new-password" placeholder={webDavConfiguration.hasPassword ? t('留空保留已保存密码', 'Leave blank to keep saved password') : t('系统安全存储', 'Stored by the system')} onChange={(event) => { webDavPasswordRef.current = event.target.value; setWebDavDraft({ ...webDavDraft, password: event.target.value }) }} /></label>
             </div>
             {webDavConfiguration.requiresPassword && <div className="settings-inline-warning">{t('服务器地址中的旧密码已移除，请重新输入 WebDAV 密码。', 'The legacy password embedded in the server URL was removed. Enter the WebDAV password again.')}</div>}
-            <div className="settings-actions"><button className="button button--secondary" type="button" disabled={Boolean(webDavBusy)} onClick={() => void saveWebDav()}>{webDavBusy === 'save' ? <LoaderCircle size={16} className="spin" /> : <Save size={16} />}{t('保存 WebDAV', 'Save WebDAV')}</button><button className="button button--secondary" type="button" disabled={!webDavConfiguration.configured || Boolean(webDavBusy)} onClick={() => void testWebDav()}>{webDavBusy === 'test' ? <LoaderCircle size={16} className="spin" /> : <Network size={16} />}{t('测试连接', 'Test')}</button><button className="button button--secondary" type="button" disabled={!webDavConfiguration.configured || portablePassword.length < 8 || Boolean(webDavBusy)} onClick={() => void uploadWebDav()}>{webDavBusy === 'upload' ? <LoaderCircle size={16} className="spin" /> : <Upload size={16} />}{t('上传最新加密备份', 'Upload latest encrypted backup')}</button><button className="icon-button" type="button" disabled={!webDavConfiguration.configured || Boolean(webDavBusy)} title={t('清除 WebDAV 配置', 'Clear WebDAV configuration')} onClick={() => void clearWebDav()}><Trash2 size={16} /></button></div>
-            {webDavConfiguration.configured && <div className="webdav-backup-list"><div className="webdav-backup-list__heading"><strong>{t('远端备份', 'Remote backups')}</strong><button className="text-button" type="button" disabled={Boolean(webDavBusy)} onClick={() => void refreshWebDav()}><RefreshCw size={14} className={webDavBusy === 'list' ? 'spin' : ''} />{t('刷新', 'Refresh')}</button></div>{webDavEntries.map((entry) => <div key={entry.name}><span><strong>{entry.name}</strong><small>{entry.size === undefined ? '' : `${Math.ceil(entry.size / 1024)} KB`}{entry.modifiedAt ? ` · ${new Date(entry.modifiedAt).toLocaleString(locale)}` : ''}</small></span><button className="button button--secondary" type="button" disabled={Boolean(webDavBusy) || portablePassword.length < 8} onClick={() => void downloadWebDav(entry)}>{webDavBusy === `download:${entry.name}` ? <LoaderCircle size={15} className="spin" /> : <Download size={15} />}{t('下载并导入', 'Download & import')}</button></div>)}{!webDavEntries.length && <span className="muted">{t('暂无远端备份', 'No remote backups')}</span>}</div>}
+            <div className="settings-actions"><button className="button button--secondary" type="button" disabled={Boolean(webDavBusy)} onClick={() => void saveWebDav()}>{webDavBusy === 'save' ? <LoaderCircle size={16} className="spin" /> : <Save size={16} />}{t('保存 WebDAV', 'Save WebDAV')}</button><button className="button button--secondary" type="button" disabled={!webDavConfiguration.configured || Boolean(webDavBusy)} onClick={() => void testWebDav()}>{webDavBusy === 'test' ? <LoaderCircle size={16} className="spin" /> : <Network size={16} />}{t('测试连接', 'Test')}</button><button className="button button--secondary" type="button" disabled={!webDavConfiguration.configured || portablePassword.length < 8 || Boolean(webDavBusy) || Boolean(portableBusy)} onClick={() => void uploadWebDav()}>{webDavBusy === 'upload' ? <LoaderCircle size={16} className="spin" /> : <Upload size={16} />}{t('上传最新加密备份', 'Upload latest encrypted backup')}</button><button className="icon-button" type="button" disabled={!webDavConfiguration.configured || Boolean(webDavBusy)} title={t('清除 WebDAV 配置', 'Clear WebDAV configuration')} onClick={() => void clearWebDav()}><Trash2 size={16} /></button></div>
+            {webDavConfiguration.configured && <div className="webdav-backup-list"><div className="webdav-backup-list__heading"><strong>{t('远端备份', 'Remote backups')}</strong><button className="text-button" type="button" disabled={Boolean(webDavBusy)} onClick={() => void refreshWebDav()}><RefreshCw size={14} className={webDavBusy === 'list' ? 'spin' : ''} />{t('刷新', 'Refresh')}</button></div>{webDavEntries.map((entry) => <div key={entry.name}><span><strong>{entry.name}</strong><small>{entry.size === undefined ? '' : `${Math.ceil(entry.size / 1024)} KB`}{entry.modifiedAt ? ` · ${new Date(entry.modifiedAt).toLocaleString(locale)}` : ''}</small></span><button className="button button--secondary" type="button" disabled={Boolean(webDavBusy) || Boolean(portableBusy) || portablePassword.length < 8} onClick={() => void downloadWebDav(entry)}>{webDavBusy === `download:${entry.name}` ? <LoaderCircle size={15} className="spin" /> : <Download size={15} />}{t('下载并导入', 'Download & import')}</button></div>)}{!webDavEntries.length && <span className="muted">{t('暂无远端备份', 'No remote backups')}</span>}</div>}
           </div>
           {operationNotice && <div className="client-config-notice">{operationNotice}</div>}
           <div className="state-backup-list">{backups.slice(0, 6).map((backup) => <div key={backup.path}><span><strong>{new Date(backup.createdAt).toLocaleString(locale)}</strong><small>{Math.ceil(backup.size / 1024)} KB · {backup.automatic ? t('自动', 'Automatic') : t('手动', 'Manual')} · {backup.integrity === 'valid' ? t('校验通过', 'Verified') : t('损坏', 'Corrupted')}</small></span><button className="icon-button" type="button" disabled={backup.integrity !== 'valid'} title={t('恢复此备份', 'Restore this backup')} onClick={() => void restoreBackup(backup)}><RotateCcw size={15} /></button></div>)}{!backups.length && <span className="muted">{t('暂无状态备份', 'No state backups')}</span>}</div>

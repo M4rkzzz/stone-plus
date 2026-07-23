@@ -193,6 +193,55 @@ describe('outbound proxy transport', () => {
     })
   })
 
+  it('bounds a stuck system proxy resolver independently from the target request', async () => {
+    const target = 'https://auth.openai.com/.well-known/openid-configuration'
+    const manager = trackManager(new OutboundTransportManager({
+      outboundNetworkMode: 'system',
+      systemProxyFetch: vi.fn(async () => new Response(null, { status: 204 })) as unknown as typeof fetch,
+      resolveSystemProxy: () => new Promise<string>(() => undefined),
+      systemProxyResolveTimeoutMs: 20,
+    }))
+
+    const detection = await manager.detectSystemProxy([target])
+
+    expect(detection.targets[0]).toMatchObject({
+      target,
+      summary: 'DIRECT',
+      reachable: true,
+      error: 'System proxy resolution timed out; using DIRECT.',
+    })
+  })
+
+  it('marks a native system-proxy HTTP 502 as unreachable', async () => {
+    const target = 'https://chatgpt.com/backend-api/codex/models'
+    const manager = trackManager(new OutboundTransportManager({
+      outboundNetworkMode: 'system',
+      systemProxyFetch: vi.fn(async () => new Response(null, { status: 502 })) as unknown as typeof fetch,
+      resolveSystemProxy: async () => 'PROXY corporate.example:8080',
+    }))
+
+    await expect(manager.detectSystemProxy([target])).resolves.toMatchObject({
+      targets: [expect.objectContaining({
+        target,
+        reachable: false,
+        error: 'HTTP_502',
+      })],
+    })
+  })
+
+  it('reports the built-in route that actually owns diagnostic requests', async () => {
+    const manager = trackManager(new OutboundTransportManager({ outboundNetworkMode: 'direct' }))
+    manager.builtInRoutes.activate({
+      fetchImplementation: vi.fn(async () => new Response(null, { status: 204 })) as unknown as typeof fetch,
+      mixedEndpoint: 'http://127.0.0.1:17890',
+    })
+
+    expect(manager.describeEffectiveDiagnosticRoute(proxyDefinition({
+      id: 'selected-but-shadowed',
+      name: 'Selected proxy',
+    }))).toEqual({ kind: 'system', name: '内置代理' })
+  })
+
   it('does not wait for a native response body cancellation during detection or warmup', async () => {
     const systemProxyFetch = vi.fn(async () => new Response(new ReadableStream({
       cancel: () => new Promise<void>(() => undefined),
@@ -824,6 +873,25 @@ describe('outbound proxy transport', () => {
     await Promise.all([rotation, closing])
 
     expect(() => manager.fetchFor(undefined)).toThrow('manager is closed')
+  })
+
+  it('forces a dispatcher closed after a short shutdown grace instead of waiting forever', async () => {
+    let heldResponse!: ServerResponse
+    const origin = createHttpServer((_request, response) => {
+      heldResponse = response
+      response.writeHead(200, { 'content-type': 'text/plain' })
+      response.write('held-open')
+    })
+    const address = await listen(origin)
+    const manager = new OutboundTransportManager()
+    const response = await manager.fetchFor(undefined)(`http://127.0.0.1:${address.port}/held`)
+    const startedAt = Date.now()
+
+    await manager.close()
+
+    expect(Date.now() - startedAt).toBeLessThan(2_500)
+    heldResponse.end()
+    await response.body?.cancel()
   })
 
   it('forwards a real HTTP request through the configured HTTP proxy', async () => {

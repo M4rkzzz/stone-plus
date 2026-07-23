@@ -1,4 +1,5 @@
 import { resolve } from 'node:path'
+import { availableParallelism } from 'node:os'
 import { defineConfig } from 'vitest/config'
 import packageMetadata from './package.json'
 
@@ -16,6 +17,10 @@ export default defineConfig({
     include: ['tests/**/*.test.ts'],
     environment: 'node',
     clearMocks: true,
-    restoreMocks: true
+    restoreMocks: true,
+    // High-core hosts otherwise spawn one fork per available CPU, which can
+    // starve the event loop in local HTTP integration tests without improving
+    // the suite's wall-clock time.
+    maxWorkers: Math.max(1, Math.min(8, availableParallelism() - 1))
   }
 })

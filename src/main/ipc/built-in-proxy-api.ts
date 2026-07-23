@@ -1,6 +1,8 @@
 import { createHash } from 'node:crypto'
+import { isIP } from 'node:net'
 import { BrowserWindow, ipcMain } from 'electron'
 import type {
+  BuiltInProxyCustomRuleSet,
   BuiltInProxyImportInput,
   BuiltInProxyNodeSummary,
   BuiltInProxyRuntimeState,
@@ -19,6 +21,7 @@ export type BuiltInProxyReconcileReason =
   | 'profile-selected'
   | 'node-selected'
   | 'rule-mode-changed'
+  | 'custom-rules-changed'
   | 'access-mode-changed'
   | 'lan-changed'
   | 'auto-start-changed'
@@ -30,7 +33,7 @@ export interface BuiltInProxyStoreFacade {
   selectProfile(id: string): Promise<void>
   selectNode(profileId: string, nodeId: string): Promise<void>
   updateSettings(
-    patch: Partial<Pick<BuiltInProxySettings, 'ruleMode' | 'accessMode' | 'lanEnabled' | 'autoStart'>>,
+    patch: Partial<Pick<BuiltInProxySettings, 'ruleMode' | 'customRules' | 'accessMode' | 'lanEnabled' | 'autoStart'>>,
   ): Promise<void>
 }
 
@@ -51,6 +54,29 @@ export interface BuiltInProxyRuntimeFacade {
   subscribe?(listener: (state: BuiltInProxyRuntimeState) => void): () => void
 }
 
+export interface BuiltInProxyShutdownBoundary {
+  quiesceIpc(): Promise<void>
+  closeProxy(): Promise<void>
+  resumeIpc(): void
+}
+
+/**
+ * Crosses the process-exit boundary only after renderer mutations have
+ * drained. A failed route/access cleanup reopens IPC so the user can retry
+ * while the still-owned proxy core remains supervised by the main process.
+ */
+export async function shutdownBuiltInProxyBoundary(
+  boundary: BuiltInProxyShutdownBoundary,
+): Promise<void> {
+  try {
+    await boundary.quiesceIpc()
+    await boundary.closeProxy()
+  } catch (error) {
+    boundary.resumeIpc()
+    throw error
+  }
+}
+
 export const builtInProxyIpcChannels = {
   getState: 'stone:get-built-in-proxy-state',
   setEnabled: 'stone:set-built-in-proxy-enabled',
@@ -61,6 +87,7 @@ export const builtInProxyIpcChannels = {
   selectProfile: 'stone:select-built-in-proxy-profile',
   selectNode: 'stone:select-built-in-proxy-node',
   setRuleMode: 'stone:set-built-in-proxy-rule-mode',
+  setCustomRules: 'stone:set-built-in-proxy-custom-rules',
   setAccessMode: 'stone:set-built-in-proxy-access-mode',
   setLanEnabled: 'stone:set-built-in-proxy-lan-enabled',
   setAutoStart: 'stone:set-built-in-proxy-auto-start',
@@ -73,6 +100,27 @@ export const builtInProxyIpcChannels = {
 
 const profileFormats = new Set(['sing-box-json', 'clash-meta-yaml', 'uri-list'])
 const ruleModes = new Set(['rule', 'global', 'direct'])
+const customRuleConditions = new Set([
+  'domain',
+  'domain-suffix',
+  'domain-keyword',
+  'ip-cidr',
+  'port',
+  'port-range',
+  'network',
+  'protocol',
+  'private-network',
+  'mainland-china',
+])
+const customRuleActions = new Set(['proxy', 'direct', 'block'])
+const customRuleFinalActions = new Set(['proxy', 'direct'])
+const valuelessCustomRuleConditions = new Set(['private-network', 'mainland-china'])
+const maxCustomRules = 500
+const maxCustomRuleValues = 128
+const maxCustomRuleTotalValues = 5_000
+const maxCustomRuleValueLength = 1_024
+const maxCustomRulesPayloadLength = 256 * 1_024
+const networkValues = new Set(['tcp', 'udp'])
 const accessModes = new Set(['system', 'tun'])
 const publicErrorCategories = new Set([
   'core-missing',
@@ -87,23 +135,16 @@ const publicErrorCategories = new Set([
   'core-crashed',
   'unknown',
 ])
-const recentMutationTtlMs = 750
-const recentMutationLimit = 64
 const publicErrorMarker = 'stone-built-in-proxy-error'
-
-interface RecentMutation {
-  expiresAt: number
-  result: unknown
-}
 
 export function registerBuiltInProxyApi(
   store: BuiltInProxyStoreFacade,
   runtime: BuiltInProxyRuntimeFacade,
-): () => void {
+): () => Promise<void> {
   let mutationTail: Promise<void> = Promise.resolve()
-  const mutationFlights = new Map<string, Promise<unknown>>()
-  const recentMutations = new Map<string, RecentMutation>()
+  let lastQueuedMutation: { key: string; promise: Promise<unknown> } | undefined
   let disposed = false
+  let disposeFlight: Promise<void> | undefined
 
   const readPublicState = async (): Promise<BuiltInProxyRuntimeState> => {
     return projectRuntimeState(await runtime.getState())
@@ -122,25 +163,25 @@ export function registerBuiltInProxyApi(
     operation: () => Promise<T>,
     secrets: readonly string[] = [],
   ): Promise<T> => {
-    const currentFlight = mutationFlights.get(key)
-    if (currentFlight) return currentFlight as Promise<T>
-
-    const now = Date.now()
-    const recent = recentMutations.get(key)
-    if (recent && recent.expiresAt > now) return Promise.resolve(recent.result as T)
-    if (recent) recentMutations.delete(key)
+    if (disposed) {
+      return Promise.reject(toPublicError(new BuiltInProxyIpcError(
+        'unknown',
+        'The built-in proxy API is closing.',
+      )))
+    }
+    // Coalesce only adjacent identical intent. A(true) -> B(false) -> C(true)
+    // must execute C after B; a global key map incorrectly reused A for C.
+    if (lastQueuedMutation?.key === key) return lastQueuedMutation.promise as Promise<T>
 
     const result = mutationTail.then(operation, operation).catch((error: unknown) => {
       throw toPublicError(error, secrets)
     })
     mutationTail = result.then(() => undefined, () => undefined)
-    mutationFlights.set(key, result)
-    void result.then((value) => {
-      if (mutationFlights.get(key) === result) mutationFlights.delete(key)
-      recentMutations.set(key, { expiresAt: Date.now() + recentMutationTtlMs, result: value })
-      pruneRecentMutations(recentMutations)
+    lastQueuedMutation = { key, promise: result }
+    void result.then(() => {
+      if (lastQueuedMutation?.promise === result) lastQueuedMutation = undefined
     }, () => {
-      if (mutationFlights.get(key) === result) mutationFlights.delete(key)
+      if (lastQueuedMutation?.promise === result) lastQueuedMutation = undefined
     })
     return result
   }
@@ -253,6 +294,21 @@ export function registerBuiltInProxyApi(
     })
   })
 
+  register(builtInProxyIpcChannels.setCustomRules, (event, value: unknown) => {
+    assertTrustedSender(event)
+    const requestedRules = normalizeCustomRules(value)
+    const customRules = requestedRules ?? undefined
+    const fingerprint = digestMutationInput(requestedRules)
+    return enqueueMutation(`custom-rules:${fingerprint}`, async () => {
+      const state = await readPublicState()
+      if (JSON.stringify(state.settings.customRules) === JSON.stringify(customRules)) return state
+      return reconcileStoreMutation(
+        'custom-rules-changed',
+        () => store.updateSettings({ customRules }),
+      )
+    })
+  })
+
   register(builtInProxyIpcChannels.setAccessMode, (event, value: unknown) => {
     assertTrustedSender(event)
     const mode = requireEnum(value, accessModes, 'access mode') as BuiltInProxySettings['accessMode']
@@ -321,12 +377,17 @@ export function registerBuiltInProxyApi(
   })
 
   return () => {
-    if (disposed) return
+    if (disposeFlight) return disposeFlight
     disposed = true
     unsubscribe?.()
     for (const channel of Object.values(builtInProxyIpcChannels)) {
       if (channel !== builtInProxyIpcChannels.stateChanged) ipcMain.removeHandler(channel)
     }
+    const acceptedMutations = mutationTail
+    disposeFlight = acceptedMutations.finally(() => {
+      lastQueuedMutation = undefined
+    })
+    return disposeFlight
   }
 }
 
@@ -383,6 +444,156 @@ function normalizeOptionalIdentifiers(value: unknown, label: string): string[] |
   return [...new Set(value.map((item) => requireIdentifier(item, label)))]
 }
 
+function normalizeCustomRules(value: unknown): BuiltInProxyCustomRuleSet | null {
+  if (value === null) return null
+  if (!isRecord(value)) {
+    throw new BuiltInProxyIpcError('configuration-invalid', 'Custom rules must be an object.')
+  }
+  if (JSON.stringify(value).length > maxCustomRulesPayloadLength) {
+    throw new BuiltInProxyIpcError('configuration-invalid', 'Custom rules payload is too large.')
+  }
+  requireOnlyKeys(value, new Set(['rules', 'finalAction']), 'Custom rules')
+  if (!Array.isArray(value.rules) || value.rules.length > maxCustomRules) {
+    throw new BuiltInProxyIpcError(
+      'configuration-invalid',
+      `Custom rules must contain at most ${maxCustomRules} rules.`,
+    )
+  }
+  const finalAction = requireEnum(
+    value.finalAction,
+    customRuleFinalActions,
+    'custom rule final action',
+  ) as BuiltInProxyCustomRuleSet['finalAction']
+  let totalValues = 0
+  const ids = new Set<string>()
+  const rules = value.rules.map((candidate, index) => {
+    if (!isRecord(candidate)) {
+      throw new BuiltInProxyIpcError('configuration-invalid', `Custom rule ${index + 1} must be an object.`)
+    }
+    requireOnlyKeys(candidate, new Set(['id', 'condition', 'values', 'action']), `Custom rule ${index + 1}`)
+    const id = requireText(candidate.id, `custom rule ${index + 1} id`, 128)
+    if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(id) || ids.has(id)) {
+      throw new BuiltInProxyIpcError(
+        'configuration-invalid',
+        `Custom rule ${index + 1} has an invalid or duplicate id.`,
+      )
+    }
+    ids.add(id)
+    const condition = requireEnum(
+      candidate.condition,
+      customRuleConditions,
+      `custom rule ${index + 1} condition`,
+    ) as BuiltInProxyCustomRuleSet['rules'][number]['condition']
+    const action = requireEnum(
+      candidate.action,
+      customRuleActions,
+      `custom rule ${index + 1} action`,
+    ) as BuiltInProxyCustomRuleSet['rules'][number]['action']
+    if (!Array.isArray(candidate.values) || candidate.values.length > maxCustomRuleValues) {
+      throw new BuiltInProxyIpcError(
+        'configuration-invalid',
+        `Custom rule ${index + 1} values must contain at most ${maxCustomRuleValues} items.`,
+      )
+    }
+    totalValues += candidate.values.length
+    if (totalValues > maxCustomRuleTotalValues) {
+      throw new BuiltInProxyIpcError(
+        'configuration-invalid',
+        `Custom rules must contain at most ${maxCustomRuleTotalValues} values.`,
+      )
+    }
+    const values = candidate.values.map((item) => validateCustomRuleValue(
+      condition,
+      requireText(item, `custom rule ${index + 1} value`, maxCustomRuleValueLength),
+      index,
+    ))
+    if (new Set(values).size !== values.length) {
+      throw new BuiltInProxyIpcError(
+        'configuration-invalid',
+        `Custom rule ${index + 1} contains duplicate values.`,
+      )
+    }
+    if (!valuelessCustomRuleConditions.has(condition) && values.length === 0) {
+      throw new BuiltInProxyIpcError(
+        'configuration-invalid',
+        `Custom rule ${index + 1} requires at least one value.`,
+      )
+    }
+    if (valuelessCustomRuleConditions.has(condition) && values.length !== 0) {
+      throw new BuiltInProxyIpcError(
+        'configuration-invalid',
+        `Custom rule ${index + 1} condition does not accept values.`,
+      )
+    }
+    return { id, condition, values, action }
+  })
+  return { rules, finalAction }
+}
+
+function requireOnlyKeys(value: Record<string, unknown>, allowed: ReadonlySet<string>, label: string): void {
+  if (Object.keys(value).some((key) => !allowed.has(key))) {
+    throw new BuiltInProxyIpcError('configuration-invalid', `${label} contains unsupported fields.`)
+  }
+}
+
+function validateCustomRuleValue(condition: string, value: string, index: number): string {
+  const invalid = (): never => {
+    throw new BuiltInProxyIpcError(
+      'configuration-invalid',
+      `Custom rule ${index + 1} contains an invalid ${condition} value.`,
+    )
+  }
+  if (condition === 'ip-cidr') {
+    const [address, rawPrefix, extra] = value.split('/')
+    const version = isIP(address)
+    const prefix = rawPrefix === undefined ? (version === 4 ? 32 : 128) : Number(rawPrefix)
+    if (version === 0 || extra !== undefined || !Number.isInteger(prefix) || prefix < 0 || prefix > (version === 4 ? 32 : 128)) invalid()
+    return `${address}/${prefix}`
+  }
+  if (condition === 'port') {
+    if (!/^\d{1,5}$/.test(value) || Number(value) < 1 || Number(value) > 65_535) invalid()
+    return String(Number(value))
+  }
+  if (condition === 'port-range') {
+    const match = /^(\d{1,5})[:-](\d{1,5})$/.exec(value)
+    if (!match) return invalid()
+    const start = Number(match[1])
+    const end = Number(match[2])
+    if (start < 1 || end > 65_535 || start > end) invalid()
+    return `${start}:${end}`
+  }
+  if (condition === 'network') {
+    const normalized = value.toLowerCase()
+    if (!networkValues.has(normalized)) invalid()
+    return normalized
+  }
+  if (condition === 'protocol') {
+    const normalized = value.toLowerCase()
+    if (!/^[a-z0-9_-]{1,32}$/.test(normalized)) invalid()
+    return normalized
+  }
+  if (condition === 'domain' || condition === 'domain-suffix') {
+    const normalized = value.toLowerCase().replace(condition === 'domain-suffix' ? /^\./ : /$^/, '')
+    if (
+      isIP(normalized)
+      || !/^(?=.{1,253}$)(?:[a-z0-9*](?:[a-z0-9_*-]{0,61}[a-z0-9*])?\.)*[a-z0-9*](?:[a-z0-9_*-]{0,61}[a-z0-9*])?$/i.test(normalized)
+    ) invalid()
+    return normalized
+  }
+  if (condition === 'domain-keyword') {
+    if (value.length > 128 || hasControlCharacters(value)) invalid()
+    return value
+  }
+  return invalid()
+}
+
+function hasControlCharacters(value: string): boolean {
+  return [...value].some((character) => {
+    const code = character.codePointAt(0) ?? 0
+    return code <= 0x1f || code === 0x7f
+  })
+}
+
 function requireIdentifier(value: unknown, label: string): string {
   return requireText(value, label, 512)
 }
@@ -416,18 +627,6 @@ function digestMutationInput(value: unknown): string {
   return createHash('sha256').update(JSON.stringify(value)).digest('hex')
 }
 
-function pruneRecentMutations(cache: Map<string, RecentMutation>): void {
-  const now = Date.now()
-  for (const [key, entry] of cache) {
-    if (entry.expiresAt <= now) cache.delete(key)
-  }
-  while (cache.size > recentMutationLimit) {
-    const first = cache.keys().next().value as string | undefined
-    if (first === undefined) break
-    cache.delete(first)
-  }
-}
-
 type Projection = true | { readonly [key: string]: Projection } | readonly [Projection]
 
 const nodeProjection = {
@@ -449,6 +648,15 @@ const runtimeStateProjection = {
     activeProfileId: true,
     accessMode: true,
     ruleMode: true,
+    customRules: {
+      rules: [{
+        id: true,
+        condition: true,
+        values: [true],
+        action: true,
+      }],
+      finalAction: true,
+    },
     mixedPort: true,
     lanEnabled: true,
     autoStart: true,
@@ -479,6 +687,12 @@ const runtimeStateProjection = {
     nodeId: true,
     mixedPort: true,
     activatedAt: true,
+  },
+  accessState: {
+    mode: true,
+    status: true,
+    endpoint: true,
+    verifiedAt: true,
   },
   coreVersion: true,
   startedAt: true,

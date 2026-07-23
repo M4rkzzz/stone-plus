@@ -117,6 +117,68 @@ describe('canonical streaming protocol conversion', () => {
     })
   })
 
+  it('collects relay Responses text when only output_text.done carries the summary', () => {
+    const collector = createOpenAiResponsesStreamCollector({ id: 'resp-done-only' })
+    collector.push(encoder.encode([
+      'event: response.output_text.done',
+      'data: {"type":"response.output_text.done","output_index":0,"content_index":0,"text":"Done-only relay summary"}',
+      '',
+      'event: response.completed',
+      'data: {"type":"response.completed","response":{"id":"resp-done-only","status":"completed","output":[]}}',
+      '',
+      ''
+    ].join('\n')))
+
+    expect(collector.finish().response).toMatchObject({
+      output: [{ content: [{ type: 'output_text', text: 'Done-only relay summary' }] }]
+    })
+  })
+
+  it('preserves streamed text when a relay terminal contains only reasoning output', () => {
+    const collector = createOpenAiResponsesStreamCollector({ id: 'resp-reasoning-terminal' })
+    collector.push(encoder.encode([
+      'event: response.output_text.delta',
+      'data: {"type":"response.output_text.delta","output_index":1,"content_index":0,"delta":"Streamed summary"}',
+      '',
+      'event: response.output_text.done',
+      'data: {"type":"response.output_text.done","output_index":1,"content_index":0,"text":"Streamed summary"}',
+      '',
+      'event: response.completed',
+      'data: {"type":"response.completed","response":{"id":"resp-reasoning-terminal","status":"completed","output":[{"type":"reasoning","summary":[]}]}}',
+      '',
+      ''
+    ].join('\n')))
+
+    const response = collector.finish().response!
+    expect(JSON.stringify(response)).toContain('Streamed summary')
+    expect(JSON.stringify(response).match(/Streamed summary/g)).toHaveLength(1)
+    expect(response.output).toEqual(expect.arrayContaining([expect.objectContaining({ type: 'reasoning' })]))
+  })
+
+  it('collects standalone usage events and ignores replayed sequenced text deltas', () => {
+    const collector = createOpenAiResponsesStreamCollector({ id: 'resp-sequence-dedup' })
+    collector.push(encoder.encode([
+      'event: response.output_text.delta',
+      'data: {"type":"response.output_text.delta","sequence_number":4,"output_index":0,"content_index":0,"delta":"Once"}',
+      '',
+      'event: response.output_text.delta',
+      'data: {"type":"response.output_text.delta","sequence_number":4,"output_index":0,"content_index":0,"delta":"Once"}',
+      '',
+      'event: response.usage.updated',
+      'data: {"type":"response.usage.updated","sequence_number":5,"usage":{"input_tokens":9,"output_tokens":2,"total_tokens":11}}',
+      '',
+      'event: response.completed',
+      'data: {"type":"response.completed","sequence_number":6,"response":{"id":"resp-sequence-dedup","status":"completed","output":[]}}',
+      '',
+      ''
+    ].join('\n')))
+
+    expect(collector.finish().response).toMatchObject({
+      output: [{ content: [{ text: 'Once' }] }],
+      usage: { input_tokens: 9, output_tokens: 2, total_tokens: 11 }
+    })
+  })
+
   it('stops parsing events after a Responses terminal and reuses its complete output', () => {
     const collector = createOpenAiResponsesStreamCollector()
     collector.push(encoder.encode([
@@ -357,7 +419,14 @@ describe('canonical streaming protocol conversion', () => {
     ['response.failed', 'response.failed']
   ] as const)('recognizes %s as an exact Responses terminal event', (eventType, expected) => {
     const parser = createCanonicalStreamParser('openai-responses')
-    parser.push(encoder.encode(`event: ${eventType}\ndata: {"type":"${eventType}","sequence_number":7,"response":{"output":[]}}\n\n`))
+    const response = eventType === 'response.failed'
+      ? { status: 'failed', error: { message: 'failed' }, output: [] }
+      : { output: [] }
+    parser.push(encoder.encode(`event: ${eventType}\ndata: ${JSON.stringify({
+      type: eventType,
+      sequence_number: 7,
+      response
+    })}\n\n`))
     expect(parser.getProtocolState().responsesTerminalEvent).toBe(expected)
   })
 
@@ -405,6 +474,27 @@ describe('canonical streaming protocol conversion', () => {
       responsesTerminalEvent: 'response.completed',
       responsesLastEventType: 'response.completed',
       responsesLastSequenceNumber: 8
+    })
+  })
+
+  it('counts only valid, changed and strictly sequenced Responses progress', () => {
+    const parser = createCanonicalStreamParser('openai-responses')
+    const wire = [
+      'event: response.queued\ndata: {"type":"response.queued","sequence_number":1}\n\n',
+      'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","sequence_number":50,"delta":""}\n\n',
+      'event: response.usage.updated\ndata: {"type":"response.usage.updated","sequence_number":2,"usage":{"output_tokens":1}}\n\n',
+      'event: response.usage.updated\ndata: {"type":"response.usage.updated","sequence_number":3,"usage":{"output_tokens":1}}\n\n',
+      'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","sequence_number":4,"delta":"x"}\n\n',
+      'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","sequence_number":4,"delta":"replay"}\n\n',
+      'event: response.completed\ndata: {"type":"response.completed","sequence_number":5,"response":{"status":"completed","output":[]}}\n\n'
+    ].join('')
+
+    parser.push(encoder.encode(wire))
+
+    expect(parser.getProtocolState()).toMatchObject({
+      responsesProgressEventCount: 3,
+      responsesLastSequenceNumber: 5,
+      responsesTerminalEvent: 'response.completed'
     })
   })
 
@@ -545,6 +635,45 @@ describe('canonical streaming protocol conversion', () => {
     })
   })
 
+  it('keeps a completed function call completed when the overall Responses result is incomplete', () => {
+    const collector = createOpenAiResponsesStreamCollector({ id: 'resp-tools', model: 'model-test' })
+    collector.push(encoder.encode([
+      'event: response.output_item.added',
+      'data: {"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"type":"function_call","call_id":"call_1","name":"lookup","arguments":""}}',
+      '',
+      'event: response.function_call_arguments.done',
+      'data: {"type":"response.function_call_arguments.done","sequence_number":2,"output_index":0,"arguments":"{}"}',
+      '',
+      'event: response.incomplete',
+      'data: {"type":"response.incomplete","sequence_number":3,"response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[]}}',
+      '',
+      ''
+    ].join('\n')))
+
+    expect(collector.finish().response).toMatchObject({
+      status: 'incomplete',
+      output: [{ type: 'function_call', status: 'completed', call_id: 'call_1' }]
+    })
+
+    const streamEncoder = createCanonicalStreamEncoder('openai-responses', {
+      id: 'resp-tools', model: 'model-test'
+    })
+    const frames = [
+      ...streamEncoder.encode({ type: 'tool-call-delta', index: 0, id: 'call_1', name: 'lookup', arguments: '{}' }),
+      ...streamEncoder.encode({ type: 'tool-call-complete', index: 0 }),
+      ...streamEncoder.encode({ type: 'stop', reason: 'length' }),
+      ...streamEncoder.encode({ type: 'done' })
+    ]
+    const wire = new TextDecoder().decode(Buffer.concat(frames.map((frame) => Buffer.from(frame))))
+    const terminalMatch = /event: response\.incomplete\ndata: ([^\n]+)/.exec(wire)
+    const terminal = JSON.parse(terminalMatch?.[1] ?? '{}') as {
+      response?: { output?: Array<{ type?: string; status?: string }> }
+    }
+    expect(terminal.response?.output).toContainEqual(expect.objectContaining({
+      type: 'function_call', status: 'completed'
+    }))
+  })
+
   it('encodes Responses content filtering as response.incomplete', () => {
     const streamEncoder = createCanonicalStreamEncoder('openai-responses', {
       id: 'resp-test',
@@ -585,6 +714,280 @@ describe('canonical streaming protocol conversion', () => {
 
     expect(text).toContain('"error"')
     expect(text).not.toContain('"finish_reason":"stop"')
+  })
+
+  it('does not publish an ignored out-of-order Responses terminal as protocol completion', () => {
+    const parser = createCanonicalStreamParser('openai-responses')
+    parser.push(encoder.encode(
+      'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","sequence_number":10,"output_index":0,"content_index":0,"delta":"partial"}\n\n'
+    ))
+
+    const terminalEvents = parser.push(encoder.encode(
+      'event: response.failed\ndata: {"type":"response.failed","sequence_number":9,"response":{"status":"failed","error":{"message":"late failure","type":"server_error"}}}\n\n'
+    ))
+
+    expect(terminalEvents).toEqual([])
+    expect(parser.getProtocolState()).toMatchObject({
+      responsesTerminalEvent: undefined,
+      responsesLastSequenceNumber: 10
+    })
+  })
+
+  it.each([
+    ['null', 'null'],
+    ['a numeric string', '"11"'],
+    ['a negative integer', '-1'],
+    ['a fractional number', '11.5']
+  ])('fails closed when a recognized Responses event has %s sequence_number', (_label, sequence) => {
+    const parser = createCanonicalStreamParser('openai-responses')
+    const events = parser.push(encoder.encode(
+      `event: response.completed\ndata: {"type":"response.completed","sequence_number":${sequence},"response":{"status":"completed","output":[]}}\n\n`
+    ))
+
+    expect(events).toContainEqual(expect.objectContaining({
+      type: 'error',
+      code: 'invalid_sequence_number'
+    }))
+    expect(events).toContainEqual({
+      type: 'stop', reason: 'error', rawReason: 'invalid_sequence_number'
+    })
+    expect(events).toContainEqual({ type: 'done' })
+    expect(parser.getProtocolState().responsesTerminalEvent).toBeUndefined()
+  })
+
+  it('keeps an explicitly incomplete Responses function call incomplete', () => {
+    const collector = createOpenAiResponsesStreamCollector({ id: 'resp-incomplete-tool' })
+    collector.push(encoder.encode([
+      'event: response.output_item.added',
+      'data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_partial","name":"lookup","arguments":"{\\"q\\":"}}',
+      '',
+      'event: response.output_item.done',
+      'data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","status":"incomplete","call_id":"call_partial","name":"lookup","arguments":"{\\"q\\":"}}',
+      '',
+      'event: response.incomplete',
+      'data: {"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[]}}',
+      '',
+      ''
+    ].join('\n')))
+
+    expect(collector.finish().response).toMatchObject({
+      status: 'incomplete',
+      output: [{
+        type: 'function_call',
+        status: 'incomplete',
+        call_id: 'call_partial',
+        arguments: '{"q":'
+      }]
+    })
+  })
+
+  it('tracks Responses message completion per output index', () => {
+    const collector = createOpenAiResponsesStreamCollector({ id: 'resp-multi-message' })
+    collector.push(encoder.encode([
+      'event: response.output_text.delta',
+      'data: {"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"complete"}',
+      '',
+      'event: response.output_item.done',
+      'data: {"type":"response.output_item.done","output_index":0,"item":{"type":"message","status":"completed"}}',
+      '',
+      'event: response.output_text.delta',
+      'data: {"type":"response.output_text.delta","output_index":1,"content_index":0,"delta":"partial"}',
+      '',
+      'event: response.incomplete',
+      'data: {"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[]}}',
+      '',
+      ''
+    ].join('\n')))
+
+    expect(collector.finish().response).toMatchObject({
+      status: 'incomplete',
+      output: [
+        { type: 'message', status: 'completed', content: [{ text: 'complete' }] },
+        { type: 'message', status: 'incomplete', content: [{ text: 'partial' }] }
+      ]
+    })
+  })
+
+  it('does not mark merged encoded Responses text complete while any source message is partial', () => {
+    const streamEncoder = createCanonicalStreamEncoder('openai-responses', {
+      id: 'resp-encoded-multi-message',
+      model: 'model-test'
+    })
+    const frames = [
+      ...streamEncoder.encode({ type: 'text-delta', text: 'complete', index: 0 }),
+      ...streamEncoder.encode({ type: 'message-complete', index: 0 }),
+      ...streamEncoder.encode({ type: 'text-delta', text: 'partial', index: 1 }),
+      ...streamEncoder.encode({ type: 'stop', reason: 'length' }),
+      ...streamEncoder.encode({ type: 'done' })
+    ]
+    const wire = new TextDecoder().decode(joinBytes(frames))
+    const terminalMatch = /event: response\.incomplete\ndata: ([^\n]+)/.exec(wire)
+    const terminal = JSON.parse(terminalMatch?.[1] ?? '{}') as {
+      response?: { output?: Array<{ type?: string; status?: string }> }
+    }
+
+    expect(terminal.response?.output).toContainEqual(expect.objectContaining({
+      type: 'message', status: 'incomplete'
+    }))
+  })
+
+  it('deduplicates replayed unsequenced output_text.done events', () => {
+    const collector = createOpenAiResponsesStreamCollector({ id: 'resp-done-replay' })
+    collector.push(encoder.encode([
+      'event: response.output_text.done',
+      'data: {"type":"response.output_text.done","output_index":0,"content_index":0,"text":"Once"}',
+      '',
+      'event: response.output_text.done',
+      'data: {"type":"response.output_text.done","output_index":0,"content_index":0,"text":"Once"}',
+      '',
+      'event: response.completed',
+      'data: {"type":"response.completed","response":{"status":"completed","output":[]}}',
+      '',
+      ''
+    ].join('\n')))
+
+    expect(collector.finish().response).toMatchObject({
+      output: [{ content: [{ text: 'Once' }] }]
+    })
+  })
+
+  it('counts a compatibility output item without output_index when it is parsed', () => {
+    const parser = createCanonicalStreamParser('openai-responses')
+    const events = parser.push(encoder.encode(
+      'event: response.output_item.added\ndata: {"type":"response.output_item.added","item":{"type":"function_call","call_id":"call_compat","name":"lookup","arguments":"{}"}}\n\n'
+    ))
+
+    expect(events).toContainEqual(expect.objectContaining({
+      type: 'tool-call-delta', id: 'call_compat', name: 'lookup'
+    }))
+    expect(parser.getRecognizedEventCount()).toBe(1)
+    expect(parser.getProtocolState().responsesProgressEventCount).toBe(1)
+  })
+
+  it('bounds one unterminated SSE frame without limiting the total response', () => {
+    const oversized = createCanonicalStreamParser('openai-chat', { maxBufferedCharacters: 96 })
+    const oversizedEvents = oversized.push(encoder.encode(`data: ${'x'.repeat(100)}`))
+    expect(oversizedEvents).toContainEqual(expect.objectContaining({
+      type: 'error', errorType: 'frame_too_large'
+    }))
+
+    const longResponse = createCanonicalStreamParser('openai-chat', { maxBufferedCharacters: 256 })
+    const event = 'data: {"choices":[{"delta":{"content":"abcdefghij"},"finish_reason":null}]}\n\n'
+    const chunks = Array.from({ length: 20 }, () => event)
+    chunks.push('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n')
+    const events = longResponse.push(encoder.encode(chunks.join('')))
+    expect(events.filter((value) => value.type === 'text-delta')).toHaveLength(20)
+    expect(events).not.toContainEqual(expect.objectContaining({ errorType: 'frame_too_large' }))
+  })
+
+  it('bounds one incomplete Gemini JSON value while accepting many small values', () => {
+    const oversized = createCanonicalStreamParser('gemini', { maxBufferedCharacters: 96 })
+    const oversizedEvents = oversized.push(encoder.encode(
+      `{"candidates":[{"content":{"parts":[{"text":"${'x'.repeat(100)}`
+    ))
+    expect(oversizedEvents).toContainEqual(expect.objectContaining({
+      type: 'error', errorType: 'frame_too_large'
+    }))
+
+    const longResponse = createCanonicalStreamParser('gemini', { maxBufferedCharacters: 160 })
+    const value = '{"candidates":[{"content":{"parts":[{"text":"ok"}]}}]}'
+    const events = longResponse.push(encoder.encode(`[ ${Array.from({ length: 20 }, () => value).join(' , \n')} ]`))
+    expect(events.filter((event) => event.type === 'text-delta')).toHaveLength(20)
+    expect(events).not.toContainEqual(expect.objectContaining({ errorType: 'frame_too_large' }))
+  })
+
+  it.each([
+    '[{"candidates":[]} {"candidates":[]}]',
+    '[{"candidates":[]},]',
+    '[,{"candidates":[]}]',
+    '[{"candidates":[]}][{"candidates":[]}]'
+  ])('rejects malformed Gemini JSON array grammar: %s', (recording) => {
+    const events = parseChunks('gemini', byteChunks(recording, 2))
+    expect(events).toContainEqual(expect.objectContaining({
+      type: 'error',
+      errorType: 'invalid_json'
+    }))
+  })
+
+  it('surfaces a terminal Responses failure instead of collecting a response', () => {
+    const collector = createOpenAiResponsesStreamCollector({ id: 'resp-failed' })
+    collector.push(encoder.encode([
+      'event: response.failed',
+      'data: {"type":"response.failed","sequence_number":1,"response":{"status":"failed","error":{"message":"model failed","type":"server_error","code":"model_failed"}}}',
+      '',
+      ''
+    ].join('\n')))
+
+    const result = collector.finish()
+    expect(result).toMatchObject({
+      error: 'model failed',
+      errorCode: 'model_failed',
+      errorType: 'server_error'
+    })
+    expect(result).not.toHaveProperty('response')
+  })
+
+  it('preserves Responses refusal text once and terminates as content filtering', () => {
+    const parser = createCanonicalStreamParser('openai-responses')
+    const events = parser.push(encoder.encode([
+      'event: response.refusal.delta',
+      'data: {"type":"response.refusal.delta","output_index":0,"content_index":0,"delta":"Cannot comply"}',
+      '',
+      'event: response.refusal.done',
+      'data: {"type":"response.refusal.done","output_index":0,"content_index":0,"refusal":"Cannot comply"}',
+      '',
+      'event: response.completed',
+      'data: {"type":"response.completed","response":{"status":"completed","output":[]}}',
+      '',
+      ''
+    ].join('\n')))
+
+    expect(events.filter((event) => event.type === 'text-delta')).toEqual([
+      { type: 'text-delta', text: 'Cannot comply', index: 0, contentType: 'refusal' }
+    ])
+    expect(events).toContainEqual({ type: 'stop', reason: 'content_filter', rawReason: 'refusal' })
+    expect(events).toContainEqual({ type: 'done' })
+  })
+
+  it('collects a completed Responses refusal with a consistent completed status', () => {
+    const collector = createOpenAiResponsesStreamCollector({ id: 'resp-refusal' })
+    collector.push(encoder.encode([
+      'event: response.refusal.delta',
+      'data: {"type":"response.refusal.delta","output_index":0,"content_index":0,"delta":"Cannot comply"}',
+      '',
+      'event: response.refusal.done',
+      'data: {"type":"response.refusal.done","output_index":0,"content_index":0,"refusal":"Cannot comply"}',
+      '',
+      'event: response.completed',
+      'data: {"type":"response.completed","response":{"id":"resp-refusal","status":"completed","output":[]}}',
+      '',
+      ''
+    ].join('\n')))
+
+    const response = collector.finish().response
+    expect(response).toMatchObject({
+      status: 'completed',
+      output: [{
+        type: 'message',
+        status: 'completed',
+        content: [{ type: 'refusal', refusal: 'Cannot comply' }]
+      }]
+    })
+    expect(response).not.toHaveProperty('incomplete_details')
+  })
+
+  it('emits a Gemini stream error instead of replacing invalid tool arguments with an empty object', async () => {
+    const recording = [
+      'data: {"id":"chat-invalid-tool","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_bad","type":"function","function":{"name":"lookup","arguments":"{\\"path\\":"}}]},"finish_reason":null}]}\n\n',
+      'data: {"id":"chat-invalid-tool","choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n\n',
+      'data: [DONE]\n\n'
+    ].join('')
+
+    const output = await transcode('openai-chat', 'gemini', recording)
+    const wire = new TextDecoder().decode(output)
+    expect(wire).toContain('invalid_tool_arguments')
+    expect(wire).not.toContain('"functionCall"')
+    expect(wire).not.toContain('"finishReason":"STOP"')
   })
 })
 

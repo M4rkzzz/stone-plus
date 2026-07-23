@@ -76,6 +76,10 @@ export interface GatewayRuntimeStateUpdate {
    * accounts or treating concurrency saturation as an account failure.
    */
   noEligibleAccounts?: {
+    /** Gateway topology generation pinned by the request that exhausted candidates. */
+    configGeneration?: number
+    /** Exact enabled route used by the request. Missing legacy context is not safe to re-probe. */
+    routeId?: string
     poolId: string
     accountIds: readonly string[]
   }
@@ -105,9 +109,11 @@ export interface GatewayController {
   start(settings?: GatewaySettings, credentialResolver?: CredentialResolver): Promise<void>
   stop(options?: { force?: boolean; drainTimeoutMs?: number }): Promise<void>
   getStatus(): GatewayStatus
+  /** Monotonic topology handoff generation. Optional only for compatibility with older adapters. */
+  getConfigGeneration?(): number
   updateConfig(config: GatewayConfig): void
   updateRuntimeAccounts(accounts: readonly Account[]): void
-  resetAccountHealth(accountId: string): void
+  resetAccountHealth(accountId: string, options?: { clearPerformance?: boolean }): void
   getAccountFitness(accountIds?: readonly string[]): Record<string, AccountFitnessSnapshot>
   getAccountInFlight(accountIds?: readonly string[]): Record<string, number>
   getRequestReplayTemplate(id: string): RequestReplayTemplate | undefined

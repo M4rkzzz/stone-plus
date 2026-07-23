@@ -8,6 +8,7 @@ import type {
 import {
   builtInProxyIpcChannels,
   registerBuiltInProxyApi,
+  shutdownBuiltInProxyBoundary,
   type BuiltInProxyRuntimeFacade,
   type BuiltInProxyStoreFacade,
 } from '../../src/main/ipc/built-in-proxy-api'
@@ -75,10 +76,18 @@ describe('built-in proxy IPC', () => {
     harness.state.profiles[0].activeNodeId = undefined
     await invoke(builtInProxyIpcChannels.selectNode, 'profile-imported', 'node-imported')
     await invoke(builtInProxyIpcChannels.setRuleMode, 'global')
+    await invoke(builtInProxyIpcChannels.setCustomRules, {
+      rules: [
+        { id: 'rule-domain', condition: 'domain-suffix', values: [' .Example.com '], action: 'proxy' },
+        { id: 'rule-private', condition: 'private-network', values: [], action: 'direct' },
+      ],
+      finalAction: 'direct',
+    })
     await invoke(builtInProxyIpcChannels.setAccessMode, 'tun')
     await invoke(builtInProxyIpcChannels.setLanEnabled, true)
     await invoke(builtInProxyIpcChannels.setAutoStart, false)
     await invoke(builtInProxyIpcChannels.refreshProfile, 'profile-imported')
+    await invoke(builtInProxyIpcChannels.closeConnection, 'connection-one')
     await invoke(builtInProxyIpcChannels.retry)
 
     expect(harness.runtime.setEnabled).toHaveBeenCalledWith(true)
@@ -88,14 +97,25 @@ describe('built-in proxy IPC', () => {
     expect(harness.store.selectProfile).toHaveBeenCalledWith('profile-imported')
     expect(harness.store.selectNode).toHaveBeenCalledWith('profile-imported', 'node-imported')
     expect(harness.store.updateSettings).toHaveBeenCalledWith({ ruleMode: 'global' })
+    expect(harness.store.updateSettings).toHaveBeenCalledWith({
+      customRules: {
+        rules: [
+          { id: 'rule-domain', condition: 'domain-suffix', values: ['example.com'], action: 'proxy' },
+          { id: 'rule-private', condition: 'private-network', values: [], action: 'direct' },
+        ],
+        finalAction: 'direct',
+      },
+    })
     expect(harness.store.updateSettings).toHaveBeenCalledWith({ accessMode: 'tun' })
     expect(harness.store.updateSettings).toHaveBeenCalledWith({ lanEnabled: true })
     expect(harness.store.updateSettings).toHaveBeenCalledWith({ autoStart: false })
+    expect(harness.runtime.closeConnection).toHaveBeenCalledWith('connection-one')
     expect(harness.runtime.reconcile.mock.calls.map(([reason]) => reason)).toEqual([
       'profile-imported',
       'profile-selected',
       'node-selected',
       'rule-mode-changed',
+      'custom-rules-changed',
       'access-mode-changed',
       'lan-changed',
       'auto-start-changed',
@@ -137,6 +157,176 @@ describe('built-in proxy IPC', () => {
     expect(harness.store.importProfile).toHaveBeenCalledTimes(1)
   })
 
+  it('preserves the last intent across true-false-true and mode reversal bursts', async () => {
+    const master = createHarness()
+    let releaseMaster!: () => void
+    const masterGate = new Promise<void>((resolve) => { releaseMaster = resolve })
+    let firstMaster = true
+    master.runtime.setEnabled.mockImplementation(async (enabled: boolean) => {
+      if (firstMaster) { firstMaster = false; await masterGate }
+      master.state.desiredEnabled = enabled
+      master.state.settings.desiredEnabled = enabled
+      master.state.status = enabled ? 'ready' : 'disabled'
+    })
+    registerBuiltInProxyApi(master.store, master.runtime)
+    const masterBurst = [
+      invoke(builtInProxyIpcChannels.setEnabled, true),
+      invoke(builtInProxyIpcChannels.setEnabled, false),
+      invoke(builtInProxyIpcChannels.setEnabled, true),
+    ]
+    await vi.waitFor(() => expect(master.runtime.setEnabled).toHaveBeenCalledOnce())
+    releaseMaster()
+    await Promise.all(masterBurst)
+    expect(master.runtime.setEnabled.mock.calls.map(([value]) => value)).toEqual([true, false, true])
+
+    const lan = createHarness()
+    let releaseLan!: () => void
+    const lanGate = new Promise<void>((resolve) => { releaseLan = resolve })
+    let firstLan = true
+    lan.store.updateSettings.mockImplementation(async (patch) => {
+      if (firstLan) { firstLan = false; await lanGate }
+      Object.assign(lan.state.settings, patch)
+    })
+    registerBuiltInProxyApi(lan.store, lan.runtime)
+    const lanBurst = [
+      invoke(builtInProxyIpcChannels.setLanEnabled, true),
+      invoke(builtInProxyIpcChannels.setLanEnabled, false),
+      invoke(builtInProxyIpcChannels.setLanEnabled, true),
+    ]
+    await vi.waitFor(() => expect(lan.store.updateSettings).toHaveBeenCalledOnce())
+    releaseLan()
+    await Promise.all(lanBurst)
+    expect(lan.store.updateSettings.mock.calls.map(([patch]) => patch)).toEqual([
+      { lanEnabled: true }, { lanEnabled: false }, { lanEnabled: true },
+    ])
+
+    const access = createHarness()
+    let releaseAccess!: () => void
+    const accessGate = new Promise<void>((resolve) => { releaseAccess = resolve })
+    let firstAccess = true
+    access.store.updateSettings.mockImplementation(async (patch) => {
+      if (firstAccess) { firstAccess = false; await accessGate }
+      Object.assign(access.state.settings, patch)
+    })
+    registerBuiltInProxyApi(access.store, access.runtime)
+    const accessBurst = [
+      invoke(builtInProxyIpcChannels.setAccessMode, 'tun'),
+      invoke(builtInProxyIpcChannels.setAccessMode, 'system'),
+      invoke(builtInProxyIpcChannels.setAccessMode, 'tun'),
+    ]
+    await vi.waitFor(() => expect(access.store.updateSettings).toHaveBeenCalledOnce())
+    releaseAccess()
+    await Promise.all(accessBurst)
+    expect(access.store.updateSettings.mock.calls.map(([patch]) => patch)).toEqual([
+      { accessMode: 'tun' }, { accessMode: 'system' }, { accessMode: 'tun' },
+    ])
+  })
+
+  it('keeps LAN exposure and access mode as independent persisted settings', async () => {
+    const harness = createHarness()
+    harness.state.settings.accessMode = 'system'
+    harness.state.settings.lanEnabled = true
+    registerBuiltInProxyApi(harness.store, harness.runtime)
+
+    await invoke(builtInProxyIpcChannels.setAccessMode, 'tun')
+    expect(harness.state.settings).toMatchObject({ accessMode: 'tun', lanEnabled: true })
+    await invoke(builtInProxyIpcChannels.setLanEnabled, false)
+    expect(harness.state.settings).toMatchObject({ accessMode: 'tun', lanEnabled: false })
+    expect(harness.store.updateSettings.mock.calls.map(([patch]) => patch)).toEqual([
+      { accessMode: 'tun' },
+      { lanEnabled: false },
+    ])
+  })
+
+  it('validates, serializes, and clears visual custom rules through reconciliation', async () => {
+    const harness = createHarness()
+    registerBuiltInProxyApi(harness.store, harness.runtime)
+
+    const configured = {
+      rules: [
+        { id: 'rule-cidr', condition: 'ip-cidr', values: ['10.0.0.0/8'], action: 'block' },
+        { id: 'rule-ports', condition: 'port-range', values: ['8000-9000'], action: 'proxy' },
+      ],
+      finalAction: 'proxy',
+    }
+    await invoke(builtInProxyIpcChannels.setCustomRules, configured)
+    await invoke(builtInProxyIpcChannels.setCustomRules, configured)
+    await invoke(builtInProxyIpcChannels.setCustomRules, null)
+
+    expect(harness.store.updateSettings).toHaveBeenCalledTimes(2)
+    expect(harness.store.updateSettings).toHaveBeenNthCalledWith(1, {
+      customRules: {
+        rules: [
+          { id: 'rule-cidr', condition: 'ip-cidr', values: ['10.0.0.0/8'], action: 'block' },
+          { id: 'rule-ports', condition: 'port-range', values: ['8000:9000'], action: 'proxy' },
+        ],
+        finalAction: 'proxy',
+      },
+    })
+    expect(harness.store.updateSettings).toHaveBeenNthCalledWith(2, { customRules: undefined })
+    expect(harness.runtime.reconcile).toHaveBeenCalledTimes(2)
+    expect(harness.runtime.reconcile).toHaveBeenNthCalledWith(1, 'custom-rules-changed')
+    expect(harness.runtime.reconcile).toHaveBeenNthCalledWith(2, 'custom-rules-changed')
+  })
+
+  it('closes mutation admission synchronously, drains accepted work, and shares one dispose flight', async () => {
+    const harness = createHarness()
+    let releaseFirst!: () => void
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve })
+    harness.store.updateSettings.mockImplementation(async (patch) => {
+      if (patch.ruleMode === 'global') await firstGate
+      Object.assign(harness.state.settings, patch)
+    })
+    const dispose = registerBuiltInProxyApi(harness.store, harness.runtime)
+    const staleHandler = electron.handlers.get(builtInProxyIpcChannels.setAutoStart)!
+
+    const first = invoke(builtInProxyIpcChannels.setRuleMode, 'global')
+    await vi.waitFor(() => expect(harness.store.updateSettings).toHaveBeenCalledTimes(1))
+    const acceptedSecond = invoke(builtInProxyIpcChannels.setLanEnabled, true)
+    const firstDispose = dispose()
+    const secondDispose = dispose()
+
+    expect(firstDispose).toBe(secondDispose)
+    expect(electron.handlers.size).toBe(0)
+    await expect(staleHandler(trustedEvent(), false)).rejects.toMatchObject({ category: 'unknown' })
+    expect(harness.store.updateSettings).toHaveBeenCalledTimes(1)
+
+    releaseFirst()
+    await Promise.all([first, acceptedSecond, firstDispose])
+    expect(harness.store.updateSettings).toHaveBeenNthCalledWith(2, { lanEnabled: true })
+    expect(harness.store.updateSettings).not.toHaveBeenCalledWith({ autoStart: false })
+  })
+
+  it('drains an accepted mutation before the main-process exit boundary and resumes IPC on close failure', async () => {
+    const harness = createHarness()
+    let releaseMutation!: () => void
+    const mutationGate = new Promise<void>((resolve) => { releaseMutation = resolve })
+    harness.store.updateSettings.mockImplementation(async (patch) => {
+      await mutationGate
+      Object.assign(harness.state.settings, patch)
+    })
+    const dispose = registerBuiltInProxyApi(harness.store, harness.runtime)
+    const accepted = invoke(builtInProxyIpcChannels.setLanEnabled, true)
+    await vi.waitFor(() => expect(harness.store.updateSettings).toHaveBeenCalledOnce())
+    const closeProxy = vi.fn(async () => { throw new Error('system proxy lease restore failed') })
+    const resumeIpc = vi.fn()
+
+    const shutdown = shutdownBuiltInProxyBoundary({
+      quiesceIpc: dispose,
+      closeProxy,
+      resumeIpc,
+    })
+    void shutdown.catch(() => undefined)
+    expect(electron.handlers.size).toBe(0)
+    expect(closeProxy).not.toHaveBeenCalled()
+
+    releaseMutation()
+    await accepted
+    await expect(shutdown).rejects.toThrow('system proxy lease restore failed')
+    expect(closeProxy).toHaveBeenCalledOnce()
+    expect(resumeIpc).toHaveBeenCalledOnce()
+  })
+
   it('makes repeated lifecycle and selection commands idempotent', async () => {
     const harness = createHarness()
     harness.state.profiles.push(profileSummary())
@@ -169,6 +359,17 @@ describe('built-in proxy IPC', () => {
     expect(harness.runtime.setEnabled).toHaveBeenCalledWith(true)
   })
 
+  it('coalesces only concurrent duplicates and never suppresses a later opposite lifecycle transition', async () => {
+    const harness = createHarness()
+    registerBuiltInProxyApi(harness.store, harness.runtime)
+
+    await invoke(builtInProxyIpcChannels.setEnabled, true)
+    await invoke(builtInProxyIpcChannels.setEnabled, false)
+    await invoke(builtInProxyIpcChannels.setEnabled, true)
+
+    expect(harness.runtime.setEnabled.mock.calls.map(([enabled]) => enabled)).toEqual([true, false, true])
+  })
+
   it('whitelists runtime, event, latency, traffic, and connection projections', async () => {
     const harness = createHarness()
     const unsafeState = harness.state as BuiltInProxyRuntimeState & Record<string, unknown>
@@ -187,6 +388,14 @@ describe('built-in proxy IPC', () => {
       message: 'failed at vmess://private-credential token=private-token',
       retryable: true,
     }
+    unsafeState.settings.customRules = {
+      rules: [Object.assign(
+        { id: 'rule-safe', condition: 'domain', values: ['safe.example'], action: 'proxy' },
+        { controllerSecret: 'rule-private' },
+      )],
+      finalAction: 'direct',
+      controllerSecret: 'rules-private',
+    } as BuiltInProxyRuntimeState['settings']['customRules']
     harness.runtime.testLatency.mockResolvedValue(unsafeState.profiles[0].nodes)
     const unsafeTraffic = Object.assign(trafficSnapshot(), { controllerSecret: 'traffic-private' })
     harness.runtime.getTraffic.mockReturnValue(unsafeTraffic)
@@ -219,6 +428,8 @@ describe('built-in proxy IPC', () => {
       expect(serialized).not.toContain('connection-password')
       expect(serialized).not.toContain('private-credential')
       expect(serialized).not.toContain('private-token')
+      expect(serialized).not.toContain('rule-private')
+      expect(serialized).not.toContain('rules-private')
     }
     expect(state.profiles[0]).toMatchObject({ nodeCount: 1, groupCount: 1, ruleStatus: 'preserved' })
     expect((traffic as ProxyTrafficSnapshot).uploadRateBytesPerSecond).toBe(128)
@@ -268,20 +479,63 @@ describe('built-in proxy IPC', () => {
     await expect(invoke(builtInProxyIpcChannels.setRuleMode, 'invalid')).rejects.toMatchObject({
       category: 'configuration-invalid',
     })
+    await expect(invoke(builtInProxyIpcChannels.closeConnection, '')).rejects.toMatchObject({
+      category: 'configuration-invalid',
+    })
+    await expect(invoke(builtInProxyIpcChannels.setCustomRules, {
+      rules: [{ id: 'bad-condition', condition: 'script', values: ['alert(1)'], action: 'proxy' }],
+      finalAction: 'proxy',
+    })).rejects.toMatchObject({ category: 'configuration-invalid' })
+    await expect(invoke(builtInProxyIpcChannels.setCustomRules, {
+      rules: [], finalAction: 'proxy', unsupported: true,
+    })).rejects.toMatchObject({ category: 'configuration-invalid' })
+    await expect(invoke(builtInProxyIpcChannels.setCustomRules, {
+      rules: [{ id: 'extra-field', condition: 'domain', values: ['example.com'], action: 'proxy', unsafe: true }],
+      finalAction: 'proxy',
+    })).rejects.toMatchObject({ category: 'configuration-invalid' })
+    await expect(invoke(builtInProxyIpcChannels.setCustomRules, {
+      rules: [{ id: 'bad-range', condition: 'port-range', values: ['9000:8000'], action: 'proxy' }],
+      finalAction: 'direct',
+    })).rejects.toMatchObject({ category: 'configuration-invalid' })
+    await expect(invoke(builtInProxyIpcChannels.setCustomRules, {
+      rules: [{ id: 'empty-domain', condition: 'domain', values: [], action: 'proxy' }],
+      finalAction: 'proxy',
+    })).rejects.toMatchObject({ category: 'configuration-invalid' })
+    await expect(invoke(builtInProxyIpcChannels.setCustomRules, {
+      rules: [{ id: 'bad-private', condition: 'private-network', values: ['unexpected'], action: 'direct' }],
+      finalAction: 'proxy',
+    })).rejects.toMatchObject({ category: 'configuration-invalid' })
 
     expect(harness.runtime.setEnabled).not.toHaveBeenCalled()
+    expect(harness.runtime.closeConnection).not.toHaveBeenCalled()
     expect(harness.store.importProfile).not.toHaveBeenCalled()
     expect(harness.store.updateSettings).not.toHaveBeenCalled()
   })
 
-  it('unsubscribes and removes fixed handlers on disposal', () => {
+  it('exposes the custom-rule mutation through preload without widening its payload', async () => {
+    vi.resetModules()
+    electron.ipcInvoke.mockResolvedValue({ status: 'ready' })
+    await import('../../src/preload/index')
+    const exposed = electron.exposeInMainWorld.mock.calls.find(([name]) => name === 'stone')?.[1] as {
+      setBuiltInProxyCustomRules(value: unknown): Promise<unknown>
+    }
+    const value = { rules: [], finalAction: 'direct' }
+
+    await exposed.setBuiltInProxyCustomRules(value)
+
+    expect(electron.ipcInvoke).toHaveBeenCalledWith(
+      builtInProxyIpcChannels.setCustomRules,
+      value,
+    )
+  })
+
+  it('unsubscribes and removes fixed handlers on disposal', async () => {
     const harness = createHarness()
     const unsubscribe = vi.fn()
     harness.runtime.subscribe.mockReturnValue(unsubscribe)
     const dispose = registerBuiltInProxyApi(harness.store, harness.runtime)
 
-    dispose()
-    dispose()
+    await Promise.all([dispose(), dispose()])
 
     expect(unsubscribe).toHaveBeenCalledOnce()
     expect(electron.handlers.size).toBe(0)
@@ -374,6 +628,7 @@ function runtimeState(): BuiltInProxyRuntimeState {
     },
     profiles: [],
     effectiveRoute: { generation: 7, kind: 'external', externalMode: 'system' },
+    accessState: { mode: 'system', status: 'idle' },
   }
 }
 

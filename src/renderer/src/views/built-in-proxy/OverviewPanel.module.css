@@ -1,0 +1,635 @@
+.panel {
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: var(--shadow-sm);
+}
+
+.header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 18px 20px 16px;
+}
+
+.heading {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  gap: 11px;
+}
+
+.headingIcon {
+  display: inline-flex;
+  width: 36px;
+  height: 36px;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  border-radius: 10px;
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.heading h2,
+.sectionHeading h3,
+.cardHeading h3 {
+  margin: 0;
+  color: var(--text);
+}
+
+.heading h2 {
+  font-size: 17px;
+  line-height: 1.35;
+}
+
+.heading p {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.status {
+  display: inline-flex;
+  min-height: 32px;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 7px;
+  padding: 0 11px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  font-size: 12px;
+}
+
+.statusInactive {
+  border-color: var(--border);
+  background: var(--surface-muted);
+  color: var(--muted);
+}
+
+.statusWorking {
+  border-color: color-mix(in srgb, var(--blue) 24%, var(--border));
+  background: var(--blue-soft);
+  color: var(--blue);
+}
+
+.statusReady {
+  border-color: color-mix(in srgb, var(--accent) 24%, var(--border));
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.statusDanger {
+  border-color: color-mix(in srgb, var(--red) 24%, var(--border));
+  background: var(--red-soft);
+  color: var(--red);
+}
+
+.statusDetail {
+  margin: -5px 20px 15px 67px;
+  color: var(--text-soft);
+  font-size: 13px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.evidence {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(155px, 1fr));
+  gap: 8px;
+  margin: 0;
+  padding: 0 20px 18px;
+}
+
+.evidenceItem {
+  min-width: 0;
+  padding: 10px 11px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface-subtle);
+}
+
+.evidenceItem dt,
+.selectionList dt {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.evidenceItem dd,
+.selectionList dd {
+  min-width: 0;
+  margin: 4px 0 0;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.evidenceNeutral {
+  border-color: var(--border);
+}
+
+.evidenceSuccess {
+  border-color: color-mix(in srgb, var(--accent) 22%, var(--border));
+  background: color-mix(in srgb, var(--accent-soft) 65%, var(--surface));
+}
+
+.evidenceWarning {
+  border-color: color-mix(in srgb, var(--amber) 22%, var(--border));
+  background: color-mix(in srgb, var(--amber-soft) 68%, var(--surface));
+}
+
+.evidenceDanger {
+  border-color: color-mix(in srgb, var(--red) 22%, var(--border));
+  background: color-mix(in srgb, var(--red-soft) 68%, var(--surface));
+}
+
+.routeSection {
+  padding: 16px 20px 18px;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-subtle);
+}
+
+.sectionHeading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+  color: var(--accent);
+}
+
+.routeState {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 7px;
+}
+
+.sectionHeading h3 {
+  margin-top: 2px;
+  font-size: 14px;
+}
+
+.eyebrow {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.routeChain {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr) minmax(44px, 0.32fr) minmax(0, 1fr) minmax(44px, 0.32fr) minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.routeHop {
+  display: flex;
+  min-width: 0;
+  min-height: 66px;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.routeIcon {
+  display: inline-flex;
+  width: 32px;
+  height: 32px;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.routeActive .routeHop {
+  border-color: color-mix(in srgb, var(--accent) 18%, var(--border));
+}
+
+.routeInactive .routeIcon {
+  background: var(--surface-muted);
+  color: var(--muted);
+}
+
+.routePreparing .routeIcon {
+  background: var(--amber-soft);
+  color: var(--amber);
+}
+
+.routeBlocked .routeHop {
+  border-color: color-mix(in srgb, var(--red) 18%, var(--border));
+}
+
+.routeBlocked .routeIcon {
+  background: var(--red-soft);
+  color: var(--red);
+}
+
+.routeBlocked .routeConnector {
+  color: color-mix(in srgb, var(--red) 55%, var(--faint));
+}
+
+.routeBlocked .routeConnector span {
+  background: color-mix(in srgb, var(--red) 25%, var(--border-strong));
+}
+
+.routeHop > div {
+  min-width: 0;
+}
+
+.routeHop strong,
+.routeHop span {
+  display: block;
+  min-width: 0;
+}
+
+.routeHop strong {
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.routeHop div > span {
+  margin-top: 3px;
+  overflow: hidden;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 10px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.routeConnector {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  color: var(--faint);
+}
+
+.routeConnector span {
+  height: 1px;
+  min-width: 5px;
+  flex: 1;
+  background: var(--border-strong);
+}
+
+.routeConnector svg {
+  flex: 0 0 auto;
+}
+
+.summaryGrid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  padding: 18px 20px;
+}
+
+.summaryCard {
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.protectionCard {
+  grid-column: 1 / -1;
+}
+
+.cardHeading {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-bottom: 12px;
+  color: var(--accent);
+}
+
+.cardHeading h3 {
+  font-size: 13px;
+}
+
+.selectionList {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin: 0;
+}
+
+.selectionList > div {
+  min-width: 0;
+  padding: 9px 10px;
+  border-radius: 6px;
+  background: var(--surface-subtle);
+}
+
+.selectionList dd {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.bindingRow,
+.protectionStatus {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 0;
+}
+
+.bindingRow + .bindingRow {
+  border-top: 1px solid var(--border);
+}
+
+.bindingRow > div,
+.protectionStatus > div {
+  min-width: 0;
+}
+
+.bindingRow span:not(.statePill),
+.protectionStatus span:not(.statePill),
+.bypassBlock > span {
+  display: block;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.bindingRow strong,
+.protectionStatus strong {
+  display: block;
+  margin-top: 3px;
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.statePill {
+  display: inline-flex;
+  min-height: 24px;
+  flex: 0 0 auto;
+  align-items: center;
+  padding: 0 8px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.pillNeutral {
+  border-color: var(--border);
+  background: var(--surface-muted);
+  color: var(--muted);
+}
+
+.pillSuccess {
+  border-color: color-mix(in srgb, var(--accent) 20%, var(--border));
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.pillWarning {
+  border-color: color-mix(in srgb, var(--amber) 20%, var(--border));
+  background: var(--amber-soft);
+  color: var(--amber);
+}
+
+.pillDanger {
+  border-color: color-mix(in srgb, var(--red) 20%, var(--border));
+  background: var(--red-soft);
+  color: var(--red);
+}
+
+.bypassBlock {
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.bypassBlock ul {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.bypassBlock li {
+  max-width: 100%;
+  overflow: hidden;
+  padding: 4px 7px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--surface-subtle);
+  color: var(--text-soft);
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 20px;
+  border-top: 1px solid var(--border);
+  background: var(--surface-subtle);
+}
+
+.primaryActions,
+.navigation {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.navigation {
+  justify-content: flex-end;
+}
+
+.primaryButton,
+.secondaryButton,
+.navigationButton {
+  display: inline-flex;
+  min-height: 34px;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 650;
+  white-space: nowrap;
+}
+
+.primaryButton,
+.secondaryButton {
+  padding: 0 11px;
+}
+
+.primaryButton {
+  background: var(--accent);
+  color: #fff;
+}
+
+.primaryButton:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+
+.secondaryButton {
+  border-color: var(--border-strong);
+  background: var(--surface);
+  color: var(--text-soft);
+}
+
+.secondaryButton:hover:not(:disabled),
+.navigationButton:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--accent) 28%, var(--border-strong));
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.navigationButton {
+  min-height: 30px;
+  padding: 0 8px;
+  border-color: transparent;
+  background: transparent;
+  color: var(--muted);
+}
+
+.primaryButton:focus-visible,
+.secondaryButton:focus-visible,
+.navigationButton:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 70%, white);
+  outline-offset: 2px;
+}
+
+.primaryButton:disabled,
+.secondaryButton:disabled,
+.navigationButton:disabled {
+  cursor: not-allowed;
+  opacity: 0.58;
+}
+
+.spin {
+  animation: overviewSpin 0.85s linear infinite;
+}
+
+@keyframes overviewSpin {
+  to { transform: rotate(360deg); }
+}
+
+@media (max-width: 760px) {
+  .routeChain {
+    grid-template-columns: 1fr;
+  }
+
+  .routeConnector {
+    width: 32px;
+    height: 20px;
+    justify-self: center;
+    transform: rotate(90deg);
+  }
+
+  .summaryGrid {
+    grid-template-columns: 1fr;
+  }
+
+  .protectionCard {
+    grid-column: auto;
+  }
+
+  .actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .navigation {
+    justify-content: flex-start;
+  }
+}
+
+@media (max-width: 520px) {
+  .header {
+    align-items: stretch;
+    flex-direction: column;
+    padding: 16px;
+  }
+
+  .status {
+    align-self: flex-start;
+  }
+
+  .statusDetail {
+    margin: -4px 16px 14px;
+  }
+
+  .evidence,
+  .summaryGrid {
+    padding-right: 16px;
+    padding-left: 16px;
+  }
+
+  .routeSection {
+    padding-right: 16px;
+    padding-left: 16px;
+  }
+
+  .selectionList {
+    grid-template-columns: 1fr;
+  }
+
+  .bindingRow,
+  .protectionStatus {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .actions {
+    padding-right: 16px;
+    padding-left: 16px;
+  }
+
+  .primaryActions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .primaryButton,
+  .secondaryButton {
+    width: 100%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spin {
+    animation: none;
+  }
+}

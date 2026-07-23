@@ -3,13 +3,15 @@ import { EventEmitter } from 'node:events'
 import type { Account, AppSnapshot, PersistentTask, ProviderDefinition, PublicProxyDefinition, RequestLog, RouteClient } from '../../src/shared/types'
 import type { GatewayController } from '../../src/main/ipc/gateway-api'
 import type { GatewayAccountState, GatewayRuntimeStateUpdate } from '../../src/main/gateway'
-import { registerGatewayApi } from '../../src/main/ipc/gateway-api'
+import { rebuildGatewayConnections, registerGatewayApi } from '../../src/main/ipc/gateway-api'
 import type { AppStore } from '../../src/main/store/app-store'
 import type { ClientConfigService } from '../../src/main/client-config'
 import type { OutboundTransportManager } from '../../src/main/proxy'
 import { OutboundReloadCoordinator } from '../../src/main/proxy/outbound-reload-coordinator'
 import type { ChatGptOAuthSessionController } from '../../src/main/auth/chatgpt-oauth-flow'
 import { PersistentTaskRunner } from '../../src/main/tasks'
+import type { DatabaseBackupService, WebDavBackupService } from '../../src/main/backup'
+import type { PersistedState } from '../../src/main/store/types'
 
 type InvokeHandler = (event: unknown, ...args: unknown[]) => unknown
 
@@ -41,6 +43,12 @@ const electron = vi.hoisted(() => ({
   getLocale: vi.fn(() => 'zh-CN'),
   showOpenDialog: vi.fn(),
   openExternal: vi.fn()
+}))
+
+const apiSourceProbe = vi.hoisted(() => ({ run: vi.fn() }))
+
+vi.mock('../../src/main/sources/api-source-service', () => ({
+  probeApiSource: apiSourceProbe.run,
 }))
 
 vi.mock('electron', () => ({
@@ -79,6 +87,28 @@ const provider: ProviderDefinition = {
   updatedAt: 1
 }
 
+function successfulApiSourceProbe() {
+  return {
+    ok: true,
+    stages: [
+      { id: 'network' as const, status: 'success' as const, message: 'connected' },
+      { id: 'authentication' as const, status: 'success' as const, message: 'authenticated' },
+      { id: 'models' as const, status: 'success' as const, message: 'models' },
+      { id: 'generation' as const, status: 'success' as const, message: 'generated' },
+    ],
+    models: ['model-a'],
+    testedModel: 'model-a',
+    warnings: [],
+    capabilityProfile: {
+      version: 1 as const,
+      origin: 'probed' as const,
+      checkedAt: Date.now(),
+      streaming: true,
+    },
+    modelCatalog: [{ id: 'model-a', capabilities: { streaming: true } }],
+  }
+}
+
 describe('refresh provider models IPC', () => {
   beforeEach(() => {
     electron.handlers.clear()
@@ -86,6 +116,231 @@ describe('refresh provider models IPC', () => {
     electron.fromWebContents.mockReturnValue({})
     electron.getLocale.mockReturnValue('zh-CN')
     vi.stubEnv('ELECTRON_RENDERER_URL', 'http://127.0.0.1:5173')
+    apiSourceProbe.run.mockReset()
+  })
+
+  it('binds an unsaved-source probe to one exact save without exposing its fingerprint', async () => {
+    apiSourceProbe.run.mockResolvedValue(successfulApiSourceProbe())
+    const harness = createHarness([apiKeyAccount()], {}, vi.fn())
+    const probe = electron.handlers.get('stone:probe-api-source')
+    const save = electron.handlers.get('stone:save-api-source')
+    if (!probe || !save) throw new Error('API source handlers were not registered')
+    const mainFrame = { url: 'http://127.0.0.1:5173/index.html' }
+    const event = { senderFrame: mainFrame, sender: { mainFrame } }
+    const draft = {
+      name: 'New relay',
+      sourceType: 'relay' as const,
+      kind: 'openai-compatible' as const,
+      baseUrl: 'https://relay-a.example/v1/',
+      protocol: 'openai-chat' as const,
+      credential: 'new-relay-private-key',
+      proxyId: undefined,
+    }
+    const result = await probe(event, { ...draft, model: 'model-a' }) as {
+      probeEvidenceToken?: string
+      capabilityProfile: Record<string, unknown>
+      modelCatalog: unknown[]
+    }
+    expect(result.probeEvidenceToken).toMatch(/^[0-9a-f-]{36}$/i)
+    expect(result.probeEvidenceToken).not.toContain(draft.credential)
+    expect(result.probeEvidenceToken).not.toContain('relay-a')
+
+    await save(event, {
+      ...draft,
+      baseUrl: 'https://relay-a.example/v1',
+      models: ['model-a'],
+      priority: 10,
+      weight: 10,
+      maxConcurrency: 4,
+      capabilityProfile: result.capabilityProfile,
+      modelCatalog: result.modelCatalog,
+      probeEvidenceToken: result.probeEvidenceToken,
+    })
+    expect(harness.store.saveApiSource).toHaveBeenLastCalledWith(
+      expect.objectContaining({ probeEvidenceToken: result.probeEvidenceToken }),
+      { acceptInitialProbeEvidence: true },
+    )
+
+    await save(event, {
+      ...draft,
+      models: ['model-a'],
+      priority: 10,
+      weight: 10,
+      maxConcurrency: 4,
+      capabilityProfile: result.capabilityProfile,
+      modelCatalog: result.modelCatalog,
+      probeEvidenceToken: result.probeEvidenceToken,
+    })
+    expect(harness.store.saveApiSource).toHaveBeenLastCalledWith(
+      expect.any(Object),
+      { acceptInitialProbeEvidence: false },
+    )
+  })
+
+  it('discards unsaved probe evidence after any connection field changes but still saves', async () => {
+    apiSourceProbe.run.mockResolvedValue(successfulApiSourceProbe())
+    const harness = createHarness([apiKeyAccount()], {}, vi.fn())
+    const probe = electron.handlers.get('stone:probe-api-source')
+    const save = electron.handlers.get('stone:save-api-source')
+    if (!probe || !save) throw new Error('API source handlers were not registered')
+    const mainFrame = { url: 'http://127.0.0.1:5173/index.html' }
+    const event = { senderFrame: mainFrame, sender: { mainFrame } }
+    const draft = {
+      name: 'Changed relay', sourceType: 'relay' as const, kind: 'openai-compatible' as const,
+      baseUrl: 'https://relay-a.example/v1', protocol: 'openai-chat' as const,
+      credential: 'relay-a-secret',
+    }
+    const result = await probe(event, { ...draft, model: 'model-a' }) as {
+      probeEvidenceToken?: string
+      capabilityProfile: Record<string, unknown>
+      modelCatalog: unknown[]
+    }
+    await expect(save(event, {
+      ...draft,
+      baseUrl: 'https://relay-b.example/v1',
+      models: ['model-a'], priority: 10, weight: 10, maxConcurrency: 4,
+      capabilityProfile: result.capabilityProfile,
+      modelCatalog: result.modelCatalog,
+      probeEvidenceToken: result.probeEvidenceToken,
+    })).resolves.toBeDefined()
+    expect(harness.store.saveApiSource).toHaveBeenLastCalledWith(
+      expect.objectContaining({ baseUrl: 'https://relay-b.example/v1' }),
+      { acceptInitialProbeEvidence: false },
+    )
+  })
+
+  it('discards unsaved probe evidence when the saved model semantics differ from the tested draft', async () => {
+    apiSourceProbe.run.mockResolvedValue(successfulApiSourceProbe())
+    const harness = createHarness([apiKeyAccount()], {}, vi.fn())
+    const probe = electron.handlers.get('stone:probe-api-source')
+    const save = electron.handlers.get('stone:save-api-source')
+    if (!probe || !save) throw new Error('API source handlers were not registered')
+    const event = rendererEvent(103)
+    const draft = {
+      name: 'Model-bound relay', sourceType: 'relay' as const, kind: 'openai-compatible' as const,
+      baseUrl: 'https://relay-model.example/v1', protocol: 'openai-chat' as const,
+      credential: 'relay-model-secret', model: 'model-a',
+    }
+    const result = await probe(event, draft) as { probeEvidenceToken?: string }
+
+    await save(event, {
+      ...draft,
+      model: undefined,
+      models: ['model-b'],
+      defaultModel: 'model-b',
+      priority: 10,
+      weight: 10,
+      maxConcurrency: 4,
+      capabilityProfile: successfulApiSourceProbe().capabilityProfile,
+      modelCatalog: successfulApiSourceProbe().modelCatalog,
+      probeEvidenceToken: result.probeEvidenceToken,
+    })
+
+    expect(harness.store.saveApiSource).toHaveBeenLastCalledWith(
+      expect.objectContaining({ models: ['model-b'], defaultModel: 'model-b' }),
+      { acceptInitialProbeEvidence: false },
+    )
+  })
+
+  it('does not reuse probe evidence for a different unsaved draft identity', async () => {
+    apiSourceProbe.run.mockResolvedValue(successfulApiSourceProbe())
+    const harness = createHarness([apiKeyAccount()], {}, vi.fn())
+    const probe = electron.handlers.get('stone:probe-api-source')
+    const save = electron.handlers.get('stone:save-api-source')
+    if (!probe || !save) throw new Error('API source handlers were not registered')
+    const event = rendererEvent(105)
+    const draft = {
+      name: 'Draft A', sourceType: 'relay' as const, kind: 'openai-compatible' as const,
+      baseUrl: 'https://same-connection.example/v1', protocol: 'openai-chat' as const,
+      credential: 'same-secret',
+    }
+    const result = await probe(event, draft) as { probeEvidenceToken?: string }
+
+    await save(event, {
+      ...draft,
+      name: 'Draft B',
+      models: ['model-a'],
+      defaultModel: 'model-a',
+      priority: 10,
+      weight: 10,
+      maxConcurrency: 4,
+      probeEvidenceToken: result.probeEvidenceToken,
+    })
+
+    expect(harness.store.saveApiSource).toHaveBeenLastCalledWith(
+      expect.objectContaining({ name: 'Draft B' }),
+      { acceptInitialProbeEvidence: false },
+    )
+  })
+
+  it('accepts evidence for the exact manually tested default when discovery returned no models', async () => {
+    apiSourceProbe.run.mockResolvedValue({
+      ...successfulApiSourceProbe(),
+      models: [],
+      testedModel: 'manual-model',
+      modelCatalog: [],
+    })
+    const harness = createHarness([apiKeyAccount()], {}, vi.fn())
+    const probe = electron.handlers.get('stone:probe-api-source')
+    const save = electron.handlers.get('stone:save-api-source')
+    if (!probe || !save) throw new Error('API source handlers were not registered')
+    const event = rendererEvent(106)
+    const draft = {
+      name: 'Manual model relay', sourceType: 'relay' as const, kind: 'openai-compatible' as const,
+      baseUrl: 'https://manual-model.example/v1', protocol: 'openai-chat' as const,
+      credential: 'manual-model-secret', model: 'manual-model',
+    }
+    const result = await probe(event, draft) as { probeEvidenceToken?: string }
+
+    await save(event, {
+      ...draft,
+      model: undefined,
+      models: [],
+      defaultModel: 'manual-model',
+      priority: 10,
+      weight: 10,
+      maxConcurrency: 4,
+      probeEvidenceToken: result.probeEvidenceToken,
+    })
+
+    expect(harness.store.saveApiSource).toHaveBeenLastCalledWith(
+      expect.objectContaining({ models: [], defaultModel: 'manual-model' }),
+      { acceptInitialProbeEvidence: true },
+    )
+  })
+
+  it('uses the service-reported tested model instead of guessing from a sorted catalog', async () => {
+    apiSourceProbe.run.mockResolvedValue({
+      ...successfulApiSourceProbe(),
+      models: ['z-tested-model', 'a-other-model'],
+      testedModel: 'z-tested-model',
+    })
+    const harness = createHarness([apiKeyAccount()], {}, vi.fn())
+    const probe = electron.handlers.get('stone:probe-api-source')
+    const save = electron.handlers.get('stone:save-api-source')
+    if (!probe || !save) throw new Error('API source handlers were not registered')
+    const event = rendererEvent(107)
+    const draft = {
+      name: 'Ordered catalog relay', sourceType: 'relay' as const, kind: 'openai-compatible' as const,
+      baseUrl: 'https://ordered-catalog.example/v1', protocol: 'openai-chat' as const,
+      credential: 'ordered-catalog-secret',
+    }
+    const result = await probe(event, draft) as { probeEvidenceToken?: string }
+
+    await save(event, {
+      ...draft,
+      models: ['z-tested-model', 'a-other-model'],
+      defaultModel: 'z-tested-model',
+      priority: 10,
+      weight: 10,
+      maxConcurrency: 4,
+      probeEvidenceToken: result.probeEvidenceToken,
+    })
+
+    expect(harness.store.saveApiSource).toHaveBeenLastCalledWith(
+      expect.objectContaining({ defaultModel: 'z-tested-model' }),
+      { acceptInitialProbeEvidence: true },
+    )
   })
 
   it('opens a multi-file picker for CPA and Sub2API account JSON imports', async () => {
@@ -327,6 +582,111 @@ describe('refresh provider models IPC', () => {
     expect(harness.gateway.stop).not.toHaveBeenCalled()
   })
 
+  it('does not persist automatic backups as enabled when the raw-backup gate is blocked', async () => {
+    const backupHarness = createBackupServiceHarness()
+    backupHarness.prepareForRawBackup.mockRejectedValueOnce(new Error(
+      'Database backups are blocked until legacy WebDAV credentials can be removed safely',
+    ))
+    const harness = createHarness(
+      [oauthAccount()], {}, vi.fn(), undefined, undefined, undefined, undefined, backupHarness.services,
+    )
+    harness.store.getSnapshot().gateway.automaticBackups = false
+    const handler = electron.handlers.get('stone:update-gateway')
+    if (!handler) throw new Error('update-gateway handler was not registered')
+
+    await expect(handler(rendererEvent(105), {
+      ...harness.store.getSnapshot().gateway,
+      automaticBackups: true,
+    })).rejects.toThrow(/backups are blocked.*WebDAV credentials/i)
+
+    expect(harness.store.updateGateway).not.toHaveBeenCalled()
+    expect(backupHarness.startAutomaticBackups).not.toHaveBeenCalled()
+    expect(harness.store.getSnapshot().gateway.automaticBackups).toBe(false)
+  })
+
+  it('reports and retries a blocked automatic-backup runtime without hiding the backup list', async () => {
+    const backupHarness = createBackupServiceHarness()
+    backupHarness.startAutomaticBackups.mockRejectedValueOnce(new Error(
+      'Database backups are blocked until legacy WebDAV credentials can be removed safely',
+    ))
+    const _harness = createHarness(
+      [oauthAccount()], {}, vi.fn(), undefined, undefined, undefined, undefined, backupHarness.services,
+    )
+    const statusHandler = electron.handlers.get('stone:get-automatic-backup-runtime-state')
+    const listHandler = electron.handlers.get('stone:list-state-backups')
+    if (!statusHandler || !listHandler) throw new Error('backup status handlers were not registered')
+
+    await expect(statusHandler(rendererEvent(106))).resolves.toMatchObject({
+      configuredEnabled: true,
+      running: false,
+      blocked: true,
+      message: expect.stringMatching(/credential safety check/i),
+    })
+    await expect(listHandler(rendererEvent(107))).resolves.toEqual([])
+
+    await expect(statusHandler(rendererEvent(108))).resolves.toMatchObject({
+      configuredEnabled: true,
+      running: true,
+      blocked: false,
+    })
+    expect(backupHarness.startAutomaticBackups).toHaveBeenCalledTimes(2)
+    expect(backupHarness.listBackups).toHaveBeenCalledOnce()
+  })
+
+  it('keeps the legacy gateway settings save successful when system PAC reload fails', async () => {
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    try {
+      const harness = createHarness([oauthAccount()], {}, vi.fn())
+      vi.mocked(harness.transport.reloadSystemProxyConfiguration)
+        .mockRejectedValueOnce(new Error('WPAD stalled'))
+      const handler = electron.handlers.get('stone:update-gateway')
+      if (!handler) throw new Error('update-gateway handler was not registered')
+
+      await expect(handler(rendererEvent(104), {
+        host: '127.0.0.1', port: 15721, autoStart: false, logPayloads: false,
+        requestTimeoutSeconds: 120, outboundNetworkMode: 'system'
+      })).resolves.toBeDefined()
+
+      expect(harness.store.getSnapshot().gateway.outboundNetworkMode).toBe('system')
+      expect(warning).toHaveBeenCalledWith(
+        expect.stringContaining('operating-system proxy configuration'),
+        expect.objectContaining({ message: 'WPAD stalled' }),
+      )
+    } finally {
+      warning.mockRestore()
+    }
+  })
+
+  it('rebuilds only the active built-in generation without reloading or invalidating the external PAC', async () => {
+    const account = apiKeyAccount()
+    const harness = createHarness([account], { [account.credentialId]: 'sk-private' }, vi.fn())
+    const snapshot = harness.store.getSnapshot()
+    snapshot.gateway.outboundNetworkMode = 'system'
+    snapshot.pools.push({
+      id: 'pool-built-in', name: 'Built-in source', kind: 'standard', protocol: 'openai-responses',
+      strategy: 'priority', members: [{ accountId: account.id, enabled: true }],
+      modelPolicy: 'all', modelAllowlist: [], stickySessions: false, stickyTtlMinutes: 30,
+      maxRetries: 0, createdAt: 1, updatedAt: 1,
+    })
+    snapshot.routes.push({
+      id: 'route-built-in', client: 'codex', enabled: true, poolId: 'pool-built-in',
+      inboundProtocol: 'openai-responses', modelMap: {}, localToken: 'local-token',
+      createdAt: 1, updatedAt: 1,
+    })
+    vi.mocked(harness.transport.builtInRoutes.isIntercepting).mockReturnValue(true)
+
+    await rebuildGatewayConnections(harness.store, harness.transport)
+
+    expect(harness.transport.reloadSystemProxyConfiguration).not.toHaveBeenCalled()
+    expect(harness.transport.invalidateSystemProxyCache).not.toHaveBeenCalled()
+    expect(harness.transport.rebuild).toHaveBeenCalledOnce()
+    expect(harness.transport.rebuild).toHaveBeenCalledWith(
+      undefined,
+      undefined,
+      ['https://api.openai.com/v1'],
+    )
+  })
+
   it('rechecks failure-cooled accounts on enabled implicit routes after system proxy activation', async () => {
     const account = apiKeyAccount()
     const upstreamFetch = vi.fn(async () => new Response('{}', {
@@ -482,7 +842,7 @@ describe('refresh provider models IPC', () => {
 
     await handler({ senderFrame: mainFrame, sender: { mainFrame } }, input)
 
-    expect(harness.store.saveApiSource).toHaveBeenCalledWith(input)
+    expect(harness.store.saveApiSource).toHaveBeenCalledWith(input, { acceptInitialProbeEvidence: false })
     expect(harness.store.getSnapshot().providers[0]).toMatchObject({ responsesCompactMode: 'native' })
     expect(harness.gateway.updateConfig).toHaveBeenCalled()
   })
@@ -1334,8 +1694,24 @@ describe('refresh provider models IPC', () => {
       },
       upstreamFetch,
     )
+    harness.store.getSnapshot().pools.push({
+      id: 'pool', name: 'Current pool', kind: 'standard', protocol: 'openai-responses',
+      strategy: 'priority', members: [
+        { accountId: disabled.id, enabled: true },
+        { accountId: active.id, enabled: true },
+      ],
+      modelPolicy: 'all', modelAllowlist: [], stickySessions: false, stickyTtlMinutes: 30,
+      maxRetries: 0, createdAt: 1, updatedAt: 1,
+    })
+    harness.store.getSnapshot().routes.push({
+      id: 'route-current', client: 'codex', enabled: true, poolId: 'pool',
+      inboundProtocol: 'openai-responses', modelMap: {}, localToken: 'local-token',
+      createdAt: 1, updatedAt: 1,
+    })
     const update: GatewayRuntimeStateUpdate = {
       noEligibleAccounts: {
+        configGeneration: 1,
+        routeId: 'route-current',
         poolId: 'pool',
         accountIds: [disabled.id, active.id],
       },
@@ -1366,6 +1742,76 @@ describe('refresh provider models IPC', () => {
     harness.emitRuntimeState(update)
     await new Promise((resolve) => setTimeout(resolve, 50))
     expect(upstreamFetch).toHaveBeenCalledOnce()
+  })
+
+  it.each([
+    ['stale generation', { configGeneration: 0, routeId: 'route-current', poolId: 'pool' }],
+    ['deleted route', { configGeneration: 1, routeId: 'route-deleted', poolId: 'pool' }],
+    ['rebound route', { configGeneration: 1, routeId: 'route-current', poolId: 'pool-old' }],
+  ] as const)('ignores a no-eligible event from a %s', async (_label, context) => {
+    const disabled = {
+      ...apiKeyAccount(),
+      status: 'disabled' as const,
+      circuitState: 'open' as const,
+      lastError: 'Stale disabled classification',
+    }
+    const upstreamFetch = vi.fn(async () => new Response('{}', { status: 200 }))
+    const harness = createHarness([disabled], { [disabled.credentialId]: 'sk-disabled' }, upstreamFetch)
+    harness.store.getSnapshot().pools.push({
+      id: 'pool', name: 'Current pool', kind: 'standard', protocol: 'openai-responses',
+      strategy: 'priority', members: [{ accountId: disabled.id, enabled: true }],
+      modelPolicy: 'all', modelAllowlist: [], stickySessions: false, stickyTtlMinutes: 30,
+      maxRetries: 0, createdAt: 1, updatedAt: 1,
+    })
+    harness.store.getSnapshot().routes.push({
+      id: 'route-current', client: 'codex', enabled: true, poolId: 'pool',
+      inboundProtocol: 'openai-responses', modelMap: {}, localToken: 'local-token',
+      createdAt: 1, updatedAt: 1,
+    })
+
+    harness.emitRuntimeState({
+      noEligibleAccounts: {
+        ...context,
+        accountIds: [disabled.id],
+      },
+    })
+    await new Promise((resolve) => setTimeout(resolve, 25))
+
+    expect(upstreamFetch).not.toHaveBeenCalled()
+    expect(harness.store.setAccountCheckResult).not.toHaveBeenCalledWith(
+      disabled.id,
+      expect.objectContaining({ status: 'checking' }),
+    )
+  })
+
+  it('ignores accounts no longer enabled in the event route source', async () => {
+    const disabled = {
+      ...apiKeyAccount(), status: 'disabled' as const, circuitState: 'open' as const,
+    }
+    const harness = createHarness([disabled], { [disabled.credentialId]: 'sk-disabled' }, vi.fn())
+    harness.store.getSnapshot().pools.push({
+      id: 'pool', name: 'Current pool', kind: 'standard', protocol: 'openai-responses',
+      strategy: 'priority', members: [{ accountId: disabled.id, enabled: false }],
+      modelPolicy: 'all', modelAllowlist: [], stickySessions: false, stickyTtlMinutes: 30,
+      maxRetries: 0, createdAt: 1, updatedAt: 1,
+    })
+    harness.store.getSnapshot().routes.push({
+      id: 'route-current', client: 'codex', enabled: true, poolId: 'pool',
+      inboundProtocol: 'openai-responses', modelMap: {}, localToken: 'local-token',
+      createdAt: 1, updatedAt: 1,
+    })
+
+    harness.emitRuntimeState({
+      noEligibleAccounts: {
+        configGeneration: 1,
+        routeId: 'route-current',
+        poolId: 'pool',
+        accountIds: [disabled.id],
+      },
+    })
+    await new Promise((resolve) => setTimeout(resolve, 25))
+
+    expect(harness.store.setAccountCheckResult).not.toHaveBeenCalled()
   })
 
   it('cools an exhausted OAuth account until the reset reported by the usage probe', async () => {
@@ -1869,6 +2315,33 @@ function rendererEvent(id: number) {
   return { senderFrame: mainFrame, sender }
 }
 
+function createBackupServiceHarness() {
+  let running = false
+  const prepareForRawBackup = vi.fn(async () => undefined)
+  const startAutomaticBackups = vi.fn(async () => { running = true })
+  const stopAutomaticBackups = vi.fn(() => { running = false })
+  const listBackups = vi.fn(async () => [])
+  const backups = {
+    directory: 'C:\\Stone\\backups',
+    get automaticBackupsRunning() { return running },
+    prepareForRawBackup,
+    startAutomaticBackups,
+    stopAutomaticBackups,
+    listBackups,
+    setAutomaticRetention: vi.fn(async () => undefined),
+  } as unknown as DatabaseBackupService<PersistedState>
+  return {
+    services: {
+      backups,
+      webDavBackups: {} as WebDavBackupService,
+    },
+    prepareForRawBackup,
+    startAutomaticBackups,
+    stopAutomaticBackups,
+    listBackups,
+  }
+}
+
 function createHarness(
   accounts: Account[],
   credentials: Readonly<Record<string, string>>,
@@ -1876,7 +2349,11 @@ function createHarness(
   proxies: PublicProxyDefinition[] = [],
   discoveryFingerprint: { current: string } = { current: 'discovery-fingerprint' },
   clientConfigService: ClientConfigService = {} as ClientConfigService,
-  sharedOutboundReloadCoordinator?: OutboundReloadCoordinator
+  sharedOutboundReloadCoordinator?: OutboundReloadCoordinator,
+  backupServices?: {
+    backups: DatabaseBackupService<PersistedState>
+    webDavBackups: WebDavBackupService
+  },
 ): {
   store: AppStore
   gateway: GatewayController
@@ -2067,6 +2544,7 @@ function createHarness(
     start: vi.fn(async () => undefined),
     stop: vi.fn(async () => undefined),
     getStatus: vi.fn(() => snapshot.gatewayStatus),
+    getConfigGeneration: vi.fn(() => 1),
     updateConfig: vi.fn(),
     updateRuntimeAccounts: vi.fn(),
     resetAccountHealth: vi.fn(),
@@ -2089,9 +2567,16 @@ function createHarness(
   } as unknown as GatewayController
   const transport = {
     fetchFor: vi.fn(() => upstreamFetch as unknown as typeof fetch),
+    describeEffectiveDiagnosticRoute: vi.fn((selectedProxy?: PublicProxyDefinition) => selectedProxy
+      ? { kind: 'proxy' as const, name: selectedProxy.name, proxyId: selectedProxy.id }
+      : { kind: 'direct' as const, name: '直连' }),
     configureOutboundNetwork: vi.fn(),
+    builtInRoutes: {
+      isIntercepting: vi.fn(() => false),
+    },
     invalidateSystemProxyCache: vi.fn(),
     reloadSystemProxyConfiguration: vi.fn(async () => undefined),
+    rebuild: vi.fn(async () => undefined),
     detectSystemProxy: vi.fn(async () => ({
       detectedAt: Date.now(),
       targets: [{ target: 'https://chatgpt.com', summary: 'DIRECT', reachable: true }]
@@ -2129,12 +2614,13 @@ function createHarness(
     gateway,
     clientConfigService,
     transport,
-    undefined,
+    backupServices?.backups,
     runtimeChanged,
     undefined,
     oauthFlow,
     undefined,
-    sharedOutboundReloadCoordinator
+    sharedOutboundReloadCoordinator,
+    backupServices?.webDavBackups,
   )
   return {
     store,

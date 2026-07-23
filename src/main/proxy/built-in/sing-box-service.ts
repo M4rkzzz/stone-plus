@@ -25,10 +25,17 @@ import {
 
 const LOOPBACK_HOST = '127.0.0.1'
 const CONFIG_SIZE_LIMIT = 8 * 1024 * 1024
-const DEFAULT_HEALTH_TIMEOUT_MS = 10_000
+// Remote Stone-owned rule sets are initialized before sing-box exposes its
+// mixed/controller listeners.  Allow a bounded proxy handshake and cold rule
+// download without misclassifying a live core as unhealthy on slower links.
+const DEFAULT_HEALTH_TIMEOUT_MS = 30_000
 const DEFAULT_HEALTH_INTERVAL_MS = 100
 const DEFAULT_RESTART_DELAYS_MS = [250, 1_000, 3_000] as const
+const DEFAULT_TERMINATION_TIMEOUT_MS = 8_000
 const MAX_EVENT_LOG_LENGTH = 2_000
+const MAX_TRACKED_CONNECTION_IDS = 50_000
+const DEFAULT_LATENCY_TEST_URL = 'http://www.gstatic.com/generate_204'
+const LATENCY_SAMPLE_COUNT = 3
 
 export type SingBoxRuntimeStatus = 'idle' | 'starting' | 'ready' | 'stopping' | 'error'
 
@@ -42,6 +49,7 @@ export type SingBoxServiceErrorCode =
   | 'controller_port'
   | 'check_failed'
   | 'start_failed'
+  | 'stop_failed'
   | 'health_check'
   | 'unexpected_exit'
   | 'not_ready'
@@ -70,7 +78,7 @@ export interface SingBoxRuntimeState {
 
 export type SingBoxRuntimeEvent =
   | { type: 'state'; state: SingBoxRuntimeState }
-  | { type: 'crash'; state: SingBoxRuntimeState; exit: string }
+  | { type: 'crash'; state: SingBoxRuntimeState; generation: number; exit: string }
   | { type: 'restart-scheduled'; state: SingBoxRuntimeState; attempt: number; delayMs: number }
   | { type: 'log'; stream: 'stdout' | 'stderr'; line: string }
 
@@ -129,6 +137,8 @@ export interface SingBoxServiceOptions {
   healthTimeoutMs?: number
   healthIntervalMs?: number
   restartDelaysMs?: readonly number[]
+  /** Bounds injected/platform termination so app shutdown can make a safe retry decision. */
+  terminationTimeoutMs?: number
 }
 
 export class SingBoxServiceError extends Error {
@@ -138,6 +148,16 @@ export class SingBoxServiceError extends Error {
     super(message, options)
     this.name = 'SingBoxServiceError'
     this.code = code
+  }
+}
+
+class SingBoxControllerStatusError extends SingBoxServiceError {
+  public readonly status: number
+
+  public constructor(status: number) {
+    super('controller_request', `sing-box controller returned status ${status}.`)
+    this.name = 'SingBoxControllerStatusError'
+    this.status = status
   }
 }
 
@@ -153,6 +173,11 @@ interface RunningChildContext {
   child: ChildProcess
   ready: boolean
   intentional: boolean
+  generation: number
+  configPath: string
+  controllerSecret: string
+  mixedPort: number
+  controllerPort: number
 }
 
 interface ControllerConnectionPayload {
@@ -191,16 +216,26 @@ export class SingBoxService {
   private readonly healthTimeoutMs: number
   private readonly healthIntervalMs: number
   private readonly restartDelaysMs: readonly number[]
+  private readonly terminationTimeoutMs: number
   private readonly runtimeConfigPath: string
   private childContext?: RunningChildContext
-  private controllerSecret?: string
+  private startingContext?: RunningChildContext
+  private readonly childContexts = new Set<RunningChildContext>()
+  private readonly generationReferences = new Map<number, number>()
   private lastRequest?: NormalizedStartRequest
+  private launchSequence = 0
+  private nextGeneration = 1
   private operationTail: Promise<void> = Promise.resolve()
   private restartTimer?: ReturnType<typeof setTimeout>
   private previousTraffic?: { capturedAt: number; uploadBytes: number; downloadBytes: number }
-  private readonly seenConnectionIds = new Set<string>()
+  // LRU-bounded de-duplication for the generation's cumulative connection
+  // counter. Active IDs are touched on every controller poll, so pruning
+  // removes closed historical entries rather than live connections.
+  private readonly seenConnectionIds = new Map<string, true>()
+  private totalConnectionCount = 0
   private closed = false
   private closing = false
+  private closeFlight?: Promise<void>
 
   public constructor(private readonly options: SingBoxServiceOptions) {
     this.platform = options.platform ?? process.platform
@@ -221,6 +256,7 @@ export class SingBoxService {
     this.healthTimeoutMs = Math.max(100, options.healthTimeoutMs ?? DEFAULT_HEALTH_TIMEOUT_MS)
     this.healthIntervalMs = Math.max(1, options.healthIntervalMs ?? DEFAULT_HEALTH_INTERVAL_MS)
     this.restartDelaysMs = sanitizeRestartDelays(options.restartDelaysMs ?? DEFAULT_RESTART_DELAYS_MS)
+    this.terminationTimeoutMs = Math.max(100, options.terminationTimeoutMs ?? DEFAULT_TERMINATION_TIMEOUT_MS)
     this.runtimeConfigPath = join(options.userDataPath, 'built-in-proxy', 'sing-box.runtime.json')
   }
 
@@ -248,7 +284,6 @@ export class SingBoxService {
       this.lastRequest = normalized
       this.setDesiredEnabled(true)
       this.setState({ restartAttempt: 0, error: undefined })
-      if (this.childContext) await this.stopChild(false)
       return this.startAttempt(normalized)
     })
   }
@@ -261,7 +296,6 @@ export class SingBoxService {
       }
       this.cancelRestart()
       this.setState({ restartAttempt: 0, error: undefined })
-      if (this.childContext) await this.stopChild(false)
       return this.startAttempt(this.lastRequest)
     })
   }
@@ -270,26 +304,107 @@ export class SingBoxService {
     return this.enqueue(async () => this.stopInternal())
   }
 
-  public async close(): Promise<void> {
-    if (this.closed || this.closing) {
-      await this.operationTail
-      return
+  /** Retains a process for one atomically published Chromium route generation. */
+  public retainGeneration(generation: number): void {
+    if (![...this.childContexts].some((context) => context.generation === generation)) {
+      throw new SingBoxServiceError('not_ready', `sing-box generation ${generation} is unavailable.`)
     }
+    this.generationReferences.set(generation, (this.generationReferences.get(generation) ?? 0) + 1)
+  }
+
+  /**
+   * Re-promotes a still-retained process after a replacement transaction was
+   * rolled back. This keeps controller telemetry and subsequent reconciles
+   * bound to the same generation that the published Chromium route uses.
+   */
+  public restoreGeneration(generation: number): Promise<SingBoxRuntimeState> {
+    return this.enqueue(async () => {
+      this.assertOpen()
+      const context = [...this.childContexts].find((candidate) => candidate.generation === generation)
+      if (
+        !context
+        || !context.ready
+        || context.child.exitCode !== null
+        || context.child.signalCode !== null
+      ) {
+        throw new SingBoxServiceError('not_ready', `sing-box generation ${generation} is unavailable.`)
+      }
+      this.cancelRestart()
+      this.childContext = context
+      this.startingContext = undefined
+      this.setDesiredEnabled(true)
+      this.setState({
+        status: 'ready',
+        generation: context.generation,
+        pid: context.child.pid,
+        mixedPort: context.mixedPort,
+        mixedEndpoint: `http://${LOOPBACK_HOST}:${context.mixedPort}`,
+        controllerPort: context.controllerPort,
+        startedAt: this.now(),
+        restartAttempt: 0,
+        error: undefined,
+      })
+      this.previousTraffic = undefined
+      this.seenConnectionIds.clear()
+      this.totalConnectionCount = 0
+      return this.getState()
+    })
+  }
+
+  /** Releases exactly the process captured by a retired Chromium route generation. */
+  public disposeGeneration(generation: number, options: { force?: boolean } = {}): Promise<void> {
+    if (this.closed) return Promise.resolve()
+    return this.enqueue(async () => {
+      const references = this.generationReferences.get(generation) ?? 0
+      if (!options.force && references > 1) {
+        this.generationReferences.set(generation, references - 1)
+        return
+      }
+      this.generationReferences.delete(generation)
+      const context = [...this.childContexts].find((candidate) => candidate.generation === generation)
+      if (!context) return
+      const wasActive = this.childContext === context
+      await this.stopContext(context)
+      if (wasActive) {
+        this.setState({
+          status: 'idle',
+          pid: undefined,
+          startedAt: undefined,
+          mixedPort: undefined,
+          mixedEndpoint: undefined,
+          controllerPort: undefined,
+        })
+      }
+    })
+  }
+
+  public async close(): Promise<void> {
+    if (this.closed) return
+    if (this.closeFlight) return this.closeFlight
     this.closing = true
-    await this.enqueue(async () => {
+    const flight = this.enqueue(async () => {
       await this.stopInternal()
       this.closed = true
       this.closing = false
       this.stateListeners.clear()
       this.eventListeners.clear()
     })
+    this.closeFlight = flight
+    try {
+      await flight
+    } catch (error) {
+      this.closing = false
+      throw error
+    } finally {
+      if (this.closeFlight === flight) this.closeFlight = undefined
+    }
   }
 
   public async getTraffic(): Promise<ProxyTrafficSnapshot> {
     const payload = await this.readConnectionsPayload()
     const connections = Array.isArray(payload.connections) ? payload.connections : []
     for (const value of connections) {
-      if (isRecord(value) && typeof value.id === 'string' && value.id) this.seenConnectionIds.add(value.id)
+      if (isRecord(value) && typeof value.id === 'string' && value.id) this.recordConnectionId(value.id)
     }
     const capturedAt = this.now()
     const uploadBytes = nonNegativeInteger(payload.uploadTotal)
@@ -308,7 +423,7 @@ export class SingBoxService {
         ? Math.max(0, Math.floor((downloadBytes - this.previousTraffic!.downloadBytes) / elapsedSeconds))
         : 0,
       activeConnections: connections.length,
-      totalConnections: Math.max(connections.length, this.seenConnectionIds.size)
+      totalConnections: Math.max(connections.length, this.totalConnectionCount)
     }
     this.previousTraffic = { capturedAt, uploadBytes, downloadBytes }
     return snapshot
@@ -319,8 +434,22 @@ export class SingBoxService {
     const result = Array.isArray(payload.connections)
       ? payload.connections.map(parseConnectionSummary).filter((value): value is ProxyConnectionSummary => Boolean(value))
       : []
-    for (const connection of result) this.seenConnectionIds.add(connection.id)
+    for (const connection of result) this.recordConnectionId(connection.id)
     return result
+  }
+
+  private recordConnectionId(id: string): void {
+    if (this.seenConnectionIds.delete(id)) {
+      this.seenConnectionIds.set(id, true)
+      return
+    }
+    this.seenConnectionIds.set(id, true)
+    this.totalConnectionCount += 1
+    while (this.seenConnectionIds.size > MAX_TRACKED_CONNECTION_IDS) {
+      const oldest = this.seenConnectionIds.keys().next().value as string | undefined
+      if (oldest === undefined) break
+      this.seenConnectionIds.delete(oldest)
+    }
   }
 
   public async closeConnection(id: string): Promise<void> {
@@ -334,19 +463,36 @@ export class SingBoxService {
 
   public async testLatency(
     proxyName: string,
-    url = 'https://www.gstatic.com/generate_204',
+    url = DEFAULT_LATENCY_TEST_URL,
     timeoutMs = 5_000
   ): Promise<ProxyLatencyResult> {
     const normalizedName = normalizeControllerIdentifier(proxyName, 'proxy name')
     const testUrl = normalizeLatencyUrl(url)
     const timeout = Math.max(250, Math.min(30_000, Math.floor(timeoutMs)))
-    const query = new URLSearchParams({ url: testUrl, timeout: String(timeout) })
-    const payload = await this.controllerRequest(
-      `/proxies/${encodeURIComponent(normalizedName)}/delay?${query.toString()}`
-    )
-    const delay = isRecord(payload) ? nonNegativeInteger(payload.delay, -1) : -1
-    if (delay < 0) throw new SingBoxServiceError('controller_request', 'sing-box did not return a valid latency result.')
-    return { proxyName: normalizedName, delayMs: delay, testedAt: this.now() }
+    const measure = async (): Promise<number> => {
+      const query = new URLSearchParams({ url: testUrl, timeout: String(timeout) })
+      const payload = await this.controllerRequest(
+        `/proxies/${encodeURIComponent(normalizedName)}/delay?${query.toString()}`
+      )
+      const delay = isRecord(payload) ? nonNegativeInteger(payload.delay, -1) : -1
+      if (delay < 0) {
+        throw new SingBoxServiceError('controller_request', 'sing-box did not return a valid latency result.')
+      }
+      return delay
+    }
+
+    // The first request pays DNS/connection setup costs and is intentionally
+    // discarded. Subsequent samples stay sequential so they do not compete
+    // with one another for the same outbound connection.
+    await measure()
+    const samples: number[] = []
+    for (let index = 0; index < LATENCY_SAMPLE_COUNT; index += 1) samples.push(await measure())
+    samples.sort((left, right) => left - right)
+    return {
+      proxyName: normalizedName,
+      delayMs: samples[Math.floor(samples.length / 2)],
+      testedAt: this.now()
+    }
   }
 
   private async startAttempt(request: NormalizedStartRequest): Promise<SingBoxRuntimeState> {
@@ -375,13 +521,21 @@ export class SingBoxService {
 
     let mixedLease: LoopbackPortLease | undefined
     let controllerLease: LoopbackPortLease | undefined
+    // A replacement must bind independently while the route using the prior
+    // process drains. Reusing its persisted listener would force us to kill the
+    // old generation before the new one is healthy.
+    const parallelStart = this.childContexts.size > 0
     try {
       mixedLease = await this.acquirePort(
-        request.mixedPort,
+        parallelStart ? 0 : request.mixedPort,
         'mixed_port',
         request.allowLan ? '0.0.0.0' : LOOPBACK_HOST
       )
-      controllerLease = await this.acquirePort(request.controllerPort, 'controller_port', LOOPBACK_HOST)
+      controllerLease = await this.acquirePort(
+        parallelStart ? 0 : request.controllerPort,
+        'controller_port',
+        LOOPBACK_HOST
+      )
     } catch (error) {
       await mixedLease?.release().catch(() => undefined)
       await controllerLease?.release().catch(() => undefined)
@@ -404,7 +558,9 @@ export class SingBoxService {
       await Promise.allSettled([mixedLease.release(), controllerLease.release()])
       return this.failStart(new SingBoxServiceError('start_failed', 'Controller secret generation failed.'))
     }
-    this.controllerSecret = secret
+    const configPath = parallelStart
+      ? `${this.runtimeConfigPath}.${process.pid}.${++this.launchSequence}`
+      : this.runtimeConfigPath
     const config = buildRuntimeConfiguration(
       request.config,
       mixedLease.port,
@@ -414,11 +570,11 @@ export class SingBoxService {
     )
 
     try {
-      await writeRuntimeConfig(this.runtimeConfigPath, config)
-      await this.checkConfiguration(runtime)
+      await writeRuntimeConfig(configPath, config)
+      await this.checkConfiguration(runtime, configPath)
     } catch (error) {
       await Promise.allSettled([mixedLease.release(), controllerLease.release()])
-      await this.removeRuntimeConfig()
+      await this.removeRuntimeConfig(configPath)
       const failure = error instanceof SingBoxServiceError
         ? error
         : new SingBoxServiceError('check_failed', 'sing-box configuration validation failed.', { cause: error })
@@ -428,7 +584,7 @@ export class SingBoxService {
     try {
       await Promise.all([mixedLease.release(), controllerLease.release()])
     } catch (error) {
-      await this.removeRuntimeConfig()
+      await this.removeRuntimeConfig(configPath)
       return this.failStart(new SingBoxServiceError('start_failed', 'Unable to release reserved loopback ports.', {
         cause: error
       }))
@@ -436,15 +592,25 @@ export class SingBoxService {
     const env = runtimeEnvironment(runtime.runtimePath, this.platform, this.environment)
     let context: RunningChildContext | undefined
     try {
-      const child = this.spawnProcess(runtime.executablePath, ['run', '-c', this.runtimeConfigPath], {
+      const child = this.spawnProcess(runtime.executablePath, ['run', '-c', configPath], {
         cwd: runtime.runtimePath,
         env,
         windowsHide: true,
         detached: this.platform !== 'win32',
         stdio: ['ignore', 'pipe', 'pipe']
       })
-      context = { child, ready: false, intentional: false }
-      this.childContext = context
+      context = {
+        child,
+        ready: false,
+        intentional: false,
+        generation: this.nextGeneration++,
+        configPath,
+        controllerSecret: secret,
+        mixedPort: mixedLease.port,
+        controllerPort: controllerLease.port,
+      }
+      this.startingContext = context
+      this.childContexts.add(context)
       this.attachChild(context)
       await waitForProcessSpawn(child)
       this.setState({
@@ -456,23 +622,39 @@ export class SingBoxService {
       })
       await this.waitUntilHealthy(context, controllerLease.port, mixedLease.port, secret)
       context.ready = true
+      if (this.startingContext !== context || context.child.exitCode !== null || context.child.signalCode !== null) {
+        throw new SingBoxServiceError('health_check', 'sing-box exited before its generation could be activated.')
+      }
+      this.startingContext = undefined
+      this.childContext = context
       this.setState({
         status: 'ready',
-        generation: this.state.generation + 1,
+        generation: context.generation,
         startedAt: this.now(),
         restartAttempt: this.state.restartAttempt,
         error: undefined
       })
       this.previousTraffic = undefined
       this.seenConnectionIds.clear()
+      this.totalConnectionCount = 0
       return this.getState()
     } catch (error) {
       if (context) {
         context.intentional = true
+        if (this.startingContext === context) this.startingContext = undefined
         if (this.childContext === context) this.childContext = undefined
-        await this.terminateProcess(context.child, this.platform).catch(() => undefined)
+        try {
+          await this.stopContext(context)
+        } catch (cleanupError) {
+          return this.failStart(new SingBoxServiceError(
+            'start_failed',
+            'sing-box failed to start and its process could not be cleaned up.',
+            { cause: cleanupError },
+          ))
+        }
+      } else {
+        await this.removeRuntimeConfig(configPath)
       }
-      await this.removeRuntimeConfig()
       return this.failStart(asServiceError(error, 'start_failed', 'sing-box failed to start.'))
     }
   }
@@ -498,9 +680,9 @@ export class SingBoxService {
     }
   }
 
-  private async checkConfiguration(runtime: VerifiedSingBoxRuntime): Promise<void> {
+  private async checkConfiguration(runtime: VerifiedSingBoxRuntime, configPath: string): Promise<void> {
     try {
-      await this.execute(runtime.executablePath, ['check', '-c', this.runtimeConfigPath], {
+      await this.execute(runtime.executablePath, ['check', '-c', configPath], {
         cwd: runtime.runtimePath,
         env: runtimeEnvironment(runtime.runtimePath, this.platform, this.environment),
         timeoutMs: 15_000
@@ -537,31 +719,97 @@ export class SingBoxService {
   ): Promise<void> {
     const attempts = Math.max(1, Math.ceil(this.healthTimeoutMs / this.healthIntervalMs))
     const deadline = Date.now() + this.healthTimeoutMs
-    let lastError: unknown
+    let controllerVerified = false
+    let lastControllerError: unknown
+    let lastMixedError: unknown
     for (let attempt = 0; attempt < attempts; attempt += 1) {
-      if (this.childContext !== context || context.child.exitCode !== null || context.child.signalCode !== null) {
-        throw new SingBoxServiceError('health_check', 'sing-box exited before its loopback endpoints became ready.')
+      this.assertHealthCandidateAlive(context)
+      const controllerRemainingMs = deadline - Date.now()
+      if (controllerRemainingMs <= 0) break
+
+      let version: unknown
+      try {
+        version = await this.controllerRequestAt(controllerPort, secret, '/version', {
+          signal: AbortSignal.timeout(controllerRemainingMs)
+        })
+      } catch (error) {
+        if (error instanceof SingBoxControllerStatusError) {
+          throw new SingBoxServiceError(
+            'health_check',
+            'sing-box loopback controller rejected the authenticated startup health check.',
+            { cause: error }
+          )
+        }
+        lastControllerError = error
+        if (attempt + 1 >= attempts || !await this.waitForHealthRetry(context, deadline)) break
+        continue
+      }
+
+      this.assertHealthCandidateAlive(context)
+      if (Date.now() >= deadline) {
+        lastControllerError = new Error('Controller health response arrived at or after the startup deadline.')
+        break
+      }
+      // A responding listener with the wrong identity/version cannot become
+      // the verified bundled process on a later retry. Fail closed now rather
+      // than probing an unknown mixed listener.
+      assertControllerVersion(version)
+      controllerVerified = true
+
+      const mixedRemainingMs = deadline - Date.now()
+      if (mixedRemainingMs <= 0) {
+        lastMixedError = new Error('No startup time remained for the mixed listener health check.')
+        break
       }
       try {
-        const remainingMs = Math.max(1, deadline - Date.now())
-        const version = await this.controllerRequestAt(controllerPort, secret, '/version', {
-          signal: AbortSignal.timeout(remainingMs)
-        })
-        assertControllerVersion(version)
-        await this.probeTcp(LOOPBACK_HOST, mixedPort, Math.max(1, Math.min(1_000, deadline - Date.now())))
-        return
+        // TCP accept is intentionally sufficient here. Sending a proxy request
+        // would make readiness depend on a node, DNS, PAC, or TUN path and can
+        // itself create a bootstrap loop.
+        await this.probeTcp(LOOPBACK_HOST, mixedPort, Math.min(1_000, mixedRemainingMs))
       } catch (error) {
-        lastError = error
+        lastMixedError = error
+        if (attempt + 1 >= attempts || !await this.waitForHealthRetry(context, deadline)) break
+        continue
       }
-      if (attempt + 1 < attempts && Date.now() < deadline) {
-        await this.sleep(Math.min(this.healthIntervalMs, Math.max(0, deadline - Date.now())))
+
+      this.assertHealthCandidateAlive(context)
+      if (Date.now() >= deadline) {
+        lastMixedError = new Error('Mixed listener health response arrived at or after the startup deadline.')
+        break
       }
+      return
+    }
+
+    if (controllerVerified) {
+      throw new SingBoxServiceError(
+        'health_check',
+        'sing-box mixed loopback listener did not become healthy before the startup deadline.',
+        { cause: lastMixedError ?? lastControllerError }
+      )
     }
     throw new SingBoxServiceError(
       'health_check',
-      'sing-box did not make both loopback endpoints healthy before the startup deadline.',
-      { cause: lastError }
+      'sing-box authenticated loopback controller did not become healthy before the startup deadline.',
+      { cause: lastControllerError }
     )
+  }
+
+  private assertHealthCandidateAlive(context: RunningChildContext): void {
+    if (
+      (this.startingContext !== context && this.childContext !== context)
+      || context.child.exitCode !== null
+      || context.child.signalCode !== null
+    ) {
+      throw new SingBoxServiceError('health_check', 'sing-box exited before its loopback endpoints became ready.')
+    }
+  }
+
+  private async waitForHealthRetry(context: RunningChildContext, deadline: number): Promise<boolean> {
+    const remainingMs = deadline - Date.now()
+    if (remainingMs <= 0) return false
+    await this.sleep(Math.min(this.healthIntervalMs, remainingMs))
+    this.assertHealthCandidateAlive(context)
+    return Date.now() < deadline
   }
 
   private attachChild(context: RunningChildContext): void {
@@ -579,14 +827,37 @@ export class SingBoxService {
     code: number | null,
     signal: NodeJS.Signals | null
   ): void {
-    if (this.childContext === context) this.childContext = undefined
+    const wasActive = this.childContext === context
+    if (wasActive) this.childContext = undefined
+    if (this.startingContext === context) this.startingContext = undefined
+    this.childContexts.delete(context)
+    this.generationReferences.delete(context.generation)
+    void this.removeRuntimeConfig(context.configPath)
     if (context.intentional || !context.ready || !this.state.desiredEnabled || this.closed || this.closing) return
 
     const exit = exitDescription(code, signal)
     const error = new SingBoxServiceError('unexpected_exit', `sing-box exited unexpectedly (${exit}).`)
-    this.setState({ status: 'error', pid: undefined, startedAt: undefined, error: runtimeError(error) })
-    this.emit({ type: 'crash', state: this.getState(), exit })
-    this.scheduleRestart()
+    if (wasActive) {
+      this.setState({ status: 'error', pid: undefined, startedAt: undefined, error: runtimeError(error) })
+    }
+    // Emit exits for every healthy retained generation, not just childContext.
+    // During a parallel replacement childContext is the candidate while the
+    // published Chromium route still owns the prior process.
+    const state = wasActive
+      ? this.getState()
+      : {
+          ...this.getState(),
+          generation: context.generation,
+          status: 'error' as const,
+          pid: undefined,
+          mixedPort: context.mixedPort,
+          mixedEndpoint: `http://${LOOPBACK_HOST}:${context.mixedPort}`,
+          controllerPort: context.controllerPort,
+          startedAt: undefined,
+          error: runtimeError(error),
+        }
+    this.emit({ type: 'crash', state, generation: context.generation, exit })
+    if (wasActive) this.scheduleRestart()
   }
 
   private scheduleRestart(): void {
@@ -622,11 +893,26 @@ export class SingBoxService {
     this.cancelRestart()
     this.setDesiredEnabled(false)
     this.lastRequest = undefined
-    if (this.childContext) await this.stopChild(true)
-    else await this.removeRuntimeConfig()
-    this.controllerSecret = undefined
+    const contexts = [...this.childContexts]
+    if (contexts.length > 0) this.setState({ status: 'stopping', error: undefined })
+    const results = await Promise.allSettled(contexts.map((context) => this.stopContext(context)))
+    const failed = results.find((result): result is PromiseRejectedResult => result.status === 'rejected')
+    if (failed) {
+      const failure = new SingBoxServiceError(
+        'stop_failed',
+        'One or more sing-box process generations could not be stopped safely.',
+        { cause: failed.reason },
+      )
+      this.setState({ status: 'error', error: runtimeError(failure) })
+      throw failure
+    }
+    this.childContext = undefined
+    this.startingContext = undefined
+    this.generationReferences.clear()
+    await this.removeRuntimeConfig(this.runtimeConfigPath)
     this.previousTraffic = undefined
     this.seenConnectionIds.clear()
+    this.totalConnectionCount = 0
     this.setState({
       status: 'idle',
       target: undefined,
@@ -641,18 +927,25 @@ export class SingBoxService {
     return this.getState()
   }
 
-  private async stopChild(publishStopping: boolean): Promise<void> {
-    const context = this.childContext
-    if (!context) return
-    if (publishStopping) this.setState({ status: 'stopping', error: undefined })
+  private async stopContext(context: RunningChildContext): Promise<void> {
+    if (!this.childContexts.has(context)) {
+      await this.removeRuntimeConfig(context.configPath)
+      return
+    }
     context.intentional = true
-    this.childContext = undefined
-    await this.terminateProcess(context.child, this.platform)
-    await this.removeRuntimeConfig()
+    await rejectAfter(
+      this.terminateProcess(context.child, this.platform),
+      this.terminationTimeoutMs,
+      `Timed out while stopping sing-box generation ${context.generation}.`,
+    )
+    this.childContexts.delete(context)
+    this.generationReferences.delete(context.generation)
+    if (this.childContext === context) this.childContext = undefined
+    if (this.startingContext === context) this.startingContext = undefined
+    await this.removeRuntimeConfig(context.configPath)
   }
 
   private failStart(error: SingBoxServiceError): never {
-    this.controllerSecret = undefined
     this.setState({ status: 'error', pid: undefined, startedAt: undefined, error: runtimeError(error) })
     throw error
   }
@@ -670,11 +963,11 @@ export class SingBoxService {
       this.state.status !== 'ready'
       || !this.childContext?.ready
       || !this.state.controllerPort
-      || !this.controllerSecret
+      || !this.childContext.controllerSecret
     ) {
       throw new SingBoxServiceError('not_ready', 'The built-in proxy core is not ready.')
     }
-    return this.controllerRequestAt(this.state.controllerPort, this.controllerSecret, path, init)
+    return this.controllerRequestAt(this.state.controllerPort, this.childContext.controllerSecret, path, init)
   }
 
   private async controllerRequestAt(
@@ -699,7 +992,7 @@ export class SingBoxService {
     }
     if (!response.ok) {
       await response.body?.cancel().catch(() => undefined)
-      throw new SingBoxServiceError('controller_request', `sing-box controller returned status ${response.status}.`)
+      throw new SingBoxControllerStatusError(response.status)
     }
     if (response.status === 204 || response.headers.get('content-length') === '0') return undefined
     try {
@@ -741,8 +1034,8 @@ export class SingBoxService {
     if (this.closed || this.closing) throw new SingBoxServiceError('closed', 'The sing-box service is closed.')
   }
 
-  private async removeRuntimeConfig(): Promise<void> {
-    await rm(this.runtimeConfigPath, { force: true }).catch(() => undefined)
+  private async removeRuntimeConfig(path: string): Promise<void> {
+    await rm(path, { force: true }).catch(() => undefined)
   }
 }
 
@@ -1017,6 +1310,21 @@ function sanitizeRestartDelays(values: readonly number[]): readonly number[] {
     .filter((value) => Number.isFinite(value) && value >= 0)
     .map((value) => Math.floor(value))
     .slice(0, 10)
+}
+
+async function rejectAfter<T>(operation: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), timeoutMs)
+        timer.unref?.()
+      }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
 }
 
 function sanitizeProcessFailure(error: unknown): string {
