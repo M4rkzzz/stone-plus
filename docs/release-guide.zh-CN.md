@@ -109,6 +109,119 @@ if ($commitObject.author.login -ne 'M4rkzzz') { throw 'Unexpected release mainta
 GitHub Secrets 和本文基线；发布一个 prerelease 完成签名、时间戳、下载后校验和与 provenance 验证后，
 才能把新证书用于正式版。旧 Release 保留原证书、原指纹和原校验和，不得覆盖。
 
+### 2.3 受保护源码身份门与许可证分布检查
+
+从 `v0.9.6` 起，以下文件共同组成 StonePlus 的受保护源码身份门。它们不是可选说明文件；发布前必须
+逐项确认仍存在、内容互相一致，并且已进入 StonePlus 完整源码归档。任何一项缺失、摘要不一致或被
+绕过都必须阻断发布。
+
+#### `PROJECT_IDENTITY.json`
+
+该文件是机器可读的官方身份基线，至少必须准确记录：
+
+- 官方仓库 `M4rkzzz/stone-plus`、GitHub 所有者和 canonical URL；
+- 授权维护者及允许的 GitHub 仓库权限；
+- 授权提交与标签签名邮箱；
+- StonePlus 主许可证名称、文件路径和 SHA-256；
+- Windows Authenticode CER 路径、SHA-1 Thumbprint 和 DER SHA-256；
+- Release provenance 工作流、attestation 要求及 `SHA256SUMS` 文件名；
+- 首个 Source Available 版本和历史许可证边界。
+
+修改许可证、证书、仓库、维护者、签名邮箱或 provenance 工作流时，必须同步更新此文件及所有引用
+文档。发布前不允许通过临时跳过字段、放宽权限或改写摘要来让验证“变绿”。
+
+#### `scripts/verify-maintainer.mjs`
+
+`npm run identity:verify` 调用该脚本，并且必须同时完成：
+
+1. 读取当前 GitHub CLI 登录用户，确认属于授权维护者；
+2. 查询其对规范仓库的 `ADMIN`、`MAINTAIN` 或 `WRITE` 权限；
+3. 确认 `origin` 指向 `PROJECT_IDENTITY.json` 中的 canonical repository；
+4. 重新计算根 `LICENSE`、许可证镜像和 Windows CER 摘要；
+5. 核对许可证边界、签名配置和 provenance 配置；
+6. 只有全部通过时返回 `"verified": true`。
+
+这既是人工发布门，也是仓库内 AI 编辑门。官方维护者使用 Codex、Claude Code、Gemini CLI、Copilot
+或其他自动化编辑器前，必须先执行：
+
+```powershell
+npm run identity:verify
+```
+
+只有输出 `"verified": true` 才允许继续编辑。仓库名称、目录名称、口头声明、Fork 所有者身份或复制的
+身份文件本身都不能替代在线 GitHub 身份和权限验证。发布质量门必须再次运行该命令，不能只依赖开发
+会话开始时的一次结果。
+
+#### `.github/CODEOWNERS`
+
+根规则和显式关键路径必须把审核责任指向 `@M4rkzzz`。至少覆盖：
+
+- `PROJECT_IDENTITY.json`、根许可证、许可证边界和 `LICENSES/`；
+- `NOTICE`、`MODIFICATIONS.md`、`THIRD_PARTY_NOTICES.md`、`SOURCE_ACCESS.md`；
+- `TRADEMARKS.md`、`AI_USAGE_POLICY.md`；
+- `AGENTS.md`、`CLAUDE.md`、`GEMINI.md`、Copilot instructions；
+- `.github/workflows/`、`scripts/verify-maintainer.mjs`、`build/signing/`；
+- `package.json`、lockfile 以及应用的 main、preload 和 renderer 关键入口。
+
+发布前检查 CODEOWNERS 不能只确认文件存在，还要确认 `@M4rkzzz` 没有被删除、被更宽泛的后置规则
+覆盖，或将法律、品牌、身份和发布路径交给未知账号。
+
+#### AI 工具入口文件
+
+以下四个入口必须同时要求编辑前阅读许可证、身份和 AI 使用政策，并执行
+`npm run identity:verify`：
+
+- `AGENTS.md`；
+- `CLAUDE.md`；
+- `GEMINI.md`；
+- `.github/copilot-instructions.md`。
+
+发布前统一检查：
+
+```powershell
+$agentFiles = @(
+  'AGENTS.md', 'CLAUDE.md', 'GEMINI.md', '.github/copilot-instructions.md'
+)
+foreach ($file in $agentFiles) {
+  if (-not (Select-String -LiteralPath $file -SimpleMatch 'npm run identity:verify' -Quiet)) {
+    throw "$file no longer requires identity verification"
+  }
+}
+```
+
+#### 多处许可证与来源声明
+
+以下位置必须继续公开且互相一致地说明 Source Available 许可证、历史许可边界、第三方归属、品牌限制
+和官方来源，不能只在根 `LICENSE` 中出现一次：
+
+- `README.md` 与 `README.en.md`；
+- `SECURITY.md`；
+- `NOTICE`；
+- `SOURCE_ACCESS.md`；
+- `TRADEMARKS.md`；
+- `AI_USAGE_POLICY.md`；
+- `LICENSES/LicenseRef-StonePlus-Source-Available-1.0.txt`；
+- `REUSE.toml`；
+- Release Note、完整源码归档和安装包 resources。
+
+根 `LICENSE` 与 `LICENSES/LicenseRef-StonePlus-Source-Available-1.0.txt` 必须字节完全一致，且 SHA-256
+等于 `PROJECT_IDENTITY.json.license.sha256`。继承的 Apache、AGPL、GPL 及其他第三方材料必须继续
+保留各自文件和 NOTICE，不得被 StonePlus 自定义许可证覆盖。
+
+#### 安装包 resources
+
+`package.json.build.extraResources` 必须把关键法律和身份文件复制进安装包 resources。至少包括：
+
+- `LICENSE`、`LICENSE_BOUNDARY.md`、`NOTICE`、`MODIFICATIONS.md`；
+- `THIRD_PARTY_NOTICES.md`、`SOURCE_ACCESS.md`、`TRADEMARKS.md`；
+- `AI_USAGE_POLICY.md`、`PROJECT_IDENTITY.json`；
+- Source Available、Apache、AGPL、GPL、sing-box 和 libcronet 的许可证材料；
+- `SOURCE_OFFER-sing-box.md` 及随包第三方组件需要的声明。
+
+不能以“仓库里有”为理由跳过安装包验收。Windows unpacked resources 检查见本文 4.4；其他平台由
+原生 runner 的打包产物和 Release 源码/资产门共同验证。正式发布记录必须明确写出身份门、CODEOWNERS、
+四个 AI 入口、许可证镜像和安装包 resources 均已验收。
+
 macOS 应用为 ad-hoc 签名且未经过 Apple 公证。上游 sing-box Mach-O 必须保持原始
 字节，`package.json` 中的 `mac.signIgnore` 不得在没有同步调整完整性设计的情况下移除。
 
@@ -753,6 +866,9 @@ gh api "repos/M4rkzzz/stone-plus/attestations/sha256:$assetDigest" `
 - provenance 覆盖数量；
 - StonePlus 完整源码归档、sing-box 对应源码归档名称和 digest；
 - Source Available 1.0、历史 Apache/AGPL、第三方 NOTICE、SOURCE_ACCESS 和品牌隔离验收结果；
+- `PROJECT_IDENTITY.json`、维护者权限、canonical remote、许可证/CER 摘要、CODEOWNERS、四个 AI
+  编辑入口、许可证多处声明和安装包 resources 的身份门验收结果；
+- GitHub 文件列表中主要目录与根文件右侧均显示本次版本号的检查结果；
 - 已知限制与任何不阻断的警告。
 
 只有以上线上验收全部完成，才能宣布 Release 完成。
