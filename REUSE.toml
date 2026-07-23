@@ -1,0 +1,18 @@
+version = 1
+
+[[annotations]]
+path = [
+  "REUSE.toml",
+  "PROJECT_IDENTITY.json",
+  "LICENSE_BOUNDARY.md",
+  "AGENTS.md",
+  "AI_USAGE_POLICY.md",
+  "CLAUDE.md",
+  "GEMINI.md",
+  ".github/CODEOWNERS",
+  ".github/copilot-instructions.md",
+  "scripts/verify-maintainer.mjs",
+]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 StonePlus Contributors"
+SPDX-License-Identifier = "LicenseRef-StonePlus-Source-Available-1.0"

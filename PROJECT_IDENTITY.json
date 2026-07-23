@@ -1,0 +1,48 @@
+{
+  "schemaVersion": 1,
+  "project": "StonePlus",
+  "productName": "Stone+",
+  "canonicalRepository": "https://github.com/M4rkzzz/stone-plus",
+  "githubRepository": "M4rkzzz/stone-plus",
+  "githubOwner": "M4rkzzz",
+  "authorizedMaintainers": ["M4rkzzz"],
+  "authorizedSigningEmails": ["221565539+M4rkzzz@users.noreply.github.com"],
+  "acceptedRepositoryPermissions": ["ADMIN", "MAINTAIN", "WRITE"],
+  "license": {
+    "name": "StonePlus Source Available License 1.0",
+    "spdxReference": "LicenseRef-StonePlus-Source-Available-1.0",
+    "primaryFile": "LICENSE",
+    "mirrorFile": "LICENSES/LicenseRef-StonePlus-Source-Available-1.0.txt",
+    "sha256": "991dec5dbeef6daa5ba64687cbdb4d941deab6a6f79684636b8c0f3f93c84dd4"
+  },
+  "licenseBoundary": {
+    "firstSourceAvailableVersion": "0.9.6",
+    "lastHistoricalReleaseTag": "v0.9.5",
+    "policyFile": "LICENSE_BOUNDARY.md"
+  },
+  "signing": {
+    "commits": {
+      "githubVerifiedRequiredForRelease": true
+    },
+    "tags": {
+      "annotated": true,
+      "githubVerifiedSignatureRequired": true
+    },
+    "windowsAuthenticode": {
+      "certificateFile": "build/signing/StonePlus-CodeSigning.cer",
+      "sha1Thumbprint": "FAA66B5891F1ACD270F2BD7232663EB7D0D9EC3D",
+      "sha256": "f4ccc82f3ade7eb06f76e55afce698179b37f299fb75ad70e5cec32e0740ca05"
+    },
+    "releaseProvenance": {
+      "workflow": ".github/workflows/release.yml",
+      "githubArtifactAttestationRequired": true,
+      "checksumFile": "SHA256SUMS"
+    }
+  },
+  "verification": {
+    "command": "npm run identity:verify",
+    "requiresAuthenticatedGitHubCli": true,
+    "requiresCanonicalRemote": true,
+    "requiresWritePermissionOnCanonicalRepository": true
+  }
+}

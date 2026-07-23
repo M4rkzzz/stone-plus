@@ -1,0 +1,119 @@
+name: Bug report / Bug 报告
+description: Report a reproducible Stone+ problem without exposing credentials / 报告可复现问题，请勿暴露凭据
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve Stone+. Before submitting, remove all API keys, tokens, passwords, cookies, session JSON, account IDs, route tokens, private URLs, database files, prompts, and model responses.
+
+        感谢帮助改进 Stone+。提交前，请移除所有 API Key、Token、密码、Cookie、session JSON、account ID、路由 Token、私有 URL、数据库文件、提示词和模型回复。
+
+        **Security vulnerabilities must not be reported here. Use [GitHub Private Vulnerability Reporting](https://github.com/M4rkzzz/stone-plus/security/advisories/new). / 安全漏洞请使用 GitHub 私密漏洞报告，禁止在此公开细节。**
+
+  - type: input
+    id: stone-version
+    attributes:
+      label: Stone+ version / Stone+ 版本
+      description: Find it in Settings or the application About row / 可在设置页底部查看
+      placeholder: "0.8.1"
+    validations:
+      required: true
+
+  - type: input
+    id: os-version-arch
+    attributes:
+      label: Platform, OS version, and architecture / 平台、系统版本与架构
+      description: Do not include your computer name or user name / 不要包含计算机名或用户名
+      placeholder: "Windows 11 24H2, x64 / macOS 15, arm64 / Ubuntu 24.04, x64"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: installation-type
+    attributes:
+      label: Installation type / 安装形式
+      options:
+        - Windows NSIS installer / Windows 安装版
+        - Windows Portable
+        - macOS dmg
+        - macOS zip
+        - Linux AppImage
+        - Linux deb
+        - Development from source / 源码开发运行
+        - Other / 其他
+    validations:
+      required: true
+
+  - type: dropdown
+    id: affected-area
+    attributes:
+      label: Affected area / 受影响功能
+      options:
+        - Providers and accounts / 供应商与账号
+        - Model discovery or model test / 模型发现或模型测试
+        - Account pools and scheduling / 号池与调度
+        - Gateway or protocol conversion / 网关或协议转换
+        - HTTP(S) or SOCKS proxy / HTTP(S) 或 SOCKS 代理
+        - Quota and usage charts / 额度与使用量图表
+        - Client routes or configuration / 客户端路由或配置
+        - Backup and restore / 备份与恢复
+        - Application update / 应用更新
+        - Desktop UI / 桌面界面
+        - Other / 其他
+    validations:
+      required: true
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Actual and expected behavior / 实际与预期行为
+      description: Describe what Stone+ displayed, what you expected, and when it started / 描述 Stone+ 的实际表现、预期结果及开始出现的时间
+      placeholder: |
+        Actual / 实际：After clicking ..., Stone+ shows ...
+        Expected / 预期：Stone+ should ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce / 复现步骤
+      description: Use dummy model, provider, account, and token values / 使用虚拟模型、供应商、账号和 Token
+      placeholder: |
+        1. Open ...
+        2. Configure ... with example.invalid and a redacted credential
+        3. Click ...
+        4. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Redacted diagnostics / 已脱敏诊断信息
+      description: Paste only the Settings > Copy diagnostic report output or a short, reviewed log excerpt. Never upload a Stone+ database or backup. / 仅粘贴“设置 > 复制诊断报告”的输出或经过检查的短日志片段，禁止上传 Stone+ 数据库或备份。
+      render: shell
+      placeholder: "Paste reviewed and redacted diagnostics here. / 在此粘贴已检查并脱敏的诊断信息。"
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional context / 补充信息
+      description: Screenshots are optional. Blur account names, email addresses, paths, proxy details, egress IPs, and tokens first. / 截图可选；请先遮盖账号名、邮箱、路径、代理信息、出口 IP 和 Token。
+
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Safety checklist / 安全确认
+      options:
+        - label: I searched existing Issues and tested the latest stable release, or explained why I could not. / 我已搜索现有 Issue，并测试最新版或说明无法测试的原因。
+          required: true
+        - label: I removed API keys, tokens, passwords, cookies, session JSON, account IDs, route tokens, private URLs, and personal information. / 我已移除 Key、Token、密码、Cookie、session JSON、account ID、路由 Token、私有 URL 和个人信息。
+          required: true
+        - label: I did not attach a Stone+ database, backup, credential file, prompt, or model response. / 我没有附加 Stone+ 数据库、备份、凭据文件、提示词或模型回复。
+          required: true
+        - label: This is not a security vulnerability. / 这不是安全漏洞。
+          required: true

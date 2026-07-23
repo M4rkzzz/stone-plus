@@ -1,0 +1,112 @@
+# Dependencies and package-manager caches
+node_modules/
+.npm/
+.pnpm-store/
+
+# Compiled output and release artifacts
+/out/
+/dist/
+/dist-*/
+/release/
+/release-*/
+/coverage/
+/.artifacts/
+/playwright-report/
+/test-results/
+/blob-report/
+*.tsbuildinfo
+
+# Local Stone state and imported account credentials
+/accents/
+/AINX_BATCH_*.zip
+/user-data/
+/userdata/
+/client-config-home/
+/backups/
+/stone-state.json*
+/stone-state.sqlite3*
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+
+# Local AI client state
+/.claude/
+/.codex/
+/.gemini/
+/auth.json
+/credentials.json
+/secrets.json
+/token.json
+
+# Environment files and signing material
+.env
+.env.*
+!.env.example
+!.env.*.example
+/.npmrc
+*.key
+*.pem
+*.crt
+*.cer
+*.der
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.keychain-db
+*.mobileprovision
+*.provisionprofile
+!/build/signing/
+!/build/signing/StonePlus-CodeSigning.cer
+
+# Logs, temporary files and crash reports
+*.log
+*.tmp
+*.temp
+*.bak
+*.backup
+*.dmp
+*.crash
+*.pid
+*.pid.lock
+*.orig
+*.rej
+*.swp
+*.swo
+*~
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.cache/
+.vite/
+.vitest/
+.eslintcache
+/tmp/
+/temp/
+/crashpad/
+
+# Downloaded sing-box runtimes are verified build inputs, not source files.
+/build/sing-box/*/
+
+# Local promotion metrics, automation state and unpublished drafts
+/.promo/
+
+# IDE and editor state
+/.idea/
+/.vscode/
+/.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Operating-system metadata
+.DS_Store
+._*
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/

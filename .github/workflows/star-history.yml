@@ -1,0 +1,53 @@
+name: Update star history
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/star-history.yml'
+      - 'scripts/generate-star-history.mjs'
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: stone-star-history
+  cancel-in-progress: false
+
+jobs:
+  update:
+    name: Refresh chart
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Generate chart
+        run: node scripts/generate-star-history.mjs
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Commit chart when star data changed
+        shell: bash
+        run: |
+          if git diff --quiet -- docs/star-history.svg; then
+            echo 'Star history is already current.'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add docs/star-history.svg
+          git commit -m 'docs: refresh star history [skip ci]'
+          git push origin HEAD:main

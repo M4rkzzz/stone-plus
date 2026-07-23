@@ -1,0 +1,99 @@
+name: Feature request / 功能建议
+description: Propose a focused improvement for Stone+ / 提出明确、可落地的 Stone+ 改进建议
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the workflow and outcome you need. Do not include real credentials, account data, private endpoints, database files, prompts, or model responses.
+
+        请描述需要解决的工作流和目标。不要包含真实凭据、账号资料、私有端点、数据库文件、提示词或模型回复。
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Feature area / 功能领域
+      options:
+        - Providers and accounts / 供应商与账号
+        - Model discovery and testing / 模型发现与测试
+        - Account pools and scheduling / 号池与调度
+        - Gateway and protocol conversion / 网关与协议转换
+        - Proxies and networking / 代理与网络
+        - Quota and observability / 额度与可观测性
+        - Client routes and configuration / 客户端路由与配置
+        - Backup, restore, and local data / 备份、恢复与本地数据
+        - Application update and release / 应用更新与发布
+        - Desktop UI and accessibility / 桌面界面与可访问性
+        - Other / 其他
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or workflow / 问题或工作流
+      description: Explain what is difficult today and who encounters it / 说明当前困难以及受影响的用户
+      placeholder: "When managing ..., I need to ..., but currently ... / 管理……时，我需要……，但目前……"
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior / 建议方案
+      description: Describe observable behavior rather than only visual styling / 描述可观察的功能行为，而不只是视觉样式
+      placeholder: "Stone+ could ... / Stone+ 可以……"
+    validations:
+      required: true
+
+  - type: textarea
+    id: example
+    attributes:
+      label: Example user flow / 示例流程
+      placeholder: |
+        1. The user opens ...
+        2. The user selects ...
+        3. Stone+ ...
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered / 已考虑的替代方案
+      description: Include current workarounds and their limitations / 说明当前临时解决方案或替代做法及其局限
+
+  - type: dropdown
+    id: platform-scope
+    attributes:
+      label: Platform scope / 平台范围
+      options:
+        - All platforms / 全平台
+        - Windows
+        - macOS
+        - Linux
+        - Not platform-specific / 与平台无关
+        - Unsure / 不确定
+    validations:
+      required: true
+
+  - type: textarea
+    id: privacy-security
+    attributes:
+      label: Privacy and security considerations / 隐私与安全考虑
+      description: Could this feature read credentials, account metadata, network traffic, client files, or external services? Use hypothetical examples only. / 此功能是否会读取凭据、账号元数据、网络流量、客户端文件或外部服务？仅使用虚拟示例。
+      placeholder: "No additional sensitive data / 该功能不新增敏感数据，或说明需要的安全边界"
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Checklist / 确认
+      options:
+        - label: I searched existing Issues and did not find the same request. / 我已搜索现有 Issue，没有发现相同建议。
+          required: true
+        - label: I removed all real credentials, account data, private URLs, personal information, prompts, and model responses. / 我已移除所有真实凭据、账号资料、私有 URL、个人信息、提示词和模型回复。
+          required: true
+        - label: I understand security vulnerabilities must use Private Vulnerability Reporting instead of this form. / 我了解安全漏洞必须通过 Private Vulnerability Reporting 报告，不能使用本表单。
+          required: true

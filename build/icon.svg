@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <clipPath id="stone-app-shape">
+      <rect x="48" y="48" width="928" height="928" rx="232"/>
+    </clipPath>
+    <clipPath id="stone-rock-shape">
+      <path d="M206 706c-28-46-22-110 8-158l88-160c27-50 69-88 120-110l125-54c37-16 81-7 108 24l89 99c26 29 46 64 57 102l46 161c15 51-6 106-51 136l-89 61c-32 22-70 33-109 33H357c-51 0-99-25-128-67Z"/>
+    </clipPath>
+  </defs>
+  <g clip-path="url(#stone-app-shape)">
+    <rect x="48" y="48" width="928" height="928" fill="#1c4e40"/>
+    <path d="M48 48h928v238L756 406 536 270 292 376 48 270Z" fill="#286c5c"/>
+    <path d="M540 976h436V388L760 522 648 752Z" fill="#153f36"/>
+  </g>
+  <rect x="58" y="58" width="908" height="908" rx="222" fill="none" stroke="#f4faf7" stroke-opacity="0.12" stroke-width="20"/>
+  <path d="M217 733c-18-43-9-98 18-141l83-151c24-45 62-79 108-99l117-50c34-15 73-7 98 21l83 92c23 26 41 58 51 92l43 151c13 45-5 94-45 121l-83 57c-29 20-64 30-99 30H367c-46 0-89-23-115-60Z" fill="#0d312a" opacity="0.34"/>
+  <g clip-path="url(#stone-rock-shape)">
+    <rect x="180" y="200" width="700" height="660" fill="#dce8e3"/>
+    <path d="M206 706 214 548 302 388 456 438 399 657 270 755Z" fill="#9eb8ad"/>
+    <path d="M302 388 422 278 547 224 655 248 744 347 626 444 456 438Z" fill="#edf4f1"/>
+    <path d="m456 438 170 6 61 196-89 200H399V657Z" fill="#c8d9d1"/>
+    <path d="m626 444 118-97 57 102 46 161-51 136-109-106Z" fill="#88a99b"/>
+    <path d="m270 755 129-98 199 183H357c-35 0-68-12-94-33Z" fill="#78998b"/>
+    <path d="m399 657 57-219 98 116-28 137Z" fill="#b4cbc1"/>
+  </g>
+  <path d="M206 706c-28-46-22-110 8-158l88-160c27-50 69-88 120-110l125-54c37-16 81-7 108 24l89 99c26 29 46 64 57 102l46 161c15 51-6 106-51 136l-89 61c-32 22-70 33-109 33H357c-51 0-99-25-128-67Z" fill="none" stroke="#0f3931" stroke-width="22" stroke-linejoin="round"/>
+</svg>

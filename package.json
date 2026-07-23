@@ -1,0 +1,280 @@
+{
+  "name": "stone-desktop",
+  "version": "0.9.6",
+  "private": true,
+  "description": "StonePlus project — Stone+ local-first AI gateway desktop application",
+  "author": {
+    "name": "StonePlus Contributors"
+  },
+  "license": "SEE LICENSE IN LICENSE",
+  "homepage": "https://github.com/M4rkzzz/stone-plus",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/M4rkzzz/stone-plus.git"
+  },
+  "bugs": {
+    "url": "https://github.com/M4rkzzz/stone-plus/issues"
+  },
+  "main": "out/main/index.js",
+  "type": "module",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "dev:web": "vite --host 127.0.0.1 --port 5173",
+    "build": "electron-vite build",
+    "build:web": "vite build",
+    "visual:check": "node scripts/visual-check.mjs",
+    "identity:verify": "node scripts/verify-maintainer.mjs",
+    "smoke:electron": "node scripts/electron-smoke.mjs",
+    "release:check": "node scripts/validate-release-tag.mjs",
+    "frp:fetch": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/fetch-frpc.ps1",
+    "sing-box:fetch": "pwsh -NoProfile -File scripts/fetch-sing-box.ps1",
+    "sing-box:verify": "node scripts/verify-sing-box-runtime.mjs --all",
+    "sing-box:source": "pwsh -NoProfile -File scripts/prepare-sing-box-source.ps1",
+    "package": "npm run build && electron-builder --dir",
+    "dist": "npm run build && electron-builder",
+    "dist:win:x64:setup": "npm run build && electron-builder --win nsis --x64",
+    "dist:win:x64:portable": "npm run build && electron-builder --win portable --x64",
+    "dist:linux:x64": "npm run build && electron-builder --linux --x64",
+    "dist:linux:arm64": "npm run build && electron-builder --linux --arm64",
+    "dist:mac:x64": "npm run build && electron-builder --mac --x64",
+    "dist:mac:arm64": "npm run build && electron-builder --mac --arm64",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "check": "npm run lint && npm run typecheck && npm test && npm run build",
+    "lint": "eslint ."
+  },
+  "dependencies": {
+    "@fontsource-variable/inter": "^5.2.6",
+    "@fontsource-variable/jetbrains-mono": "^5.2.6",
+    "electron-updater": "^6.8.9",
+    "fetch-socks": "^1.3.3",
+    "libsodium-wrappers-sumo": "^0.7.16",
+    "lucide-react": "^0.468.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "semver": "^7.7.3",
+    "smol-toml": "^1.7.0",
+    "undici": "^7.28.0",
+    "ws": "^8.21.1",
+    "zustand": "^5.0.2"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.17.0",
+    "@types/libsodium-wrappers-sumo": "^0.7.8",
+    "@types/node": "^22.10.5",
+    "@types/react": "^19.0.3",
+    "@types/react-dom": "^19.0.2",
+    "@types/semver": "^7.7.1",
+    "@types/ws": "^8.18.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "electron": "^43.1.0",
+    "electron-builder": "^26.0.12",
+    "electron-vite": "^3.1.0",
+    "eslint": "^9.17.0",
+    "eslint-plugin-react-hooks": "^5.1.0",
+    "eslint-plugin-react-refresh": "^0.4.16",
+    "globals": "^17.7.0",
+    "playwright-core": "^1.61.1",
+    "typescript": "^5.7.2",
+    "typescript-eslint": "^8.19.1",
+    "vite": "^6.0.7",
+    "vitest": "^4.1.10"
+  },
+  "build": {
+    "appId": "io.github.m4rkzzz.stoneplus",
+    "productName": "Stone+",
+    "publish": {
+      "provider": "github",
+      "owner": "M4rkzzz",
+      "repo": "stone-plus"
+    },
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "out/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "build/icon.png",
+        "to": "icon.png"
+      },
+      {
+        "from": "LICENSE",
+        "to": "LICENSE"
+      },
+      {
+        "from": "PROJECT_IDENTITY.json",
+        "to": "PROJECT_IDENTITY.json"
+      },
+      {
+        "from": "LICENSE_BOUNDARY.md",
+        "to": "LICENSE_BOUNDARY.md"
+      },
+      {
+        "from": "AI_USAGE_POLICY.md",
+        "to": "AI_USAGE_POLICY.md"
+      },
+      {
+        "from": "NOTICE",
+        "to": "NOTICE"
+      },
+      {
+        "from": "THIRD_PARTY_NOTICES.md",
+        "to": "THIRD_PARTY_NOTICES.md"
+      },
+      {
+        "from": "MODIFICATIONS.md",
+        "to": "MODIFICATIONS.md"
+      },
+      {
+        "from": "TRADEMARKS.md",
+        "to": "TRADEMARKS.md"
+      },
+      {
+        "from": "SOURCE_ACCESS.md",
+        "to": "SOURCE_ACCESS.md"
+      },
+      {
+        "from": "LICENSES/Apache-2.0.txt",
+        "to": "licenses/Apache-2.0.txt"
+      },
+      {
+        "from": "LICENSES/AGPL-3.0-or-later.txt",
+        "to": "licenses/AGPL-3.0-or-later.txt"
+      },
+      {
+        "from": "LICENSES/LicenseRef-StonePlus-Source-Available-1.0.txt",
+        "to": "licenses/LicenseRef-StonePlus-Source-Available-1.0.txt"
+      },
+      {
+        "from": "build/sing-box/runtime-manifest.json",
+        "to": "sing-box/runtime-manifest.json"
+      },
+      {
+        "from": "build/sing-box/distribution-manifest.json",
+        "to": "sing-box/distribution-manifest.json"
+      },
+      {
+        "from": "LICENSES/GPL-3.0-or-later.txt",
+        "to": "licenses/GPL-3.0-or-later.txt"
+      },
+      {
+        "from": "LICENSES/sing-box-v1.13.14.txt",
+        "to": "licenses/sing-box-v1.13.14.txt"
+      },
+      {
+        "from": "LICENSES/libcronet",
+        "to": "licenses/libcronet"
+      },
+      {
+        "from": "SOURCE_OFFER-sing-box.md",
+        "to": "SOURCE_OFFER-sing-box.md"
+      },
+      {
+        "from": "docs/distribution-compliance.md",
+        "to": "docs/distribution-compliance.md"
+      },
+      {
+        "from": "build/signing/StonePlus-CodeSigning.cer",
+        "to": "signing/StonePlus-CodeSigning.cer"
+      },
+      {
+        "from": "build/signing/README.md",
+        "to": "signing/README.md"
+      }
+    ],
+    "beforePack": "./scripts/electron-builder-before-pack.mjs",
+    "asar": true,
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "icon": "build/icon.icns",
+      "artifactName": "StonePlus-${version}-macos-${arch}.${ext}",
+      "signIgnore": [
+        "/sing-box/mac-(x64|arm64)/sing-box$"
+      ],
+      "extraResources": [
+        {
+          "from": "build/sing-box/mac-${arch}",
+          "to": "sing-box/mac-${arch}"
+        }
+      ],
+      "target": [
+        "dmg",
+        "zip"
+      ]
+    },
+    "win": {
+      "icon": "build/icon.ico",
+      "signExts": [
+        "!sing-box.exe"
+      ],
+      "extraResources": [
+        {
+          "from": "build/icon.ico",
+          "to": "icon.ico"
+        },
+        {
+          "from": "build/frp/frpc.exe",
+          "to": "frp/frpc.exe"
+        },
+        {
+          "from": "build/frp/LICENSE.frp.txt",
+          "to": "frp/LICENSE.frp.txt"
+        },
+        {
+          "from": "build/sing-box/win-${arch}",
+          "to": "sing-box/win-${arch}"
+        }
+      ],
+      "target": [
+        "nsis",
+        "portable"
+      ]
+    },
+    "nsis": {
+      "artifactName": "StonePlus-${version}-windows-${arch}-setup.${ext}",
+      "oneClick": false,
+      "perMachine": false,
+      "allowElevation": true,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Stone+",
+      "uninstallDisplayName": "Stone+ ${version}",
+      "runAfterFinish": true,
+      "installerLanguages": [
+        "zh_CN",
+        "en_US"
+      ],
+      "displayLanguageSelector": false,
+      "license": "LICENSE",
+      "include": "build/installer.nsh"
+    },
+    "portable": {
+      "artifactName": "StonePlus-${version}-windows-${arch}-portable.${ext}"
+    },
+    "linux": {
+      "category": "Development",
+      "icon": "build/icons",
+      "executableName": "stone-plus",
+      "artifactName": "StonePlus-${version}-linux-${arch}.${ext}",
+      "extraResources": [
+        {
+          "from": "build/sing-box/linux-${arch}",
+          "to": "sing-box/linux-${arch}"
+        }
+      ],
+      "target": [
+        "AppImage",
+        "deb"
+      ]
+    },
+    "copyright": "Copyright © 2026 StonePlus Contributors"
+  },
+  "overrides": {
+    "fast-uri": "3.1.4"
+  }
+}

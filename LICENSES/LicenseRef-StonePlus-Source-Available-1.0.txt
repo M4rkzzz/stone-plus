@@ -1,0 +1,167 @@
+StonePlus Source Available License 1.0
+Effective date: 2026-07-23
+
+Copyright (c) 2026 StonePlus Contributors. All rights reserved except as
+expressly stated in this License.
+
+This is a source-available license, not an open-source license. By accessing,
+downloading, building, running, or otherwise using the Covered Material, you
+accept this License.
+
+1. Definitions
+
+"Licensor" means the applicable copyright holder or holders identified in
+NOTICE who have authority to license the Covered Material.
+
+"Covered Material" means the source code, documentation, build material,
+original visual material, and other copyrightable material in this repository
+for which the Licensor holds the necessary rights and which is made available
+under this License.
+
+"Third-Party Material" means material identified in NOTICE,
+THIRD_PARTY_NOTICES.md, LICENSES/, file headers, or accompanying notices as
+being owned or licensed by another person. Third-Party Material is excluded
+from the Covered Material and remains governed by its own terms.
+
+"Official Channels" means the StonePlus repository, issue tracker, private
+security-reporting channel, and other submission channels expressly designated
+by the Licensor.
+
+2. Limited permission
+
+Subject to continuous compliance with this License, the Licensor grants you a
+personal, limited, non-exclusive, non-transferable, non-sublicensable,
+revocable, royalty-free permission to:
+
+a. view and inspect the Covered Material for personal learning, evaluation,
+   security review, and interoperability analysis;
+b. download and retain a reasonable number of unmodified copies solely as
+   technically necessary for those permitted purposes;
+c. run an unmodified official build, or build and run an unmodified copy
+   locally, as an internal end-user tool for its intended purpose, including
+   personal or organizational work, evaluation, and good-faith security
+   research; and
+d. prepare a private issue report or proposed patch solely for submission to
+   the Licensor through an Official Channel.
+
+No permission is granted by implication, estoppel, exhaustion, or otherwise.
+All rights not expressly granted are reserved.
+
+3. Security research and submissions
+
+Security testing must be conducted only against systems and accounts you own
+or are expressly authorized to test. It must not disrupt other users, access
+unrelated data, or publish an unremediated vulnerability or exploit before a
+reasonable coordinated-disclosure period.
+
+You may submit issues, suggestions, or proposed patches through Official
+Channels. By intentionally submitting a patch or other copyrightable
+contribution, you grant the Licensor a perpetual, irrevocable, worldwide,
+royalty-free, transferable, sublicensable license to use, reproduce, modify,
+distribute, publicly perform, publicly display, and otherwise exploit that
+submission for any purpose. You represent that you have the right to grant
+that permission. Submitting material does not require the Licensor to accept,
+use, or respond to it.
+
+4. Prohibited conduct
+
+Except for the narrow permissions in Sections 2 and 3, you must not, directly
+or indirectly:
+
+a. copy, modify, adapt, translate, transform, port, reverse engineer, or create
+   derivative works from the Covered Material;
+b. publish, distribute, redistribute, sublicense, sell, lease, transfer,
+   mirror, or make the Covered Material or any derivative available to another
+   person, including through a public or shared fork;
+c. repackage, relabel, rebrand, white-label, or combine the Covered Material
+   into another application, extension, service, appliance, or distribution;
+d. use the Covered Material to create, operate, support, or market a product or
+   service that has the same or substantially similar purpose or functionality,
+   or that competes with StonePlus or Stone+;
+e. sell, license, rent, monetize, or commercially distribute the Covered
+   Material; provide it to third parties as a hosted service, managed service,
+   software as a service, or paid feature; or embed it in a product or service
+   offered to another person. This does not prohibit using an unmodified
+   official StonePlus build internally as an end-user tool;
+f. provide the Covered Material, or a non-trivial portion or representation of
+   it, to an artificial-intelligence or machine-learning system for training,
+   fine-tuning, dataset creation, embedding, indexing, retrieval-augmented
+   generation, automated code generation, code transformation, migration, or
+   creation of derivative code;
+g. use Stone+, StonePlus, Stone Plus, any confusingly similar name, the project
+   logo, application icon, interface artwork, official update channel,
+   signature, certificate, provenance, or other Brand Asset except for a
+   truthful, non-confusing reference permitted by TRADEMARKS.md;
+h. remove, hide, alter, or misrepresent any copyright, license, attribution,
+   provenance, source, or trademark notice; or
+i. assist, authorize, encourage, or enable another person to do any prohibited
+   act, or attempt to circumvent this License or a technical measure supporting
+   it.
+
+Core restriction / 核心限制：
+
+无论使用人工、生成式人工智能、自动化程序或其他技术手段，均不得基于本软件创建、修改、转换、重新包装、分发或运营衍生产品。
+
+Whether by human effort, generative artificial intelligence, automated
+programs, or any other technical means, you may not create, modify, transform,
+repackage, distribute, or operate a derivative product based on this software.
+The English text governs if the two statements are interpreted inconsistently.
+
+5. Brand assets
+
+No trademark, trade dress, logo, signing identity, update-channel identity, or
+other brand right is granted. TRADEMARKS.md applies in addition to this
+License. A permitted truthful reference does not authorize branding, product
+naming, endorsement claims, or use of official visual assets.
+
+6. Third-party and historical material
+
+This License does not replace or restrict any license that applies to
+Third-Party Material. In particular, material inherited from upstream Stone
+and identified as Apache-2.0 remains available under Apache-2.0, and bundled
+third-party components remain under their respective licenses.
+
+StonePlus v0.9.5 and earlier remain available under the license terms shipped
+with those versions. Repository revisions that were first published with an
+AGPL-3.0-or-later notice before this License took effect remain available under
+the AGPL terms that accompanied those revisions. This License is prospective
+and does not revoke permissions already granted for historical material.
+
+7. Termination
+
+Your permissions terminate automatically and immediately if you breach this
+License. Upon termination, you must stop using the Covered Material and delete
+all copies in your possession or control, except copies that applicable law
+requires you to retain. Sections 3 through 11 survive termination. The Licensor
+may reinstate permission only in a signed writing.
+
+8. No patent or other license
+
+No patent license is granted. No right is granted to use any name, mark,
+identity, data, account, credential, model, service, or other right belonging
+to the Licensor or a third party.
+
+9. Disclaimer of warranty
+
+TO THE MAXIMUM EXTENT PERMITTED BY LAW, THE COVERED MATERIAL IS PROVIDED
+"AS IS" AND "AS AVAILABLE," WITHOUT WARRANTY OF ANY KIND, EXPRESS, IMPLIED,
+OR STATUTORY, INCLUDING WARRANTIES OF TITLE, NON-INFRINGEMENT,
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, ACCURACY, SECURITY, OR
+AVAILABILITY.
+
+10. Limitation of liability
+
+TO THE MAXIMUM EXTENT PERMITTED BY LAW, THE LICENSOR AND CONTRIBUTORS WILL NOT
+BE LIABLE FOR ANY DIRECT, INDIRECT, SPECIAL, INCIDENTAL, CONSEQUENTIAL,
+EXEMPLARY, OR PUNITIVE DAMAGES, OR FOR LOSS OF DATA, PROFITS, REVENUE,
+GOODWILL, OR BUSINESS INTERRUPTION, ARISING FROM OR RELATING TO THE COVERED
+MATERIAL OR THIS LICENSE, UNDER ANY THEORY OF LIABILITY.
+
+11. General
+
+If any provision is unenforceable, it will be limited to the minimum extent
+necessary and the remaining provisions will remain effective. A failure to
+enforce a provision is not a waiver. This License and the documents it
+expressly incorporates constitute the complete permission granted for the
+Covered Material. Any broader permission requires a separate written agreement
+signed by the Licensor.

@@ -1,0 +1,41 @@
+Stone Desktop
+Copyright 2026 Stone Contributors
+
+StonePlus Project
+Copyright 2026 StonePlus Contributors
+
+StonePlus is an unofficial community fork of Stone. The desktop application
+currently retains the Stone+ product name. StonePlus is not affiliated with or
+endorsed by the upstream Stone maintainers.
+
+The canonical project repository, authorized maintainer account, license
+digest, signing certificate fingerprints, and release-provenance policy are
+recorded in PROJECT_IDENTITY.json. Copies of this notice or repository name
+alone do not prove official ownership.
+
+New StonePlus-owned material first published after the source-available
+migration is made available under the StonePlus Source Available License 1.0.
+The complete current license is in LICENSE. It permits inspection, learning,
+limited local evaluation and good-faith security research, but does not permit
+modification, derivative products, redistribution, commercial distribution or
+third-party hosted use, AI-based code generation, or repackaging except as
+expressly stated there. An unmodified official build may still be used
+internally as an end-user tool.
+
+Portions derived from upstream Stone remain Copyright 2026 Stone Contributors
+and remain available under Apache-2.0. Its complete text is in
+LICENSES/Apache-2.0.txt. See MODIFICATIONS.md for the upstream basis and a
+summary of StonePlus changes.
+
+Third-party components remain under their respective licenses. The StonePlus
+license does not replace, remove, or change those terms, notices, attributions,
+or source-delivery requirements. See THIRD_PARTY_NOTICES.md and LICENSES/.
+
+No software license grants permission to use the Stone+, StonePlus, or Stone
+names, logos, official update identity, or signing identity except as allowed
+by the applicable trademark owner and TRADEMARKS.md.
+
+Historical grants are not revoked. StonePlus v0.9.5 and earlier remain under
+the Apache-2.0 terms shipped with those versions. Repository revisions first
+published with an AGPL-3.0-or-later notice before the source-available
+migration remain available under the AGPL terms that accompanied them.

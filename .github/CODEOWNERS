@@ -1,0 +1,28 @@
+# StonePlus canonical ownership and review routing.
+* @M4rkzzz
+
+# Identity, licensing, provenance, and AI policy require owner review.
+/PROJECT_IDENTITY.json @M4rkzzz
+/LICENSE @M4rkzzz
+/LICENSE_BOUNDARY.md @M4rkzzz
+/LICENSES/ @M4rkzzz
+/NOTICE @M4rkzzz
+/MODIFICATIONS.md @M4rkzzz
+/THIRD_PARTY_NOTICES.md @M4rkzzz
+/TRADEMARKS.md @M4rkzzz
+/SOURCE_ACCESS.md @M4rkzzz
+/AI_USAGE_POLICY.md @M4rkzzz
+/AGENTS.md @M4rkzzz
+/CLAUDE.md @M4rkzzz
+/GEMINI.md @M4rkzzz
+/.github/copilot-instructions.md @M4rkzzz
+/.github/workflows/ @M4rkzzz
+/scripts/verify-maintainer.mjs @M4rkzzz
+/build/signing/ @M4rkzzz
+
+# Official application and release entry points.
+/package.json @M4rkzzz
+/package-lock.json @M4rkzzz
+/src/main/index.ts @M4rkzzz
+/src/preload/index.ts @M4rkzzz
+/src/renderer/src/ui.tsx @M4rkzzz
