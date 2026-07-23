@@ -64,6 +64,7 @@ jobs:
             id: windows-x64
             os: windows-latest
             runtime_targets: win-x64
+            packaged_runtime_checks: win-x64=release/win-unpacked/resources/sing-box
             builder_args: --win nsis portable --x64
             artifact_path: |
               release/StonePlus-*-windows-x64-setup.exe
@@ -75,6 +76,7 @@ jobs:
             id: linux-x64
             os: ubuntu-latest
             runtime_targets: linux-x64
+            packaged_runtime_checks: linux-x64=release/linux-unpacked/resources/sing-box
             builder_args: --linux AppImage deb --x64
             artifact_path: |
               release/StonePlus-*-linux-x86_64.AppImage
@@ -84,6 +86,7 @@ jobs:
             id: linux-arm64
             os: ubuntu-24.04-arm
             runtime_targets: linux-arm64
+            packaged_runtime_checks: linux-arm64=release/linux-arm64-unpacked/resources/sing-box
             builder_args: --linux AppImage deb --arm64
             artifact_path: |
               release/StonePlus-*-linux-arm64.AppImage
@@ -93,6 +96,7 @@ jobs:
             id: macos
             os: macos-15
             runtime_targets: mac-x64 mac-arm64
+            packaged_runtime_checks: mac-x64=release/mac/Stone+.app/Contents/Resources/sing-box mac-arm64=release/mac-arm64/Stone+.app/Contents/Resources/sing-box
             builder_args: --mac dmg zip --x64 --arm64 --config.mac.identity=- --config.mac.hardenedRuntime=false
             artifact_path: |
               release/StonePlus-*-macos-x64.dmg
@@ -160,17 +164,33 @@ jobs:
           --config.extraMetadata.author.email=${{ github.repository_owner }}@users.noreply.github.com
           --config.linux.maintainer=${{ github.repository_owner }}@users.noreply.github.com
 
-      - name: Verify Windows signatures and packaged core
+      - name: Verify packaged sing-box runtime
+        shell: pwsh
+        run: |
+          $checks = '${{ matrix.packaged_runtime_checks }}'.Split(' ', [StringSplitOptions]::RemoveEmptyEntries)
+          foreach ($check in $checks) {
+            $parts = $check.Split('=', 2)
+            if ($parts.Count -ne 2) {
+              throw "Invalid packaged runtime check: $check"
+            }
+            $target = $parts[0]
+            $root = $parts[1]
+            node scripts/verify-sing-box-runtime.mjs --target $target --runtime-root $root --manifest-root $root --require-executable
+            if ($LASTEXITCODE -ne 0) {
+              throw "Packaged sing-box runtime verification failed for $target."
+            }
+            node scripts/smoke-sing-box-runtime.mjs --target $target --runtime-root $root --manifest-root $root
+            if ($LASTEXITCODE -ne 0) {
+              throw "Packaged sing-box runtime smoke test failed for $target."
+            }
+          }
+
+      - name: Verify Windows signatures
         if: matrix.id == 'windows-x64'
         shell: pwsh
         env:
           WIN_SIGNING_CERT_SHA1: ${{ vars.WIN_SIGNING_CERT_SHA1 }}
         run: |
-          node scripts/verify-sing-box-runtime.mjs --target win-x64 --runtime-root release/win-unpacked/resources/sing-box
-          if ($LASTEXITCODE -ne 0) {
-            throw 'The packaged sing-box runtime no longer matches its pinned manifest.'
-          }
-
           $expectedThumbprint = $env:WIN_SIGNING_CERT_SHA1.Replace(' ', '').ToUpperInvariant()
           $signedFiles = @(
             'release/win-unpacked/Stone+.exe',
@@ -213,6 +233,7 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.26.4'
+          cache: false
 
       - name: Prepare pinned corresponding source
         shell: pwsh

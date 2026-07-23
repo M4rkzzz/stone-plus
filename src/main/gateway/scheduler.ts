@@ -128,7 +128,10 @@ const TRANSPORT_FALLBACK_FLOOR_MS = 3_000
 const CONCURRENT_STICKY_SESSION_PENALTY = 120
 
 export class NoEligibleAccountError extends Error {
-  constructor(message = 'No eligible account is available for this request') {
+  constructor(
+    readonly accountIds: readonly string[] = [],
+    message = 'No eligible account is available for this request'
+  ) {
     super(message)
     this.name = 'NoEligibleAccountError'
   }
@@ -303,7 +306,10 @@ export class PoolScheduler {
       ? verifiedCandidates
       : sourceEligibility.unknown.filter(runtimeEligible)
     if (candidates.length === 0) {
-      throw new NoEligibleAccountError()
+      throw new NoEligibleAccountError([
+        ...sourceEligibility.verified.map((account) => account.id),
+        ...sourceEligibility.unknown.map((account) => account.id),
+      ])
     }
 
     const stickyKey = pool.stickySessions && sessionId ? `${pool.id}:${sessionId}` : undefined

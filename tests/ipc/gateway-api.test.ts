@@ -1310,6 +1310,64 @@ describe('refresh provider models IPC', () => {
     expect(upstreamFetch).toHaveBeenCalledTimes(2)
   })
 
+  it('rechecks a disabled matching account once when the scheduler has no candidates', async () => {
+    const disabled = {
+      ...apiKeyAccount(),
+      status: 'disabled' as const,
+      circuitState: 'open' as const,
+      lastError: 'Stale disabled classification',
+    }
+    const active = {
+      ...apiKeyAccount(),
+      id: 'account-active',
+      credentialId: 'credential-active',
+    }
+    let resolveProbe!: (response: Response) => void
+    const upstreamFetch = vi.fn(() => new Promise<Response>((resolve) => {
+      resolveProbe = resolve
+    }))
+    const harness = createHarness(
+      [disabled, active],
+      {
+        [disabled.credentialId]: 'sk-disabled',
+        [active.credentialId]: 'sk-active',
+      },
+      upstreamFetch,
+    )
+    const update: GatewayRuntimeStateUpdate = {
+      noEligibleAccounts: {
+        poolId: 'pool',
+        accountIds: [disabled.id, active.id],
+      },
+    }
+
+    harness.emitRuntimeState(update)
+    harness.emitRuntimeState(update)
+    await vi.waitFor(() => expect(upstreamFetch).toHaveBeenCalledOnce())
+    expect(harness.store.setAccountCheckResult).toHaveBeenCalledWith(
+      disabled.id,
+      expect.objectContaining({ status: 'checking' }),
+    )
+    expect(harness.store.setAccountCheckResult).not.toHaveBeenCalledWith(
+      active.id,
+      expect.anything(),
+    )
+
+    resolveProbe(new Response('{}', { status: 200 }))
+    await vi.waitFor(() => expect(disabled.status).toBe('active'))
+    expect(disabled).toMatchObject({
+      status: 'active',
+      circuitState: 'closed',
+      consecutiveFailures: 0,
+      lastError: undefined,
+    })
+
+    // A duplicate zero-candidate signal cannot re-probe the now-active source.
+    harness.emitRuntimeState(update)
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(upstreamFetch).toHaveBeenCalledOnce()
+  })
+
   it('cools an exhausted OAuth account until the reset reported by the usage probe', async () => {
     const oauth = oauthAccount()
     const resetAfterSeconds = 3_600

@@ -113,6 +113,7 @@ try {
     'build\sing-box\runtime-manifest.json',
     'scripts\fetch-sing-box.ps1',
     'scripts\verify-sing-box-runtime.mjs',
+    'scripts\smoke-sing-box-runtime.mjs',
     'scripts\electron-builder-before-pack.mjs',
     'scripts\prepare-sing-box-source.ps1'
   )) {

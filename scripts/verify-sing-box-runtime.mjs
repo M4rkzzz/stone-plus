@@ -10,10 +10,6 @@ const manifestRoot = path.join(repositoryRoot, 'build', 'sing-box')
 const defaultRuntimeRoot = manifestRoot
 const supportedTargets = ['win-x64', 'linux-x64', 'linux-arm64', 'mac-x64', 'mac-arm64']
 
-async function readJson(filePath) {
-  return JSON.parse(await readFile(filePath, 'utf8'))
-}
-
 function assertSafeRelativePath(relativePath) {
   if (typeof relativePath !== 'string' || relativePath.length === 0 || relativePath.includes('\\')) {
     throw new Error(`Invalid portable runtime path: ${String(relativePath)}`)
@@ -44,7 +40,7 @@ async function collectFiles(directory, prefix = '') {
     if (metadata.isDirectory()) {
       files.push(...await collectFiles(absolutePath, relativePath))
     } else if (metadata.isFile()) {
-      files.push({ relativePath, absolutePath, size: metadata.size })
+      files.push({ relativePath, absolutePath, size: metadata.size, mode: metadata.mode })
     } else {
       throw new Error(`Runtime contains an unsupported filesystem entry: ${relativePath}`)
     }
@@ -66,8 +62,21 @@ export async function verifyRuntimeTarget(targetName, options = {}) {
     throw new Error(`Unsupported sing-box runtime target: ${targetName}`)
   }
   const runtimeRoot = path.resolve(options.runtimeRoot ?? defaultRuntimeRoot)
-  const runtimeManifest = await readJson(path.join(manifestRoot, 'runtime-manifest.json'))
-  const distributionManifest = await readJson(path.join(manifestRoot, 'distribution-manifest.json'))
+  const selectedManifestRoot = path.resolve(options.manifestRoot ?? manifestRoot)
+  const manifestNames = ['runtime-manifest.json', 'distribution-manifest.json']
+  const canonicalManifestContents = await Promise.all(manifestNames.map((name) => (
+    readFile(path.join(manifestRoot, name))
+  )))
+  const selectedManifestContents = selectedManifestRoot === manifestRoot
+    ? canonicalManifestContents
+    : await Promise.all(manifestNames.map((name) => readFile(path.join(selectedManifestRoot, name))))
+  for (let index = 0; index < manifestNames.length; index += 1) {
+    if (!canonicalManifestContents[index].equals(selectedManifestContents[index])) {
+      throw new Error(`Packaged sing-box manifest differs from the pinned source: ${manifestNames[index]}`)
+    }
+  }
+  const runtimeManifest = JSON.parse(selectedManifestContents[0].toString('utf8'))
+  const distributionManifest = JSON.parse(selectedManifestContents[1].toString('utf8'))
 
   if (runtimeManifest.schemaVersion !== 1 || distributionManifest.schemaVersion !== 1) {
     throw new Error('Unsupported sing-box manifest schema.')
@@ -132,6 +141,12 @@ export async function verifyRuntimeTarget(targetName, options = {}) {
     if (await sha256(actualFile.absolutePath) !== expectedFile.sha256) {
       throw new Error(`SHA-256 mismatch for ${targetName}/${actualFile.relativePath}.`)
     }
+    if (options.requireExecutable
+      && !targetName.startsWith('win-')
+      && actualFile.relativePath === target.executable
+      && (actualFile.mode & 0o111) === 0) {
+      throw new Error(`Packaged sing-box executable is not executable: ${targetName}/${actualFile.relativePath}`)
+    }
   }
 
   return { targetName, runtimeRoot: targetRoot, version: runtimeManifest.version }
@@ -147,10 +162,16 @@ function readOption(args, optionName) {
 async function main() {
   const args = process.argv.slice(2)
   const runtimeRoot = readOption(args, '--runtime-root')
+  const selectedManifestRoot = readOption(args, '--manifest-root')
+  const requireExecutable = args.includes('--require-executable')
   const selectedTarget = readOption(args, '--target')
   const targets = args.includes('--all') ? supportedTargets : [selectedTarget ?? runtimeTargetName()]
   for (const targetName of targets) {
-    const result = await verifyRuntimeTarget(targetName, { runtimeRoot })
+    const result = await verifyRuntimeTarget(targetName, {
+      runtimeRoot,
+      manifestRoot: selectedManifestRoot,
+      requireExecutable,
+    })
     process.stdout.write(`Verified sing-box ${result.version} runtime: ${result.targetName}\n`)
   }
 }
