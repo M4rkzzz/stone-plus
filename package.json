@@ -159,6 +159,9 @@
       "category": "public.app-category.developer-tools",
       "icon": "build/icon.icns",
       "artifactName": "StonePlus-${version}-macos-${arch}.${ext}",
+      "signIgnore": [
+        "/sing-box/mac-(x64|arm64)/sing-box$"
+      ],
       "extraResources": [
         {
           "from": "build/sing-box/mac-${arch}",
