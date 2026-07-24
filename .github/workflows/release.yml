@@ -109,8 +109,19 @@ jobs:
           if (pkg.license !== 'SEE LICENSE IN LICENSE' || lock.packages?.['']?.license !== 'SEE LICENSE IN LICENSE') {
             throw new Error('Root package license metadata must point to LICENSE.')
           }
-          if (pkg.version !== identity.licenseBoundary.firstSourceAvailableVersion || lock.version !== pkg.version) {
-            throw new Error('Package version does not match the protected license baseline.')
+          const core = (value) => {
+            const match = /^(?:v)?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/.exec(String(value))
+            if (!match) throw new Error(`Invalid semantic version: ${value}`)
+            return match.slice(1, 4).map(Number)
+          }
+          const candidate = core(pkg.version)
+          const baseline = core(identity.licenseBoundary.firstSourceAvailableVersion)
+          const isAtLeastBaseline = candidate.every((part, index) => part === baseline[index])
+            ? true
+            : candidate.some((part, index) => part > baseline[index]
+              && candidate.slice(0, index).every((previous, previousIndex) => previous === baseline[previousIndex]))
+          if (!isAtLeastBaseline || lock.version !== pkg.version) {
+            throw new Error('Package version predates the protected license baseline or lockfile is inconsistent.')
           }
           const license = readFileSync('LICENSE', 'utf8')
           if (!license.startsWith('StonePlus Source Available License 1.0')) {

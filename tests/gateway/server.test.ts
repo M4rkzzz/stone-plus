@@ -2350,6 +2350,58 @@ describe('GatewayServer', () => {
     })
   })
 
+  it('preserves local-shell results and independent server tool-search output in fallback history', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers[0] = {
+      ...gatewayConfig.providers[0],
+      sourceType: 'relay',
+      kind: 'openai-compatible',
+      protocol: 'openai-responses',
+      responsesCompactMode: 'legacy'
+    }
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    gatewayConfig.accounts[1].status = 'disabled'
+    gatewayConfig.pools[0].maxRetries = 0
+    let upstreamBody: Record<string, unknown> = {}
+    const upstreamFetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      upstreamBody = JSON.parse(String(init?.body)) as Record<string, unknown>
+      return new Response(JSON.stringify({
+        id: 'resp_structured_history',
+        status: 'completed',
+        output_text: 'Structured tool history survived.'
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    })
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'relay-private-key',
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses/compact`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'source-model',
+        input: [
+          { type: 'local_shell_call', call_id: 'shell-call', command: 'npm test' },
+          { type: 'function_call_output', call_id: 'shell-call', output: 'shell-output-marker' },
+          { type: 'tool_search_output', id: 'search-result', execution: 'server', output: 'server-search-marker' },
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'keep tool history' }] }
+        ]
+      })
+    })
+
+    expect(response.status).toBe(200)
+    expect(await response.text()).toContain('Structured tool history survived.')
+    expect(JSON.stringify(upstreamBody)).toContain('local_shell_call')
+    expect(JSON.stringify(upstreamBody)).toContain('shell-output-marker')
+    expect(JSON.stringify(upstreamBody)).toContain('server-search-marker')
+  })
+
   it('retries a legacy compact fallback on an HTTP context overflow with older history trimmed', async () => {
     const port = await freePort()
     const gatewayConfig = config(port)
@@ -2431,6 +2483,58 @@ describe('GatewayServer', () => {
     expect(secondBody).toContain('call-kept')
     expect(secondBody).toContain('kept-parallel-output')
     expect(secondBody).toContain('newest-history-marker')
+  })
+
+  it('fails instead of producing a compact summary after every history item would be trimmed', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers[0] = {
+      ...gatewayConfig.providers[0],
+      sourceType: 'relay',
+      kind: 'openai-compatible',
+      protocol: 'openai-responses',
+      responsesCompactMode: 'legacy'
+    }
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    gatewayConfig.accounts[1].status = 'disabled'
+    gatewayConfig.pools[0].maxRetries = 0
+    const requestBodies: Array<Record<string, unknown>> = []
+    const upstreamFetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      requestBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>)
+      return new Response(JSON.stringify({
+        error: {
+          message: 'The input exceeds the context window.',
+          type: 'invalid_request_error',
+          code: 'context_length_exceeded'
+        }
+      }), { status: 400, headers: { 'content-type': 'application/json' } })
+    })
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'relay-private-key',
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses/compact`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'source-model',
+        input: [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'oldest-two-item-marker' }] },
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'newest-two-item-marker' }] }
+        ]
+      })
+    })
+
+    expect(response.status).toBe(400)
+    expect(await response.json()).toMatchObject({ error: { type: 'context_length_exceeded' } })
+    expect(upstreamFetch).toHaveBeenCalledTimes(2)
+    expect(JSON.stringify(requestBodies[1])).not.toContain('oldest-two-item-marker')
+    expect(JSON.stringify(requestBodies[1])).toContain('newest-two-item-marker')
   })
 
   it('retries a legacy compact fallback after an SSE response.failed context overflow', async () => {
@@ -2556,7 +2660,67 @@ describe('GatewayServer', () => {
     expect(upstreamFetch.mock.calls.map((call) => JSON.parse(String(call[1]?.body)).stream)).toEqual([true, true])
   })
 
-  it('sniffs compact fallback JSON and SSE across whitespace and a split UTF-8 BOM', async () => {
+  it('rejects partial buffered JSON compact summaries without a terminal status', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers[0] = {
+      ...gatewayConfig.providers[0],
+      sourceType: 'relay',
+      kind: 'openai-compatible',
+      protocol: 'openai-responses',
+      responsesCompactMode: 'legacy'
+    }
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    gatewayConfig.accounts[1].status = 'disabled'
+    gatewayConfig.pools[0].maxRetries = 0
+    const partialPayloads = [
+      { status: 'in_progress', output_text: 'Partial top-level summary.' },
+      {
+        status: 'completed',
+        output: [{
+          type: 'message',
+          status: 'in_progress',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: 'Partial output item summary.' }]
+        }]
+      },
+      {
+        choices: [{
+          message: { role: 'assistant', content: 'Partial chat summary.' },
+          finish_reason: null
+        }]
+      }
+    ]
+    let upstreamIndex = 0
+    const upstreamFetch = vi.fn(async () => new Response(JSON.stringify(partialPayloads[upstreamIndex++]), {
+      status: 200,
+      headers: { 'content-type': 'application/json' }
+    }))
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'relay-private-key',
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    for (let index = 0; index < partialPayloads.length; index += 1) {
+      const response = await fetch(`http://127.0.0.1:${port}/v1/responses/compact`, {
+        method: 'POST',
+        headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+        body: JSON.stringify({
+          model: 'source-model',
+          input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: `partial-${index}` }] }]
+        })
+      })
+      expect(response.status).toBe(502)
+      expect(await response.json()).toMatchObject({ error: { type: 'upstream_compact_error' } })
+    }
+    expect(upstreamFetch).toHaveBeenCalledTimes(partialPayloads.length)
+  })
+
+  it('sniffs compact fallback JSON and SSE across whitespace, split BOM, and split SSE fields', async () => {
     const port = await freePort()
     const gatewayConfig = config(port)
     gatewayConfig.providers[0] = {
@@ -2593,7 +2757,8 @@ describe('GatewayServer', () => {
       ], { 'content-type': 'text/plain' }))
       .mockResolvedValueOnce(sseResponseChunks([
         encoder.encode(' \r\n\t'),
-        encoder.encode(sseWire)
+        ...sseWire.slice(0, 6).split('').map((value) => encoder.encode(value)),
+        encoder.encode(sseWire.slice(6))
       ], { 'content-type': 'application/json' }))
     const gateway = new GatewayServer({
       config: gatewayConfig,
@@ -2693,7 +2858,8 @@ describe('GatewayServer', () => {
       [{ type: 'message' }],
       [{ type: 'message', role: 'user', content: [{ type: 'input_text' }] }],
       [{ type: 'compaction', id: 'cmp_without_ciphertext' }],
-      [{ type: 'compaction', id: 'cmp_blank_ciphertext', encrypted_content: '   ' }]
+      [{ type: 'compaction', id: 'cmp_blank_ciphertext', encrypted_content: '   ' }],
+      [{ type: 'context_compaction' }]
     ]
 
     for (const output of invalidOutputs) {
@@ -2904,7 +3070,7 @@ describe('GatewayServer', () => {
     expect(new Headers(upstreamFetch.mock.calls[2][1]?.headers).get('x-codex-turn-state')).toBe('turn-state-v2')
   })
 
-  it('rejects relay-only V2 compact before resolving credentials or sending an incompatible request', async () => {
+  it('adapts relay-only V2 compact to a portable summary and materializes it on follow-up', async () => {
     const port = await freePort()
     const gatewayConfig = config(port)
     gatewayConfig.providers[0] = {
@@ -2916,8 +3082,36 @@ describe('GatewayServer', () => {
     gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
     gatewayConfig.pools[0].protocol = 'openai-responses'
     gatewayConfig.accounts = gatewayConfig.accounts.map((item) => ({ ...item, credentialType: 'api-key' }))
-    const credentialResolver = vi.fn(() => 'must-not-resolve')
-    const upstreamFetch = vi.fn()
+    gatewayConfig.accounts[1].status = 'disabled'
+    gatewayConfig.pools[0].maxRetries = 0
+    const credentialResolver = vi.fn()
+      .mockReturnValueOnce('a')
+      .mockReturnValue('relay-private')
+    const upstreamBodies: Array<Record<string, unknown>> = []
+    const upstreamFetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      upstreamBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>)
+      if (upstreamBodies.length === 1) {
+        return new Response(JSON.stringify({
+          id: 'resp_relay_compact_summary',
+          status: 'completed',
+          output: [{
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'Portable relay handoff summary.' }]
+          }],
+          usage: { input_tokens: 120, output_tokens: 8, total_tokens: 128 }
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      return new Response([
+        'event: response.output_text.delta',
+        'data: {"type":"response.output_text.delta","delta":"continued after relay compact"}',
+        '',
+        'event: response.completed',
+        'data: {"type":"response.completed","response":{"id":"resp_relay_followup","status":"completed","output":[]}}',
+        '',
+        ''
+      ].join('\n'), { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    })
     const logs: RequestLog[] = []
     const gateway = new GatewayServer({
       config: gatewayConfig,
@@ -2933,33 +3127,2456 @@ describe('GatewayServer', () => {
       headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
       body: JSON.stringify({
         model: 'source-model',
-        input: [{ type: 'compaction_trigger' }],
+        input: [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'must survive compact' }] },
+          { type: 'compaction_trigger' }
+        ],
         stream: true
       })
     })
 
-    expect(response.status).toBe(422)
-    expect(await response.json()).toMatchObject({ error: { type: 'remote_compaction_unsupported' } })
-    expect(credentialResolver).not.toHaveBeenCalled()
-    expect(upstreamFetch).not.toHaveBeenCalled()
-    expect(logs[0]).toMatchObject({ status: 'error', statusCode: 422, failureStage: 'scheduler' })
+    expect(response.status).toBe(200)
+    const compactWire = await response.text()
+    const compactEvents = compactWire.split('\n')
+      .filter((line) => line.startsWith('data: '))
+      .map((line) => JSON.parse(line.slice(6)) as Record<string, unknown>)
+    const outputEvent = compactEvents.find((event) => event.type === 'response.output_item.done')
+    const compactItem = outputEvent?.item as Record<string, unknown>
+    const completedEvent = compactEvents.find((event) => event.type === 'response.completed')
+    expect(compactItem).toMatchObject({ type: 'compaction' })
+    expect(String(compactItem.encrypted_content)).toMatch(/^stoneplus-compact-v1:/)
+    expect((completedEvent?.response as Record<string, unknown>)?.output).toEqual([])
+    expect(compactWire.match(/stoneplus-compact-v1:/g)).toHaveLength(1)
+    expect(compactWire).not.toContain('Portable relay handoff summary.')
+    expect(upstreamBodies[0].input).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'message', role: 'user' })
+    ]))
+    expect(JSON.stringify(upstreamBodies[0])).not.toContain('compaction_trigger')
 
-    const embeddedTrigger = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+    const followup = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
       method: 'POST',
       headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
       body: JSON.stringify({
         model: 'source-model',
         input: [
-          { type: 'compaction_trigger' },
-          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'must not bypass' }] }
+          compactItem,
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'continue' }] }
         ],
         stream: true
       })
     })
-    expect(embeddedTrigger.status).toBe(422)
-    expect(await embeddedTrigger.text()).toContain('disable remote_compaction_v2')
+    expect(followup.status).toBe(200)
+    expect(await followup.text()).toContain('continued after relay compact')
+    expect(JSON.stringify(upstreamBodies[1])).toContain('Portable relay handoff summary.')
+    expect(JSON.stringify(upstreamBodies[1])).toContain('Another language model started to solve this problem')
+    expect(JSON.stringify(upstreamBodies[1])).not.toContain('stoneplus-compact-v1:')
+    expect(JSON.stringify(upstreamBodies[1])).not.toContain('encrypted_content')
+    expect(credentialResolver).toHaveBeenCalledTimes(2)
+    expect(upstreamFetch).toHaveBeenCalledTimes(2)
+    expect(logs.find((log) => log.requestKind === 'compaction'))
+      .toMatchObject({ status: 'success', statusCode: 200, requestKind: 'compaction' })
+  })
+
+  it.each([
+    {
+      name: 'function',
+      call: {
+        type: 'function_call',
+        call_id: 'latest-function-call',
+        name: 'inspect_latest_state',
+        arguments: '{"scope":"current"}'
+      },
+      output: {
+        type: 'function_call_output',
+        call_id: 'latest-function-call',
+        output: 'latest-function-output-marker'
+      }
+    },
+    {
+      name: 'local shell',
+      call: {
+        type: 'local_shell_call',
+        call_id: 'latest-shell-call',
+        command: 'npm test'
+      },
+      output: {
+        type: 'function_call_output',
+        call_id: 'latest-shell-call',
+        output: 'latest-shell-output-marker'
+      }
+    }
+  ])('keeps the newest $name call/output pair intact at the final V2 fallback trim', async ({
+    call,
+    output
+  }) => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers[0] = {
+      ...gatewayConfig.providers[0],
+      sourceType: 'relay',
+      kind: 'openai-compatible',
+      protocol: 'openai-responses'
+    }
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    gatewayConfig.accounts[0].credentialType = 'api-key'
+    gatewayConfig.accounts[1].status = 'disabled'
+    gatewayConfig.pools[0].maxRetries = 0
+    const upstreamBodies: Array<Record<string, unknown>> = []
+    const upstreamFetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      const upstreamBody = JSON.parse(String(init?.body)) as Record<string, unknown>
+      upstreamBodies.push(upstreamBody)
+      const wireBody = JSON.stringify(upstreamBody)
+      const retainedPair = wireBody.includes(String(call.call_id))
+        && wireBody.includes(String(output.output))
+      if (wireBody.includes('old-history-marker-') || !retainedPair) {
+        return new Response(JSON.stringify({
+          error: {
+            message: 'The input exceeds the maximum context length.',
+            type: 'invalid_request_error',
+            code: 'context_length_exceeded'
+          }
+        }), { status: 400, headers: { 'content-type': 'application/json' } })
+      }
+      return new Response(JSON.stringify({
+        id: 'resp_final_pair_trim',
+        status: 'completed',
+        output_text: 'Summary after preserving the newest tool pair.'
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    })
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'relay-private-key',
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const oldHistory = Array.from({ length: 32 }, (_, index) => ({
+      type: 'message',
+      role: index % 2 === 0 ? 'user' : 'assistant',
+      content: [{
+        type: index % 2 === 0 ? 'input_text' : 'output_text',
+        text: `old-history-marker-${index}`
+      }]
+    }))
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'source-model',
+        input: [...oldHistory, call, output, { type: 'compaction_trigger' }],
+        stream: true
+      })
+    })
+
+    expect(response.status).toBe(200)
+    expect(await response.text()).toContain('stoneplus-compact-v1:')
+    expect(upstreamFetch).toHaveBeenCalledTimes(7)
+    expect(upstreamBodies.every((body) => !JSON.stringify(body).includes('compaction_trigger'))).toBe(true)
+    const finalInput = upstreamBodies.at(-1)?.input as Array<Record<string, unknown>>
+    expect(finalInput).toEqual([call, output, expect.objectContaining({ type: 'message', role: 'user' })])
+    expect(JSON.stringify(finalInput)).not.toContain('old-history-marker-')
+  })
+
+  it('fails closed before contacting a relay when V2 compaction contains only a trigger', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers[0] = {
+      ...gatewayConfig.providers[0],
+      sourceType: 'relay',
+      kind: 'openai-compatible',
+      protocol: 'openai-responses'
+    }
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    gatewayConfig.accounts[0].credentialType = 'api-key'
+    gatewayConfig.accounts[1].status = 'disabled'
+    gatewayConfig.pools[0].maxRetries = 0
+    const credentialResolver = vi.fn(() => 'relay-private-key')
+    const upstreamFetch = vi.fn(async () => new Response(JSON.stringify({
+      id: 'must_not_be_reached',
+      status: 'completed',
+      output_text: 'unsafe prompt-only summary'
+    }), { status: 200, headers: { 'content-type': 'application/json' } }))
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver,
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'source-model',
+        input: [{ type: 'compaction_trigger' }],
+        stream: true
+      })
+    })
+
+    expect(response.status).toBe(400)
+    expect(await response.json()).toMatchObject({
+      error: {
+        type: 'invalid_compaction_input',
+        message: expect.stringContaining('requires conversation history')
+      }
+    })
     expect(credentialResolver).not.toHaveBeenCalled()
     expect(upstreamFetch).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    {
+      name: 'OpenAI Chat SSE',
+      protocol: 'openai-chat' as const,
+      kind: 'openai-compatible' as const,
+      expectedBodyField: 'messages',
+      contentType: 'text/event-stream',
+      wire: [
+        'data: {"id":"chat_compact","model":"source-model","choices":[{"index":0,"delta":{"content":"Chat relay summary."},"finish_reason":null}]}',
+        '',
+        'data: {"id":"chat_compact","model":"source-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}',
+        '',
+        'data: [DONE]',
+        '',
+        ''
+      ].join('\n')
+    },
+    {
+      name: 'Anthropic SSE',
+      protocol: 'anthropic-messages' as const,
+      kind: 'anthropic-compatible' as const,
+      expectedBodyField: 'messages',
+      contentType: 'text/event-stream',
+      wire: [
+        'event: message_start',
+        'data: {"type":"message_start","message":{"id":"msg_compact","model":"source-model","usage":{"input_tokens":20,"output_tokens":0}}}',
+        '',
+        'event: content_block_delta',
+        'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Anthropic relay summary."}}',
+        '',
+        'event: message_delta',
+        'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":4}}',
+        '',
+        'event: message_stop',
+        'data: {"type":"message_stop"}',
+        '',
+        ''
+      ].join('\n')
+    },
+    {
+      name: 'Gemini JSON-array stream',
+      protocol: 'gemini' as const,
+      kind: 'google' as const,
+      expectedBodyField: 'contents',
+      contentType: 'application/json',
+      wire: JSON.stringify([{
+        candidates: [{
+          content: { role: 'model', parts: [{ text: 'Gemini relay summary.' }] },
+          finishReason: 'STOP'
+        }],
+        usageMetadata: { promptTokenCount: 20, candidatesTokenCount: 4, totalTokenCount: 24 }
+      }])
+    }
+  ])('adapts V2 compaction through $name without exposing the trigger', async ({
+    protocol,
+    kind,
+    expectedBodyField,
+    contentType,
+    wire
+  }) => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers[0] = {
+      ...gatewayConfig.providers[0],
+      sourceType: 'relay',
+      kind,
+      protocol,
+      baseUrl: 'https://cross-protocol.example.test/v1'
+    }
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = protocol
+    gatewayConfig.accounts[0].credentialType = 'api-key'
+    gatewayConfig.accounts[1].status = 'disabled'
+    gatewayConfig.pools[0].maxRetries = 0
+    let upstreamBody: Record<string, unknown> = {}
+    const upstreamFetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      upstreamBody = JSON.parse(String(init?.body)) as Record<string, unknown>
+      return new Response(wire, { status: 200, headers: { 'content-type': contentType } })
+    })
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'cross-protocol-private',
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'source-model',
+        input: [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'portable cross protocol history' }] },
+          { type: 'compaction_trigger' }
+        ],
+        stream: true
+      })
+    })
+
+    expect(response.status).toBe(200)
+    expect(await response.text()).toContain('stoneplus-compact-v1:')
+    expect(upstreamFetch).toHaveBeenCalledOnce()
+    expect(upstreamBody[expectedBodyField]).toBeDefined()
+    expect(JSON.stringify(upstreamBody)).toContain('portable cross protocol history')
+    expect(JSON.stringify(upstreamBody)).not.toContain('compaction_trigger')
+  })
+
+  it.each([
+    {
+      name: 'OpenAI Chat reasoning_content',
+      protocol: 'openai-chat' as const,
+      kind: 'openai-compatible' as const,
+      finalSummary: 'Chat final summary.',
+      privateMarker: 'chat-hidden-reasoning',
+      frames: [
+        {
+          atMs: 0,
+          data: 'data: {"id":"chat_reasoning","choices":[{"index":0,"delta":{"reasoning_content":"chat-hidden-reasoning-1"},"finish_reason":null}]}\n\n'
+        },
+        {
+          atMs: 150,
+          data: 'data: {"id":"chat_reasoning","choices":[{"index":0,"delta":{"reasoning_content":"chat-hidden-reasoning-2"},"finish_reason":null}]}\n\n'
+        },
+        {
+          atMs: 300,
+          data: 'data: {"id":"chat_reasoning","choices":[{"index":0,"delta":{"reasoning_content":"chat-hidden-reasoning-3"},"finish_reason":null}]}\n\n'
+        },
+        {
+          atMs: 450,
+          data: [
+            'data: {"id":"chat_reasoning","choices":[{"index":0,"delta":{"content":"Chat final summary."},"finish_reason":null}]}',
+            '',
+            'data: {"id":"chat_reasoning","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}',
+            '',
+            ''
+          ].join('\n'),
+          close: true
+        }
+      ]
+    },
+    {
+      name: 'OpenAI Chat reasoning_details',
+      protocol: 'openai-chat' as const,
+      kind: 'openai-compatible' as const,
+      finalSummary: 'Chat details final summary.',
+      privateMarker: 'chat-hidden-details',
+      frames: [
+        {
+          atMs: 0,
+          data: 'data: {"id":"chat_reasoning_details","choices":[{"index":0,"delta":{"reasoning_details":[{"type":"reasoning.text","text":"chat-hidden-details-1"}]} ,"finish_reason":null}]}\n\n'
+        },
+        {
+          atMs: 150,
+          data: 'data: {"id":"chat_reasoning_details","choices":[{"index":0,"delta":{"reasoning_details":["chat-hidden-details-2"]},"finish_reason":null}]}\n\n'
+        },
+        {
+          atMs: 300,
+          data: 'data: {"id":"chat_reasoning_details","choices":[{"index":0,"delta":{"reasoning_details":[{"summary":"chat-hidden-details-3"}]},"finish_reason":null}]}\n\n'
+        },
+        {
+          atMs: 450,
+          data: [
+            'data: {"id":"chat_reasoning_details","choices":[{"index":0,"delta":{"content":"Chat details final summary."},"finish_reason":null}]}',
+            '',
+            'data: {"id":"chat_reasoning_details","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}',
+            '',
+            ''
+          ].join('\n'),
+          close: true
+        }
+      ]
+    },
+    {
+      name: 'Anthropic thinking_delta',
+      protocol: 'anthropic-messages' as const,
+      kind: 'anthropic-compatible' as const,
+      finalSummary: 'Anthropic final summary.',
+      privateMarker: 'anthropic-hidden-thinking',
+      frames: [
+        {
+          atMs: 0,
+          data: 'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"anthropic-hidden-thinking-1"}}\n\n'
+        },
+        {
+          atMs: 150,
+          data: 'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"anthropic-hidden-thinking-2"}}\n\n'
+        },
+        {
+          atMs: 300,
+          data: 'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"anthropic-hidden-thinking-3"}}\n\n'
+        },
+        {
+          atMs: 450,
+          data: [
+            'event: content_block_delta',
+            'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Anthropic final summary."}}',
+            '',
+            'event: message_delta',
+            'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":4}}',
+            '',
+            ''
+          ].join('\n'),
+          close: true
+        }
+      ]
+    },
+    {
+      name: 'Gemini thought parts',
+      protocol: 'gemini' as const,
+      kind: 'google' as const,
+      finalSummary: 'Gemini final summary.',
+      privateMarker: 'gemini-hidden-thought',
+      frames: [
+        {
+          atMs: 0,
+          data: 'data: {"candidates":[{"content":{"role":"model","parts":[{"text":"gemini-hidden-thought-1","thought":true}]}}]}\n\n'
+        },
+        {
+          atMs: 150,
+          data: 'data: {"candidates":[{"content":{"role":"model","parts":[{"text":"gemini-hidden-thought-2","thought":true}]}}]}\n\n'
+        },
+        {
+          atMs: 300,
+          data: 'data: {"candidates":[{"content":{"role":"model","parts":[{"text":"gemini-hidden-thought-3","thought":true}]}}]}\n\n'
+        },
+        {
+          atMs: 450,
+          data: 'data: {"candidates":[{"content":{"role":"model","parts":[{"text":"Gemini final summary."}]},"finishReason":"STOP"}]}\n\n',
+          close: true
+        }
+      ]
+    }
+  ])('uses $name as compact progress without exposing hidden reasoning', async ({
+    protocol,
+    kind,
+    finalSummary,
+    privateMarker,
+    frames
+  }) => {
+    const port = await freePort()
+    const gatewayConfig = config(port, { requestTimeoutSeconds: 5 })
+    gatewayConfig.providers[0] = {
+      ...gatewayConfig.providers[0],
+      sourceType: 'relay',
+      kind,
+      protocol,
+      baseUrl: 'https://reasoning-progress.example.test/v1'
+    }
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = protocol
+    gatewayConfig.pools[0].maxRetries = 0
+    gatewayConfig.accounts[0].credentialType = 'api-key'
+    gatewayConfig.accounts[1].status = 'disabled'
+    const upstreamFetch = vi.fn(async () => scheduledSseResponse(frames))
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'reasoning-progress-private',
+      responsesProgressIdleTimeoutMs: 400,
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'source-model',
+        input: [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'reasoning progress history' }] },
+          { type: 'compaction_trigger' }
+        ],
+        stream: true
+      })
+    })
+
+    const responseWire = await response.text()
+    expect(response.status, responseWire).toBe(200)
+    const compactEvent = responseWire.split('\n')
+      .filter((line) => line.startsWith('data: '))
+      .map((line) => JSON.parse(line.slice(6)) as Record<string, unknown>)
+      .find((event) => event.type === 'response.output_item.done')
+    const compactItem = compactEvent?.item as Record<string, unknown> | undefined
+    const envelope = String(compactItem?.encrypted_content ?? '')
+    expect(envelope).toMatch(/^stoneplus-compact-v1:/)
+    const decodedSummary = Buffer.from(
+      envelope.slice('stoneplus-compact-v1:'.length),
+      'base64url'
+    ).toString('utf8')
+    expect(decodedSummary).toBe(finalSummary)
+    expect(decodedSummary).not.toContain(privateMarker)
+    expect(responseWire).not.toContain(privateMarker)
+    expect(upstreamFetch).toHaveBeenCalledOnce()
+  }, 5_000)
+
+  it.each([
+    {
+      name: 'OpenAI Chat text followed by DONE without a finish reason',
+      protocol: 'openai-chat' as const,
+      kind: 'openai-compatible' as const,
+      wire: [
+        'data: {"id":"chat_incomplete","choices":[{"index":0,"delta":{"content":"partial chat summary"},"finish_reason":null}]}',
+        '',
+        'data: [DONE]',
+        '',
+        ''
+      ].join('\n')
+    },
+    {
+      name: 'Anthropic message_stop without a stop reason',
+      protocol: 'anthropic-messages' as const,
+      kind: 'anthropic-compatible' as const,
+      wire: [
+        'event: content_block_delta',
+        'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial anthropic summary"}}',
+        '',
+        'event: message_stop',
+        'data: {"type":"message_stop"}',
+        '',
+        ''
+      ].join('\n')
+    },
+    {
+      name: 'Anthropic pause_turn followed by message_stop',
+      protocol: 'anthropic-messages' as const,
+      kind: 'anthropic-compatible' as const,
+      wire: [
+        'event: content_block_delta',
+        'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"paused anthropic summary"}}',
+        '',
+        'event: message_delta',
+        'data: {"type":"message_delta","delta":{"stop_reason":"pause_turn"}}',
+        '',
+        'event: message_stop',
+        'data: {"type":"message_stop"}',
+        '',
+        ''
+      ].join('\n')
+    },
+    {
+      name: 'Gemini text that reaches EOF without a terminal reason',
+      protocol: 'gemini' as const,
+      kind: 'google' as const,
+      wire: [
+        'data: {"candidates":[{"content":{"role":"model","parts":[{"text":"partial gemini summary"}]}}]}',
+        '',
+        ''
+      ].join('\n')
+    }
+  ])('rejects incomplete compact fallback stream: $name', async ({ protocol, kind, wire }) => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers[0] = {
+      ...gatewayConfig.providers[0],
+      sourceType: 'relay',
+      kind,
+      protocol,
+      baseUrl: 'https://incomplete-compact.example.test/v1'
+    }
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = protocol
+    gatewayConfig.accounts[0].credentialType = 'api-key'
+    gatewayConfig.accounts[1].status = 'disabled'
+    gatewayConfig.pools[0].maxRetries = 0
+    const upstreamFetch = vi.fn(async () => new Response(wire, {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream' }
+    }))
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'incomplete-compact-private',
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'source-model',
+        input: [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'history must not be erased' }] },
+          { type: 'compaction_trigger' }
+        ],
+        stream: true
+      })
+    })
+
+    expect(response.status).toBe(502)
+    const responseWire = await response.text()
+    expect(responseWire).toContain('upstream_compact_error')
+    expect(responseWire).not.toContain('stoneplus-compact-v1:')
+    expect(upstreamFetch).toHaveBeenCalledOnce()
+  })
+
+  it.each([
+    {
+      name: 'a string error beside partial Responses text',
+      protocol: 'openai-responses' as const,
+      kind: 'openai-compatible' as const,
+      payload: {
+        id: 'resp_string_error',
+        status: 'completed',
+        output_text: 'partial response summary',
+        error: 'relay failed after producing partial text'
+      }
+    },
+    {
+      name: 'an object error beside partial Responses text',
+      protocol: 'openai-responses' as const,
+      kind: 'openai-compatible' as const,
+      payload: {
+        id: 'resp_object_error',
+        status: 'completed',
+        output_text: 'partial response summary',
+        error: { message: 'relay failed after producing partial text', type: 'server_error' }
+      }
+    },
+    {
+      name: 'a legacy Chat function_call',
+      protocol: 'openai-chat' as const,
+      kind: 'openai-compatible' as const,
+      payload: {
+        id: 'chat_function_call',
+        choices: [{
+          index: 0,
+          finish_reason: 'stop',
+          message: {
+            role: 'assistant',
+            content: 'partial chat summary',
+            function_call: { name: 'erase_history', arguments: '{}' }
+          }
+        }]
+      }
+    },
+    {
+      name: 'a Responses web_search_call',
+      protocol: 'openai-responses' as const,
+      kind: 'openai-compatible' as const,
+      payload: {
+        id: 'resp_web_search_call',
+        status: 'completed',
+        output: [
+          {
+            type: 'message',
+            role: 'assistant',
+            status: 'completed',
+            content: [{ type: 'output_text', text: 'partial response summary' }]
+          },
+          { type: 'web_search_call', id: 'search_partial', status: 'completed' }
+        ]
+      }
+    }
+  ])('rejects buffered compact fallback output containing $name', async ({
+    protocol,
+    kind,
+    payload
+  }) => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers[0] = {
+      ...gatewayConfig.providers[0],
+      sourceType: 'relay',
+      kind,
+      protocol,
+      baseUrl: 'https://invalid-buffered-compact.example.test/v1',
+      ...(protocol === 'openai-responses' ? { responsesCompactMode: 'legacy' as const } : {})
+    }
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = protocol
+    gatewayConfig.accounts[0].credentialType = 'api-key'
+    gatewayConfig.accounts[1].status = 'disabled'
+    gatewayConfig.pools[0].maxRetries = 0
+    const upstreamFetch = vi.fn(async () => new Response(JSON.stringify(payload), {
+      status: 200,
+      headers: { 'content-type': 'application/json' }
+    }))
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'invalid-buffered-compact-private',
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'source-model',
+        input: [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'buffered history' }] },
+          { type: 'compaction_trigger' }
+        ],
+        stream: true
+      })
+    })
+
+    expect(response.status).toBe(502)
+    const responseWire = await response.text()
+    expect(responseWire).toContain('upstream_compact_error')
+    expect(responseWire).not.toContain('stoneplus-compact-v1:')
+    expect(upstreamFetch).toHaveBeenCalledOnce()
+  })
+
+  it.each([
+    {
+      name: 'JSON-array stream',
+      contentType: 'application/json',
+      wire: JSON.stringify([{
+        candidates: [{
+          content: {
+            role: 'model',
+            parts: [
+              { text: 'gemini-array-private-thought', thought: true },
+              { text: 'Gemini array final summary.' }
+            ]
+          },
+          finishReason: 'STOP'
+        }]
+      }]),
+      finalSummary: 'Gemini array final summary.',
+      privateThought: 'gemini-array-private-thought'
+    },
+    {
+      name: 'SSE stream',
+      contentType: 'text/event-stream',
+      wire: [
+        'data: {"candidates":[{"content":{"role":"model","parts":[{"text":"gemini-sse-private-thought","thought":true},{"text":"Gemini SSE final summary."}]},"finishReason":"STOP"}]}',
+        '',
+        ''
+      ].join('\n'),
+      finalSummary: 'Gemini SSE final summary.',
+      privateThought: 'gemini-sse-private-thought'
+    },
+    {
+      name: 'buffered response',
+      contentType: 'application/json',
+      wire: JSON.stringify({
+        candidates: [{
+          content: {
+            role: 'model',
+            parts: [
+              { text: 'gemini-buffered-private-thought', thought: true },
+              { text: 'Gemini buffered final summary.' }
+            ]
+          },
+          finishReason: 'STOP'
+        }]
+      }),
+      finalSummary: 'Gemini buffered final summary.',
+      privateThought: 'gemini-buffered-private-thought'
+    }
+  ])('excludes Gemini thought text from a compact $name and its materialized follow-up', async ({
+    contentType,
+    wire,
+    finalSummary,
+    privateThought
+  }) => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers[0] = {
+      ...gatewayConfig.providers[0],
+      sourceType: 'relay',
+      kind: 'google',
+      protocol: 'gemini',
+      baseUrl: 'https://gemini-compact.example.test/v1'
+    }
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'gemini'
+    gatewayConfig.accounts[0].credentialType = 'api-key'
+    gatewayConfig.accounts[1].status = 'disabled'
+    gatewayConfig.pools[0].maxRetries = 0
+    const upstreamBodies: Array<Record<string, unknown>> = []
+    const upstreamFetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      upstreamBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>)
+      if (upstreamBodies.length === 1) {
+        return new Response(wire, { status: 200, headers: { 'content-type': contentType } })
+      }
+      return new Response([
+        'data: {"candidates":[{"content":{"role":"model","parts":[{"text":"continued after compact"}]},"finishReason":"STOP"}]}',
+        '',
+        ''
+      ].join('\n'), { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    })
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'gemini-compact-private-key',
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const compactResponse = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'source-model',
+        input: [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Gemini compact history' }] },
+          { type: 'compaction_trigger' }
+        ],
+        stream: true
+      })
+    })
+
+    expect(compactResponse.status).toBe(200)
+    const compactWire = await compactResponse.text()
+    const compactEvents = compactWire.split('\n')
+      .filter((line) => line.startsWith('data: '))
+      .map((line) => JSON.parse(line.slice(6)) as Record<string, unknown>)
+    const compactItem = compactEvents.find((event) => event.type === 'response.output_item.done')?.item as
+      | Record<string, unknown>
+      | undefined
+    const encodedSummary = String(compactItem?.encrypted_content ?? '')
+    expect(encodedSummary).toMatch(/^stoneplus-compact-v1:/)
+    const decodedSummary = Buffer.from(encodedSummary.slice('stoneplus-compact-v1:'.length), 'base64url')
+      .toString('utf8')
+    expect(decodedSummary).toBe(finalSummary)
+    expect(decodedSummary).not.toContain(privateThought)
+
+    const followup = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'source-model',
+        input: [
+          compactItem,
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'continue' }] }
+        ],
+        stream: true
+      })
+    })
+    expect(followup.status).toBe(200)
+    await followup.text()
+    const followupBody = JSON.stringify(upstreamBodies[1])
+    expect(followupBody).toContain(finalSummary)
+    expect(followupBody).not.toContain(privateThought)
+    expect(followupBody).not.toContain('stoneplus-compact-v1:')
+    expect(followupBody).not.toContain('encrypted_content')
+    expect(upstreamFetch).toHaveBeenCalledTimes(2)
+  })
+
+  it('fails closed before network access when compact fallback carries previous_response_id', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers[0] = {
+      ...gatewayConfig.providers[0],
+      sourceType: 'relay',
+      kind: 'openai-compatible',
+      protocol: 'openai-responses',
+      responsesCompactMode: 'legacy'
+    }
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    gatewayConfig.accounts[0].credentialType = 'api-key'
+    gatewayConfig.accounts[1].status = 'disabled'
+    gatewayConfig.pools[0].maxRetries = 0
+    const upstreamFetch = vi.fn()
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'previous-response-private',
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'source-model',
+        previous_response_id: 'resp_server_side_history',
+        input: [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'only the newest local item' }] },
+          { type: 'compaction_trigger' }
+        ],
+        stream: true
+      })
+    })
+
+    expect(response.status).toBe(422)
+    expect(await response.json()).toMatchObject({ error: { type: 'unsupported_compaction_history' } })
+    expect(upstreamFetch).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    {
+      name: 'OpenAI Chat',
+      protocol: 'openai-chat' as const,
+      kind: 'openai-compatible' as const,
+      bodyField: 'messages',
+      responsePayload: {
+        id: 'chat_projected_history',
+        choices: [{
+          index: 0,
+          finish_reason: 'stop',
+          message: { role: 'assistant', content: 'Projected history summary.' }
+        }]
+      }
+    },
+    {
+      name: 'Anthropic',
+      protocol: 'anthropic-messages' as const,
+      kind: 'anthropic-compatible' as const,
+      bodyField: 'messages',
+      responsePayload: {
+        id: 'msg_projected_history',
+        type: 'message',
+        role: 'assistant',
+        content: [{ type: 'text', text: 'Projected history summary.' }],
+        stop_reason: 'end_turn'
+      }
+    },
+    {
+      name: 'Gemini',
+      protocol: 'gemini' as const,
+      kind: 'google' as const,
+      bodyField: 'contents',
+      responsePayload: {
+        candidates: [{
+          content: { role: 'model', parts: [{ text: 'Projected history summary.' }] },
+          finishReason: 'STOP'
+        }]
+      }
+    }
+  ])('safely projects structured compact history through $name', async ({
+    protocol,
+    kind,
+    bodyField,
+    responsePayload
+  }) => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers[0] = {
+      ...gatewayConfig.providers[0],
+      sourceType: 'relay',
+      kind,
+      protocol,
+      baseUrl: 'https://projected-compact.example.test/v1'
+    }
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = protocol
+    gatewayConfig.accounts[0].credentialType = 'api-key'
+    gatewayConfig.accounts[1].status = 'disabled'
+    gatewayConfig.pools[0].maxRetries = 0
+    let upstreamBody: Record<string, unknown> = {}
+    const upstreamFetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      upstreamBody = JSON.parse(String(init?.body)) as Record<string, unknown>
+      return new Response(JSON.stringify(responsePayload), {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      })
+    })
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'projected-compact-private',
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'source-model',
+        input: [
+          {
+            type: 'reasoning',
+            id: 'reasoning_record',
+            summary: [{ type: 'summary_text', text: 'reasoning-history-marker' }],
+            encrypted_content: 'reasoning-encrypted-do-not-leak'
+          },
+          {
+            type: 'local_shell_call',
+            id: 'shell_call',
+            call_id: 'shell_call',
+            command: 'local-shell-history-marker',
+            encrypted_content: 'shell-encrypted-do-not-leak'
+          },
+          {
+            type: 'tool_search_call',
+            id: 'search_call',
+            call_id: 'search_call',
+            query: 'tool-search-query-marker',
+            encrypted_content: 'search-call-encrypted-do-not-leak'
+          },
+          {
+            type: 'tool_search_output',
+            call_id: 'search_call',
+            output: 'tool-search-output-marker',
+            thinking_signature: 'search-output-signature-do-not-leak'
+          },
+          { type: 'compaction_trigger' }
+        ],
+        stream: true
+      })
+    })
+
+    expect(response.status).toBe(200)
+    expect(await response.text()).toContain('stoneplus-compact-v1:')
+    expect(upstreamBody[bodyField]).toBeDefined()
+    const serializedBody = JSON.stringify(upstreamBody)
+    expect(serializedBody).toContain('reasoning-history-marker')
+    expect(serializedBody).toContain('local-shell-history-marker')
+    expect(serializedBody).toContain('tool-search-query-marker')
+    expect(serializedBody).toContain('tool-search-output-marker')
+    expect(serializedBody).toContain('[opaque value intentionally not forwarded]')
+    expect(serializedBody).not.toContain('compaction_trigger')
+    expect(serializedBody).not.toContain('reasoning-encrypted-do-not-leak')
+    expect(serializedBody).not.toContain('shell-encrypted-do-not-leak')
+    expect(serializedBody).not.toContain('search-call-encrypted-do-not-leak')
+    expect(serializedBody).not.toContain('search-output-signature-do-not-leak')
+    expect(upstreamFetch).toHaveBeenCalledOnce()
+  })
+
+  it('uses the first-body timeout when a cross-protocol compact relay sends only 200 headers', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port, { requestTimeoutSeconds: 10 })
+    gatewayConfig.providers[0] = {
+      ...gatewayConfig.providers[0],
+      sourceType: 'relay',
+      kind: 'openai-compatible',
+      protocol: 'openai-chat',
+      baseUrl: 'https://cross-protocol.example.test/v1'
+    }
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-chat'
+    gatewayConfig.pools[0].firstBodyTimeoutMs = 1_000
+    gatewayConfig.pools[0].maxRetries = 0
+    gatewayConfig.accounts[0].credentialType = 'api-key'
+    gatewayConfig.accounts[1].status = 'disabled'
+    const upstreamFetch = vi.fn(async () => new Response(new ReadableStream<Uint8Array>({
+      start() {
+        // Deliberately keep the accepted response body pending forever.
+      }
+    }), { status: 200, headers: { 'content-type': 'text/event-stream' } }))
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'cross-protocol-private',
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const startedAt = Date.now()
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'source-model',
+        input: [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'headers-only history' }] },
+          { type: 'compaction_trigger' }
+        ],
+        stream: true
+      })
+    })
+
+    expect(response.status).toBe(504)
+    expect(Date.now() - startedAt).toBeLessThan(4_000)
+    expect(await response.json()).toMatchObject({ error: { type: 'upstream_first_body_timeout' } })
+    expect(upstreamFetch).toHaveBeenCalledOnce()
+  }, 6_000)
+
+  it('bounds cross-protocol compact keepalives that make no semantic progress', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port, { requestTimeoutSeconds: 10 })
+    gatewayConfig.providers[0] = {
+      ...gatewayConfig.providers[0],
+      sourceType: 'relay',
+      kind: 'openai-compatible',
+      protocol: 'openai-chat',
+      baseUrl: 'https://cross-protocol.example.test/v1'
+    }
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-chat'
+    gatewayConfig.pools[0].maxRetries = 0
+    gatewayConfig.accounts[0].credentialType = 'api-key'
+    gatewayConfig.accounts[1].status = 'disabled'
+    const upstreamFetch = vi.fn(async () => scheduledSseResponse([
+      { atMs: 0, data: ': compact-keep-alive-0\n\n' },
+      { atMs: 100, data: ': compact-keep-alive-1\n\n' },
+      { atMs: 200, data: ': compact-keep-alive-2\n\n' },
+      { atMs: 300, data: ': compact-keep-alive-3\n\n' }
+    ]))
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'cross-protocol-private',
+      responsesProgressIdleTimeoutMs: 400,
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const startedAt = Date.now()
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'source-model',
+        input: [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'keepalive history' }] },
+          { type: 'compaction_trigger' }
+        ],
+        stream: true
+      })
+    })
+
+    expect(response.status).toBe(504)
+    expect(Date.now() - startedAt).toBeLessThan(2_000)
+    expect(await response.json()).toMatchObject({ error: { type: 'upstream_response_progress_timeout' } })
+    expect(upstreamFetch).toHaveBeenCalledOnce()
+  }, 5_000)
+
+  it('ignores compact fallback text after stop regardless of the packet boundary', async () => {
+    const encoder = new TextEncoder()
+    const acceptedPrefix = [
+      'data: {"id":"chat_compact_tail","choices":[{"index":0,"delta":{"content":"Accepted summary."},"finish_reason":null}]}',
+      '',
+      'data: {"id":"chat_compact_tail","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}',
+      '',
+      ''
+    ].join('\n')
+    const trailingWire = [
+      'data: {"id":"chat_compact_tail","choices":[{"index":0,"delta":{"content":" TRAILING-TEXT-MUST-NOT-APPEAR"},"finish_reason":null}]}',
+      '',
+      'data: [DONE]',
+      '',
+      ''
+    ].join('\n')
+    const packetizations = [
+      [encoder.encode(acceptedPrefix + trailingWire)],
+      [encoder.encode(acceptedPrefix), encoder.encode(trailingWire)]
+    ]
+    const summaries: string[] = []
+
+    for (const chunks of packetizations) {
+      const port = await freePort()
+      const gatewayConfig = config(port)
+      gatewayConfig.providers[0] = {
+        ...gatewayConfig.providers[0],
+        sourceType: 'relay',
+        kind: 'openai-compatible',
+        protocol: 'openai-chat',
+        baseUrl: 'https://cross-protocol.example.test/v1'
+      }
+      gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+      gatewayConfig.pools[0].protocol = 'openai-chat'
+      gatewayConfig.pools[0].maxRetries = 0
+      gatewayConfig.accounts[0].credentialType = 'api-key'
+      gatewayConfig.accounts[1].status = 'disabled'
+      const gateway = new GatewayServer({
+        config: gatewayConfig,
+        credentialResolver: () => 'cross-protocol-private',
+        fetchImplementation: vi.fn(async () => sseResponseChunks(chunks)) as typeof fetch
+      })
+      runningServers.push(gateway)
+      await gateway.start()
+
+      const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+        method: 'POST',
+        headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+        body: JSON.stringify({
+          model: 'source-model',
+          input: [
+            { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'tail boundary history' }] },
+            { type: 'compaction_trigger' }
+          ],
+          stream: true
+        })
+      })
+
+      const responseText = await response.text()
+      expect(response.status, responseText).toBe(200)
+      const compactEvent = responseText.split('\n')
+        .filter((line) => line.startsWith('data: '))
+        .map((line) => JSON.parse(line.slice(6)) as Record<string, unknown>)
+        .find((event) => event.type === 'response.output_item.done')
+      const compactItem = compactEvent?.item as Record<string, unknown> | undefined
+      const envelope = String(compactItem?.encrypted_content ?? '')
+      const encodedSummary = envelope.replace(/^stoneplus-compact-v1:/, '')
+      expect(envelope).toMatch(/^stoneplus-compact-v1:/)
+      summaries.push(Buffer.from(encodedSummary, 'base64url').toString('utf8'))
+    }
+
+    expect(summaries).toHaveLength(2)
+    expect(summaries[0]).toBe(summaries[1])
+    expect(summaries[0]).toContain('Accepted summary.')
+    expect(summaries[0]).not.toContain('TRAILING-TEXT-MUST-NOT-APPEAR')
+  })
+
+  it('bounds a relay JSON compact fallback that stalls after its first byte', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port, { requestTimeoutSeconds: 1 })
+    gatewayConfig.providers[0] = {
+      ...gatewayConfig.providers[0],
+      sourceType: 'relay',
+      kind: 'openai-compatible',
+      protocol: 'openai-responses'
+    }
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    gatewayConfig.accounts = gatewayConfig.accounts.map((item) => ({ ...item, credentialType: 'api-key' }))
+    gatewayConfig.accounts[1].status = 'disabled'
+    gatewayConfig.pools[0].maxRetries = 0
+    const upstreamFetch = vi.fn(async () => new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('{'))
+      }
+    }), { status: 200, headers: { 'content-type': 'application/json' } }))
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'relay-private',
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const startedAt = Date.now()
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'source-model',
+        input: [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'stalled-json-history' }] },
+          { type: 'compaction_trigger' }
+        ],
+        stream: true
+      })
+    })
+
+    expect(response.status).toBe(504)
+    expect(Date.now() - startedAt).toBeLessThan(3_500)
+    expect(await response.json()).toMatchObject({ error: { type: 'upstream_stream_idle_timeout' } })
+    expect(upstreamFetch).toHaveBeenCalledOnce()
+  }, 5_000)
+
+  it('falls back to a legacy relay when configured native compact accounts are unavailable', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers = [
+      {
+        ...gatewayConfig.providers[0],
+        id: 'legacy-relay',
+        sourceType: 'relay',
+        kind: 'openai-compatible',
+        baseUrl: 'https://legacy-relay.example.test/v1',
+        protocol: 'openai-responses',
+        responsesCompactMode: 'legacy'
+      },
+      {
+        ...gatewayConfig.providers[0],
+        id: 'native-relay',
+        sourceType: 'relay',
+        kind: 'openai-compatible',
+        baseUrl: 'https://native-relay.example.test/v1',
+        protocol: 'openai-responses',
+        responsesCompactMode: 'native'
+      }
+    ]
+    gatewayConfig.accounts = [
+      { ...gatewayConfig.accounts[0], providerId: 'legacy-relay', credentialType: 'api-key' },
+      {
+        ...gatewayConfig.accounts[1],
+        providerId: 'native-relay',
+        credentialType: 'api-key',
+        status: 'disabled'
+      }
+    ]
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    gatewayConfig.pools[0].members = gatewayConfig.accounts.map((item) => ({ accountId: item.id, enabled: true }))
+    gatewayConfig.pools[0].maxRetries = 0
+    const selectedAccountIds: string[] = []
+    const upstreamBodies: Array<Record<string, unknown>> = []
+    const upstreamFetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      upstreamBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>)
+      return new Response([
+        'event: response.output_text.delta',
+        'data: {"type":"response.output_text.delta","delta":"Summary from the available relay."}',
+        '',
+        'event: response.completed',
+        'data: {"type":"response.completed","response":{"id":"resp_mixed_fallback","status":"completed","output":[]}}',
+        '',
+        ''
+      ].join('\n'), { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    })
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: (selected) => {
+        selectedAccountIds.push(selected.id)
+        // The synthesized SSE is local data and must not be passed through the
+        // arbitrary-substring credential redactor. A one-byte key catches
+        // corruption of both `data:` framing and the base64url envelope.
+        return 'a'
+      },
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'source-model',
+        input: [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'compact me' }] },
+          { type: 'compaction_trigger' }
+        ],
+        stream: true
+      })
+    })
+
+    expect(response.status).toBe(200)
+    expect(await response.text()).toContain('stoneplus-compact-v1:')
+    expect(selectedAccountIds).toEqual(['first'])
+    expect(upstreamFetch).toHaveBeenCalledOnce()
+    expect(upstreamFetch.mock.calls[0][0]).toBe('https://legacy-relay.example.test/v1/responses')
+    expect(JSON.stringify(upstreamBodies[0])).not.toContain('compaction_trigger')
+  })
+
+  it('preserves the native scheduler error when compact fallback has no in-band history', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers = [
+      {
+        ...gatewayConfig.providers[0],
+        id: 'legacy-relay',
+        sourceType: 'relay',
+        kind: 'openai-compatible',
+        baseUrl: 'https://legacy-relay.example.test/v1',
+        protocol: 'openai-responses',
+        responsesCompactMode: 'legacy'
+      },
+      {
+        ...gatewayConfig.providers[0],
+        id: 'native-relay',
+        sourceType: 'relay',
+        kind: 'openai-compatible',
+        baseUrl: 'https://native-relay.example.test/v1',
+        protocol: 'openai-responses',
+        responsesCompactMode: 'native'
+      }
+    ]
+    gatewayConfig.accounts = [
+      { ...gatewayConfig.accounts[0], providerId: 'legacy-relay', credentialType: 'api-key' },
+      {
+        ...gatewayConfig.accounts[1],
+        providerId: 'native-relay',
+        credentialType: 'api-key',
+        status: 'cooldown',
+        circuitState: 'open',
+        consecutiveFailures: 1,
+        cooldownUntil: timestamp + 60_000
+      }
+    ]
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    gatewayConfig.pools[0].members = gatewayConfig.accounts.map((item) => ({ accountId: item.id, enabled: true }))
+    gatewayConfig.pools[0].maxRetries = 0
+    const credentialResolver = vi.fn(() => 'must-not-resolve')
+    const upstreamFetch = vi.fn()
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver,
+      fetchImplementation: upstreamFetch as typeof fetch,
+      now: () => timestamp
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'source-model',
+        input: [{ type: 'compaction_trigger' }],
+        stream: true
+      })
+    })
+
+    expect(response.status).toBe(503)
+    expect(await response.json()).toMatchObject({
+      error: {
+        message: 'No eligible account is available for this request',
+        type: 'account_unavailable'
+      }
+    })
+    expect(credentialResolver).not.toHaveBeenCalled()
+    expect(upstreamFetch).not.toHaveBeenCalled()
+  })
+
+  it('retries a compatibility peer when credential resolution is unavailable with maxRetries zero', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers[0] = {
+      ...gatewayConfig.providers[0],
+      sourceType: 'relay',
+      kind: 'openai-compatible',
+      protocol: 'openai-responses',
+      responsesCompactMode: 'legacy'
+    }
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    gatewayConfig.accounts = gatewayConfig.accounts.map((item) => ({
+      ...item,
+      credentialType: 'api-key'
+    }))
+    gatewayConfig.pools[0].members = gatewayConfig.accounts.map((item) => ({
+      accountId: item.id,
+      enabled: true
+    }))
+    gatewayConfig.pools[0].maxRetries = 0
+    const selectedAccountIds: string[] = []
+    const upstreamBodies: Array<Record<string, unknown>> = []
+    const upstreamFetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      upstreamBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>)
+      return new Response([
+        'event: response.output_text.delta',
+        'data: {"type":"response.output_text.delta","delta":"Summary from the credential-ready peer."}',
+        '',
+        'event: response.completed',
+        'data: {"type":"response.completed","response":{"id":"resp_credential_peer","status":"completed","output":[]}}',
+        '',
+        ''
+      ].join('\n'), { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    })
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: (selected) => {
+        selectedAccountIds.push(selected.id)
+        return selected.id === 'first' ? undefined : 'second-private'
+      },
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'source-model',
+        input: [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'credential peer history' }] },
+          { type: 'compaction_trigger' }
+        ],
+        stream: true
+      })
+    })
+
+    expect(response.status).toBe(200)
+    expect(await response.text()).toContain('stoneplus-compact-v1:')
+    expect(selectedAccountIds).toEqual(['first', 'second'])
+    expect(upstreamFetch).toHaveBeenCalledOnce()
+    expect(new Headers(upstreamFetch.mock.calls[0][1]?.headers).get('authorization'))
+      .toBe('Bearer second-private')
+    expect(JSON.stringify(upstreamBodies[0])).not.toContain('compaction_trigger')
+  })
+
+  it('uses relay fallback when native compact sources do not expose the requested model', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers = [
+      {
+        ...gatewayConfig.providers[0],
+        id: 'legacy-relay',
+        sourceType: 'relay',
+        kind: 'openai-compatible',
+        baseUrl: 'https://legacy-relay.example.test/v1',
+        protocol: 'openai-responses',
+        responsesCompactMode: 'legacy'
+      },
+      {
+        ...gatewayConfig.providers[0],
+        id: 'native-relay',
+        sourceType: 'relay',
+        kind: 'openai-compatible',
+        baseUrl: 'https://native-relay.example.test/v1',
+        protocol: 'openai-responses',
+        models: ['different-model'],
+        responsesCompactMode: 'native'
+      }
+    ]
+    gatewayConfig.accounts = [
+      { ...gatewayConfig.accounts[0], providerId: 'legacy-relay', credentialType: 'api-key' },
+      {
+        ...gatewayConfig.accounts[1],
+        providerId: 'native-relay',
+        credentialType: 'api-key',
+        modelPolicy: 'selected',
+        modelAllowlist: ['different-model']
+      }
+    ]
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    gatewayConfig.pools[0].members = gatewayConfig.accounts.map((item) => ({ accountId: item.id, enabled: true }))
+    gatewayConfig.pools[0].maxRetries = 0
+    const selectedAccountIds: string[] = []
+    const upstreamFetch = vi.fn(async () => new Response([
+      'event: response.output_text.delta',
+      'data: {"type":"response.output_text.delta","delta":"Model-compatible relay summary."}',
+      '',
+      'event: response.completed',
+      'data: {"type":"response.completed","response":{"id":"resp_model_fallback","status":"completed","output":[]}}',
+      '',
+      ''
+    ].join('\n'), { status: 200, headers: { 'content-type': 'text/event-stream' } }))
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: (selected) => {
+        selectedAccountIds.push(selected.id)
+        return 'relay-private'
+      },
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'source-model',
+        input: [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'model-fallback-history' }] },
+          { type: 'compaction_trigger' }
+        ],
+        stream: true
+      })
+    })
+
+    expect(response.status).toBe(200)
+    expect(await response.text()).toContain('stoneplus-compact-v1:')
+    expect(selectedAccountIds).toEqual(['first'])
+    expect(upstreamFetch).toHaveBeenCalledOnce()
+  })
+
+  it('preserves model scheduling errors when previous_response_id makes compact fallback unsafe', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers = [
+      {
+        ...gatewayConfig.providers[0],
+        id: 'legacy-relay',
+        sourceType: 'relay',
+        kind: 'openai-compatible',
+        baseUrl: 'https://legacy-relay.example.test/v1',
+        protocol: 'openai-responses',
+        responsesCompactMode: 'legacy'
+      },
+      {
+        ...gatewayConfig.providers[0],
+        id: 'native-relay',
+        sourceType: 'relay',
+        kind: 'openai-compatible',
+        baseUrl: 'https://native-relay.example.test/v1',
+        protocol: 'openai-responses',
+        models: ['different-model'],
+        responsesCompactMode: 'native'
+      }
+    ]
+    gatewayConfig.accounts = [
+      { ...gatewayConfig.accounts[0], providerId: 'legacy-relay', credentialType: 'api-key' },
+      {
+        ...gatewayConfig.accounts[1],
+        providerId: 'native-relay',
+        credentialType: 'api-key',
+        modelPolicy: 'selected',
+        modelAllowlist: ['different-model']
+      }
+    ]
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    gatewayConfig.pools[0].members = gatewayConfig.accounts.map((item) => ({ accountId: item.id, enabled: true }))
+    gatewayConfig.pools[0].maxRetries = 0
+    const credentialResolver = vi.fn(() => 'must-not-resolve')
+    const upstreamFetch = vi.fn()
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver,
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'source-model',
+        previous_response_id: 'resp_native_scheduler_history',
+        input: [{ type: 'compaction_trigger' }],
+        stream: true
+      })
+    })
+
+    expect(response.status).toBe(404)
+    expect(await response.json()).toMatchObject({
+      error: {
+        message: 'The requested model is not exposed by this pool',
+        type: 'model_not_found'
+      }
+    })
+    expect(credentialResolver).not.toHaveBeenCalled()
+    expect(upstreamFetch).not.toHaveBeenCalled()
+  })
+
+  it('never leaks a compact trigger when resolved credentials are not actually native-capable', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers[0] = {
+      ...gatewayConfig.providers[0],
+      sourceType: 'relay',
+      kind: 'openai-compatible',
+      protocol: 'openai-responses',
+      responsesCompactMode: 'legacy'
+    }
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    gatewayConfig.accounts[0].credentialType = 'chatgpt-oauth'
+    gatewayConfig.accounts[1].status = 'disabled'
+    gatewayConfig.pools[0].maxRetries = 0
+    let upstreamBody: Record<string, unknown> | undefined
+    const upstreamFetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      upstreamBody = JSON.parse(String(init?.body)) as Record<string, unknown>
+      return new Response([
+        'event: response.output_text.delta',
+        'data: {"type":"response.output_text.delta","delta":"Credential-safe relay summary."}',
+        '',
+        'event: response.completed',
+        'data: {"type":"response.completed","response":{"id":"resp_credential_fallback","status":"completed","output":[]}}',
+        '',
+        ''
+      ].join('\n'), { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    })
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      // A stale account snapshot says OAuth, but the authoritative resolver
+      // supplies an API key. The per-attempt decision must remain fail-safe.
+      credentialResolver: () => 'relay-private',
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'source-model',
+        input: [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'resolved-kind-history' }] },
+          { type: 'compaction_trigger' }
+        ],
+        stream: true
+      })
+    })
+
+    expect(response.status).toBe(200)
+    expect(await response.text()).toContain('stoneplus-compact-v1:')
+    expect(JSON.stringify(upstreamBody)).not.toContain('compaction_trigger')
+    expect(upstreamFetch).toHaveBeenCalledOnce()
+  })
+
+  it('tries a legacy peer after authoritative credentials downgrade a native-looking account', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers = [
+      {
+        ...gatewayConfig.providers[0],
+        id: 'stale-native-provider',
+        sourceType: 'relay',
+        kind: 'openai-compatible',
+        baseUrl: 'https://stale-native.example.test/v1',
+        protocol: 'openai-responses',
+        responsesCompactMode: 'legacy'
+      },
+      {
+        ...gatewayConfig.providers[0],
+        id: 'legacy-peer-provider',
+        sourceType: 'relay',
+        kind: 'openai-compatible',
+        baseUrl: 'https://legacy-peer.example.test/v1',
+        protocol: 'openai-responses',
+        responsesCompactMode: 'legacy'
+      }
+    ]
+    gatewayConfig.accounts = [
+      {
+        ...account('stale-native', 1),
+        providerId: 'stale-native-provider',
+        credentialType: 'chatgpt-oauth'
+      },
+      {
+        ...account('legacy-peer', 10),
+        providerId: 'legacy-peer-provider',
+        credentialType: 'api-key'
+      }
+    ]
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    gatewayConfig.pools[0].members = gatewayConfig.accounts.map((item) => ({
+      accountId: item.id,
+      enabled: true
+    }))
+    gatewayConfig.pools[0].maxRetries = 0
+    const selectedAccountIds: string[] = []
+    const upstreamBodies: Array<Record<string, unknown>> = []
+    const upstreamFetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      upstreamBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>)
+      if (upstreamBodies.length === 1) {
+        return new Response(JSON.stringify({ error: { message: 'ordinary endpoint unavailable' } }), {
+          status: 503,
+          headers: { 'content-type': 'application/json' }
+        })
+      }
+      return new Response([
+        'event: response.output_text.delta',
+        'data: {"type":"response.output_text.delta","delta":"Summary from the authoritative-kind peer."}',
+        '',
+        'event: response.completed',
+        'data: {"type":"response.completed","response":{"id":"resp_authoritative_peer","status":"completed","output":[]}}',
+        '',
+        ''
+      ].join('\n'), { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    })
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: (selected) => {
+        selectedAccountIds.push(selected.id)
+        // The stored type makes the first account look native, but the
+        // resolver's API key is authoritative for the actual wire request.
+        return `${selected.id}-private`
+      },
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'source-model',
+        input: [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'authoritative kind history' }] },
+          { type: 'compaction_trigger' }
+        ],
+        stream: true
+      })
+    })
+
+    expect(response.status).toBe(200)
+    expect(await response.text()).toContain('stoneplus-compact-v1:')
+    expect(selectedAccountIds).toEqual(['stale-native', 'legacy-peer'])
+    expect(upstreamFetch.mock.calls.map((call) => call[0])).toEqual([
+      'https://stale-native.example.test/v1/responses',
+      'https://legacy-peer.example.test/v1/responses'
+    ])
+    expect(upstreamBodies).toHaveLength(2)
+    for (const upstreamBody of upstreamBodies) {
+      expect(JSON.stringify(upstreamBody)).not.toContain('compaction_trigger')
+    }
+  })
+
+  it('strips native Codex continuity headers from an OAuth compatibility summary', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers[0] = {
+      ...gatewayConfig.providers[0],
+      sourceType: 'relay',
+      kind: 'openai-compatible',
+      protocol: 'openai-responses',
+      responsesCompactMode: 'legacy'
+    }
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    gatewayConfig.accounts[0].credentialType = 'api-key'
+    gatewayConfig.accounts[1].status = 'disabled'
+    gatewayConfig.pools[0].maxRetries = 0
+    let upstreamHeaders = new Headers()
+    let upstreamBody: Record<string, unknown> = {}
+    const upstreamFetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      upstreamHeaders = new Headers(init?.headers)
+      upstreamBody = JSON.parse(String(init?.body)) as Record<string, unknown>
+      return new Response([
+        'event: response.output_text.delta',
+        'data: {"type":"response.output_text.delta","delta":"OAuth-safe portable summary."}',
+        '',
+        'event: response.completed',
+        'data: {"type":"response.completed","response":{"id":"resp_oauth_compat","status":"completed","output":[]}}',
+        '',
+        ''
+      ].join('\n'), { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    })
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => ({
+        secret: 'oauth-fallback-private',
+        kind: 'chatgpt-oauth' as const,
+        accountId: 'acct-oauth-fallback'
+      }),
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer local-secret',
+        'content-type': 'application/json',
+        'x-stone-session-id': 'stone-session-only',
+        'x-codex-turn-state': 'native-turn-state',
+        'x-codex-turn-metadata': '{"turn":"native"}',
+        'x-codex-window-id': 'native-window',
+        'x-client-request-id': 'native-request-id',
+        'x-openai-internal-codex-responses-lite': 'true'
+      },
+      body: JSON.stringify({
+        model: 'source-model',
+        input: [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'compact securely' }] },
+          { type: 'compaction_trigger' }
+        ],
+        stream: true
+      })
+    })
+
+    expect(response.status).toBe(200)
+    expect(await response.text()).toContain('stoneplus-compact-v1:')
+    expect(upstreamFetch).toHaveBeenCalledOnce()
+    expect(upstreamHeaders.get('authorization')).toBe('Bearer oauth-fallback-private')
+    expect(upstreamHeaders.get('chatgpt-account-id')).toBe('acct-oauth-fallback')
+    for (const name of [
+      'session-id',
+      'x-codex-turn-state',
+      'x-codex-turn-metadata',
+      'x-codex-window-id',
+      'x-client-request-id',
+      'x-openai-internal-codex-responses-lite'
+    ]) expect(upstreamHeaders.get(name), name).toBeNull()
+    expect(JSON.stringify(upstreamBody)).not.toContain('compaction_trigger')
+  })
+
+  it('fails over from a broken native compact source to a compatible relay summary', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers = [
+      {
+        ...gatewayConfig.providers[0],
+        id: 'legacy-relay',
+        sourceType: 'relay',
+        kind: 'openai-compatible',
+        baseUrl: 'https://legacy-relay.example.test/v1',
+        protocol: 'openai-responses',
+        responsesCompactMode: 'legacy'
+      },
+      {
+        ...gatewayConfig.providers[0],
+        id: 'native-relay',
+        sourceType: 'relay',
+        kind: 'openai-compatible',
+        baseUrl: 'https://native-relay.example.test/v1',
+        protocol: 'openai-responses',
+        responsesCompactMode: 'native'
+      }
+    ]
+    gatewayConfig.accounts = [
+      { ...gatewayConfig.accounts[0], providerId: 'legacy-relay', credentialType: 'api-key' },
+      { ...gatewayConfig.accounts[1], providerId: 'native-relay', credentialType: 'api-key' }
+    ]
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    gatewayConfig.pools[0].members = gatewayConfig.accounts.map((item) => ({ accountId: item.id, enabled: true }))
+    gatewayConfig.pools[0].maxRetries = 0
+    const selectedAccountIds: string[] = []
+    const upstreamBodies: Array<Record<string, unknown>> = []
+    const upstreamFetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      upstreamBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>)
+      if (upstreamBodies.length === 1) {
+        return new Response(JSON.stringify({ error: { message: 'native compact unavailable' } }), {
+          status: 503,
+          headers: { 'content-type': 'application/json' }
+        })
+      }
+      return new Response([
+        'event: response.output_text.delta',
+        'data: {"type":"response.output_text.delta","delta":"Recovered summary from relay."}',
+        '',
+        'event: response.completed',
+        'data: {"type":"response.completed","response":{"id":"resp_native_failover","status":"completed","output":[]}}',
+        '',
+        ''
+      ].join('\n'), { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    })
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: (selected) => {
+        selectedAccountIds.push(selected.id)
+        return 'relay-private'
+      },
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer local-secret',
+        'content-type': 'application/json',
+        'x-codex-turn-state': 'native-before-fallback'
+      },
+      body: JSON.stringify({
+        model: 'source-model',
+        input: [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'native-failover-history' }] },
+          { type: 'compaction_trigger' }
+        ],
+        stream: true
+      })
+    })
+
+    expect(response.status).toBe(200)
+    expect(await response.text()).toContain('stoneplus-compact-v1:')
+    expect(selectedAccountIds).toEqual(['second', 'first'])
+    expect(upstreamFetch.mock.calls.map((call) => call[0])).toEqual([
+      'https://native-relay.example.test/v1/responses',
+      'https://legacy-relay.example.test/v1/responses'
+    ])
+    expect(JSON.stringify(upstreamBodies[0])).toContain('compaction_trigger')
+    expect(JSON.stringify(upstreamBodies[1])).not.toContain('compaction_trigger')
+    expect(new Headers(upstreamFetch.mock.calls[0][1]?.headers).get('x-codex-turn-state'))
+      .toBe('native-before-fallback')
+    expect(new Headers(upstreamFetch.mock.calls[1][1]?.headers).get('x-codex-turn-state')).toBeNull()
+  })
+
+  it('keeps a native account healthy when its ordinary fallback succeeds after a compact 503', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers[0] = {
+      ...gatewayConfig.providers[0],
+      sourceType: 'relay',
+      kind: 'openai-compatible',
+      baseUrl: 'https://native-health.example.test/v1',
+      protocol: 'openai-responses',
+      responsesCompactMode: 'native'
+    }
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    gatewayConfig.accounts[0].credentialType = 'api-key'
+    gatewayConfig.accounts[1].status = 'disabled'
+    gatewayConfig.pools[0].maxRetries = 0
+    const selectedAccountIds: string[] = []
+    const upstreamBodies: Array<Record<string, unknown>> = []
+    const states: Array<{ accountId: string; status: string }> = []
+    const upstreamFetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      upstreamBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>)
+      if (upstreamBodies.length === 1) {
+        return new Response(JSON.stringify({ error: { message: 'native compact temporarily unavailable' } }), {
+          status: 503,
+          headers: { 'content-type': 'application/json' }
+        })
+      }
+      if (upstreamBodies.length === 2) {
+        return new Response([
+          'event: response.output_text.delta',
+          'data: {"type":"response.output_text.delta","delta":"Same-account ordinary summary."}',
+          '',
+          'event: response.completed',
+          'data: {"type":"response.completed","response":{"id":"resp_native_health_fallback","status":"completed","output":[]}}',
+          '',
+          ''
+        ].join('\n'), { status: 200, headers: { 'content-type': 'text/event-stream' } })
+      }
+      return new Response([
+        'event: response.created',
+        'data: {"type":"response.created","response":{"id":"resp_normal_after_compact","model":"source-model"}}',
+        '',
+        'event: response.output_text.delta',
+        'data: {"type":"response.output_text.delta","delta":"Normal generation remains available."}',
+        '',
+        'event: response.completed',
+        'data: {"type":"response.completed","response":{"id":"resp_normal_after_compact","model":"source-model","status":"completed","output":[]}}',
+        '',
+        ''
+      ].join('\n'), { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    })
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: (selected) => {
+        selectedAccountIds.push(selected.id)
+        return 'native-health-private'
+      },
+      fetchImplementation: upstreamFetch as typeof fetch,
+      onAccountState: (state) => states.push(state)
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const compactResponse = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'source-model',
+        input: [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'native health history' }] },
+          { type: 'compaction_trigger' }
+        ],
+        stream: true
+      })
+    })
+    expect(compactResponse.status).toBe(200)
+    expect(await compactResponse.text()).toContain('stoneplus-compact-v1:')
+    expect(states).not.toContainEqual(expect.objectContaining({ accountId: 'first', status: 'cooldown' }))
+
+    const normalResponse = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'source-model',
+        input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'normal request' }] }],
+        stream: true
+      })
+    })
+    expect(normalResponse.status).toBe(200)
+    expect(await normalResponse.text()).toContain('Normal generation remains available.')
+    expect(selectedAccountIds).toEqual(['first', 'first', 'first'])
+    expect(upstreamFetch).toHaveBeenCalledTimes(3)
+    expect(JSON.stringify(upstreamBodies[0])).toContain('compaction_trigger')
+    expect(JSON.stringify(upstreamBodies[1])).not.toContain('compaction_trigger')
+    expect(JSON.stringify(upstreamBodies[2])).not.toContain('compaction_trigger')
+    expect(states).not.toContainEqual(expect.objectContaining({ accountId: 'first', status: 'cooldown' }))
+  })
+
+  it('does not globally cool down an account for a compact-only response-shape failure', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers = [
+      {
+        ...gatewayConfig.providers[0],
+        id: 'native-provider',
+        sourceType: 'relay',
+        protocol: 'openai-responses',
+        responsesCompactMode: 'native',
+        baseUrl: 'https://native-shape.example.test/v1'
+      },
+      {
+        ...gatewayConfig.providers[0],
+        id: 'legacy-provider',
+        sourceType: 'relay',
+        protocol: 'openai-responses',
+        responsesCompactMode: 'legacy',
+        baseUrl: 'https://legacy-shape.example.test/v1'
+      }
+    ]
+    gatewayConfig.accounts = [
+      { ...account('native-shape', 1), providerId: 'native-provider', credentialType: 'api-key' },
+      { ...account('legacy-shape', 10), providerId: 'legacy-provider', credentialType: 'api-key' }
+    ]
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    gatewayConfig.pools[0].members = gatewayConfig.accounts.map((item) => ({ accountId: item.id, enabled: true }))
+    gatewayConfig.pools[0].maxRetries = 0
+    const states: Array<{ accountId: string; status: string }> = []
+    const upstreamFetch = vi.fn(async () => {
+      if (upstreamFetch.mock.calls.length === 1) {
+        return new Response([
+          'event: response.output_text.delta',
+          'data: {"type":"response.output_text.delta","delta":"not a compact item"}',
+          '',
+          'event: response.completed',
+          'data: {"type":"response.completed","response":{"id":"resp_invalid_native_shape","status":"completed","output":[]}}',
+          '',
+          ''
+        ].join('\n'), { status: 200, headers: { 'content-type': 'text/event-stream' } })
+      }
+      return new Response([
+        'event: response.output_text.delta',
+        'data: {"type":"response.output_text.delta","delta":"Portable summary after shape fallback."}',
+        '',
+        'event: response.completed',
+        'data: {"type":"response.completed","response":{"id":"resp_shape_fallback","status":"completed","output":[]}}',
+        '',
+        ''
+      ].join('\n'), { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    })
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'relay-private',
+      fetchImplementation: upstreamFetch as typeof fetch,
+      onAccountState: (state) => states.push(state)
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'source-model',
+        input: [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'shape fallback' }] },
+          { type: 'compaction_trigger' }
+        ],
+        stream: true
+      })
+    })
+
+    expect(response.status).toBe(200)
+    expect(await response.text()).toContain('stoneplus-compact-v1:')
+    expect(upstreamFetch).toHaveBeenCalledTimes(2)
+    expect(states).not.toContainEqual(expect.objectContaining({ accountId: 'native-shape', status: 'cooldown' }))
+  })
+
+  it('enters compatibility fallback after the configured native retry budget is exhausted', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers = [
+      {
+        ...gatewayConfig.providers[0],
+        id: 'native-one-provider',
+        sourceType: 'relay',
+        protocol: 'openai-responses',
+        responsesCompactMode: 'native',
+        baseUrl: 'https://native-one.example.test/v1'
+      },
+      {
+        ...gatewayConfig.providers[0],
+        id: 'native-two-provider',
+        sourceType: 'relay',
+        protocol: 'openai-responses',
+        responsesCompactMode: 'native',
+        baseUrl: 'https://native-two.example.test/v1'
+      },
+      {
+        ...gatewayConfig.providers[0],
+        id: 'legacy-provider',
+        sourceType: 'relay',
+        protocol: 'openai-responses',
+        responsesCompactMode: 'legacy',
+        baseUrl: 'https://legacy.example.test/v1'
+      }
+    ]
+    gatewayConfig.accounts = [
+      { ...account('native-one', 1), providerId: 'native-one-provider', credentialType: 'api-key' },
+      { ...account('native-two', 2), providerId: 'native-two-provider', credentialType: 'api-key' },
+      { ...account('legacy', 10), providerId: 'legacy-provider', credentialType: 'api-key' }
+    ]
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    gatewayConfig.pools[0].members = gatewayConfig.accounts.map((item) => ({ accountId: item.id, enabled: true }))
+    gatewayConfig.pools[0].maxRetries = 1
+    const selectedAccountIds: string[] = []
+    const upstreamBodies: Array<Record<string, unknown>> = []
+    const upstreamFetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      upstreamBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>)
+      if (upstreamBodies.length <= 2) {
+        return new Response(JSON.stringify({ error: { message: 'native compact unavailable' } }), {
+          status: 503,
+          headers: { 'content-type': 'application/json' }
+        })
+      }
+      return new Response([
+        'event: response.output_text.delta',
+        'data: {"type":"response.output_text.delta","delta":"Summary after native retry exhaustion."}',
+        '',
+        'event: response.completed',
+        'data: {"type":"response.completed","response":{"id":"resp_retry_exhausted","status":"completed","output":[]}}',
+        '',
+        ''
+      ].join('\n'), { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    })
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: (selected) => {
+        selectedAccountIds.push(selected.id)
+        return 'relay-private'
+      },
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'source-model',
+        input: [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'native-retry-history' }] },
+          { type: 'compaction_trigger' }
+        ],
+        stream: true
+      })
+    })
+
+    expect(response.status).toBe(200)
+    expect(await response.text()).toContain('stoneplus-compact-v1:')
+    expect(selectedAccountIds).toEqual(['native-one', 'native-two', 'native-one'])
+    expect(JSON.stringify(upstreamBodies[0])).toContain('compaction_trigger')
+    expect(JSON.stringify(upstreamBodies[1])).toContain('compaction_trigger')
+    expect(JSON.stringify(upstreamBodies[2])).not.toContain('compaction_trigger')
+  })
+
+  it('uses the same relay ordinary Responses path when its native compact extension returns 404', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers[0] = {
+      ...gatewayConfig.providers[0],
+      sourceType: 'relay',
+      kind: 'openai-compatible',
+      baseUrl: 'https://native-relay.example.test/v1',
+      protocol: 'openai-responses',
+      responsesCompactMode: 'native'
+    }
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    gatewayConfig.accounts = gatewayConfig.accounts.map((item) => ({ ...item, credentialType: 'api-key' }))
+    gatewayConfig.accounts[1].status = 'disabled'
+    gatewayConfig.pools[0].maxRetries = 0
+    const upstreamBodies: Array<Record<string, unknown>> = []
+    const upstreamFetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      upstreamBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>)
+      if (upstreamBodies.length === 1) {
+        return new Response(JSON.stringify({
+          error: { message: 'compaction_trigger is not supported', type: 'invalid_request_error' }
+        }), { status: 404, headers: { 'content-type': 'application/json' } })
+      }
+      return new Response([
+        'event: response.output_text.delta',
+        'data: {"type":"response.output_text.delta","delta":"Same-relay portable summary."}',
+        '',
+        'event: response.completed',
+        'data: {"type":"response.completed","response":{"id":"resp_same_relay_fallback","status":"completed","output":[]}}',
+        '',
+        ''
+      ].join('\n'), { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    })
+    const credentialResolver = vi.fn(() => 'relay-private')
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver,
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'source-model',
+        input: [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'same-relay-history' }] },
+          { type: 'compaction_trigger' }
+        ],
+        stream: true
+      })
+    })
+
+    expect(response.status).toBe(200)
+    expect(await response.text()).toContain('stoneplus-compact-v1:')
+    expect(credentialResolver).toHaveBeenCalledTimes(2)
+    expect(upstreamFetch).toHaveBeenCalledTimes(2)
+    expect(upstreamFetch.mock.calls.map((call) => call[0])).toEqual([
+      'https://native-relay.example.test/v1/responses',
+      'https://native-relay.example.test/v1/responses'
+    ])
+    expect(JSON.stringify(upstreamBodies[0])).toContain('compaction_trigger')
+    expect(JSON.stringify(upstreamBodies[1])).not.toContain('compaction_trigger')
+  })
+
+  it('uses the same OAuth Responses source when its native compact extension is unavailable', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers[0] = {
+      ...gatewayConfig.providers[0],
+      sourceType: 'oauth-system',
+      kind: 'openai',
+      protocol: 'openai-responses'
+    }
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    gatewayConfig.accounts[0] = {
+      ...gatewayConfig.accounts[0],
+      credentialType: 'chatgpt-oauth',
+      chatgptAccountId: 'acct-native-fallback'
+    }
+    gatewayConfig.accounts[1].status = 'disabled'
+    gatewayConfig.pools[0].maxRetries = 0
+    const upstreamBodies: Array<Record<string, unknown>> = []
+    const upstreamHeaders: Headers[] = []
+    const upstreamFetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      upstreamBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>)
+      upstreamHeaders.push(new Headers(init?.headers))
+      if (upstreamBodies.length === 1) {
+        return new Response(JSON.stringify({
+          error: { message: 'native compact extension unavailable', type: 'invalid_request_error' }
+        }), { status: 404, headers: { 'content-type': 'application/json' } })
+      }
+      return new Response([
+        'event: response.output_text.delta',
+        'data: {"type":"response.output_text.delta","delta":"Same-account OAuth summary."}',
+        '',
+        'event: response.completed',
+        'data: {"type":"response.completed","response":{"id":"resp_oauth_same_source","status":"completed","output":[]}}',
+        '',
+        ''
+      ].join('\n'), { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    })
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => ({
+        secret: 'oauth-same-source-private',
+        kind: 'chatgpt-oauth' as const,
+        accountId: 'acct-native-fallback'
+      }),
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer local-secret',
+        'content-type': 'application/json',
+        'x-codex-turn-state': 'oauth-native-state'
+      },
+      body: JSON.stringify({
+        model: 'source-model',
+        input: [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'oauth history' }] },
+          { type: 'compaction_trigger' }
+        ],
+        stream: true
+      })
+    })
+
+    expect(response.status).toBe(200)
+    expect(await response.text()).toContain('stoneplus-compact-v1:')
+    expect(upstreamFetch).toHaveBeenCalledTimes(2)
+    expect(JSON.stringify(upstreamBodies[0])).toContain('compaction_trigger')
+    expect(JSON.stringify(upstreamBodies[1])).not.toContain('compaction_trigger')
+    expect(upstreamHeaders[0].get('x-codex-turn-state')).toBe('oauth-native-state')
+    expect(upstreamHeaders[1].get('x-codex-turn-state')).toBeNull()
+    expect(upstreamHeaders[1].get('authorization')).toBe('Bearer oauth-same-source-private')
+    expect(upstreamHeaders[1].get('chatgpt-account-id')).toBe('acct-native-fallback')
+  })
+
+  it('tries a compatible peer when the same-relay ordinary fallback also fails', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers = [
+      {
+        ...gatewayConfig.providers[0],
+        id: 'native-provider',
+        sourceType: 'relay',
+        protocol: 'openai-responses',
+        responsesCompactMode: 'native',
+        baseUrl: 'https://native.example.test/v1'
+      },
+      {
+        ...gatewayConfig.providers[0],
+        id: 'legacy-provider',
+        sourceType: 'relay',
+        protocol: 'openai-responses',
+        responsesCompactMode: 'legacy',
+        baseUrl: 'https://legacy.example.test/v1'
+      }
+    ]
+    gatewayConfig.accounts = [
+      { ...account('native', 1), providerId: 'native-provider', credentialType: 'api-key' },
+      { ...account('legacy', 10), providerId: 'legacy-provider', credentialType: 'api-key' }
+    ]
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    gatewayConfig.pools[0].members = gatewayConfig.accounts.map((item) => ({ accountId: item.id, enabled: true }))
+    gatewayConfig.pools[0].maxRetries = 0
+    const selectedAccountIds: string[] = []
+    const upstreamBodies: Array<Record<string, unknown>> = []
+    const upstreamFetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      upstreamBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>)
+      if (upstreamBodies.length === 1) {
+        return new Response(JSON.stringify({ error: { message: 'native extension missing' } }), {
+          status: 404,
+          headers: { 'content-type': 'application/json' }
+        })
+      }
+      if (upstreamBodies.length === 2) {
+        return new Response(JSON.stringify({ error: { message: 'ordinary endpoint unavailable' } }), {
+          status: 503,
+          headers: { 'content-type': 'application/json' }
+        })
+      }
+      return new Response([
+        'event: response.output_text.delta',
+        'data: {"type":"response.output_text.delta","delta":"Summary from compatibility peer."}',
+        '',
+        'event: response.completed',
+        'data: {"type":"response.completed","response":{"id":"resp_peer_compat","status":"completed","output":[]}}',
+        '',
+        ''
+      ].join('\n'), { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    })
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: (selected) => {
+        selectedAccountIds.push(selected.id)
+        return `${selected.id}-private`
+      },
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'source-model',
+        input: [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'peer fallback' }] },
+          { type: 'compaction_trigger' }
+        ],
+        stream: true
+      })
+    })
+
+    expect(response.status).toBe(200)
+    expect(await response.text()).toContain('stoneplus-compact-v1:')
+    expect(selectedAccountIds).toEqual(['native', 'native', 'legacy'])
+    expect(upstreamFetch.mock.calls.map((call) => call[0])).toEqual([
+      'https://native.example.test/v1/responses',
+      'https://native.example.test/v1/responses',
+      'https://legacy.example.test/v1/responses'
+    ])
+    expect(JSON.stringify(upstreamBodies[0])).toContain('compaction_trigger')
+    expect(JSON.stringify(upstreamBodies[1])).not.toContain('compaction_trigger')
+    expect(JSON.stringify(upstreamBodies[2])).not.toContain('compaction_trigger')
   })
 
   it('rejects only genuinely opaque compact history on legacy relay sources', async () => {
@@ -3007,6 +5624,27 @@ describe('GatewayServer', () => {
     expect(credentialResolver).not.toHaveBeenCalled()
     expect(upstreamFetch).not.toHaveBeenCalled()
 
+    for (const malformedEnvelope of [
+      'stoneplus-compact-v1:',
+      'stoneplus-compact-v1:not!base64',
+      'stoneplus-compact-v1:Zh',
+      'stoneplus-compact-v1:_w'
+    ]) {
+      const malformed = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+        method: 'POST',
+        headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+        body: JSON.stringify({
+          model: 'source-model',
+          input: [{ type: 'compaction', encrypted_content: malformedEnvelope }],
+          stream: true
+        })
+      })
+      expect(malformed.status).toBe(422)
+      expect(await malformed.json()).toMatchObject({ error: { type: 'invalid_compaction_envelope' } })
+      expect(credentialResolver).not.toHaveBeenCalled()
+      expect(upstreamFetch).not.toHaveBeenCalled()
+    }
+
     const standaloneOpaque = await fetch(`http://127.0.0.1:${port}/v1/responses/compact`, {
       method: 'POST',
       headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
@@ -3052,7 +5690,7 @@ describe('GatewayServer', () => {
     expect(upstreamFetch).toHaveBeenCalledOnce()
   })
 
-  it('allows opaque continuation but not compact creation on passthrough relay sources', async () => {
+  it('allows opaque continuation and adapts compact creation on passthrough relay sources', async () => {
     const port = await freePort()
     const gatewayConfig = config(port)
     gatewayConfig.providers[0] = {
@@ -3106,6 +5744,20 @@ describe('GatewayServer', () => {
     runningServers.push(gateway)
     await gateway.start()
 
+    const malformedLocalEnvelope = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'source-model',
+        input: [{ type: 'compaction', encrypted_content: 'stoneplus-compact-v1:not!base64' }],
+        stream: true
+      })
+    })
+    expect(malformedLocalEnvelope.status).toBe(422)
+    expect(await malformedLocalEnvelope.json())
+      .toMatchObject({ error: { type: 'invalid_compaction_envelope' } })
+    expect(upstreamFetch).not.toHaveBeenCalled()
+
     const opaqueInput = [
       { type: 'compaction', encrypted_content: 'encrypted-passthrough' },
       { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'continue' }] }
@@ -3149,11 +5801,20 @@ describe('GatewayServer', () => {
     const createCompact = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
       method: 'POST',
       headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
-      body: JSON.stringify({ model: 'source-model', input: [{ type: 'compaction_trigger' }], stream: true })
+      body: JSON.stringify({
+        model: 'source-model',
+        input: [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'passthrough-create-history' }] },
+          { type: 'compaction_trigger' }
+        ],
+        stream: true
+      })
     })
-    expect(createCompact.status).toBe(422)
-    expect(await createCompact.text()).toContain('native OpenAI Responses compact support')
-    expect(upstreamFetch).toHaveBeenCalledTimes(2)
+    expect(createCompact.status).toBe(200)
+    expect(await createCompact.text()).toContain('stoneplus-compact-v1:')
+    expect(JSON.stringify(JSON.parse(String(upstreamFetch.mock.calls[2][1]?.body))))
+      .not.toContain('compaction_trigger')
+    expect(upstreamFetch).toHaveBeenCalledTimes(3)
   })
 
   it('uses native compact creation and endpoint routing for upgraded relay sources', async () => {

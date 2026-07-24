@@ -152,6 +152,13 @@ const COMPACT_FALLBACK_INSTRUCTIONS = [
 // Codex recognizes locally compacted summaries by this exact prefix. Keep it
 // byte-for-byte aligned with codex-rs/prompts/templates/compact/summary_prefix.md.
 const COMPACT_SUMMARY_PREFIX = 'Another language model started to solve this problem and produced a summary of its thinking process. You also have access to the state of the tools that were used by that language model. Use this to build on the work that has already been done and avoid duplicating work. Here is the summary produced by the other language model, use the information in this summary to assist with your own analysis:'
+// Codex enables Remote Compaction V2 by default. Relays without native
+// compaction cannot create OpenAI's opaque item, so Stone+ wraps the existing
+// portable text summary in a self-describing local envelope. The envelope is
+// materialized back into an ordinary user summary before any relay sees it.
+const STONE_COMPACT_FALLBACK_PREFIX = 'stoneplus-compact-v1:'
+const MAX_STONE_COMPACT_FALLBACK_VALUE_BYTES = MAX_COMPACT_V2_STREAM_BYTES - (64 * 1024)
+const MIN_COMPACT_FALLBACK_REDACTION_SECRET_BYTES = 8
 const COMPACT_PASSTHROUGH_HEADERS = Object.freeze([
   'conversation_id',
   'session_id',
@@ -845,6 +852,9 @@ export class GatewayServer implements GatewayController {
       }
       const bodyReadyAt = this.now()
       bodyReadMs = Math.max(0, bodyReadyAt - started)
+      if (incoming.protocol === 'openai-responses' && logRoute.client === 'codex') {
+        body = materializeStoneCompactFallbackHistory(body)
+      }
       model = getRequestModel(incoming.protocol, body, pathname)
       if (!model) throw new GatewayHttpError(400, 'A model is required')
       const codexSearch = incoming.operation === 'codex-search'
@@ -855,12 +865,27 @@ export class GatewayServer implements GatewayController {
       if (codexCompact && !Array.isArray(body.input)) {
         throw new GatewayHttpError(400, 'A compact request requires an input history')
       }
+      const codexCompactV2 = incoming.operation === 'generate'
+        && incoming.protocol === 'openai-responses'
+        && isCodexCompactV2Body(body)
+      if (codexCompactV2) requestKind = 'compaction'
+      const compactFallbackCompatibilityBody = codexCompactV2 && logRoute.client === 'codex'
+        ? buildCompactFallbackBody(body, model, 0, false, true)
+        : undefined
+      const compactFallbackInputUsable = codexCompactV2 && logRoute.client === 'codex'
+        ? compactFallbackBodyIsUsable(body, model)
+        : false
 
       failureStage = 'scheduler'
       const pool = requestIndex.poolsById.get(logRoute?.poolId ?? '')
       if (!pool) throw new GatewayHttpError(503, 'The matched route has no available pool')
       if (incoming.operation === 'generate') {
-        const conversion = analyzeProtocolConversion(incoming.protocol, pool.protocol, body)
+        // A V2 trigger is a Codex/OpenAI transport control record, not
+        // conversation content. Cross-protocol pools must be checked against
+        // the ordinary summary request that Stone+ will actually send rather
+        // than rejecting the trigger before compatibility fallback can run.
+        const conversionBody = compactFallbackCompatibilityBody ?? body
+        const conversion = analyzeProtocolConversion(incoming.protocol, pool.protocol, conversionBody)
         if (!conversion.supported) {
           const first = conversion.issues[0]
           throw new GatewayHttpError(
@@ -872,20 +897,50 @@ export class GatewayServer implements GatewayController {
         }
       }
       const providerAccounts = requestIndex.accountsByPoolId.get(pool.id) ?? []
-      const codexCompactV2 = incoming.operation === 'generate'
-        && incoming.protocol === 'openai-responses'
-        && isCodexCompactV2Body(body)
-      if (codexCompactV2) requestKind = 'compaction'
       const codexOpaqueCompactHistory = incoming.protocol === 'openai-responses'
         && hasCodexOpaqueCompactHistory(body)
-      const compactSensitive = codexCompactV2 || codexOpaqueCompactHistory
-      const schedulingAccounts = compactSensitive
+      const nativeCompactAccounts = codexCompactV2
+        ? providerAccounts.filter((account) => accountSupportsNativeCompact(
+            account,
+            requestIndex.providersById.get(account.providerId)
+          ))
+        : []
+      const fallbackCompactAccounts = codexCompactV2 && logRoute.client === 'codex'
         ? providerAccounts.filter((account) => {
             const provider = requestIndex.providersById.get(account.providerId)
-            return (!codexCompactV2 || accountSupportsNativeCompact(account, provider))
-              && (!codexOpaqueCompactHistory || accountSupportsOpaqueCompactHistory(account, provider))
+            if (!provider) return false
+            // OAuth credentials are bound to the ChatGPT Responses endpoint.
+            // API-key providers may use any protocol for which the portable
+            // summary request has a lossless conversion.
+            if (account.credentialType === 'chatgpt-oauth'
+              || account.credentialType === 'chatgpt-agent-identity') {
+              return provider.protocol === 'openai-responses'
+            }
+            return analyzeProtocolConversion(
+              'openai-responses',
+              provider.protocol,
+              compactFallbackCompatibilityBody!
+            ).supported
           })
-        : providerAccounts
+        : []
+      let codexCompactV2Fallback = codexCompactV2
+        && logRoute.client === 'codex'
+        && nativeCompactAccounts.length === 0
+        && fallbackCompactAccounts.length > 0
+      const compactSensitive = codexCompactV2 || codexOpaqueCompactHistory
+      let schedulingAccounts = codexCompactV2
+        ? (codexCompactV2Fallback ? fallbackCompactAccounts : nativeCompactAccounts)
+          .filter((account) => !codexOpaqueCompactHistory
+            || accountSupportsOpaqueCompactHistory(
+              account,
+              requestIndex.providersById.get(account.providerId)
+            ))
+        : codexOpaqueCompactHistory
+          ? providerAccounts.filter((account) => accountSupportsOpaqueCompactHistory(
+              account,
+              requestIndex.providersById.get(account.providerId)
+            ))
+          : providerAccounts
       if (compactSensitive && schedulingAccounts.length === 0) {
         throw new GatewayHttpError(
           422,
@@ -920,7 +975,10 @@ export class GatewayServer implements GatewayController {
       scheduleProgressLog('scheduling')
       const streaming = !codexSearch && !codexCompact
         && (body.stream === true || incoming.geminiMethod === 'streamGenerateContent')
-      const requiredCapabilities = requiredUpstreamCapabilities(body, streaming)
+      let requiredCapabilities = requiredUpstreamCapabilities(
+        codexCompactV2Fallback ? buildCompactFallbackBody(body, targetModel) : body,
+        codexCompactV2Fallback ? true : streaming
+      )
       const firstBodyTimeoutMs = Math.min(MAX_FIRST_BODY_TIMEOUT_MS, Math.max(
         MIN_FIRST_BODY_TIMEOUT_MS,
         pool.firstBodyTimeoutMs ?? Math.floor(requestConfig.settings.requestTimeoutSeconds * 250)
@@ -941,12 +999,20 @@ export class GatewayServer implements GatewayController {
       // mirror that contract so a valid native compact body is not cut off by
       // Stone+ before the client itself would abandon it.
       const responseStartDeadlineAt = bodyReadyAt
-         + Math.max(1, requestConfig.settings.requestTimeoutSeconds) * 1000 * (codexCompact ? 4 : 1)
-      let lastRetryableError: GatewayHttpError | undefined
+         + Math.max(1, requestConfig.settings.requestTimeoutSeconds) * 1000
+           * (codexCompact || codexCompactV2 ? 4 : 1)
+      let lastAttemptError: GatewayHttpError | undefined
+      let ordinaryRetriesUsed = 0
+      let compactCompatibilityRetriesUsed = 0
       const failedAccountIds = new Set<string>()
-      for (let attempt = 0; attempt <= retryLimit; attempt += 1) {
+      const nativeCompactCapabilityFailedAccountIds = new Set<string>()
+      const currentExcludedAccountIds = (): string[] => codexCompactV2 && !codexCompactV2Fallback
+        ? [...new Set([...failedAccountIds, ...nativeCompactCapabilityFailedAccountIds])]
+        : [...failedAccountIds]
+      for (;;) {
         let release: (() => void) | undefined
         let attemptedAccount: Account | undefined
+        let attemptedCompactFallback = false
         let selectedHealthRevision: number | undefined
         let selectedResetEpoch: number | undefined
         let performanceRevision: number | undefined
@@ -971,34 +1037,70 @@ export class GatewayServer implements GatewayController {
               accounts: schedulingAccounts,
               model: targetModel,
               sessionId,
-              excludedAccountIds: [...failedAccountIds],
+              excludedAccountIds: currentExcludedAccountIds(),
               providers: requestConfig.providers,
               requiredCapabilities
             })
           } catch (error) {
-            if (error instanceof NoEligibleAccountError) {
+            let selectionError: unknown = error
+            if (
+              (error instanceof NoEligibleAccountError || error instanceof ModelNotExposedError)
+              && codexCompactV2
+              && !codexCompactV2Fallback
+              && !codexOpaqueCompactHistory
+              && compactFallbackInputUsable
+              && fallbackCompactAccounts.length > 0
+            ) {
+              // Prefer a provider that can perform native V2 compaction, but do
+              // not strand the request when every native account is disabled,
+              // cooling down, saturated, or already failed in this retry loop.
+              // The relay fallback receives an ordinary summary request only.
+              codexCompactV2Fallback = true
+              schedulingAccounts = fallbackCompactAccounts
+              requiredCapabilities = requiredUpstreamCapabilities(
+                buildCompactFallbackBody(body, targetModel),
+                true
+              )
+              try {
+                scheduled = this.scheduler.selectAndAcquire({
+                  pool: schedulingPool,
+                  accounts: schedulingAccounts,
+                  model: targetModel,
+                  sessionId,
+                  excludedAccountIds: currentExcludedAccountIds(),
+                  providers: requestConfig.providers,
+                  requiredCapabilities
+                })
+              } catch (fallbackError) {
+                selectionError = fallbackError
+              }
+            }
+            if (!scheduled && selectionError instanceof NoEligibleAccountError) {
               // Report only the statically compatible source set. The desktop
               // layer filters this down to recoverable disabled/failure-cooled
               // accounts and applies per-account single-flight throttling, so
               // retry exhaustion can recover a stale sibling without turning
               // repeated 503s into a probe storm.
               if (
-                error.accountIds.length > 0
+                selectionError.accountIds.length > 0
                 && requestConfigGeneration === this.configGeneration
               ) {
                 const noEligibleAccounts = {
                   configGeneration: requestConfigGeneration,
                   routeId: logRoute.id,
                   poolId: pool.id,
-                  accountIds: error.accountIds,
+                  accountIds: selectionError.accountIds,
                 }
                 this.emitRuntimeState({
                   noEligibleAccounts,
                 })
               }
-              if (lastRetryableError) throw lastRetryableError
+              if (lastAttemptError) throw lastAttemptError
             }
-            throw error
+            if (!scheduled && selectionError instanceof ModelNotExposedError && lastAttemptError) {
+              throw lastAttemptError
+            }
+            if (!scheduled) throw selectionError
           } finally {
             schedulerSelectMs = Math.max(0, this.now() - schedulerSelectStarted)
           }
@@ -1006,6 +1108,10 @@ export class GatewayServer implements GatewayController {
           selectedHealthRevision = scheduled.healthRevision
           selectedResetEpoch = scheduled.resetEpoch
           attemptedAccount = account
+          // Mark the attempt as compatibility-mode before any asynchronous
+          // credential work. Resolver and provider-validation failures must be
+          // eligible for the compatibility stage's independent peer retry.
+          attemptedCompactFallback = codexCompactV2 && codexCompactV2Fallback
           selectedAccount = account
           failureStage = 'credential'
           release = this.runtimeTrackedRelease(
@@ -1029,14 +1135,6 @@ export class GatewayServer implements GatewayController {
                 : 'Standalone web search requires an OpenAI Responses provider',
               'unsupported_conversion'
             )
-          }
-          const convertedBodyKey = `${provider.protocol}\0${targetModel}`
-          let convertedBody = convertedBodies.get(convertedBodyKey)
-          if (!convertedBody) {
-            convertedBody = codexSearch || codexCompact
-              ? { ...body, model: targetModel }
-              : convertRequest(incoming.protocol, provider.protocol, body, targetModel).body
-            convertedBodies.set(convertedBodyKey, convertedBody)
           }
           const outboundFetch = this.outboundFetchResolver?.(account, pool, requestConfig.proxies ?? [])
             ?? this.fetchImplementation
@@ -1068,12 +1166,39 @@ export class GatewayServer implements GatewayController {
             : undefined
           const preferSearchFallback = cachedSearchCapability === 'responses-fallback'
           const compactFallback = codexCompact
-            && !supportsNativeCompact(provider, resolvedCredential.kind)
+            ? !supportsNativeCompact(provider, resolvedCredential.kind)
+            : codexCompactV2 && logRoute.client === 'codex'
+              && (codexCompactV2Fallback || !supportsNativeCompact(provider, resolvedCredential.kind))
+          attemptedCompactFallback = codexCompactV2 && compactFallback
+          if (attemptedCompactFallback && !codexCompactV2Fallback) {
+            // The persisted credential type is only a scheduling hint. The
+            // resolver is authoritative, so a native-looking account that
+            // resolves to an API key promotes the whole request into the
+            // compatibility stage before any upstream work. Peer retry and
+            // exclusion rules must follow what is actually sent on the wire.
+            codexCompactV2Fallback = true
+            schedulingAccounts = fallbackCompactAccounts
+            requiredCapabilities = requiredUpstreamCapabilities(
+              buildCompactFallbackBody(body, targetModel),
+              true
+            )
+          }
           // Codex's local summarization path is an ordinary streaming Responses
           // request. Many Responses-compatible relays only implement that path
           // (or implement their buffered JSON path incompletely), so use the
           // same proven transport for legacy compact fallback.
           const upstreamStreaming = streaming || compactFallback
+          const convertedBodyKey = `${provider.protocol}\0${targetModel}`
+            + `\0${compactFallback ? 'compact-fallback' : 'native'}`
+          let convertedBody = convertedBodies.get(convertedBodyKey)
+          if (!convertedBody) {
+            convertedBody = compactFallback
+              ? buildProviderCompactFallbackBody(body, targetModel, provider.protocol)
+              : codexSearch || codexCompact
+                ? { ...body, model: targetModel }
+                : convertRequest(incoming.protocol, provider.protocol, body, targetModel).body
+            convertedBodies.set(convertedBodyKey, convertedBody)
+          }
           scheduleProgressLog('connecting')
 
           let upstreamHeaders = new Headers()
@@ -1116,26 +1241,27 @@ export class GatewayServer implements GatewayController {
           const nativeCompactResponses = incoming.protocol === 'openai-responses'
             && provider.protocol === 'openai-responses'
             && supportsNativeCompact(provider, resolvedCredential.kind)
-          const compactResponsePassthrough = nativeCompactResponses
+          const compactResponsePassthrough = (!compactFallback || codexCompact) && (
+            nativeCompactResponses
             || (codexOpaqueCompactHistory
               && incoming.protocol === 'openai-responses'
               && provider.protocol === 'openai-responses'
               && supportsOpaqueCompactHistory(provider, resolvedCredential.kind))
+          )
           // Legacy compact fallback is an ordinary text-summary request. Do not
           // leak compact state metadata into that unrelated endpoint. Native
           // compact and opaque passthrough still need the continuity headers.
           if ((codexCompact && !compactFallback) || compactResponsePassthrough) {
             copyCompactRequestHeaders(request, upstreamHeaders)
           }
-          const outboundBody = codexSearch || codexCompact
+          if (codexCompactV2 && compactFallback) stripCompactRequestHeaders(upstreamHeaders)
+          const outboundBody = codexSearch || codexCompact || compactFallback
             ? convertedBody
             : withStreamingFlag(convertedBody, provider.protocol, streaming)
-          const compactFallbackBody = compactFallback
-            ? buildCompactFallbackBody(outboundBody, targetModel)
-            : outboundBody
-          const tieredOutboundBody = !codexSearch && !codexCompact && supportsFastServiceTier(provider.protocol)
+          const tieredOutboundBody = !codexSearch && !codexCompact && !compactFallback
+            && supportsFastServiceTier(provider.protocol)
             ? normalizeOpenAIServiceTier(outboundBody, pool.forceFastMode === true)
-            : compactFallbackBody
+            : outboundBody
           const upstreamBody = preferSearchFallback
             ? withChatGptCodexBody(buildChatGptSearchFallbackBody(body, targetModel))
             : isChatGptCodexCredentialKind(resolvedCredential.kind) && !codexSearch && !codexCompact
@@ -1230,7 +1356,7 @@ export class GatewayServer implements GatewayController {
           let errorPayload: JsonObject | undefined
           let codexSearchFallbackPayload: JsonObject | undefined
           const compactFallbackHistoryItems = compactFallback
-            ? compactFallbackHistoryLength(outboundBody)
+            ? compactFallbackHistoryLength(body)
             : 0
           let compactFallbackDroppedHistoryItems = 0
           let compactFallbackContextRetries = 0
@@ -1250,9 +1376,10 @@ export class GatewayServer implements GatewayController {
                 compactFallbackContextRetries += 1
                 // Do not use `serializedBodies` here: every recovery request
                 // intentionally carries a smaller history than the first one.
-                serializedUpstreamBody = JSON.stringify(buildCompactFallbackBody(
-                  outboundBody,
+                serializedUpstreamBody = JSON.stringify(buildProviderCompactFallbackBody(
+                  body,
                   targetModel,
+                  provider.protocol,
                   compactFallbackDroppedHistoryItems
                 ))
                 failureStage = 'connect'
@@ -1348,6 +1475,7 @@ export class GatewayServer implements GatewayController {
               if ((codexCompact && !compactFallback) || compactResponsePassthrough) {
                 copyCompactRequestHeaders(request, upstreamHeaders)
               }
+              if (codexCompactV2 && compactFallback) stripCompactRequestHeaders(upstreamHeaders)
               upstreamResponse = await awaitWithAbortSignal(
                 outboundFetch(upstreamUrl, {
                   method: 'POST', headers: upstreamHeaders,
@@ -1570,10 +1698,11 @@ export class GatewayServer implements GatewayController {
           // transport/protocol idle guards after its headers are accepted.
           // ChatGPT OAuth always uses SSE upstream even when the downstream
           // caller requested a buffered JSON response.
-          const upstreamResponseIsStream = streaming
-            || codexCompactV2
-            || (compactFallback && !isJsonUpstreamResponse(upstreamResponse))
-            || (isChatGptCodexCredentialKind(resolvedCredential.kind) && !codexSearch && !codexCompact)
+          const upstreamResponseIsStream = compactFallback
+            ? false
+            : streaming
+              || codexCompactV2
+              || (isChatGptCodexCredentialKind(resolvedCredential.kind) && !codexSearch && !codexCompact)
           if (upstreamResponseIsStream) {
             upstreamDeadline?.clear()
             upstreamDeadline = undefined
@@ -1605,8 +1734,9 @@ export class GatewayServer implements GatewayController {
             return
           }
 
-          if (codexCompact) {
-            let payload: JsonObject
+          if (codexCompact || (codexCompactV2 && compactFallback)) {
+            let payload: JsonObject | undefined
+            let fallbackSummary: string | undefined
             let compactUsage: NormalizedTokenUsage | undefined
             if (compactFallback) {
               let fallbackResponse: JsonObject | undefined
@@ -1615,9 +1745,10 @@ export class GatewayServer implements GatewayController {
                 try {
                   fallbackResponse = await readCompactFallbackResponse(
                     upstreamResponse,
+                    provider.protocol,
                     { id: randomUUID(), model: targetModel, now: this.now },
                     compactFallbackReadSignal,
-                    streamIdleTimeoutMs,
+                    firstBodyTimeoutMs,
                     streamIdleTimeoutMs,
                     responsesProgressIdleTimeoutMs,
                     sensitiveValues(resolvedCredential)
@@ -1645,9 +1776,10 @@ export class GatewayServer implements GatewayController {
                     }
                     compactFallbackDroppedHistoryItems = nextDropCount
                     compactFallbackContextRetries += 1
-                    serializedUpstreamBody = JSON.stringify(buildCompactFallbackBody(
-                      outboundBody,
+                    serializedUpstreamBody = JSON.stringify(buildProviderCompactFallbackBody(
+                      body,
                       targetModel,
+                      provider.protocol,
                       compactFallbackDroppedHistoryItems
                     ))
                     upstreamDeadline?.clear()
@@ -1716,11 +1848,6 @@ export class GatewayServer implements GatewayController {
                     if (upstreamResponse.ok) {
                       errorPayload = undefined
                       receivedSuccessfulHeaders = true
-                      if (!isJsonUpstreamResponse(upstreamResponse)) {
-                        upstreamDeadline.clear()
-                        upstreamDeadline = undefined
-                        compactFallbackReadSignal = clientAbortController.signal
-                      }
                       continue
                     }
                     errorPayload = await readUpstreamJson(upstreamResponse, compactRetrySignal)
@@ -1748,7 +1875,7 @@ export class GatewayServer implements GatewayController {
               if (!fallbackResponse) {
                 throw new GatewayHttpError(502, 'Compact fallback returned no response', 'upstream_compact_error')
               }
-              if (compactFallbackResponseIsIncomplete(fallbackResponse)) {
+              if (compactFallbackResponseIsIncomplete(fallbackResponse, 'openai-responses')) {
                 throw new GatewayHttpError(
                   502,
                   'Compact fallback ended before the summary was complete',
@@ -1763,8 +1890,20 @@ export class GatewayServer implements GatewayController {
                   'upstream_compact_error'
                 )
               }
-              payload = compactReplacementPayload(summary, body.input)
-              compactUsage = extractProtocolUsage('openai-responses', fallbackResponse)
+              // Substring-redacting tiny credentials (for example a test key
+              // of "a") silently destroys ordinary language. Real tokens have
+              // enough entropy to clear this floor; shorter values remain in
+              // headers and are never inserted into the fallback prompt.
+              const safeSummary = redactSensitiveText(
+                summary,
+                sensitiveValues(resolvedCredential).filter((value) => (
+                  Buffer.byteLength(value, 'utf8') >= MIN_COMPACT_FALLBACK_REDACTION_SECRET_BYTES
+                ))
+              )
+              fallbackSummary = safeSummary
+              if (codexCompact) payload = compactReplacementPayload(safeSummary, body.input)
+              compactUsage = extractProtocolUsage(provider.protocol, fallbackResponse)
+                ?? extractProtocolUsage('openai-responses', fallbackResponse)
             } else {
               payload = await readUpstreamJson(upstreamResponse, responseBodySignal)
               if (!isValidCompactReplacementHistory(payload.output)) {
@@ -1776,6 +1915,21 @@ export class GatewayServer implements GatewayController {
               }
               compactUsage = extractProtocolUsage('openai-responses', payload)
             }
+            const compactV2Wire = codexCompactV2
+              ? (() => {
+                  if (!fallbackSummary) {
+                    throw new GatewayHttpError(
+                      502,
+                      'Compact V2 fallback returned no summary text',
+                      'upstream_compact_error'
+                    )
+                  }
+                  return buildCompactV2FallbackWire(fallbackSummary, targetModel, compactUsage, this.now())
+                })()
+              : undefined
+            if (!codexCompactV2 && !payload) {
+              throw new GatewayHttpError(502, 'Compact fallback returned no output history', 'upstream_compact_error')
+            }
             if (!compactFallback) copyResponsesResponseHeaders(upstreamResponse.headers, response)
             performanceRevision = this.reportAccountSuccess(
               account, attemptStarted, headerSignals, selectedHealthRevision, selectedResetEpoch
@@ -1783,7 +1937,21 @@ export class GatewayServer implements GatewayController {
             release?.()
             release = undefined
             releaseCommittedRequestBody()
-            const written = await this.writeJson(response, 200, payload, markClientFirstWrite)
+            let written: boolean
+            if (compactV2Wire) {
+              written = await writeBufferedResponsesStream(
+                compactV2FallbackResponse(),
+                response,
+                [compactV2Wire],
+                [],
+                markClientFirstWrite
+              )
+            } else {
+              if (!payload) {
+                throw new GatewayHttpError(502, 'Compact fallback returned no output history', 'upstream_compact_error')
+              }
+              written = await this.writeJson(response, 200, payload, markClientFirstWrite)
+            }
             if (!written) throw new GatewayHttpError(499, 'Client closed the request', 'client_closed')
             const completedAt = this.now()
             this.successRequests += 1
@@ -1819,7 +1987,9 @@ export class GatewayServer implements GatewayController {
               upstreamResponse,
               response,
               compactStream.chunks,
-              sensitiveValues(resolvedCredential),
+              sensitiveValues(resolvedCredential).filter((value) => (
+                Buffer.byteLength(value, 'utf8') >= MIN_COMPACT_FALLBACK_REDACTION_SECRET_BYTES
+              )),
               markClientFirstWrite
             )
             if (!written) throw new GatewayHttpError(499, 'Client closed the request', 'client_closed')
@@ -1989,34 +2159,62 @@ export class GatewayServer implements GatewayController {
           const gatewayError = normalizeError(error)
           const retryable = isRetryable(gatewayError)
           const accountAction = gatewayError.providerFailure?.accountAction
-          const provenAccountFailure = retryable
-            || accountAction === 'disable'
-            || accountAction === 'cooldown'
-            || gatewayError.statusCode === 502
-            || gatewayError.statusCode === 504
-          if (attemptedAccount && provenAccountFailure) {
-            const failureNow = this.now()
-            const actualResetAt = quotaSignalCooldownUntil(gatewayError.quotaSignals, failureNow)
-            const quotaExhausted = codexQuotaIsExhausted(gatewayError.quotaSignals?.codexQuota, failureNow)
-              || genericQuotaExhausted(gatewayError.quotaSignals?.quota, failureNow)
-            const hardAccountFailure = accountAction === 'disable'
-              || gatewayError.providerFailure?.category === 'rate_limit'
-              || quotaExhausted
-            const hasUsableAlternative = this.scheduler.hasUsableAlternative(
+          const failureNow = this.now()
+          const actualResetAt = quotaSignalCooldownUntil(gatewayError.quotaSignals, failureNow)
+          const quotaExhausted = codexQuotaIsExhausted(gatewayError.quotaSignals?.codexQuota, failureNow)
+            || genericQuotaExhausted(gatewayError.quotaSignals?.quota, failureNow)
+          const hardAccountFailure = accountAction === 'disable'
+            || gatewayError.providerFailure?.category === 'rate_limit'
+            || quotaExhausted
+          const fallbackRequirements = codexCompactV2
+            ? requiredUpstreamCapabilities(compactFallbackCompatibilityBody!, true)
+            : requiredCapabilities
+          const hasCurrentModeAlternative = attemptedAccount !== undefined
+            && this.scheduler.hasUsableAlternative(
               schedulingAccounts,
               targetModel,
               attemptedAccount.id,
               schedulingPool,
               requestConfig.providers,
               requiredCapabilities,
+              currentExcludedAccountIds()
+            )
+          const hasCompactFallbackPeer = attemptedAccount !== undefined
+            && codexCompactV2
+            && !codexCompactV2Fallback
+            && fallbackCompactAccounts.length > 0
+            && this.scheduler.hasUsableAlternative(
+              fallbackCompactAccounts,
+              targetModel,
+              attemptedAccount.id,
+              schedulingPool,
+              requestConfig.providers,
+              fallbackRequirements,
               [...failedAccountIds]
             )
+          const provenAccountFailure = retryable
+            || accountAction === 'disable'
+            || accountAction === 'cooldown'
+            || gatewayError.statusCode === 502
+            || gatewayError.statusCode === 504
+          const compactCapabilityFailure = codexCompactV2
+            && !attemptedCompactFallback
+            && !hardAccountFailure
+          if (attemptedAccount && provenAccountFailure) {
+            const hasUsableAlternative = hasCurrentModeAlternative || hasCompactFallbackPeer
+            if (compactCapabilityFailure && hasUsableAlternative) {
+              // A malformed native compact stream proves only that this
+              // extension is incompatible. Keep ordinary generation healthy;
+              // exclude it only from the native stage without opening its
+              // global circuit or suppressing its ordinary Responses path.
+              nativeCompactCapabilityFailedAccountIds.add(attemptedAccount.id)
+            }
             // Keep the final usable source routable after ordinary transport,
             // timeout, 5xx, or incomplete-stream failures. With no peer to
             // fail over to, opening its circuit only converts one failed
             // request into a pool-wide outage. Hard credential/quota signals
             // still disable or cool the source to avoid retry storms.
-            if (hardAccountFailure || hasUsableAlternative) {
+            if (!compactCapabilityFailure && (hardAccountFailure || hasUsableAlternative)) {
               failedAccountIds.add(attemptedAccount.id)
               this.scheduler.recordStickyFailure(schedulingPool.id, sessionId, attemptedAccount.id)
               const retryAfterMs = Math.max(
@@ -2051,13 +2249,65 @@ export class GatewayServer implements GatewayController {
               }
             }
           }
-          const canRetry = attempt < retryLimit
+          const canRetry = ordinaryRetriesUsed < retryLimit
             && !response.headersSent
             && retryable
             && attemptedAccount !== undefined
             && this.now() < responseStartDeadlineAt
+          const attemptedProvider = attemptedAccount
+            ? requestIndex.providersById.get(attemptedAccount.providerId)
+            : undefined
+          const attemptedAccountId = attemptedAccount?.id
+          const sameSourceCanUseOrdinaryResponses = attemptedProvider?.protocol === 'openai-responses'
+            && attemptedAccountId !== undefined
+            && fallbackCompactAccounts.some((account) => account.id === attemptedAccountId)
+            && upstreamHeadersAt !== undefined
+            && !hardAccountFailure
+          const canEnterCompactCompatibilityStage = codexCompactV2
+            && logRoute.client === 'codex'
+            && !codexCompactV2Fallback
+            && !attemptedCompactFallback
+            && !codexOpaqueCompactHistory
+            && !response.headersSent
+            && attemptedAccount !== undefined
+            && compactFallbackInputUsable
+            && this.now() < responseStartDeadlineAt
+            && (hasCompactFallbackPeer || sameSourceCanUseOrdinaryResponses)
+          // Exhaust the configured native peer retries first. The portable
+          // compatibility stage is then one independent chance, so maxRetries
+          // cannot turn an unsupported native extension into a user-visible
+          // 400/404/422/5xx when ordinary Responses generation still works.
+          if (canEnterCompactCompatibilityStage && !(canRetry && hasCurrentModeAlternative)) {
+            codexCompactV2Fallback = true
+            schedulingAccounts = fallbackCompactAccounts
+            requiredCapabilities = fallbackRequirements
+            lastAttemptError = gatewayError
+            failoverCount += 1
+            scheduleProgressLog('retrying')
+            continue
+          }
+          const canRetryCompactFallbackPeer = codexCompactV2Fallback
+            && attemptedCompactFallback
+            && !response.headersSent
+            && attemptedAccount !== undefined
+            && hasCurrentModeAlternative
+            && compactCompatibilityRetriesUsed < Math.max(1, retryLimit)
+            && this.now() < responseStartDeadlineAt
+          if (canRetryCompactFallbackPeer && attemptedAccount) {
+            // The compatibility stage owns a small independent peer budget.
+            // With maxRetries=0 this still permits one alternate relay, so a
+            // broken ordinary endpoint on the native source is not surfaced
+            // while another pool member can summarize the same history.
+            failedAccountIds.add(attemptedAccount.id)
+            compactCompatibilityRetriesUsed += 1
+            lastAttemptError = gatewayError
+            failoverCount += 1
+            scheduleProgressLog('retrying')
+            continue
+          }
           if (!canRetry) throw gatewayError
-          lastRetryableError = gatewayError
+          ordinaryRetriesUsed += 1
+          lastAttemptError = gatewayError
           failoverCount += 1
           scheduleProgressLog('retrying')
         } finally {
@@ -2996,6 +3246,68 @@ function isCodexCompactV2Body(body: JsonObject): boolean {
   return body.input.some((item) => objectValue(item)?.type === 'compaction_trigger')
 }
 
+function materializeStoneCompactFallbackHistory(body: JsonObject): JsonObject {
+  if (!Array.isArray(body.input)) return body
+  let changed = false
+  const input = body.input.map((value) => {
+    const item = objectValue(value)
+    if (item?.type !== 'compaction' && item?.type !== 'compaction_summary') return value
+    const encryptedContent = item.encrypted_content
+    if (typeof encryptedContent !== 'string' || !encryptedContent.startsWith(STONE_COMPACT_FALLBACK_PREFIX)) {
+      return value
+    }
+    const summary = decodeStoneCompactFallback(encryptedContent)
+    if (!summary) {
+      throw new GatewayHttpError(
+        422,
+        'Stone+ compact fallback history is malformed or exceeds the compatibility limit',
+        'invalid_compaction_envelope'
+      )
+    }
+    changed = true
+    return {
+      type: 'message',
+      role: 'user',
+      content: [{
+        type: 'input_text',
+        text: `${COMPACT_SUMMARY_PREFIX}\n${summary}`
+      }]
+    }
+  })
+  return changed ? { ...body, input } : body
+}
+
+function encodeStoneCompactFallback(summary: string): string {
+  const value = `${STONE_COMPACT_FALLBACK_PREFIX}${Buffer.from(summary, 'utf8').toString('base64url')}`
+  if (Buffer.byteLength(value, 'utf8') > MAX_STONE_COMPACT_FALLBACK_VALUE_BYTES) {
+    throw new GatewayHttpError(
+      502,
+      'Compact fallback summary exceeds the V2 compatibility limit',
+      'upstream_compact_error'
+    )
+  }
+  return value
+}
+
+function decodeStoneCompactFallback(value: unknown): string | undefined {
+  if (typeof value !== 'string' || !value.startsWith(STONE_COMPACT_FALLBACK_PREFIX)) return undefined
+  if (Buffer.byteLength(value, 'utf8') > MAX_STONE_COMPACT_FALLBACK_VALUE_BYTES) return undefined
+  const encoded = value.slice(STONE_COMPACT_FALLBACK_PREFIX.length)
+  if (!encoded || !/^[A-Za-z0-9_-]+$/.test(encoded)) {
+    return undefined
+  }
+  try {
+    const decoded = Buffer.from(encoded, 'base64url')
+    if (decoded.toString('base64url') !== encoded || decoded.byteLength > MAX_COMPACT_V2_STREAM_BYTES) {
+      return undefined
+    }
+    const summary = new TextDecoder('utf-8', { fatal: true }).decode(decoded)
+    return summary.trim() ? summary : undefined
+  } catch {
+    return undefined
+  }
+}
+
 function hasCodexOpaqueCompactHistory(body: JsonObject): boolean {
   if (!Array.isArray(body.input)) return false
   return body.input.some((item) => {
@@ -3010,6 +3322,84 @@ function hasCodexOpaqueCompactHistory(body: JsonObject): boolean {
   })
 }
 
+function compactV2FallbackResponse(): Response {
+  return new Response(null, {
+    status: 200,
+    headers: {
+      'content-type': 'text/event-stream; charset=utf-8',
+      'cache-control': 'no-cache',
+      'x-accel-buffering': 'no'
+    }
+  })
+}
+
+function buildCompactV2FallbackWire(
+  summary: string,
+  model: string,
+  usage: NormalizedTokenUsage | undefined,
+  now: number
+): Uint8Array {
+  const item = {
+    id: `cmp_stone_${randomUUID()}`,
+    type: 'compaction',
+    encrypted_content: encodeStoneCompactFallback(summary)
+  }
+  const responseId = `resp_stone_compact_${randomUUID()}`
+  const wireUsage = compactV2FallbackWireUsage(usage)
+  const events = [
+    {
+      type: 'response.output_item.done',
+      output_index: 0,
+      item
+    },
+    {
+      type: 'response.completed',
+      response: {
+        id: responseId,
+        object: 'response',
+        created_at: Math.max(0, Math.floor(now / 1_000)),
+        status: 'completed',
+        model,
+        // Codex consumes the compact item from output_item.done. Repeating the
+        // opaque payload here doubles the largest response for no benefit.
+        output: [],
+        ...(wireUsage ? { usage: wireUsage } : {})
+      }
+    }
+  ]
+  const wire = Buffer.from(events.map((event) => [
+    `event: ${event.type}`,
+    `data: ${JSON.stringify(event)}`,
+    '',
+    ''
+  ].join('\n')).join(''), 'utf8')
+  if (wire.byteLength > MAX_COMPACT_V2_STREAM_BYTES) {
+    throw new GatewayHttpError(
+      502,
+      'Compact fallback summary exceeds the V2 compatibility limit',
+      'upstream_compact_error'
+    )
+  }
+  return wire
+}
+
+function compactV2FallbackWireUsage(usage: NormalizedTokenUsage | undefined): JsonObject | undefined {
+  if (!usage) return undefined
+  const inputTokens = usage.inputTokens ?? 0
+  const outputTokens = usage.outputTokens ?? 0
+  return {
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    total_tokens: usage.totalTokens ?? inputTokens + outputTokens,
+    ...(usage.cachedInputTokens === undefined ? {} : {
+      input_tokens_details: { cached_tokens: usage.cachedInputTokens }
+    }),
+    ...(usage.reasoningTokens === undefined ? {} : {
+      output_tokens_details: { reasoning_tokens: usage.reasoningTokens }
+    })
+  }
+}
+
 function compactUpstreamUrl(generationEndpoint: string, compact: boolean): string {
   if (!compact) return generationEndpoint
   const url = new URL(generationEndpoint)
@@ -3020,7 +3410,9 @@ function compactUpstreamUrl(generationEndpoint: string, compact: boolean): strin
 function buildCompactFallbackBody(
   body: JsonObject,
   model: string,
-  dropOldestHistoryItems = 0
+  dropOldestHistoryItems = 0,
+  requireHistory = true,
+  portableHistory = false
 ): JsonObject {
   const history = Array.isArray(body.input)
     ? body.input.filter((item) => {
@@ -3031,14 +3423,48 @@ function buildCompactFallbackBody(
         return type !== 'compaction_trigger' && type !== 'additional_tools'
       })
     : []
-  let retainedStart = Math.min(history.length, Math.max(0, Math.floor(dropOldestHistoryItems)))
-  // A progressive prefix trim can land between a tool call and its output.
-  // Drop leading outputs as part of the same oldest group so a retry never
-  // manufactures an orphaned call result that a strict relay will reject.
-  while (retainedStart < history.length && isCompactToolOutput(history[retainedStart])) retainedStart += 1
-  const retainedHistory = pruneCompactOrphanToolOutputs(history.slice(retainedStart))
+  const retainedStart = compactFallbackRetainedStart(history, dropOldestHistoryItems)
+  const structuredHistory = pruneCompactOrphanToolOutputs(history.slice(retainedStart))
+  const retainedHistory = portableHistory
+    ? projectCompactFallbackHistory(structuredHistory, retainedStart)
+    : structuredHistory
+  const previousResponseId = typeof body.previous_response_id === 'string'
+    && body.previous_response_id.trim()
+    ? body.previous_response_id.trim()
+    : undefined
+  if (body.previous_response_id !== undefined
+    && body.previous_response_id !== null
+    && previousResponseId === undefined) {
+    throw new GatewayHttpError(
+      400,
+      'Compact fallback previous_response_id must be a non-empty string',
+      'invalid_compaction_input'
+    )
+  }
+  if (requireHistory && previousResponseId) {
+    // Stone+ cannot prove which upstream account owns an opaque server-side
+    // response id. Forwarding it to a failover peer may be ignored while the
+    // peer happily summarizes only the synthetic prompt, silently erasing the
+    // real conversation. Native V2 remains available; portable fallback must
+    // fail closed until the history is present in-band.
+    throw new GatewayHttpError(
+      422,
+      'Compact fallback cannot safely expand previous_response_id history',
+      'unsupported_compaction_history'
+    )
+  }
+  if (requireHistory && retainedHistory.length === 0 && !previousResponseId) {
+    throw new GatewayHttpError(
+      400,
+      dropOldestHistoryItems > 0
+        ? 'Compact fallback cannot trim all conversation history'
+        : 'Compact fallback requires conversation history to summarize',
+      dropOldestHistoryItems > 0 ? 'context_length_exceeded' : 'invalid_compaction_input'
+    )
+  }
   return {
     model,
+    ...(previousResponseId ? { previous_response_id: previousResponseId } : {}),
     instructions: typeof body.instructions === 'string' && body.instructions.trim()
       ? `${body.instructions.trim()}\n\n${COMPACT_FALLBACK_INSTRUCTIONS}`
       : COMPACT_FALLBACK_INSTRUCTIONS,
@@ -3057,12 +3483,200 @@ function buildCompactFallbackBody(
   }
 }
 
+function compactFallbackBodyIsUsable(body: JsonObject, model: string): boolean {
+  try {
+    buildCompactFallbackBody(body, model)
+    return true
+  } catch {
+    return false
+  }
+}
+
+function buildProviderCompactFallbackBody(
+  body: JsonObject,
+  model: string,
+  protocol: Protocol,
+  dropOldestHistoryItems = 0
+): JsonObject {
+  const responsesBody = buildCompactFallbackBody(
+    body,
+    model,
+    dropOldestHistoryItems,
+    true,
+    protocol !== 'openai-responses'
+  )
+  if (protocol === 'openai-responses') return responsesBody
+  const conversion = analyzeProtocolConversion('openai-responses', protocol, responsesBody)
+  if (!conversion.supported) {
+    const first = conversion.issues[0]
+    throw new GatewayHttpError(
+      422,
+      `Compact fallback cannot be converted without data loss at ${first.path}: ${first.reason}`,
+      'unsupported_conversion'
+    )
+  }
+  return withStreamingFlag(
+    convertRequest('openai-responses', protocol, responsesBody, model).body,
+    protocol,
+    true
+  )
+}
+
+function compactFallbackRetainedStart(history: readonly unknown[], dropOldestHistoryItems: number): number {
+  let retainedStart = Math.min(history.length, Math.max(0, Math.floor(dropOldestHistoryItems)))
+  if (dropOldestHistoryItems <= 0 || retainedStart >= history.length) return retainedStart
+
+  // Prefix trimming can land on the output half of the newest complete tool
+  // group. Prefer retaining its initiating call over discarding the only
+  // usable recent history; unmatched leading outputs are still dropped below.
+  let earliestMatchedCall = retainedStart
+  for (let index = retainedStart;
+    index < history.length && isCompactDependentToolOutput(history[index]);
+    index += 1) {
+    const output = objectValue(history[index])
+    const callId = output && typeof output.call_id === 'string' && output.call_id.trim()
+      ? output.call_id
+      : undefined
+    if (!callId) continue
+    for (let callIndex = retainedStart - 1; callIndex >= 0; callIndex -= 1) {
+      const call = objectValue(history[callIndex])
+      if (!call || !isCompactToolCallType(call.type) || compactToolCallId(call) !== callId) continue
+      earliestMatchedCall = Math.min(earliestMatchedCall, callIndex)
+      break
+    }
+  }
+  if (earliestMatchedCall < retainedStart) return earliestMatchedCall
+  while (retainedStart < history.length && isCompactDependentToolOutput(history[retainedStart])) {
+    retainedStart += 1
+  }
+  return retainedStart
+}
+
+function projectCompactFallbackHistory(history: readonly unknown[], sourceStart: number): JsonObject[] {
+  const losslessFunctionCallIds = new Set<string>()
+  for (const value of history) {
+    const item = objectValue(value)
+    if (item?.type !== 'function_call') continue
+    const callId = compactToolCallId(item)
+    if (callId) losslessFunctionCallIds.add(callId)
+  }
+  return history.map((value, index) => projectCompactFallbackHistoryItem(
+    value,
+    sourceStart + index,
+    losslessFunctionCallIds
+  ))
+}
+
+function projectCompactFallbackHistoryItem(
+  value: unknown,
+  index: number,
+  losslessFunctionCallIds: ReadonlySet<string>
+): JsonObject {
+  const item = objectValue(value)
+  const type = typeof item?.type === 'string' && item.type.trim() ? item.type.trim() : 'record'
+  const sourceRole = typeof item?.role === 'string' ? item.role.trim().toLowerCase() : ''
+  if (item && compactHistoryItemHasLosslessPortableShape(
+    item,
+    type,
+    sourceRole,
+    losslessFunctionCallIds
+  )) return { ...item }
+  const assistantRecord = sourceRole === 'assistant'
+    || type === 'reasoning'
+    || isCompactToolCallType(type)
+  const role = assistantRecord ? 'assistant' : 'user'
+  const textType = role === 'assistant' ? 'output_text' : 'input_text'
+  const messageText = item && (type === 'message' || sourceRole)
+    ? portableCompactMessageText(item)
+    : undefined
+  const roleLabel = sourceRole && sourceRole !== role ? `${sourceRole} ` : ''
+  const text = messageText || [
+    `[Stone+ portable ${roleLabel}${type} history item ${index + 1}]`,
+    portableCompactJson(value)
+  ].join('\n')
+  return {
+    type: 'message',
+    role,
+    content: [{ type: textType, text }]
+  }
+}
+
+function compactHistoryItemHasLosslessPortableShape(
+  item: JsonObject,
+  type: string,
+  sourceRole: string,
+  losslessFunctionCallIds: ReadonlySet<string>
+): boolean {
+  if (type === 'function_call') return true
+  if (type === 'function_call_output') {
+    return typeof item.call_id === 'string' && losslessFunctionCallIds.has(item.call_id)
+  }
+  if (type !== 'message' && !sourceRole) return false
+  if (typeof item.content === 'string') return true
+  if (!Array.isArray(item.content)) return false
+  return item.content.every((value) => {
+    const part = objectValue(value)
+    return Boolean(part && (
+      part.type === 'input_text'
+      || part.type === 'output_text'
+      || part.type === 'text'
+      || part.type === 'input_image'
+    ))
+  })
+}
+
+function portableCompactMessageText(item: JsonObject): string | undefined {
+  const chunks: string[] = []
+  if (typeof item.content === 'string' && item.content.trim()) chunks.push(item.content.trim())
+  if (Array.isArray(item.content)) {
+    for (const value of item.content) {
+      if (typeof value === 'string' && value.trim()) {
+        chunks.push(value.trim())
+        continue
+      }
+      const part = objectValue(value)
+      if (part && (part.type === 'input_text' || part.type === 'output_text' || part.type === 'text')
+        && typeof part.text === 'string' && part.text.trim()) {
+        chunks.push(part.text.trim())
+        continue
+      }
+      chunks.push(`[non-text content: ${portableCompactJson(value)}]`)
+    }
+  }
+  if (chunks.length === 0) return undefined
+  const sourceRole = typeof item.role === 'string' ? item.role.trim().toLowerCase() : ''
+  return sourceRole && sourceRole !== 'user' && sourceRole !== 'assistant'
+    ? `[${sourceRole} message]\n${chunks.join('\n')}`
+    : chunks.join('\n')
+}
+
+function portableCompactJson(value: unknown): string {
+  try {
+    return JSON.stringify(value, (key, nested) => (
+      /^(?:encrypted[_-]?content|encryptedContent|thinking[_-]?signature|thought[_-]?signature|signature)$/i.test(key)
+        ? '[opaque value intentionally not forwarded]'
+        : nested
+    )) ?? String(value)
+  } catch {
+    return '[unserializable structured history item]'
+  }
+}
+
 function isCompactToolOutput(value: unknown): boolean {
   const type = objectValue(value)?.type
   return type === 'function_call_output'
     || type === 'custom_tool_call_output'
     || type === 'computer_call_output'
     || type === 'tool_search_output'
+}
+
+function isCompactDependentToolOutput(value: unknown): boolean {
+  if (!isCompactToolOutput(value)) return false
+  const item = objectValue(value)
+  if (item?.type !== 'tool_search_output') return true
+  return item.execution !== 'server'
+    && typeof item.call_id === 'string'
+    && Boolean(item.call_id.trim())
 }
 
 function pruneCompactOrphanToolOutputs(history: readonly unknown[]): unknown[] {
@@ -3076,7 +3690,15 @@ function pruneCompactOrphanToolOutputs(history: readonly unknown[]): unknown[] {
   return history.filter((value) => {
     if (!isCompactToolOutput(value)) return true
     const item = objectValue(value)
-    const callId = item ? compactToolCallId(item) : undefined
+    if (item?.type === 'tool_search_output'
+      && (item.execution === 'server'
+        || typeof item.call_id !== 'string'
+        || !item.call_id.trim())) return true
+    // Output item `id` identifies the result record, not the initiating call.
+    // Unknown/vendor output shapes without call_id stay intact.
+    const callId = item && typeof item.call_id === 'string' && item.call_id.trim()
+      ? item.call_id
+      : undefined
     // Unknown vendor-specific output shapes are left untouched. For canonical
     // call ids, however, never send a result after its initiating call was
     // removed by a prefix trim (including interleaved parallel calls).
@@ -3088,6 +3710,7 @@ function isCompactToolCallType(type: unknown): boolean {
   return type === 'function_call'
     || type === 'custom_tool_call'
     || type === 'computer_call'
+    || type === 'local_shell_call'
     || type === 'tool_search_call'
 }
 
@@ -3105,16 +3728,15 @@ function compactFallbackHistoryLength(body: JsonObject): number {
 }
 
 function nextCompactFallbackDropCount(current: number, historyLength: number, retry: number): number | undefined {
-  if (current >= historyLength) return undefined
+  const maximumDropCount = Math.max(0, historyLength - 1)
+  if (current >= maximumDropCount) return undefined
   if (retry >= MAX_COMPACT_CONTEXT_RETRIES - 2) {
-    // Preserve the newest item on the penultimate attempt, then allow the
-    // synthetic summary prompt alone. This mirrors Codex's local fallback,
-    // which removes oldest items until the request fits.
-    return retry === MAX_COMPACT_CONTEXT_RETRIES - 2
-      ? Math.max(current + 1, historyLength - 1)
-      : historyLength
+    // Never manufacture a successful summary from the synthetic prompt alone.
+    // If the newest history item still does not fit, fail explicitly instead
+    // of silently replacing the user's entire context with an empty summary.
+    return maximumDropCount
   }
-  return Math.min(historyLength, current === 0 ? 1 : current * 2 + 1)
+  return Math.min(maximumDropCount, current === 0 ? 1 : current * 2 + 1)
 }
 
 function isCompactContextOverflow(statusCode: number, payload: JsonObject | undefined): boolean {
@@ -3197,9 +3819,15 @@ function isValidCompactReplacementHistory(output: unknown): boolean {
       continue
     }
     if (item.type === 'context_compaction') {
+      const hasId = typeof item.id === 'string' && Boolean(item.id.trim())
+      const hasEncryptedContent = typeof item.encrypted_content === 'string'
+        && Boolean(item.encrypted_content.trim())
       if (
         (item.id !== undefined && item.id !== null && typeof item.id !== 'string')
+        || (typeof item.id === 'string' && !item.id.trim())
         || (item.encrypted_content !== undefined && typeof item.encrypted_content !== 'string')
+        || (typeof item.encrypted_content === 'string' && !item.encrypted_content.trim())
+        || (!hasId && !hasEncryptedContent)
       ) return false
       hasReplacementAnchor = true
       continue
@@ -3284,7 +3912,21 @@ function responseOutputText(payload: JsonObject): string | undefined {
     .filter(Boolean)
     .join('\n')
     .trim()
-  return choiceText || undefined
+  if (choiceText) return choiceText
+  const anthropicText = responseContentText(payload.content)
+  if (anthropicText) return anthropicText
+  const geminiText = (Array.isArray(payload.candidates) ? payload.candidates : [])
+    .map((value) => objectValue(value))
+    .flatMap((candidate) => {
+      const content = objectValue(candidate?.content)
+      return (Array.isArray(content?.parts) ? content.parts : [])
+        .map((part) => objectValue(part))
+        .map((part) => typeof part?.text === 'string' ? part.text.trim() : '')
+        .filter(Boolean)
+    })
+    .join('\n')
+    .trim()
+  return geminiText || undefined
 }
 
 function responseOutputArrayText(value: unknown): string | undefined {
@@ -3318,29 +3960,104 @@ function responseContentText(value: unknown): string | undefined {
   return text || undefined
 }
 
-function compactFallbackResponseIsIncomplete(payload: JsonObject): boolean {
-  if (payload.status === 'incomplete' || payload.status === 'failed') return true
+function compactFallbackResponseIsIncomplete(payload: JsonObject, protocol: Protocol): boolean {
+  if (Object.hasOwn(payload, 'status') && !compactFallbackStatusIsComplete(payload.status)) return true
   if (objectValue(payload.incomplete_details)) return true
-  if (compactFallbackFinishReasonIsIncomplete(payload.finish_reason)) return true
-  if (Array.isArray(payload.output) && payload.output.some((value) => {
-    const status = objectValue(value)?.status
-    return status === 'incomplete' || status === 'failed'
-  })) return true
-  const nested = objectValue(payload.response)
-  if (nested && compactFallbackResponseIsIncomplete(nested)) return true
-  return (Array.isArray(payload.choices) ? payload.choices : []).some((value) => {
-    const reason = objectValue(value)?.finish_reason
-    return compactFallbackFinishReasonIsIncomplete(reason)
+
+  if (protocol === 'openai-responses') {
+    const response = objectValue(payload.response) ?? payload
+    if (!Object.hasOwn(response, 'status') || !compactFallbackStatusIsComplete(response.status)) return true
+    if (objectValue(response.incomplete_details)) return true
+    if (response.output !== undefined && !Array.isArray(response.output)) return true
+    return (Array.isArray(response.output) ? response.output : []).some((value) => {
+      const item = objectValue(value)
+      if (!item || isCompactResponseToolCallType(item.type)) return true
+      return Object.hasOwn(item, 'status') && !compactFallbackStatusIsComplete(item.status)
+    })
+  }
+
+  if (protocol === 'openai-chat') {
+    const choices = Array.isArray(payload.choices) ? payload.choices : []
+    if (choices.length === 0) return true
+    return choices.some((value) => {
+      const choice = objectValue(value)
+      const message = objectValue(choice?.message)
+      const hasLegacyFunctionCall = message?.function_call !== undefined && message.function_call !== null
+      const invalidToolCalls = message?.tool_calls !== undefined
+        && (!Array.isArray(message.tool_calls) || message.tool_calls.length > 0)
+      return !choice
+        || !compactFallbackFinishReasonIsComplete(choice.finish_reason)
+        || invalidToolCalls
+        || hasLegacyFunctionCall
+        || (typeof message?.role === 'string' && message.role !== 'assistant')
+        || (!message && typeof choice.text !== 'string')
+    })
+  }
+
+  if (protocol === 'anthropic-messages') {
+    if (!Array.isArray(payload.content) || !compactFallbackFinishReasonIsComplete(payload.stop_reason)) {
+      return true
+    }
+    return payload.content.some((value) => objectValue(value)?.type === 'tool_use')
+  }
+
+  const candidates = Array.isArray(payload.candidates) ? payload.candidates : []
+  if (candidates.length === 0) return true
+  return candidates.some((value) => {
+    const candidate = objectValue(value)
+    const content = objectValue(candidate?.content)
+    const parts = Array.isArray(content?.parts) ? content.parts : []
+    return !candidate
+      || !compactFallbackFinishReasonIsComplete(candidate.finishReason ?? candidate.finish_reason)
+      || parts.some((part) => {
+        const item = objectValue(part)
+        return Boolean(item?.functionCall ?? item?.function_call)
+      })
   })
 }
 
-function compactFallbackFinishReasonIsIncomplete(value: unknown): boolean {
+function isCompactResponseToolCallType(value: unknown): boolean {
+  if (isCompactToolCallType(value)) return true
+  if (typeof value !== 'string') return false
+  return value === 'tool_call'
+    || value === 'web_search_call'
+    || value === 'file_search_call'
+    || value === 'code_interpreter_call'
+    || value === 'image_generation_call'
+    || value === 'mcp_call'
+    || value === 'shell_call'
+    || value === 'apply_patch_call'
+}
+
+function withoutGeminiCompactThoughtParts(payload: JsonObject): JsonObject {
+  if (!Array.isArray(payload.candidates)) return payload
+  return {
+    ...payload,
+    candidates: payload.candidates.map((value) => {
+      const candidate = objectValue(value)
+      const content = objectValue(candidate?.content)
+      if (!candidate || !content || !Array.isArray(content.parts)) return value
+      return {
+        ...candidate,
+        content: {
+          ...content,
+          parts: content.parts.filter((part) => objectValue(part)?.thought !== true)
+        }
+      }
+    })
+  }
+}
+
+function compactFallbackStatusIsComplete(value: unknown): boolean {
+  if (typeof value !== 'string') return false
+  const status = value.trim().toLowerCase()
+  return status === 'completed' || status === 'complete' || status === 'succeeded' || status === 'success'
+}
+
+function compactFallbackFinishReasonIsComplete(value: unknown): boolean {
   if (typeof value !== 'string') return false
   const reason = value.trim().toLowerCase()
-  return reason === 'length'
-    || reason === 'max_tokens'
-    || reason === 'max_output_tokens'
-    || reason === 'content_filter'
+  return reason === 'stop' || reason === 'end_turn' || reason === 'completed' || reason === 'complete'
 }
 
 function isChatGptSearchAccessPolicyRejection(statusCode: number, payload: JsonObject | undefined): boolean {
@@ -3414,6 +4131,10 @@ function copyCompactRequestHeaders(source: IncomingMessage, target: Headers): vo
     const first = Array.isArray(value) ? value[0] : value
     if (typeof first === 'string' && first.trim()) target.set(name, first.trim())
   }
+}
+
+function stripCompactRequestHeaders(target: Headers): void {
+  for (const name of COMPACT_PASSTHROUGH_HEADERS) target.delete(name)
 }
 
 interface ParsedUpstreamJson {
@@ -3589,8 +4310,56 @@ async function readUpstreamJson(response: Response, signal?: AbortSignal): Promi
   return { error: { message: 'Upstream returned a non-object JSON response' } }
 }
 
+async function readBoundedCompactFallbackJson(
+  response: Response,
+  signal: AbortSignal | undefined,
+  idleTimeoutMs: number
+): Promise<JsonObject> {
+  if (!response.body) return readUpstreamJson(response, signal)
+  const reader = response.body.getReader()
+  const chunks: Buffer[] = []
+  let totalBytes = 0
+  let reachedEof = false
+  try {
+    let result = await readFirstStreamChunk(reader, idleTimeoutMs, signal)
+    for (;;) {
+      if (result.done) {
+        reachedEof = true
+        break
+      }
+      if (result.value?.byteLength) {
+        totalBytes += result.value.byteLength
+        if (totalBytes > MAX_COMPACT_V2_STREAM_BYTES) {
+          throw new GatewayHttpError(
+            502,
+            'Compact fallback JSON exceeds the gateway safety limit',
+            'upstream_compact_error'
+          )
+        }
+        chunks.push(Buffer.from(result.value))
+      }
+      result = await readIdleStreamChunk(reader, idleTimeoutMs, signal)
+    }
+  } finally {
+    if (!reachedEof) cancelStreamReader(reader)
+    else {
+      try {
+        reader.releaseLock()
+      } catch {
+        // A non-standard reader may still report a pending read during EOF.
+      }
+    }
+  }
+  return readUpstreamJson(new Response(Buffer.concat(chunks, totalBytes), {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers
+  }), signal)
+}
+
 async function readCompactFallbackResponse(
   upstream: Response,
+  protocol: Protocol,
   options: StreamEncodingOptions,
   signal: AbortSignal | undefined,
   firstBodyTimeoutMs: number,
@@ -3603,28 +4372,62 @@ async function readCompactFallbackResponse(
   // actual framing; the forwarded branch remains streaming and unbuffered.
   const inspected = await inspectCompactFallbackResponse(
     upstream,
+    protocol,
     signal,
     firstBodyTimeoutMs
   )
   upstream = inspected.response
   if (inspected.kind === 'json') {
-    const payload = await readUpstreamJson(upstream, signal)
+    const payload = await readBoundedCompactFallbackJson(upstream, signal, idleTimeoutMs)
     const failure = compactFallbackFailurePayload(payload)
-    if (failure && isCompactContextOverflow(400, failure)) {
-      throw new CompactFallbackContextOverflowError(
-        redactSensitiveText(upstreamErrorMessage(failure), secrets)
+    if (failure) {
+      const safeMessage = redactSensitiveText(upstreamErrorMessage(failure), secrets)
+      if (isCompactContextOverflow(400, failure)) {
+        throw new CompactFallbackContextOverflowError(safeMessage)
+      }
+      const error = objectValue(failure.error)
+        ?? objectValue(objectValue(failure.response)?.error)
+        ?? failure
+      const errorType = typeof error.type === 'string' ? error.type : undefined
+      const errorCode = typeof error.code === 'string' ? error.code : undefined
+      throw new GatewayHttpError(
+        compactFallbackIsRequestError(errorType, errorCode) ? 400 : 502,
+        safeMessage,
+        'upstream_compact_error'
       )
     }
-    return payload
+    const payloadProtocol = compactFallbackPayloadProtocol(payload, protocol)
+    if (compactFallbackResponseIsIncomplete(payload, payloadProtocol)) {
+      throw new GatewayHttpError(
+        502,
+        'Compact fallback ended before the summary was complete',
+        'upstream_compact_error'
+      )
+    }
+    if (payloadProtocol === 'openai-responses') return payload
+    const sourcePayload = payloadProtocol === 'gemini'
+      ? withoutGeminiCompactThoughtParts(payload)
+      : payload
+    return convertResponse(payloadProtocol, 'openai-responses', sourcePayload, options.model ?? '', options.now)
   }
-  const result = await collectOpenAiResponsesUpstream(
-    upstream,
-    options,
-    signal,
-    firstBodyTimeoutMs,
-    idleTimeoutMs,
-    progressIdleTimeoutMs
-  )
+  const result = protocol === 'openai-responses'
+    ? await collectOpenAiResponsesUpstream(
+        upstream,
+        options,
+        signal,
+        firstBodyTimeoutMs,
+        idleTimeoutMs,
+        progressIdleTimeoutMs
+      )
+    : await collectCanonicalCompactFallbackUpstream(
+        upstream,
+        protocol,
+        options,
+        signal,
+        firstBodyTimeoutMs,
+        idleTimeoutMs,
+        progressIdleTimeoutMs
+      )
   if (result.error) {
     const errorPayload: JsonObject = {
       error: {
@@ -3653,10 +4456,206 @@ async function readCompactFallbackResponse(
   return result.response
 }
 
+interface CanonicalCompactFallbackResult {
+  response?: JsonObject
+  error?: string
+  errorCode?: string
+  errorType?: string
+}
+
+async function collectCanonicalCompactFallbackUpstream(
+  upstream: Response,
+  protocol: Exclude<Protocol, 'openai-responses'>,
+  options: StreamEncodingOptions,
+  signal: AbortSignal | undefined,
+  firstBodyTimeoutMs: number,
+  idleTimeoutMs: number,
+  progressIdleTimeoutMs: number
+): Promise<CanonicalCompactFallbackResult> {
+  if (!upstream.body) {
+    return { error: 'Compact fallback stream returned no body', errorType: 'incomplete_stream' }
+  }
+  const parser = createCanonicalStreamParser(protocol, {
+    maxBufferedCharacters: MAX_STREAM_FRAME_BYTES,
+    suppressGeminiThoughtText: true,
+    emitReasoningProgress: true
+  })
+  const frameGuard = new ProtocolStreamFrameGuard(protocol, MAX_STREAM_FRAME_BYTES)
+  const reader = upstream.body.getReader()
+  const textChunks: string[] = []
+  const usage: JsonObject = {}
+  let textBytes = 0
+  let terminalObserved = false
+  let stopReason: string | undefined
+  let stopRawReason: string | undefined
+  let semanticProgressCount = 0
+  let streamError: Extract<CanonicalStreamEvent, { type: 'error' }> | undefined
+  let reachedEof = false
+  const consume = (events: CanonicalStreamEvent[]): void => {
+    for (const event of events) {
+      if (terminalObserved) return
+      if (event.type === 'text-delta') {
+        textBytes += Buffer.byteLength(event.text, 'utf8')
+        if (textBytes > MAX_COMPACT_V2_STREAM_BYTES) {
+          streamError = {
+            type: 'error',
+            message: 'Compact fallback summary exceeds the gateway safety limit',
+            errorType: 'response_too_large'
+          }
+          terminalObserved = true
+          return
+        }
+        textChunks.push(event.text)
+        semanticProgressCount += 1
+      } else if (event.type === 'tool-call-delta' || event.type === 'tool-call-complete') {
+        streamError = {
+          type: 'error',
+          message: 'Compact fallback unexpectedly returned a tool call',
+          errorType: 'invalid_compact_output'
+        }
+        terminalObserved = true
+        return
+      } else if (event.type === 'usage') {
+        if (event.inputTokens !== undefined) usage.input_tokens = event.inputTokens
+        if (event.outputTokens !== undefined) usage.output_tokens = event.outputTokens
+        if (event.totalTokens !== undefined) usage.total_tokens = event.totalTokens
+        if (event.cachedInputTokens !== undefined) {
+          usage.input_tokens_details = { cached_tokens: event.cachedInputTokens }
+        }
+        if (event.reasoningTokens !== undefined) {
+          usage.output_tokens_details = { reasoning_tokens: event.reasoningTokens }
+        }
+        semanticProgressCount += 1
+      } else if (event.type === 'reasoning-progress') {
+        semanticProgressCount += 1
+      } else if (event.type === 'error') {
+        streamError = event
+        terminalObserved = true
+        return
+      } else if (event.type === 'stop') {
+        stopReason = event.reason
+        stopRawReason = event.rawReason
+        terminalObserved = true
+        semanticProgressCount += 1
+        return
+      }
+    }
+  }
+  try {
+    let result = await readFirstStreamChunk(reader, firstBodyTimeoutMs, signal)
+    let observedProgressCount = semanticProgressCount
+    let progressDeadlineAt = Date.now() + progressIdleTimeoutMs
+    let transportActivityWithoutProgress = false
+    for (;;) {
+      if (result.done) {
+        reachedEof = true
+        consume(parser.finish())
+        break
+      }
+      frameGuard.push(result.value)
+      consume(parser.push(result.value))
+      if (terminalObserved) {
+        cancelStreamReader(reader)
+        break
+      }
+      if (semanticProgressCount > observedProgressCount) {
+        observedProgressCount = semanticProgressCount
+        progressDeadlineAt = Date.now() + progressIdleTimeoutMs
+        transportActivityWithoutProgress = false
+      } else if (result.value.byteLength > 0) {
+        transportActivityWithoutProgress = true
+      }
+      const progressRemaining = transportActivityWithoutProgress
+        ? progressDeadlineAt - Date.now()
+        : undefined
+      if (progressRemaining !== undefined && progressRemaining <= 0) {
+        throw responsesProgressTimeoutError(progressIdleTimeoutMs)
+      }
+      const progressTimeoutSelected = progressRemaining !== undefined
+        && progressRemaining < idleTimeoutMs
+      try {
+        result = await readIdleStreamChunk(
+          reader,
+          Math.min(idleTimeoutMs, progressRemaining ?? Number.POSITIVE_INFINITY),
+          signal
+        )
+      } catch (error) {
+        if (progressTimeoutSelected && isStreamIdleTimeout(error)) {
+          throw responsesProgressTimeoutError(progressIdleTimeoutMs)
+        }
+        throw error
+      }
+    }
+  } finally {
+    if (!reachedEof) cancelStreamReader(reader)
+    else {
+      try {
+        reader.releaseLock()
+      } catch {
+        // A non-standard reader may retain its lock at EOF.
+      }
+    }
+  }
+  if (streamError) {
+    return {
+      error: streamError.message,
+      errorCode: streamError.code,
+      errorType: streamError.errorType
+    }
+  }
+  if (!terminalObserved || !compactFallbackStreamStopIsComplete(protocol, stopReason, stopRawReason)) {
+    return {
+      error: stopRawReason || stopReason
+        ? `Compact fallback ended with ${stopRawReason ?? stopReason}`
+        : 'Compact fallback stream ended before a terminal event',
+      errorCode: stopRawReason ?? stopReason,
+      errorType: 'incomplete_stream'
+    }
+  }
+  const outputText = textChunks.join('').trim()
+  return {
+    response: {
+      id: options.id,
+      object: 'response',
+      model: options.model,
+      status: 'completed',
+      output_text: outputText,
+      ...(Object.keys(usage).length > 0 ? { usage } : {})
+    }
+  }
+}
+
+function compactFallbackStreamStopIsComplete(
+  protocol: Exclude<Protocol, 'openai-responses'>,
+  reason: string | undefined,
+  rawReason: string | undefined
+): boolean {
+  if (reason !== 'stop' || typeof rawReason !== 'string') return false
+  const normalized = rawReason.trim().toLowerCase()
+  if (protocol === 'openai-chat') return normalized === 'stop'
+  if (protocol === 'anthropic-messages') {
+    return normalized === 'end_turn' || normalized === 'stop_sequence'
+  }
+  return normalized === 'stop'
+}
+
 type CompactFallbackBodyKind = 'json' | 'sse'
+type CompactFallbackPrefixKind = CompactFallbackBodyKind | 'pending' | 'unknown'
+
+function classifyCompactFallbackPrefix(value: string, protocol: Protocol): CompactFallbackPrefixKind {
+  const significant = value.trimStart()
+  if (!significant) return 'pending'
+  if (significant.startsWith('[')) return protocol === 'gemini' ? 'sse' : 'json'
+  if (significant.startsWith('{')) return 'json'
+  const ssePrefixes = ['data:', 'event:', 'id:', 'retry:', ':']
+  if (ssePrefixes.some((prefix) => significant.startsWith(prefix))) return 'sse'
+  if (ssePrefixes.some((prefix) => prefix.startsWith(significant))) return 'pending'
+  return 'unknown'
+}
 
 async function inspectCompactFallbackResponse(
   upstream: Response,
+  protocol: Protocol,
   signal: AbortSignal | undefined,
   firstBodyTimeoutMs: number
 ): Promise<{ response: Response, kind: CompactFallbackBodyKind }> {
@@ -3669,6 +4668,7 @@ async function inspectCompactFallbackResponse(
     const decoder = new TextDecoder()
     let prefix = ''
     let inspectedBytes = 0
+    let prefixKind: CompactFallbackPrefixKind = 'pending'
     const probeDeadlineAt = Date.now() + firstBodyTimeoutMs
     let result = await readFirstStreamChunk(probeReader, firstBodyTimeoutMs, signal)
     for (;;) {
@@ -3680,8 +4680,8 @@ async function inspectCompactFallbackResponse(
         inspectedBytes += result.value.byteLength
         prefix += decoder.decode(result.value, { stream: true })
       }
-      const significant = prefix.trimStart()
-      if (significant.length > 0 || inspectedBytes >= MAX_STREAM_FRAME_BYTES) break
+      prefixKind = classifyCompactFallbackPrefix(prefix, protocol)
+      if (prefixKind !== 'pending' || inspectedBytes >= MAX_STREAM_FRAME_BYTES) break
       const remainingMs = probeDeadlineAt - Date.now()
       if (remainingMs <= 0) {
         throw new GatewayHttpError(
@@ -3694,11 +4694,10 @@ async function inspectCompactFallbackResponse(
     }
     prefix = prefix.trimStart()
     cancelStreamReader(probeReader)
-    const kind: CompactFallbackBodyKind = prefix.startsWith('{') || prefix.startsWith('[')
-      ? 'json'
-      : /^(?:data|event|id|retry):|^:/.test(prefix)
-        ? 'sse'
-        : isJsonUpstreamResponse(upstream) ? 'json' : 'sse'
+    prefixKind = classifyCompactFallbackPrefix(prefix, protocol)
+    const kind: CompactFallbackBodyKind = prefixKind === 'json' || prefixKind === 'sse'
+      ? prefixKind
+      : isJsonUpstreamResponse(upstream) ? 'json' : 'sse'
     return {
       response: new Response(forwardBody, {
         status: upstream.status,
@@ -3708,19 +4707,39 @@ async function inspectCompactFallbackResponse(
       kind
     }
   } catch (error) {
+    cancelStreamReader(probeReader)
     void forwardBody.cancel().catch(() => undefined)
     throw error
   }
 }
 
 function compactFallbackFailurePayload(payload: JsonObject): JsonObject | undefined {
-  const directError = objectValue(payload.error)
-  if (directError) return { error: directError }
+  if (payload.error !== undefined && payload.error !== null) {
+    const directError = objectValue(payload.error)
+    return {
+      error: directError ?? {
+        message: typeof payload.error === 'string' ? payload.error : 'Upstream compact fallback failed'
+      }
+    }
+  }
   const response = objectValue(payload.response)
-  const responseError = objectValue(response?.error)
-  if (responseError) return { error: responseError }
+  if (response?.error !== undefined && response.error !== null) {
+    const responseError = objectValue(response.error)
+    return {
+      error: responseError ?? {
+        message: typeof response.error === 'string' ? response.error : 'Upstream compact fallback failed'
+      }
+    }
+  }
   if (payload.status === 'failed' || response?.status === 'failed') return payload
   return undefined
+}
+
+function compactFallbackPayloadProtocol(payload: JsonObject, configured: Protocol): Protocol {
+  if (Array.isArray(payload.choices)) return 'openai-chat'
+  if (Array.isArray(payload.candidates)) return 'gemini'
+  if (Array.isArray(payload.content) && Object.hasOwn(payload, 'stop_reason')) return 'anthropic-messages'
+  return configured
 }
 
 function compactFallbackIsRequestError(errorType: string | undefined, errorCode: string | undefined): boolean {

@@ -12,6 +12,21 @@ const packageMetadata = JSON.parse(
   readFileSync(new URL("../package.json", import.meta.url), "utf8"),
 );
 
+function versionCore(value) {
+  const match = /^(?:v)?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/.exec(String(value));
+  if (!match) throw new Error(`invalid semantic version: ${value}`);
+  return match.slice(1, 4).map(Number);
+}
+
+function isVersionAtLeast(candidate, minimum) {
+  const left = versionCore(candidate);
+  const right = versionCore(minimum);
+  for (let index = 0; index < left.length; index += 1) {
+    if (left[index] !== right[index]) return left[index] > right[index];
+  }
+  return true;
+}
+
 function run(command, args) {
   const result = spawnSync(command, args, {
     encoding: "utf8",
@@ -103,12 +118,12 @@ try {
       "license digest or LICENSES mirror does not match PROJECT_IDENTITY.json",
     );
   }
-  if (
-    packageMetadata.version !==
-    identity.licenseBoundary.firstSourceAvailableVersion
-  ) {
+  if (!isVersionAtLeast(
+    packageMetadata.version,
+    identity.licenseBoundary.firstSourceAvailableVersion,
+  )) {
     fail(
-      `package version ${packageMetadata.version} does not match source-available baseline ${identity.licenseBoundary.firstSourceAvailableVersion}`,
+      `package version ${packageMetadata.version} predates source-available baseline ${identity.licenseBoundary.firstSourceAvailableVersion}`,
     );
   }
   readFileSync(

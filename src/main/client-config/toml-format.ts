@@ -536,9 +536,9 @@ export function planCodexToml(content: string | undefined, baseUrl: string): Tex
 
   setTopLevel(lines, { key: 'model_provider', value: 'stone' })
   setTopLevel(lines, { key: 'cli_auth_credentials_store', value: 'file' })
-  // Stone+ implements the portable Legacy compact endpoint for relay pools.
-  // V2 requires an opaque native compaction item and cannot be safely
-  // synthesized by a transparent gateway.
+  // Prefer Codex's portable standalone compact path for relay pools. The
+  // gateway can bridge an already-running V2 client with a bounded local
+  // envelope, but managed configs keep that compatibility path exceptional.
   setPath(lines, ['features', 'remote_compaction_v2'], false)
   setSection(lines, ['model_providers', 'stone'], [
     { key: 'name', value: 'OpenAI' },

@@ -19,6 +19,7 @@ export type CanonicalStopReason =
 export type CanonicalStreamEvent =
   | { type: 'start'; id?: string; model?: string; createdAt?: number }
   | { type: 'text-delta'; text: string; index?: number; contentType?: 'text' | 'refusal' }
+  | { type: 'reasoning-progress' }
   | { type: 'tool-call-delta'; index: number; id?: string; name?: string; arguments?: string }
   /** Lifecycle signal used to distinguish a consumable tool call from a partial client abort. */
   | { type: 'tool-call-complete'; index: number }
@@ -42,6 +43,14 @@ export interface StreamParsingOptions {
    * cap the total length of a healthy streamed response.
    */
   maxBufferedCharacters?: number
+  /** Keep Gemini thinking parts out of consumers that require only the final
+   * answer text (for example local compatibility compaction). Normal protocol
+   * conversion retains the historical behavior unless explicitly enabled. */
+  suppressGeminiThoughtText?: boolean
+  /** Emit a content-free progress signal for provider reasoning/thinking
+   * deltas. This lets bounded consumers distinguish real model work from SSE
+   * heartbeats without exposing hidden reasoning as answer text. */
+  emitReasoningProgress?: boolean
 }
 
 export interface CanonicalStreamParser {
@@ -604,8 +613,12 @@ class ProtocolParser implements CanonicalStreamParser {
   private readonly responsesTextDoneKeys = new Set<string>()
   private recognizedEventCount = 0
   private responsesLastProgressUsage = ''
+  private readonly suppressGeminiThoughtText: boolean
+  private readonly emitReasoningProgress: boolean
 
   constructor(private readonly protocol: Protocol, options: StreamParsingOptions = {}) {
+    this.suppressGeminiThoughtText = options.suppressGeminiThoughtText === true
+    this.emitReasoningProgress = options.emitReasoningProgress === true
     const maxBufferedCharacters = normalizeBufferedCharacterLimit(options.maxBufferedCharacters)
     this.sse = new SseFramer(
       (eventName, data) => this.handleSse(eventName, data),
@@ -732,6 +745,16 @@ class ProtocolParser implements CanonicalStreamParser {
       const delta = objectValue(choice.delta) ?? {}
       const text = stringValue(delta.content)
       if (text) this.events.push({ type: 'text-delta', text })
+      const reasoning = stringValue(delta.reasoning_content ?? delta.reasoning)
+      const reasoningDetailsAdvance = Array.isArray(delta.reasoning_details)
+        && delta.reasoning_details.some((value) => {
+          if (typeof value === 'string') return Boolean(value.trim())
+          const detail = objectValue(value)
+          return Boolean(detail && Object.keys(detail).length > 0)
+        })
+      if ((reasoning || reasoningDetailsAdvance) && this.emitReasoningProgress) {
+        this.events.push({ type: 'reasoning-progress' })
+      }
       for (const toolCall of arrayOfObjects(delta.tool_calls)) {
         const definition = objectValue(toolCall.function) ?? {}
         const event: CanonicalStreamEvent = {
@@ -1077,6 +1100,11 @@ class ProtocolParser implements CanonicalStreamParser {
         const text = stringValue(delta.text)
         if (text) this.events.push({ type: 'text-delta', text })
       }
+      if (stringValue(delta.type) === 'thinking_delta'
+        && stringValue(delta.thinking)
+        && this.emitReasoningProgress) {
+        this.events.push({ type: 'reasoning-progress' })
+      }
       if (stringValue(delta.type) === 'input_json_delta') {
         const index = this.anthropicToolIndex(numberValue(payload.index) ?? 0)
         this.sawToolCall = true
@@ -1109,7 +1137,13 @@ class ProtocolParser implements CanonicalStreamParser {
       const content = objectValue(candidate.content) ?? {}
       for (const [partIndex, part] of arrayOfObjects(content.parts).entries()) {
         const text = stringValue(part.text)
-        if (text) this.events.push({ type: 'text-delta', text })
+        if (text) {
+          if (this.suppressGeminiThoughtText && part.thought === true) {
+            if (this.emitReasoningProgress) this.events.push({ type: 'reasoning-progress' })
+          } else {
+            this.events.push({ type: 'text-delta', text })
+          }
+        }
         const call = objectValue(part.functionCall) ?? objectValue(part.function_call)
         if (call) {
           const key = optionalString(call.id) ?? `${candidateIndex}:${partIndex}`
