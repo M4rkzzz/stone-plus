@@ -469,6 +469,71 @@ Windows 发布维护者还应至少完成一次本机签名打包与 packaged co
 
 本机不具备所有平台时，不用跨平台伪造包；由 GitHub-hosted 原生 runner 验收。
 
+#### 4.4.1 本地 Windows 正式副本（必做）
+
+每次正式版发布完成后，必须把 Windows x64 资产下载并保留在项目目录的固定位置：
+
+```text
+release/windows/vX.Y.Z/
+```
+
+该目录由根 `.gitignore` 忽略，属于维护者本机的发行留档，不提交到 Git，也不能用临时目录代替。
+每个版本至少保留以下文件：
+
+- `StonePlus-X.Y.Z-windows-x64-setup.exe`；
+- `StonePlus-X.Y.Z-windows-x64-setup.exe.blockmap`；
+- `StonePlus-X.Y.Z-windows-x64-portable.exe`；
+- `latest.yml`；
+- `SHA256SUMS`；
+- `StonePlus-CodeSigning.cer`。
+
+发布工作流成功且 Release 已公开后，在仓库根目录执行：
+
+```powershell
+$releaseTag = 'vX.Y.Z'
+$localWindowsRelease = Join-Path (Get-Location) "release/windows/$releaseTag"
+New-Item -ItemType Directory -Path $localWindowsRelease -Force | Out-Null
+
+gh release download $releaseTag `
+  -R M4rkzzz/stone-plus `
+  --dir $localWindowsRelease `
+  --clobber `
+  --pattern 'StonePlus-*-windows-x64-setup.exe' `
+  --pattern 'StonePlus-*-windows-x64-setup.exe.blockmap' `
+  --pattern 'StonePlus-*-windows-x64-portable.exe' `
+  --pattern 'latest.yml' `
+  --pattern 'SHA256SUMS' `
+  --pattern 'StonePlus-CodeSigning.cer'
+```
+
+下载后必须确认目录只对应当前版本，并逐项核对本地 SHA-256 与 Release API digest：
+
+```powershell
+$release = gh release view $releaseTag -R M4rkzzz/stone-plus --json assets | ConvertFrom-Json
+$required = @(
+  "StonePlus-$($releaseTag.TrimStart('v'))-windows-x64-setup.exe",
+  "StonePlus-$($releaseTag.TrimStart('v'))-windows-x64-setup.exe.blockmap",
+  "StonePlus-$($releaseTag.TrimStart('v'))-windows-x64-portable.exe",
+  'latest.yml', 'SHA256SUMS', 'StonePlus-CodeSigning.cer'
+)
+foreach ($name in $required) {
+  $local = Join-Path $localWindowsRelease $name
+  if (-not (Test-Path -LiteralPath $local)) { throw "Missing local Windows release asset: $name" }
+  $asset = $release.assets | Where-Object name -eq $name
+  if (-not $asset -or -not $asset.digest.StartsWith('sha256:')) { throw "Missing Release digest: $name" }
+  $localDigest = (Get-FileHash -Algorithm SHA256 -LiteralPath $local).Hash.ToLowerInvariant()
+  if ($localDigest -ne $asset.digest.Substring(7).ToLowerInvariant()) { throw "Local digest mismatch: $name" }
+}
+if ((Get-Content (Join-Path $localWindowsRelease 'SHA256SUMS')).Count -ne 22) {
+  throw 'SHA256SUMS must contain exactly 22 entries.'
+}
+Write-Output "Local Windows release verified: $localWindowsRelease"
+```
+
+完成后，`release/windows/vX.Y.Z/` 是该版本 Windows 包的本地固定副本；线上 Release、
+`SHA256SUMS` 和本地副本三者必须保持一致。若线上版本需要修复，创建新的补丁版本并新增目录，
+不得覆盖旧版本目录或替换已公开 Release 资产。
+
 ### 4.5 提交发布内容
 
 只提交本次发布范围，避免把未跟踪诊断文件或其他人的工作带入：
