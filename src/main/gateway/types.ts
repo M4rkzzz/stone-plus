@@ -31,7 +31,7 @@ export interface GatewayConfig {
 
 export interface ResolvedGatewayCredential {
   secret: string
-  kind: 'api-key' | 'chatgpt-oauth' | 'chatgpt-agent-identity'
+  kind: 'api-key' | 'chatgpt-oauth' | 'chatgpt-agent-identity' | 'grok-oauth'
   accountId?: string
   fedramp?: boolean
   /** Re-registers an invalid Agent Identity task and returns a fresh assertion. */
@@ -146,4 +146,42 @@ export interface ProtocolRequest {
   protocol: Protocol
   body: Record<string, unknown>
   model: string
+  /** Optional request-scoped state used by a provider dialect bridge. */
+  conversionContext?: ProtocolConversionContext
+}
+
+export type ProtocolConversionDialect = 'xai-grok'
+
+export interface ToolBridgeBinding {
+  sourceType: 'function' | 'custom'
+  sourceName: string
+  /** Original Codex namespace for a flattened function declaration. */
+  sourceNamespace?: string
+  wireName: string
+  /** Declarations from the current request may be called by the upstream model. */
+  declared?: boolean
+}
+
+export interface ToolCallBridgeBinding {
+  callId: string
+  sourceType: 'function' | 'custom'
+  sourceName?: string
+  sourceNamespace?: string
+  wireName?: string
+}
+
+/** JSON-safe, request-scoped mapping between Responses tools and Chat tools. */
+export interface ToolBridgePlan {
+  dialect: ProtocolConversionDialect
+  tools: ToolBridgeBinding[]
+  calls: ToolCallBridgeBinding[]
+  /** Same-protocol Responses traffic must pass through the response restorer. */
+  requiresResponseBridge?: boolean
+  /** Preserve the originating Responses request's execution constraint. */
+  parallelToolCalls?: boolean
+}
+
+export interface ProtocolConversionContext {
+  dialect?: ProtocolConversionDialect
+  toolBridgePlan?: ToolBridgePlan
 }

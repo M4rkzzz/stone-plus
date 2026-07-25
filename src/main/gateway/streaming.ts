@@ -1,4 +1,5 @@
 import type { Protocol } from '../../shared/types'
+import type { ToolBridgeBinding, ToolBridgePlan } from './types'
 
 type JsonObject = Record<string, unknown>
 
@@ -25,7 +26,17 @@ export type CanonicalStreamEvent =
   | { type: 'tool-call-complete'; index: number }
   /** Lifecycle signal emitted when a Responses assistant message output item is complete. */
   | { type: 'message-complete'; index: number }
-  | { type: 'usage'; inputTokens?: number; outputTokens?: number; totalTokens?: number; cachedInputTokens?: number; reasoningTokens?: number }
+  | {
+      type: 'usage'
+      inputTokens?: number
+      outputTokens?: number
+      totalTokens?: number
+      cachedInputTokens?: number
+      cacheCreationInputTokens?: number
+      cacheCreation5mInputTokens?: number
+      cacheCreation1hInputTokens?: number
+      reasoningTokens?: number
+    }
   | { type: 'stop'; reason: CanonicalStopReason; rawReason?: string }
   | { type: 'error'; message: string; code?: string; errorType?: string }
   | { type: 'done' }
@@ -34,6 +45,8 @@ export interface StreamEncodingOptions {
   id?: string
   model?: string
   now?: () => number
+  /** Request-scoped provider mapping used to authorize and restore streamed tools. */
+  toolBridgePlan?: ToolBridgePlan
 }
 
 export interface StreamParsingOptions {
@@ -92,7 +105,16 @@ export interface CanonicalStreamEncoder {
 
 export interface OpenAiResponsesStreamResult {
   response?: JsonObject
-  usage?: { input_tokens?: number; output_tokens?: number; total_tokens?: number; cached_input_tokens?: number; reasoning_tokens?: number }
+  usage?: {
+    input_tokens?: number
+    output_tokens?: number
+    total_tokens?: number
+    cached_input_tokens?: number
+    cache_creation_input_tokens?: number
+    cache_creation_5m_input_tokens?: number
+    cache_creation_1h_input_tokens?: number
+    reasoning_tokens?: number
+  }
   error?: string
   errorCode?: string
   errorType?: string
@@ -306,6 +328,9 @@ class ResponsesStreamCollector implements OpenAiResponsesStreamCollector {
         if (event.outputTokens !== undefined) this.usage.output_tokens = event.outputTokens
         if (event.totalTokens !== undefined) this.usage.total_tokens = event.totalTokens
         if (event.cachedInputTokens !== undefined) this.usage.cached_input_tokens = event.cachedInputTokens
+        if (event.cacheCreationInputTokens !== undefined) this.usage.cache_creation_input_tokens = event.cacheCreationInputTokens
+        if (event.cacheCreation5mInputTokens !== undefined) this.usage.cache_creation_5m_input_tokens = event.cacheCreation5mInputTokens
+        if (event.cacheCreation1hInputTokens !== undefined) this.usage.cache_creation_1h_input_tokens = event.cacheCreation1hInputTokens
         if (event.reasoningTokens !== undefined) this.usage.reasoning_tokens = event.reasoningTokens
       } else if (event.type === 'stop') {
         this.stopReason = event.reason
@@ -594,14 +619,19 @@ class ProtocolParser implements CanonicalStreamParser {
   private readonly anthropicToolIndices = new Map<number, number>()
   private readonly responsesToolIndices = new Map<number, number>()
   private readonly responsesToolMetadataSeen = new Set<number>()
-  private readonly responsesArgumentsSeen = new Set<number>()
+  private readonly responsesArguments = new Map<number, string>()
   private readonly responsesToolCompleted = new Set<number>()
+  private readonly responsesToolIdentityIndices = new Map<string, number>()
+  private nextSyntheticResponsesOutputIndex = -1
   private readonly geminiToolIndices = new Map<string, number>()
   private lastUsage = ''
   private usageInputTokens: number | undefined
   private usageOutputTokens: number | undefined
   private usageTotalTokens: number | undefined
   private usageCachedInputTokens: number | undefined
+  private usageCacheCreationInputTokens: number | undefined
+  private usageCacheCreation5mInputTokens: number | undefined
+  private usageCacheCreation1hInputTokens: number | undefined
   private usageReasoningTokens: number | undefined
   private responsesEventCount = 0
   private responsesProgressEventCount = 0
@@ -710,6 +740,13 @@ class ProtocolParser implements CanonicalStreamParser {
         this.responsesLastEventType = '[DONE]'
         return
       }
+      // Chat's [DONE] marker closes the transport; it does not prove that the
+      // selected choice reached a semantic finish_reason. Treat a bare marker
+      // as a truncated stream so protocol conversion cannot synthesize a
+      // successful response.completed from partial Grok/OpenAI output.
+      if (this.protocol === 'openai-chat' && !this.stopped && !this.errored) {
+        this.emitIncompleteStream('Stream ended before a semantic finish reason')
+      }
       this.emitDone()
       return
     }
@@ -729,19 +766,39 @@ class ProtocolParser implements CanonicalStreamParser {
       return
     }
     if (recognizedProtocolPayload(this.protocol, eventName, payload)) this.recognizedEventCount += 1
-    if (this.protocol === 'openai-chat') this.handleOpenAiChat(payload)
+    if (this.protocol === 'openai-chat') this.handleOpenAiChat(eventName, payload)
     else if (this.protocol === 'openai-responses') this.handleOpenAiResponses(eventName, payload)
     else if (this.protocol === 'anthropic-messages') this.handleAnthropic(eventName, payload)
     else this.handleGemini(payload)
   }
 
-  private handleOpenAiChat(payload: JsonObject): void {
+  private handleOpenAiChat(eventName: string | undefined, payload: JsonObject): void {
     if (payload.error) {
-      this.emitErrorObject(payload.error)
+      if (typeof payload.error === 'string') {
+        this.emitError(
+          stringValue(payload.message, payload.error),
+          optionalString(payload.code),
+          optionalString(payload.type)
+        )
+      } else {
+        this.emitErrorObject(payload.error)
+      }
       return
     }
-    this.emitStart(payload.id, payload.model, payload.created)
-    for (const choice of arrayOfObjects(payload.choices)) {
+    if (eventName === 'error') {
+      this.emitErrorObject(payload)
+      return
+    }
+    const choices = arrayOfObjects(payload.choices)
+    const selectedChoices = choices.filter((choice) => (numberValue(choice.index) ?? 0) === 0)
+    // Responses exposes one assistant output, so merging alternate Chat
+    // choices would corrupt both text and tool-call index namespaces. Grok's
+    // REST API can return n>1; deterministically consume only choice index 0.
+    if (choices.length === 0 || selectedChoices.length > 0) {
+      this.emitStart(payload.id, payload.model, payload.created)
+    }
+    for (const choice of selectedChoices) {
+      if (this.stopped) break
       const delta = objectValue(choice.delta) ?? {}
       const text = stringValue(delta.content)
       if (text) this.events.push({ type: 'text-delta', text })
@@ -906,62 +963,58 @@ class ProtocolParser implements CanonicalStreamParser {
       const item = objectValue(payload.item) ?? {}
       const itemType = stringValue(item.type)
       if (itemType === 'function_call' || itemType === 'custom_tool_call') {
-        const outputIndex = numberValue(payload.output_index) ?? 0
+        const outputIndex = this.responsesToolOutputIndex(payload, item)
         const index = this.responseToolIndex(outputIndex)
         const args = itemType === 'custom_tool_call'
           ? optionalString(item.input)
           : optionalString(item.arguments)
+        const includeMetadata = !this.responsesToolMetadataSeen.has(outputIndex)
+        const argumentSuffix = this.reconcileResponsesToolArguments(outputIndex, args)
+        if (this.done) return
         this.responsesToolMetadataSeen.add(outputIndex)
-        if (args) this.responsesArgumentsSeen.add(outputIndex)
         this.sawToolCall = true
-        this.events.push(omitUndefinedEvent({
-          type: 'tool-call-delta',
-          index,
-          id: optionalString(item.call_id) ?? optionalString(item.id),
-          name: optionalString(item.name),
-          arguments: args
-        }))
+        if (includeMetadata || argumentSuffix) {
+          this.events.push(omitUndefinedEvent({
+            type: 'tool-call-delta',
+            index,
+            id: includeMetadata ? optionalString(item.call_id) ?? optionalString(item.id) : undefined,
+            name: includeMetadata ? optionalString(item.name) : undefined,
+            arguments: argumentSuffix
+          }))
+        }
       }
       return
     }
     if (type === 'response.function_call_arguments.delta') {
-      const outputIndex = numberValue(payload.output_index) ?? 0
+      const outputIndex = this.responsesToolOutputIndex(payload)
       const index = this.responseToolIndex(outputIndex)
       const args = optionalString(payload.delta)
-      if (args) this.responsesArgumentsSeen.add(outputIndex)
       this.sawToolCall = true
       this.events.push(omitUndefinedEvent({
         type: 'tool-call-delta',
         index,
-        arguments: args
+        arguments: this.appendResponsesToolArguments(outputIndex, args)
       }))
       return
     }
     if (type === 'response.custom_tool_call_input.delta') {
-      const outputIndex = numberValue(payload.output_index) ?? 0
+      const outputIndex = this.responsesToolOutputIndex(payload)
       const index = this.responseToolIndex(outputIndex)
       const input = optionalString(payload.delta)
-      if (input) this.responsesArgumentsSeen.add(outputIndex)
       this.sawToolCall = true
       this.events.push(omitUndefinedEvent({
         type: 'tool-call-delta',
         index,
-        arguments: input
+        arguments: this.appendResponsesToolArguments(outputIndex, input)
       }))
       return
     }
     if (type === 'response.function_call_arguments.done') {
-      const outputIndex = numberValue(payload.output_index) ?? 0
+      const outputIndex = this.responsesToolOutputIndex(payload)
       const index = this.responseToolIndex(outputIndex)
-      const args = optionalString(payload.arguments)
-      if (args && !this.responsesArgumentsSeen.has(outputIndex)) {
-        this.responsesArgumentsSeen.add(outputIndex)
-        this.events.push({
-          type: 'tool-call-delta',
-          index,
-          arguments: args
-        })
-      }
+      const args = this.reconcileResponsesToolArguments(outputIndex, optionalString(payload.arguments))
+      if (this.done) return
+      if (args) this.events.push({ type: 'tool-call-delta', index, arguments: args })
       if (!this.responsesToolCompleted.has(outputIndex)) {
         this.responsesToolCompleted.add(outputIndex)
         this.events.push({ type: 'tool-call-complete', index })
@@ -969,13 +1022,11 @@ class ProtocolParser implements CanonicalStreamParser {
       return
     }
     if (type === 'response.custom_tool_call_input.done') {
-      const outputIndex = numberValue(payload.output_index) ?? 0
+      const outputIndex = this.responsesToolOutputIndex(payload)
       const index = this.responseToolIndex(outputIndex)
-      const input = optionalString(payload.input)
-      if (input && !this.responsesArgumentsSeen.has(outputIndex)) {
-        this.responsesArgumentsSeen.add(outputIndex)
-        this.events.push({ type: 'tool-call-delta', index, arguments: input })
-      }
+      const input = this.reconcileResponsesToolArguments(outputIndex, optionalString(payload.input))
+      if (this.done) return
+      if (input) this.events.push({ type: 'tool-call-delta', index, arguments: input })
       if (!this.responsesToolCompleted.has(outputIndex)) {
         this.responsesToolCompleted.add(outputIndex)
         this.events.push({ type: 'tool-call-complete', index })
@@ -983,8 +1034,10 @@ class ProtocolParser implements CanonicalStreamParser {
       return
     }
     if (type === 'response.output_item.done') {
-      const outputIndex = numberValue(payload.output_index) ?? 0
       const item = objectValue(payload.item) ?? {}
+      const outputIndex = stringValue(item.type) === 'message'
+        ? numberValue(payload.output_index) ?? 0
+        : this.responsesToolOutputIndex(payload, item)
       if (stringValue(item.type) === 'message') {
         const status = optionalString(item.status)
         if (!status || status === 'completed') {
@@ -999,7 +1052,9 @@ class ProtocolParser implements CanonicalStreamParser {
       const args = itemType === 'custom_tool_call'
         ? optionalString(item.input)
         : optionalString(item.arguments)
-      const includeArguments = Boolean(args) && !this.responsesArgumentsSeen.has(outputIndex)
+      const argumentSuffix = this.reconcileResponsesToolArguments(outputIndex, args)
+      if (this.done) return
+      const includeArguments = Boolean(argumentSuffix)
       if (includeMetadata || includeArguments) {
         this.sawToolCall = true
         this.events.push(omitUndefinedEvent({
@@ -1007,11 +1062,10 @@ class ProtocolParser implements CanonicalStreamParser {
           index,
           id: includeMetadata ? optionalString(item.call_id) ?? optionalString(item.id) : undefined,
           name: includeMetadata ? optionalString(item.name) : undefined,
-          arguments: includeArguments ? args : undefined
+          arguments: argumentSuffix
         }))
       }
       this.responsesToolMetadataSeen.add(outputIndex)
-      if (includeArguments) this.responsesArgumentsSeen.add(outputIndex)
       const status = optionalString(item.status)
       if ((!status || status === 'completed') && !this.responsesToolCompleted.has(outputIndex)) {
         this.responsesToolCompleted.add(outputIndex)
@@ -1020,6 +1074,55 @@ class ProtocolParser implements CanonicalStreamParser {
       return
     }
     if (type === 'response.completed' || type === 'response.incomplete') {
+      for (const [outputIndex, item] of arrayOfObjects(response?.output).entries()) {
+        const itemType = stringValue(item.type)
+        if (itemType === 'message') {
+          for (const [contentIndex, part] of arrayOfObjects(item.content).entries()) {
+            const partType = stringValue(part.type)
+            const contentType = partType === 'refusal' ? 'refusal' : 'text'
+            const value = contentType === 'refusal'
+              ? optionalString(part.refusal)
+              : optionalString(part.text)
+            if (!value) continue
+            const key = `${contentType}:${outputIndex}:${contentIndex}`
+            if (!this.responsesTextDeltaKeys.has(key) && !this.responsesTextDoneKeys.has(key)) {
+              this.events.push({ type: 'text-delta', text: value, index: outputIndex, contentType })
+            }
+            if (contentType === 'refusal') this.sawRefusal = true
+            this.responsesTextDoneKeys.add(key)
+          }
+          const status = optionalString(item.status)
+          if (!status || status === 'completed') {
+            this.events.push({ type: 'message-complete', index: outputIndex })
+          }
+          continue
+        }
+        if (itemType !== 'function_call' && itemType !== 'custom_tool_call') continue
+        const resolvedOutputIndex = this.responsesToolOutputIndex({ output_index: outputIndex }, item)
+        const index = this.responseToolIndex(resolvedOutputIndex)
+        const includeMetadata = !this.responsesToolMetadataSeen.has(resolvedOutputIndex)
+        const snapshot = itemType === 'custom_tool_call'
+          ? optionalString(item.input)
+          : optionalString(item.arguments)
+        const argumentSuffix = this.reconcileResponsesToolArguments(resolvedOutputIndex, snapshot)
+        if (this.done) return
+        if (includeMetadata || argumentSuffix) {
+          this.sawToolCall = true
+          this.events.push(omitUndefinedEvent({
+            type: 'tool-call-delta',
+            index,
+            id: includeMetadata ? optionalString(item.call_id) ?? optionalString(item.id) : undefined,
+            name: includeMetadata ? optionalString(item.name) : undefined,
+            arguments: argumentSuffix
+          }))
+        }
+        this.responsesToolMetadataSeen.add(resolvedOutputIndex)
+        const status = optionalString(item.status)
+        if ((!status || status === 'completed') && !this.responsesToolCompleted.has(resolvedOutputIndex)) {
+          this.responsesToolCompleted.add(resolvedOutputIndex)
+          this.events.push({ type: 'tool-call-complete', index })
+        }
+      }
       this.emitUsage(objectValue(response?.usage), 'input_tokens', 'output_tokens', 'total_tokens')
       const incomplete = objectValue(response?.incomplete_details)
       const rawReason = stringValue(incomplete?.reason)
@@ -1070,7 +1173,7 @@ class ProtocolParser implements CanonicalStreamParser {
     if (type === 'message_start') {
       const message = objectValue(payload.message) ?? {}
       this.emitStart(message.id, message.model)
-      this.emitUsage(objectValue(message.usage), 'input_tokens', 'output_tokens')
+      this.emitAnthropicUsage(objectValue(message.usage))
       return
     }
     if (type === 'content_block_start') {
@@ -1118,7 +1221,7 @@ class ProtocolParser implements CanonicalStreamParser {
     }
     if (type === 'message_delta') {
       const delta = objectValue(payload.delta) ?? {}
-      this.emitUsage(objectValue(payload.usage), 'input_tokens', 'output_tokens')
+      this.emitAnthropicUsage(objectValue(payload.usage))
       const rawReason = optionalString(delta.stop_reason)
       if (rawReason) this.emitStop(anthropicStopReason(rawReason), rawReason)
       return
@@ -1188,6 +1291,53 @@ class ProtocolParser implements CanonicalStreamParser {
     return index
   }
 
+  private responsesToolOutputIndex(payload: JsonObject, item?: JsonObject): number {
+    const identities = [
+      optionalString(payload.item_id),
+      optionalString(payload.call_id),
+      optionalString(item?.id),
+      optionalString(item?.call_id)
+    ].filter((value): value is string => Boolean(value))
+    const explicit = nonNegativeSafeInteger(payload.output_index)
+    if (explicit !== undefined) {
+      for (const identity of identities) {
+        if (!this.responsesToolIdentityIndices.has(identity)) {
+          this.responsesToolIdentityIndices.set(identity, explicit)
+        }
+      }
+      return explicit
+    }
+    for (const identity of identities) {
+      const existing = this.responsesToolIdentityIndices.get(identity)
+      if (existing !== undefined) return existing
+    }
+    const outputIndex = this.nextSyntheticResponsesOutputIndex--
+    for (const identity of identities) this.responsesToolIdentityIndices.set(identity, outputIndex)
+    return outputIndex
+  }
+
+  private appendResponsesToolArguments(outputIndex: number, delta?: string): string | undefined {
+    if (!delta) return undefined
+    this.responsesArguments.set(outputIndex, (this.responsesArguments.get(outputIndex) ?? '') + delta)
+    return delta
+  }
+
+  private reconcileResponsesToolArguments(outputIndex: number, snapshot?: string): string | undefined {
+    if (!snapshot) return undefined
+    const current = this.responsesArguments.get(outputIndex) ?? ''
+    if (snapshot === current) return undefined
+    if (snapshot.startsWith(current)) {
+      const suffix = snapshot.slice(current.length)
+      this.responsesArguments.set(outputIndex, snapshot)
+      return suffix || undefined
+    }
+    this.emitResponsesProtocolError(
+      'Responses tool argument snapshots do not match streamed deltas',
+      'inconsistent_tool_arguments'
+    )
+    return undefined
+  }
+
   private anthropicToolIndex(blockIndex: number): number {
     const existing = this.anthropicToolIndices.get(blockIndex)
     if (existing !== undefined) return existing
@@ -1224,17 +1374,26 @@ class ProtocolParser implements CanonicalStreamParser {
     const inputDetails = objectValue(usage.input_tokens_details) ?? objectValue(usage.prompt_tokens_details)
     const outputDetails = objectValue(usage.output_tokens_details) ?? objectValue(usage.completion_tokens_details)
     const parsedCachedInputTokens = numberValue(inputDetails?.cached_tokens)
+    const cacheCreation = objectValue(usage.cache_creation)
+    const parsedCacheCreationInputTokens = numberValue(usage.cache_creation_input_tokens)
+    const parsedCacheCreation5mInputTokens = numberValue(cacheCreation?.ephemeral_5m_input_tokens)
+    const parsedCacheCreation1hInputTokens = numberValue(cacheCreation?.ephemeral_1h_input_tokens)
     const parsedReasoningTokens = numberValue(outputDetails?.reasoning_tokens)
     if (parsedInputTokens === undefined && parsedOutputTokens === undefined && parsedTotalTokens === undefined
-      && parsedCachedInputTokens === undefined && parsedReasoningTokens === undefined) return
+      && parsedCachedInputTokens === undefined && parsedCacheCreationInputTokens === undefined
+      && parsedCacheCreation5mInputTokens === undefined && parsedCacheCreation1hInputTokens === undefined
+      && parsedReasoningTokens === undefined) return
     this.usageInputTokens = parsedInputTokens ?? this.usageInputTokens
     this.usageOutputTokens = parsedOutputTokens ?? this.usageOutputTokens
     this.usageTotalTokens = parsedTotalTokens
       ?? sumDefined(this.usageInputTokens, this.usageOutputTokens)
       ?? this.usageTotalTokens
     this.usageCachedInputTokens = parsedCachedInputTokens ?? this.usageCachedInputTokens
+    this.usageCacheCreationInputTokens = parsedCacheCreationInputTokens ?? this.usageCacheCreationInputTokens
+    this.usageCacheCreation5mInputTokens = parsedCacheCreation5mInputTokens ?? this.usageCacheCreation5mInputTokens
+    this.usageCacheCreation1hInputTokens = parsedCacheCreation1hInputTokens ?? this.usageCacheCreation1hInputTokens
     this.usageReasoningTokens = parsedReasoningTokens ?? this.usageReasoningTokens
-    const signature = `${this.usageInputTokens ?? ''}:${this.usageOutputTokens ?? ''}:${this.usageTotalTokens ?? ''}:${this.usageCachedInputTokens ?? ''}:${this.usageReasoningTokens ?? ''}`
+    const signature = `${this.usageInputTokens ?? ''}:${this.usageOutputTokens ?? ''}:${this.usageTotalTokens ?? ''}:${this.usageCachedInputTokens ?? ''}:${this.usageCacheCreationInputTokens ?? ''}:${this.usageCacheCreation5mInputTokens ?? ''}:${this.usageCacheCreation1hInputTokens ?? ''}:${this.usageReasoningTokens ?? ''}`
     if (signature === this.lastUsage) return
     this.lastUsage = signature
     this.events.push(omitUndefinedEvent({
@@ -1243,8 +1402,36 @@ class ProtocolParser implements CanonicalStreamParser {
       outputTokens: this.usageOutputTokens,
       totalTokens: this.usageTotalTokens,
       cachedInputTokens: this.usageCachedInputTokens,
+      cacheCreationInputTokens: this.usageCacheCreationInputTokens,
+      cacheCreation5mInputTokens: this.usageCacheCreation5mInputTokens,
+      cacheCreation1hInputTokens: this.usageCacheCreation1hInputTokens,
       reasoningTokens: this.usageReasoningTokens
     }))
+  }
+
+  private emitAnthropicUsage(usage: JsonObject | undefined): void {
+    if (!usage) return
+    const uncached = numberValue(usage.input_tokens)
+    const cacheRead = numberValue(usage.cache_read_input_tokens)
+    const cacheCreationDetails = objectValue(usage.cache_creation)
+    const cacheCreation5m = numberValue(cacheCreationDetails?.ephemeral_5m_input_tokens)
+    const cacheCreation1h = numberValue(cacheCreationDetails?.ephemeral_1h_input_tokens)
+    const reportedCacheCreation = numberValue(usage.cache_creation_input_tokens)
+    const cacheCreation = reportedCacheCreation ?? sumOptional(cacheCreation5m, cacheCreation1h)
+    const inputParts = [uncached, cacheRead, cacheCreation].filter((value): value is number => value !== undefined)
+    const inputTokens = inputParts.length > 0 ? inputParts.reduce((sum, value) => sum + value, 0) : undefined
+    const thinkingTokens = numberValue(objectValue(usage.output_tokens_details)?.thinking_tokens)
+    this.emitUsage(omitUndefined({
+      input_tokens: inputTokens,
+      output_tokens: numberValue(usage.output_tokens),
+      input_tokens_details: cacheRead === undefined ? undefined : { cached_tokens: cacheRead },
+      cache_creation_input_tokens: cacheCreation,
+      cache_creation: cacheCreation5m === undefined && cacheCreation1h === undefined ? undefined : {
+        ephemeral_5m_input_tokens: cacheCreation5m,
+        ephemeral_1h_input_tokens: cacheCreation1h
+      },
+      output_tokens_details: thinkingTokens === undefined ? undefined : { reasoning_tokens: thinkingTokens }
+    }), 'input_tokens', 'output_tokens')
   }
 
   private emitStop(reason: CanonicalStopReason, rawReason?: string): void {
@@ -1303,7 +1490,11 @@ function recognizedProtocolPayload(protocol: Protocol, eventName: string | undef
     return recognizedResponsesPayload(type, payload)
   }
   if (protocol === 'openai-chat') {
-    return Boolean(payload.error) || Array.isArray(payload.choices) || objectValue(payload.usage) !== undefined
+    const choices = arrayOfObjects(payload.choices)
+    return eventName === 'error'
+      || Boolean(payload.error)
+      || choices.some((choice) => (numberValue(choice.index) ?? 0) === 0)
+      || objectValue(payload.usage) !== undefined
   }
   if (protocol === 'anthropic-messages') {
     const type = stringValue(payload.type, eventName ?? '')
@@ -1432,6 +1623,8 @@ interface EncodedToolState {
   emittedArguments: number
   emitted: boolean
   completed: boolean
+  bridgeBinding?: ToolBridgeBinding
+  customInput?: string
 }
 
 class ProtocolEncoder implements CanonicalStreamEncoder {
@@ -1463,12 +1656,14 @@ class ProtocolEncoder implements CanonicalStreamEncoder {
   private readonly responsesCompletedMessageIndices = new Set<number>()
   private chatUsageEmitted = false
   private readonly chatToolIds = new Map<number, string>()
+  private readonly toolBridgePlan?: ToolBridgePlan
 
   constructor(private readonly protocol: Protocol, options: StreamEncodingOptions) {
     this.now = options.now ?? Date.now
     this.createdAt = this.now()
     this.id = options.id ?? `stream_${this.createdAt}`
     this.model = options.model ?? ''
+    this.toolBridgePlan = options.toolBridgePlan
   }
 
   encode(event: CanonicalStreamEvent): Uint8Array[] {
@@ -1590,6 +1785,10 @@ class ProtocolEncoder implements CanonicalStreamEncoder {
     if (event.type === 'tool-call-delta') {
       this.ensureResponsesStart()
       const tool = this.updateTool(event)
+      // A provider bridge cannot authorize the call until the complete wire
+      // alias is known. Custom wrappers additionally require complete JSON so
+      // their raw input can be restored without exposing the wrapper to Codex.
+      if (this.toolBridgePlan) return
       const wasStarted = tool.started
       this.ensureResponsesToolStarted(tool)
       if (tool.started && event.arguments !== undefined) {
@@ -1640,6 +1839,10 @@ class ProtocolEncoder implements CanonicalStreamEncoder {
       }
       if (!this.stopped) {
         this.ensureResponsesStart()
+        if (!this.prepareResponsesToolBridge()) {
+          this.done = true
+          return
+        }
         this.closeResponsesOutput(this.pendingStop ?? { type: 'stop', reason: 'stop' })
         this.stopped = true
       }
@@ -1773,10 +1976,84 @@ class ProtocolEncoder implements CanonicalStreamEncoder {
       }
       this.tools.set(event.index, tool)
     }
-    if (event.id !== undefined) tool.id += event.id
-    if (event.name !== undefined) tool.name += event.name
+    if (event.id !== undefined) tool.id = mergeStreamedIdentity(tool.id, event.id)
+    if (event.name !== undefined) tool.name = mergeStreamedIdentity(tool.name, event.name)
     if (event.arguments !== undefined) tool.arguments += event.arguments
     return tool
+  }
+
+  private prepareResponsesToolBridge(): boolean {
+    const plan = this.toolBridgePlan
+    if (!plan || this.protocol !== 'openai-responses') return true
+    const tools = [...this.tools.values()]
+    if (plan.parallelToolCalls === false && tools.length > 1) {
+      return this.failResponsesToolBridge(
+        'Upstream returned parallel tool calls when parallel tool calls were disabled',
+        'invalid_tool_bridge'
+      )
+    }
+    const aliases = new Map<string, ToolBridgeBinding>()
+    for (const binding of plan.tools) {
+      if (binding.declared === false) continue
+      if (aliases.has(binding.wireName)) {
+        return this.failResponsesToolBridge(
+          'The current request contains an ambiguous tool alias',
+          'duplicate_tool_alias'
+        )
+      }
+      aliases.set(binding.wireName, binding)
+    }
+    const usedCallIds = new Set(plan.calls.map((call) => call.callId))
+    for (const tool of tools) {
+      const binding = aliases.get(tool.name)
+      if (!binding) {
+        return this.failResponsesToolBridge(
+          'Upstream returned a tool that was not declared by the current request',
+          'unknown_tool_alias'
+        )
+      }
+      if (!tool.id) {
+        return this.failResponsesToolBridge(
+          'Upstream returned a tool call without an id',
+          'missing_tool_call_id'
+        )
+      }
+      const callId = tool.id
+      if (usedCallIds.has(callId)) {
+        return this.failResponsesToolBridge(
+          'Upstream returned a duplicate tool call id',
+          'duplicate_tool_call_id'
+        )
+      }
+      usedCallIds.add(callId)
+      tool.bridgeBinding = binding
+      if (binding.sourceType !== 'custom') continue
+      const parsed = parseJsonObject(tool.arguments)
+      if (!parsed || typeof parsed.input !== 'string' || Object.keys(parsed).some((key) => key !== 'input')) {
+        return this.failResponsesToolBridge(
+          'Upstream custom tool arguments must be exactly { input: string }',
+          'invalid_custom_tool_arguments'
+        )
+      }
+      tool.customInput = parsed.input
+    }
+    return true
+  }
+
+  private failResponsesToolBridge(message: string, code: string): false {
+    this.failed = true
+    this.encodingFailure ??= {
+      type: 'error',
+      message,
+      errorType: 'invalid_tool_bridge',
+      code
+    }
+    this.frames.push(responsesSse('error', {
+      message,
+      error_type: 'invalid_tool_bridge',
+      code
+    }))
+    return false
   }
 
   private mergeUsage(event: Extract<CanonicalStreamEvent, { type: 'usage' }>): void {
@@ -1788,6 +2065,9 @@ class ProtocolEncoder implements CanonicalStreamEncoder {
       outputTokens,
       totalTokens: event.totalTokens ?? sumDefined(inputTokens, outputTokens) ?? this.usage.totalTokens,
       cachedInputTokens: event.cachedInputTokens ?? this.usage.cachedInputTokens,
+      cacheCreationInputTokens: event.cacheCreationInputTokens ?? this.usage.cacheCreationInputTokens,
+      cacheCreation5mInputTokens: event.cacheCreation5mInputTokens ?? this.usage.cacheCreation5mInputTokens,
+      cacheCreation1hInputTokens: event.cacheCreation1hInputTokens ?? this.usage.cacheCreation1hInputTokens,
       reasoningTokens: event.reasoningTokens ?? this.usage.reasoningTokens
     }
   }
@@ -1847,15 +2127,24 @@ class ProtocolEncoder implements CanonicalStreamEncoder {
     tool.started = true
     tool.outputIndex = this.responsesNextOutputIndex++
     tool.itemId = `${this.id}_fc_${tool.index}`
+    const custom = tool.bridgeBinding?.sourceType === 'custom'
     this.frames.push(responsesSse('response.output_item.added', {
       response_id: this.id,
       output_index: tool.outputIndex,
-      item: {
+      item: custom ? {
+        id: tool.itemId,
+        type: 'custom_tool_call',
+        status: 'in_progress',
+        call_id: tool.id || tool.itemId,
+        name: tool.bridgeBinding?.sourceName,
+        input: ''
+      } : {
         id: tool.itemId,
         type: 'function_call',
         status: 'in_progress',
         call_id: tool.id || tool.itemId,
-        name: tool.name,
+        name: tool.bridgeBinding?.sourceName ?? tool.name,
+        ...(tool.bridgeBinding?.sourceNamespace ? { namespace: tool.bridgeBinding.sourceNamespace } : {}),
         arguments: ''
       }
     }))
@@ -1866,6 +2155,10 @@ class ProtocolEncoder implements CanonicalStreamEncoder {
       ? 'max_output_tokens'
       : stop.reason === 'content_filter' ? 'content_filter' : undefined
     const itemStatus = incompleteReason ? 'incomplete' : 'completed'
+    // The terminal snapshot must use the same output_index namespace already
+    // advertised by response.output_item.* events. Appending text first would
+    // corrupt tool-first streams by making output[0] disagree with the earlier
+    // tool event at output_index=0.
     const output: JsonObject[] = []
     if (this.responsesTextStarted) {
       const allSourceMessagesCompleted = this.responsesTextSourceIndices.size > 0
@@ -1889,39 +2182,55 @@ class ProtocolEncoder implements CanonicalStreamEncoder {
         output_index: this.responsesTextOutputIndex,
         item
       }))
-      output.push(item)
+      output[this.responsesTextOutputIndex ?? 0] = item
     }
     for (const tool of this.tools.values()) {
       this.ensureResponsesToolStarted(tool, true)
-      if (tool.arguments.length > tool.emittedArguments) {
-        this.frames.push(responsesSse('response.function_call_arguments.delta', {
+      const custom = tool.bridgeBinding?.sourceType === 'custom'
+      const streamedValue = custom ? (tool.customInput ?? '') : tool.arguments
+      const deltaEvent = custom
+        ? 'response.custom_tool_call_input.delta'
+        : 'response.function_call_arguments.delta'
+      const doneEvent = custom
+        ? 'response.custom_tool_call_input.done'
+        : 'response.function_call_arguments.done'
+      if (streamedValue.length > tool.emittedArguments) {
+        this.frames.push(responsesSse(deltaEvent, {
           response_id: this.id,
           item_id: tool.itemId,
           output_index: tool.outputIndex,
-          delta: tool.arguments.slice(tool.emittedArguments)
+          delta: streamedValue.slice(tool.emittedArguments)
         }))
-        tool.emittedArguments = tool.arguments.length
+        tool.emittedArguments = streamedValue.length
       }
-      const item = {
+      const item = custom ? {
+        id: tool.itemId,
+        type: 'custom_tool_call',
+        status: tool.completed ? 'completed' : itemStatus,
+        call_id: tool.id || tool.itemId,
+        name: tool.bridgeBinding?.sourceName,
+        input: streamedValue
+      } : {
         id: tool.itemId,
         type: 'function_call',
         status: tool.completed ? 'completed' : itemStatus,
         call_id: tool.id || tool.itemId,
-        name: tool.name,
+        name: tool.bridgeBinding?.sourceName ?? tool.name,
+        ...(tool.bridgeBinding?.sourceNamespace ? { namespace: tool.bridgeBinding.sourceNamespace } : {}),
         arguments: tool.arguments
       }
-      this.frames.push(responsesSse('response.function_call_arguments.done', {
+      this.frames.push(responsesSse(doneEvent, {
         response_id: this.id,
         item_id: tool.itemId,
         output_index: tool.outputIndex,
-        arguments: tool.arguments
+        ...(custom ? { input: streamedValue } : { arguments: tool.arguments })
       }))
       this.frames.push(responsesSse('response.output_item.done', {
         response_id: this.id,
         output_index: tool.outputIndex,
         item
       }))
-      output.push(item)
+      output[tool.outputIndex ?? output.length] = item
     }
     const response = this.responsesEnvelope(incompleteReason ? 'incomplete' : 'completed', output)
     if (incompleteReason) response.incomplete_details = { reason: incompleteReason }
@@ -2204,9 +2513,23 @@ function responsesUsage(event: Extract<CanonicalStreamEvent, { type: 'usage' }>)
 }
 
 function anthropicUsage(event: Extract<CanonicalStreamEvent, { type: 'usage' }>): JsonObject {
+  const cacheCreation = event.cacheCreationInputTokens
+    ?? sumOptional(event.cacheCreation5mInputTokens, event.cacheCreation1hInputTokens)
+  const uncachedInput = event.inputTokens === undefined
+    ? undefined
+    : Math.max(0, event.inputTokens - (event.cachedInputTokens ?? 0) - (cacheCreation ?? 0))
   return omitUndefined({
-    input_tokens: event.inputTokens,
-    output_tokens: event.outputTokens
+    input_tokens: uncachedInput,
+    output_tokens: event.outputTokens,
+    cache_read_input_tokens: event.cachedInputTokens,
+    cache_creation_input_tokens: event.cacheCreationInputTokens,
+    cache_creation: event.cacheCreation5mInputTokens === undefined
+      && event.cacheCreation1hInputTokens === undefined
+      ? undefined
+      : omitUndefined({
+          ephemeral_5m_input_tokens: event.cacheCreation5mInputTokens,
+          ephemeral_1h_input_tokens: event.cacheCreation1hInputTokens
+        })
   })
 }
 
@@ -2223,11 +2546,19 @@ function sumDefined(first: number | undefined, second: number | undefined): numb
   return first !== undefined && second !== undefined ? first + second : undefined
 }
 
+function sumOptional(first: number | undefined, second: number | undefined): number | undefined {
+  if (first === undefined && second === undefined) return undefined
+  return (first ?? 0) + (second ?? 0)
+}
+
 function hasUsage(event: Extract<CanonicalStreamEvent, { type: 'usage' }>): boolean {
   return event.inputTokens !== undefined
     || event.outputTokens !== undefined
     || event.totalTokens !== undefined
     || event.cachedInputTokens !== undefined
+    || event.cacheCreationInputTokens !== undefined
+    || event.cacheCreation5mInputTokens !== undefined
+    || event.cacheCreation1hInputTokens !== undefined
     || event.reasoningTokens !== undefined
 }
 
@@ -2318,6 +2649,17 @@ function parseJsonObject(value: string): JsonObject | undefined {
 
 function normalizeTimestamp(value: number): number {
   return value < 10_000_000_000 ? value * 1000 : value
+}
+
+/**
+ * Some OpenAI-compatible relays repeat the complete id/name in later chunks,
+ * while others send append-only fragments. Accept both without duplicating a
+ * repeated snapshot (for example `call_1call_1`).
+ */
+function mergeStreamedIdentity(current: string, incoming: string): string {
+  if (!incoming || incoming === current || current.startsWith(incoming)) return current
+  if (!current || incoming.startsWith(current)) return incoming
+  return current + incoming
 }
 
 function safeIdentifier(value: string): string {

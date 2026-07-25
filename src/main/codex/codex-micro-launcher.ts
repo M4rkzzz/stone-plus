@@ -95,9 +95,30 @@ export const codexMicroNoDeviceBootstrap = String.raw`
     Object.defineProperty(StoneCodexWorker, "__stoneCodexMicroWorker", { value: true });
     workerThreads.Worker = StoneCodexWorker;
   }
+  const noDeviceState = Object.freeze({
+    status: "not-detected",
+    transport: null,
+    model: null,
+    error: null,
+    battery: null,
+  });
+  class StoneCodexMicroService {
+    getState() { return noDeviceState; }
+    start() {}
+    async stop() {}
+    async updateLighting() { return false; }
+    dispose() { return this.stop(); }
+  }
+  const noDeviceServiceModule = { CodexMicroService: StoneCodexMicroService };
   const noDeviceModule = {
     ConnectionEventType: { CONNECTED: "CONNECTED", DISCONNECTED: "DISCONNECTED", ERROR: "ERROR" },
-    DeviceType: { Project2077: "Project2077" },
+    ConnectionType: { hid: "hid" },
+    DeviceLayoutType: { universal: "universal" },
+    DeviceType: {
+      CodexMicro: "CodexMicro",
+      CreatorMicroV2: "CreatorMicroV2",
+      Project2077: "Project2077",
+    },
     OAILightingEffect: { off: 0, breath: 1, solid: 2, snake: 3 },
     WLDeviceDiscovery: class { findWLDevices() { return []; } },
     WLDeviceCommImpl: class {
@@ -115,6 +136,9 @@ export const codexMicroNoDeviceBootstrap = String.raw`
   };
   const originalLoad = Module._load;
   Module._load = function stoneCodexMicroLoader(request) {
+    if (typeof request === "string" && /(?:^|[\\/])codex-micro-service(?:-[^\\/]+)?\.js$/.test(request)) {
+      return noDeviceServiceModule;
+    }
     if (request === "@worklouder/device-kit-oai") return noDeviceModule;
     return Reflect.apply(originalLoad, this, arguments);
   };

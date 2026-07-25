@@ -45,6 +45,7 @@ export async function probeApiSource(
   const warnings: string[] = []
   let capabilityProfile = inferUpstreamCapabilities({
     protocol: input.protocol,
+    kind: input.kind,
     sourceType: input.sourceType,
     responsesCompactMode: input.responsesCompactMode,
   })
@@ -69,6 +70,7 @@ export async function probeApiSource(
   const protocolCapabilities = adapter.capabilities.protocols[input.protocol]
   capabilityProfile = inferUpstreamCapabilities({
     protocol: input.protocol,
+    kind: input.kind,
     sourceType: input.sourceType,
     responsesCompactMode: input.responsesCompactMode,
     modelDiscovery: adapter.capabilities.modelDiscovery,

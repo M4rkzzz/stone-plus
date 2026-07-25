@@ -154,6 +154,7 @@
 .built-in-proxy-settings-workspace__mode.is-applying { border-color: #a9bfd8; }
 .built-in-proxy-settings-workspace__mode:has(input:focus-visible) { outline: 2px solid var(--accent); outline-offset: 2px; }
 .built-in-proxy-settings-workspace__mode:has(input:disabled) { cursor: not-allowed; }
+.built-in-proxy-settings-workspace__mode.is-unavailable { opacity: .68; }
 .built-in-proxy-settings-workspace__mode > input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
 
 .built-in-proxy-settings-workspace__mode-icon {
@@ -174,6 +175,13 @@
 .built-in-proxy-settings-workspace__mode-copy { display: grid; min-width: 0; gap: 3px; }
 .built-in-proxy-settings-workspace__mode-copy strong { color: var(--text); font-size: 10px; }
 .built-in-proxy-settings-workspace__mode-copy small { color: var(--muted); font-size: 8px; line-height: 1.45; }
+.built-in-proxy-settings-workspace__mode-copy .built-in-proxy-settings-workspace__mode-unavailable {
+  color: var(--red);
+  font-size: 8px;
+  font-style: normal;
+  font-weight: 700;
+  line-height: 1.4;
+}
 .built-in-proxy-settings-workspace__mode-state { display: grid; place-items: center; color: var(--accent); }
 
 .built-in-proxy-settings-workspace__details {

@@ -9,7 +9,7 @@ import { registerUpdateApi } from './ipc/update-api'
 import { AppStore } from './store/app-store'
 import { DatabaseBackupService, WebDavBackupService } from './backup'
 import { resolveChatGptCredential } from './providers'
-import { resolveChatGptAgentIdentity } from './auth'
+import { resolveChatGptAgentIdentity, resolveGrokOAuthCredential } from './auth'
 import {
   createOutboundReloadCoordinator,
   OutboundTransportManager,
@@ -25,11 +25,17 @@ import {
   CodexSessionManager,
   CodexSessionIndexCleanupService,
   CodexSessionRepairService,
+  MacChatGptDesktopController,
+  UnsupportedChatGptDesktopController,
   WindowsChatGptDesktopController,
 } from './codex'
 import { registerCodexSessionRepairApi } from './ipc/session-repair-api'
 import { ClientInstanceManager } from './client-instances'
 import { registerClientInstanceApi } from './ipc/client-instance-api'
+import { registerAgentLifecycleApi } from './ipc/agent-lifecycle-api'
+import { createAgentLifecycleService } from './agent-lifecycle/integration'
+import type { AgentLifecycleService } from './agent-lifecycle/service'
+import { AgentInstallationService } from './agent-installation'
 import { registerCodexSessionManagerApi } from './ipc/session-manager-api'
 import { registerPersistentTaskApi } from './ipc/persistent-task-api'
 import { BROWSER_SESSION_PARTITION, BrowserImportQueue } from './browser-import-queue'
@@ -41,7 +47,7 @@ import { BuiltInProxyOrchestrator } from './proxy/built-in/orchestrator'
 import { createChromiumMixedSessionGeneration } from './proxy/built-in/chromium-route-session'
 import { FileSystemProxyLeaseRecoveryStore } from './proxy/built-in/lease-recovery'
 import { SystemProxyLease } from './proxy/built-in/system-proxy-lease'
-import { createSystemProxyPlatformAdapter } from './proxy/built-in/platform-adapters'
+import { builtInProxyPlatformCapabilities, createSystemProxyPlatformAdapter } from './proxy/built-in/platform-adapters'
 import { ElevatedSingBoxTunAdapter } from './proxy/built-in/tun-sidecar-adapter'
 import { TunController } from './proxy/built-in/tun-controller'
 
@@ -67,6 +73,8 @@ let codexSessionIndexCleanup: CodexSessionIndexCleanupService
 let codexRepairAndRestart: CodexRepairAndRestartService
 let codexSessionManager: CodexSessionManager
 let clientInstanceManager: ClientInstanceManager
+let agentLifecycle: AgentLifecycleService
+let agentInstaller: AgentInstallationService
 let browserImportQueue: BrowserImportQueue
 let localEventServer: LocalEventServer
 let systemLifecycle: SystemLifecycleCoordinator
@@ -76,8 +84,12 @@ let shutdownForUpdate = false
 let shutdownPromise: Promise<void> | undefined
 let flushGatewayApiState: (() => Promise<void>) | undefined
 let disposeBuiltInProxyApi: (() => Promise<void>) | undefined
+let disposeClientInstanceApi: (() => Promise<void>) | undefined
+let disposeAgentLifecycleApi: (() => Promise<void>) | undefined
 let focusMainWindowOnReady = false
 let builtInChromiumGeneration = 0
+const LOGIN_STARTUP_ARGUMENT = '--hidden'
+let startedHidden = app.isPackaged && process.argv.includes(LOGIN_STARTUP_ARGUMENT)
 
 if (process.env.STONE_USER_DATA_DIR) {
   app.setPath('userData', resolve(process.env.STONE_USER_DATA_DIR))
@@ -94,6 +106,10 @@ if (ownsSingleInstanceLock) {
 
 async function bootstrap(): Promise<void> {
   await app.whenReady()
+  if (app.isPackaged) {
+    const loginLaunch = app.getLoginItemSettings()
+    startedHidden ||= loginLaunch.wasOpenedAsHidden === true || loginLaunch.wasOpenedAtLogin === true
+  }
   if (bootstrapShouldStop()) return
 
   store = new AppStore(app.getPath('userData'))
@@ -173,17 +189,23 @@ async function bootstrap(): Promise<void> {
       return { targets: [...targets] }
     },
     coordinateBuiltInRouteChange: outboundReloadCoordinator.builtInRouteChangeCoordinator(),
-    scheduleBuiltInRouteChange: (detector) => outboundReloadCoordinator.scheduleBuiltInRouteChange(detector)
+    scheduleBuiltInRouteChange: (detector) => outboundReloadCoordinator.scheduleBuiltInRouteChange(detector),
+    platformCapabilities: builtInProxyPlatformCapabilities(),
   })
   codexConversationTitles = new CodexConversationTitleResolver(app.getPath('home'))
   codexSessionRepair = new CodexSessionRepairService({ codexHome: join(app.getPath('home'), '.codex') })
   codexSessionIndexCleanup = new CodexSessionIndexCleanupService({ codexHome: join(app.getPath('home'), '.codex') })
   codexSessionManager = new CodexSessionManager({ codexHome: join(app.getPath('home'), '.codex') })
+  const codexDesktop = process.platform === 'darwin'
+    ? new MacChatGptDesktopController()
+    : process.platform === 'win32'
+      ? new WindowsChatGptDesktopController({
+      shouldDisableCodexMicro: () => store.getRuntimeGatewaySettings().disableCodexMicro === true,
+      })
+      : new UnsupportedChatGptDesktopController(process.platform)
   codexRepairAndRestart = new CodexRepairAndRestartService(
     codexSessionRepair,
-    new WindowsChatGptDesktopController({
-      shouldDisableCodexMicro: () => store.getRuntimeGatewaySettings().disableCodexMicro === true,
-    }),
+    codexDesktop,
     codexSessionIndexCleanup,
   )
   await store.refreshRequestConversationTitles((conversationId) => codexConversationTitles.resolve(conversationId))
@@ -272,6 +294,18 @@ async function bootstrap(): Promise<void> {
         )
         return { secret: resolved.bundle.accessToken, kind: 'chatgpt-oauth' as const, accountId: resolved.bundle.accountId }
       }
+      if (account.credentialType === 'grok-oauth') {
+        const serialized = store.getCredential(account.credentialId)
+        if (!serialized) return undefined
+        const resolved = await resolveGrokOAuthCredential(
+          serialized,
+          (rotated, expectedSource) => store.updateGrokOAuthCredential(account.id, rotated, expectedSource),
+          fetchImplementation,
+          Date.now(),
+          { refreshKey: account.id, signal }
+        )
+        return { secret: resolved.bundle.accessToken, kind: 'grok-oauth' as const }
+      }
       const secret = store.getCredential(account.credentialId)
       return secret ? { secret, kind: 'api-key' as const } : undefined
     },
@@ -300,9 +334,11 @@ async function bootstrap(): Promise<void> {
     console.warn('Stone+ local event stream is unavailable', eventServerStart.error)
   }
   const clientConfigHome = process.env.STONE_CLIENT_CONFIG_HOME
+  const grokBuildHome = process.env.GROK_HOME?.trim()
   const clientConfig = new ClientConfigService({
     homeDir: clientConfigHome ? resolve(clientConfigHome) : app.getPath('home'),
-    platform: process.platform
+    platform: process.platform,
+    ...(grokBuildHome ? { overrides: { grokbuildDirectory: resolve(grokBuildHome) } } : {}),
   })
   clientInstanceManager = new ClientInstanceManager({
     store: store.getStateRepository(),
@@ -334,10 +370,30 @@ async function bootstrap(): Promise<void> {
       const base = `http://${host}:${snapshot.gateway.port}`
       if (instance.client === 'codex') return { env: { OPENAI_BASE_URL: `${base}/v1`, OPENAI_API_KEY: route.localToken } }
       if (instance.client === 'claude') return { env: { ANTHROPIC_BASE_URL: base, ANTHROPIC_AUTH_TOKEN: route.localToken } }
-      return { env: { GOOGLE_GEMINI_BASE_URL: base, GEMINI_API_KEY: route.localToken } }
+      if (instance.client === 'gemini') return { env: { GOOGLE_GEMINI_BASE_URL: base, GEMINI_API_KEY: route.localToken } }
+      // Grok Build primarily reads config.toml, but env fallbacks keep a managed
+      // launch usable when the selected profile was not rewritten yet.
+      return {
+        env: {
+          OPENAI_BASE_URL: `${base}/grokbuild/v1`,
+          OPENAI_API_KEY: route.localToken,
+        },
+      }
     }
   })
-  const initializedInstances = clientInstanceManager.initialize()
+  agentInstaller = new AgentInstallationService({
+    openExternal: (url) => shell.openExternal(url),
+  })
+  agentLifecycle = createAgentLifecycleService({
+    store,
+    clientConfig,
+    instances: clientInstanceManager,
+    codexRepair: codexRepairAndRestart,
+    codexDesktop,
+    installer: agentInstaller,
+  })
+  clientInstanceManager.initialize()
+  const initializedInstances = await clientInstanceManager.recoverOrphanedProcesses()
   const instanceSnapshot = store.getSnapshot()
   const profiles = instanceSnapshot.clientProfiles
   for (const instance of initializedInstances) {
@@ -413,31 +469,31 @@ async function bootstrap(): Promise<void> {
     updateTrayMenu, browserImportQueue, undefined, localEventServer, outboundReloadCoordinator, webDavBackups
   )
   disposeBuiltInProxyApi = registerBuiltInProxyApi(builtInProxy, builtInProxy)
-  await builtInProxy.initialize().catch((error) => {
-    // Built-in startup failures are renderer-visible and deliberately do not
-    // prevent the local gateway UI from opening. Previously activated routes
-    // have already moved to the coordinator's fail-closed generation.
-    console.error('[built-in-proxy] Automatic initialization failed', error)
-  })
-  if (bootstrapShouldStop()) return
   systemLifecycle = new SystemLifecycleCoordinator({
     rebuildConnections: () => rebuildGatewayConnections(store, outboundTransport),
     isOnline: () => net.isOnline()
   })
-  powerMonitor.on('suspend', () => systemLifecycle.onSuspend())
-  powerMonitor.on('resume', () => systemLifecycle.onResume())
-  systemLifecycle.start()
   registerCodexSessionRepairApi(codexSessionRepair, codexRepairAndRestart, {
     clientConfig,
     clientProfiles: () => store.getSnapshot().clientProfiles,
   }, codexSessionIndexCleanup)
-  registerClientInstanceApi(clientInstanceManager, store)
+  disposeClientInstanceApi = registerClientInstanceApi(clientInstanceManager, store)
+  disposeAgentLifecycleApi = registerAgentLifecycleApi(agentLifecycle)
   registerCodexSessionManagerApi(codexSessionManager)
   registerPersistentTaskApi(store.getPersistentTaskRunner())
   registerUpdateApi(updateService)
   registerTunnelApi(tunnelService)
   createWindow()
   createTray()
+  await builtInProxy.initialize().catch((error) => {
+    // The window and IPC surface are ready before optional proxy auto-start so
+    // slow subscriptions and health checks remain visible to the user.
+    console.error('[built-in-proxy] Automatic initialization failed', error)
+  })
+  if (bootstrapShouldStop()) return
+  powerMonitor.on('suspend', () => systemLifecycle.onSuspend())
+  powerMonitor.on('resume', () => systemLifecycle.onResume())
+  systemLifecycle.start()
   updateService.startAutomaticChecks()
 
   if (store.getSnapshot().gateway.autoStart) {
@@ -479,7 +535,11 @@ function createWindow(): void {
     titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'hidden',
     ...(process.platform === 'darwin' ? {} : {
       titleBarOverlay: {
-        color: '#f9fbfa00',
+        // Keep the native Windows overlay opaque. A transparent overlay makes
+        // DWM blend the continuously updating renderer behind the caption
+        // buttons, which can stall desktop composition under request bursts.
+        // This is visually identical to the app chrome behind it.
+        color: '#f9fbfa',
         symbolColor: '#3d4a45',
         height: 38
       }
@@ -508,7 +568,8 @@ function createWindow(): void {
   }
 
   mainWindow.setMenuBarVisibility(false)
-  const rendererTarget = process.env.ELECTRON_RENDERER_URL ?? pathToFileURL(join(__dirname, '../renderer/index.html')).toString()
+  const rendererTarget = trustedDevelopmentRendererUrl()
+    ?? pathToFileURL(join(__dirname, '../renderer/index.html')).toString()
   mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
   mainWindow.webContents.on('will-attach-webview', (event, webPreferences, params) => {
     delete webPreferences.preload
@@ -521,13 +582,13 @@ function createWindow(): void {
     if (!isSafeBrowserUrl(params.src) || partition !== BROWSER_SESSION_PARTITION) event.preventDefault()
   })
   mainWindow.webContents.on('will-navigate', (event, targetUrl) => {
-    const allowed = process.env.ELECTRON_RENDERER_URL
+    const allowed = trustedDevelopmentRendererUrl()
       ? new URL(targetUrl).origin === new URL(rendererTarget).origin
       : targetUrl === rendererTarget
     if (!allowed) event.preventDefault()
   })
   mainWindow.once('ready-to-show', () => {
-    mainWindow?.show()
+    if (!startedHidden || focusMainWindowOnReady) mainWindow?.show()
     if (focusMainWindowOnReady) showMainWindow()
   })
   mainWindow.on('close', (event) => {
@@ -537,10 +598,23 @@ function createWindow(): void {
     }
   })
 
-  if (process.env.ELECTRON_RENDERER_URL) {
+  if (trustedDevelopmentRendererUrl()) {
     void mainWindow.loadURL(rendererTarget)
   } else {
     void mainWindow.loadFile(join(__dirname, '../renderer/index.html'))
+  }
+}
+
+function trustedDevelopmentRendererUrl(): string | undefined {
+  if (app.isPackaged) return undefined
+  const candidate = process.env.ELECTRON_RENDERER_URL?.trim()
+  if (!candidate) return undefined
+  try {
+    const url = new URL(candidate)
+    const loopback = url.hostname === 'localhost' || url.hostname === '127.0.0.1' || url.hostname === '[::1]'
+    return loopback && (url.protocol === 'http:' || url.protocol === 'https:') ? url.toString() : undefined
+  } catch {
+    return undefined
   }
 }
 
@@ -610,7 +684,11 @@ function updateTrayMenu(): void {
         click: () => void toggleGatewayFromTray()
       },
       ...snapshot.routes.map((route) => ({
-        label: `${route.client === 'claude' ? 'Claude Code' : route.client === 'codex' ? 'Codex' : 'Gemini CLI'} Route`,
+        label: `${route.client === 'claude'
+          ? 'Claude Code'
+          : route.client === 'codex'
+            ? 'Codex'
+            : route.client === 'grokbuild' ? 'Grok Build' : 'Gemini CLI'} Route`,
         type: 'checkbox' as const,
         checked: route.enabled,
         click: () => void toggleRouteFromTray(route.id)
@@ -733,7 +811,19 @@ function shutdownServices(): Promise<void> {
       if (!shutdownForUpdate && updateService) updateService.close()
     })
     await shutdownStep('managed client instances', async () => {
-      if (clientInstanceManager) await clientInstanceManager.stopAll()
+      await Promise.all([
+        disposeAgentLifecycleApi?.(),
+        disposeClientInstanceApi?.(),
+      ])
+      disposeAgentLifecycleApi = undefined
+      disposeClientInstanceApi = undefined
+      if (agentLifecycle) await agentLifecycle.dispose()
+      if (clientInstanceManager) {
+        const result = await clientInstanceManager.stopAll()
+        if (result.stillRunning.length > 0) {
+          console.error('Stone+ could not terminate every managed client instance', result.stillRunning)
+        }
+      }
     })
     await shutdownStep('Codex repair service', async () => {
       if (codexRepairAndRestart) await codexRepairAndRestart.close()

@@ -13,8 +13,10 @@ import {
   Trash2,
   Zap,
 } from 'lucide-react'
-import { supportsFastServiceTier } from '@shared/types'
-import type { AppSnapshot, GatewayApi, ModelPolicy, Pool, PoolInput, PoolStrategy, Protocol } from '@shared/types'
+import { supportsFastServiceTier, supportsPoolFastServiceTier } from '@shared/types'
+import type { AppSnapshot, GatewayApi, ModelPolicy, Pool, PoolInput, PoolProtocol, PoolStrategy } from '@shared/types'
+import { accountMatchesPoolProtocol, accountPoolProtocol } from '@shared/pool-protocol'
+import { providerSourceFamily } from '@shared/source-family'
 import type { ActionRunner } from '../App'
 import { accountSourceLabel } from '../account-source-label'
 import { BUILT_IN_PROXY_BINDING_NOTICE, useBuiltInProxyInterlock } from '../built-in-proxy-interlocks'
@@ -30,6 +32,7 @@ import {
   Modal,
   OverflowMenu,
   PageHeader,
+  ProviderAvatar,
   protocolLabels,
 } from '../ui'
 import { ModelPolicyEditor } from './ModelPolicyEditor'
@@ -71,7 +74,7 @@ const strategyDescriptionsEn: Record<PoolStrategy, string> = {
   'weighted-round-robin': 'Alternate requests smoothly by weight',
 }
 
-const protocols: Protocol[] = ['anthropic-messages', 'openai-responses', 'openai-chat', 'gemini']
+const protocols: PoolProtocol[] = ['anthropic-messages', 'openai-responses', 'openai-chat', 'gemini', 'grok']
 
 function FastModeControl({
   sourceName,
@@ -167,7 +170,10 @@ export function PoolsView({
   const accountById = useMemo(() => new Map(snapshot.accounts.map((account) => [account.id, account])), [snapshot.accounts])
   const providerById = useMemo(() => new Map(snapshot.providers.map((provider) => [provider.id, provider])), [snapshot.providers])
   const poolEligibleAccounts = useMemo(
-    () => snapshot.accounts.filter((account) => providerById.get(account.providerId)?.sourceType !== 'relay'),
+    () => snapshot.accounts.filter((account) => {
+      const provider = providerById.get(account.providerId)
+      return provider !== undefined && provider.sourceType !== 'relay'
+    }),
     [providerById, snapshot.accounts],
   )
   const proxyById = useMemo(() => new Map(snapshot.proxies.map((proxy) => [proxy.id, proxy])), [snapshot.proxies])
@@ -223,6 +229,19 @@ export function PoolsView({
     const nextErrors: Record<string, string> = {}
     if (!draft.name.trim()) nextErrors.name = t('请输入号池名称', 'Enter a pool name.')
     if (!draft.accountIds.length) nextErrors.accounts = t('至少选择一个账号', 'Select at least one account.')
+    if (draft.accountIds.some((id) => {
+      const account = accountById.get(id)
+      const provider = providerById.get(account?.providerId ?? '')
+      return !account || !accountMatchesPoolProtocol(draft.protocol, account, provider)
+    })) {
+      nextErrors.accounts = t('所选账号与号池对外协议不兼容。', 'A selected account is incompatible with the pool protocol.')
+    }
+    const families = new Set(draft.accountIds.flatMap((id) => {
+      const account = accountById.get(id)
+      const provider = providerById.get(account?.providerId ?? '')
+      return provider ? [providerSourceFamily(provider.kind)] : []
+    }))
+    if (families.size > 1) nextErrors.accounts = t('一个号池只能使用同一种来源。', 'A pool can use only one source family.')
     setErrors(nextErrors)
     if (Object.keys(nextErrors).length) return
     const success = await runAction('save-pool', () => api.savePool({ ...draft, name: draft.name.trim() }))
@@ -232,7 +251,8 @@ export function PoolsView({
   const coverageForAccounts = (accountIds: string[]) => buildPoolModelCoverage(
     accountIds.flatMap((accountId) => {
       const account = accountById.get(accountId)
-      return account && providerById.get(account.providerId)?.sourceType !== 'relay' ? [account] : []
+      const provider = account ? providerById.get(account.providerId) : undefined
+      return account && provider && accountMatchesPoolProtocol(draft.protocol, account, provider) ? [account] : []
     }),
     (providerId) => providerById.get(providerId)?.models ?? [],
   )
@@ -249,7 +269,7 @@ export function PoolsView({
   const toggleTagMembers = (tagId: string) => {
     const matchingIds = snapshot.accounts
       .filter((account) => (account.credentialType === 'chatgpt-oauth' || account.credentialType === 'chatgpt-agent-identity') && account.tagId === tagId)
-      .filter((account) => providerById.get(account.providerId)?.protocol === draft.protocol)
+      .filter((account) => accountMatchesPoolProtocol(draft.protocol, account, providerById.get(account.providerId)))
       .map((account) => account.id)
     if (!matchingIds.length) return
     const selected = new Set(draft.accountIds)
@@ -260,6 +280,11 @@ export function PoolsView({
   }
 
   const draftCoverage = coverageForAccounts(draft.accountIds)
+  const draftSourceFamily = useMemo(() => {
+    const account = draft.accountIds.map((id) => accountById.get(id)).find(Boolean)
+    const provider = providerById.get(account?.providerId ?? '')
+    return provider ? providerSourceFamily(provider.kind) : undefined
+  }, [accountById, draft.accountIds, providerById])
 
   const removePool = async () => {
     if (!deleteTarget) return
@@ -289,7 +314,7 @@ export function PoolsView({
             const inFlight = members.reduce((sum, member) => sum + (member?.inFlight ?? 0), 0)
             const capacity = members.reduce((sum, member) => sum + (member?.maxConcurrency ?? 0), 0)
             const routeCount = snapshot.routes.filter((route) => route.poolId === pool.id).length
-            const fastSupported = supportsFastServiceTier(pool.protocol)
+            const fastSupported = supportsPoolFastServiceTier(pool.protocol)
             const fastEnabled = fastSupported && (pendingFastModes[pool.id] ?? pool.forceFastMode ?? false)
             const fastBusy = busyKeys.has(`set-fast-mode:${pool.id}`)
             return (
@@ -331,7 +356,7 @@ export function PoolsView({
                     return (
                       <div className="pool-member" key={account.id}>
                         <span className="pool-member__order">{index + 1}</span>
-                        <span className="provider-avatar" style={{ '--provider-color': provider?.color ?? '#61736f' } as React.CSSProperties}>{sourceLabel.slice(0, 1)}</span>
+                        <ProviderAvatar kind={provider?.kind} name={sourceLabel} color={provider?.color} />
                         <div><strong>{account.name}</strong><span>{sourceLabel} · {t('权重', 'Weight')} {account.weight}{account.proxyId ? t(` · 账号代理：${proxyById.get(account.proxyId)?.name ?? '已删除'}`, ` · Account proxy: ${proxyById.get(account.proxyId)?.name ?? 'Deleted'}`) : ''}</span></div>
                         <AccountStatusBadge status={account.status} circuitState={account.circuitState} />
                       </div>
@@ -384,7 +409,7 @@ export function PoolsView({
                   <div className="pool-members__heading"><span>{t('中转来源', 'Relay source')}</span><Badge tone="neutral">{t('配置只读', 'Read-only configuration')}</Badge></div>
                   <div className="pool-member">
                     <span className="pool-member__order">1</span>
-                    <span className="provider-avatar" style={{ '--provider-color': provider.color ?? '#61736f' } as React.CSSProperties}>{provider.name.slice(0, 1)}</span>
+                    <ProviderAvatar kind={provider.kind} name={provider.name} color={provider.color} />
                     <div><strong>{account.name}</strong><span>{t('优先级', 'Priority')} {account.priority} · {t('权重', 'Weight')} {account.weight}{account.proxyId ? t(` · 代理：${proxyById.get(account.proxyId)?.name ?? '已删除'}`, ` · Proxy: ${proxyById.get(account.proxyId)?.name ?? 'Deleted'}`) : ''}</span></div>
                     <AccountStatusBadge status={account.status} circuitState={account.circuitState} />
                   </div>
@@ -420,11 +445,11 @@ export function PoolsView({
               <select
                 value={draft.protocol}
                 onChange={(event) => {
-                  const protocol = event.target.value as Protocol
+                  const protocol = event.target.value as PoolProtocol
                   const accountIds = draft.accountIds.filter((accountId) => {
                     const account = accountById.get(accountId)
                     const provider = account ? providerById.get(account.providerId) : undefined
-                    return provider?.sourceType !== 'relay' && provider?.protocol === protocol
+                    return Boolean(account && accountMatchesPoolProtocol(protocol, account, provider))
                   })
                   const candidates = coverageForAccounts(accountIds).options.map((option) => option.model)
                   setDraft({
@@ -432,7 +457,7 @@ export function PoolsView({
                     protocol,
                     accountIds,
                     modelAllowlist: pruneModelSelection(draft.modelAllowlist, candidates),
-                    forceFastMode: supportsFastServiceTier(protocol) ? draft.forceFastMode : false,
+                    forceFastMode: supportsPoolFastServiceTier(protocol) ? draft.forceFastMode : false,
                     hedgedRequests: protocol === 'openai-responses' ? draft.hedgedRequests : false,
                   })
                 }}
@@ -461,12 +486,12 @@ export function PoolsView({
             </label>
             <div className="field field--full">
               <span>{t('账号成员', 'Account members')}</span>
-              {snapshot.accountTags.length > 0 && <div className="pool-tag-quick-select" aria-label={t('按 Tag 快速选择账号', 'Quickly select accounts by tag')}>
+              {snapshot.accountTags.length > 0 && draft.protocol !== 'grok' && <div className="pool-tag-quick-select" aria-label={t('按 Tag 快速选择账号', 'Quickly select accounts by tag')}>
                 <span>{t('Tag 快选', 'Quick tag selection')}</span>
                 {snapshot.accountTags.map((tag) => {
                   const matchingIds = snapshot.accounts
                     .filter((account) => (account.credentialType === 'chatgpt-oauth' || account.credentialType === 'chatgpt-agent-identity') && account.tagId === tag.id)
-                    .filter((account) => providerById.get(account.providerId)?.protocol === draft.protocol)
+                    .filter((account) => accountMatchesPoolProtocol(draft.protocol, account, providerById.get(account.providerId)))
                     .map((account) => account.id)
                   const allSelected = matchingIds.length > 0 && matchingIds.every((id) => draft.accountIds.includes(id))
                   return <button type="button" key={tag.id} disabled={!matchingIds.length} className={allSelected ? 'active' : ''} onClick={() => toggleTagMembers(tag.id)}>{tag.name}<span>{matchingIds.length}</span></button>
@@ -476,7 +501,10 @@ export function PoolsView({
                 {poolEligibleAccounts.map((account) => {
                   const selected = draft.accountIds.includes(account.id)
                   const provider = providerById.get(account.providerId)
-                  const compatible = provider?.protocol === draft.protocol
+                  const protocolCompatible = Boolean(provider && accountMatchesPoolProtocol(draft.protocol, account, provider))
+                  const familyCompatible = selected || !draftSourceFamily || (provider !== undefined && providerSourceFamily(provider.kind) === draftSourceFamily)
+                  const compatible = protocolCompatible && familyCompatible
+                  const canToggle = selected || compatible
                   const wildcard = isAccountModelWildcard(account)
                   const sourceLabel = accountSourceLabel(account.credentialType, provider?.name)
                   return (
@@ -484,14 +512,16 @@ export function PoolsView({
                       type="button"
                       className={`${selected ? 'selected' : ''} ${!compatible ? 'incompatible' : ''}`}
                       key={account.id}
-                      disabled={!compatible}
-                      title={compatible ? undefined : t(`账号协议为 ${provider ? protocolLabels[provider.protocol] : '未知'}，与号池不匹配`, `Account protocol is ${provider ? protocolLabels[provider.protocol] : 'unknown'} and does not match the pool.`)}
+                      disabled={!canToggle}
+                      title={compatible ? undefined : !familyCompatible
+                        ? t('号池已锁定为另一种来源。', 'The pool is locked to another source family.')
+                        : t(`账号协议为 ${provider ? protocolLabels[provider.protocol] : '未知'}，与号池不匹配`, `Account protocol is ${provider ? protocolLabels[provider.protocol] : 'unknown'} and does not match the pool.`)}
                       onClick={() => updateMemberIds(selected ? draft.accountIds.filter((id) => id !== account.id) : [...draft.accountIds, account.id])}
                     >
                       <span className="checkbox-mark">{selected && <Check size={13} />}</span>
-                      <span className="provider-avatar" style={{ '--provider-color': provider?.color ?? '#61736f' } as React.CSSProperties}>{sourceLabel.slice(0, 1)}</span>
-                      <span><strong>{account.name}</strong><small>{sourceLabel} · {protocolLabels[provider?.protocol ?? 'openai-chat']} · {wildcard ? t('待刷新 · 兼容通配', 'Refresh pending · Compatible wildcard') : t(`开放 ${effectiveAccountModels(account, provider?.models).length} 个模型`, `${effectiveAccountModels(account, provider?.models).length} models allowed`)}</small></span>
-                      {compatible ? <AccountStatusBadge status={account.status} circuitState={account.circuitState} /> : <Badge tone="neutral">{t('协议不匹配', 'Protocol mismatch')}</Badge>}
+                      <ProviderAvatar kind={provider?.kind} name={sourceLabel} color={provider?.color} />
+                      <span><strong>{account.name}</strong><small>{sourceLabel} · {provider ? protocolLabels[accountPoolProtocol(account, provider)] : t('未知协议', 'Unknown protocol')} · {wildcard ? t('待刷新 · 兼容通配', 'Refresh pending · Compatible wildcard') : t(`开放 ${effectiveAccountModels(account, provider?.models).length} 个模型`, `${effectiveAccountModels(account, provider?.models).length} models allowed`)}</small></span>
+                      {compatible ? <AccountStatusBadge status={account.status} circuitState={account.circuitState} /> : <Badge tone="neutral">{!familyCompatible ? t('来源不匹配', 'Source mismatch') : t('协议不匹配', 'Protocol mismatch')}</Badge>}
                     </button>
                   )
                 })}
@@ -513,14 +543,14 @@ export function PoolsView({
               />
             </div>
             <div className="field field--full inline-settings">
-              <div><strong>{t('FAST 服务层', 'FAST service tier')}<InfoTip text={supportsFastServiceTier(draft.protocol) ? t('强制号池内所有对话使用上游 Fast 服务层，可能消耗对应服务额度。', 'Force every conversation in the pool to use the upstream FAST service tier, which may consume the corresponding service quota.') : t('仅 OpenAI Responses 与 OpenAI Chat 协议支持此选项。', 'Only OpenAI Responses and OpenAI Chat support this option.')} /></strong></div>
+              <div><strong>{t('FAST 服务层', 'FAST service tier')}<InfoTip text={supportsPoolFastServiceTier(draft.protocol) ? t('强制号池内所有对话使用上游 Fast 服务层，可能消耗对应服务额度。', 'Force every conversation in the pool to use the upstream FAST service tier, which may consume the corresponding service quota.') : t('仅 OpenAI Responses 与 OpenAI Chat 协议支持此选项。', 'Only OpenAI Responses and OpenAI Chat support this option.')} /></strong></div>
               <button
                 className={`toggle ${draft.forceFastMode ? 'toggle--on' : ''}`}
                 role="switch"
                 aria-label={t('FAST 服务层', 'FAST service tier')}
                 aria-checked={draft.forceFastMode}
                 type="button"
-                disabled={!supportsFastServiceTier(draft.protocol)}
+                disabled={!supportsPoolFastServiceTier(draft.protocol)}
                 onClick={() => setDraft({ ...draft, forceFastMode: !draft.forceFastMode })}
               ><span /></button>
             </div>

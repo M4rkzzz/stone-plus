@@ -7,6 +7,7 @@ import {
   Clipboard,
   Download,
   Eye,
+  ExternalLink,
   FileCode2,
   FolderCog,
   History,
@@ -14,6 +15,7 @@ import {
   LogIn,
   Pencil,
   Plus,
+  Play,
   RefreshCw,
   RotateCcw,
   Save,
@@ -39,14 +41,20 @@ import type {
   Route,
   RouteClient,
 } from '@shared/types'
+import type { AgentLifecycleSnapshot, AgentTarget } from '@shared/agent-lifecycle'
 import { clientNativeProtocols } from '@shared/types'
-import { listRouteSources, resolveRouteSource } from '@shared/route-sources'
+import { enumerateRouteSourceModels, isNativeGrokRouteSource, listRouteSources, resolveRouteSource } from '@shared/route-sources'
 import {
   buildClientConfigWorkbenchPreview,
+  clientRouteSelectionDisabled,
+  clientSettingOptionClassName,
   createInitialClientConfigDrafts,
   getClientConfigFieldGuide,
   isClientConfigWorkbenchDirty,
   localizeClientConfigEditorField,
+  oneClickAgentRuntimeAction,
+  oneClickRouteModelMap,
+  oneClickRouteNeedsUpdate,
   resetClientConfigDrafts,
   type ClientConfigFieldDrafts,
   type ClientConfigFileDrafts,
@@ -59,8 +67,58 @@ import { Badge, ConfirmDialog, EmptyState, formatDateTime, InfoTip, Modal, Toggl
 import '../clients-view.css'
 import { ManagedClientInstancesPanel } from '../managed-client-instances'
 import { PersistentTaskCenter } from '../persistent-task-center'
+import { agentActionBlockReason, localizedLifecycleError } from '../agent-lifecycle-control'
+import { ExclusiveAsyncOperation } from '../async-operation'
+import { shouldAcceptSnapshotRevision } from '../runtime-delta'
 
-const clientOrder: RouteClient[] = ['claude', 'codex', 'gemini']
+const clientOrder: RouteClient[] = ['claude', 'codex', 'gemini', 'grokbuild']
+
+interface AgentInstallMeta {
+  name: string
+  client: RouteClient
+  channel: readonly [chinese: string, english: string]
+  detection: readonly [chinese: string, english: string]
+}
+
+const agentInstallMeta: Record<AgentTarget, AgentInstallMeta> = {
+  'codex-desktop': {
+    name: 'ChatGPT Desktop',
+    client: 'codex',
+    channel: ['OpenAI 官方获取页面', 'Official OpenAI download page'],
+    detection: ['自动检测 Windows 应用安装与运行状态', 'Automatically checks Windows app installation and running state'],
+  },
+  'codex-cli': {
+    name: 'Codex CLI',
+    client: 'codex',
+    channel: ['官方安装指引', 'Official installation guide'],
+    detection: ['自动检查标准安装位置与 PATH', 'Automatically checks standard install locations and PATH'],
+  },
+  'claude-code': {
+    name: 'Claude Code',
+    client: 'claude',
+    channel: ['官方安装指引', 'Official installation guide'],
+    detection: ['自动检查标准安装位置与 PATH', 'Automatically checks standard install locations and PATH'],
+  },
+  'gemini-cli': {
+    name: 'Gemini CLI',
+    client: 'gemini',
+    channel: ['官方安装指引', 'Official installation guide'],
+    detection: ['自动检查标准安装位置与 PATH', 'Automatically checks standard install locations and PATH'],
+  },
+  'grok-build': {
+    name: 'Grok Build',
+    client: 'grokbuild',
+    channel: ['xAI 官方安装指引', 'Official xAI installation guide'],
+    detection: ['自动检查 ~/.grok/bin、标准安装位置与 PATH', 'Automatically checks ~/.grok/bin, standard install locations, and PATH'],
+  },
+}
+
+const clientAgentTargets: Record<RouteClient, readonly AgentTarget[]> = {
+  codex: ['codex-desktop', 'codex-cli'],
+  claude: ['claude-code'],
+  gemini: ['gemini-cli'],
+  grokbuild: ['grok-build'],
+}
 
 const roleLabels: Record<ClientConfigFileRole, readonly [chinese: string, english: string]> = {
   'claude-settings': ['Claude 设置', 'Claude settings'],
@@ -69,6 +127,7 @@ const roleLabels: Record<ClientConfigFileRole, readonly [chinese: string, englis
   'codex-auth': ['Codex 认证', 'Codex authentication'],
   'gemini-settings': ['Gemini 设置', 'Gemini settings'],
   'gemini-env': ['Gemini 环境变量', 'Gemini environment'],
+  'grok-config': ['Grok Build 配置', 'Grok Build configuration'],
 }
 
 function roleLabel(role: ClientConfigFileRole, language: UiLanguage): string {
@@ -111,11 +170,14 @@ export function ClientsView({
   const [advancedOpen, setAdvancedOpen] = useState(false)
   const [restoreTarget, setRestoreTarget] = useState<ClientBackupGroup | null>(null)
   const [officialLoginConfirm, setOfficialLoginConfirm] = useState(false)
+  const [codexRestartConfirm, setCodexRestartConfirm] = useState<'editor' | 'agent-limit' | null>(null)
   const [deleteProfileTarget, setDeleteProfileTarget] = useState<ClientConfigProfile | null>(null)
   const [pendingSwitch, setPendingSwitch] = useState<PendingSwitch | null>(null)
   const [busy, setBusy] = useState<string | null>('load')
   const [error, setError] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
+  const [agentLifecycle, setAgentLifecycle] = useState<AgentLifecycleSnapshot | null>(null)
+  const [agentCheckError, setAgentCheckError] = useState<string | null>(null)
   const [configHealth, setConfigHealth] = useState<ConfigHealth>('checking')
   const [configReadError, setConfigReadError] = useState<string | null>(null)
   const [profile, setProfile] = useState<ClientConfigProfile | null>(null)
@@ -134,23 +196,35 @@ export function ClientsView({
     claude: 'default-claude',
     codex: 'default-codex',
     gemini: 'default-gemini',
+    grokbuild: 'default-grokbuild',
   })
   const requestSequence = useRef(0)
+  const agentLifecycleRevision = useRef(-1)
+  const operationGate = useRef(new ExclusiveAsyncOperation())
 
   const activeProfileId = activeProfiles[activeClient]
 
+  const acceptAgentLifecycle = useCallback((next: AgentLifecycleSnapshot) => {
+    if (!shouldAcceptSnapshotRevision(agentLifecycleRevision.current, next.revision)) return
+    agentLifecycleRevision.current = next.revision
+    setAgentLifecycle(next)
+  }, [])
+
   const run = async <T,>(key: string, operation: () => Promise<T>): Promise<T | undefined> => {
-    setBusy(key)
-    setError(null)
-    setNotice(null)
-    try {
-      return await operation()
-    } catch (cause) {
-      setError(errorMessage(cause, t('客户端配置操作失败', 'Client configuration operation failed'), language))
-      return undefined
-    } finally {
-      setBusy(null)
-    }
+    const outcome = await operationGate.current.run(async () => {
+      setBusy(key)
+      setError(null)
+      setNotice(null)
+      try {
+        return await operation()
+      } catch (cause) {
+        setError(errorMessage(cause, t('客户端配置操作失败', 'Client configuration operation failed'), language))
+        return undefined
+      } finally {
+        setBusy(null)
+      }
+    })
+    return outcome.started ? outcome.value : undefined
   }
 
   const loadWorkspace = useCallback(async (client: RouteClient, profileId: string, announce = false) => {
@@ -237,6 +311,24 @@ export function ClientsView({
     void loadWorkspace(activeClient, activeProfileId)
   }, [activeClient, activeProfileId, loadWorkspace])
 
+  const refreshAgents = useCallback(async () => {
+    try {
+      const next = await api.getAgentLifecycleSnapshot()
+      acceptAgentLifecycle(next)
+      setAgentCheckError(null)
+    } catch (cause) {
+      setAgentCheckError(errorMessage(cause, t('无法检测客户端安装状态', 'Unable to check client installation status'), language))
+    }
+  }, [acceptAgentLifecycle, api, language, t])
+
+  useEffect(() => {
+    void refreshAgents()
+    return api.onAgentLifecycleChanged((event) => {
+      acceptAgentLifecycle(event.snapshot)
+      setAgentCheckError(null)
+    })
+  }, [acceptAgentLifecycle, api, refreshAgents])
+
   useEffect(() => {
     if (!notice) return undefined
     const timer = window.setTimeout(() => setNotice(null), 4_000)
@@ -280,7 +372,9 @@ export function ClientsView({
   const route = snapshot.routes.find((candidate) => candidate.client === activeClient)
   const routeSelection = routeSelections[activeClient] ?? route?.poolId ?? ''
   const resolvedRouteSource = route?.poolId ? resolveRouteSource(route.poolId, snapshot) : undefined
-  const availableRouteSources = useMemo(() => listRouteSources(snapshot), [snapshot])
+  const availableRouteSources = useMemo(() => listRouteSources(snapshot)
+    .filter((source) => activeClient !== 'grokbuild'
+      || isNativeGrokRouteSource(resolveRouteSource(source.id, snapshot), snapshot)), [activeClient, snapshot])
   const routeSources = useMemo(() => {
     if (!resolvedRouteSource || availableRouteSources.some((source) => source.id === resolvedRouteSource.summary.id)) return availableRouteSources
     return [resolvedRouteSource.summary, ...availableRouteSources]
@@ -362,7 +456,7 @@ export function ClientsView({
     if (location) setActiveEditorRole(location.role)
   }
 
-  const saveEditor = async () => {
+  const saveEditor = async (restartCodex = false) => {
     if (!editor) return
     const patches = editor.fields
       .filter((field) => !field.readOnly && !sameConfigValue(field.value, draftValue(field, fieldDrafts)))
@@ -370,17 +464,36 @@ export function ClientsView({
     const files = editor.files
       .filter((file) => file.editable && file.content !== undefined && fileDrafts[file.role] !== undefined && fileDrafts[file.role] !== file.content)
       .map((file) => ({ role: file.role, revision: file.revision, content: fileDrafts[file.role] ?? '' }))
-    const result = await run(`save-editor-${editor.client}`, () => api.saveClientConfigEditor({
-      client: editor.client,
-      profileId: editor.profileId,
-      patches,
-      files,
-    }))
+    if (editor.client === 'codex' && !restartCodex && (patches.length > 0 || files.length > 0)) {
+      setCodexRestartConfirm('editor')
+      return
+    }
+    const result = await run(`save-editor-${editor.client}`, async () => {
+      const saved = await api.saveClientConfigEditor({
+        client: editor.client,
+        profileId: editor.profileId,
+        patches,
+        files,
+      })
+      if (restartCodex && saved.changedFiles.length > 0) {
+        try {
+          await api.repairCodexSessionsAndRestartChatGpt()
+        } catch (error) {
+          const backupGroupId = saved.backups[0]?.groupId
+          if (backupGroupId) {
+            await api.restoreClientConfigBackupSet(backupGroupId, 'codex', editor.profileId)
+          }
+          throw error
+        }
+      }
+      return saved
+    })
     if (!result) return
+    setCodexRestartConfirm(null)
     setNotice(result.changedFiles.length
       ? t(
-        `${clientMeta[editor.client].name} 已保存 ${result.changedFiles.length} 个文件，并自动创建备份`,
-        `${clientMeta[editor.client].name} saved ${result.changedFiles.length} ${result.changedFiles.length === 1 ? 'file' : 'files'} and created a backup automatically`,
+        `${clientMeta[editor.client].name} 已保存 ${result.changedFiles.length} 个文件，并自动创建备份${restartCodex ? '；已完成关闭、修复会话和重新开启' : ''}`,
+        `${clientMeta[editor.client].name} saved ${result.changedFiles.length} ${result.changedFiles.length === 1 ? 'file' : 'files'} and created a backup automatically${restartCodex ? '; Codex was closed, its sessions repaired, and reopened' : ''}`,
       )
       : t(
         `${clientMeta[editor.client].name} 配置无需更改`,
@@ -389,20 +502,37 @@ export function ClientsView({
     await loadWorkspace(editor.client, editor.profileId)
   }
 
-  const saveCodexAgentLimit = async () => {
+  const saveCodexAgentLimit = async (restartCodex = false) => {
     if (!editor || editor.client !== 'codex' || !codexAgentLimitField || !codexAgentLimitDirty
       || !codexAgentLimitValid || hasOtherEditorChanges) return
     const value = codexAgentLimitValue
-    const result = await run('save-codex-agent-limit', () => api.saveClientConfigEditor({
-      client: 'codex',
-      profileId: editor.profileId,
-      patches: [{ id: codexAgentLimitField.id, value }],
-      files: [],
-    }))
+    if (!restartCodex) {
+      setCodexRestartConfirm('agent-limit')
+      return
+    }
+    const result = await run('save-codex-agent-limit', async () => {
+      const saved = await api.saveClientConfigEditor({
+        client: 'codex',
+        profileId: editor.profileId,
+        patches: [{ id: codexAgentLimitField.id, value }],
+        files: [],
+      })
+      try {
+        await api.repairCodexSessionsAndRestartChatGpt()
+      } catch (error) {
+        const backupGroupId = saved.backups[0]?.groupId
+        if (backupGroupId) {
+          await api.restoreClientConfigBackupSet(backupGroupId, 'codex', editor.profileId)
+        }
+        throw error
+      }
+      return saved
+    })
     if (!result) return
+    setCodexRestartConfirm(null)
     setNotice(value === null
-      ? t('子代理上限已恢复为 Codex 默认值', 'The subagent limit now follows the Codex default')
-      : t(`子代理上限已设为 ${value}，重新启动 Codex 后生效`, `The subagent limit is now ${value}; restart Codex to apply it`))
+      ? t('子代理上限已恢复为 Codex 默认值，并已重开 Codex', 'The subagent limit now follows the Codex default and Codex was reopened')
+      : t(`子代理上限已设为 ${value}，并已重开 Codex`, `The subagent limit is now ${value} and Codex was reopened`))
     await loadWorkspace('codex', editor.profileId)
   }
 
@@ -410,21 +540,70 @@ export function ClientsView({
     const client = activeClient
     const result = await run(`repair-${client}`, () => api.repairClientConfig(client, activeProfileId))
     if (!result) return
+    const restartNotice = client === 'grokbuild'
+      ? t('；重启 Grok Build 后生效', '; restart Grok Build to apply the change')
+      : ''
     setNotice(result.rebuiltRoles.length
       ? t(
-        `${meta.name} 已从损坏文件重建，并恢复 Stone+ 连接`,
-        `${meta.name} was rebuilt from the damaged files and reconnected to Stone+`,
+        `${meta.name} 已从损坏文件重建，并恢复 Stone+ 连接${restartNotice}`,
+        `${meta.name} was rebuilt from the damaged files and reconnected to Stone+${restartNotice}`,
       )
       : t(
-        `${meta.name} 已修复连接且保留其他设置`,
-        `${meta.name} connection repaired while preserving the other settings`,
+        `${meta.name} 已修复连接且保留其他设置${restartNotice}`,
+        `${meta.name} connection repaired while preserving the other settings${restartNotice}`,
       ))
     await loadWorkspace(client, activeProfileId)
+  }
+
+  const installAgent = async (target: AgentTarget) => {
+    const result = await run(`install-${target}`, async () => {
+      const operation = await api.installAgent(target)
+      acceptAgentLifecycle(operation.snapshot)
+      const failure = operation.results.find((item) => item.target === target)?.error
+      if (operation.status === 'failed' || failure) throw new Error(failure
+        ? localizedLifecycleError(failure, t)
+        : t('安装未能完成', 'Installation could not be completed'))
+      return operation
+    })
+    if (!result) return
+    setNotice(t(
+      `已打开 ${agentInstallMeta[target].name} 官方安装指引；安装完成后请重新检测`,
+      `Opened the official ${agentInstallMeta[target].name} installation guide. Check again after installation.`,
+    ))
+  }
+
+  const startInstalledAgent = async (target: AgentTarget) => {
+    const agent = agentLifecycle?.agents[target]
+    if (agent) {
+      const blockedReason = agentActionBlockReason(agent, Object.values(agentLifecycle.agents), t)
+      if (blockedReason) {
+        setNotice(null)
+        setError(blockedReason)
+        return
+      }
+    }
+
+    const result = await run(`start-${target}`, async () => {
+      const operation = await api.startAgent(target)
+      acceptAgentLifecycle(operation.snapshot)
+      const failure = operation.results.find((item) => item.target === target)?.error
+      if (operation.status === 'failed' || failure) throw new Error(failure
+        ? localizedLifecycleError(failure, t)
+        : t('客户端未能启动', 'The client could not be started'))
+      return operation
+    })
+    if (!result) return
+    setNotice(t(`${agentInstallMeta[target].name} 已启动`, `${agentInstallMeta[target].name} started`))
   }
 
   const repairedRouteDraft = (): Route | undefined => {
     if (!routeSelection || !availableRouteSources.some((source) => source.id === routeSelection)) return undefined
     const timestamp = Date.now()
+    const selectedSource = resolveRouteSource(routeSelection, snapshot)
+    const modelMap = oneClickRouteModelMap(
+      route?.modelMap ?? {},
+      enumerateRouteSourceModels(selectedSource, snapshot),
+    )
     return {
       ...(route ?? {
         id: '',
@@ -435,6 +614,7 @@ export function ClientsView({
       enabled: true,
       poolId: routeSelection,
       inboundProtocol: clientNativeProtocols[activeClient],
+      modelMap,
       localToken: route?.localToken || newLocalToken(activeClient),
       updatedAt: timestamp,
     }
@@ -459,12 +639,69 @@ export function ClientsView({
       return
     }
     const result = await run(`connect-${activeClient}`, async () => {
-      if (!routeHealthy) await api.updateRoute(draft)
+      const routeUpdated = oneClickRouteNeedsUpdate(route, draft)
+      if (routeUpdated) await api.updateRoute(draft)
       if (!snapshot.gatewayStatus.running) await api.startGateway()
-      return api.repairClientConfig(activeClient, activeProfileId)
+      let preflightChanged = true
+      try {
+        const preview = await api.previewClientConfig(activeClient, activeProfileId)
+        preflightChanged = preview.files.some((file) => file.changed)
+      } catch {
+        // A malformed file is still repairable. The repair call below owns the
+        // backup/rebuild behavior and the postflight must become readable.
+      }
+      const repair = await api.repairClientConfig(activeClient, activeProfileId)
+      const verification = await api.previewClientConfig(activeClient, activeProfileId)
+      const remaining = verification.files.filter((file) => file.changed).map((file) => file.role)
+      if (remaining.length > 0) {
+        throw new Error(t(
+          `一键连接后仍检测到配置残留：${remaining.join('、')}`,
+          `Configuration drift remains after one-click connection: ${remaining.join(', ')}`,
+        ))
+      }
+      const connectionUpdated = routeUpdated || preflightChanged || repair.changedFiles.length > 0
+      const restarted: string[] = []
+      let unmanagedRunning = false
+      if (connectionUpdated) {
+        let lifecycle = await api.getAgentLifecycleSnapshot()
+        acceptAgentLifecycle(lifecycle)
+        for (const target of clientAgentTargets[activeClient]) {
+          const agent = lifecycle.agents[target]
+          const runtimeAction = oneClickAgentRuntimeAction(agent)
+          if (runtimeAction === 'none') continue
+          if (runtimeAction === 'manual-restart') {
+            unmanagedRunning = true
+            continue
+          }
+          const operation = await api.restartAgent(target)
+          acceptAgentLifecycle(operation.snapshot)
+          lifecycle = operation.snapshot
+          const failure = operation.results.find((item) => item.target === target)?.error
+          if (operation.status === 'failed' || failure) {
+            throw new Error(failure
+              ? localizedLifecycleError(failure, t)
+              : t(`${agentInstallMeta[target].name} 未能重启`, `${agentInstallMeta[target].name} could not restart`))
+          }
+          restarted.push(agentInstallMeta[target].name)
+        }
+      }
+      return {
+        repair,
+        updated: connectionUpdated,
+        restarted,
+        unmanagedRunning,
+      }
     })
     if (!result) return
-    setNotice(t(`${meta.name} 已连接到 Stone+`, `${meta.name} is connected to Stone+`))
+    const verified = result.updated
+      ? t('已复核并更新旧连接残留', 'Legacy connection residue was checked and updated')
+      : t('未发现冲突残留，连接配置已确认', 'No conflicting residue was found; the connection was verified')
+    const activation = result.restarted.length > 0
+      ? t(`；已自动重启 ${result.restarted.join('、')}`, `; automatically restarted ${result.restarted.join(', ')}`)
+      : result.unmanagedRunning
+        ? t('；检测到非 Stone+ 托管会话，请手动重启客户端后生效', '; an unmanaged session is running; restart the client manually to apply the change')
+        : ''
+    setNotice(t(`${meta.name} 已连接到 Stone+；${verified}${activation}`, `${meta.name} is connected to Stone+; ${verified}${activation}`))
     await loadWorkspace(activeClient, activeProfileId)
   }
 
@@ -494,6 +731,15 @@ export function ClientsView({
       `已切换到 ${sourceName}，客户端配置文件未改动`,
       `Switched to ${sourceName}; the client configuration files were not changed`,
     ))
+  }
+
+  const selectUpstream = (sourceId: string) => {
+    if (!route) {
+      setRouteSelections((current) => ({ ...current, [activeClient]: sourceId }))
+      setError(null)
+      return
+    }
+    void switchUpstream(sourceId)
   }
 
   const restore = async () => {
@@ -688,6 +934,94 @@ export function ClientsView({
       {error && <div className="error-banner client-config-message" role="alert"><div><AlertTriangle size={16} /><span>{error}</span></div></div>}
       {notice && <div className="client-easy-toast" role="status"><CheckCircle2 size={16} /><span>{notice}</span></div>}
 
+      {clientAgentTargets[activeClient].length > 0 && <div className={`client-install-list ${clientAgentTargets[activeClient].length > 1 ? 'is-pair' : ''}`} aria-label={t('安装与启动', 'Install and launch')}>
+        {clientAgentTargets[activeClient].map((target) => {
+          const item = agentLifecycle?.agents[target]
+          const itemMeta = agentInstallMeta[target]
+          const installing = busy === `install-${target}` || item?.busyAction === 'install'
+          const starting = busy === `start-${target}` || item?.busyAction === 'start'
+          const isDesktopDownload = target === 'codex-desktop'
+          const itemError = item?.error ? localizedLifecycleError(item.error, t) : agentCheckError
+          const statusLabel = !item
+            ? t('正在检测', 'Checking')
+            : item.installed
+              ? item.running
+                ? t('运行中', 'Running')
+                : t('已安装', 'Installed')
+              : t('未安装', 'Not installed')
+          return (
+            <section className="client-install" key={target} data-testid={`client-install-${target}`}>
+              <div className="client-install__main">
+                <div className="client-install__identity">
+                  <span className="client-install__icon"><img src={clientMeta[itemMeta.client].icon} alt="" /></span>
+                  <div className="client-install__copy">
+                    <div className="client-install__title">
+                      <strong>{itemMeta.name}</strong>
+                      <span className={`client-install__status ${itemError ? 'is-error' : item?.installed ? 'is-installed' : item ? 'is-missing' : ''}`}>
+                        {!item ? <LoaderCircle size={12} className="spin" /> : itemError ? <AlertTriangle size={12} /> : item.installed ? <CheckCircle2 size={12} /> : <Download size={12} />}
+                        {statusLabel}{item?.version ? ` · v${item.version.replace(/^v/i, '')}` : ''}
+                      </span>
+                    </div>
+                    <span className="client-install__description">{item?.installed
+                      ? item.running
+                        ? t('客户端已就绪，无需额外设置。', 'The client is ready with no additional setup required.')
+                        : t('检测完成，可以直接启动。', 'Detection complete. The client is ready to launch.')
+                      : isDesktopDownload
+                        ? t('ChatGPT Desktop 内含 Codex；从官方页面获取后 Stone+ 会自动识别。', 'ChatGPT Desktop includes Codex; Stone+ detects it automatically after installation.')
+                        : t('打开官方安装指引；完成安装后返回此处重新检测。', 'Open the official installation guide, then return here and check again after installation.')}</span>
+                  </div>
+                </div>
+                <div className="client-install__actions">
+                  <button
+                    className="icon-button"
+                    type="button"
+                    aria-label={t('重新检测客户端', 'Check client again')}
+                    title={t('重新检测客户端', 'Check client again')}
+                    disabled={Boolean(busy) || agentLifecycle?.busy}
+                    onClick={() => void refreshAgents()}
+                  >
+                    <RefreshCw size={15} />
+                  </button>
+                  {!item?.installed ? (
+                    <button
+                      className="button button--primary client-install__primary"
+                      type="button"
+                      disabled={!item || Boolean(busy) || agentLifecycle?.busy || installing}
+                      onClick={() => void installAgent(target)}
+                    >
+                      {installing ? <LoaderCircle size={16} className="spin" /> : <ExternalLink size={16} />}
+                      {t('打开官方指引', 'Open official guide')}
+                    </button>
+                  ) : (
+                    <button
+                      className="button button--primary client-install__primary"
+                      type="button"
+                      disabled={Boolean(busy) || agentLifecycle?.busy || starting || item.running}
+                      onClick={() => void startInstalledAgent(target)}
+                    >
+                      {starting ? <LoaderCircle size={16} className="spin" /> : item.running ? <CheckCircle2 size={16} /> : <Play size={16} />}
+                      {item.running ? t('正在运行', 'Running') : t('启动', 'Launch')}
+                    </button>
+                  )}
+                </div>
+              </div>
+              {(installing || starting) && <div className="client-install__progress" role="status"><LoaderCircle size={15} className="spin" /><span>{installing ? t('正在打开官方安装指引…', 'Opening the official installation guide…') : t('正在启动客户端…', 'Launching client…')}</span></div>}
+              {itemError && <div className="client-install__error" role="alert"><AlertTriangle size={15} /><span>{itemError}</span></div>}
+              <details className="client-install__advanced">
+                <summary className="client-install__advanced-toggle"><span><SlidersHorizontal size={15} />{t('安装详情', 'Installation details')}</span><ChevronDown size={15} /></summary>
+                <div className="client-install__advanced-body">
+                  <div className="client-install__advanced-grid">
+                    <label className="client-install__field"><span>{t('默认渠道', 'Default channel')}</span><input value={itemMeta.channel[language === 'zh-CN' ? 0 : 1]} readOnly /></label>
+                    <label className="client-install__field"><span>{t('检测方式', 'Detection')}</span><input value={itemMeta.detection[language === 'zh-CN' ? 0 : 1]} readOnly /></label>
+                  </div>
+                  <p className="client-install__hint">{t('Stone+ 会自动使用推荐设置；无需手动填写安装地址或可执行文件路径。', 'Stone+ uses the recommended settings automatically; no install URL or executable path is required.')}</p>
+                </div>
+              </details>
+            </section>
+          )
+        })}
+      </div>}
+
       <section className={`client-easy-card ${connectionReady ? 'is-ready' : ''}`}>
         <header className="client-easy-card__header">
           <div className="client-easy-identity">
@@ -718,15 +1052,15 @@ export function ClientsView({
               id="client-upstream-select"
               aria-label={t('当前上游', 'Current upstream')}
               value={routeSelection}
-              disabled={!route || Boolean(busy)}
-              onChange={(event) => void switchUpstream(event.target.value)}
+              disabled={clientRouteSelectionDisabled(Boolean(busy), availableRouteSources.length)}
+              onChange={(event) => selectUpstream(event.target.value)}
             >
               {!routeSelection && <option value="">{t('请选择上游', 'Select an upstream')}</option>}
               {routeSelection && !routeSources.some((source) => source.id === routeSelection) && (
                 <option value={routeSelection}>{t('当前来源不可用', 'Current source unavailable')}</option>
               )}
               {routeSources.map((source) => (
-                <option value={source.id} key={source.id}>
+                <option value={source.id} key={source.id} disabled={!availableRouteSources.some((candidate) => candidate.id === source.id)}>
                   {setupPoolDisplayName(source.name, t)} · {sourceKindLabel(source.kind, language)} · {t(
                     `${source.accountCount} 个账号`,
                     `${source.accountCount} ${source.accountCount === 1 ? 'account' : 'accounts'}`,
@@ -734,6 +1068,7 @@ export function ClientsView({
                 </option>
               ))}
             </select>
+            {activeClient === 'grokbuild' && <small>{t('Grok Build 仅显示原生 Responses 的 Grok 号池或 Grok 中转站；Chat 兼容来源不会出现在这里。', 'Grok Build lists only Responses-native Grok pools or relays; Chat compatibility sources are hidden.')}</small>}
           </label>
 
           <div className="client-easy-route__arrow" aria-hidden="true"><span>→</span></div>
@@ -850,7 +1185,7 @@ export function ClientsView({
                 : t('客户端仍在使用旧连接配置', 'The client is still using an old connection configuration')}</strong>
               <small>{configHealth === 'invalid'
                 ? t('不用手工找错，下面的一键修复会先保存原文件再恢复连接。', 'One-click repair saves the original file before restoring the connection, so you do not need to find the error manually.')
-                : t('点击一键修复即可改回 Stone+；模型、MCP 和其他设置会保留。', 'Use one-click repair to reconnect to Stone+. Models, MCP, and other settings are preserved.')}</small>
+                : t('点击一键修复即可改回 Stone+；客户端模型偏好、MCP 和其他设置会保留，冲突的旧中转模型覆盖会迁移到路由层。', 'Use one-click repair to reconnect to Stone+. Client model preferences, MCP, and other settings are preserved while conflicting relay model overrides move to the route layer.')}</small>
             </span>
           </div>
         )}
@@ -955,9 +1290,9 @@ export function ClientsView({
                 </select>
               </label>
               <div className="client-advanced-toolbar__buttons">
-                <button className="icon-button" type="button" title={t('新建配置目录', 'New configuration directory')} aria-label={t('新建配置目录', 'New configuration directory')} onClick={() => setProfile(newProfile(activeClient))}><Plus size={15} /></button>
-                {!selectedProfile?.isDefault && <button className="icon-button" type="button" title={t('编辑当前配置目录', 'Edit current configuration directory')} aria-label={t('编辑当前配置目录', 'Edit current configuration directory')} onClick={editProfile}><Pencil size={14} /></button>}
-                {!selectedProfile?.isDefault && <button className="icon-button" type="button" title={t('删除当前配置目录', 'Delete current configuration directory')} aria-label={t('删除当前配置目录', 'Delete current configuration directory')} onClick={() => setDeleteProfileTarget(selectedProfile ?? null)}><Trash2 size={14} /></button>}
+                <button className="icon-button" type="button" disabled={isDirty} title={isDirty ? t('请先保存或撤销未保存更改', 'Save or revert unsaved changes first') : t('新建配置目录', 'New configuration directory')} aria-label={t('新建配置目录', 'New configuration directory')} onClick={() => setProfile(newProfile(activeClient))}><Plus size={15} /></button>
+                {!selectedProfile?.isDefault && <button className="icon-button" type="button" disabled={isDirty} title={isDirty ? t('请先保存或撤销未保存更改', 'Save or revert unsaved changes first') : t('编辑当前配置目录', 'Edit current configuration directory')} aria-label={t('编辑当前配置目录', 'Edit current configuration directory')} onClick={editProfile}><Pencil size={14} /></button>}
+                {!selectedProfile?.isDefault && <button className="icon-button" type="button" disabled={isDirty} title={isDirty ? t('请先保存或撤销未保存更改', 'Save or revert unsaved changes first') : t('删除当前配置目录', 'Delete current configuration directory')} aria-label={t('删除当前配置目录', 'Delete current configuration directory')} onClick={() => setDeleteProfileTarget(selectedProfile ?? null)}><Trash2 size={14} /></button>}
                 <button className="icon-button" type="button" title={t('导出目录定义', 'Export directory definition')} aria-label={t('导出目录定义', 'Export directory definition')} onClick={() => void exportProfile()}><Download size={14} /></button>
                 <button className="icon-button" type="button" title={t('导入目录定义', 'Import directory definition')} aria-label={t('导入目录定义', 'Import directory definition')} onClick={openProfileImport}><Upload size={14} /></button>
               </div>
@@ -1119,6 +1454,25 @@ export function ClientsView({
       </section>
 
       <ConfirmDialog
+        open={Boolean(codexRestartConfirm)}
+        title={t('需要重开 Codex', 'Codex must be reopened')}
+        message={t(
+          '该改动只有重开 Codex 后才能可靠生效。确定后将保存改动，立即执行“关闭 Codex → 修复会话/provider → 开启 Codex”；取消则放弃并回退本次界面改动。',
+          'This change takes effect reliably only after Codex is reopened. Confirm to save it and immediately run Close Codex → Repair sessions/provider → Reopen Codex. Cancel to discard and roll back the pending UI changes.',
+        )}
+        confirmLabel={t('保存并重开', 'Save and reopen')}
+        busy={busy === 'save-editor-codex' || busy === 'save-codex-agent-limit'}
+        onCancel={() => {
+          setCodexRestartConfirm(null)
+          undoDrafts()
+        }}
+        onConfirm={() => {
+          if (codexRestartConfirm === 'agent-limit') void saveCodexAgentLimit(true)
+          else if (codexRestartConfirm === 'editor') void saveEditor(true)
+        }}
+      />
+
+      <ConfirmDialog
         open={officialLoginConfirm}
         title={t('恢复 Codex 官方登录', 'Restore official Codex login')}
         message={t(
@@ -1197,7 +1551,7 @@ export function ClientsView({
         footer={<><button className="button button--secondary" type="button" onClick={() => setProfile(null)}>{t('取消', 'Cancel')}</button><button className="button button--primary" type="submit" form="client-profile-form" disabled={busy === 'save-profile'}><Save size={16} />{t('保存', 'Save')}</button></>}
       >
         {profile && <form id="client-profile-form" className="form-grid" onSubmit={(event) => void saveProfile(event)}>
-          <label className="field"><span>{t('客户端', 'Client')}</span><select value={profile.client} disabled={Boolean(profile.id)} onChange={(event) => setProfile({ ...profile, client: event.target.value as RouteClient })}><option value="claude">Claude Code</option><option value="codex">Codex</option><option value="gemini">Gemini CLI</option></select></label>
+          <label className="field"><span>{t('客户端', 'Client')}</span><select value={profile.client} disabled={Boolean(profile.id)} onChange={(event) => setProfile({ ...profile, client: event.target.value as RouteClient })}><option value="claude">Claude Code</option><option value="codex">Codex</option><option value="gemini">Gemini CLI</option><option value="grokbuild">Grok Build</option></select></label>
           <label className="field"><span>{t('名称', 'Name')}</span><input required value={profile.name} onChange={(event) => setProfile({ ...profile, name: event.target.value })} placeholder={t('例如：工作配置', 'For example: Work configuration')} /></label>
           <label className="field field--full">
             <span>{t('配置目录', 'Configuration directory')}</span>
@@ -1291,7 +1645,7 @@ function ClientSettingRow({
         {field.options && field.options.length > 0 && (
           <div className="client-setting-options">
             {field.options.map((item) => (
-              <span className={value === item.value ? 'active' : ''} title={item.description ?? optionHelp?.[item.value]} key={item.value}>
+              <span className={clientSettingOptionClassName(value, item.value)} title={item.description ?? optionHelp?.[item.value]} key={item.value}>
                 <strong>{item.label}</strong>{item.description ?? optionHelp?.[item.value] ? ` · ${item.description ?? optionHelp?.[item.value]}` : ''}
               </span>
             ))}
@@ -1315,15 +1669,31 @@ function CodePreview({
 }) {
   const { t } = useI18n()
   const lines = content.split(/\r?\n/)
+  const selectedLine = Math.min(lines.length, Math.max(1, startLine ?? 1))
   return (
-    <div className="client-code-preview mono" role="region" aria-label={t('配置文件内容', 'Configuration file contents')}>
+    <div
+      className="client-code-preview mono"
+      role="region"
+      aria-label={t('配置文件内容；使用上下方向键选择行', 'Configuration file contents; use the up and down arrow keys to select a line')}
+      tabIndex={0}
+      onKeyDown={(event) => {
+        if (event.key !== 'ArrowUp' && event.key !== 'ArrowDown' && event.key !== 'Home' && event.key !== 'End') return
+        event.preventDefault()
+        const next = event.key === 'Home'
+          ? 1
+          : event.key === 'End'
+            ? lines.length
+            : Math.min(lines.length, Math.max(1, selectedLine + (event.key === 'ArrowUp' ? -1 : 1)))
+        onSelectLine(next)
+      }}
+    >
       {lines.map((line, index) => {
         const lineNumber = index + 1
         const highlighted = startLine !== undefined && lineNumber >= startLine && lineNumber <= (endLine ?? startLine)
         return (
-          <button type="button" className={highlighted ? 'is-highlighted' : ''} onClick={() => onSelectLine(lineNumber)} key={`${lineNumber}-${line}`}>
+          <div className={highlighted ? 'is-highlighted' : ''} aria-current={highlighted ? 'true' : undefined} onClick={() => onSelectLine(lineNumber)} key={`${lineNumber}-${line}`}>
             <span>{lineNumber}</span><code>{line || ' '}</code>
-          </button>
+          </div>
         )
       })}
     </div>
@@ -1347,6 +1717,7 @@ function preferredRole(editor: ClientConfigEditorState): ClientConfigFileRole | 
     claude: 'claude-settings',
     codex: 'codex-config',
     gemini: 'gemini-settings',
+    grokbuild: 'grok-config',
   }
   return editor.files.find((file) => file.role === preferred[editor.client])?.role
     ?? editor.files.find((file) => file.editable)?.role

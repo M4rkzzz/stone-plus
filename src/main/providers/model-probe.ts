@@ -60,7 +60,8 @@ export async function probeProviderModel(input: ProviderModelProbeInput): Promis
       method: 'POST',
       headers,
       body: JSON.stringify(probeBody(input.protocol, model)),
-      signal: input.signal
+      signal: input.signal,
+      ...(input.adapter.kind === 'xai' ? { redirect: 'error' as const } : {}),
     })
   } catch (error) {
     throw new AccountModelProbeError(input.adapter.classifyFailure({ error, now: now() }))

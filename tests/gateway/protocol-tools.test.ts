@@ -12,7 +12,7 @@ const weatherSchema = {
 }
 
 describe('non-streaming tool protocol conversion', () => {
-  it('keeps direct Responses/Anthropic conversion byte-shape compatible with the Chat bridge', () => {
+  it('keeps direct Responses/Anthropic conversion compatible while preserving Anthropic block order', () => {
     const responsesSource = {
       instructions: [{ type: 'input_text', text: 'System' }],
       max_output_tokens: 77,
@@ -61,9 +61,38 @@ describe('non-streaming tool protocol conversion', () => {
     const directResponses = convertRequest(
       'anthropic-messages', 'openai-responses', anthropicSource, 'target'
     )
-    const anthropicChat = convertRequest('anthropic-messages', 'openai-chat', anthropicSource, 'target')
-    const bridgedResponses = convertRequest('openai-chat', 'openai-responses', anthropicChat.body, 'target')
-    expect(directResponses).toEqual(bridgedResponses)
+    expect(directResponses.body.input).toEqual([
+      { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Before.' }] },
+      { type: 'function_call', call_id: 'tool_1', name: 'lookup', arguments: '{"city":"Paris"}' },
+      { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'After.' }] },
+      { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'prefix' }] },
+      { type: 'function_call_output', call_id: 'tool_1', output: [{ type: 'input_text', text: '21' }] },
+      { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'suffix' }] },
+    ])
+  })
+
+  it('preserves interleaved Anthropic response blocks in Responses output order', () => {
+    const converted = convertResponse('anthropic-messages', 'openai-responses', {
+      id: 'msg_ordered',
+      type: 'message',
+      role: 'assistant',
+      model: 'claude',
+      content: [
+        { type: 'text', text: 'Before.' },
+        { type: 'tool_use', id: 'call_1', name: 'lookup', input: { city: 'Paris' } },
+        { type: 'text', text: 'After.' },
+      ],
+      stop_reason: 'tool_use',
+      usage: { input_tokens: 4, output_tokens: 3 },
+    }, 'claude', () => 1_700_000_000_000)
+
+    expect((converted.output as Array<Record<string, unknown>>).map((item) => item.type))
+      .toEqual(['message', 'function_call', 'message'])
+    expect(converted.output).toMatchObject([
+      { content: [{ text: 'Before.' }] },
+      { call_id: 'call_1', name: 'lookup' },
+      { content: [{ text: 'After.' }] },
+    ])
   })
 
   it('converts a multi-round Responses request to Anthropic without losing tool semantics', () => {

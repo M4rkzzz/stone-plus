@@ -246,22 +246,27 @@ export class DatabaseBackupService<T> {
       // The next live generation came from the selected backup and has not yet
       // completed its cache invalidation/sanitization/migration barrier.
       safeToResumeAutomaticBackups = false
-      const state = await this.store.restoreFrom(stagedPath, safetyPath)
-      restoreCommitted = true
-      this.pendingRestoredState = state
-      this.hasPendingRestoredState = true
-      await this.prepareForRawBackup()
-      safeToResumeAutomaticBackups = true
-      const safetyVerification = await this.verifyPath(safetyPath, safetyId)
-      if (!safetyVerification.valid) {
-        throw new Error(`Pre-restore backup verification failed: ${safetyVerification.issue ?? 'integrity check failed'}`)
+      const commitRestore = async (): Promise<DatabaseRestoreResult<T>> => {
+        const state = await this.store.restoreFrom(stagedPath!, safetyPath)
+        restoreCommitted = true
+        this.pendingRestoredState = state
+        this.hasPendingRestoredState = true
+        await this.prepareForRawBackup()
+        safeToResumeAutomaticBackups = true
+        const safetyVerification = await this.verifyPath(safetyPath, safetyId)
+        if (!safetyVerification.valid) {
+          throw new Error(`Pre-restore backup verification failed: ${safetyVerification.issue ?? 'integrity check failed'}`)
+        }
+        await this.pruneKind('pre-restore', this.preRestoreRetention, safetyId)
+        return {
+          restoredBackup: withoutIntegrityRows(sourceVerification),
+          safetyBackup: withoutIntegrityRows(safetyVerification),
+          state
+        }
       }
-      await this.pruneKind('pre-restore', this.preRestoreRetention, safetyId)
-      return {
-        restoredBackup: withoutIntegrityRows(sourceVerification),
-        safetyBackup: withoutIntegrityRows(safetyVerification),
-        state
-      }
+      return this.store.runInRestoreMaintenance
+        ? await this.store.runInRestoreMaintenance(commitRestore)
+        : await commitRestore()
     } catch (error) {
       if (restoreCommitted) {
         throw new Error(
@@ -271,7 +276,9 @@ export class DatabaseBackupService<T> {
       throw new Error(`Unable to restore database backup: ${messageOf(error)}`)
     } finally {
       if (stagedPath) await rm(stagedPath, { force: true }).catch(() => undefined)
-      if (resumeAutomaticBackups && safeToResumeAutomaticBackups) {
+      // A committed restore requires a process restart before ordinary writes
+      // resume. Never restart the old generation's timer against restored data.
+      if (!restoreCommitted && resumeAutomaticBackups && safeToResumeAutomaticBackups) {
         await this.startAutomaticBackups().catch((error: unknown) => {
           this.onAutomaticBackupError(toError(error))
         })

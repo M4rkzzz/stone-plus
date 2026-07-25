@@ -22,6 +22,8 @@ export interface NormalizedTokenUsage {
   totalTokens?: number
   cachedInputTokens?: number
   cacheCreationInputTokens?: number
+  cacheCreation5mInputTokens?: number
+  cacheCreation1hInputTokens?: number
   reasoningTokens?: number
 }
 
@@ -500,14 +502,29 @@ function extractAnthropicUsage(root: Record<string, unknown>): NormalizedTokenUs
   const message = objectValue(root.message)
   const usage = mergeObjects(objectValue(message?.usage), objectValue(root.usage), looksLikeAnthropicUsage(root) ? root : undefined)
   if (!usage) return undefined
-  const inputTokens = tokenNumber(usage.input_tokens)
+  const uncachedInputTokens = tokenNumber(usage.input_tokens)
   const outputTokens = tokenNumber(usage.output_tokens)
+  const cachedInputTokens = tokenNumber(usage.cache_read_input_tokens)
+  const cacheCreation = objectValue(usage.cache_creation)
+  const cacheCreation5mInputTokens = tokenNumber(cacheCreation?.ephemeral_5m_input_tokens)
+  const cacheCreation1hInputTokens = tokenNumber(cacheCreation?.ephemeral_1h_input_tokens)
+  const cacheCreationInputTokens = tokenNumber(usage.cache_creation_input_tokens)
+    ?? safeTokenParts(cacheCreation5mInputTokens, cacheCreation1hInputTokens)
+  const inputTokens = safeTokenParts(
+    uncachedInputTokens,
+    cachedInputTokens,
+    cacheCreationInputTokens
+  )
+  const outputDetails = objectValue(usage.output_tokens_details)
   return compactUsage({
     inputTokens,
     outputTokens,
     totalTokens: tokenNumber(usage.total_tokens) ?? safeTokenSum(inputTokens, outputTokens),
-    cachedInputTokens: tokenNumber(usage.cache_read_input_tokens),
-    cacheCreationInputTokens: tokenNumber(usage.cache_creation_input_tokens)
+    cachedInputTokens,
+    cacheCreationInputTokens,
+    cacheCreation5mInputTokens,
+    cacheCreation1hInputTokens,
+    reasoningTokens: tokenNumber(outputDetails?.thinking_tokens)
   })
 }
 
@@ -533,6 +550,13 @@ function tokenNumber(value: unknown): number | undefined {
 function safeTokenSum(left: number | undefined, right: number | undefined): number | undefined {
   if (left === undefined || right === undefined) return undefined
   const total = left + right
+  return Number.isSafeInteger(total) ? total : undefined
+}
+
+function safeTokenParts(...values: Array<number | undefined>): number | undefined {
+  const present = values.filter((value): value is number => value !== undefined)
+  if (present.length === 0) return undefined
+  const total = present.reduce((sum, value) => sum + value, 0)
   return Number.isSafeInteger(total) ? total : undefined
 }
 
@@ -598,6 +622,8 @@ function compactUsage(usage: NormalizedTokenUsage): NormalizedTokenUsage | undef
     ...(usage.totalTokens === undefined ? {} : { totalTokens: usage.totalTokens }),
     ...(usage.cachedInputTokens === undefined ? {} : { cachedInputTokens: usage.cachedInputTokens }),
     ...(usage.cacheCreationInputTokens === undefined ? {} : { cacheCreationInputTokens: usage.cacheCreationInputTokens }),
+    ...(usage.cacheCreation5mInputTokens === undefined ? {} : { cacheCreation5mInputTokens: usage.cacheCreation5mInputTokens }),
+    ...(usage.cacheCreation1hInputTokens === undefined ? {} : { cacheCreation1hInputTokens: usage.cacheCreation1hInputTokens }),
     ...(usage.reasoningTokens === undefined ? {} : { reasoningTokens: usage.reasoningTokens })
   }
   return Object.keys(result).length > 0 ? result : undefined

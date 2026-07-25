@@ -7,7 +7,10 @@ import {
   TelemetryWorkspace,
   filterProxyConnections,
   formatTelemetryBytes,
+  limitProxyConnectionsForDisplay,
+  normalizeTelemetryFilters,
   proxyConnectionFilterOptions,
+  TELEMETRY_CONNECTION_PAGE_SIZE,
   type TelemetryConnectionFilters,
 } from '../../src/renderer/src/telemetry-workspace'
 
@@ -74,12 +77,68 @@ describe('telemetry workspace model', () => {
     })
   })
 
+  it('returns removed dynamic selections to all instead of hiding live connections', () => {
+    expect(normalizeTelemetryFilters({
+      query: 'api',
+      target: 'removed.example:443',
+      network: 'tcp',
+      outbound: 'removed-outbound',
+    }, proxyConnectionFilterOptions(connections))).toEqual({
+      query: 'api',
+      target: 'all',
+      network: 'tcp',
+      outbound: 'all',
+    })
+  })
+
   it('formats byte counters defensively and with useful precision', () => {
     expect(formatTelemetryBytes(-1)).toBe('0 B')
     expect(formatTelemetryBytes(Number.POSITIVE_INFINITY)).toBe('0 B')
     expect(formatTelemetryBytes(999)).toBe('999 B')
     expect(formatTelemetryBytes(1_536)).toBe('1.50 KB')
     expect(formatTelemetryBytes(15 * 1024 * 1024)).toBe('15.0 MB')
+  })
+
+  it('bounds the initial DOM projection without losing the full filtered result', () => {
+    const manyConnections = Array.from(
+      { length: TELEMETRY_CONNECTION_PAGE_SIZE + 25 },
+      (_, index) => connection({ id: `connection-${index}`, startedAt: index }),
+    )
+    const visible = limitProxyConnectionsForDisplay(manyConnections, TELEMETRY_CONNECTION_PAGE_SIZE)
+
+    expect(visible).toHaveLength(TELEMETRY_CONNECTION_PAGE_SIZE)
+    expect(visible[0]).toBe(manyConnections[0])
+    expect(visible.at(-1)).toBe(manyConnections[TELEMETRY_CONNECTION_PAGE_SIZE - 1])
+    expect(limitProxyConnectionsForDisplay(manyConnections, Number.NaN)).toEqual([])
+    expect(manyConnections).toHaveLength(TELEMETRY_CONNECTION_PAGE_SIZE + 25)
+  })
+
+  it('renders a progressive disclosure affordance for a large live connection set', () => {
+    const manyConnections = Array.from(
+      { length: TELEMETRY_CONNECTION_PAGE_SIZE + 1 },
+      (_, index) => connection({
+        id: `connection-${index}`,
+        source: `127.0.0.1:${50_000 + index}`,
+        startedAt: index,
+      }),
+    )
+    const markup = renderToStaticMarkup(createElement(
+      I18nProvider,
+      null,
+      createElement(TelemetryWorkspace, {
+        state: 'ready',
+        traffic: trafficSnapshot(),
+        connections: manyConnections,
+        onRefresh: () => undefined,
+        onCloseConnection: () => undefined,
+      }),
+    ))
+
+    expect(markup).toContain(`当前展示 ${TELEMETRY_CONNECTION_PAGE_SIZE} 个`)
+    expect(markup).toContain('还有 1 个匹配连接')
+    expect(markup).toContain('显示更多')
+    expect(markup).not.toContain('127.0.0.1:50000')
+    expect(markup).toContain(`127.0.0.1:${50_000 + TELEMETRY_CONNECTION_PAGE_SIZE}`)
   })
 
   it('never presents stale traffic or destinations as current while fail-closed', () => {

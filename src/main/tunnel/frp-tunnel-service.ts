@@ -1,6 +1,6 @@
 import { spawn, execFile, type ChildProcessByStdio } from 'node:child_process'
-import { access, mkdir, readFile, rename, writeFile } from 'node:fs/promises'
-import { dirname, join } from 'node:path'
+import { access, chmod, mkdir, readFile, realpath, rename, unlink, writeFile } from 'node:fs/promises'
+import { dirname, join, resolve } from 'node:path'
 import type { Readable } from 'node:stream'
 import { parse } from 'smol-toml'
 import type { FrpTunnelState } from '@shared/types'
@@ -18,14 +18,30 @@ export interface FrpTunnelServiceOptions {
   userDataPath: string
   binaryPath: string
   binaryExists?: (path: string) => Promise<boolean>
+  platform?: NodeJS.Platform
+  inspectProcess?: (pid: number) => Promise<{ executablePath: string; commandLine: string } | undefined>
+  terminateProcessTree?: (pid: number) => Promise<void>
+}
+
+interface FrpcProcessMarker {
+  version: 1
+  pid: number
+  executablePath: string
+  configPath: string
+  startedAt: number
 }
 
 export class FrpTunnelService {
   private readonly configPath: string
   private readonly binaryPath: string
   private readonly binaryExists: (path: string) => Promise<boolean>
+  private readonly markerPath: string
+  private readonly platform: NodeJS.Platform
+  private readonly inspectProcess: NonNullable<FrpTunnelServiceOptions['inspectProcess']>
+  private readonly terminateProcessTree: NonNullable<FrpTunnelServiceOptions['terminateProcessTree']>
   private config = ''
   private child?: FrpcProcess
+  private recoveredPid?: number
   private startedAt?: number
   private lastError?: string
   private logs: string[] = []
@@ -34,24 +50,35 @@ export class FrpTunnelService {
     this.configPath = join(options.userDataPath, 'frp', 'frpc.toml')
     this.binaryPath = options.binaryPath
     this.binaryExists = options.binaryExists ?? fileExists
+    this.markerPath = join(options.userDataPath, 'frp', 'frpc-process.json')
+    this.platform = options.platform ?? process.platform
+    this.inspectProcess = options.inspectProcess ?? ((pid) => inspectNativeProcess(pid, this.platform))
+    this.terminateProcessTree = options.terminateProcessTree ?? ((pid) => terminateNativeProcessTree(pid, this.platform))
   }
 
   public async initialize(): Promise<void> {
+    if (this.platform !== 'win32') {
+      await chmod(dirname(this.configPath), 0o700).catch((error) => {
+        if (!isMissingFile(error)) throw error
+      })
+    }
     try {
       this.config = await readFile(this.configPath, 'utf8')
+      if (this.platform !== 'win32') await chmod(this.configPath, 0o600)
     } catch (error) {
       if (!isMissingFile(error)) throw error
     }
+    await this.recoverManagedProcess()
   }
 
   public async getState(): Promise<FrpTunnelState> {
     const endpoint = parseTunnelEndpoint(this.config)
     return {
-      config: this.config,
+      config: redactTunnelConfig(this.config),
       configSaved: Boolean(this.config.trim()),
       binaryAvailable: await this.binaryExists(this.binaryPath),
-      running: Boolean(this.child && this.child.exitCode === null && !this.child.killed),
-      ...(this.child?.pid ? { pid: this.child.pid } : {}),
+      running: Boolean(this.recoveredPid || (this.child && this.child.exitCode === null && !this.child.killed)),
+      ...(this.child?.pid || this.recoveredPid ? { pid: this.child?.pid ?? this.recoveredPid } : {}),
       ...(this.startedAt ? { startedAt: this.startedAt } : {}),
       ...endpoint,
       ...(this.lastError ? { lastError: this.lastError } : {}),
@@ -60,13 +87,15 @@ export class FrpTunnelService {
   }
 
   public async saveConfig(content: string): Promise<FrpTunnelState> {
-    if (this.child) throw new Error('Stop frpc before changing its configuration.')
-    const normalized = normalizeConfig(content)
+    if (this.child || this.recoveredPid) throw new Error('Stop frpc before changing its configuration.')
+    const normalized = normalizeConfig(restoreRedactedSecrets(content, this.config))
     parseTunnelEndpoint(normalized, true)
     await mkdir(dirname(this.configPath), { recursive: true })
+    if (this.platform !== 'win32') await chmod(dirname(this.configPath), 0o700)
     const temporaryPath = `${this.configPath}.tmp`
-    await writeFile(temporaryPath, normalized, 'utf8')
+    await writeFile(temporaryPath, normalized, { encoding: 'utf8', mode: 0o600 })
     await rename(temporaryPath, this.configPath)
+    if (this.platform !== 'win32') await chmod(this.configPath, 0o600)
     this.config = normalized
     this.lastError = undefined
     this.appendLog('Configuration saved.')
@@ -74,7 +103,7 @@ export class FrpTunnelService {
   }
 
   public async start(): Promise<FrpTunnelState> {
-    if (this.child) return this.getState()
+    if (this.child || this.recoveredPid) return this.getState()
     if (!this.config.trim()) throw new Error('Paste and save an frpc TOML configuration first.')
     if (!await this.binaryExists(this.binaryPath)) {
       throw new Error('The embedded frpc executable is unavailable or was blocked by antivirus software.')
@@ -85,6 +114,7 @@ export class FrpTunnelService {
     this.appendLog('Starting frpc...')
     const child = spawn(this.binaryPath, ['-c', this.configPath], {
       windowsHide: true,
+      detached: this.platform !== 'win32',
       stdio: ['ignore', 'pipe', 'pipe']
     })
     const spawned = waitForSpawn(child)
@@ -100,6 +130,9 @@ export class FrpTunnelService {
       if (this.child !== child) return
       this.child = undefined
       this.startedAt = undefined
+      void this.clearProcessMarker().catch((error) => {
+        console.error('Stone+ could not clear the stopped frpc recovery marker', error)
+      })
       if (code !== 0 && !child.killed) {
         this.lastError = `frpc exited with ${code === null ? signal ?? 'unknown status' : `code ${code}`}.`
       }
@@ -107,6 +140,18 @@ export class FrpTunnelService {
     })
     try {
       await spawned
+      if (!child.pid) throw new Error('frpc started without a process identifier.')
+      await this.writeProcessMarker({
+        version: 1,
+        pid: child.pid,
+        executablePath: await canonicalPath(this.binaryPath),
+        configPath: resolve(this.configPath),
+        startedAt: this.startedAt ?? Date.now(),
+      })
+      if (child.exitCode !== null) {
+        await this.clearProcessMarker()
+        throw new Error('frpc exited before startup recovery state could be saved.')
+      }
     } catch (error) {
       if (this.child === child) {
         this.child = undefined
@@ -119,11 +164,19 @@ export class FrpTunnelService {
 
   public async stop(): Promise<FrpTunnelState> {
     const child = this.child
-    if (!child) return this.getState()
+    const recoveredPid = this.recoveredPid
+    if (!child && !recoveredPid) return this.getState()
+    if (child) {
+      child.kill()
+      if (!await waitForExit(child, 3_000) && child.pid) await this.terminateProcessTree(child.pid)
+    } else if (recoveredPid) {
+      const markerMatches = await this.recoveredProcessStillMatches(recoveredPid)
+      if (markerMatches) await this.terminateProcessTree(recoveredPid)
+    }
     this.child = undefined
+    this.recoveredPid = undefined
     this.startedAt = undefined
-    child.kill()
-    await waitForExit(child, 3_000)
+    await this.clearProcessMarker()
     this.appendLog('frpc stopped.')
     return this.getState()
   }
@@ -142,6 +195,69 @@ export class FrpTunnelService {
     if (!value) return
     this.logs.push(`[${new Date().toLocaleTimeString()}] ${value}`)
     if (this.logs.length > MAX_LOG_LINES) this.logs.splice(0, this.logs.length - MAX_LOG_LINES)
+  }
+
+  private async recoverManagedProcess(): Promise<void> {
+    let marker: FrpcProcessMarker | undefined
+    try {
+      const candidate = JSON.parse(await readFile(this.markerPath, 'utf8')) as Partial<FrpcProcessMarker>
+      if (candidate.version === 1 && Number.isSafeInteger(candidate.pid) && candidate.pid! > 0
+        && typeof candidate.executablePath === 'string' && typeof candidate.configPath === 'string'
+        && typeof candidate.startedAt === 'number') marker = candidate as FrpcProcessMarker
+    } catch (error) {
+      if (!isMissingFile(error) && !(error instanceof SyntaxError)) throw error
+    }
+    if (!marker) {
+      await this.clearProcessMarker()
+      return
+    }
+    let live: Awaited<ReturnType<NonNullable<FrpTunnelServiceOptions['inspectProcess']>>>
+    try {
+      live = await this.inspectProcess(marker.pid)
+    } catch (error) {
+      // Do not allow a transient process-inspection failure to turn a known
+      // managed process into an untracked duplicate. Keep it adoptable and
+      // require an explicit stop/retry instead.
+      this.recoveredPid = marker.pid
+      this.startedAt = marker.startedAt
+      this.lastError = `Could not verify the recovered frpc process: ${error instanceof Error ? error.message : String(error)}`
+      return
+    }
+    const expectedExecutable = await canonicalPath(this.binaryPath)
+    const expectedConfig = resolve(this.configPath)
+    const liveExecutableMatches = Boolean(live && samePath(live.executablePath, expectedExecutable, this.platform))
+    const markerExecutableMatches = samePath(marker.executablePath, expectedExecutable, this.platform)
+    const markerConfigMatches = samePath(marker.configPath, expectedConfig, this.platform)
+    const commandMatches = Boolean(live && commandLineContainsPath(live.commandLine, expectedConfig, this.platform))
+    if (!liveExecutableMatches || !markerExecutableMatches || !markerConfigMatches || !commandMatches) {
+      this.lastError = `Discarded stale frpc recovery state (live executable: ${liveExecutableMatches}, marker executable: ${markerExecutableMatches}, config: ${markerConfigMatches}, command: ${commandMatches}).`
+      await this.clearProcessMarker()
+      return
+    }
+    this.recoveredPid = marker.pid
+    this.startedAt = marker.startedAt
+    this.appendLog(`Recovered the managed frpc process (${marker.pid}) after Stone+ restarted.`)
+  }
+
+  private async recoveredProcessStillMatches(pid: number): Promise<boolean> {
+    const live = await this.inspectProcess(pid)
+    if (!live) return false
+    const expectedExecutable = await canonicalPath(this.binaryPath)
+    return samePath(live.executablePath, expectedExecutable, this.platform)
+      && commandLineContainsPath(live.commandLine, resolve(this.configPath), this.platform)
+  }
+
+  private async writeProcessMarker(marker: FrpcProcessMarker): Promise<void> {
+    await mkdir(dirname(this.markerPath), { recursive: true })
+    const temporaryPath = `${this.markerPath}.${process.pid}.tmp`
+    await writeFile(temporaryPath, `${JSON.stringify(marker)}\n`, 'utf8')
+    await rename(temporaryPath, this.markerPath)
+  }
+
+  private async clearProcessMarker(): Promise<void> {
+    await unlink(this.markerPath).catch((error) => {
+      if (!isMissingFile(error)) throw error
+    })
   }
 }
 
@@ -178,6 +294,44 @@ function normalizeConfig(content: string): string {
   return `${normalized}\n`
 }
 
+function redactTunnelConfig(content: string): string {
+  return transformTunnelSecrets(content, () => '"[REDACTED]"')
+}
+
+function restoreRedactedSecrets(content: string, current: string): string {
+  const currentSecrets = collectTunnelSecrets(current)
+  return transformTunnelSecrets(content, (path, value) => {
+    return /^(['"]?)\[REDACTED\]\1$/i.test(value.trim()) ? currentSecrets.get(path) ?? value : value
+  })
+}
+
+function collectTunnelSecrets(content: string): Map<string, string> {
+  const secrets = new Map<string, string>()
+  transformTunnelSecrets(content, (path, value) => {
+    secrets.set(path, value)
+    return value
+  })
+  return secrets
+}
+
+function transformTunnelSecrets(content: string, replace: (path: string, value: string) => string): string {
+  let section = ''
+  return content.split(/(\r?\n)/).map((line) => {
+    if (/^\r?\n$/.test(line)) return line
+    const sectionMatch = /^\s*\[([^\]]+)\]\s*(?:#.*)?$/.exec(line)
+    if (sectionMatch) {
+      section = sectionMatch[1].trim().toLowerCase()
+      return line
+    }
+    const assignment = /^(\s*)([A-Za-z0-9_.-]+)(\s*=\s*)(.*)$/.exec(line)
+    if (!assignment) return line
+    const key = assignment[2].toLowerCase()
+    const path = key.includes('.') ? key : section ? `${section}.${key}` : key
+    if (path !== 'auth.token' && path !== 'auth.oidc.clientsecret') return line
+    return `${assignment[1]}${assignment[2]}${assignment[3]}${replace(path, assignment[4])}`
+  }).join('')
+}
+
 async function verifyConfiguration(binaryPath: string, configPath: string): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     execFile(binaryPath, ['verify', '-c', configPath], { windowsHide: true, timeout: 15_000 }, (error, stdout, stderr) => {
@@ -201,18 +355,70 @@ function waitForSpawn(child: FrpcProcess): Promise<void> {
   })
 }
 
-async function waitForExit(child: FrpcProcess, timeoutMs: number): Promise<void> {
-  if (child.exitCode !== null) return
-  await new Promise<void>((resolve) => {
+async function waitForExit(child: FrpcProcess, timeoutMs: number): Promise<boolean> {
+  if (child.exitCode !== null) return true
+  return new Promise<boolean>((resolve) => {
     const timer = setTimeout(() => {
-      child.kill('SIGKILL')
-      resolve()
+      resolve(false)
     }, timeoutMs)
     child.once('exit', () => {
       clearTimeout(timer)
-      resolve()
+      resolve(true)
     })
   })
+}
+
+async function inspectNativeProcess(pid: number, platform: NodeJS.Platform): Promise<{ executablePath: string; commandLine: string } | undefined> {
+  if (platform === 'win32') {
+    const script = `$p=Get-CimInstance Win32_Process -Filter 'ProcessId = ${pid}' -ErrorAction SilentlyContinue; if($p){[Console]::Out.Write(($p | Select-Object ExecutablePath,CommandLine | ConvertTo-Json -Compress))}`
+    const result = await executeFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script])
+    if (!result.stdout.trim()) return undefined
+    const parsed = JSON.parse(result.stdout) as { ExecutablePath?: unknown; CommandLine?: unknown }
+    return typeof parsed.ExecutablePath === 'string' && typeof parsed.CommandLine === 'string'
+      ? { executablePath: parsed.ExecutablePath, commandLine: parsed.CommandLine }
+      : undefined
+  }
+  const result = await executeFile('/bin/ps', ['-p', String(pid), '-o', 'comm=', '-o', 'args='])
+  const line = result.stdout.trim()
+  if (!line) return undefined
+  const separator = line.search(/\s/)
+  return separator > 0 ? { executablePath: line.slice(0, separator), commandLine: line.slice(separator).trim() } : undefined
+}
+
+async function terminateNativeProcessTree(pid: number, platform: NodeJS.Platform): Promise<void> {
+  if (platform === 'win32') {
+    await executeFile('taskkill.exe', ['/PID', String(pid), '/T', '/F'])
+    return
+  }
+  try { process.kill(-pid, 'SIGKILL') } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error
+  }
+}
+
+function executeFile(file: string, args: string[]): Promise<{ stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    execFile(file, args, { windowsHide: true, encoding: 'utf8' }, (error, stdout, stderr) => {
+      if (error) reject(error)
+      else resolve({ stdout, stderr })
+    })
+  })
+}
+
+async function canonicalPath(path: string): Promise<string> {
+  return realpath(path).catch(() => resolve(path))
+}
+
+function samePath(left: string, right: string, platform: NodeJS.Platform): boolean {
+  const normalize = (value: string): string => resolve(value).replace(/^\\\\\?\\/, '').replace(/[\\/]+$/, '')
+  const a = normalize(left)
+  const b = normalize(right)
+  return platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b
+}
+
+function commandLineContainsPath(commandLine: string, expectedPath: string, platform: NodeJS.Platform): boolean {
+  const haystack = platform === 'win32' ? commandLine.toLowerCase() : commandLine
+  const needle = platform === 'win32' ? expectedPath.toLowerCase() : expectedPath
+  return haystack.includes(needle)
 }
 
 function pipeLines(stream: Readable, listener: (line: string) => void): void {

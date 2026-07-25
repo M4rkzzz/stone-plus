@@ -26,6 +26,7 @@ import type {
   ChatGptAccountImportProxyMode,
   GatewayApi,
 } from '@shared/types'
+import { providerSourceFamily } from '@shared/source-family'
 import { localizeBackendError, localizeBackendMessage } from '../backend-message'
 import {
   BUILTIN_BROWSER_DEFAULT_URL,
@@ -80,6 +81,7 @@ export function BrowserView({ snapshot, api }: { snapshot: AppSnapshot; api: Gat
   const [shortcuts, setShortcuts] = useState<BrowserShortcut[]>(loadShortcuts)
   const [shortcutOpen, setShortcutOpen] = useState(false)
   const [shortcutDraft, setShortcutDraft] = useState({ name: '', url: '' })
+  const [shortcutError, setShortcutError] = useState('')
   const [queue, setQueue] = useState<BrowserImportQueueState>(EMPTY_QUEUE)
   const [cache, setCache] = useState<BrowserJsonCacheState>(EMPTY_CACHE)
   const [cacheOpen, setCacheOpen] = useState(false)
@@ -102,8 +104,14 @@ export function BrowserView({ snapshot, api }: { snapshot: AppSnapshot; api: Gat
   const readyItems = useMemo(() => queue.items.filter((item) => item.status === 'ready'), [queue.items])
   const selectedReadyIds = useMemo(() => selectedIds.filter((id) => readyItems.some((item) => item.id === id)), [readyItems, selectedIds])
   const compatiblePools = useMemo(
-    () => snapshot.pools.filter((pool) => pool.kind === 'standard' && pool.protocol === 'openai-responses'),
-    [snapshot.pools],
+    () => snapshot.pools.filter((pool) => pool.kind === 'standard'
+      && pool.protocol === 'openai-responses'
+      && pool.members.every((member) => {
+        const account = snapshot.accounts.find((candidate) => candidate.id === member.accountId)
+        const provider = snapshot.providers.find((candidate) => candidate.id === account?.providerId)
+        return provider !== undefined && providerSourceFamily(provider.kind) === 'openai'
+      })),
+    [snapshot.accounts, snapshot.pools, snapshot.providers],
   )
 
   useEffect(() => {
@@ -187,10 +195,11 @@ export function BrowserView({ snapshot, api }: { snapshot: AppSnapshot; api: Gat
       const name = shortcutDraft.name.trim() || new URL(url).hostname
       setShortcuts((current) => [...current, { id: crypto.randomUUID(), name: name.slice(0, 30), url }])
       setShortcutDraft({ name: '', url: '' })
+      setShortcutError('')
       setShortcutOpen(false)
       setError('')
     } catch (cause) {
-      setError(localizeBackendError(cause, language, t('快捷入口网址无效', 'Invalid shortcut URL')))
+      setShortcutError(localizeBackendError(cause, language, t('快捷入口网址无效', 'Invalid shortcut URL')))
     }
   }
 
@@ -299,30 +308,29 @@ export function BrowserView({ snapshot, api }: { snapshot: AppSnapshot; api: Gat
   const proxyValue = proxyMode === 'preserve' ? '__preserve__' : proxyMode === 'direct' ? '__direct__' : proxyId
 
   return <div className="page-stack builtin-browser-page">
-    <section className={`browser-import-banner ${queue.readyCount ? 'browser-import-banner--active' : ''}`}>
-      <span className="browser-import-banner__icon"><FileJson size={20} /></span>
-      <div>
-        <strong>{queue.readyCount ? t(`已挂起 ${queue.readyCount} 个 JSON`, `${queue.readyCount} JSON files queued`) : t('暂无挂起 JSON', 'No queued JSON')}</strong>
-      </div>
-      <div className="browser-import-banner__actions">
-        <button type="button" className="text-button browser-cache-button" disabled={busy} onClick={() => void openCache()}><Archive size={14} />{t('缓存', 'Cache')}{cache.items.length ? ` ${cache.items.length}` : ''}</button>
-        {queue.items.length > 0 && <button type="button" className="text-button button--danger-text" disabled={busy} onClick={() => void api.clearBrowserImportQueue().then(setQueue)}>{t('清空', 'Clear')}</button>}
-        <button type="button" className="button button--primary" disabled={!queue.readyCount || busy} onClick={openImport}><Download size={16} />{t('确认导入', 'Review import')}</button>
-      </div>
-    </section>
-
     {notice && <div className="client-config-notice"><CheckCircle2 size={16} /><span>{notice}</span></div>}
     {error && !importOpen && <div className="client-config-message error-banner"><XCircle size={16} /><span>{error}</span></div>}
 
     <section className="builtin-browser panel panel--flush">
       <div className="builtin-browser__shortcuts">
-        {shortcuts.map((shortcut) => <div className="browser-shortcut" key={shortcut.id}>
-          <button type="button" className={activeTab.url.startsWith(shortcut.url) ? 'active' : ''} onClick={() => navigate(shortcut.url)} title={shortcut.url}>
-            <Globe2 size={14} /><span>{shortcut.name}</span>
-          </button>
-          <button type="button" className="browser-shortcut__remove" aria-label={t(`删除 ${shortcut.name}`, `Delete ${shortcut.name}`)} onClick={() => setShortcuts((current) => current.filter((item) => item.id !== shortcut.id))}><XCircle size={13} /></button>
-        </div>)}
-        <button type="button" className="browser-shortcut-add" onClick={() => setShortcutOpen(true)}><Plus size={14} />{t('添加', 'Add')}</button>
+        <div className="builtin-browser__shortcut-list">
+          {shortcuts.map((shortcut) => <div className="browser-shortcut" key={shortcut.id}>
+            <button type="button" className={activeTab.url.startsWith(shortcut.url) ? 'active' : ''} onClick={() => navigate(shortcut.url)} title={shortcut.url}>
+              <Globe2 size={13} /><span>{shortcut.name}</span>
+            </button>
+            <button type="button" className="browser-shortcut__remove" aria-label={t(`删除 ${shortcut.name}`, `Delete ${shortcut.name}`)} onClick={() => setShortcuts((current) => current.filter((item) => item.id !== shortcut.id))}><XCircle size={12} /></button>
+          </div>)}
+          <button type="button" className="browser-shortcut-add" onClick={() => { setShortcutError(''); setShortcutOpen(true) }}><Plus size={13} />{t('添加', 'Add')}</button>
+        </div>
+        <div className={`browser-import-inline ${queue.readyCount ? 'browser-import-inline--active' : ''}`}>
+          <span className="browser-import-inline__status" title={queue.readyCount ? t(`已挂起 ${queue.readyCount} 个 JSON`, `${queue.readyCount} JSON files queued`) : t('暂无挂起 JSON', 'No queued JSON')}>
+            <FileJson size={14} />
+            <strong>{queue.readyCount ? t(`挂起 JSON ${queue.readyCount}`, `${queue.readyCount} queued JSON`) : t('挂起 JSON 0', '0 queued JSON')}</strong>
+          </span>
+          <button type="button" className="text-button browser-cache-button" disabled={busy} title={t('查看下载缓存', 'View download cache')} onClick={() => void openCache()}><Archive size={13} /><span>{t('缓存', 'Cache')}</span>{cache.items.length ? ` ${cache.items.length}` : ''}</button>
+          {queue.items.length > 0 && <button type="button" className="icon-button button--danger-text browser-import-inline__clear" disabled={busy} title={t('清空挂起 JSON', 'Clear queued JSON')} aria-label={t('清空挂起 JSON', 'Clear queued JSON')} onClick={() => void api.clearBrowserImportQueue().then(setQueue)}><Trash2 size={13} /></button>}
+          <button type="button" className="button button--primary browser-import-inline__review" disabled={!queue.readyCount || busy} title={t('确认并导入挂起 JSON', 'Review and import queued JSON')} onClick={openImport}><Download size={14} /><span>{t('导入', 'Import')}</span></button>
+        </div>
       </div>
       <div className="builtin-browser__tabs" role="tablist" aria-label={t('浏览器标签页', 'Browser tabs')}>
         {tabs.map((tab) => <button
@@ -338,10 +346,17 @@ export function BrowserView({ snapshot, api }: { snapshot: AppSnapshot; api: Gat
           <span>{tab.title}</span>
           <span
             role="button"
+            tabIndex={tabs.length <= 1 ? -1 : 0}
             aria-label={t(`关闭 ${tab.title}`, `Close ${tab.title}`)}
             aria-disabled={tabs.length <= 1}
             className={`browser-tab__close ${tabs.length <= 1 ? 'disabled' : ''}`}
             onClick={(event) => { event.stopPropagation(); closeTab(tab.id) }}
+            onKeyDown={(event) => {
+              if (event.key !== 'Enter' && event.key !== ' ') return
+              event.preventDefault()
+              event.stopPropagation()
+              closeTab(tab.id)
+            }}
           ><XCircle size={13} /></span>
         </button>)}
         <button type="button" className="browser-tab-add" title={t('新建标签页', 'New tab')} aria-label={t('新建标签页', 'New tab')} onClick={() => openTab()}><Plus size={15} /></button>
@@ -377,6 +392,7 @@ export function BrowserView({ snapshot, api }: { snapshot: AppSnapshot; api: Gat
       <button type="submit" form="browser-shortcut-form" className="button button--primary"><Plus size={16} />{t('添加', 'Add')}</button>
     </>}>
       <form id="browser-shortcut-form" className="form-grid" onSubmit={saveShortcut}>
+        {shortcutError && <div className="client-config-message error-banner field--full" role="alert"><XCircle size={16} /><span>{shortcutError}</span></div>}
         <label className="field field--full"><span>{t('名称', 'Name')}</span><input value={shortcutDraft.name} maxLength={30} placeholder={t('例如 NVTokens', 'For example, NVTokens')} onChange={(event) => setShortcutDraft({ ...shortcutDraft, name: event.target.value })} /></label>
         <label className="field field--full"><span>{t('网址', 'URL')}</span><input required value={shortcutDraft.url} placeholder="https://example.com/" onChange={(event) => setShortcutDraft({ ...shortcutDraft, url: event.target.value })} /></label>
       </form>

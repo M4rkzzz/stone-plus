@@ -1,6 +1,7 @@
 import type { AppUpdateProgress, AppUpdateRelease, AppUpdateState, ProjectPage } from '@shared/types'
 import type { AppUpdater, ProgressInfo, UpdateCheckResult, UpdateDownloadedEvent } from 'electron-updater'
 import { clean, eq, gt, gte, valid } from 'semver'
+import { verifyStonePlusWindowsUpdateSignature } from './windows-signature'
 
 const RELEASE_API_URL = 'https://api.github.com/repos/M4rkzzz/stone-plus/releases/latest'
 const RELEASE_PAGE_URL = 'https://github.com/M4rkzzz/stone-plus/releases/latest'
@@ -79,6 +80,16 @@ export class UpdateService {
     options.updater.on('download-progress', this.handleDownloadProgress)
     options.updater.on('update-downloaded', this.handleUpdateDownloaded)
     options.updater.on('error', this.handleUpdaterError)
+    if (options.platform === 'win32') {
+      // electron-updater's default verifier rejects the project's published
+      // self-signed continuity certificate on clean Windows installations.
+      // Keep verification enabled, but pin the exact certificate instead of
+      // asking users to install it as a trusted system root.
+      const windowsUpdater = options.updater as AppUpdater & {
+        verifyUpdateCodeSignature?: (publisherNames: string[], updatePath: string) => Promise<string | null>
+      }
+      windowsUpdater.verifyUpdateCodeSignature = verifyStonePlusWindowsUpdateSignature
+    }
   }
 
   public async initialize(): Promise<AppUpdateState> {
@@ -241,6 +252,13 @@ export class UpdateService {
     try {
       await this.options.prepareToInstall()
       this.options.updater.quitAndInstall(true, true)
+      // electron-updater reports a missing installer or a synchronous launch
+      // failure through its error event and otherwise returns void. Do not
+      // leave the UI permanently stuck in `installing` when that happens.
+      const stateAfterInstall = this.getState()
+      if (stateAfterInstall.error) {
+        throw new Error(stateAfterInstall.error ?? 'The update installer could not be started.')
+      }
     } catch (error) {
       this.updateState({ status: 'error', error: updateDownloadErrorMessage(error) })
       throw error
@@ -286,7 +304,7 @@ export class UpdateService {
   }
 
   private readonly handleUpdaterError = (error: Error): void => {
-    if (this.closed || this.state.status !== 'downloading') return
+    if (this.closed || (this.state.status !== 'downloading' && this.state.status !== 'installing')) return
     this.updateState({ status: 'error', progress: undefined, error: updateDownloadErrorMessage(error) })
   }
 
@@ -318,10 +336,12 @@ export function determineAutomaticUpdateSupport(
     return { supported: true }
   }
   if (platform === 'linux') {
-    if (!environment.APPIMAGE) {
-      return { supported: false, reason: '当前 Linux 安装形式不支持一键替换，请从 GitHub Release 下载新版。' }
+    return {
+      supported: false,
+      reason: environment.APPIMAGE
+        ? 'Linux 一键更新将在独立发布签名验证启用后开放，请从 GitHub Release 下载并校验新版。'
+        : '当前 Linux 安装形式不支持一键替换，请从 GitHub Release 下载并校验新版。'
     }
-    return { supported: true }
   }
   if (platform === 'darwin') {
     return { supported: false, reason: 'macOS 自动安装将在正式代码签名与 Apple 公证启用后开放。' }

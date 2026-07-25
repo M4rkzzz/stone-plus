@@ -18,10 +18,26 @@ import {
   type BuiltInProxyWorkspaceTab,
 } from '../../src/renderer/src/built-in-proxy-workspace'
 import { I18nProvider } from '../../src/renderer/src/i18n'
-import { BuiltInProxyView } from '../../src/renderer/src/views/BuiltInProxyView'
+import {
+  BuiltInProxyView,
+  shouldPollBuiltInProxyTelemetry,
+  shouldReplaceMasterSwitchWithReload,
+} from '../../src/renderer/src/views/BuiltInProxyView'
 import { ProxyView } from '../../src/renderer/src/views/ProxyView'
 
 describe('built-in proxy workspace preferences', () => {
+  it('polls the potentially large connection list only while its visible workspace is open', () => {
+    expect(shouldPollBuiltInProxyTelemetry(true, 'activity', 'visible')).toBe(true)
+    expect(shouldPollBuiltInProxyTelemetry(true, 'overview', 'visible')).toBe(false)
+    expect(shouldPollBuiltInProxyTelemetry(true, 'activity', 'hidden')).toBe(false)
+    expect(shouldPollBuiltInProxyTelemetry(false, 'activity', 'visible')).toBe(false)
+  })
+
+  it('keeps the emergency master switch when a valid runtime survives a failed refresh', () => {
+    expect(shouldReplaceMasterSwitchWithReload(runtime(), 'temporary read failure')).toBe(false)
+    expect(shouldReplaceMasterSwitchWithReload(null, 'temporary read failure')).toBe(true)
+  })
+
   it('restores valid current and legacy tab preferences', () => {
     expect(parseBuiltInProxyWorkspacePreferences('activity')).toEqual({ version: 1, activeTab: 'activity' })
     expect(parseBuiltInProxyWorkspacePreferences(JSON.stringify({

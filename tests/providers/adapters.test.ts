@@ -6,7 +6,9 @@ import {
   getProviderAdapter,
   googleAdapter,
   openAIAdapter,
-  openAICompatibleAdapter
+  openAICompatibleAdapter,
+  xAIAdapter,
+  xAICompatibleAdapter
 } from '../../src/main/providers'
 
 describe('provider adapter endpoints', () => {
@@ -85,6 +87,33 @@ describe('provider adapter endpoints', () => {
     })).toBe('https://custom.example.test/v1/chat/completions')
   })
 
+  it('builds both OpenAI wire endpoints for xAI-compatible relays', () => {
+    expect(getProviderAdapter('xai-compatible')).toBe(xAICompatibleAdapter)
+    expect(xAICompatibleAdapter.buildEndpoint({
+      baseUrl: 'https://xai-relay.example.test/api/v1',
+      protocol: 'openai-responses',
+      operation: 'generate'
+    })).toBe('https://xai-relay.example.test/api/v1/responses')
+    expect(xAICompatibleAdapter.buildEndpoint({
+      baseUrl: 'https://xai-relay.example.test/api/v1',
+      protocol: 'openai-chat',
+      operation: 'generate'
+    })).toBe('https://xai-relay.example.test/api/v1/chat/completions')
+    expect(xAICompatibleAdapter.capabilities.protocols).toMatchObject({
+      'openai-responses': { streaming: true, toolCalls: true, modelInPath: false },
+      'openai-chat': { streaming: true, toolCalls: true, modelInPath: false }
+    })
+  })
+
+  it('uses the dedicated xAI adapter for official Grok credentials', () => {
+    expect(getProviderAdapter('xai')).toBe(xAIAdapter)
+    expect(xAIAdapter.buildEndpoint({
+      baseUrl: 'https://api.x.ai/v1',
+      protocol: 'openai-chat',
+      operation: 'generate'
+    })).toBe('https://api.x.ai/v1/chat/completions')
+  })
+
   it('rejects credentials embedded in provider URLs', () => {
     expect(() => openAIAdapter.buildEndpoint({
       baseUrl: 'https://user:secret@example.test/v1',
@@ -121,6 +150,29 @@ describe('provider adapter authentication', () => {
       'user-agent': 'Stone/Test'
     })
     expect(headers.get('authorization')).not.toContain('local-gateway-token')
+  })
+
+  it('uses only Bearer auth for xAI-compatible relays and strips downstream tenant identity', () => {
+    const headers = new Headers({
+      'user-agent': 'preexisting-client',
+      'openai-organization': 'preexisting-org',
+      'openai-project': 'preexisting-project'
+    })
+    xAICompatibleAdapter.applyRequestHeaders(headers, {
+      protocol: 'openai-chat',
+      credential: 'xai-relay-secret',
+      sourceHeaders: {
+        accept: 'application/json',
+        'user-agent': 'Codex/tenant-client',
+        'openai-organization': 'org_downstream',
+        'openai-project': 'project_downstream'
+      }
+    })
+
+    expect(headers.get('authorization')).toBe('Bearer xai-relay-secret')
+    expect(headers.has('user-agent')).toBe(false)
+    expect(headers.has('openai-organization')).toBe(false)
+    expect(headers.has('openai-project')).toBe(false)
   })
 
   it('applies Anthropic version and API key headers', () => {
@@ -405,6 +457,109 @@ describe('provider discovery and health probes', () => {
         'gpt-4o-audio-preview',
         'vendor/custom-embedding-chat'
       ]
+    })
+    expect(fetchImplementation).toHaveBeenCalledOnce()
+  })
+
+  it('discovers and filters the OpenAI data model list for xAI-compatible relays', async () => {
+    const fetchImplementation = vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      expect(String(request)).toBe('https://xai-relay.example.test/v1/models')
+      expect(new Headers(init?.headers).get('authorization')).toBe('Bearer xai-model-secret')
+      return new Response(JSON.stringify({
+        data: [
+          { id: 'grok-4' },
+          { id: 'grok-code-fast-1' },
+          { id: 'grok-imagine-image' },
+          { id: 'text-embedding-xai' },
+          { id: 'rerank-xai' }
+        ]
+      }), { status: 200 })
+    })
+
+    const result = await xAICompatibleAdapter.discoverModels({
+      baseUrl: 'https://xai-relay.example.test/v1',
+      protocol: 'openai-chat',
+      credential: 'xai-model-secret',
+      fetchImplementation: fetchImplementation as typeof fetch
+    })
+
+    expect(result).toMatchObject({
+      ok: true,
+      models: ['grok-4', 'grok-code-fast-1']
+    })
+    expect(fetchImplementation).toHaveBeenCalledOnce()
+    expect(fetchImplementation.mock.calls[0][1]?.redirect).toBe('error')
+  })
+
+  it('does not follow redirects while discovering official xAI models', async () => {
+    const fetchImplementation = vi.fn(async (_request: string | URL | Request, init?: RequestInit) => {
+      expect(init?.redirect).toBe('error')
+      return new Response(JSON.stringify({ data: [{ id: 'grok-4' }] }), { status: 200 })
+    })
+
+    const result = await xAIAdapter.discoverModels({
+      baseUrl: 'https://api.x.ai/v1',
+      protocol: 'openai-chat',
+      credential: 'xai-official-secret',
+      fetchImplementation: fetchImplementation as typeof fetch
+    })
+
+    expect(result).toMatchObject({ ok: true, models: ['grok-4'] })
+  })
+
+  it.each([
+    ['an overlong model id', { data: [{ id: `grok-${'x'.repeat(252)}` }] }],
+    ['a control character in a model id', { data: [{ id: 'grok-safe' }, { id: 'grok-\u0000evil' }] }],
+    ['too many model ids', { data: Array.from({ length: 10_001 }, (_, index) => ({ id: `grok-${index}` })) }]
+  ])('rejects a malicious xAI relay catalog containing %s', async (_name, payload) => {
+    const result = await xAICompatibleAdapter.discoverModels({
+      baseUrl: 'https://xai-relay.example.test/v1',
+      protocol: 'openai-chat',
+      credential: 'xai-model-secret',
+      fetchImplementation: vi.fn(async () => new Response(JSON.stringify(payload), { status: 200 })) as typeof fetch
+    })
+
+    expect(result).toMatchObject({
+      ok: false,
+      models: [],
+      failure: { category: 'invalid_response' }
+    })
+  })
+
+  it('bounds each relay model-catalog response before parsing JSON', async () => {
+    const result = await xAICompatibleAdapter.discoverModels({
+      baseUrl: 'https://xai-relay.example.test/v1',
+      protocol: 'openai-chat',
+      credential: 'xai-model-secret',
+      fetchImplementation: vi.fn(async () => new Response(
+        JSON.stringify({ data: [{ id: 'grok-4' }], padding: 'x'.repeat(3 * 1024 * 1024) }),
+        { status: 200 }
+      )) as typeof fetch
+    })
+
+    expect(result).toMatchObject({
+      ok: false,
+      models: [],
+      failure: { category: 'invalid_response' }
+    })
+  })
+
+  it('rejects an oversized pagination token from a custom relay before issuing another request', async () => {
+    const fetchImplementation = vi.fn(async () => new Response(JSON.stringify({
+      models: [{ name: 'models/grok-4', supportedGenerationMethods: ['generateContent'] }],
+      nextPageToken: 'x'.repeat(2_049)
+    }), { status: 200 }))
+    const result = await customAdapter.discoverModels({
+      baseUrl: 'https://custom-relay.example.test',
+      protocol: 'gemini',
+      credential: 'custom-secret',
+      fetchImplementation: fetchImplementation as typeof fetch
+    })
+
+    expect(result).toMatchObject({
+      ok: false,
+      models: [],
+      failure: { category: 'invalid_response' }
     })
     expect(fetchImplementation).toHaveBeenCalledOnce()
   })

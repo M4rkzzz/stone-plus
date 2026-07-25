@@ -554,7 +554,12 @@ const helpEnglish = new Map<string, string>([
 
 function localizeHelpValue(value: unknown, t: Translate): unknown {
   if (typeof value === 'string') return t(value, helpEnglish.get(value) ?? value)
-  if (Array.isArray(value)) return value.map((item) => localizeHelpValue(item, t))
+  if (Array.isArray(value)) return value.map((item, index) => {
+    const localized = localizeHelpValue(item, t)
+    return isValidElement(localized) && localized.key == null
+      ? cloneElement(localized, { key: `localized-${index}` })
+      : localized
+  })
   if (isValidElement(value)) {
     const element = value as ReactElement<Record<string, unknown>>
     const props = Object.fromEntries(Object.entries(element.props).map(([key, item]) => [key, localizeHelpValue(item, t)]))

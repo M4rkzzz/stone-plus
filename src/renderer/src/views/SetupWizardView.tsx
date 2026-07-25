@@ -45,7 +45,9 @@ import type {
   SetupWizardState,
   SetupWizardStep,
 } from '@shared/types'
-import { isAvailableRouteAccount } from '@shared/route-sources'
+import { providerSourceFamily } from '@shared/source-family'
+import { DEFAULT_ACCOUNT_MAX_CONCURRENCY } from '@shared/types'
+import { isAvailableRouteAccount, isNativeGrokRouteSource, resolveRouteSource } from '@shared/route-sources'
 import { Badge, ConfirmDialog, InfoTip, protocolLabels } from '../ui'
 import { ExclusiveAsyncOperation, SerializedAsyncOperation } from '../async-operation'
 import { BUILT_IN_PROXY_BINDING_NOTICE, useBuiltInProxyInterlock } from '../built-in-proxy-interlocks'
@@ -65,6 +67,15 @@ import {
   setupSourceProbeMatches,
   type SetupSourceProbeBinding,
 } from '../setup-wizard-operations'
+import {
+  newRelayConnectionDefaults,
+  protocolAfterProviderKindChange,
+  protocolOptionLabel,
+  protocolsByProviderKind,
+  providerKindLabelsEn,
+  providerKindLabelsZh,
+  XAI_COMPATIBLE_KIND,
+} from '../grok-relay-ui'
 import { setupPoolDisplayName } from '../system-generated-text'
 import '../setup-wizard.css'
 
@@ -95,23 +106,27 @@ const clientLabels: Record<RouteClient, string> = {
   codex: 'Codex',
   claude: 'Claude Code',
   gemini: 'Gemini CLI',
+  grokbuild: 'Grok Build',
 }
 
-const emptyApiSource = (sourceType: 'official-api' | 'relay'): ApiSourceInput => ({
-  name: '',
-  sourceType,
-  kind: sourceType === 'official-api' ? 'openai' : 'openai-compatible',
-  baseUrl: 'https://api.openai.com/v1',
-  protocol: 'openai-responses',
-  responsesCompactMode: sourceType === 'relay' ? 'legacy' : undefined,
-  credential: '',
-  models: [],
-  defaultModel: '',
-  priority: 10,
-  weight: 10,
-  maxConcurrency: 4,
-  proxyId: '',
-})
+const emptyApiSource = (sourceType: 'official-api' | 'relay'): ApiSourceInput => {
+  const relayDefaults = sourceType === 'relay' ? newRelayConnectionDefaults() : undefined
+  return {
+    name: '',
+    sourceType,
+    kind: sourceType === 'official-api' ? 'openai' : relayDefaults!.kind,
+    baseUrl: sourceType === 'official-api' ? 'https://api.openai.com/v1' : relayDefaults!.baseUrl,
+    protocol: sourceType === 'official-api' ? 'openai-responses' : relayDefaults!.protocol,
+    responsesCompactMode: sourceType === 'relay' ? relayDefaults!.responsesCompactMode : undefined,
+    credential: '',
+    models: [],
+    defaultModel: '',
+    priority: 10,
+    weight: 10,
+    maxConcurrency: DEFAULT_ACCOUNT_MAX_CONCURRENCY,
+    proxyId: '',
+  }
+}
 
 export function SetupWizardView({
   snapshot,
@@ -180,7 +195,18 @@ export function SetupWizardView({
     ? oauthImportedSnapshot?.providers.find((provider) => provider.id === selectedAccount.providerId)
       ?? providerById.get(selectedAccount.providerId)
     : undefined
-  const compatiblePools = snapshot.pools.filter((pool) => pool.kind === 'standard' && pool.protocol === 'openai-responses')
+  const selectedSourceIsGrok = aggregatePoolId
+    ? isNativeGrokRouteSource(resolveRouteSource(aggregatePoolId, snapshot), snapshot)
+    : selectedProvider !== undefined
+      && selectedProvider.protocol === 'openai-responses'
+      && providerSourceFamily(selectedProvider.kind) === 'grok'
+  const compatiblePools = snapshot.pools.filter((pool) => pool.kind === 'standard'
+    && pool.protocol === 'openai-responses'
+    && pool.members.every((member) => {
+      const account = snapshot.accounts.find((candidate) => candidate.id === member.accountId)
+      const provider = providerById.get(account?.providerId ?? '')
+      return provider !== undefined && providerSourceFamily(provider.kind) === 'openai'
+    }))
   const aggregatePools = snapshot.pools.filter((pool) => pool.kind === 'relay-aggregate'
     && pool.members.some((member) => member.enabled
       && availableAccounts.some((account) => account.id === member.accountId)))
@@ -636,12 +662,13 @@ export function SetupWizardView({
   }
 
   const applyOfficialVendor = (kind: ProviderKind) => {
-    const presets: Record<'openai' | 'anthropic' | 'google', Pick<ApiSourceInput, 'kind' | 'baseUrl' | 'protocol' | 'name'>> = {
+    const presets: Record<'openai' | 'xai' | 'anthropic' | 'google', Pick<ApiSourceInput, 'kind' | 'baseUrl' | 'protocol' | 'name'>> = {
       openai: { kind: 'openai', baseUrl: 'https://api.openai.com/v1', protocol: 'openai-responses', name: 'OpenAI API' },
+      xai: { kind: 'xai', baseUrl: 'https://api.x.ai/v1', protocol: 'openai-responses', name: 'Grok / xAI' },
       anthropic: { kind: 'anthropic', baseUrl: 'https://api.anthropic.com', protocol: 'anthropic-messages', name: 'Anthropic API' },
       google: { kind: 'google', baseUrl: 'https://generativelanguage.googleapis.com', protocol: 'gemini', name: 'Google Gemini API' },
     }
-    if (kind !== 'openai' && kind !== 'anthropic' && kind !== 'google') return
+    if (kind !== 'openai' && kind !== 'xai' && kind !== 'anthropic' && kind !== 'google') return
     setSourceDraft((current) => {
       const next = { ...current, ...presets[kind], responsesCompactMode: undefined }
       sourceDraftRef.current = next
@@ -749,6 +776,7 @@ export function SetupWizardView({
 
   const createRouting = async () => {
     if (!wizard?.sessionId || !selectedAccountId || !model) return setError(t('缺少来源、模型或向导会话。', 'The source, model, or wizard session is missing.'))
+    if (client === 'grokbuild' && !selectedSourceIsGrok) return setError(t('Grok Build 仅可连接原生 Responses 的 Grok 号池或中转站。', 'Grok Build can connect only to Responses-native Grok pools or relays.'))
     const result = await run('routing', () => api.applySetupRouting({
       sessionId: wizard.sessionId,
       sourceId: selectedAccountId,
@@ -964,8 +992,9 @@ export function SetupWizardView({
           </WizardSection>}
 
           {currentStep === 'client' && <WizardSection icon={<Settings2 />} title={t('选择主客户端', 'Choose your primary client')} description={t('向导一次配置一个客户端，完成后可以继续配置其他客户端。', 'The wizard configures one client at a time. You can add more after this setup.')}>
-            <div className="setup-choice-grid setup-choice-grid--clients">{(['codex', 'claude', 'gemini'] as RouteClient[]).map((item) => <Choice key={item} title={clientLabels[item]} description={item === 'codex' ? t('推荐用于 OAuth / Responses 来源', 'Recommended for OAuth / Responses sources') : t(`通过 Stone+ 协议转换接入 ${clientLabels[item]}`, `Connect ${clientLabels[item]} through Stone+ protocol conversion`)} selected={client === item} onClick={() => setClient(item)} disabled={Boolean(busy)} />)}</div>
-            <PrimaryAction busy={false} disabled={Boolean(busy)} onClick={() => void move('routing', { client, model })} label={t('继续配置路由', 'Continue to routing')} />
+            <div className="setup-choice-grid setup-choice-grid--clients">{(['codex', 'claude', 'gemini', 'grokbuild'] as RouteClient[]).map((item) => <Choice key={item} title={clientLabels[item]} description={item === 'codex' ? t('推荐用于 OAuth / Responses 来源', 'Recommended for OAuth / Responses sources') : item === 'grokbuild' ? t('仅连接原生 Responses 的 Grok 号池或中转站', 'Connects only to Responses-native Grok pools or relays') : t(`通过 Stone+ 协议转换接入 ${clientLabels[item]}`, `Connect ${clientLabels[item]} through Stone+ protocol conversion`)} selected={client === item} onClick={() => setClient(item)} disabled={Boolean(busy) || (item === 'grokbuild' && !selectedSourceIsGrok)} />)}</div>
+            {!selectedSourceIsGrok && <small>{t('当前来源不是 Grok 原生 Responses 来源，因此不能选择 Grok Build。', 'The current source is not a Responses-native Grok source, so Grok Build is unavailable.')}</small>}
+            <PrimaryAction busy={false} disabled={Boolean(busy) || (client === 'grokbuild' && !selectedSourceIsGrok)} onClick={() => void move('routing', { client, model })} label={t('继续配置路由', 'Continue to routing')} />
           </WizardSection>}
 
           {currentStep === 'routing' && <WizardSection icon={<Waypoints />} title={t('创建号池与路由', 'Create the pool and route')} description={t('Stone+ 会原子创建或复用号池，并启用对应客户端路由。', 'Stone+ atomically creates or reuses a pool and enables the matching client route.')}>
@@ -1035,17 +1064,17 @@ function ScanSummary({ snapshot }: { snapshot: AppSnapshot }) {
 
 function ApiSourceForm({ draft, proxies, proxyId, proxyInterlocked, official, onChange, onProxyChange, onVendor }: { draft: ApiSourceInput; proxies: AppSnapshot['proxies']; proxyId: string; proxyInterlocked: boolean; official: boolean; onChange: (value: ApiSourceInput) => void; onProxyChange: (value: string) => void; onVendor: (kind: ProviderKind) => void }) {
   const { t } = useI18n()
-  const compatibleKinds: ProviderKind[] = ['openai-compatible', 'anthropic-compatible', 'custom']
-  const protocols: Protocol[] = draft.kind === 'anthropic' || draft.kind === 'anthropic-compatible'
-    ? ['anthropic-messages']
-    : draft.kind === 'google' ? ['gemini'] : ['openai-responses', 'openai-chat']
+  const compatibleKinds: ProviderKind[] = [XAI_COMPATIBLE_KIND, 'openai-compatible', 'anthropic-compatible', 'custom']
+  const protocols = official && draft.kind === 'xai'
+    ? ['openai-responses'] as const
+    : protocolsByProviderKind[draft.kind]
   const compactMode = effectiveResponsesCompactMode(draft.responsesCompactMode)
   const compactCopy = responsesCompactModeCopy[compactMode]
   return <div className="setup-form-grid">
-    {official && <label><span>{t('官方厂商', 'Official provider')}</span><select value={draft.kind} onChange={(event) => onVendor(event.target.value as ProviderKind)}><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option><option value="google">Google Gemini</option></select></label>}
+    {official && <label><span>{t('官方厂商', 'Official provider')}</span><select value={draft.kind} onChange={(event) => onVendor(event.target.value as ProviderKind)}><option value="openai">OpenAI</option><option value="xai">Grok / xAI</option><option value="anthropic">Anthropic</option><option value="google">Google Gemini</option></select></label>}
     {!official && <label><span>{t('兼容类型', 'Compatibility type')}</span><select value={draft.kind} onChange={(event) => {
       const kind = event.target.value as ProviderKind
-      const protocol = kind === 'anthropic-compatible' ? 'anthropic-messages' : draft.protocol === 'anthropic-messages' ? 'openai-responses' : draft.protocol
+      const protocol = protocolAfterProviderKindChange(kind, draft.protocol)
       onChange({
         ...draft,
         kind,
@@ -1054,10 +1083,10 @@ function ApiSourceForm({ draft, proxies, proxyId, proxyInterlocked, official, on
           ? effectiveResponsesCompactMode(draft.responsesCompactMode)
           : undefined,
       })
-    }}>{compatibleKinds.map((kind) => <option value={kind} key={kind}>{kind}</option>)}</select></label>}
+    }}>{compatibleKinds.map((kind) => <option value={kind} key={kind}>{t(providerKindLabelsZh[kind], providerKindLabelsEn[kind])}</option>)}</select></label>}
     <label><span>{t('显示名称', 'Display name')}</span><input value={draft.name} onChange={(event) => onChange({ ...draft, name: event.target.value })} /></label>
     <label className="full"><span>Base URL</span><input className="mono" disabled={official} value={draft.baseUrl} onChange={(event) => onChange({ ...draft, baseUrl: event.target.value })} /></label>
-    <label><span>{t('协议', 'Protocol')}</span><select value={draft.protocol} onChange={(event) => {
+    <label><span>{t('协议', 'Protocol')}</span><select value={draft.protocol} disabled={official && draft.kind === 'xai'} onChange={(event) => {
       const protocol = event.target.value as Protocol
       onChange({
         ...draft,
@@ -1066,7 +1095,7 @@ function ApiSourceForm({ draft, proxies, proxyId, proxyInterlocked, official, on
           ? effectiveResponsesCompactMode(draft.responsesCompactMode)
           : undefined,
       })
-    }}>{protocols.map((protocol) => <option value={protocol} key={protocol}>{protocolLabels[protocol]}</option>)}</select></label>
+    }}>{protocols.map((protocol) => <option value={protocol} key={protocol}>{protocolOptionLabel(draft.kind, protocol, protocolLabels, t)}</option>)}</select>{draft.kind === XAI_COMPATIBLE_KIND && <small>{t('默认使用官方当前主路径 Responses；仅当中转明确只兼容 Chat Completions 时选择高级兼容模式。', 'Responses is the current primary API path. Choose advanced Chat compatibility only when the relay explicitly requires Chat Completions.')}</small>}</label>
     {relayCanConfigureResponsesCompact(draft.sourceType, draft.protocol) && <label className="full"><span className="field-label-with-help">{t('Responses Compact 能力', 'Responses compact capability')}<InfoTip text={t(compactCopy.helpZh, compactCopy.helpEn)} /></span><select value={compactMode} onChange={(event) => onChange({ ...draft, responsesCompactMode: event.target.value as ResponsesCompactMode })}>{responsesCompactModes.map((mode) => <option value={mode} key={mode}>{t(responsesCompactModeCopy[mode].labelZh, responsesCompactModeCopy[mode].labelEn)}</option>)}</select></label>}
     {officialOpenAiUsesNativeCompact(draft.sourceType, draft.kind, draft.protocol) && <label className="full"><span className="field-label-with-help"><ShieldCheck size={13} />{t('Responses Compact 能力', 'Responses compact capability')}<InfoTip text={t('官方 OpenAI 按 Responses 协议自动使用完整原生 Compact，无需手动配置。', 'Official OpenAI automatically uses full native compact through the Responses protocol. No manual setting is needed.')} /></span><input disabled value={t('自动：完整原生 Compact', 'Automatic: full native compact')} /></label>}
     <label><span>{t('测试/默认模型', 'Test/default model')}</span><input value={draft.defaultModel ?? ''} onChange={(event) => onChange({ ...draft, defaultModel: event.target.value })} placeholder={t('例如 gpt-5.4', 'For example, gpt-5.4')} /></label>

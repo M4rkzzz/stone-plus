@@ -317,6 +317,34 @@
   border-bottom: 0;
 }
 
+.telemetry-workspace__load-more {
+  display: flex;
+  min-height: 42px;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 6px 12px;
+  border-top: 1px solid var(--border);
+  background: var(--surface-subtle);
+  color: var(--muted);
+  font-size: 9px;
+}
+
+.telemetry-workspace__load-more button {
+  min-height: 28px;
+  padding: 0 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 7px;
+  background: var(--surface);
+  color: var(--accent);
+  font-size: 9px;
+  font-weight: 700;
+}
+
+.telemetry-workspace__load-more button:hover {
+  border-color: var(--accent);
+}
+
 .telemetry-workspace__endpoint {
   display: grid;
   min-width: 0;

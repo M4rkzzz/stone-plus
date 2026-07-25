@@ -93,6 +93,22 @@ describe('built-in proxy settings workspace', () => {
     expect(markup).toContain('temporary elevation for the current start')
   })
 
+  it('disables unavailable platform access modes and explains why', () => {
+    const markup = renderSettings(runtime({
+      platformCapabilities: {
+        platform: 'linux',
+        accessModes: {
+          system: { available: false, unavailableReason: 'unsupported-desktop', authorizationRequired: false },
+          tun: { available: true, authorizationRequired: true },
+        },
+      },
+    }))
+
+    expect(markup).toMatch(/<input(?=[^>]*type="radio")(?=[^>]*value="system")(?=[^>]*disabled="")[^>]*>/)
+    expect(markup).toContain('System proxy mode is unavailable in this Linux desktop environment')
+    expect(markup).toMatch(/<input(?=[^>]*type="radio")(?=[^>]*value="tun")(?![^>]*disabled="")[^>]*>/)
+  })
+
   it('uses native keyboard controls, concise names, and a single live status', () => {
     const ready = renderSettings(runtime())
     expect(ready).toMatch(/<input(?=[^>]*type="radio")(?=[^>]*aria-labelledby=)(?=[^>]*aria-describedby=)[^>]*>/)

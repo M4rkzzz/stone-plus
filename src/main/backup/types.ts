@@ -23,6 +23,7 @@ export interface DatabaseRestoreResult<T> {
 export interface DatabaseBackupStore<T> {
   backupTo(destinationPath: string): Promise<number>
   restoreFrom(stagedDatabasePath: string, rollbackDatabasePath: string): Promise<T>
+  runInRestoreMaintenance?<TResult>(operation: () => Promise<TResult>): Promise<TResult>
 }
 
 export interface DatabaseBackupServiceOptions<T> {

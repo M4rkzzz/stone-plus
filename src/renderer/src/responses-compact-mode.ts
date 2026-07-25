@@ -3,6 +3,7 @@ import type { Protocol, ResponsesCompactMode, UpstreamSourceType } from '@shared
 export type { ResponsesCompactMode } from '@shared/types'
 
 export const responsesCompactModes: readonly ResponsesCompactMode[] = [
+  'auto',
   'legacy',
   'passthrough',
   'native',
@@ -14,6 +15,12 @@ export const responsesCompactModeCopy: Record<ResponsesCompactMode, {
   helpZh: string
   helpEn: string
 }> = {
+  auto: {
+    labelZh: '自动（推荐）',
+    labelEn: 'Automatic (recommended)',
+    helpZh: 'Stone+ 自动保持 opaque 会话连续性：先尝试中转的原生 Responses Compact，确认不支持时再改用普通 Responses 文本摘要。运行中切换 OAuth 账号或中转时无需手动改模式。',
+    helpEn: 'Stone+ preserves opaque conversation continuity automatically: it tries the relay\'s native Responses Compact path first, then uses a normal Responses text summary only after native compact is proven unsupported. Switching between OAuth accounts and relays requires no manual mode change.',
+  },
   legacy: {
     labelZh: '传统回退（兼容优先）',
     labelEn: 'Legacy fallback (compatibility first)',
@@ -37,7 +44,7 @@ export const responsesCompactModeCopy: Record<ResponsesCompactMode, {
 export function effectiveResponsesCompactMode(value: unknown): ResponsesCompactMode {
   return responsesCompactModes.includes(value as ResponsesCompactMode)
     ? value as ResponsesCompactMode
-    : 'legacy'
+    : 'auto'
 }
 
 export function relayCanConfigureResponsesCompact(

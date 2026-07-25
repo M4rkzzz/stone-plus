@@ -1,17 +1,18 @@
 import { DatabaseSync } from 'node:sqlite'
-import { appendFile, mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, mkdtemp, open, readFile, rm, stat, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { CodexSessionRepairService } from '../../src/main/codex'
 
 const temporaryDirectories: string[] = []
+type SessionRepairOptions = ConstructorParameters<typeof CodexSessionRepairService>[0]
 
 afterEach(async () => {
   await Promise.all(temporaryDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })))
 })
 
-async function createFixture() {
+async function createFixture(options: Partial<SessionRepairOptions> = {}) {
   const root = await mkdtemp(join(tmpdir(), 'stone-session-repair-'))
   temporaryDirectories.push(root)
   const codexHome = join(root, '.codex')
@@ -36,7 +37,17 @@ async function createFixture() {
 
   const activeRollout = join(activeDirectory, 'rollout-2026-07-18T12-00-00-thread-one.jsonl')
   const activeLines = [
-    { timestamp: '2026-07-18T12:00:00Z', type: 'session_meta', payload: { id: 'thread-one', cwd: '\\\\?\\D:\\project\\stone+', model_provider: 'openai' } },
+    {
+      timestamp: '2026-07-18T12:00:00Z',
+      type: 'session_meta',
+      payload: {
+        id: 'thread-one',
+        cwd: '\\\\?\\D:\\project\\stone+',
+        model_provider: 'openai',
+        reasoning_effort: 'ultra',
+        unknown_nested: { keep: { value: 7, labels: ['purple', 'unchanged'] } },
+      },
+    },
     { timestamp: '2026-07-18T12:00:01Z', type: 'event_msg', payload: { type: 'user_message', message: 'keep this text' } },
     { timestamp: '2026-07-18T12:00:02Z', type: 'response_item', payload: { encrypted_content: 'opaque' } },
   ].map((item) => JSON.stringify(item)).join('\r\n') + '\r\n'
@@ -59,13 +70,15 @@ async function createFixture() {
       model_provider TEXT,
       has_user_event INTEGER,
       cwd TEXT,
-      title TEXT
+      title TEXT,
+      reasoning_effort TEXT,
+      unknown_json TEXT
     );
   `)
-  const insert = database.prepare('INSERT INTO threads (id, model_provider, has_user_event, cwd, title) VALUES (?, ?, ?, ?, ?)')
-  insert.run('thread-one', 'openai', 0, null, 'One')
-  insert.run('thread-two', 'stone', 1, 'D:\\project\\other', 'Two')
-  insert.run('orphan-thread', 'openai', 1, 'D:\\project\\orphan', 'Orphan')
+  const insert = database.prepare('INSERT INTO threads (id, model_provider, has_user_event, cwd, title, reasoning_effort, unknown_json) VALUES (?, ?, ?, ?, ?, ?, ?)')
+  insert.run('thread-one', 'openai', 0, null, 'One', 'ultra', '{"keep":{"value":7}}')
+  insert.run('thread-two', 'stone', 1, 'D:\\project\\other', 'Two', 'high', '{"two":true}')
+  insert.run('orphan-thread', 'openai', 1, 'D:\\project\\orphan', 'Orphan', 'medium', '{"orphan":true}')
   database.close()
 
   const unrelated = new DatabaseSync(join(sqliteDirectory, 'codex-dev.db'))
@@ -76,8 +89,31 @@ async function createFixture() {
     codexHome,
     now: () => new Date('2026-07-18T13:00:00Z'),
     randomId: () => 'fixedbackup',
+    ...options,
   })
   return { service, codexHome, activeRollout, activeLines, databasePath, originalMtime }
+}
+
+function observeRolloutReads() {
+  const bytes = new Map<string, number>()
+  const opened = new Map<string, number>()
+  const closed = new Map<string, number>()
+  const openRollout: NonNullable<SessionRepairOptions['openRollout']> = async (path) => {
+    const handle = await open(path, 'r')
+    opened.set(path, (opened.get(path) ?? 0) + 1)
+    return {
+      read: async (buffer, offset, length, position) => {
+        const result = await handle.read(buffer, offset, length, position)
+        bytes.set(path, (bytes.get(path) ?? 0) + result.bytesRead)
+        return result
+      },
+      close: async () => {
+        closed.set(path, (closed.get(path) ?? 0) + 1)
+        await handle.close()
+      },
+    }
+  }
+  return { openRollout, bytes, opened, closed }
 }
 
 describe('CodexSessionRepairService', () => {
@@ -111,6 +147,114 @@ describe('CodexSessionRepairService', () => {
     expect(preview.revision).toMatch(/^[a-f0-9]{64}$/)
   })
 
+  it('combines overview and preview in one rollout analysis pass', async () => {
+    const observed = observeRolloutReads()
+    const { service } = await createFixture({ openRollout: observed.openRollout })
+
+    const analysis = await service.analyze()
+
+    expect(analysis).toMatchObject({
+      currentProvider: 'stone',
+      targetProvider: 'stone',
+      sessionFiles: 1,
+      archivedSessionFiles: 1,
+      rolloutFilesToUpdate: 1,
+    })
+    expect([...observed.opened.values()].reduce((sum, count) => sum + count, 0)).toBe(2)
+    expect([...observed.closed.values()].reduce((sum, count) => sum + count, 0)).toBe(2)
+  })
+
+  it('builds and applies one post-shutdown plan without a preview rescan', async () => {
+    const observed = observeRolloutReads()
+    const { service } = await createFixture({ openRollout: observed.openRollout })
+
+    const result = await service.analyzeAndRepair()
+
+    expect(result).toMatchObject({ targetProvider: 'stone', repairedRolloutFiles: 1 })
+    expect([...observed.opened.values()].reduce((sum, count) => sum + count, 0)).toBe(2)
+    expect([...observed.closed.values()].reduce((sum, count) => sum + count, 0)).toBe(2)
+  })
+
+  it('recognizes first-line metadata without reading an oversized suffix and closes the handle', async () => {
+    const observed = observeRolloutReads()
+    const { service, codexHome } = await createFixture({ openRollout: observed.openRollout })
+    const directory = join(codexHome, 'sessions', '2026', '07', '19')
+    await mkdir(directory, { recursive: true })
+    const rolloutPath = join(directory, 'rollout-2026-07-19T11-00-00-bounded-suffix.jsonl')
+    const firstLine = Buffer.from(JSON.stringify({
+      timestamp: '2026-07-19T11:00:00Z',
+      type: 'session_meta',
+      payload: { id: 'bounded-suffix', cwd: 'D:\\project\\bounded', model_provider: 'openai' },
+    }) + '\n')
+    const handle = await open(rolloutPath, 'w')
+    try {
+      await handle.write(firstLine, 0, firstLine.length, 0)
+      // A sparse, unterminated suffix makes an accidental full-line/full-file
+      // scan both expensive and easy to detect without bloating the test tree.
+      await handle.truncate(firstLine.length + 64 * 1024 * 1024)
+    } finally {
+      await handle.close()
+    }
+
+    const preview = await service.preview('stone')
+
+    expect(preview).toMatchObject({
+      sessionFiles: 2,
+      rolloutFilesWithSessionMeta: 3,
+      rolloutFilesWithoutSessionMeta: 0,
+      rolloutFilesToUpdate: 2,
+    })
+    expect(observed.bytes.get(rolloutPath)).toBeGreaterThanOrEqual(1024 * 1024)
+    expect(observed.bytes.get(rolloutPath)).toBeLessThan(2 * 1024 * 1024)
+    expect(observed.opened.get(rolloutPath)).toBe(1)
+    expect(observed.closed.get(rolloutPath)).toBe(1)
+  })
+
+  it('hard-limits an unterminated metadata search instead of buffering the whole line', async () => {
+    const observed = observeRolloutReads()
+    const { service, codexHome } = await createFixture({ openRollout: observed.openRollout })
+    const rolloutPath = join(codexHome, 'archived_sessions', 'rollout-no-meta-huge-line.jsonl')
+    const handle = await open(rolloutPath, 'w')
+    try {
+      await handle.write(Buffer.from('{"type":"diagnostic","payload":"unterminated'))
+      await handle.truncate(64 * 1024 * 1024)
+    } finally {
+      await handle.close()
+    }
+
+    const preview = await service.preview('stone')
+
+    expect(preview.rolloutFilesWithoutSessionMeta).toBe(1)
+    expect(observed.bytes.get(rolloutPath)).toBe(16 * 1024 * 1024)
+    expect(observed.opened.get(rolloutPath)).toBe(1)
+    expect(observed.closed.get(rolloutPath)).toBe(1)
+  })
+
+  it('closes the rollout handle when a bounded read fails', async () => {
+    let failedPath = ''
+    let closedFailedHandle = false
+    const { service, codexHome } = await createFixture({
+      openRollout: async (path) => {
+        const handle = await open(path, 'r')
+        return {
+          read: async (buffer, offset, length, position) => {
+            if (path === failedPath) throw new Error('simulated bounded read failure')
+            return handle.read(buffer, offset, length, position)
+          },
+          close: async () => {
+            if (path === failedPath) closedFailedHandle = true
+            await handle.close()
+          },
+        }
+      },
+    })
+    failedPath = join(codexHome, 'sessions', '2026', '07', '18', 'rollout-2026-07-18T11-00-00-read-error.jsonl')
+    await writeFile(failedPath, JSON.stringify({ type: 'session_meta', payload: { id: 'read-error' } }) + '\n')
+
+    await expect(service.preview('stone')).rejects.toThrow('simulated bounded read failure')
+    expect(closedFailedHandle).toBe(true)
+  })
+
   it('backs up and repairs rollout metadata and SQLite visibility indexes without changing conversation content or mtime', async () => {
     const { service, activeRollout, activeLines, databasePath, originalMtime } = await createFixture()
     const preview = await service.preview('stone')
@@ -128,7 +272,13 @@ describe('CodexSessionRepairService', () => {
     expect(result.backupPath).toBeTruthy()
     const repairedText = await readFile(activeRollout, 'utf8')
     const repairedLines = repairedText.trim().split(/\r?\n/).map((line) => JSON.parse(line) as Record<string, unknown>)
-    expect((repairedLines[0].payload as Record<string, unknown>).model_provider).toBe('stone')
+    expect(repairedLines[0].payload).toEqual({
+      id: 'thread-one',
+      cwd: '\\\\?\\D:\\project\\stone+',
+      model_provider: 'stone',
+      reasoning_effort: 'ultra',
+      unknown_nested: { keep: { value: 7, labels: ['purple', 'unchanged'] } },
+    })
     expect(repairedText).toContain('keep this text')
     expect((await stat(activeRollout)).mtimeMs).toBeCloseTo(originalMtime.getTime(), -2)
     expect(await readFile(join(result.backupPath!, 'rollouts', 'sessions', '2026', '07', '18', 'rollout-2026-07-18T12-00-00-thread-one.jsonl'), 'utf8')).toBe(activeLines)
@@ -138,10 +288,17 @@ describe('CodexSessionRepairService', () => {
     })
 
     const database = new DatabaseSync(databasePath, { readOnly: true })
-    const threadOne = database.prepare('SELECT model_provider, has_user_event, cwd FROM threads WHERE id = ?').get('thread-one') as Record<string, unknown>
+    const threadOne = database.prepare('SELECT model_provider, has_user_event, cwd, title, reasoning_effort, unknown_json FROM threads WHERE id = ?').get('thread-one') as Record<string, unknown>
     const orphan = database.prepare('SELECT model_provider FROM threads WHERE id = ?').get('orphan-thread') as Record<string, unknown>
     database.close()
-    expect(threadOne).toEqual(expect.objectContaining({ model_provider: 'stone', has_user_event: 1, cwd: 'D:/project/stone+' }))
+    expect(threadOne).toEqual({
+      model_provider: 'stone',
+      has_user_event: 1,
+      cwd: 'D:/project/stone+',
+      title: 'One',
+      reasoning_effort: 'ultra',
+      unknown_json: '{"keep":{"value":7}}',
+    })
     expect(orphan.model_provider).toBe('stone')
 
     const after = await service.preview('stone')
@@ -149,6 +306,57 @@ describe('CodexSessionRepairService', () => {
     expect(after.sqliteProviderRowsToUpdate).toBe(0)
     expect(after.sqliteUserEventRowsToUpdate).toBe(0)
     expect(after.sqliteCwdRowsToUpdate).toBe(0)
+  })
+
+  it('recognizes and repairs a session_meta line larger than the old 1 MiB scan prefix', async () => {
+    const { service, codexHome } = await createFixture()
+    const directory = join(codexHome, 'sessions', '2026', '07', '19')
+    await mkdir(directory, { recursive: true })
+    const rolloutPath = join(directory, 'rollout-2026-07-19T12-00-00-large-meta.jsonl')
+    const oversizedInstructions = 'x'.repeat(1024 * 1024 + 4096)
+    await writeFile(rolloutPath, [
+      JSON.stringify({ type: 'response_item', payload: { type: 'message', role: 'system' } }),
+      JSON.stringify({
+        timestamp: '2026-07-19T12:00:00Z',
+        type: 'session_meta',
+        payload: {
+          id: 'large-meta',
+          cwd: 'D:\\project\\large',
+          // Older official Codex rollouts may omit this optional field entirely.
+          base_instructions: oversizedInstructions,
+        },
+      }),
+      JSON.stringify({ type: 'event_msg', payload: { type: 'user_message', message: 'keep' } }),
+    ].join('\n') + '\n')
+
+    const preview = await service.preview('stone')
+    expect(preview).toMatchObject({
+      sessionFiles: 2,
+      rolloutFilesWithSessionMeta: 3,
+      rolloutFilesWithoutSessionMeta: 0,
+      rolloutFilesAlreadyTargetProvider: 1,
+      rolloutFilesToUpdate: 2,
+    })
+
+    await service.repair('stone', preview.revision)
+    const repairedLines = (await readFile(rolloutPath, 'utf8')).trim().split(/\r?\n/)
+    const repairedMeta = JSON.parse(repairedLines[1]) as { payload: Record<string, unknown> }
+    expect(repairedMeta.payload.model_provider).toBe('stone')
+    expect(repairedMeta.payload.base_instructions).toBe(oversizedInstructions)
+  })
+
+  it('reports discovered rollout files whose session metadata is genuinely absent', async () => {
+    const { service, codexHome } = await createFixture()
+    const path = join(codexHome, 'archived_sessions', 'rollout-no-session-meta.jsonl')
+    await writeFile(path, JSON.stringify({ type: 'event_msg', payload: { type: 'user_message', message: 'legacy' } }) + '\n')
+
+    const preview = await service.preview('stone')
+    expect(preview).toMatchObject({
+      rolloutFilesWithSessionMeta: 2,
+      rolloutFilesWithoutSessionMeta: 1,
+      rolloutFilesAlreadyTargetProvider: 1,
+      rolloutFilesToUpdate: 1,
+    })
   })
 
   it('rolls back committed rollout bytes when restoring the original mtime fails', async () => {
@@ -349,5 +557,74 @@ describe('CodexSessionRepairService', () => {
     expect(result.globalStateFieldsUpdated).toBe(1)
     expect(await readFile(indexPath, 'utf8')).toBe(indexText)
     expect((JSON.parse(await readFile(join(codexHome, '.codex-global-state.json'), 'utf8')) as Record<string, unknown>)['active-workspace-roots']).toBe('D:/only-global')
+  })
+
+  it('scans rollout files with bounded concurrency and reports monotonic progress', async () => {
+    let active = 0
+    let peak = 0
+    const progress: number[] = []
+    const openRollout: NonNullable<SessionRepairOptions['openRollout']> = async (path) => {
+      const handle = await open(path, 'r')
+      active += 1
+      peak = Math.max(peak, active)
+      return {
+        read: async (buffer, offset, length, position) => {
+          await new Promise((resolve) => setTimeout(resolve, 10))
+          return handle.read(buffer, offset, length, position)
+        },
+        close: async () => {
+          active -= 1
+          await handle.close()
+        },
+      }
+    }
+    const { service, codexHome } = await createFixture({ openRollout, scanConcurrency: 2 })
+    await writeFile(join(codexHome, 'archived_sessions', 'rollout-extra.jsonl'), JSON.stringify({
+      type: 'session_meta',
+      payload: { id: 'thread-extra', model_provider: 'openai' },
+    }) + '\n')
+
+    await service.preview('stone', {
+      onProgress: (event) => {
+        if (event.stage === 'scan') progress.push(event.completed)
+      },
+    })
+
+    expect(peak).toBe(2)
+    expect(active).toBe(0)
+    expect(progress).toEqual([1, 2, 3])
+  })
+
+  it('cancels scanning without leaking rollout handles or writing session data', async () => {
+    const controller = new AbortController()
+    let opened = 0
+    let closed = 0
+    const openRollout: NonNullable<SessionRepairOptions['openRollout']> = async (path) => {
+      const handle = await open(path, 'r')
+      opened += 1
+      return {
+        read: async (buffer, offset, length, position) => {
+          controller.abort(new Error('会话修复已取消。'))
+          return handle.read(buffer, offset, length, position)
+        },
+        close: async () => {
+          closed += 1
+          await handle.close()
+        },
+      }
+    }
+    const { service, activeRollout, activeLines } = await createFixture({ openRollout, scanConcurrency: 2 })
+
+    await expect(service.preview('stone', { signal: controller.signal })).rejects.toThrow('已取消')
+    expect(closed).toBe(opened)
+    expect(await readFile(activeRollout, 'utf8')).toBe(activeLines)
+  })
+
+  it('fails closed when rollout discovery exceeds the configured safety limit', async () => {
+    const { service, codexHome, activeRollout, activeLines } = await createFixture({ maxRolloutFiles: 1 })
+
+    await expect(service.preview('stone')).rejects.toThrow('安全扫描上限')
+    expect(await readFile(activeRollout, 'utf8')).toBe(activeLines)
+    await expect(stat(join(codexHome, 'backups_state'))).rejects.toMatchObject({ code: 'ENOENT' })
   })
 })

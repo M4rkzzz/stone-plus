@@ -340,16 +340,49 @@ describe('protocol usage extraction', () => {
     })
   })
 
-  it('normalizes Anthropic cache usage without guessing it into input totals', () => {
+  it('normalizes Anthropic cached reads and cache creation into complete input totals', () => {
     expect(extractProtocolUsage('anthropic-messages', {
       message: { usage: { input_tokens: 25, cache_read_input_tokens: 100 } },
-      usage: { output_tokens: 10, cache_creation_input_tokens: 40 }
+      usage: {
+        output_tokens: 10,
+        cache_creation_input_tokens: 40,
+        cache_creation: {
+          ephemeral_5m_input_tokens: 30,
+          ephemeral_1h_input_tokens: 10
+        },
+        output_tokens_details: { thinking_tokens: 6 }
+      }
     })).toEqual({
-      inputTokens: 25,
+      inputTokens: 165,
       outputTokens: 10,
-      totalTokens: 35,
+      totalTokens: 175,
       cachedInputTokens: 100,
-      cacheCreationInputTokens: 40
+      cacheCreationInputTokens: 40,
+      cacheCreation5mInputTokens: 30,
+      cacheCreation1hInputTokens: 10,
+      reasoningTokens: 6
+    })
+  })
+
+  it('derives aggregate Anthropic cache creation from the 5m and 1h breakdown', () => {
+    expect(extractProtocolUsage('anthropic-messages', {
+      usage: {
+        input_tokens: 5,
+        output_tokens: 2,
+        cache_read_input_tokens: 3,
+        cache_creation: {
+          ephemeral_5m_input_tokens: 4,
+          ephemeral_1h_input_tokens: 6
+        }
+      }
+    })).toEqual({
+      inputTokens: 18,
+      outputTokens: 2,
+      totalTokens: 20,
+      cachedInputTokens: 3,
+      cacheCreationInputTokens: 10,
+      cacheCreation5mInputTokens: 4,
+      cacheCreation1hInputTokens: 6
     })
   })
 

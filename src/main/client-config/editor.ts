@@ -3,7 +3,7 @@ import type { ClientConfigEditorFile } from '@shared/types'
 import { parseJsonObject, stringifyJsonObject, type JsonObject } from './json-format'
 import { parseCodexToml, patchCodexTomlPaths, type TomlValue } from './toml-format'
 import type { ClientConfigFilePath } from './types'
-import { ClientConfigValidationError } from './types'
+import { ClientConfigParseError, ClientConfigValidationError } from './types'
 
 export const protectedValuePlaceholder = '__STONE_PROTECTED_VALUE__'
 const dotenvAssignment = /^(\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)(?:\s*=\s*))(.*)$/
@@ -60,7 +60,7 @@ export function createClientConfigEditorFile(
     ? protectJsonDocument(initial, file.role)
     : file.format === 'dotenv'
       ? protectDotenv(initial)
-      : protectTomlDocument(initial)
+      : protectTomlDocument(initial, file.role)
   return {
     role: file.role,
     path: file.path,
@@ -87,7 +87,7 @@ export function restoreClientConfigEditorContent(
   if (file.role === 'claude-mcp') return restoreClaudeMcp(draft, original)
   if (file.format === 'json') return restoreJsonDocument(draft, original, file.role)
   if (file.format === 'dotenv') return restoreDotenv(draft, original)
-  return restoreTomlDocument(draft, original)
+  return restoreTomlDocument(draft, original, file.role)
 }
 
 /**
@@ -152,31 +152,66 @@ function tomlValueAt(root: Record<string, unknown>, path: readonly string[]): un
   return current
 }
 
-function protectTomlDocument(content: string): { content: string; count: number } {
-  const root = parseCodexToml(content)
+function protectTomlDocument(
+  content: string,
+  role: ClientConfigFilePath['role'],
+): { content: string; count: number } {
+  const root = parseTomlForRole(content, role)
   const protectedPaths = collectSensitiveTomlPaths(root)
   if (!protectedPaths.length) return { content, count: 0 }
-  return {
-    content: patchCodexTomlPaths(content, protectedPaths.map((path) => ({
-      path,
-      value: protectedValuePlaceholder,
-    }))).content,
-    count: protectedPaths.length,
+  try {
+    return {
+      content: patchCodexTomlPaths(content, protectedPaths.map((path) => ({
+        path,
+        value: protectedValuePlaceholder,
+      }))).content,
+      count: protectedPaths.length,
+    }
+  } catch (error) {
+    throw tomlRoleError(error, role)
   }
 }
 
-function restoreTomlDocument(draft: string, original: string): string {
-  const draftRoot = parseCodexToml(draft)
-  const originalRoot = parseCodexToml(original)
+function restoreTomlDocument(
+  draft: string,
+  original: string,
+  role: ClientConfigFilePath['role'],
+): string {
+  const draftRoot = parseTomlForRole(draft, role)
+  const originalRoot = parseTomlForRole(original, role)
   const placeholderPaths = collectTomlPlaceholderPaths(draftRoot)
   if (!placeholderPaths.length) return draft
-  return patchCodexTomlPaths(draft, placeholderPaths.map((path) => {
-    const value = tomlValueAt(originalRoot, path)
-    if (!isTomlValue(value)) {
-      throw new ClientConfigValidationError('A protected value in codex-config no longer exists')
-    }
-    return { path, value }
-  })).content
+  try {
+    return patchCodexTomlPaths(draft, placeholderPaths.map((path) => {
+      const value = tomlValueAt(originalRoot, path)
+      if (!isTomlValue(value)) {
+        throw new ClientConfigValidationError(`A protected value in ${role} no longer exists`)
+      }
+      return { path, value }
+    })).content
+  } catch (error) {
+    if (error instanceof ClientConfigValidationError) throw error
+    throw tomlRoleError(error, role)
+  }
+}
+
+function parseTomlForRole(
+  content: string,
+  role: ClientConfigFilePath['role'],
+): Record<string, unknown> {
+  try {
+    return parseCodexToml(content)
+  } catch (error) {
+    throw tomlRoleError(error, role)
+  }
+}
+
+function tomlRoleError(error: unknown, role: ClientConfigFilePath['role']): ClientConfigParseError {
+  if (error instanceof ClientConfigParseError && error.role === role) return error
+  const detail = error instanceof Error
+    ? error.message.replace(/^Cannot parse [^:]+:\s*/, '')
+    : 'invalid TOML'
+  return new ClientConfigParseError(role, detail)
 }
 
 function projectClaudeMcp(source: string | undefined): string {

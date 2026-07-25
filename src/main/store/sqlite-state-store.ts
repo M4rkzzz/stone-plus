@@ -3,7 +3,8 @@ import { chmod, copyFile, mkdir, open, readFile, rename, rm } from 'node:fs/prom
 import { basename, dirname, join } from 'node:path'
 import { backup, DatabaseSync } from 'node:sqlite'
 import { randomUUID } from 'node:crypto'
-import { estimateOpenAiTokenCosts } from '@shared/openai-pricing'
+import { AsyncLocalStorage } from 'node:async_hooks'
+import { estimateOpenAiTokenCosts, resolveModelPricing } from '@shared/openai-pricing'
 import type {
   CodexQuotaHistoryPoint,
   OpenAiTokenCostBreakdown,
@@ -15,6 +16,7 @@ const CURRENT_SCHEMA_VERSION = 9
 const STATE_INITIALIZED_KEY = 'state_initialized'
 const LEGACY_IMPORT_KEY = 'legacy_json_import'
 const LIFETIME_TOKEN_COSTS_KEY = 'lifetime_token_costs_v1'
+const TOKEN_PRICING_CATALOG_REVISION = 2
 
 const TOKEN_COST_NUMBER_KEYS = [
   'totalTokens',
@@ -37,6 +39,8 @@ const TOKEN_COST_NUMBER_KEYS = [
 
 interface LifetimeTokenCostState {
   version: 1
+  /** Revision of the model-price catalog already applied to retained logs. */
+  pricingRevision: number
   breakdown: OpenAiTokenCostBreakdown
   /** Counts are retained separately so an in-place request update can remove
    * the final occurrence of an unknown model without losing set semantics. */
@@ -306,6 +310,9 @@ export class SqliteStateStore<T extends SqlitePersistedShape> {
     }>
   }>()
   private requestLogFlushScheduled = false
+  private restoreMaintenance = false
+  private restoreCommittedInMaintenance = false
+  private readonly restoreMaintenanceContext = new AsyncLocalStorage<boolean>()
 
   public constructor(private readonly options: SqliteStateStoreOptions<T>) {
     this.data = this.normalize(options.initialData)
@@ -316,6 +323,7 @@ export class SqliteStateStore<T extends SqlitePersistedShape> {
   public async initialize(): Promise<T> {
     if (this.database) return this.read()
 
+    let initializationBackupPath: string | undefined
     await mkdir(dirname(this.options.databasePath), { recursive: true, mode: 0o700 })
     await secureDatabaseFile(this.options.databasePath)
     const database = new DatabaseSync(this.options.databasePath)
@@ -323,10 +331,26 @@ export class SqliteStateStore<T extends SqlitePersistedShape> {
 
     try {
       configureDatabase(database)
+      const schemaVersion = readUserVersion(database)
+      if (schemaVersion > 0 && schemaVersion < CURRENT_SCHEMA_VERSION) {
+        initializationBackupPath = await createPreMigrationBackup(
+          database,
+          this.options.databasePath,
+          schemaVersion,
+          CURRENT_SCHEMA_VERSION,
+        )
+      }
       runMigrations(database)
 
       if (readMetadata(database, STATE_INITIALIZED_KEY) === '1') {
-        this.data = this.readDatabaseState(database)
+        this.data = await this.readDatabaseState(database, async () => {
+          initializationBackupPath ??= await createPreMigrationBackup(
+            database,
+            this.options.databasePath,
+            readUserVersion(database),
+            CURRENT_SCHEMA_VERSION,
+          )
+        })
       } else {
         const legacy = await readLegacyState<T>(this.options.legacyJsonPath)
         const initial = this.normalize(legacy ?? this.options.initialData)
@@ -348,6 +372,14 @@ export class SqliteStateStore<T extends SqlitePersistedShape> {
           throw new Error('Lifetime token ledger metadata is invalid; refusing to discard cumulative history')
         }
       }
+      if (this.lifetimeTokenCosts.pricingRevision < TOKEN_PRICING_CATALOG_REVISION) {
+        this.lifetimeTokenCosts = upgradeLifetimeTokenPricing(
+          this.lifetimeTokenCosts,
+          this.data.requestLogs,
+          Date.now()
+        )
+        writeMetadata(database, LIFETIME_TOKEN_COSTS_KEY, JSON.stringify(this.lifetimeTokenCosts))
+      }
 
       if (process.platform !== 'win32') {
         await chmod(this.options.databasePath, 0o600)
@@ -363,7 +395,36 @@ export class SqliteStateStore<T extends SqlitePersistedShape> {
       this.telemetryDatabase = undefined
       database.close()
       this.database = undefined
+      if (initializationBackupPath) {
+        try {
+          await restorePreMigrationBackup(initializationBackupPath, this.options.databasePath)
+        } catch (recoveryError) {
+          throw new Error(
+            `Unable to initialize SQLite state (${messageOf(error)}); `
+            + `pre-migration recovery also failed (${messageOf(recoveryError)})`,
+          )
+        }
+      }
       throw new Error(`Unable to initialize SQLite state: ${messageOf(error)}`)
+    }
+  }
+
+  /**
+   * Stops accepting ordinary writes, drains work accepted before the barrier,
+   * and runs the restore generation as the sole writer. Once restoreFrom has
+   * committed, the repository intentionally stays read-only until process
+   * restart so a stale renderer cannot write its pre-restore snapshot back.
+   */
+  public async runInRestoreMaintenance<TResult>(operation: () => Promise<TResult>): Promise<TResult> {
+    if (this.restoreMaintenance) throw new Error('SQLite state restore is already in progress')
+    this.restoreMaintenance = true
+    this.restoreCommittedInMaintenance = false
+    await this.writeChain
+    try {
+      return await this.restoreMaintenanceContext.run(true, operation)
+    } catch (error) {
+      if (!this.restoreCommittedInMaintenance) this.restoreMaintenance = false
+      throw error
     }
   }
 
@@ -390,10 +451,12 @@ export class SqliteStateStore<T extends SqlitePersistedShape> {
   }
 
   public async writeAppMetadata(key: string, value: string): Promise<void> {
+    this.assertWriteAllowed()
     await this.mutateAppMetadata((database) => writeMetadata(database, key, value))
   }
 
   public async removeAppMetadata(key: string): Promise<void> {
+    this.assertWriteAllowed()
     await this.mutateAppMetadata((database) => {
       database.prepare('DELETE FROM app_metadata WHERE key = ?').run(key)
     })
@@ -413,6 +476,7 @@ export class SqliteStateStore<T extends SqlitePersistedShape> {
     mutator: (draft: T) => void | Promise<void>,
     sections?: readonly SqliteStateSection[]
   ): Promise<void> {
+    this.assertWriteAllowed()
     const operation = async (): Promise<void> => {
       this.requireDatabase()
       const next = sections ? this.createMutationDraft(sections) : this.read()
@@ -450,6 +514,7 @@ export class SqliteStateStore<T extends SqlitePersistedShape> {
   }
 
   public appendRequestLog(log: Identified, maximumRows: number): Promise<void> {
+    this.assertWriteAllowed()
     const detached = structuredClone(log)
     const completion = new Promise<void>((resolve, reject) => {
       const pending = this.pendingRequestLogs.get(detached.id)
@@ -555,6 +620,7 @@ export class SqliteStateStore<T extends SqlitePersistedShape> {
 
   /** Appends a bounded health event without rewriting unrelated state tables. */
   public async appendHealthEvent<TEvent extends Identified>(event: TEvent, maximumRows: number): Promise<void> {
+    this.assertWriteAllowed()
     const detached = structuredClone(event)
     const operation = async (): Promise<void> => {
       const database = this.requireTelemetryDatabase()
@@ -596,6 +662,7 @@ export class SqliteStateStore<T extends SqlitePersistedShape> {
   public async clearRequestLogs<TLog extends Identified>(
     trackedIds: ReadonlySet<string> = new Set()
   ): Promise<TLog[]> {
+    this.assertWriteAllowed()
     const tracked = new Set(trackedIds)
     const operation = async (): Promise<TLog[]> => {
       const trackedLogs = this.data.requestLogs
@@ -618,6 +685,7 @@ export class SqliteStateStore<T extends SqlitePersistedShape> {
     next: RequestLog,
     previous?: RequestLog
   ): Promise<void> {
+    this.assertWriteAllowed()
     const detachedNext = structuredClone(next)
     const detachedPrevious = previous ? structuredClone(previous) : undefined
     const operation = async (): Promise<void> => {
@@ -650,6 +718,7 @@ export class SqliteStateStore<T extends SqlitePersistedShape> {
   public async updateRequestLogs<TLog extends Identified>(
     transform: (log: Readonly<TLog>) => TLog | undefined
   ): Promise<number> {
+    this.assertWriteAllowed()
     const operation = async (): Promise<number> => {
       const database = this.requireTelemetryDatabase()
       const replacements = new Map<string, TLog>()
@@ -695,6 +764,7 @@ export class SqliteStateStore<T extends SqlitePersistedShape> {
 
   /** Clears health history using its table directly rather than a full-state persist. */
   public async clearHealthEvents(): Promise<void> {
+    this.assertWriteAllowed()
     const operation = async (): Promise<void> => {
       this.requireDatabase().exec('DELETE FROM health_events')
       this.data = { ...this.data, healthEvents: [] }
@@ -722,6 +792,7 @@ export class SqliteStateStore<T extends SqlitePersistedShape> {
     mutator: (account: TAccount, id: string) => void,
     quotaSample?: (account: Readonly<TAccount>, id: string) => CodexQuotaHistoryPoint | undefined
   ): Promise<TAccount[]> {
+    this.assertWriteAllowed()
     const uniqueIds = [...new Set(ids)]
     if (uniqueIds.length === 0) return []
     const operation = async (): Promise<TAccount[]> => {
@@ -796,6 +867,7 @@ export class SqliteStateStore<T extends SqlitePersistedShape> {
     mutator: (account: TAccount) => void,
     expectedEncryptedValue?: string
   ): Promise<TAccount> {
+    this.assertWriteAllowed()
     const operation = async (): Promise<TAccount> => {
       const database = this.requireDatabase()
       const indexed = this.accountsById.get(accountId)
@@ -862,6 +934,7 @@ export class SqliteStateStore<T extends SqlitePersistedShape> {
     bucketSizeMs = 5 * 60 * 1000,
     retentionMs = 14 * 24 * 60 * 60 * 1000
   ): Promise<void> {
+    this.assertWriteAllowed()
     const batch = normalizeCodexQuotaSamples(samples, bucketSizeMs)
     if (batch.length === 0) return
     const operation = async (): Promise<void> => {
@@ -902,6 +975,7 @@ export class SqliteStateStore<T extends SqlitePersistedShape> {
   }
 
   public async pruneCodexQuotaHistory(cutoff: number): Promise<void> {
+    this.assertWriteAllowed()
     if (!Number.isFinite(cutoff)) return
     const operation = async (): Promise<void> => {
       this.requireTelemetryDatabase().prepare('DELETE FROM account_codex_quota_samples WHERE observed_at < ?').run(cutoff)
@@ -912,6 +986,7 @@ export class SqliteStateStore<T extends SqlitePersistedShape> {
   }
 
   public async deleteCodexQuotaHistory(accountId: string): Promise<void> {
+    this.assertWriteAllowed()
     const operation = async (): Promise<void> => {
       this.requireTelemetryDatabase().prepare('DELETE FROM account_codex_quota_samples WHERE account_id = ?').run(accountId)
     }
@@ -945,6 +1020,7 @@ export class SqliteStateStore<T extends SqlitePersistedShape> {
   }
 
   public async upsertPersistentTask(task: PersistentTask): Promise<void> {
+    this.assertWriteAllowed()
     const detached = structuredClone(task)
     const operation = async (): Promise<void> => {
       this.requireDatabase().prepare(`
@@ -963,6 +1039,7 @@ export class SqliteStateStore<T extends SqlitePersistedShape> {
   }
 
   public async deletePersistentTask(id: string): Promise<void> {
+    this.assertWriteAllowed()
     const operation = async (): Promise<void> => {
       this.requireDatabase().prepare('DELETE FROM persistent_tasks WHERE id = ?').run(id)
     }
@@ -972,6 +1049,7 @@ export class SqliteStateStore<T extends SqlitePersistedShape> {
   }
 
   public async prunePersistentTasks(cutoff: number, maximumTerminalRows: number): Promise<number> {
+    this.assertWriteAllowed()
     const normalizedCutoff = Number.isFinite(cutoff) ? Math.floor(cutoff) : 0
     const normalizedMaximum = Math.max(0, Math.floor(maximumTerminalRows))
     const operation = async (): Promise<number> => {
@@ -1004,6 +1082,7 @@ export class SqliteStateStore<T extends SqlitePersistedShape> {
   }
 
   public async clearTerminalPersistentTasks(): Promise<number> {
+    this.assertWriteAllowed()
     const operation = async (): Promise<number> => {
       const result = this.requireDatabase().prepare(`
         DELETE FROM persistent_tasks WHERE status IN ('completed', 'cancelled', 'failed')
@@ -1016,6 +1095,7 @@ export class SqliteStateStore<T extends SqlitePersistedShape> {
   }
 
   public async backupTo(destinationPath: string): Promise<number> {
+    this.assertWriteAllowed()
     const operation = async (): Promise<number> => backup(this.requireDatabase(), destinationPath)
     const pending = this.writeChain.then(operation, operation)
     this.writeChain = pending.then(
@@ -1026,6 +1106,7 @@ export class SqliteStateStore<T extends SqlitePersistedShape> {
   }
 
   public async restoreFrom(stagedDatabasePath: string, rollbackDatabasePath: string): Promise<T> {
+    this.assertWriteAllowed()
     const operation = async (): Promise<T> => {
       const database = this.requireDatabase()
       const rollbackTemporaryPath = join(
@@ -1046,7 +1127,9 @@ export class SqliteStateStore<T extends SqlitePersistedShape> {
         this.database = undefined
         databaseClosed = true
         await replaceDatabaseFile(stagedDatabasePath, this.options.databasePath)
-        return await this.initialize()
+        const restored = await this.initialize()
+        if (this.restoreMaintenanceContext.getStore()) this.restoreCommittedInMaintenance = true
+        return restored
       } catch (restoreError) {
         await rm(rollbackTemporaryPath, { force: true }).catch(() => undefined)
         if (!databaseClosed) {
@@ -1183,6 +1266,12 @@ export class SqliteStateStore<T extends SqlitePersistedShape> {
     return this.lifetimeTokenCosts
   }
 
+  private assertWriteAllowed(): void {
+    if (this.restoreMaintenance && !this.restoreMaintenanceContext.getStore()) {
+      throw new Error('Stone+ state is read-only after database restore; restart Stone+ before making changes')
+    }
+  }
+
   private persist(
     state: T,
     legacyImport?: { importedAt: number; source: string },
@@ -1251,7 +1340,10 @@ export class SqliteStateStore<T extends SqlitePersistedShape> {
     }
   }
 
-  private readDatabaseState(database: DatabaseSync): T {
+  private async readDatabaseState(
+    database: DatabaseSync,
+    beforeNormalizationPersist: () => Promise<void>,
+  ): Promise<T> {
     const gatewayRow = database.prepare('SELECT payload FROM gateway_settings WHERE singleton = 1').get() as
       | { payload: string }
       | undefined
@@ -1290,7 +1382,10 @@ export class SqliteStateStore<T extends SqlitePersistedShape> {
         : []
     } as T
     const normalized = this.normalize(stored)
-    if (JSON.stringify(normalized) !== JSON.stringify(stored)) this.persist(normalized)
+    if (JSON.stringify(normalized) !== JSON.stringify(stored)) {
+      await beforeNormalizationPersist()
+      this.persist(normalized)
+    }
     return normalized
   }
 }
@@ -1491,6 +1586,11 @@ function parseLifetimeTokenCostState(serialized: string): LifetimeTokenCostState
     const updatedAt = finiteTimestamp(candidate.updatedAt) ?? initializedAt
     return {
       version: 1,
+      pricingRevision: typeof candidate.pricingRevision === 'number'
+        && Number.isSafeInteger(candidate.pricingRevision)
+        && candidate.pricingRevision > 0
+        ? candidate.pricingRevision
+        : 1,
       breakdown: normalizedBreakdown,
       unknownModelCounts,
       initializedAt,
@@ -1536,11 +1636,85 @@ function createLifetimeTokenCostState(
     .sort((left, right) => left.localeCompare(right))
   return {
     version: 1,
+    pricingRevision: TOKEN_PRICING_CATALOG_REVISION,
     breakdown,
     unknownModelCounts,
     initializedAt: now,
     updatedAt: now
   }
+}
+
+/**
+ * Reclassifies only retained rows whose original token details still prove the
+ * new price. Aggregated history that has already been pruned remains unpriced:
+ * the v1 ledger intentionally has no per-model token split from which a safe
+ * historical bill could be reconstructed.
+ */
+function upgradeLifetimeTokenPricing(
+  current: Readonly<LifetimeTokenCostState>,
+  retainedLogs: readonly Identified[],
+  now: number
+): LifetimeTokenCostState {
+  const breakdown = structuredClone(current.breakdown)
+  const unknownModelCounts: Record<string, number> = Object.assign(
+    Object.create(null),
+    current.unknownModelCounts
+  )
+  for (const value of retainedLogs) {
+    if (!isTokenCostRequestLog(value)) continue
+    const model = tokenCostModel(value)
+    if ((unknownModelCounts[model] ?? 0) <= 0 || !safeToRepriceRetainedLog(value)) continue
+    const contribution = estimateOpenAiTokenCosts([value])
+    if (contribution.pricedRequestCount !== 1 || contribution.pricedTokens <= 0) continue
+
+    breakdown.unpricedTokens = nonNegativeFinite(breakdown.unpricedTokens - contribution.pricedTokens)
+    breakdown.pricedTokens += contribution.pricedTokens
+    breakdown.unpricedRequestCount = nonNegativeFinite(breakdown.unpricedRequestCount - 1)
+    breakdown.pricedRequestCount += 1
+    breakdown.standardInputTokens += contribution.standardInputTokens
+    breakdown.cachedInputTokens += contribution.cachedInputTokens
+    breakdown.cacheWriteInputTokens += contribution.cacheWriteInputTokens
+    breakdown.inputCostUsd += contribution.inputCostUsd
+    breakdown.cachedInputCostUsd += contribution.cachedInputCostUsd
+    breakdown.cacheWriteCostUsd += contribution.cacheWriteCostUsd
+    breakdown.outputCostUsd += contribution.outputCostUsd
+    breakdown.totalCostUsd += contribution.totalCostUsd
+    breakdown.longContextRequestCount += contribution.longContextRequestCount
+    adjustUnknownModelCount(unknownModelCounts, model, -1)
+  }
+  breakdown.unknownModels = Object.keys(unknownModelCounts)
+    .sort((left, right) => left.localeCompare(right))
+  if (!validLifetimeTokenCostBreakdown(breakdown, unknownModelCounts)) {
+    throw new Error('Lifetime token ledger pricing migration is inconsistent; refusing to rewrite cumulative history')
+  }
+  return {
+    version: 1,
+    pricingRevision: TOKEN_PRICING_CATALOG_REVISION,
+    breakdown,
+    unknownModelCounts,
+    initializedAt: current.initializedAt,
+    updatedAt: now
+  }
+}
+
+function safeToRepriceRetainedLog(log: Readonly<RequestLog>): boolean {
+  const pricing = resolveModelPricing(tokenCostModel(log), log.timestamp)
+  if (!pricing) return false
+  if (log.tokenAccountingVersion === 2 || pricing.family === 'grok-4.5') return true
+  // Old Anthropic cache counters used different input semantics in streaming
+  // and buffered paths. Cache-free rows remain exact; cached rows do not.
+  return !positiveTokenCount(log.cachedInputTokens)
+    && !positiveTokenCount(log.cacheWriteInputTokens)
+    && !positiveTokenCount(log.cacheWriteInputTokens5m)
+    && !positiveTokenCount(log.cacheWriteInputTokens1h)
+}
+
+function tokenCostModel(log: Readonly<RequestLog>): string {
+  return log.upstreamModel?.trim() || log.model.trim() || '未知模型'
+}
+
+function positiveTokenCount(value: number | undefined): boolean {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0
 }
 
 function applyLifetimeTokenCostReplacements(
@@ -1580,6 +1754,7 @@ function applyLifetimeTokenCostReplacements(
     .sort((left, right) => left.localeCompare(right))
   return {
     version: 1,
+    pricingRevision: current.pricingRevision,
     breakdown,
     unknownModelCounts,
     initializedAt: current.initializedAt,
@@ -1661,6 +1836,35 @@ async function secureDatabaseFile(path: string): Promise<void> {
   const handle = await open(path, 'a', 0o600)
   await handle.close()
   if (process.platform !== 'win32') await chmod(path, 0o600)
+}
+
+async function createPreMigrationBackup(
+  database: DatabaseSync,
+  databasePath: string,
+  sourceVersion: number,
+  targetVersion: number,
+): Promise<string> {
+  const destination = `${databasePath}.pre-migration-v${sourceVersion}-to-v${targetVersion}-${Date.now()}-${randomUUID()}.bak`
+  try {
+    await backup(database, destination)
+    if (process.platform !== 'win32') await chmod(destination, 0o600)
+    assertDatabaseIntegrity(destination)
+    return destination
+  } catch (error) {
+    await rm(destination, { force: true }).catch(() => undefined)
+    throw new Error(`Unable to create pre-migration SQLite backup: ${messageOf(error)}`)
+  }
+}
+
+async function restorePreMigrationBackup(backupPath: string, databasePath: string): Promise<void> {
+  const stage = join(dirname(databasePath), `.${SQLITE_DATABASE_FILENAME}.${randomUUID()}.migration-recovery`)
+  try {
+    await copyFile(backupPath, stage)
+    assertDatabaseIntegrity(stage)
+    await replaceDatabaseFile(stage, databasePath)
+  } finally {
+    await rm(stage, { force: true }).catch(() => undefined)
+  }
 }
 
 async function replaceDatabaseFile(sourcePath: string, databasePath: string): Promise<void> {

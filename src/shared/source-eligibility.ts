@@ -84,7 +84,14 @@ export function accountSupportsModel(
   if (requireProvider && !provider) return false
   if (!model) return true
   if (poolModelPolicy === 'selected' && !(poolModelAllowlist ?? []).includes(model)) return false
+  const relayProbeExposesModel = provider?.sourceType === 'relay' && provider.models.includes(model)
+  // An explicit per-account allowlist is authoritative. Provider discovery may
+  // fill an unrefreshed catalog, but must never reopen a model the user closed.
   if (account.modelPolicy === 'selected' && !account.modelAllowlist.includes(model)) return false
+  // Relay capability detection is provider-scoped. Once it has positively
+  // exposed a model, do not let an older per-account/default-model snapshot
+  // reject the same model before the request reaches the relay.
+  if (relayProbeExposesModel) return true
   // Before an account has been probed, provider catalogs are advisory and may
   // contain aliases or only a subset of models exposed by OAuth credentials.
   // Preserve the scheduler's established permissive behavior until the

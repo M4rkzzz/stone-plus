@@ -3,6 +3,7 @@ import { execFile, spawn, type ChildProcess } from 'node:child_process'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import type { BuiltInProxyPlatformCapabilities } from '@shared/types'
 import type {
   NormalizedSystemProxyLeaseTarget,
   SystemProxyCompareResult,
@@ -124,6 +125,37 @@ export interface SystemProxyPlatformAdapterFactoryOptions {
   platform?: NodeJS.Platform
   runner?: PlatformCommandRunner
   desktopEnvironment?: string
+}
+
+export function builtInProxyPlatformCapabilities(
+  platform: NodeJS.Platform = process.platform,
+  desktopEnvironment = process.env.XDG_CURRENT_DESKTOP
+): BuiltInProxyPlatformCapabilities {
+  const platformName = platform === 'win32' ? 'windows'
+    : platform === 'darwin' ? 'macos'
+      : platform === 'linux' ? 'linux'
+        : 'other'
+  const systemAvailable = platform === 'win32'
+    || platform === 'darwin'
+    || (platform === 'linux' && (!desktopEnvironment || /(^|:)(gnome|unity|budgie)(:|$)/i.test(desktopEnvironment)))
+  const tunAvailable = platform === 'win32' || platform === 'darwin' || platform === 'linux'
+  return {
+    platform: platformName,
+    accessModes: {
+      system: {
+        available: systemAvailable,
+        ...(!systemAvailable ? {
+          unavailableReason: platform === 'linux' ? 'unsupported-desktop' as const : 'unsupported-platform' as const
+        } : {}),
+        authorizationRequired: platform === 'darwin'
+      },
+      tun: {
+        available: tunAvailable,
+        ...(!tunAvailable ? { unavailableReason: 'unsupported-platform' as const } : {}),
+        authorizationRequired: tunAvailable
+      }
+    }
+  }
 }
 
 export function createSystemProxyPlatformAdapter(
@@ -763,6 +795,12 @@ export class MacOsSystemProxyPlatformAdapter implements SystemProxyPlatformAdapt
     }
   }
 
+  public async isSnapshotApplied(snapshot: SystemProxySnapshot): Promise<boolean> {
+    const expected = parseMacSnapshot(snapshot)
+    const observed = parseMacSnapshot(await this.captureSnapshot())
+    return stableJson(observed) === stableJson(expected)
+  }
+
   public async compareAndApplySnapshot(
     expected: SystemProxySnapshot,
     replacement: SystemProxySnapshot
@@ -1005,6 +1043,12 @@ export class GnomeSystemProxyPlatformAdapter implements SystemProxyPlatformAdapt
     }
   }
 
+  public async isSnapshotApplied(snapshot: SystemProxySnapshot): Promise<boolean> {
+    const expected = parseGnomeSnapshot(snapshot)
+    const observed = parseGnomeSnapshot(await this.captureSnapshot())
+    return stableJson(observed) === stableJson(expected)
+  }
+
   public async compareAndApplySnapshot(
     expected: SystemProxySnapshot,
     replacement: SystemProxySnapshot
@@ -1102,6 +1146,12 @@ export interface TemporaryElevatedProcessHandle {
 
 export interface TemporaryElevationProcessRunner {
   start(request: TemporaryElevatedProcessRequest): Promise<TemporaryElevatedProcessHandle>
+  /** Reattaches to a process recorded by a prior Stone+ process after verifying its exact command identity. */
+  recover?(request: TemporaryElevatedProcessRecoveryRequest): Promise<TemporaryElevatedProcessHandle | undefined>
+}
+
+export interface TemporaryElevatedProcessRecoveryRequest extends TemporaryElevatedProcessRequest {
+  pid: number
 }
 
 export interface SingBoxTemporaryTunAdapterOptions {
@@ -1274,6 +1324,77 @@ export class NativeTemporaryElevationProcessRunner implements TemporaryElevation
     }
   }
 
+  public async recover(
+    request: TemporaryElevatedProcessRecoveryRequest
+  ): Promise<TemporaryElevatedProcessHandle | undefined> {
+    if (!Number.isInteger(request.pid) || request.pid <= 0) return undefined
+    const matches = await this.recoveredProcessMatches(request)
+    if (!matches) return undefined
+    const exit = observeProcessIdExit(request.pid)
+    return {
+      id: `recovered-${request.launcher}-${request.pid}`,
+      pid: request.pid,
+      exit,
+      stop: request.launcher === 'windows-uac'
+        ? () => this.stopRecoveredWindowsUac(request)
+        : async () => {
+            const launcher = request.launcher === 'macos-sudo' ? 'macos-sudo' : 'linux-pkexec'
+            for (const signal of ['TERM', 'KILL'] as const) {
+              if (launcher === 'macos-sudo') {
+                await this.runMacOsSudo(['/bin/kill', `-${signal}`, '--', `-${request.pid}`], `tun.recover.macos-${signal.toLowerCase()}`)
+              } else {
+                await runChecked(this.commandRunner, {
+                  file: 'pkexec',
+                  args: ['/bin/kill', `-${signal}`, '--', `-${request.pid}`],
+                  timeoutMs: 120_000,
+                  operation: `tun.recover.linux-${signal.toLowerCase()}`
+                })
+              }
+              if (!isProcessRunning(request.pid)) return
+            }
+            throw new Error(`Recovered elevated TUN process ${request.pid} did not exit.`)
+          }
+    }
+  }
+
+  private async recoveredProcessMatches(request: TemporaryElevatedProcessRecoveryRequest): Promise<boolean> {
+    const expectedConfig = request.args.at(-1)
+    if (!expectedConfig) return false
+    if (request.launcher === 'windows-uac') {
+      const script = String.raw`
+$ErrorActionPreference = 'Stop'
+$p = [Console]::In.ReadToEnd() | ConvertFrom-Json
+$process = Get-CimInstance Win32_Process -Filter ("ProcessId = " + [int]$p.pid) -ErrorAction SilentlyContinue
+if ($null -eq $process) { [Console]::Out.Write('missing'); exit 0 }
+$exeMatches = [string]::Equals([IO.Path]::GetFullPath([string]$process.ExecutablePath), [IO.Path]::GetFullPath([string]$p.executablePath), [StringComparison]::OrdinalIgnoreCase)
+$commandMatches = ([string]$process.CommandLine).IndexOf([string]$p.configPath, [StringComparison]::OrdinalIgnoreCase) -ge 0
+[Console]::Out.Write($(if ($exeMatches -and $commandMatches) { 'match' } else { 'mismatch' }))
+`.trim()
+      const result = await runChecked(this.commandRunner, {
+        file: 'powershell.exe',
+        args: ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script],
+        input: JSON.stringify({ pid: request.pid, executablePath: request.executablePath, configPath: expectedConfig }),
+        timeoutMs: 10_000,
+        operation: 'tun.windows-uac.recover-identify'
+      })
+      return result.stdout.trim() === 'match'
+    }
+    let result: PlatformCommandResult
+    try {
+      result = await runChecked(this.commandRunner, {
+        file: '/bin/ps',
+        args: ['-p', String(request.pid), '-o', 'command='],
+        timeoutMs: 10_000,
+        operation: `tun.${request.launcher}.recover-identify`
+      })
+    } catch (error) {
+      if (error instanceof PlatformProxyCommandError && error.exitCode === 1) return false
+      throw error
+    }
+    const command = result.stdout.trim()
+    return command.includes(request.executablePath) && command.includes(expectedConfig)
+  }
+
   private async startWindowsUac(
     request: TemporaryElevatedProcessRequest
   ): Promise<TemporaryElevatedProcessHandle> {
@@ -1336,6 +1457,44 @@ if ($process.ExitCode -ne 0) { throw "Elevated TUN stop failed with exit code $(
         args: ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script],
         timeoutMs: 120_000,
         operation: 'tun.windows-uac.stop'
+      })
+    } catch (error) {
+      if (isCommandElevationDenial(error)) throw new TunElevationDeniedError(undefined, { cause: error })
+      throw error
+    }
+  }
+
+  private async stopRecoveredWindowsUac(request: TemporaryElevatedProcessRecoveryRequest): Promise<void> {
+    const configPath = request.args.at(-1)!
+    const identity = Buffer.from(JSON.stringify({
+      pid: request.pid,
+      executablePath: request.executablePath,
+      configPath
+    }), 'utf8').toString('base64')
+    const inner = String.raw`
+$ErrorActionPreference = 'Stop'
+$p = ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${identity}'))) | ConvertFrom-Json
+$target = Get-CimInstance Win32_Process -Filter ("ProcessId = " + [int]$p.pid) -ErrorAction SilentlyContinue
+if ($null -eq $target) { exit 0 }
+$exeMatches = [string]::Equals([IO.Path]::GetFullPath([string]$target.ExecutablePath), [IO.Path]::GetFullPath([string]$p.executablePath), [StringComparison]::OrdinalIgnoreCase)
+$commandMatches = ([string]$target.CommandLine).IndexOf([string]$p.configPath, [StringComparison]::OrdinalIgnoreCase) -ge 0
+if (-not ($exeMatches -and $commandMatches)) { throw 'Recovered TUN PID no longer belongs to Stone+.' }
+$taskkill = Join-Path $env:SystemRoot 'System32\taskkill.exe'
+& $taskkill /PID ([int]$p.pid) /T /F 2>$null
+if ($LASTEXITCODE -ne 0) { Stop-Process -Id ([int]$p.pid) -Force -ErrorAction Stop }
+`.trim()
+    const encodedInner = Buffer.from(inner, 'utf16le').toString('base64')
+    const script = String.raw`
+$ErrorActionPreference = 'Stop'
+$process = Start-Process -FilePath 'powershell.exe' -ArgumentList '-NoProfile -NonInteractive -EncodedCommand ${encodedInner}' -Verb RunAs -PassThru -Wait -WindowStyle Hidden
+if ($process.ExitCode -ne 0) { throw "Recovered elevated TUN stop failed with exit code $($process.ExitCode)." }
+`.trim()
+    try {
+      await runChecked(this.commandRunner, {
+        file: 'powershell.exe',
+        args: ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script],
+        timeoutMs: 120_000,
+        operation: 'tun.windows-uac.recover-stop'
       })
     } catch (error) {
       if (isCommandElevationDenial(error)) throw new TunElevationDeniedError(undefined, { cause: error })
@@ -2054,6 +2213,15 @@ function observeProcessIdExit(
     }
     check()
   })
+}
+
+function isProcessRunning(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM'
+  }
 }
 
 function quoteWindowsArgument(value: string): string {

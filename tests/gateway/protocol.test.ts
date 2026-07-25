@@ -56,6 +56,38 @@ describe('gateway protocol conversion', () => {
     })
   })
 
+  it('rejects Responses controls that would otherwise disappear cross-protocol', () => {
+    const analysis = analyzeProtocolConversion('openai-responses', 'anthropic-messages', {
+      model: 'gpt',
+      input: 'hello',
+      max_tool_calls: 1,
+      truncation: 'disabled',
+      include: ['reasoning.encrypted_content'],
+      store: true,
+      service_tier: 'priority',
+    })
+    expect(analysis.supported).toBe(false)
+    expect(analysis.issues.map((issue) => issue.path)).toEqual(expect.arrayContaining([
+      'max_tool_calls', 'truncation', 'include', 'store', 'service_tier'
+    ]))
+  })
+
+  it('maps Responses controls supported by Chat instead of silently deleting them', () => {
+    const body = {
+      model: 'gpt', input: 'hello', store: true, service_tier: 'priority',
+      safety_identifier: 'safe-user', user: 'legacy-user', reasoning: { effort: 'high' }
+    }
+    expect(analyzeProtocolConversion('openai-responses', 'openai-chat', body))
+      .toEqual({ supported: true, issues: [] })
+    expect(convertRequest('openai-responses', 'openai-chat', body, 'chat-model').body).toMatchObject({
+      store: true,
+      service_tier: 'priority',
+      safety_identifier: 'safe-user',
+      user: 'legacy-user',
+      reasoning_effort: 'high',
+    })
+  })
+
   it('rejects Responses conversation chaining before a cross-protocol conversion', () => {
     expect(analyzeProtocolConversion('openai-responses', 'anthropic-messages', {
       model: 'gpt',

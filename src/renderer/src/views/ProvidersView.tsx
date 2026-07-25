@@ -45,12 +45,16 @@ import type {
   PublicAccount,
   PublicProxyDefinition,
 } from '@shared/types'
+import { DEFAULT_ACCOUNT_MAX_CONCURRENCY } from '@shared/types'
+import { providerSourceFamily, type ProviderSourceFamily } from '@shared/source-family'
+import { accountMatchesPoolProtocol } from '@shared/pool-protocol'
 import type { ActionRunner } from '../App'
 import { BoundAsyncOperation } from '../async-operation'
 import { normalizeAggregateRelayMembers, toggleAggregateRelayMember } from '../aggregate-relay-members'
 import { providerBrandIcon } from '../brand-icons'
 import { BUILT_IN_PROXY_BINDING_NOTICE, useBuiltInProxyInterlock } from '../built-in-proxy-interlocks'
 import { providerProbeDraftBinding } from '../provider-probe-binding'
+import { accountDisplayNames, accountSelectionSummary, nextTabIndex, selectMatchingAccountIds } from '../providers-view-state'
 import {
   localizeBackendError,
   localizeBackendMessage,
@@ -60,8 +64,16 @@ import {
   providerProbeStatusLabel,
 } from '../backend-message'
 import { useI18n } from '../i18n'
+import {
+  newRelayConnectionDefaults,
+  protocolAfterProviderKindChange,
+  protocolOptionLabel,
+  protocolsByProviderKind,
+  providerKindLabelsEn,
+  providerKindLabelsZh,
+  XAI_COMPATIBLE_KIND,
+} from '../grok-relay-ui'
 import { setupPoolDisplayName } from '../system-generated-text'
-import { PersistentTaskCenter } from '../persistent-task-center'
 import {
   effectiveResponsesCompactMode,
   officialOpenAiUsesNativeCompact,
@@ -83,6 +95,7 @@ import {
   Modal,
   OverflowMenu,
   PageHeader,
+  ProviderAvatar,
   protocolLabels,
   relativeTime,
 } from '../ui'
@@ -91,8 +104,10 @@ import { CodexQuotaCompact, CodexQuotaModal } from './CodexQuotaModal'
 const HIDE_EXHAUSTED_ACCOUNTS_STORAGE_KEY = 'stone.providers.hide-exhausted-accounts'
 const ACCOUNT_TAG_FILTER_STORAGE_KEY = 'stone.providers.tag-filter'
 const ACCOUNT_COLUMN_STORAGE_KEY = 'stone:account-column-widths:v1'
+const ACCOUNT_FAMILY_STORAGE_KEY = 'stone.providers.account-family'
 
 type AccountAddMethod = 'oauth' | 'token-json'
+type AccountFamilyTab = Extract<ProviderSourceFamily, 'openai' | 'grok'>
 type OAuthUiStage = 'idle' | 'starting' | 'waiting' | 'submitting' | 'exchanging' | 'cancelling' | 'success' | 'error' | 'cancelled'
 
 type AccountColumnId = 'select' | 'account' | 'tag' | 'status' | 'fitness' | 'credential' | 'concurrency' | 'quota' | 'latency' | 'lastUsed' | 'actions'
@@ -216,20 +231,15 @@ function accountRecoveryAt(account: PublicAccount, now: number): number | undefi
   return candidates.length ? Math.max(...candidates) : undefined
 }
 
-function accountDisplayNames(accounts: readonly PublicAccount[]): Map<string, string> {
-  const bases = accounts.map((account) => ({
-    account,
-    base: Array.from(account.name).slice(0, 8).join('')
-  }))
-  const counts = new Map<string, number>()
-  for (const { base } of bases) counts.set(base, (counts.get(base) ?? 0) + 1)
-  const occurrences = new Map<string, number>()
-  return new Map(bases.map(({ account, base }) => {
-    if ((counts.get(base) ?? 0) <= 1) return [account.id, base]
-    const occurrence = (occurrences.get(base) ?? 0) + 1
-    occurrences.set(base, occurrence)
-    return [account.id, `${base}(${occurrence})`]
-  }))
+function handleTabListKeyDown(event: React.KeyboardEvent<HTMLElement>) {
+  const tabs = Array.from(event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="tab"]:not(:disabled)'))
+  const currentIndex = tabs.indexOf(document.activeElement as HTMLButtonElement)
+  if (currentIndex < 0) return
+  const nextIndex = nextTabIndex(currentIndex, tabs.length, event.key)
+  if (nextIndex === undefined) return
+  event.preventDefault()
+  tabs[nextIndex]?.focus()
+  tabs[nextIndex]?.click()
 }
 
 function AccountFitness({ fitness }: { fitness?: AccountFitnessSnapshot }) {
@@ -282,58 +292,34 @@ function CooldownCountdown({ account }: { account: PublicAccount }) {
 import { ModelPolicyEditor } from './ModelPolicyEditor'
 import { accountModelCatalog, effectiveAccountModels, isAccountModelWildcard } from '../model-policy'
 
-const providerKindLabels: Record<ProviderKind, string> = {
-  anthropic: 'Anthropic',
-  openai: 'OpenAI',
-  google: 'Google',
-  'openai-compatible': 'OpenAI 兼容',
-  'anthropic-compatible': 'Anthropic 兼容',
-  custom: '自定义',
-}
-
-const providerKindLabelsEn: Record<ProviderKind, string> = {
-  anthropic: 'Anthropic',
-  openai: 'OpenAI',
-  google: 'Google',
-  'openai-compatible': 'OpenAI compatible',
-  'anthropic-compatible': 'Anthropic compatible',
-  custom: 'Custom',
-}
-
-const protocols: Protocol[] = ['anthropic-messages', 'openai-responses', 'openai-chat', 'gemini']
-const protocolsByKind: Record<ProviderKind, Protocol[]> = {
-  anthropic: ['anthropic-messages'],
-  openai: ['openai-responses', 'openai-chat'],
-  google: ['gemini'],
-  'openai-compatible': ['openai-responses', 'openai-chat'],
-  'anthropic-compatible': ['anthropic-messages'],
-  custom: protocols,
-}
 type ApiSourceDraft = Omit<ApiSourceInput, 'models' | 'defaultModel'> & { modelsText: string; defaultModel: string }
 type AccountDraft = Omit<AccountInput, 'modelPolicy'> & { modelPolicy: ModelPolicy }
 type AggregateRelayDraft = AggregateRelayInput
+const aggregateProtocols: Protocol[] = ['anthropic-messages', 'openai-responses', 'openai-chat', 'gemini']
 
-const officialSourceDefaults: Record<'openai' | 'anthropic' | 'google', Pick<ApiSourceDraft, 'baseUrl' | 'protocol'>> = {
+const officialSourceDefaults: Record<'openai' | 'xai' | 'anthropic' | 'google', Pick<ApiSourceDraft, 'baseUrl' | 'protocol'>> = {
   openai: { baseUrl: 'https://api.openai.com/v1', protocol: 'openai-responses' },
+  xai: { baseUrl: 'https://api.x.ai/v1', protocol: 'openai-responses' },
   anthropic: { baseUrl: 'https://api.anthropic.com', protocol: 'anthropic-messages' },
   google: { baseUrl: 'https://generativelanguage.googleapis.com', protocol: 'gemini' },
 }
 
 function emptyApiSource(sourceType: 'official-api' | 'relay'): ApiSourceDraft {
   const official = officialSourceDefaults.openai
+  const relay = newRelayConnectionDefaults()
   return {
     name: '',
     sourceType,
-    kind: sourceType === 'official-api' ? 'openai' : 'openai-compatible',
-    baseUrl: sourceType === 'official-api' ? official.baseUrl : 'https://',
-    protocol: sourceType === 'official-api' ? official.protocol : 'openai-chat',
-    responsesCompactMode: sourceType === 'relay' ? 'legacy' : undefined,
+    kind: sourceType === 'official-api' ? 'openai' : relay.kind,
+    baseUrl: sourceType === 'official-api' ? official.baseUrl : relay.baseUrl,
+    protocol: sourceType === 'official-api' ? official.protocol : relay.protocol,
+    responsesCompactMode: sourceType === 'relay' ? relay.responsesCompactMode : undefined,
     credential: '',
     modelsText: '',
     defaultModel: '',
     priority: 10,
     weight: 10,
-    maxConcurrency: 4,
+    maxConcurrency: DEFAULT_ACCOUNT_MAX_CONCURRENCY,
     proxyId: '',
   }
 }
@@ -359,7 +345,7 @@ function makeAccountDraft(providerId = ''): AccountDraft {
     credential: '',
     priority: 10,
     weight: 10,
-    maxConcurrency: 4,
+    maxConcurrency: DEFAULT_ACCOUNT_MAX_CONCURRENCY,
     modelPolicy: 'all',
     modelAllowlist: [],
     proxyId: '',
@@ -381,10 +367,12 @@ function ApiSourceForm({
   errors: Record<string, string>
 }) {
   const { t } = useI18n()
-  const availableProtocols = protocolsByKind[draft.kind]
+  const availableProtocols = draft.sourceType === 'official-api' && draft.kind === 'xai'
+    ? ['openai-responses'] as const
+    : protocolsByProviderKind[draft.kind]
   const availableKinds: ProviderKind[] = draft.sourceType === 'official-api'
-    ? ['openai', 'anthropic', 'google']
-    : ['openai-compatible', 'anthropic-compatible', 'custom']
+    ? draft.kind === 'xai' ? ['xai'] : ['openai', 'anthropic', 'google']
+    : [XAI_COMPATIBLE_KIND, 'openai-compatible', 'anthropic-compatible', 'custom']
   const compactMode = effectiveResponsesCompactMode(draft.responsesCompactMode)
   const compactCopy = responsesCompactModeCopy[compactMode]
   return (
@@ -396,11 +384,10 @@ function ApiSourceForm({
       </label>
       <label className="field">
         <span>{draft.sourceType === 'official-api' ? t('官方服务', 'Official service') : t('兼容类型', 'Compatibility type')}</span>
-        <select value={draft.kind} onChange={(event) => {
+        <select value={draft.kind} disabled={draft.sourceType === 'official-api' && draft.kind === 'xai'} onChange={(event) => {
           const kind = event.target.value as ProviderKind
-          const supported = protocolsByKind[kind]
-          const official = kind === 'openai' || kind === 'anthropic' || kind === 'google' ? officialSourceDefaults[kind] : undefined
-          const protocol = official?.protocol ?? (supported.includes(draft.protocol) ? draft.protocol : supported[0])
+          const official = kind === 'openai' || kind === 'xai' || kind === 'anthropic' || kind === 'google' ? officialSourceDefaults[kind] : undefined
+          const protocol = official?.protocol ?? protocolAfterProviderKindChange(kind, draft.protocol)
           setDraft({
             ...draft,
             kind,
@@ -411,12 +398,12 @@ function ApiSourceForm({
               : undefined,
           })
         }}>
-          {availableKinds.map((kind) => <option value={kind} key={kind}>{t(providerKindLabels[kind], providerKindLabelsEn[kind])}</option>)}
+          {availableKinds.map((kind) => <option value={kind} key={kind}>{t(providerKindLabelsZh[kind], providerKindLabelsEn[kind])}</option>)}
         </select>
       </label>
       <label className="field">
         <span>{t('上游协议', 'Upstream protocol')}</span>
-        <select value={draft.protocol} onChange={(event) => {
+        <select value={draft.protocol} disabled={draft.sourceType === 'official-api' && draft.kind === 'xai'} onChange={(event) => {
           const protocol = event.target.value as Protocol
           setDraft({
             ...draft,
@@ -426,8 +413,9 @@ function ApiSourceForm({
               : undefined,
           })
         }}>
-          {availableProtocols.map((protocol) => <option value={protocol} key={protocol}>{protocolLabels[protocol]}</option>)}
+          {availableProtocols.map((protocol) => <option value={protocol} key={protocol}>{protocolOptionLabel(draft.kind, protocol, protocolLabels, t)}</option>)}
         </select>
+        {draft.kind === XAI_COMPATIBLE_KIND && <small>{t('默认使用官方当前主路径 Responses；仅当中转明确只兼容 Chat Completions 时选择高级兼容模式。', 'Responses is the current primary API path. Choose advanced Chat compatibility only when the relay explicitly requires Chat Completions.')}</small>}
       </label>
       {relayCanConfigureResponsesCompact(draft.sourceType, draft.protocol) && <label className="field field--full">
         <span className="field-label-with-help">{t('Responses Compact 能力', 'Responses compact capability')}<InfoTip text={t(compactCopy.helpZh, compactCopy.helpEn)} /></span>
@@ -474,6 +462,7 @@ function AccountForm({
   account,
   editing,
   oauthAccount,
+  codexQuotaAccount,
   refreshingModels,
   refreshDisabledReason,
   onRefreshModels,
@@ -488,6 +477,7 @@ function AccountForm({
   account?: PublicAccount
   editing: boolean
   oauthAccount: boolean
+  codexQuotaAccount: boolean
   refreshingModels: boolean
   refreshDisabledReason?: string
   onRefreshModels: () => void
@@ -495,6 +485,7 @@ function AccountForm({
   errors: Record<string, string>
 }) {
   const { t } = useI18n()
+  const grokOAuthAccount = account?.credentialType === 'grok-oauth'
   const selectedProvider = providers.find((provider) => provider.id === draft.providerId)
   const catalogAccount = account?.providerId === draft.providerId ? account : undefined
   const catalog = catalogAccount
@@ -513,7 +504,9 @@ function AccountForm({
         </select>
         <FieldError>{errors.providerId}</FieldError>
       </label>}
-      {oauthAccount && <div className="form-context"><Server size={16} /><span>{t('系统 ChatGPT OAuth 来源', 'System ChatGPT OAuth source')}</span></div>}
+      {oauthAccount && <div className="form-context"><Server size={16} /><span>{grokOAuthAccount
+        ? t('系统 Grok OAuth 来源', 'System Grok OAuth source')
+        : t('系统 ChatGPT OAuth 来源', 'System ChatGPT OAuth source')}</span></div>}
       <label className="field">
         <span>{t('账号名称', 'Account name')}</span>
         <input value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} placeholder={t('例如：日常开发', 'e.g. Daily development')} />
@@ -524,7 +517,9 @@ function AccountForm({
         <div className="input-with-icon"><KeyRound size={16} /><input type="password" className="mono" value={draft.credential ?? ''} onChange={(event) => setDraft({ ...draft, credential: event.target.value })} placeholder={editing ? t('留空表示不更换凭据', 'Leave blank to keep the current credential') : t('输入上游凭据', 'Enter the upstream credential')} /></div>
         <FieldError>{errors.credential}</FieldError>
       </label>}
-      {oauthAccount && <div className="form-context field--full"><KeyRound size={16} /><span>{t('ChatGPT OAuth 凭据只能通过重新导入更新', 'ChatGPT OAuth credentials can be updated only by importing them again.')}</span></div>}
+      {oauthAccount && <div className="form-context field--full"><KeyRound size={16} /><span>{grokOAuthAccount
+        ? t('Grok OAuth 凭据只能通过重新导入更新', 'Grok OAuth credentials can be updated only by importing them again.')
+        : t('ChatGPT OAuth 凭据只能通过重新导入更新', 'ChatGPT OAuth credentials can be updated only by importing them again.')}</span></div>}
       <label className="field">
         <span className="field-label-with-help">{t('优先级', 'Priority')}<InfoTip text={t('数值越小越优先，仅在优先级调度或故障转移时决定先后顺序。', 'Lower values have higher priority and determine order only for priority scheduling or failover.')} /></span>
         <input type="number" min={1} max={999} value={draft.priority} onChange={(event) => setDraft({ ...draft, priority: Number(event.target.value) })} />
@@ -545,8 +540,8 @@ function AccountForm({
         <span className="field-label-with-help">{t('最大并发', 'Maximum concurrency')}<InfoTip text={t('限制该账号同时处理的请求数，达到上限后会等待或切换账号。', 'Limits simultaneous requests for this account. At the limit, requests wait or switch accounts.')} /></span>
         <input type="number" min={1} max={100} value={draft.maxConcurrency} onChange={(event) => setDraft({ ...draft, maxConcurrency: Number(event.target.value) })} />
       </label>
-      {oauthAccount && <div className="field field--full inline-settings"><div><strong>{t('账号额度保护线', 'Account quota reserve guard')}<InfoTip text={t('达到保留额度后不再为新请求选择该账号。', 'Stop selecting this account for new requests when its reserve is reached.')} /></strong></div><button className={`toggle ${draft.quotaProtection ? 'toggle--on' : ''}`} type="button" role="switch" aria-checked={Boolean(draft.quotaProtection)} onClick={() => setDraft({ ...draft, quotaProtection: draft.quotaProtection ? undefined : { fiveHourRemainingPercent: 10, sevenDayRemainingPercent: 10, unavailableBehavior: 'allow', staleAfterMinutes: 15 } })}><span /></button></div>}
-      {oauthAccount && draft.quotaProtection && <>
+      {codexQuotaAccount && <div className="field field--full inline-settings"><div><strong>{t('账号额度保护线', 'Account quota reserve guard')}<InfoTip text={t('达到保留额度后不再为新请求选择该账号。', 'Stop selecting this account for new requests when its reserve is reached.')} /></strong></div><button className={`toggle ${draft.quotaProtection ? 'toggle--on' : ''}`} type="button" role="switch" aria-checked={Boolean(draft.quotaProtection)} onClick={() => setDraft({ ...draft, quotaProtection: draft.quotaProtection ? undefined : { fiveHourRemainingPercent: 10, sevenDayRemainingPercent: 10, unavailableBehavior: 'allow', staleAfterMinutes: 15 } })}><span /></button></div>}
+      {codexQuotaAccount && draft.quotaProtection && <>
         <label className="field"><span>{t('5 小时最低保留（%）', '5-hour reserve (%)')}</span><input type="number" min={0} max={100} value={draft.quotaProtection.fiveHourRemainingPercent ?? ''} onChange={(event) => setDraft({ ...draft, quotaProtection: { ...draft.quotaProtection!, fiveHourRemainingPercent: event.target.value === '' ? undefined : Number(event.target.value) } })} /></label>
         <label className="field"><span>{t('周额度最低保留（%）', 'Weekly reserve (%)')}</span><input type="number" min={0} max={100} value={draft.quotaProtection.sevenDayRemainingPercent ?? ''} onChange={(event) => setDraft({ ...draft, quotaProtection: { ...draft.quotaProtection!, sevenDayRemainingPercent: event.target.value === '' ? undefined : Number(event.target.value) } })} /></label>
         <label className="field"><span>{t('额度未知或过期', 'Unknown or stale quota')}</span><select value={draft.quotaProtection.unavailableBehavior ?? 'allow'} onChange={(event) => setDraft({ ...draft, quotaProtection: { ...draft.quotaProtection!, unavailableBehavior: event.target.value as 'allow' | 'block' } })}><option value="allow">{t('继续调度', 'Continue scheduling')}</option><option value="block">{t('保守停用', 'Block conservatively')}</option></select></label>
@@ -591,6 +586,9 @@ export function ProvidersView({
   const { t, language, locale } = useI18n()
   const builtInProxyInterlocked = useBuiltInProxyInterlock(snapshot, api)
   const [tab, setTab] = useState<'accounts' | 'official' | 'relays'>('accounts')
+  const [accountFamily, setAccountFamily] = useState<AccountFamilyTab>(() =>
+    window.localStorage.getItem(ACCOUNT_FAMILY_STORAGE_KEY) === 'grok' ? 'grok' : 'openai'
+  )
   const [providerModal, setProviderModal] = useState(false)
   const [accountModal, setAccountModal] = useState(false)
   const [providerDraft, setProviderDraft] = useState<ApiSourceDraft>(() => emptyApiSource('official-api'))
@@ -609,6 +607,9 @@ export function ProvidersView({
   const [deleteTarget, setDeleteTarget] = useState<{ kind: 'provider' | 'account'; id: string; name: string } | null>(null)
   const [menuOpen, setMenuOpen] = useState<string | null>(null)
   const [chatGptImportOpen, setChatGptImportOpen] = useState(false)
+  const [grokImportOpen, setGrokImportOpen] = useState(false)
+  const [grokImportBusy, setGrokImportBusy] = useState(false)
+  const [grokImport, setGrokImport] = useState({ content: '', proxyId: '', poolId: '' })
   const [accountAddMethod, setAccountAddMethod] = useState<AccountAddMethod>('oauth')
   const [chatGptImport, setChatGptImport] = useState({
     name: '',
@@ -650,7 +651,7 @@ export function ProvidersView({
     window.localStorage.getItem(HIDE_EXHAUSTED_ACCOUNTS_STORAGE_KEY) === 'true'
   )
   const [tagFilter, setTagFilter] = useState<'all' | 'untagged' | string>(() =>
-    window.localStorage.getItem(ACCOUNT_TAG_FILTER_STORAGE_KEY)?.trim() || 'all'
+    accountFamily === 'grok' ? 'all' : window.localStorage.getItem(ACCOUNT_TAG_FILTER_STORAGE_KEY)?.trim() || 'all'
   )
   const [tagManagerOpen, setTagManagerOpen] = useState(false)
   const [tagAssignmentOpen, setTagAssignmentOpen] = useState(false)
@@ -664,11 +665,25 @@ export function ProvidersView({
   const quotaAccount = quotaAccountId ? snapshot.accounts.find((account) => account.id === quotaAccountId) ?? null : null
   const editingAccount = accountDraft.id ? snapshot.accounts.find((account) => account.id === accountDraft.id) : undefined
   const accountModelsBusy = Boolean(accountDraft.id && busyKeys.has(`refresh-account-models-${accountDraft.id}`))
-  const oauthAccounts = useMemo(
-    () => snapshot.accounts.filter((account) => account.credentialType === 'chatgpt-oauth'
-      || account.credentialType === 'chatgpt-agent-identity'),
-    [snapshot.accounts]
-  )
+  const loginAccounts = useMemo(() => snapshot.accounts.filter((account) => {
+    const provider = providerById.get(account.providerId)
+    return provider?.sourceType === 'oauth-system'
+      || (provider?.sourceType === 'official-api' && provider.kind === 'xai')
+  }), [providerById, snapshot.accounts])
+  const accountFamilyCounts = useMemo(() => ({
+    openai: loginAccounts.filter((account) => {
+      const provider = providerById.get(account.providerId)
+      return provider !== undefined && providerSourceFamily(provider.kind) === 'openai'
+    }).length,
+    grok: loginAccounts.filter((account) => {
+      const provider = providerById.get(account.providerId)
+      return provider !== undefined && providerSourceFamily(provider.kind) === 'grok'
+    }).length,
+  }), [loginAccounts, providerById])
+  const oauthAccounts = useMemo(() => loginAccounts.filter((account) => {
+    const provider = providerById.get(account.providerId)
+    return provider !== undefined && providerSourceFamily(provider.kind) === accountFamily
+  }), [accountFamily, loginAccounts, providerById])
   const tagById = useMemo(() => new Map(snapshot.accountTags.map((tag) => [tag.id, tag])), [snapshot.accountTags])
   const exhaustedAccountCount = useMemo(
     () => oauthAccounts.filter((account) => accountQuotaIsExhausted(account)).length,
@@ -681,10 +696,22 @@ export function ProvidersView({
     return true
   }), [hideExhaustedAccounts, oauthAccounts, tagFilter])
   const checkingAllAccounts = busyKeys.has('check-all-accounts')
-  const officialProviders = useMemo(() => snapshot.providers.filter((provider) => provider.sourceType === 'official-api'), [snapshot.providers])
+  const officialProviders = useMemo(() => snapshot.providers.filter((provider) => provider.sourceType === 'official-api' && provider.kind !== 'xai'), [snapshot.providers])
   const relayProviders = useMemo(() => snapshot.providers.filter((provider) => provider.sourceType === 'relay'), [snapshot.providers])
   const aggregateRelays = useMemo(() => snapshot.pools.filter((pool) => pool.kind === 'relay-aggregate'), [snapshot.pools])
-  const compatibleImportPools = useMemo(() => snapshot.pools.filter((pool) => pool.kind === 'standard' && pool.protocol === 'openai-responses'), [snapshot.pools])
+  const compatibleImportPools = useMemo(() => snapshot.pools.filter((pool) => pool.kind === 'standard'
+    && pool.protocol === 'openai-responses'
+    && pool.members.every((member) => {
+      const account = snapshot.accounts.find((candidate) => candidate.id === member.accountId)
+      const provider = providerById.get(account?.providerId ?? '')
+      return provider !== undefined && providerSourceFamily(provider.kind) === 'openai'
+    })), [providerById, snapshot.accounts, snapshot.pools])
+  const compatibleGrokImportPools = useMemo(() => snapshot.pools.filter((pool) => pool.kind === 'standard'
+    && pool.protocol === 'grok'
+    && pool.members.every((member) => {
+      const account = snapshot.accounts.find((candidate) => candidate.id === member.accountId)
+      return Boolean(account && accountMatchesPoolProtocol('grok', account, providerById.get(account.providerId)))
+    })), [providerById, snapshot.accounts, snapshot.pools])
   const oauthActive = oauthStage === 'starting' || oauthStage === 'waiting' || oauthStage === 'submitting' || oauthStage === 'exchanging' || oauthStage === 'cancelling'
   const importConfigurationLocked = fileImportBusy || oauthActive
   const oauthExpiresInSeconds = oauthSession ? Math.max(0, Math.ceil((oauthSession.expiresAt - oauthNow) / 1000)) : 0
@@ -693,6 +720,19 @@ export function ProvidersView({
     : accountDraft.credential?.trim()
       ? t('凭据有未保存的更改，请先保存账号。', 'The credential has unsaved changes. Save the account first.')
       : undefined
+
+  const selectAccountFamily = (family: AccountFamilyTab) => {
+    setAccountFamily(family)
+    setSelectedAccountIds([])
+    setExportAccountIds([])
+    setTagFilter('all')
+    setMenuOpen(null)
+    try {
+      window.localStorage.setItem(ACCOUNT_FAMILY_STORAGE_KEY, family)
+    } catch {
+      // The selected family still works for this session when storage is unavailable.
+    }
+  }
 
   useEffect(() => {
     try {
@@ -878,7 +918,8 @@ export function ProvidersView({
   const openProvider = (sourceType: 'official-api' | 'relay', provider?: ProviderDefinition) => {
     const account = provider ? snapshot.accounts.find((candidate) => candidate.providerId === provider.id
       && candidate.credentialType !== 'chatgpt-oauth'
-      && candidate.credentialType !== 'chatgpt-agent-identity') : undefined
+      && candidate.credentialType !== 'chatgpt-agent-identity'
+      && candidate.credentialType !== 'grok-oauth') : undefined
     showProviderDraft(provider ? {
       id: provider.id,
       name: provider.name,
@@ -896,16 +937,56 @@ export function ProvidersView({
       defaultModel: account?.modelAllowlist[0] ?? provider.models[0] ?? '',
       priority: account?.priority ?? 10,
       weight: account?.weight ?? 10,
-      maxConcurrency: account?.maxConcurrency ?? 4,
+      maxConcurrency: account?.maxConcurrency ?? DEFAULT_ACCOUNT_MAX_CONCURRENCY,
       proxyId: account?.proxyId ?? '',
     } : emptyApiSource(sourceType))
   }
 
+  const openGrokCredential = () => {
+    setErrors({})
+    setGrokImportOpen(true)
+  }
+
+  const openGrokApiKey = () => {
+    setGrokImportOpen(false)
+    const draft = emptyApiSource('official-api')
+    showProviderDraft({
+      ...draft,
+      kind: 'xai',
+      baseUrl: officialSourceDefaults.xai.baseUrl,
+      protocol: officialSourceDefaults.xai.protocol,
+    })
+  }
+
+  const submitGrokImport = async (event: React.FormEvent) => {
+    event.preventDefault()
+    setGrokImportBusy(true)
+    setErrors({})
+    try {
+      const result = await api.importGrokAccounts({
+        content: grokImport.content,
+        proxyId: grokImport.proxyId || undefined,
+        poolId: grokImport.poolId || null,
+      })
+      setGrokImportOpen(false)
+      setGrokImport({ ...grokImport, content: '' })
+      setImportNotice(t(
+        `Grok OAuth 导入完成：新增 ${result.createdAccountIds.length} 个，更新 ${result.updatedAccountIds.length} 个${result.warnings.length ? `；${localizeBackendMessages(result.warnings, language, 'Import warning.').join(' ')}` : ''}`,
+        `Grok OAuth import complete: ${result.createdAccountIds.length} added and ${result.updatedAccountIds.length} updated${result.warnings.length ? `; ${localizeBackendMessages(result.warnings, language, 'Import warning.').join(' ')}` : ''}`,
+      ))
+    } catch (cause) {
+      setErrors({ grokImport: localizeBackendError(cause, language, t('Grok OAuth 账号导入失败', 'Failed to import Grok OAuth accounts.')) })
+    } finally {
+      setGrokImportBusy(false)
+    }
+  }
+
   const openAggregateRelay = (pool?: Pool) => {
+    if (pool && (pool.kind !== 'relay-aggregate' || pool.protocol === 'grok')) return
     setAggregateDraft(pool ? {
       id: pool.id,
       name: pool.name,
-      protocol: pool.protocol,
+      protocol: pool.protocol as Protocol,
       strategy: pool.strategy === 'round-robin' || pool.strategy === 'weighted-round-robin' ? pool.strategy : 'priority',
       members: pool.members
         .filter((member) => member.enabled)
@@ -931,6 +1012,19 @@ export function ProvidersView({
   }
 
   const toggleAggregateMember = (account: PublicAccount) => {
+    const provider = providerById.get(account.providerId)
+    const selectedMember = aggregateDraft.members
+      .map((member) => snapshot.accounts.find((candidate) => candidate.id === member.accountId))
+      .find((candidate) => candidate?.id !== account.id)
+    const selectedProvider = selectedMember ? providerById.get(selectedMember.providerId) : undefined
+    if (provider && selectedProvider
+      && providerSourceFamily(provider.kind) !== providerSourceFamily(selectedProvider.kind)) {
+      setErrors((current) => ({
+        ...current,
+        aggregateMembers: t('聚合中转只能选择同一种来源，不能混合 OpenAI 与 Grok。', 'Aggregate relays require one source family and cannot mix OpenAI with Grok.'),
+      }))
+      return
+    }
     setAggregateDraft((current) => ({
       ...current,
       members: toggleAggregateRelayMember(current.members, account),
@@ -943,6 +1037,12 @@ export function ProvidersView({
     const nextErrors: Record<string, string> = {}
     if (!aggregateDraft.name.trim()) nextErrors.aggregateName = t('请输入聚合中转名称', 'Enter an aggregate relay name.')
     if (aggregateDraft.members.length < 2) nextErrors.aggregateMembers = t('至少选择两个同协议 API 来源', 'Select at least two API sources with the same protocol.')
+    const aggregateFamilies = new Set(aggregateDraft.members.flatMap((member) => {
+      const account = snapshot.accounts.find((candidate) => candidate.id === member.accountId)
+      const provider = providerById.get(account?.providerId ?? '')
+      return provider ? [providerSourceFamily(provider.kind)] : []
+    }))
+    if (aggregateFamilies.size > 1) nextErrors.aggregateMembers = t('聚合中转只能使用同一种来源。', 'Aggregate relays can use only one source family.')
     setErrors(nextErrors)
     if (Object.keys(nextErrors).length) return
     const success = await runAction('save-aggregate-relay', () => api.saveAggregateRelay({
@@ -1008,13 +1108,29 @@ export function ProvidersView({
     const sourceAccount = providerDraft.id
       ? snapshot.accounts.find((account) => account.providerId === providerDraft.id
         && account.credentialType !== 'chatgpt-oauth'
-        && account.credentialType !== 'chatgpt-agent-identity')
+        && account.credentialType !== 'chatgpt-agent-identity'
+        && account.credentialType !== 'grok-oauth')
       : undefined
+    const nextFamily = providerSourceFamily(providerDraft.kind)
+    const nextProvider = {
+      kind: providerDraft.kind,
+      protocol: providerDraft.protocol,
+      sourceType: providerDraft.sourceType,
+    }
     const incompatiblePools = sourceAccount
-      ? snapshot.pools.filter((pool) => pool.protocol !== providerDraft.protocol && pool.members.some((member) => member.accountId === sourceAccount.id))
+      ? snapshot.pools.filter((pool) => pool.members.some((member) => member.accountId === sourceAccount.id)
+        && (pool.kind === 'relay-aggregate'
+          ? providerDraft.sourceType !== 'relay' || pool.protocol !== providerDraft.protocol
+          : !accountMatchesPoolProtocol(pool.protocol, sourceAccount, nextProvider)
+            || pool.members.some((member) => {
+                if (member.accountId === sourceAccount.id) return false
+                const memberAccount = snapshot.accounts.find((account) => account.id === member.accountId)
+                const memberProvider = providerById.get(memberAccount?.providerId ?? '')
+                return !memberProvider || providerSourceFamily(memberProvider.kind) !== nextFamily
+              })))
       : []
     const unlinkIncompatiblePools = incompatiblePools.length > 0
-      ? window.confirm(t(`修改协议将从 ${incompatiblePools.map((pool) => `“${pool.name}”`).join('、')} 解除此来源。聚合成员不足时相关聚合中转也会被删除，是否继续？`, `Changing the protocol will unlink this source from ${incompatiblePools.map((pool) => `“${setupPoolDisplayName(pool.name, t)}”`).join(', ')}. Aggregate relays with too few members will also be deleted. Continue?`))
+      ? window.confirm(t(`修改协议或来源类型将从 ${incompatiblePools.map((pool) => `“${pool.name}”`).join('、')} 解除此来源。聚合成员不足时相关聚合中转也会被删除，是否继续？`, `Changing the protocol or source family will unlink this source from ${incompatiblePools.map((pool) => `“${setupPoolDisplayName(pool.name, t)}”`).join(', ')}. Aggregate relays with too few members will also be deleted. Continue?`))
       : false
     if (incompatiblePools.length > 0 && !unlinkIncompatiblePools) return
     const success = await runAction('save-api-source', () => api.saveApiSource({
@@ -1148,7 +1264,7 @@ export function ProvidersView({
       defaultModel: account?.modelAllowlist[0] ?? account?.availableModels[0] ?? provider.models[0] ?? '',
       priority: account?.priority ?? 10,
       weight: account?.weight ?? 10,
-      maxConcurrency: account?.maxConcurrency ?? 4,
+      maxConcurrency: account?.maxConcurrency ?? DEFAULT_ACCOUNT_MAX_CONCURRENCY,
       proxyId: account?.proxyId ?? '',
       credential: '',
     })
@@ -1503,7 +1619,7 @@ export function ProvidersView({
   }
 
   const selectAccounts = (predicate: (account: PublicAccount) => boolean) => {
-    setSelectedAccountIds(oauthAccounts.filter(predicate).map((account) => account.id))
+    setSelectedAccountIds(selectMatchingAccountIds(visibleAccounts, predicate))
   }
 
   const saveTag = async (selectForImport = false) => {
@@ -1595,36 +1711,49 @@ export function ProvidersView({
     }
   }
 
+  const selectedAccounts = snapshot.accounts.filter((account) => selectedAccountIds.includes(account.id))
+  const selectedVisibleIds = new Set(visibleAccounts.map((account) => account.id))
+  const selectedAccountSummary = accountSelectionSummary(selectedAccounts, selectedVisibleIds)
+
   return (
     <div className="page-stack">
       <PageHeader
         title={t('账号与中转', 'Accounts & relays')}
         actions={
           tab === 'accounts'
-            ? <button type="button" className="button button--primary" onClick={openChatGptAccountDialog}><Plus size={16} /> {t('添加 Codex 账号', 'Add Codex account')}</button>
+            ? accountFamily === 'openai'
+              ? <button type="button" className="button button--primary" onClick={openChatGptAccountDialog}><Plus size={16} /> {t('添加 Codex 账号', 'Add Codex account')}</button>
+              : <button type="button" className="button button--primary" onClick={openGrokCredential}><Plus size={16} /> {t('添加 Grok 凭据', 'Add Grok credential')}</button>
             : tab === 'official'
               ? <button type="button" className="button button--primary" onClick={() => openProvider('official-api')}><Plus size={16} /> {t('添加官方 API', 'Add official API')}</button>
               : <><button type="button" className="button button--secondary" onClick={() => openAggregateRelay()}><Boxes size={16} /> {t('添加聚合中转', 'Add aggregate relay')}</button><button type="button" className="button button--primary" onClick={() => openProvider('relay')}><Plus size={16} /> {t('添加中转站', 'Add relay')}</button></>
         }
       />
 
-      <div className="segmented-control source-type-tabs" role="tablist" aria-label={t('账号与中转管理视图', 'Accounts and relays management view')}>
-        <button type="button" role="tab" aria-selected={tab === 'accounts'} className={tab === 'accounts' ? 'active' : ''} onClick={() => setTab('accounts')}>
-          <KeyRound size={15} />{t('账号', 'Accounts')} <span>{oauthAccounts.length}</span>
+      <div className="segmented-control source-type-tabs" role="tablist" aria-label={t('账号与中转管理视图', 'Accounts and relays management view')} onKeyDown={handleTabListKeyDown}>
+        <button id="providers-tab-accounts" type="button" role="tab" tabIndex={tab === 'accounts' ? 0 : -1} aria-selected={tab === 'accounts'} aria-controls="providers-panel-accounts" className={tab === 'accounts' ? 'active' : ''} onClick={() => { setTab('accounts'); setMenuOpen(null) }}>
+          <KeyRound size={15} />{t('账号', 'Accounts')} <span>{loginAccounts.length}</span>
         </button>
-        <button type="button" role="tab" aria-selected={tab === 'official'} className={tab === 'official' ? 'active' : ''} onClick={() => setTab('official')}>
+        <button id="providers-tab-official" type="button" role="tab" tabIndex={tab === 'official' ? 0 : -1} aria-selected={tab === 'official'} aria-controls="providers-panel-official" className={tab === 'official' ? 'active' : ''} onClick={() => { setTab('official'); setMenuOpen(null) }}>
           <Server size={15} />{t('官方 API', 'Official APIs')} <span>{officialProviders.length}</span>
         </button>
-        <button type="button" role="tab" aria-selected={tab === 'relays'} className={tab === 'relays' ? 'active' : ''} onClick={() => setTab('relays')}>
+        <button id="providers-tab-relays" type="button" role="tab" tabIndex={tab === 'relays' ? 0 : -1} aria-selected={tab === 'relays'} aria-controls="providers-panel-relays" className={tab === 'relays' ? 'active' : ''} onClick={() => { setTab('relays'); setMenuOpen(null) }}>
           <Boxes size={15} />{t('中转站', 'Relays')} <span>{relayProviders.length + aggregateRelays.length}</span>
         </button>
       </div>
+      {tab === 'accounts' && <div className="segmented-control account-family-tabs" role="tablist" aria-label={t('账号来源', 'Account source')} onKeyDown={handleTabListKeyDown}>
+        <button id="account-family-tab-openai" type="button" role="tab" tabIndex={accountFamily === 'openai' ? 0 : -1} aria-selected={accountFamily === 'openai'} aria-controls="account-family-panel" className={accountFamily === 'openai' ? 'active' : ''} onClick={() => selectAccountFamily('openai')}>
+          <img src={providerBrandIcon('openai')} alt="" />OpenAI <span>{accountFamilyCounts.openai}</span>
+        </button>
+        <button id="account-family-tab-grok" type="button" role="tab" tabIndex={accountFamily === 'grok' ? 0 : -1} aria-selected={accountFamily === 'grok'} aria-controls="account-family-panel" className={accountFamily === 'grok' ? 'active' : ''} onClick={() => selectAccountFamily('grok')}>
+          <img src={providerBrandIcon('xai-compatible')} alt="" />Grok <span>{accountFamilyCounts.grok}</span>
+        </button>
+      </div>}
       {importNotice && <div className="client-config-notice"><CheckCircle2 size={16} />{importNotice}</div>}
       {exportNotice && <div className="client-config-notice"><Download size={16} />{exportNotice}</div>}
-      {tab === 'accounts' && <PersistentTaskCenter api={api} />}
-
       {tab === 'accounts' ? (
-        <section className="panel panel--flush">
+        <section id="providers-panel-accounts" className="panel panel--flush" role="tabpanel" aria-labelledby="providers-tab-accounts">
+          <div id="account-family-panel" role="tabpanel" aria-labelledby={`account-family-tab-${accountFamily}`}>
           {oauthAccounts.length ? (
             <>
               <div className="table-toolbar account-table-toolbar">
@@ -1632,11 +1761,11 @@ export function ProvidersView({
                   <label className="account-quota-filter"><input type="checkbox" checked={hideExhaustedAccounts} onChange={(event) => setHideExhaustedAccounts(event.target.checked)} /><span>{t('隐藏额度耗尽账号', 'Hide quota-exhausted accounts')}</span><small>{exhaustedAccountCount ? t(`${exhaustedAccountCount} 个`, `${exhaustedAccountCount}`) : t('暂无', 'None')}</small></label>
                   <strong>{t(`已选择 ${selectedAccountIds.length} 个`, `${selectedAccountIds.length} selected`)}</strong>
                 </div>
-                <div className="account-tag-filter" aria-label={t('按 Tag 筛选账号', 'Filter accounts by tag')}>
+                {accountFamily === 'openai' && <div className="account-tag-filter" aria-label={t('按 Tag 筛选账号', 'Filter accounts by tag')}>
                   <button type="button" className={tagFilter === 'all' ? 'active' : ''} onClick={() => setTagFilter('all')}>{t('全部', 'All')} <span>{oauthAccounts.length}</span></button>
                   <button type="button" className={tagFilter === 'untagged' ? 'active' : ''} onClick={() => setTagFilter(tagFilter === 'untagged' ? 'all' : 'untagged')}>{t('未标记', 'Untagged')} <span>{oauthAccounts.filter((account) => !account.tagId).length}</span></button>
                   {snapshot.accountTags.map((tag) => <button type="button" key={tag.id} className={tagFilter === tag.id ? 'active' : ''} onClick={() => setTagFilter(tagFilter === tag.id ? 'all' : tag.id)}>{tag.name} <span>{oauthAccounts.filter((account) => account.tagId === tag.id).length}</span></button>)}
-                </div>
+                </div>}
                 <div className="account-selection-actions" aria-label={t('按条件选择账号', 'Select accounts by condition')}>
                   <button type="button" onClick={() => selectAccounts(() => true)}>{t('全选', 'Select all')}</button>
                   <button type="button" onClick={() => selectAccounts((account) => !accountIsCooling(account))}>{t('非冷却', 'Not cooling')}</button>
@@ -1646,9 +1775,9 @@ export function ProvidersView({
                   <button type="button" disabled={!selectedAccountIds.length} onClick={() => setSelectedAccountIds([])}>{t('清空', 'Clear')}</button>
                 </div>
                 <div className="account-toolbar-actions">
-                  <button className="button button--secondary" type="button" onClick={() => setTagManagerOpen(true)}><Tags size={16} />{t('管理 Tag', 'Manage tags')}</button>
-                  <button className="button button--secondary" type="button" disabled={!selectedAccountIds.length} onClick={() => setTagAssignmentOpen(true)}><Tag size={16} />{t('设置 Tag', 'Set tag')}</button>
-                  <button className="button button--secondary" type="button" disabled={!oauthAccounts.length} onClick={openAccountExport}><Download size={16} />{t('导出账号', 'Export accounts')}</button>
+                  {accountFamily === 'openai' && <button className="button button--secondary" type="button" onClick={() => setTagManagerOpen(true)}><Tags size={16} />{t('管理 Tag', 'Manage tags')}</button>}
+                  {accountFamily === 'openai' && <button className="button button--secondary" type="button" disabled={!selectedAccountIds.length} onClick={() => setTagAssignmentOpen(true)}><Tag size={16} />{t('设置 Tag', 'Set tag')}</button>}
+                  {accountFamily === 'openai' && <button className="button button--secondary" type="button" disabled={!oauthAccounts.length} onClick={openAccountExport}><Download size={16} />{t('导出账号', 'Export accounts')}</button>}
                   <button className="button button--secondary button--danger-text" type="button" disabled={!selectedAccountIds.length} onClick={() => setBulkDeleteOpen(true)}><Trash2 size={16} />{t('删除所选', 'Delete selected')}</button>
                   <button className="button button--secondary" type="button" disabled={checkingAllAccounts || !visibleAccounts.length} onClick={() => void checkAllAccounts()}>{checkingAllAccounts ? <LoaderCircle size={16} className="spin" /> : <RefreshCw size={16} />}{checkingAllAccounts ? t('正在检测…', 'Checking…') : t('检测全部', 'Check all')}</button>
                 </div>
@@ -1671,24 +1800,32 @@ export function ProvidersView({
                       : account.modelsRefreshedAt === undefined
                         ? t(`待刷新 · 开放 ${openModels.length} 个模型`, `Refresh pending · ${openModels.length} models allowed`)
                         : t(`开放 ${openModels.length} 个模型`, `${openModels.length} models allowed`)
+                    const grokQuotaTitle = account.grokQuota
+                      ? [
+                          account.grokQuota.plan?.name ?? account.grokQuota.plan?.code,
+                          account.grokQuota.resetAt !== undefined
+                            ? `${t('周期结束', 'Period ends')} ${new Intl.DateTimeFormat(locale, { dateStyle: 'medium', timeStyle: 'short' }).format(account.grokQuota.resetAt)}`
+                            : undefined,
+                        ].filter(Boolean).join(' · ')
+                      : undefined
                     return (
                       <tr key={account.id}>
                         <td className="account-select-column"><input type="checkbox" aria-label={t(`选择账号 ${account.name}`, `Select account ${account.name}`)} checked={selectedAccountIds.includes(account.id)} onChange={() => toggleSelectedAccount(account.id)} /></td>
-                        <td><div className="provider-cell"><span className="provider-avatar" style={{ '--provider-color': provider?.color ?? '#61736f' } as React.CSSProperties}>{provider?.name.slice(0, 1) ?? '?'}</span><div><strong title={account.name}>{accountNameById.get(account.id) ?? account.name}</strong><span>{provider?.name ?? t('供应商已删除', 'Provider deleted')}{account.proxyId ? ` · ${proxyById.get(account.proxyId)?.name ?? t('代理已删除', 'Proxy deleted')}` : ''} · {modelSummary}</span></div></div></td>
+                        <td><div className="provider-cell"><ProviderAvatar kind={provider?.kind} name={provider?.name} color={provider?.color} /><div><strong title={account.name}>{accountNameById.get(account.id) ?? account.name}</strong><span>{provider?.name ?? t('供应商已删除', 'Provider deleted')}{account.proxyId ? ` · ${proxyById.get(account.proxyId)?.name ?? t('代理已删除', 'Proxy deleted')}` : ''} · {modelSummary}</span></div></div></td>
                         <td>{account.tagId && tagById.has(account.tagId) ? <span className="account-tag-chip"><Tag size={12} />{tagById.get(account.tagId)?.name}</span> : <span className="muted">{t('未标记', 'Untagged')}</span>}</td>
-                        <td><AccountStatusBadge status={account.status} circuitState={account.circuitState} /><CooldownCountdown account={account} />{(account.credentialType === 'chatgpt-oauth' || account.credentialType === 'chatgpt-agent-identity') && <span className="row-note">{account.credentialType === 'chatgpt-agent-identity' ? 'Agent Identity' : 'ChatGPT OAuth'} · {account.renewable ? t('可续期', 'Renewable') : t('会话到期即停用', 'Disabled when the session expires')}</span>}{Boolean(account.consecutiveFailures) && <span className="row-note">{t('连续失败', 'Consecutive failures')} {account.consecutiveFailures}</span>}{account.lastError && <span className="row-note row-note--danger" title={localizeBackendMessage(account.lastError, language, t('账号检测失败', 'Account check failed.'))}>{localizeBackendMessage(account.lastError, language, t('账号检测失败', 'Account check failed.'))}</span>}</td>
+                        <td><AccountStatusBadge status={account.status} circuitState={account.circuitState} /><CooldownCountdown account={account} />{(account.credentialType === 'chatgpt-oauth' || account.credentialType === 'chatgpt-agent-identity' || account.credentialType === 'grok-oauth') && <span className="row-note">{account.credentialType === 'chatgpt-agent-identity' ? 'Agent Identity' : account.credentialType === 'grok-oauth' ? 'Grok OAuth' : 'ChatGPT OAuth'} · {account.renewable ? t('可续期', 'Renewable') : t('会话到期即停用', 'Disabled when the session expires')}</span>}{provider?.kind === 'xai' && account.credentialType !== 'grok-oauth' && <span className="row-note">xAI API Key</span>}{Boolean(account.consecutiveFailures) && <span className="row-note">{t('连续失败', 'Consecutive failures')} {account.consecutiveFailures}</span>}{account.lastError && <span className="row-note row-note--danger" title={localizeBackendMessage(account.lastError, language, t('账号检测失败', 'Account check failed.'))}>{localizeBackendMessage(account.lastError, language, t('账号检测失败', 'Account check failed.'))}</span>}</td>
                         <td><AccountFitness fitness={account.fitness} /></td>
                         <td><span className="mono masked-key">{account.maskedCredential}</span></td>
                         <td><div className="concurrency-cell"><strong>{account.inFlight} / {account.maxConcurrency}</strong><div className="mini-progress"><span style={{ width: `${Math.min(100, account.inFlight / account.maxConcurrency * 100)}%` }} /></div></div></td>
                         <td>{account.credentialType === 'chatgpt-oauth' || account.credentialType === 'chatgpt-agent-identity'
                           ? <CodexQuotaCompact quota={account.codexQuota} onClick={() => setQuotaAccountId(account.id)} />
-                          : account.quotaRemaining !== undefined ? <strong>{account.quotaUnit === 'usd' ? new Intl.NumberFormat(locale, { style: 'currency', currency: 'USD', currencyDisplay: 'narrowSymbol' }).format(account.quotaRemaining) : `${new Intl.NumberFormat(locale).format(account.quotaRemaining)}${account.quotaUnit === 'percent' ? '%' : ''}`}</strong> : <span className="muted">{t('未知', 'Unknown')}</span>}</td>
+                          : account.quotaRemaining !== undefined ? <strong title={grokQuotaTitle}>{account.quotaUnit === 'usd' ? new Intl.NumberFormat(locale, { style: 'currency', currency: 'USD', currencyDisplay: 'narrowSymbol' }).format(account.quotaRemaining) : `${new Intl.NumberFormat(locale).format(account.quotaRemaining)}${account.quotaUnit === 'percent' ? '%' : ''}`}</strong> : <span className="muted" title={grokQuotaTitle}>{t('未知', 'Unknown')}</span>}</td>
                         <td>{account.latencyMs ? durationLabel(account.latencyMs) : '—'}</td>
                         <td>{relativeTime(account.lastUsedAt, locale)}</td>
                         <td className="actions-cell">
-                          <button className="icon-button" type="button" title={t('刷新此账号的可用模型', 'Refresh available models for this account')} disabled={refreshingModels} onClick={() => void runAction(`refresh-account-models-${account.id}`, () => api.refreshAccountModels(account.id))}>{refreshingModels ? <LoaderCircle size={16} className="spin" /> : <Boxes size={16} />}</button>
-                          <button className="icon-button" type="button" title={t('检测账号', 'Check account')} disabled={checking} onClick={() => void runAction(`check-${account.id}`, () => api.checkAccount(account.id))}>{checking ? <LoaderCircle size={16} className="spin" /> : <RefreshCw size={16} />}</button>
-                          <OverflowMenu open={menuOpen === account.id} onOpenChange={(open) => setMenuOpen(open ? account.id : null)} label={t('更多操作', 'More actions')}><button type="button" onClick={() => openAccount(account)}><Edit3 size={15} />{t('编辑', 'Edit')}</button><button className="danger" type="button" onClick={() => { setDeleteTarget({ kind: 'account', id: account.id, name: account.name }); setMenuOpen(null) }}><Trash2 size={15} />{t('删除', 'Delete')}</button></OverflowMenu>
+                          <button className="icon-button" type="button" title={account.credentialType === 'grok-oauth' ? t('Grok OAuth 使用内置模型目录', 'Grok OAuth uses the built-in model catalog') : t('刷新此账号的可用模型', 'Refresh available models for this account')} disabled={refreshingModels || account.credentialType === 'grok-oauth'} onClick={() => void runAction(`refresh-account-models-${account.id}`, () => api.refreshAccountModels(account.id))}>{refreshingModels ? <LoaderCircle size={16} className="spin" /> : <Boxes size={16} />}</button>
+                          <button className="icon-button" type="button" title={account.credentialType === 'grok-oauth' ? t('检测账号并刷新额度', 'Check account and refresh quota') : t('检测账号', 'Check account')} disabled={checking} onClick={() => void runAction(`check-${account.id}`, () => api.checkAccount(account.id))}>{checking ? <LoaderCircle size={16} className="spin" /> : <RefreshCw size={16} />}</button>
+                          <OverflowMenu open={menuOpen === account.id} onOpenChange={(open) => setMenuOpen(open ? account.id : null)} label={t('更多操作', 'More actions')}><button type="button" onClick={() => provider?.kind === 'xai' && account.credentialType !== 'grok-oauth' ? openProvider('official-api', provider) : openAccount(account)}><Edit3 size={15} />{t('编辑', 'Edit')}</button><button className="danger" type="button" onClick={() => { setDeleteTarget(provider?.kind === 'xai' && account.credentialType !== 'grok-oauth' ? { kind: 'provider', id: provider.id, name: provider.name } : { kind: 'account', id: account.id, name: account.name }); setMenuOpen(null) }}><Trash2 size={15} />{t('删除', 'Delete')}</button></OverflowMenu>
                         </td>
                       </tr>
                     )
@@ -1699,27 +1836,27 @@ export function ProvidersView({
             </>
           ) : (
             <EmptyState
-              icon={<KeyRound size={24} />}
-              title={t('尚未添加 Codex 账号', 'No Codex accounts yet')}
-              action={<button className="button button--primary" type="button" onClick={openChatGptAccountDialog}><Plus size={16} />{t('添加 Codex 账号', 'Add Codex account')}</button>}
+              icon={accountFamily === 'openai'
+                ? <img className="account-family-empty-icon" src={providerBrandIcon('openai')} alt="" />
+                : <img className="account-family-empty-icon" src={providerBrandIcon('xai-compatible')} alt="" />}
+              title={accountFamily === 'openai' ? t('尚未添加 Codex 账号', 'No Codex accounts yet') : t('尚未添加 Grok 账号', 'No Grok accounts yet')}
+              action={accountFamily === 'openai' ? <button className="button button--primary" type="button" onClick={openChatGptAccountDialog}><Plus size={16} />{t('添加 Codex 账号', 'Add Codex account')}</button> : <button className="button button--primary" type="button" onClick={openGrokCredential}><Plus size={16} />{t('添加 Grok 凭据', 'Add Grok credential')}</button>}
             />
           )}
+          </div>
         </section>
       ) : (
         (tab === 'official' ? officialProviders.length : relayProviders.length + aggregateRelays.length) ? (
-          <div className="provider-grid">
+          <div id={`providers-panel-${tab}`} className="provider-grid" role="tabpanel" aria-labelledby={`providers-tab-${tab}`}>
             {(tab === 'official' ? officialProviders : relayProviders).map((provider) => {
               const sourceAccount = snapshot.accounts.find((account) => account.providerId === provider.id
                 && account.credentialType !== 'chatgpt-oauth'
                 && account.credentialType !== 'chatgpt-agent-identity')
-              const brandIcon = providerBrandIcon(provider.kind)
               return (
                 <article className="provider-card" key={provider.id}>
                   <div className="provider-card__top">
-                    <span className={`provider-avatar provider-avatar--large ${brandIcon ? 'provider-avatar--brand' : ''}`} style={{ '--provider-color': provider.color ?? '#61736f' } as React.CSSProperties}>
-                      {brandIcon ? <img src={brandIcon} alt="" /> : provider.name.slice(0, 1)}
-                    </span>
-                    <div><h2>{provider.name}</h2><span>{t(providerKindLabels[provider.kind], providerKindLabelsEn[provider.kind])}</span></div>
+                    <ProviderAvatar kind={provider.kind} name={provider.name} color={provider.color} large />
+                    <div><h2>{provider.name}</h2><span>{t(providerKindLabelsZh[provider.kind], providerKindLabelsEn[provider.kind])}</span></div>
                     <OverflowMenu open={menuOpen === provider.id} onOpenChange={(open) => setMenuOpen(open ? provider.id : null)} label={t('来源操作', 'Source actions')}><button type="button" disabled={testingSourceId === provider.id || !sourceAccount} onClick={() => void testSavedSource(provider, sourceAccount)}>{testingSourceId === provider.id ? <LoaderCircle size={15} className="spin" /> : <RefreshCw size={15} />}{t('测试', 'Test')}</button><button type="button" onClick={() => openProvider(provider.sourceType === 'relay' ? 'relay' : 'official-api', provider)}><Edit3 size={15} />{t('编辑', 'Edit')}</button><button type="button" onClick={() => copySourceConfiguration(provider, sourceAccount)}><Copy size={15} />{t('复制配置', 'Copy configuration')}</button><button className="danger" type="button" onClick={() => { setDeleteTarget({ kind: 'provider', id: provider.id, name: provider.name }); setMenuOpen(null) }}><Trash2 size={15} />{t('删除', 'Delete')}</button></OverflowMenu>
                   </div>
                   <div className="provider-card__endpoint"><span>{t('基础地址', 'Base URL')}</span><code>{provider.baseUrl}</code></div>
@@ -1751,7 +1888,7 @@ export function ProvidersView({
             })}
           </div>
         ) : (
-          <section className="panel"><EmptyState icon={<Server size={24} />} title={tab === 'official' ? t('尚未配置官方 API', 'No official APIs configured') : t('尚未配置中转站', 'No relays configured')} action={<button className="button button--primary" type="button" onClick={() => openProvider(tab === 'official' ? 'official-api' : 'relay')}><Plus size={16} />{tab === 'official' ? t('添加官方 API', 'Add official API') : t('添加中转站', 'Add relay')}</button>} /></section>
+          <section id={`providers-panel-${tab}`} className="panel" role="tabpanel" aria-labelledby={`providers-tab-${tab}`}><EmptyState icon={<Server size={24} />} title={tab === 'official' ? t('尚未配置官方 API', 'No official APIs configured') : t('尚未配置中转站', 'No relays configured')} action={<button className="button button--primary" type="button" onClick={() => openProvider(tab === 'official' ? 'official-api' : 'relay')}><Plus size={16} />{tab === 'official' ? t('添加官方 API', 'Add official API') : t('添加中转站', 'Add relay')}</button>} /></section>
         )
       )}
 
@@ -1784,7 +1921,7 @@ export function ProvidersView({
             {oauthAccounts.map((account) => {
               const provider = providerById.get(account.providerId)
               const selected = exportAccountIds.includes(account.id)
-              return <label className={selected ? 'selected' : ''} key={account.id}><input type="checkbox" checked={selected} onChange={() => toggleExportAccount(account.id)} /><span className="provider-avatar" style={{ '--provider-color': provider?.color ?? '#61736f' } as React.CSSProperties}>{provider?.name.slice(0, 1) ?? '?'}</span><span><strong title={account.name}>{accountNameById.get(account.id) ?? account.name}</strong><small>{provider?.name ?? t('供应商已删除', 'Provider deleted')} · {accountIsCooling(account) ? t('冷却中', 'Cooling down') : t('非冷却', 'Not cooling')} · {account.renewable ? t('可续期', 'Renewable') : 'Access Token only'}</small></span><AccountStatusBadge status={account.status} circuitState={account.circuitState} /></label>
+              return <label className={selected ? 'selected' : ''} key={account.id}><input type="checkbox" checked={selected} onChange={() => toggleExportAccount(account.id)} /><ProviderAvatar kind={provider?.kind} name={provider?.name} color={provider?.color} /><span><strong title={account.name}>{accountNameById.get(account.id) ?? account.name}</strong><small>{provider?.name ?? t('供应商已删除', 'Provider deleted')} · {accountIsCooling(account) ? t('冷却中', 'Cooling down') : t('非冷却', 'Not cooling')} · {account.renewable ? t('可续期', 'Renewable') : 'Access Token only'}</small></span><AccountStatusBadge status={account.status} circuitState={account.circuitState} /></label>
             })}
           </div>
           <FieldError>{errors.accountExport}</FieldError>
@@ -1806,13 +1943,13 @@ export function ProvidersView({
               : <button className="button button--secondary" type="button" onClick={() => void closeChatGptAccountDialog()}>{t('关闭', 'Close')}</button>}
       >
         <form id="chatgpt-account-import" className="form-grid" onSubmit={(event) => void submitChatGptImport(event)}>
-          <div className="account-add-method-tabs field--full" role="tablist" aria-label={t('Codex 账号添加方式', 'Method for adding a Codex account')}>
-            <button type="button" role="tab" aria-selected={accountAddMethod === 'oauth'} className={accountAddMethod === 'oauth' ? 'active' : ''} disabled={importConfigurationLocked} onClick={() => switchAccountAddMethod('oauth')}>
+          <div className="account-add-method-tabs field--full" role="tablist" aria-label={t('Codex 账号添加方式', 'Method for adding a Codex account')} onKeyDown={handleTabListKeyDown}>
+            <button id="account-add-tab-oauth" type="button" role="tab" tabIndex={accountAddMethod === 'oauth' ? 0 : -1} aria-selected={accountAddMethod === 'oauth'} aria-controls="account-add-panel-oauth" className={accountAddMethod === 'oauth' ? 'active' : ''} disabled={importConfigurationLocked} onClick={() => switchAccountAddMethod('oauth')}>
               <span className="account-add-method-tabs__icon"><ShieldCheck size={18} /></span>
               <span><strong>{t('OAuth 授权', 'OAuth authorization')}</strong><small>{t('在 OpenAI 页面登录，无需手动查找 Token', 'Sign in on the OpenAI page without locating a token manually')}</small></span>
               <Badge tone="success">{t('推荐', 'Recommended')}</Badge>
             </button>
-            <button type="button" role="tab" aria-selected={accountAddMethod === 'token-json'} className={accountAddMethod === 'token-json' ? 'active' : ''} disabled={importConfigurationLocked} onClick={() => switchAccountAddMethod('token-json')}>
+            <button id="account-add-tab-token-json" type="button" role="tab" tabIndex={accountAddMethod === 'token-json' ? 0 : -1} aria-selected={accountAddMethod === 'token-json'} aria-controls="account-add-panel-token-json" className={accountAddMethod === 'token-json' ? 'active' : ''} disabled={importConfigurationLocked} onClick={() => switchAccountAddMethod('token-json')}>
               <span className="account-add-method-tabs__icon"><Files size={18} /></span>
               <span><strong>Token / JSON</strong><small>{t('导入 Sub2API / CPA 或粘贴 Access Token', 'Import Sub2API / CPA or paste an access token')}</small></span>
               <Badge tone="neutral">{t('兼容导入', 'Compatible import')}</Badge>
@@ -1873,7 +2010,7 @@ export function ProvidersView({
             </div>
           </details>
 
-          {accountAddMethod === 'oauth' ? <section className="oauth-account-flow field--full" role="tabpanel" aria-label={t('OAuth 授权添加账号', 'Add account using OAuth')}>
+          {accountAddMethod === 'oauth' ? <section id="account-add-panel-oauth" className="oauth-account-flow field--full" role="tabpanel" aria-labelledby="account-add-tab-oauth">
             {oauthStage === 'idle' || oauthStage === 'starting' ? <div className="oauth-account-flow__intro">
               <span className="oauth-account-flow__hero"><ShieldCheck size={25} /></span>
               <div><h3>{oauthStage === 'starting' ? t('正在创建安全授权会话', 'Creating a secure authorization session') : t('使用 OpenAI OAuth 添加 Codex 账号', 'Add a Codex account with OpenAI OAuth')}</h3><p>{oauthStage === 'starting' ? t('正在准备 PKCE 授权链接和本机回调监听…', 'Preparing the PKCE authorization link and local callback listener…') : t('点击开始后将在系统浏览器打开 OpenAI 登录页，授权成功后 Stone+ 会自动接收回调、保存账号并立即检测可用性。', 'Starting opens the OpenAI sign-in page in your system browser. After authorization, Stone+ receives the callback, saves the account, and checks availability.')}</p></div>
@@ -1888,7 +2025,7 @@ export function ProvidersView({
               </div>
               <div className="oauth-authorization-link"><span>{t('授权链接', 'Authorization link')}</span><div><input className="mono" readOnly value={oauthSession.authorizationUrl} aria-label={t('OpenAI OAuth 授权链接', 'OpenAI OAuth authorization link')} /><button className="icon-button" type="button" aria-label={t('复制 OAuth 授权链接', 'Copy OAuth authorization link')} title={t('复制授权链接', 'Copy authorization link')} onClick={() => void copyOAuthAuthorizationUrl()}>{oauthCopied ? <CheckCircle2 size={16} /> : <Copy size={16} />}</button></div></div>
               <div className="oauth-account-flow__actions"><button className="button button--primary" type="button" disabled={oauthOpenBusy || oauthStage === 'exchanging'} onClick={() => void openOAuthInSystemBrowser()}>{oauthOpenBusy ? <LoaderCircle size={16} className="spin" /> : <ExternalLink size={16} />}{t('在系统浏览器中打开', 'Open in system browser')}</button><button className="button button--secondary" type="button" onClick={() => void copyOAuthAuthorizationUrl()}><Copy size={16} />{t('复制链接', 'Copy link')}</button></div>
-              {oauthOpenHint && <div className="oauth-inline-message"><CircleAlert size={14} />{oauthOpenHint}</div>}
+              {oauthOpenHint && <div className="oauth-inline-message" role="status" aria-live="polite"><CircleAlert size={14} />{oauthOpenHint}</div>}
               <div className="oauth-manual-callback">
                 <div><strong>{t('浏览器没有自动返回？', 'Did the browser fail to return automatically?')}</strong><span>{t('从浏览器地址栏复制跳转后的完整 localhost 回调 URL，粘贴到下方。', 'Copy the complete localhost callback URL from the browser address bar and paste it below.')}</span></div>
                 <textarea className="mono" rows={3} value={oauthCallbackUrl} disabled={oauthStage === 'submitting' || oauthStage === 'exchanging'} onChange={(event) => setOauthCallbackUrl(event.target.value)} placeholder={`${oauthSession.redirectUri}?code=...&state=...`} aria-label={t('完整 OAuth 回调 URL', 'Complete OAuth callback URL')} />
@@ -1905,7 +2042,7 @@ export function ProvidersView({
 
             {oauthStage === 'error' ? <div className="oauth-account-flow__result oauth-account-flow__result--error"><span className="oauth-result-icon"><CircleAlert size={25} /></span><div><h3>{t('OAuth 授权未完成', 'OAuth authorization incomplete')}</h3><p>{oauthError || t('授权会话已结束，请重新开始。', 'The authorization session ended. Start again.')}</p></div><button className="button button--secondary" type="button" onClick={() => void startChatGptOAuth()}><RefreshCw size={15} />{t('重试授权', 'Retry authorization')}</button><button className="text-button" type="button" onClick={() => switchAccountAddMethod('token-json')}>{t('改用 Token / JSON 导入', 'Use Token / JSON import instead')}</button></div> : null}
             {oauthStage === 'cancelled' ? <div className="oauth-account-flow__result oauth-account-flow__result--cancelled"><span className="oauth-result-icon"><XCircle size={25} /></span><div><h3>{t('本次授权已取消', 'Authorization cancelled')}</h3><p>{t('未保存任何 OAuth 回调或新账号，可以随时重新开始。', 'No OAuth callback or new account was saved. You can start again at any time.')}</p></div><button className="button button--secondary" type="button" onClick={() => void startChatGptOAuth()}><RefreshCw size={15} />{t('重新授权', 'Authorize again')}</button></div> : null}
-          </section> : <section className="token-json-import field--full" role="tabpanel" aria-label={t('Token 或 JSON 导入账号', 'Import accounts using Token or JSON')}>
+          </section> : <section id="account-add-panel-token-json" className="token-json-import field--full" role="tabpanel" aria-labelledby="account-add-tab-token-json">
             <div className="account-file-import">
               <span className="account-file-import__icon"><Files size={20} /></span>
               <div><strong>{t('批量导入 CPA / Sub2API JSON', 'Batch import CPA / Sub2API JSON')}</strong><span>{t('在文件选择器中按 Ctrl 或 Shift 多选；自动补全缺失的 account_id，导入后立即刷新状态并查询可用模型。', 'Use Ctrl or Shift to select multiple files. Missing account_id values are filled automatically, then status and available models are refreshed.')}</span></div>
@@ -1920,8 +2057,25 @@ export function ProvidersView({
       </Modal>
 
       <Modal
+        open={grokImportOpen}
+        title={t('添加 Grok 凭据', 'Add Grok credential')}
+        description={t('导入 Sub2API 导出的 Grok OAuth JSON，访问令牌与刷新令牌将加密保存。', 'Import a Grok OAuth JSON exported by Sub2API. Access and refresh tokens are stored encrypted.')}
+        onClose={() => setGrokImportOpen(false)}
+        width="large"
+        footer={<><button type="button" className="button button--secondary" onClick={openGrokApiKey}>{t('改用 xAI API Key', 'Use xAI API Key')}</button><button type="button" className="button button--secondary" onClick={() => setGrokImportOpen(false)}>{t('取消', 'Cancel')}</button><button type="submit" form="grok-import-form" className="button button--primary" disabled={grokImportBusy}>{grokImportBusy ? <LoaderCircle size={16} className="spin" /> : <CheckCircle2 size={16} />}{t('导入 OAuth 账号', 'Import OAuth account')}</button></>}
+      >
+        <form id="grok-import-form" className="form-grid" onSubmit={(event) => void submitGrokImport(event)}>
+          <label className="field field--full"><span>{t('Sub2API JSON', 'Sub2API JSON')}</span><textarea autoFocus required className="mono" rows={12} value={grokImport.content} onChange={(event) => setGrokImport({ ...grokImport, content: event.target.value })} placeholder='{"type":"sub2api-data","version":1,"accounts":[...]}' /><small>{t('仅导入 platform=grok、type=oauth 的账号；其他平台账号会被忽略。', 'Only platform=grok, type=oauth accounts are imported; other platforms are ignored.')}</small><FieldError>{errors.grokImport}</FieldError></label>
+          <label className="field field--full"><span>{t('加入 Grok 号池', 'Add to Grok pool')}</span><select value={grokImport.poolId} onChange={(event) => setGrokImport({ ...grokImport, poolId: event.target.value })}><option value="">{t('暂不加入号池', 'Do not add to a pool yet')}</option>{compatibleGrokImportPools.map((pool) => <option key={pool.id} value={pool.id}>{setupPoolDisplayName(pool.name, t)} · {t(`${pool.members.length} 个成员`, `${pool.members.length} members`)}</option>)}</select><small>{t('Grok OAuth 账号只能加入对外协议为 Grok 的号池。', 'Grok OAuth accounts can only join pools whose public protocol is Grok.')}</small></label>
+          <label className="field field--full"><span>{t('账号代理', 'Account proxy')}</span><select value={grokImport.proxyId} onChange={(event) => setGrokImport({ ...grokImport, proxyId: event.target.value })} disabled={builtInProxyInterlocked}><option value="">{t('直连', 'Direct')}</option>{snapshot.proxies.map((proxy) => <option key={proxy.id} value={proxy.id}>{proxy.name}</option>)}</select>{builtInProxyInterlocked && <small>{t('内置代理接管中，账号代理绑定将在关闭后恢复。', 'The built-in proxy is active. Account proxy bindings resume after it is disabled.')}</small>}</label>
+        </form>
+      </Modal>
+
+      <Modal
         open={providerModal}
-        title={providerDraft.id ? (providerDraft.sourceType === 'official-api' ? t('编辑官方 API', 'Edit official API') : t('编辑中转站', 'Edit relay')) : (providerDraft.sourceType === 'official-api' ? t('添加官方 API', 'Add official API') : t('添加中转站', 'Add relay'))}
+        title={providerDraft.kind === 'xai'
+          ? providerDraft.id ? t('编辑 Grok 凭据', 'Edit Grok credential') : t('添加 Grok 凭据', 'Add Grok credential')
+          : providerDraft.id ? (providerDraft.sourceType === 'official-api' ? t('编辑官方 API', 'Edit official API') : t('编辑中转站', 'Edit relay')) : (providerDraft.sourceType === 'official-api' ? t('添加官方 API', 'Add official API') : t('添加中转站', 'Add relay'))}
         onClose={closeProvider}
         width="large"
         footer={<><button type="button" className="button button--secondary" onClick={closeProvider}>{t('取消', 'Cancel')}</button><button type="button" className="button button--secondary" disabled={providerProbeBusy} onClick={() => void probeProvider()}>{providerProbeBusy ? <LoaderCircle size={16} className="spin" /> : <RefreshCw size={16} />}{t('测试连接', 'Test connection')}</button><button type="submit" form="provider-form" className="button button--primary" disabled={providerProbeBusy || busyKeys.has('save-api-source')}>{busyKeys.has('save-api-source') ? <LoaderCircle size={16} className="spin" /> : <CheckCircle2 size={16} />}{t('保存来源', 'Save source')}</button></>}
@@ -1947,7 +2101,7 @@ export function ProvidersView({
         width="xlarge"
         footer={<><button type="button" className="button button--secondary" onClick={() => setAccountModal(false)}>{t('取消', 'Cancel')}</button><button type="submit" form="account-form" className="button button--primary" disabled={busyKeys.has('save-account')}>{busyKeys.has('save-account') ? <LoaderCircle size={16} className="spin" /> : <CheckCircle2 size={16} />}{t('保存账号', 'Save account')}</button></>}
       >
-        <form id="account-form" onSubmit={(event) => void submitAccount(event)}><AccountForm draft={accountDraft} setDraft={setAccountDraft} providers={snapshot.providers} proxies={snapshot.proxies} proxyInterlocked={builtInProxyInterlocked} account={editingAccount} editing={Boolean(accountDraft.id)} oauthAccount={editingAccount?.credentialType === 'chatgpt-oauth' || editingAccount?.credentialType === 'chatgpt-agent-identity'} refreshingModels={accountModelsBusy} refreshDisabledReason={refreshModelsDisabledReason} onRefreshModels={() => void refreshEditingAccountModels()} onTestModel={accountDraft.id ? (model) => api.testAccountModel(accountDraft.id as string, model) : undefined} errors={errors} /></form>
+        <form id="account-form" onSubmit={(event) => void submitAccount(event)}><AccountForm draft={accountDraft} setDraft={setAccountDraft} providers={snapshot.providers} proxies={snapshot.proxies} proxyInterlocked={builtInProxyInterlocked} account={editingAccount} editing={Boolean(accountDraft.id)} oauthAccount={editingAccount?.credentialType === 'chatgpt-oauth' || editingAccount?.credentialType === 'chatgpt-agent-identity' || editingAccount?.credentialType === 'grok-oauth'} codexQuotaAccount={editingAccount?.credentialType === 'chatgpt-oauth' || editingAccount?.credentialType === 'chatgpt-agent-identity'} refreshingModels={accountModelsBusy} refreshDisabledReason={refreshModelsDisabledReason} onRefreshModels={() => void refreshEditingAccountModels()} onTestModel={accountDraft.id ? (model) => api.testAccountModel(accountDraft.id as string, model) : undefined} errors={errors} /></form>
       </Modal>
 
       <Modal
@@ -1959,7 +2113,7 @@ export function ProvidersView({
       >
         <form id="aggregate-relay-form" className="form-grid" onSubmit={(event) => void submitAggregateRelay(event)}>
           <label className="field"><span>{t('显示名称', 'Display name')}</span><input autoFocus value={aggregateDraft.name} onChange={(event) => setAggregateDraft({ ...aggregateDraft, name: event.target.value })} placeholder={t('例如：Codex 多线路', 'e.g. Multi-route Codex')} /><FieldError>{errors.aggregateName}</FieldError></label>
-          <label className="field"><span>{t('对外协议', 'Public protocol')}</span><select value={aggregateDraft.protocol} onChange={(event) => { const protocol = event.target.value as Protocol; setAggregateDraft({ ...aggregateDraft, protocol, members: aggregateDraft.members.filter((member) => providerById.get(snapshot.accounts.find((account) => account.id === member.accountId)?.providerId ?? '')?.protocol === protocol) }) }}>{protocols.map((protocol) => <option key={protocol} value={protocol}>{protocolLabels[protocol]}</option>)}</select></label>
+          <label className="field"><span>{t('对外协议', 'Public protocol')}</span><select value={aggregateDraft.protocol} onChange={(event) => { const protocol = event.target.value as Protocol; setAggregateDraft({ ...aggregateDraft, protocol, members: aggregateDraft.members.filter((member) => providerById.get(snapshot.accounts.find((account) => account.id === member.accountId)?.providerId ?? '')?.protocol === protocol) }) }}>{aggregateProtocols.map((protocol) => <option key={protocol} value={protocol}>{protocolLabels[protocol]}</option>)}</select></label>
           <div className="field field--full"><span>{t('调度策略', 'Scheduling strategy')}</span><div className="aggregate-strategy-grid">
             {([
               ['priority', '故障转移', 'Failover', '按成员顺序使用，失败时切换下一条', 'Use members in order and switch to the next after a failure'],
@@ -1971,19 +2125,27 @@ export function ProvidersView({
             <span>{t('API 来源成员', 'API source members')}</span>
             <div className="aggregate-member-picker">
               {snapshot.accounts.filter((account) => {
-                if (account.credentialType === 'chatgpt-oauth' || account.credentialType === 'chatgpt-agent-identity') return false
+                if (account.credentialType === 'chatgpt-oauth' || account.credentialType === 'chatgpt-agent-identity' || account.credentialType === 'grok-oauth') return false
                 const provider = providerById.get(account.providerId)
-                return (provider?.sourceType === 'official-api' || provider?.sourceType === 'relay') && provider.protocol === aggregateDraft.protocol
+                if (!provider || (provider.sourceType !== 'official-api' && provider.sourceType !== 'relay') || provider.protocol !== aggregateDraft.protocol) return false
+                const selectedProviders = aggregateDraft.members.flatMap((member) => {
+                  const selectedAccount = snapshot.accounts.find((candidate) => candidate.id === member.accountId)
+                  const selectedProvider = providerById.get(selectedAccount?.providerId ?? '')
+                  return selectedProvider ? [selectedProvider] : []
+                })
+                return aggregateDraft.members.some((member) => member.accountId === account.id)
+                  || selectedProviders.length === 0
+                  || selectedProviders.every((selectedProvider) => providerSourceFamily(selectedProvider.kind) === providerSourceFamily(provider.kind))
               }).map((account) => {
                 const provider = providerById.get(account.providerId)
                 const memberIndex = aggregateDraft.members.findIndex((member) => member.accountId === account.id)
                 const member = memberIndex >= 0 ? aggregateDraft.members[memberIndex] : undefined
                 return <div className={member ? 'selected' : ''} key={account.id}>
-                  <button className="aggregate-member-picker__toggle" type="button" aria-pressed={Boolean(member)} aria-label={member ? t(`取消选择${provider?.name ?? account.name}`, `Deselect ${provider?.name ?? account.name}`) : t(`选择${provider?.name ?? account.name}`, `Select ${provider?.name ?? account.name}`)} onClick={() => toggleAggregateMember(account)}><span className="checkbox-mark" aria-hidden="true">{member && <CheckCircle2 size={13} />}</span><span className="provider-avatar" style={{ '--provider-color': provider?.color ?? '#61736f' } as React.CSSProperties}>{provider?.name.slice(0, 1)}</span><span><strong>{provider?.name}</strong><small>{account.maskedCredential} · {protocolLabels[aggregateDraft.protocol]}</small></span></button>
+                  <button className="aggregate-member-picker__toggle" type="button" aria-pressed={Boolean(member)} aria-label={member ? t(`取消选择${provider?.name ?? account.name}`, `Deselect ${provider?.name ?? account.name}`) : t(`选择${provider?.name ?? account.name}`, `Select ${provider?.name ?? account.name}`)} onClick={() => toggleAggregateMember(account)}><span className="checkbox-mark" aria-hidden="true">{member && <CheckCircle2 size={13} />}</span><ProviderAvatar kind={provider?.kind} name={provider?.name} color={provider?.color} /><span><strong>{provider?.name}</strong><small>{account.maskedCredential} · {protocolLabels[aggregateDraft.protocol]}</small></span></button>
                   {member && <div className="aggregate-member-controls"><button type="button" title={t('上移', 'Move up')} disabled={memberIndex === 0} onClick={() => { const next = [...aggregateDraft.members]; [next[memberIndex - 1], next[memberIndex]] = [next[memberIndex], next[memberIndex - 1]]; updateAggregateMembers(next) }}>↑</button><button type="button" title={t('下移', 'Move down')} disabled={memberIndex === aggregateDraft.members.length - 1} onClick={() => { const next = [...aggregateDraft.members]; [next[memberIndex + 1], next[memberIndex]] = [next[memberIndex], next[memberIndex + 1]]; updateAggregateMembers(next) }}>↓</button><label>{t('权重', 'Weight')} <input type="number" min={1} max={100} value={member.weight} onChange={(event) => updateAggregateMembers(aggregateDraft.members.map((item) => item.accountId === member.accountId ? { ...item, weight: Number(event.target.value) } : item))} /></label><span>#{memberIndex + 1}</span></div>}
                 </div>
               })}
-              {!snapshot.accounts.some((account) => account.credentialType !== 'chatgpt-oauth' && account.credentialType !== 'chatgpt-agent-identity' && providerById.get(account.providerId)?.protocol === aggregateDraft.protocol) && <div className="aggregate-member-picker__empty">{t('没有同协议的官方 API 或中转站，请先添加来源。', 'No official API or relay uses this protocol. Add a source first.')}</div>}
+              {!snapshot.accounts.some((account) => account.credentialType !== 'chatgpt-oauth' && account.credentialType !== 'chatgpt-agent-identity' && account.credentialType !== 'grok-oauth' && providerById.get(account.providerId)?.protocol === aggregateDraft.protocol) && <div className="aggregate-member-picker__empty">{t('没有同协议的官方 API 或中转站，请先添加来源。', 'No official API or relay uses this protocol. Add a source first.')}</div>}
             </div>
             <FieldError>{errors.aggregateMembers}</FieldError>
           </div>
@@ -2045,7 +2207,10 @@ export function ProvidersView({
       <ConfirmDialog
         open={bulkDeleteOpen}
         title={t('批量删除账号', 'Delete accounts in bulk')}
-        message={t(`确定删除已选择的 ${selectedAccountIds.length} 个账号吗？这些账号会自动从所属号池移除，此操作无法撤销。`, `Delete the ${selectedAccountIds.length} selected accounts? They will be removed from their pools automatically. This cannot be undone.`)}
+        message={t(
+          `将删除 ${selectedAccounts.length} 个账号：${selectedAccountSummary.names.join('、') || '—'}${selectedAccountSummary.remainingCount ? `，以及另外 ${selectedAccountSummary.remainingCount} 个账号` : ''}。${selectedAccountSummary.hiddenCount ? `其中 ${selectedAccountSummary.hiddenCount} 个在当前筛选下不可见。` : ''}账号会从所属号池移除；空号池或成员不足的聚合中转会被删除，引用它们的路由会停用。此操作无法撤销。`,
+          `Delete ${selectedAccounts.length} accounts: ${selectedAccountSummary.names.join(', ') || '—'}${selectedAccountSummary.remainingCount ? `, plus ${selectedAccountSummary.remainingCount} more` : ''}. ${selectedAccountSummary.hiddenCount ? `${selectedAccountSummary.hiddenCount} are hidden by the current filters. ` : ''}Accounts will be removed from their pools; empty pools or aggregate relays with too few members will be deleted, and routes using them will be disabled. This cannot be undone.`,
+        )}
         busy={busyKeys.has('delete-accounts')}
         onCancel={() => setBulkDeleteOpen(false)}
         onConfirm={() => void confirmBulkDelete()}

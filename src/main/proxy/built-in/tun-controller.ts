@@ -164,6 +164,13 @@ export class TunController {
     return () => this.eventListeners.delete(listener)
   }
 
+  /** Cleans ownership left by a prior main-process crash without changing desired runtime state. */
+  public recoverStale(): Promise<void> {
+    return this.enqueue(async () => {
+      await this.adapter.cleanupPending?.()
+    })
+  }
+
   public start(routing: TunRoutingContext): Promise<TunControllerState> {
     return this.enqueue(async () => {
       this.desiredEnabled = true

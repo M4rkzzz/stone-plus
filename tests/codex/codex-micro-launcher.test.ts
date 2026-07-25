@@ -1,5 +1,6 @@
 import { EventEmitter } from 'node:events'
 import type { ChildProcess, spawn } from 'node:child_process'
+import { runInNewContext } from 'node:vm'
 import { describe, expect, it, vi } from 'vitest'
 import { WebSocket } from 'ws'
 import {
@@ -74,6 +75,48 @@ describe('WindowsCodexMicroDisabledLauncher', () => {
     expect(codexMicroNoDeviceBootstrap).toContain('process.execArgv.splice')
     expect(codexMicroNoDeviceBootstrap).toContain('execArgv: options.execArgv ?? []')
     expect(codexMicroNoDeviceBootstrap).not.toContain('inspector").close()')
+  })
+
+  it('replaces the complete lazy Codex Micro service before it can load native HID discovery', async () => {
+    const originalLoad = vi.fn((_request: string) => ({ original: true }))
+    const moduleApi = { _load: originalLoad }
+    class Worker {}
+    const workerThreads = { Worker }
+    const processApi = {
+      argv: ['ChatGPT.exe', '--inspect-brk=127.0.0.1:9229'],
+      execArgv: ['--inspect-brk=127.0.0.1:9229'],
+      getBuiltinModule: (name: string) => name === 'module' ? moduleApi : workerThreads,
+    }
+
+    const result = runInNewContext(codexMicroNoDeviceBootstrap, { process: processApi })
+    const currentBundle = moduleApi._load('./codex-micro-service-CY8ASf0t.js') as {
+      CodexMicroService: new () => {
+        getState(): unknown
+        start(): void
+        stop(): Promise<void>
+        updateLighting(): Promise<boolean>
+        dispose(): Promise<void>
+      }
+    }
+    const futureBundle = moduleApi._load('C:\\Codex\\codex-micro-service.js') as typeof currentBundle
+    const service = new currentBundle.CodexMicroService()
+
+    service.start()
+    expect(result).toBe('stone-codex-micro-disabled')
+    expect(service.getState()).toEqual({
+      status: 'not-detected',
+      transport: null,
+      model: null,
+      error: null,
+      battery: null,
+    })
+    await expect(service.updateLighting()).resolves.toBe(false)
+    await expect(service.stop()).resolves.toBeUndefined()
+    await expect(service.dispose()).resolves.toBeUndefined()
+    expect(futureBundle.CodexMicroService).toBe(currentBundle.CodexMicroService)
+    expect(originalLoad).not.toHaveBeenCalled()
+    expect(processApi.execArgv).toEqual([])
+    expect(processApi.argv).toEqual(['ChatGPT.exe'])
   })
 })
 

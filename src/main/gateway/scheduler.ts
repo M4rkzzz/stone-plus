@@ -239,7 +239,19 @@ export class PoolScheduler {
       if (!accountIds.has(accountId)) this.quotaHalfOpenObservations.delete(accountId)
     }
     for (const account of accounts) {
-      if (this.health.has(account.id)) continue
+      const liveHealth = this.health.get(account.id)
+      if (liveHealth) {
+        const explicitlyRecovered = account.status === 'active'
+          && account.circuitState !== 'open'
+          && account.circuitState !== 'half-open'
+          && account.cooldownUntil === undefined
+          && account.updatedAt > (liveHealth.lastFailureAt ?? 0)
+        if (!explicitlyRecovered) continue
+        this.health.delete(account.id)
+        this.healthReasons.delete(account.id)
+        this.quotaHalfOpenObservations.delete(account.id)
+        this.bumpHealthRevision(account.id)
+      }
       const persistedOpen = account.circuitState === 'open'
         || account.circuitState === 'half-open'
         || account.status === 'cooldown'
@@ -1480,6 +1492,7 @@ function quotaWindows(account: Account) {
 
 function quotaExhausted(account: Account, now: number): boolean {
   return codexQuotaIsExhausted(account.codexQuota, now)
+    || grokQuotaExhausted(account, now)
     || quotaWindows(account).some((window) =>
       window?.remaining === 0 && (
         window.resetAt !== undefined
@@ -1489,10 +1502,14 @@ function quotaExhausted(account: Account, now: number): boolean {
 }
 
 function expiredResetlessQuotaObservation(account: Account, now: number): number | undefined {
-  if (!quotaWindows(account).some((window) => window?.remaining === 0 && window.resetAt === undefined)) {
+  const genericResetless = quotaWindows(account).some((window) => window?.remaining === 0 && window.resetAt === undefined)
+  const grokResetless = grokQuotaIsZero(account) && account.grokQuota?.resetAt === undefined
+  if (!genericResetless && !grokResetless) {
     return undefined
   }
-  const observedAt = quotaObservedAt(account)
+  const observedAt = grokResetless
+    ? account.grokQuota?.observedAt ?? quotaObservedAt(account)
+    : quotaObservedAt(account)
   return now >= observedAt + UNKNOWN_RESET_QUOTA_RECHECK_MS ? observedAt : undefined
 }
 
@@ -1505,6 +1522,14 @@ function quotaObservedAt(account: Account): number {
 
 function quotaPressure(account: Account, now: number): number {
   let pressure = 0
+  const grokQuota = account.grokQuota
+  if (grokQuota && (grokQuota.resetAt === undefined || grokQuota.resetAt > now)) {
+    if (grokQuota.remainingPercent !== undefined) {
+      pressure = Math.max(pressure, Math.max(0, Math.min(1, 1 - grokQuota.remainingPercent / 100)))
+    } else if (grokQuota.limit !== undefined && grokQuota.limit > 0 && grokQuota.remaining !== undefined) {
+      pressure = Math.max(pressure, Math.max(0, Math.min(1, 1 - grokQuota.remaining / grokQuota.limit)))
+    }
+  }
   for (const window of quotaWindows(account)) {
     if (window?.resetAt !== undefined && window.resetAt <= now) continue
     if (window?.resetAt === undefined && now >= quotaObservedAt(account) + UNKNOWN_RESET_QUOTA_RECHECK_MS) continue
@@ -1512,6 +1537,20 @@ function quotaPressure(account: Account, now: number): number {
     pressure = Math.max(pressure, Math.max(0, Math.min(1, 1 - window.remaining / window.limit)))
   }
   return pressure
+}
+
+function grokQuotaIsZero(account: Account): boolean {
+  const quota = account.grokQuota
+  if (!quota) return false
+  return quota.remainingPercent === 0
+    || (quota.limit !== undefined && quota.limit > 0 && quota.remaining === 0)
+}
+
+function grokQuotaExhausted(account: Account, now: number): boolean {
+  const quota = account.grokQuota
+  if (!quota || !grokQuotaIsZero(account)) return false
+  if (quota.resetAt !== undefined) return quota.resetAt > now
+  return now < quota.observedAt + UNKNOWN_RESET_QUOTA_RECHECK_MS
 }
 
 function effectivePriority(account: Account, now: number): number {

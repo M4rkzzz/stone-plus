@@ -5,16 +5,21 @@ import { chromium } from 'playwright-core'
 
 const baseUrl = process.env.STONE_PREVIEW_URL ?? 'http://127.0.0.1:5173'
 const outputDirectory = fileURLToPath(new URL('../.artifacts/visual/', import.meta.url))
-const pages = ['总览', '账号与中转', '代理', '号池', '路由', '客户端配置', '会话修复', '诊断', '请求记录', '设置', '帮助与下一步']
-const englishPages = ['Overview', 'Accounts & Relays', 'Client Configuration', 'Diagnostics', 'Settings', 'Help & Next Steps']
+const pages = ['总览', '账号与中转', '代理', '号池', '路由', '客户端配置', '会话修复', '内网穿透', '内置浏览器', '诊断', '请求记录', '设置', '帮助与下一步']
+const englishPages = ['Overview', 'Accounts & Relays', 'Client Configuration', 'Tunnel', 'Built-in Browser', 'Diagnostics', 'Settings', 'Help & Next Steps']
 const modalCases = [
   {
     name: 'account-model-modal',
     page: '账号与中转',
     open: async (page) => {
-      const row = page.locator('.accounts-table tbody tr').first()
+      let row = page.locator('.accounts-table tbody tr').first()
+      if (await row.count() === 0) {
+        await page.getByRole('tab', { name: /Grok/ }).click()
+        row = page.locator('.accounts-table tbody tr').first()
+      }
       await row.locator('button[title="更多操作"]').click()
       await page.locator('.context-menu--portal button').filter({ hasText: '编辑' }).click()
+      return true
     }
   },
   {
@@ -23,6 +28,7 @@ const modalCases = [
     open: async (page) => {
       const card = page.locator('.pool-card').filter({ hasText: 'Codex 主线路' })
       await card.locator('.text-button').filter({ hasText: '编辑配置' }).click()
+      return true
     }
   },
   {
@@ -30,7 +36,9 @@ const modalCases = [
     page: '账号与中转',
     scrollTo: '.oauth-account-flow',
     open: async (page) => {
-      await page.getByRole('button', { name: '添加 Codex 账号' }).click()
+      await page.getByRole('tab', { name: /OpenAI/ }).click()
+      await page.getByRole('button', { name: '添加 Codex 账号' }).first().click()
+      return true
     }
   },
   {
@@ -38,7 +46,12 @@ const modalCases = [
     page: '账号与中转',
     scrollTo: '.account-export__list',
     open: async (page) => {
-      await page.getByRole('button', { name: '导出账号' }).click()
+      await page.getByRole('tab', { name: /OpenAI/ }).click()
+      const trigger = page.locator('.account-toolbar-actions button').filter({ hasText: '导出账号' })
+      if (await trigger.count() === 0) return false
+      if (await trigger.isDisabled()) return false
+      await trigger.click()
+      return true
     }
   }
 ]
@@ -74,7 +87,7 @@ try {
 
     for (const modalCase of modalCases) {
       await navigate(page, modalCase.page, viewport.name)
-      await modalCase.open(page)
+      if (!await modalCase.open(page)) continue
       const modal = page.locator('.modal')
       await modal.waitFor()
       await modal.locator(modalCase.scrollTo ?? '.model-policy').scrollIntoViewIfNeeded()

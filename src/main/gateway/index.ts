@@ -12,6 +12,7 @@ export {
   convertRequest,
   convertResponse,
   getRequestModel,
+  InvalidToolBridgeError,
   UnsupportedProtocolConversionError
 } from './protocol'
 export {
@@ -42,7 +43,12 @@ export type {
   GatewayRuntimeStateUpdate,
   GatewayServerOptions,
   ProtocolRequest,
+  ProtocolConversionContext,
+  ProtocolConversionDialect,
   ResolvedGatewayCredential,
   ScheduledAccount,
-  SchedulerSelectionInput
+  SchedulerSelectionInput,
+  ToolBridgeBinding,
+  ToolBridgePlan,
+  ToolCallBridgeBinding
 } from './types'

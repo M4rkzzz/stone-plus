@@ -1,14 +1,16 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState, type CSSProperties, type PropsWithChildren, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import { AlertCircle, Check, LoaderCircle, MoreHorizontal, X } from 'lucide-react'
-import type { AccountCircuitState, AccountImportProgress, AccountStatus, Protocol, RequestLog } from '@shared/types'
+import type { AccountCircuitState, AccountImportProgress, AccountStatus, PoolProtocol, ProviderKind, RequestLog } from '@shared/types'
+import { providerBrandIcon } from './brand-icons'
 import { useI18n } from './i18n'
 
-export const protocolLabels: Record<Protocol, string> = {
+export const protocolLabels: Record<PoolProtocol, string> = {
   'anthropic-messages': 'Anthropic Messages',
   'openai-responses': 'OpenAI Responses',
   'openai-chat': 'OpenAI Chat',
   gemini: 'Gemini',
+  grok: 'Grok',
 }
 
 export const accountStatusLabels = {
@@ -27,6 +29,19 @@ export const requestStatusLabels = {
 
 export function Badge({ tone = 'neutral', children }: PropsWithChildren<{ tone?: 'neutral' | 'success' | 'warning' | 'danger' | 'info' }>) {
   return <span className={`badge badge--${tone}`}>{children}</span>
+}
+
+export function ProviderAvatar({ kind, name, color = '#61736f', large = false, className = '' }: { kind?: ProviderKind; name?: string; color?: string; large?: boolean; className?: string }) {
+  const brandIcon = kind ? providerBrandIcon(kind) : undefined
+  return (
+    <span
+      className={`provider-avatar ${large ? 'provider-avatar--large' : ''} ${brandIcon ? 'provider-avatar--brand' : ''} ${className}`.trim()}
+      style={{ '--provider-color': color } as CSSProperties}
+      aria-hidden="true"
+    >
+      {brandIcon ? <img src={brandIcon} alt="" /> : name?.slice(0, 1) ?? '?'}
+    </span>
+  )
 }
 
 export function AccountStatusBadge({ status, circuitState }: { status: AccountStatus; circuitState?: AccountCircuitState }) {
@@ -48,10 +63,13 @@ export function RequestStatusBadge({ status, statusCode, requestKind }: {
   requestKind?: RequestLog['requestKind']
 }) {
   const { t } = useI18n()
+  if (status === 'success' && statusCode === 499) {
+    return <Badge tone="warning">{t('取消', 'Cancelled')}</Badge>
+  }
   if (status === 'success' && requestKind === 'compaction') {
     return <Badge tone="info">{t('压缩', 'Compaction')}</Badge>
   }
-  const tone = status === 'success' ? statusCode === 499 ? 'warning' : 'success' : status === 'streaming' ? 'info' : 'danger'
+  const tone = status === 'success' ? 'success' : status === 'streaming' ? 'info' : 'danger'
   return <Badge tone={tone}>{t(requestStatusLabelsZh[status], requestStatusLabelsEn[status])}</Badge>
 }
 

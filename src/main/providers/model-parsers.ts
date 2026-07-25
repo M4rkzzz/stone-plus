@@ -66,6 +66,14 @@ export function filterOpenAIGenerativeModels(models: string[]): string[] {
   })
 }
 
+export function filterXaiLanguageModels(models: string[]): string[] {
+  return filterOpenAIGenerativeModels(models).filter((model) => {
+    const normalized = model.trim().toLowerCase()
+    return !/(?:^|[/:])grok-imagine(?:[-_.:]|$)/.test(normalized)
+      && !/(?:^|[/:])grok-(?:image|video)(?:[-_.:]|$)/.test(normalized)
+  })
+}
+
 function stripModelPrefix(model: string): string {
   return model.startsWith('models/') ? model.slice('models/'.length) : model
 }

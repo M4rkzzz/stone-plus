@@ -44,6 +44,95 @@ describe('setup routing transaction', () => {
     expect(result).toMatchObject({ poolId: 'import-pool', createdPool: false })
   })
 
+  it('uses a wildcard for Codex routes created from an xAI-compatible relay', () => {
+    const draft = state()
+    draft.providers[0] = {
+      ...draft.providers[0],
+      sourceType: 'relay',
+      kind: 'xai-compatible',
+      protocol: 'openai-chat',
+      models: ['grok-4.20'],
+    }
+    draft.accounts.forEach((account) => {
+      account.credentialType = 'api-key'
+      account.availableModels = ['grok-4.20']
+    })
+
+    applySetupRoutingDraft(draft, {
+      sessionId: 'session', sourceId: 'one', client: 'codex', model: 'grok-4.20',
+    })
+
+    expect(draft.routes[0].modelMap).toEqual({ '*': 'grok-4.20' })
+    expect(draft.pools[0].protocol).toBe('grok')
+  })
+
+  it('connects Grok Build directly to a native Grok Responses account pool', () => {
+    const draft = state()
+    draft.providers[0] = {
+      ...draft.providers[0],
+      sourceType: 'oauth-system',
+      kind: 'xai',
+      protocol: 'openai-responses',
+      models: ['grok-4.5'],
+    }
+    draft.accounts.forEach((account) => {
+      account.credentialType = 'grok-oauth'
+      account.availableModels = ['grok-4.5']
+    })
+
+    applySetupRoutingDraft(draft, {
+      sessionId: 'session', sourceId: 'one', client: 'grokbuild', model: 'grok-4.5',
+    })
+
+    expect(draft.routes[0]).toMatchObject({
+      client: 'grokbuild',
+      inboundProtocol: 'openai-responses',
+      modelMap: { '*': 'grok-4.5' },
+    })
+    expect(draft.pools[0]).toMatchObject({ protocol: 'grok' })
+  })
+
+  it('rejects Chat-compatible Grok relays for Grok Build before creating a route', () => {
+    const draft = state()
+    draft.providers[0] = {
+      ...draft.providers[0],
+      sourceType: 'relay',
+      kind: 'xai-compatible',
+      protocol: 'openai-chat',
+      models: ['grok-4.5'],
+    }
+    draft.accounts.forEach((account) => {
+      account.credentialType = 'api-key'
+      account.availableModels = ['grok-4.5']
+    })
+
+    expect(() => applySetupRoutingDraft(draft, {
+      sessionId: 'session', sourceId: 'one', client: 'grokbuild', model: 'grok-4.5',
+    })).toThrow(/OpenAI Responses/)
+    expect(draft.routes).toEqual([])
+    expect(draft.pools).toEqual([])
+  })
+
+  it('uses a wildcard for Codex routes backed by Claude', () => {
+    const draft = state()
+    draft.providers[0] = {
+      ...draft.providers[0], kind: 'anthropic', protocol: 'anthropic-messages', models: ['claude-opus-4-8'],
+    }
+    draft.accounts.forEach((account) => { account.availableModels = ['claude-opus-4-8'] })
+    applySetupRoutingDraft(draft, {
+      sessionId: 'session', sourceId: 'one', client: 'codex', model: 'claude-opus-4-8',
+    })
+    expect(draft.routes[0].modelMap).toEqual({ '*': 'claude-opus-4-8' })
+  })
+
+  it('uses a wildcard for Claude routes backed by OpenAI Responses', () => {
+    const draft = state()
+    applySetupRoutingDraft(draft, {
+      sessionId: 'session', sourceId: 'one', client: 'claude', model: 'gpt-test',
+    })
+    expect(draft.routes[0].modelMap).toEqual({ '*': 'gpt-test' })
+  })
+
   it('mixes eligible OAuth and Agent Identity peers but excludes unsupported members', () => {
     const draft = state()
     draft.accounts[1].credentialType = 'chatgpt-agent-identity'

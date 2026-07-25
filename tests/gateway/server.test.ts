@@ -698,6 +698,63 @@ describe('GatewayServer', () => {
     ])
   })
 
+  it('automatically bounds progress telemetry under concurrent load without losing terminal audit data', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.accounts[0].maxConcurrency = 8
+    gatewayConfig.accounts[1].status = 'disabled'
+    gatewayConfig.pools[0].maxRetries = 0
+    const rawLogs: RequestLog[] = []
+    const releases = new Map<string, (response: Response) => void>()
+    const upstreamFetch = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      const payload = JSON.parse(String(init?.body ?? '{}')) as { metadata?: { session_id?: string } }
+      const sessionId = payload.metadata?.session_id ?? `request-${releases.size + 1}`
+      return new Promise<Response>((resolve) => { releases.set(sessionId, resolve) })
+    })
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'credential',
+      fetchImplementation: upstreamFetch as typeof fetch,
+      onLog: (log) => rawLogs.push(log)
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const requests = Array.from({ length: 4 }, (_, index) => post(port, 'local-secret', {
+      metadata: { session_id: `telemetry-pressure-${index + 1}` }
+    }))
+    await vi.waitFor(() => expect(releases.size).toBe(4))
+
+    const success = (sessionId: string) => new Response(JSON.stringify({
+      id: `chatcmpl-${sessionId}`,
+      choices: [{ index: 0, message: { role: 'assistant', content: 'Done' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 }
+    }), { status: 200, headers: { 'content-type': 'application/json' } })
+
+    releases.get('telemetry-pressure-4')?.(success('telemetry-pressure-4'))
+    expect((await requests[3]).status).toBe(200)
+    const terminal = rawLogs.find((log) => (
+      log.conversationId === 'telemetry-pressure-4' && log.status === 'success'
+    ))
+    expect(terminal).toMatchObject({
+      statusCode: 200,
+      inputTokens: 3,
+      outputTokens: 2,
+      accountId: 'first'
+    })
+    const lifecycle = rawLogs.filter((log) => log.id === terminal?.id)
+    expect(lifecycle[0]).toMatchObject({ status: 'streaming', progressStage: 'receiving-body' })
+    expect(lifecycle.at(-1)).toMatchObject({ status: 'success', progressStage: undefined })
+    expect(lifecycle.filter((log) => log.status === 'streaming')).toHaveLength(1)
+
+    for (const index of [1, 2, 3]) {
+      releases.get(`telemetry-pressure-${index}`)?.(success(`telemetry-pressure-${index}`))
+    }
+    await Promise.all(requests.slice(0, 3).map(async (request) => {
+      expect((await request).status).toBe(200)
+    }))
+  })
+
   it('retains replay, title lookup, hedging, and detailed progress when high-concurrency mode is off', async () => {
     const { gateway, rawLogs, status, titleResolver, upstreamFetch, wire } = await runConcurrencyModeRequest(false)
     const terminal = rawLogs.find((log) => log.status === 'success')
@@ -831,6 +888,45 @@ describe('GatewayServer', () => {
     expect(response.status).toBe(401)
     expect(await response.json()).toMatchObject({ error: { type: 'authentication_error' } })
     expect(upstreamFetch).not.toHaveBeenCalled()
+  })
+
+  it('formats authentication failures using the inbound Anthropic error envelope', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.routes[0].inboundProtocol = 'anthropic-messages'
+    const gateway = new GatewayServer({ config: gatewayConfig })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer wrong-token', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'source-model', max_tokens: 32, messages: [{ role: 'user', content: 'Hi' }] })
+    })
+    expect(response.status).toBe(401)
+    expect(await response.json()).toEqual({
+      type: 'error',
+      error: { type: 'authentication_error', message: 'Invalid local gateway token' }
+    })
+  })
+
+  it('formats authentication failures using the inbound Gemini error envelope', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.routes[0].inboundProtocol = 'gemini'
+    const gateway = new GatewayServer({ config: gatewayConfig })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1beta/models/source-model:generateContent`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer wrong-token', 'content-type': 'application/json' },
+      body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: 'Hi' }] }] })
+    })
+    expect(response.status).toBe(401)
+    expect(await response.json()).toEqual({
+      error: { code: 401, message: 'Invalid local gateway token', status: 'UNAUTHENTICATED' }
+    })
   })
 
   it('emits live lifecycle updates and completes the same id without logging payloads or credentials', async () => {
@@ -1374,7 +1470,7 @@ describe('GatewayServer', () => {
     await cancelled
     await vi.waitFor(() => expect(gateway.getStatus().activeRequests).toBe(2))
     expect(events).toEqual(expect.arrayContaining([
-      expect.objectContaining({ status: 'error', statusCode: 499, failureStage: 'client' })
+      expect.objectContaining({ status: 'success', statusCode: 499 })
     ]))
 
     const small = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
@@ -2408,8 +2504,8 @@ describe('GatewayServer', () => {
     gatewayConfig.providers[0] = {
       ...gatewayConfig.providers[0],
       sourceType: 'relay',
-      kind: 'openai-compatible',
-      baseUrl: 'https://relay.example.test/v1',
+      kind: 'xai-compatible',
+      baseUrl: 'https://xai-relay.example.test/v1',
       protocol: 'openai-responses',
       responsesCompactMode: 'legacy'
     }
@@ -2467,6 +2563,7 @@ describe('GatewayServer', () => {
     expect(response.status).toBe(200)
     expect(await response.text()).toContain('Summary after trimming old history.')
     expect(upstreamFetch).toHaveBeenCalledTimes(2)
+    expect(upstreamFetch.mock.calls.map((call) => call[1]?.redirect)).toEqual(['error', 'error'])
     expect(credentialResolver).toHaveBeenCalledOnce()
     expect(requestBodies[0]).toMatchObject({ stream: true })
     expect(requestBodies[0].reasoning).toBeUndefined()
@@ -5341,16 +5438,16 @@ describe('GatewayServer', () => {
     expect(JSON.stringify(upstreamBodies[2])).not.toContain('compaction_trigger')
   })
 
-  it('uses the same relay ordinary Responses path when its native compact extension returns 404', async () => {
+  it('automatically falls back to the same relay ordinary Responses path when native compact returns 404', async () => {
     const port = await freePort()
     const gatewayConfig = config(port)
     gatewayConfig.providers[0] = {
       ...gatewayConfig.providers[0],
       sourceType: 'relay',
-      kind: 'openai-compatible',
-      baseUrl: 'https://native-relay.example.test/v1',
+      kind: 'xai-compatible',
+      baseUrl: 'https://xai-native-relay.example.test/v1',
       protocol: 'openai-responses',
-      responsesCompactMode: 'native'
+      responsesCompactMode: 'auto'
     }
     gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
     gatewayConfig.pools[0].protocol = 'openai-responses'
@@ -5358,9 +5455,11 @@ describe('GatewayServer', () => {
     gatewayConfig.accounts[1].status = 'disabled'
     gatewayConfig.pools[0].maxRetries = 0
     const upstreamBodies: Array<Record<string, unknown>> = []
-    const upstreamFetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
-      upstreamBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>)
-      if (upstreamBodies.length === 1) {
+    const upstreamFetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const upstreamBody = JSON.parse(String(init?.body)) as Record<string, unknown>
+      upstreamBodies.push(upstreamBody)
+      if (String(input).endsWith('/responses/compact')
+        || JSON.stringify(upstreamBody).includes('compaction_trigger')) {
         return new Response(JSON.stringify({
           error: { message: 'compaction_trigger is not supported', type: 'invalid_request_error' }
         }), { status: 404, headers: { 'content-type': 'application/json' } })
@@ -5401,12 +5500,37 @@ describe('GatewayServer', () => {
     expect(await response.text()).toContain('stoneplus-compact-v1:')
     expect(credentialResolver).toHaveBeenCalledTimes(2)
     expect(upstreamFetch).toHaveBeenCalledTimes(2)
+    expect(upstreamFetch.mock.calls.slice(0, 2).map((call) => call[1]?.redirect)).toEqual(['error', 'error'])
     expect(upstreamFetch.mock.calls.map((call) => call[0])).toEqual([
-      'https://native-relay.example.test/v1/responses',
-      'https://native-relay.example.test/v1/responses'
+      'https://xai-native-relay.example.test/v1/responses',
+      'https://xai-native-relay.example.test/v1/responses'
     ])
     expect(JSON.stringify(upstreamBodies[0])).toContain('compaction_trigger')
     expect(JSON.stringify(upstreamBodies[1])).not.toContain('compaction_trigger')
+
+    const standalone = await fetch(`http://127.0.0.1:${port}/v1/responses/compact`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'source-model',
+        input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'standalone-auto' }] }]
+      })
+    })
+    const standaloneText = await standalone.text()
+    expect(standalone.status, JSON.stringify({
+      standaloneText,
+      urls: upstreamFetch.mock.calls.map((call) => call[0]),
+      bodies: upstreamBodies,
+    })).toBe(200)
+    expect(standaloneText).toContain('Same-relay portable summary.')
+    expect(upstreamFetch.mock.calls.map((call) => call[1]?.redirect))
+      .toEqual(['error', 'error', 'error', 'error'])
+    expect(upstreamFetch.mock.calls.map((call) => call[0])).toEqual([
+      'https://xai-native-relay.example.test/v1/responses',
+      'https://xai-native-relay.example.test/v1/responses',
+      'https://xai-native-relay.example.test/v1/responses/compact',
+      'https://xai-native-relay.example.test/v1/responses'
+    ])
   })
 
   it('uses the same OAuth Responses source when its native compact extension is unavailable', async () => {
@@ -5579,7 +5703,7 @@ describe('GatewayServer', () => {
     expect(JSON.stringify(upstreamBodies[2])).not.toContain('compaction_trigger')
   })
 
-  it('rejects only genuinely opaque compact history on legacy relay sources', async () => {
+  it('opportunistically preserves opaque history on legacy relay sources during live switches', async () => {
     const port = await freePort()
     const gatewayConfig = config(port)
     gatewayConfig.providers[0] = {
@@ -5593,12 +5717,19 @@ describe('GatewayServer', () => {
     gatewayConfig.pools[0].protocol = 'openai-responses'
     gatewayConfig.accounts[1].status = 'disabled'
     gatewayConfig.pools[0].maxRetries = 0
-    const upstreamFetch = vi.fn(async () => new Response([
-      'event: response.completed',
-      'data: {"type":"response.completed","response":{"id":"resp_plaintext_compact","status":"completed","output":[]}}',
-      '',
-      ''
-    ].join('\n'), { status: 200, headers: { 'content-type': 'text/event-stream' } }))
+    const upstreamFetch = vi.fn(async (input: string | URL | Request) => {
+      if (String(input).endsWith('/responses/compact')) {
+        return new Response(JSON.stringify({
+          output: [{ type: 'compaction', encrypted_content: 'relay-native-compact' }]
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      return new Response([
+        'event: response.completed',
+        'data: {"type":"response.completed","response":{"id":"resp_plaintext_compact","status":"completed","output":[]}}',
+        '',
+        ''
+      ].join('\n'), { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    })
     const credentialResolver = vi.fn(() => 'relay-private')
     const gateway = new GatewayServer({
       config: gatewayConfig,
@@ -5617,12 +5748,10 @@ describe('GatewayServer', () => {
         stream: true
       })
     })
-    expect(opaque.status).toBe(422)
-    const opaqueError = await opaque.text()
-    expect(opaqueError).toContain('configured to pass through encrypted')
-    expect(opaqueError).not.toContain('created it')
-    expect(credentialResolver).not.toHaveBeenCalled()
-    expect(upstreamFetch).not.toHaveBeenCalled()
+    expect(opaque.status).toBe(200)
+    expect(await opaque.text()).toContain('resp_plaintext_compact')
+    expect(credentialResolver).toHaveBeenCalledOnce()
+    expect(upstreamFetch).toHaveBeenCalledOnce()
 
     for (const malformedEnvelope of [
       'stoneplus-compact-v1:',
@@ -5641,8 +5770,8 @@ describe('GatewayServer', () => {
       })
       expect(malformed.status).toBe(422)
       expect(await malformed.json()).toMatchObject({ error: { type: 'invalid_compaction_envelope' } })
-      expect(credentialResolver).not.toHaveBeenCalled()
-      expect(upstreamFetch).not.toHaveBeenCalled()
+      expect(credentialResolver).toHaveBeenCalledOnce()
+      expect(upstreamFetch).toHaveBeenCalledOnce()
     }
 
     const standaloneOpaque = await fetch(`http://127.0.0.1:${port}/v1/responses/compact`, {
@@ -5653,10 +5782,9 @@ describe('GatewayServer', () => {
         input: [{ type: 'compaction', encrypted_content: 'encrypted-standalone-history' }]
       })
     })
-    expect(standaloneOpaque.status).toBe(422)
-    expect(await standaloneOpaque.text()).toContain('configured to pass through encrypted')
-    expect(credentialResolver).not.toHaveBeenCalled()
-    expect(upstreamFetch).not.toHaveBeenCalled()
+    expect(standaloneOpaque.status).toBe(200)
+    expect(await standaloneOpaque.text()).toContain('relay-native-compact')
+    expect(upstreamFetch.mock.calls[1][0]).toBe('https://api.example.test/v1/responses/compact')
 
     const plaintext = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
       method: 'POST',
@@ -5673,8 +5801,8 @@ describe('GatewayServer', () => {
     })
     expect(plaintext.status).toBe(200)
     expect(await plaintext.text()).toContain('resp_plaintext_compact')
-    expect(credentialResolver).toHaveBeenCalledOnce()
-    expect(upstreamFetch).toHaveBeenCalledOnce()
+    expect(credentialResolver).toHaveBeenCalledTimes(3)
+    expect(upstreamFetch).toHaveBeenCalledTimes(3)
 
     const contextCompaction = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
       method: 'POST',
@@ -5685,9 +5813,9 @@ describe('GatewayServer', () => {
         stream: true
       })
     })
-    expect(contextCompaction.status).toBe(422)
-    expect(credentialResolver).toHaveBeenCalledOnce()
-    expect(upstreamFetch).toHaveBeenCalledOnce()
+    expect(contextCompaction.status).toBe(200)
+    expect(credentialResolver).toHaveBeenCalledTimes(4)
+    expect(upstreamFetch).toHaveBeenCalledTimes(4)
   })
 
   it('allows opaque continuation and adapts compact creation on passthrough relay sources', async () => {
@@ -6453,7 +6581,7 @@ describe('GatewayServer', () => {
     abortController.abort()
     await expect(victim).rejects.toThrow()
     await vi.waitFor(() => {
-      expect(logs.some((log) => log.statusCode === 499 && log.failureStage === 'client')).toBe(true)
+      expect(logs.some((log) => log.status === 'success' && log.statusCode === 499)).toBe(true)
       expect(gateway.getStatus().activeRequests).toBe(0)
       expect(gateway.getAccountInFlight().first).toBe(0)
     }, { timeout: 2_000 })
@@ -7182,6 +7310,82 @@ describe('GatewayServer', () => {
     })
   })
 
+  it('runs a Codex reasoning/tool request through a wildcard-mapped Claude stream', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers[0] = {
+      ...gatewayConfig.providers[0],
+      kind: 'anthropic',
+      baseUrl: 'https://api.anthropic.test/v1',
+      protocol: 'anthropic-messages',
+      models: ['claude-opus-4-8'],
+    }
+    gatewayConfig.pools[0] = { ...gatewayConfig.pools[0], protocol: 'anthropic-messages' }
+    gatewayConfig.routes[0] = {
+      ...gatewayConfig.routes[0], inboundProtocol: 'openai-responses', modelMap: { '*': 'claude-opus-4-8' },
+    }
+    gatewayConfig.accounts[1].status = 'disabled'
+    const logs: RequestLog[] = []
+    const rawLogs: RequestLog[] = []
+    const privateThinking = 'claude-private-thinking-must-not-leak'
+    const upstreamFetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      expect(String(input)).toBe('https://api.anthropic.test/v1/messages')
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>
+      expect(body).toMatchObject({
+        model: 'claude-opus-4-8',
+        stream: true,
+        thinking: { type: 'adaptive', display: 'omitted' },
+        output_config: { effort: 'xhigh' },
+        tools: [{ name: 'lookup', strict: true }],
+      })
+      return new Response([
+        'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_codex_claude","model":"claude-opus-4-8","usage":{"input_tokens":10,"cache_read_input_tokens":30,"cache_creation_input_tokens":20,"output_tokens":0}}}\n\n',
+        `event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"${privateThinking}"}}\n\n`,
+        'event: content_block_start\ndata: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}\n\n',
+        'event: content_block_delta\ndata: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Claude via Codex"}}\n\n',
+        'event: content_block_stop\ndata: {"type":"content_block_stop","index":1}\n\n',
+        'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":12,"output_tokens_details":{"thinking_tokens":7}}}\n\n',
+        'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+      ].join(''), { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    })
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'anthropic-private',
+      fetchImplementation: upstreamFetch as typeof fetch,
+      onLog: (log) => {
+        rawLogs.push(log)
+        upsertLog(logs, log)
+      },
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'codex-client-alias', input: 'Solve it', stream: true, max_output_tokens: 16_000,
+        reasoning: { effort: 'xhigh', summary: 'auto' },
+        tools: [{ type: 'function', name: 'lookup', strict: true, parameters: { type: 'object' } }],
+      }),
+    })
+    const wire = await response.text()
+    expect(response.status).toBe(200)
+    expect(wire).toContain('Claude via Codex')
+    expect(wire).toContain('"cached_tokens":30')
+    expect(wire).toContain('"reasoning_tokens":7')
+    expect(wire).not.toContain(privateThinking)
+    await vi.waitFor(() => expect(logs[0]?.status).toBe('success'))
+    expect(logs[0]).toMatchObject({
+      model: 'codex-client-alias', upstreamModel: 'claude-opus-4-8',
+      inputTokens: 60, outputTokens: 12, cachedInputTokens: 30, reasoningTokens: 7,
+    })
+    expect(rawLogs[0]).toMatchObject({
+      model: '', status: 'streaming', progressStage: 'receiving-body',
+    })
+    expect(rawLogs[0]?.upstreamModel).toBeUndefined()
+  })
+
   it('reports live rate limits and detailed usage after failover', async () => {
     const port = await freePort()
     const states: Parameters<NonNullable<ConstructorParameters<typeof GatewayServer>[0]['onAccountState']>>[0][] = []
@@ -7301,8 +7505,11 @@ describe('GatewayServer', () => {
     expect(logs).toHaveLength(1)
     expect(logs[0]).toMatchObject({
       status: 'success',
-      inputTokens: 120,
+      // Anthropic reports uncached, cache-read, and cache-created input as
+      // separate buckets; Stone's canonical input total includes all three.
+      inputTokens: 190,
       outputTokens: 7,
+      tokenAccountingVersion: 2,
       cachedInputTokens: 30,
       cacheWriteInputTokens: 40
     })
@@ -8765,11 +8972,11 @@ describe('GatewayServer', () => {
     const abortedAt = performance.now()
     controller.abort()
     await response.text().catch(() => undefined)
-    await vi.waitFor(() => expect(logs[0]?.status).toBe('error'))
+    await vi.waitFor(() => expect(logs[0]?.status).toBe('success'))
 
     expect(performance.now() - abortedAt).toBeLessThan(1_500)
     expect(reader.cancel).toHaveBeenCalled()
-    expect(logs[0]).toMatchObject({ statusCode: 499, failureStage: 'client' })
+    expect(logs[0]).toMatchObject({ status: 'success', statusCode: 499 })
     expect(gateway.getStatus().activeRequests).toBe(0)
     expect(gateway.getAccountInFlight().first).toBe(0)
   }, 10_000)
@@ -9261,6 +9468,11 @@ describe('GatewayServer', () => {
   it('optionally hedges slow response headers through another hot transport lane', async () => {
     const port = await freePort()
     const gatewayConfig = config(port)
+    gatewayConfig.providers[0] = {
+      ...gatewayConfig.providers[0],
+      sourceType: 'relay',
+      kind: 'xai-compatible'
+    }
     gatewayConfig.pools[0].hedgedRequests = true
     gatewayConfig.pools[0].hedgeDelayMs = 250
     const stream = 'data: {"id":"chat-hedged","model":"source-model","choices":[{"index":0,"delta":{"content":"Fast"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
@@ -9282,6 +9494,7 @@ describe('GatewayServer', () => {
     expect(response.status).toBe(200)
     expect(await response.text()).toContain('Fast')
     expect(upstreamFetch).toHaveBeenCalledTimes(2)
+    expect(upstreamFetch.mock.calls.map((call) => call[1]?.redirect)).toEqual(['error', 'error'])
   })
 
   it('hedges a response whose headers arrive quickly but first body stalls', async () => {
@@ -9550,15 +9763,13 @@ describe('GatewayServer', () => {
     await vi.waitFor(() => expect(upstreamFetch).toHaveBeenCalledOnce())
     controller.abort()
     await disconnectedRequest
-    await vi.waitFor(() => expect(logs[0]?.status).toBe('error'))
+    await vi.waitFor(() => expect(logs[0]?.status).toBe('success'))
 
     expect(upstreamFetch).toHaveBeenCalledOnce()
     expect(states).toHaveLength(0)
     expect(logs[0]).toMatchObject({
-      status: 'error',
+      status: 'success',
       statusCode: 499,
-      error: 'Client closed the request',
-      failureStage: 'client',
       failoverCount: 0,
       accountId: 'first'
     })
@@ -9692,7 +9903,7 @@ describe('GatewayServer', () => {
     expect(states[0]).toMatchObject({ accountId: 'first', status: 'active' })
   })
 
-  it('records 499 when Codex closes after receiving complete custom-tool input without a Responses terminal', async () => {
+  it('records a successful 499 cancellation when Codex closes after receiving complete custom-tool input', async () => {
     const port = await freePort()
     const gatewayConfig = config(port)
     gatewayConfig.providers[0].protocol = 'openai-responses'
@@ -9744,9 +9955,9 @@ describe('GatewayServer', () => {
     expect(new TextDecoder().decode(first.value)).toContain('response.custom_tool_call_input.done')
     await reader!.cancel()
 
-    await vi.waitFor(() => expect(logs[0]?.status).toBe('error'))
+    await vi.waitFor(() => expect(logs[0]?.status).toBe('success'))
     expect(logs[0]).toMatchObject({
-      status: 'error',
+      status: 'success',
       statusCode: 499,
       streamEndReason: 'client-closed',
       streamLastEventType: 'response.custom_tool_call_input.done'
@@ -9864,7 +10075,7 @@ describe('GatewayServer', () => {
     const encoder = new TextEncoder()
     const chunks = [
       'data: {"id":"chat-ttft","model":"source-model","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}\n\n',
-      'data: {"id":"chat-ttft","model":"source-model","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}\n\ndata: [DONE]\n\n'
+      'data: {"id":"chat-ttft","model":"source-model","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
     ]
     const upstreamFetch = vi.fn(async () => new Response(new ReadableStream<Uint8Array>({
       pull(controller) {
@@ -10250,6 +10461,59 @@ describe('GatewayServer', () => {
     expect(upstreamFetch).toHaveBeenCalledOnce()
   })
 
+  it('maps a real Codex request alias through the xAI wildcard without exposing it in the model list', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers[0] = {
+      ...gatewayConfig.providers[0],
+      kind: 'xai-compatible',
+      protocol: 'openai-chat',
+      models: ['grok-4.20', '*', ' * '],
+    }
+    gatewayConfig.pools[0].protocol = 'grok'
+    gatewayConfig.routes[0] = {
+      ...gatewayConfig.routes[0],
+      inboundProtocol: 'openai-responses',
+      modelMap: { '*': 'grok-4.20' },
+    }
+    gatewayConfig.accounts = gatewayConfig.accounts.map((item) => ({ ...item, credentialType: 'api-key' }))
+    gatewayConfig.accounts[0] = {
+      ...gatewayConfig.accounts[0],
+      modelPolicy: 'selected',
+      modelAllowlist: ['grok-4.20', '*', ' * '],
+    }
+    gatewayConfig.accounts[1].status = 'disabled'
+    const upstreamFetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      expect(JSON.parse(String(init?.body))).toMatchObject({ model: 'grok-4.20' })
+      return new Response(JSON.stringify({
+        id: 'grok-completion',
+        model: 'grok-4.20',
+        choices: [{ message: { role: 'assistant', content: 'OK' }, finish_reason: 'stop' }],
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    })
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'credential',
+      fetchImplementation: upstreamFetch as typeof fetch,
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'codex-configured-alias', input: 'Hello', stream: false }),
+    })
+    const responseText = await response.text()
+    expect(response.status, responseText).toBe(200)
+    expect(JSON.parse(responseText)).toMatchObject({ object: 'response', status: 'completed' })
+    expect(upstreamFetch).toHaveBeenCalledOnce()
+
+    const models = await getModels(port)
+    expect((await models.json() as { data: Array<{ id: string }> }).data.map((model) => model.id))
+      .not.toContain('*')
+  })
+
   it('returns the route pool model union in OpenAI format without contacting upstream', async () => {
     const port = await freePort()
     const gatewayConfig = config(port)
@@ -10526,6 +10790,165 @@ describe('GatewayServer', () => {
       streamEndReason: 'explicit-error'
     })
     expect(states).toContainEqual(expect.objectContaining({ accountId: 'first', status: 'cooldown' }))
+  })
+
+  it('fails closed for a buffered Chat 200 error envelope instead of returning an empty Responses success', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers[0].protocol = 'openai-chat'
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-chat'
+    gatewayConfig.pools[0].maxRetries = 0
+    gatewayConfig.accounts[1].status = 'disabled'
+    const upstreamFetch = vi.fn(async () => new Response(JSON.stringify({
+      error: { message: 'The prompt exceeds the context window.', type: 'invalid_request_error', code: 'context_length_exceeded' }
+    }), { status: 200, headers: { 'content-type': 'application/json' } }))
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'credential',
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'source-model', input: 'Reply', stream: false })
+    })
+    expect(response.status).toBe(400)
+    expect(await response.json()).toMatchObject({ error: { code: 'context_length_exceeded' } })
+    expect(upstreamFetch).toHaveBeenCalledOnce()
+  })
+
+  it('preserves a cross-protocol SSE context error as a request-level failure', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-chat'
+    gatewayConfig.pools[0].maxRetries = 0
+    gatewayConfig.accounts[1].status = 'disabled'
+    const logs: RequestLog[] = []
+    const upstreamFetch = vi.fn(async () => scheduledSseResponse([{
+      atMs: 0,
+      data: 'event: error\ndata: {"error":{"message":"The prompt exceeds the context window.","type":"invalid_request_error","code":"context_length_exceeded"}}\n\n',
+      close: true
+    }]))
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'credential',
+      fetchImplementation: upstreamFetch as typeof fetch,
+      onLog: (log) => upsertLog(logs, log)
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'source-model', input: 'Reply', stream: true })
+    })
+    expect(response.status).toBe(400)
+    expect(await response.json()).toMatchObject({ error: { code: 'context_length_exceeded' } })
+    expect(upstreamFetch).toHaveBeenCalledOnce()
+    await vi.waitFor(() => expect(logs[0]?.status).toBe('error'))
+    expect(logs[0]).toMatchObject({ status: 'error', statusCode: 400 })
+  })
+
+  it('drains usage after a Chat tool-call finish before closing the Responses stream', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-chat'
+    gatewayConfig.pools[0].maxRetries = 0
+    gatewayConfig.accounts[1].status = 'disabled'
+    const logs: RequestLog[] = []
+    const upstreamFetch = vi.fn(async () => scheduledSseResponse([
+      {
+        atMs: 0,
+        data: 'data: {"id":"grok-tool","model":"grok","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}]},"finish_reason":null}]}\n\n'
+      },
+      {
+        atMs: 20,
+        data: 'data: {"id":"grok-tool","model":"grok","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n\n'
+      },
+      {
+        atMs: 80,
+        data: 'data: {"id":"grok-tool","model":"grok","choices":[],"usage":{"prompt_tokens":12,"completion_tokens":3,"total_tokens":15,"completion_tokens_details":{"reasoning_tokens":1}}}\n\n'
+      },
+      { atMs: 100, data: 'data: [DONE]\n\n', close: true }
+    ]))
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'credential',
+      fetchImplementation: upstreamFetch as typeof fetch,
+      onLog: (log) => upsertLog(logs, log)
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'source-model', input: 'Call lookup', stream: true })
+    })
+    const wire = await response.text()
+    expect(response.status).toBe(200)
+    expect(wire).toContain('"output_tokens":3')
+    await vi.waitFor(() => expect(logs[0]?.status).toBe('success'))
+    expect(logs[0]).toMatchObject({ outputTokens: 3, reasoningTokens: 1 })
+  })
+
+  it('honors a single-source 503 Retry-After instead of immediately retrying the same account', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.accounts[1].status = 'disabled'
+    gatewayConfig.pools[0].maxRetries = 2
+    const states: Array<{ accountId: string; status: string; cooldownUntil?: number }> = []
+    const upstreamFetch = vi.fn(async () => new Response(JSON.stringify({ error: { message: 'overloaded' } }), {
+      status: 503,
+      headers: { 'content-type': 'application/json', 'retry-after': '120' }
+    }))
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'credential',
+      fetchImplementation: upstreamFetch as typeof fetch,
+      now: () => timestamp,
+      onAccountState: (state) => states.push(state)
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await post(port)
+    expect(response.status).toBe(503)
+    expect(upstreamFetch).toHaveBeenCalledOnce()
+    expect(states).toContainEqual(expect.objectContaining({
+      accountId: 'first',
+      status: 'cooldown',
+      cooldownUntil: timestamp + 120_000
+    }))
+  })
+
+  it('does not disable a Grok account for an explicit model-scoped 403', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.accounts[1].status = 'disabled'
+    gatewayConfig.pools[0].maxRetries = 0
+    const states: Array<{ accountId: string; status: string }> = []
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'credential',
+      fetchImplementation: vi.fn(async () => new Response(JSON.stringify({
+        error: { message: 'Model is not available for this account.', code: 'model_access_denied' }
+      }), { status: 403, headers: { 'content-type': 'application/json' } })) as typeof fetch,
+      onAccountState: (state) => states.push(state)
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await post(port)
+    expect(response.status).toBe(403)
+    expect(states).not.toContainEqual(expect.objectContaining({ accountId: 'first', status: 'disabled' }))
   })
 
   it('refuses to bind a non-loopback host', async () => {

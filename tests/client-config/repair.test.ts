@@ -89,6 +89,34 @@ describe('client configuration repair planning', () => {
     })
   })
 
+  it('migrates stale relay model overrides to the route layer without discarding Claude preferences', () => {
+    const claude = planClientConfigRepair('claude', paths, {
+      'claude-settings': JSON.stringify({
+        model: 'sonnet',
+        permissions: { allow: ['Read'] },
+        env: {
+          KEEP_ME: 'yes',
+          ANTHROPIC_MODEL: 'gpt-5.5',
+          ANTHROPIC_DEFAULT_HAIKU_MODEL: 'gpt-5.5',
+          ANTHROPIC_DEFAULT_OPUS_MODEL: 'gpt-5.5',
+          ANTHROPIC_DEFAULT_SONNET_MODEL: 'gpt-5.5',
+          ANTHROPIC_SMALL_FAST_MODEL: 'gpt-5.5',
+          ANTHROPIC_REASONING_MODEL: 'gpt-5.5',
+        },
+      }),
+    }, target)
+    const settings = JSON.parse(claude.files[0].content)
+
+    expect(claude.rebuiltRoles).toEqual([])
+    expect(settings.permissions).toEqual({ allow: ['Read'] })
+    expect(settings.model).toBe('sonnet')
+    expect(settings.env).toEqual({
+      KEEP_ME: 'yes',
+      ANTHROPIC_BASE_URL: 'http://127.0.0.1:15721',
+      ANTHROPIC_AUTH_TOKEN: target.token,
+    })
+  })
+
   it('preserves unrelated TOML when a valid Stone provider field has the wrong shape', () => {
     const plan = planClientConfigRepair('codex', paths, {
       'codex-config': [
@@ -172,6 +200,48 @@ describe('ClientConfigService repair transaction', () => {
     expect(result.changedFiles.every((path) => path.startsWith(profileDirectory))).toBe(true)
     expect(await readFile(service.paths.codex.config.path, 'utf8')).toBe('model = "default-must-stay"\n')
     expect(await readFile(join(profileDirectory, 'config.toml'), 'utf8')).toContain('[model_providers.stone]')
+  })
+
+  it('cleans Claude relay residue once and remains write-free on repeated one-click repair', async () => {
+    const original = JSON.stringify({
+      model: 'sonnet',
+      permissions: { allow: ['Read'] },
+      mcpServers: { files: { command: 'mcp-files' } },
+      env: {
+        KEEP_ME: 'yes',
+        ANTHROPIC_BASE_URL: 'https://old-relay.example',
+        ANTHROPIC_AUTH_TOKEN: 'old-secret',
+        ANTHROPIC_MODEL: 'gpt-5.5',
+        ANTHROPIC_DEFAULT_OPUS_MODEL: 'gpt-5.5',
+        ANTHROPIC_DEFAULT_SONNET_MODEL: 'gpt-5.5',
+        ANTHROPIC_DEFAULT_HAIKU_MODEL: 'gpt-5.5',
+        ANTHROPIC_REASONING_MODEL: 'gpt-5.5',
+      },
+    }, null, 2) + '\n'
+    await mkdir(service.paths.claude.directory, { recursive: true })
+    await writeFile(service.paths.claude.settings.path, original)
+
+    const first = await service.repair('claude', target)
+    const repaired = JSON.parse(await readFile(service.paths.claude.settings.path, 'utf8'))
+    const second = await service.repair('claude', target)
+
+    expect(first.changedFiles).toEqual([service.paths.claude.settings.path])
+    expect(first.backups).toHaveLength(1)
+    expect(await readFile(first.backups[0].backupPath, 'utf8')).toBe(original)
+    expect(repaired).toMatchObject({
+      model: 'sonnet',
+      permissions: { allow: ['Read'] },
+      mcpServers: { files: { command: 'mcp-files' } },
+      env: {
+        KEEP_ME: 'yes',
+        ANTHROPIC_BASE_URL: target.gatewayBaseUrl,
+        ANTHROPIC_AUTH_TOKEN: target.token,
+      },
+    })
+    expect(JSON.stringify(repaired)).not.toContain('gpt-5.5')
+    expect(second).toMatchObject({ changedFiles: [], backups: [] })
+    expect(await service.listBackups('claude')).toHaveLength(1)
+    expect(JSON.stringify(first)).not.toContain(target.token)
   })
 
   it('rolls back files already written when a later repair write fails', async () => {

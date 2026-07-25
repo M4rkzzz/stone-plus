@@ -49,6 +49,7 @@ export interface NodesWorkspaceProps {
   /** Controlled value from the existing node-panel localStorage preference. */
   collapsed: boolean
   disabled?: boolean
+  latencyEnabled?: boolean
   pending?: ReadonlySet<string>
   onSelectProfile: (profileId: string) => void
   onRefreshProfile: (profileId: string) => void
@@ -67,6 +68,7 @@ export function NodesWorkspace({
   groupFilter: requestedGroupFilter,
   collapsed,
   disabled = false,
+  latencyEnabled = true,
   pending = EMPTY_PENDING,
   onSelectProfile,
   onRefreshProfile,
@@ -190,7 +192,8 @@ export function NodesWorkspace({
         {!collapsed && activeProfile && <button
           type="button"
           className="button button--secondary"
-          disabled={disabled || pending.has(`latency-${activeProfile.id}`)}
+          disabled={disabled || !latencyEnabled || pending.has(`latency-${activeProfile.id}`)}
+          title={!latencyEnabled ? t('代理核心就绪后才能测试延迟', 'Latency testing is available after the proxy core is ready') : undefined}
           onClick={() => onTestLatency(activeProfile)}
         >
           {pending.has(`latency-${activeProfile.id}`) ? <LoaderCircle size={14} className="spin" /> : <Gauge size={14} />}
@@ -256,7 +259,7 @@ export function NodesWorkspace({
                 <td data-label={t('延迟', 'Latency')}><NodeLatency node={node} testing={testing} /></td>
                 <td data-label={t('最近测试', 'Last tested')}>{relativeTime(node.lastTestedAt, locale)}</td>
                 <td className="nodes-workspace__node-actions">
-                  <button type="button" className="nodes-workspace__icon-button" title={t('测试此节点延迟', 'Test this node latency')} aria-label={t(`测试节点 ${node.name} 的延迟`, `Test latency for node ${node.name}`)} disabled={disabled || testing} onClick={() => onTestLatency(activeProfile, [node.id])}>{testing ? <LoaderCircle size={15} className="spin" /> : <Gauge size={15} />}</button>
+                  <button type="button" className="nodes-workspace__icon-button" title={latencyEnabled ? t('测试此节点延迟', 'Test this node latency') : t('代理核心就绪后才能测试延迟', 'Latency testing is available after the proxy core is ready')} aria-label={t(`测试节点 ${node.name} 的延迟`, `Test latency for node ${node.name}`)} disabled={disabled || !latencyEnabled || testing} onClick={() => onTestLatency(activeProfile, [node.id])}>{testing ? <LoaderCircle size={15} className="spin" /> : <Gauge size={15} />}</button>
                   <button type="button" className={`nodes-workspace__use ${active ? 'is-active' : ''}`} disabled={disabled || active || selecting} onClick={() => onSelectNode(activeProfile.id, node.id)}>{selecting ? <LoaderCircle size={13} className="spin" /> : active ? t('已选择', 'Selected') : t('使用', 'Use')}</button>
                 </td>
               </tr>

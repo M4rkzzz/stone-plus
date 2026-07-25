@@ -4,13 +4,59 @@ import type {
   ClientConfigFieldValue,
   ClientConfigFileFormat,
   ClientConfigFileRole,
+  Route,
 } from '@shared/types'
+import type { AgentLifecycleState } from '@shared/agent-lifecycle'
 import type { UiLanguage } from './i18n'
 import { mutateJsonObject, objectField, parseJsonObject, type JsonObject } from '../../main/client-config/json-format'
 import { locateCodexTomlPath, parseCodexToml, patchCodexTomlPaths } from '../../main/client-config/toml-format'
 
 export type ClientConfigFieldDrafts = Record<string, ClientConfigFieldValue>
 export type ClientConfigFileDrafts = Partial<Record<ClientConfigFileRole, string>>
+
+export function clientSettingOptionClassName(value: ClientConfigFieldValue, optionValue: string): string {
+  if (value !== optionValue) return ''
+  return optionValue === 'ultra' ? 'active active--maximum' : 'active'
+}
+
+export function clientRouteSelectionDisabled(busy: boolean, availableSourceCount: number): boolean {
+  return busy || availableSourceCount === 0
+}
+
+/** Keep explicit user mappings; otherwise a single exposed upstream model is
+ * a deterministic route-layer default for one-click connection. */
+export function oneClickRouteModelMap(
+  current: Readonly<Record<string, string>>,
+  sourceModels: readonly string[],
+): Record<string, string> {
+  if (Object.keys(current).length > 0 || sourceModels.length !== 1) return { ...current }
+  return { '*': sourceModels[0] }
+}
+
+export function oneClickRouteNeedsUpdate(current: Route | undefined, next: Route): boolean {
+  if (!current) return true
+  return current.enabled !== next.enabled
+    || current.poolId !== next.poolId
+    || current.inboundProtocol !== next.inboundProtocol
+    || current.localToken !== next.localToken
+    || !sameStringMap(current.modelMap, next.modelMap)
+}
+
+export function oneClickAgentRuntimeAction(
+  agent: Pick<AgentLifecycleState, 'running' | 'processControl' | 'managedInstanceCount'>,
+): 'none' | 'restart' | 'manual-restart' {
+  if (!agent.running) return 'none'
+  return agent.processControl === 'full' || agent.managedInstanceCount > 0
+    ? 'restart'
+    : 'manual-restart'
+}
+
+function sameStringMap(left: Readonly<Record<string, string>>, right: Readonly<Record<string, string>>): boolean {
+  const leftEntries = Object.entries(left)
+  const rightEntries = Object.entries(right)
+  return leftEntries.length === rightEntries.length
+    && leftEntries.every(([key, value]) => Object.hasOwn(right, key) && right[key] === value)
+}
 
 export interface ClientConfigFieldGuide {
   role: ClientConfigFileRole
@@ -91,7 +137,7 @@ export const clientConfigFieldGuides: Readonly<Record<string, ClientConfigFieldG
 
   'codex.model': guide('codex-config', ['model'], '指定 Codex 默认模型；留空可避免把 Profile 锁定到某个模型。'),
   'codex.reasoningEffort': guide('codex-config', ['model_reasoning_effort'], '控制模型的推理投入。任务越复杂可选越高，但响应时间与用量也可能增加。', 'medium', '跟随模型默认推理强度', {
-    none: '不额外请求推理', minimal: '极少推理', low: '较快', medium: '速度与质量均衡', high: '深入推理', xhigh: '最大推理投入',
+    none: '不额外请求推理', minimal: '极少推理', low: '较快', medium: '速度与质量均衡', high: '深入推理', xhigh: '超高推理投入', max: '最高推理投入', ultra: '极限推理投入',
   }),
   'codex.approvalPolicy': guide('codex-config', ['approval_policy'], '决定 Codex 在执行命令前何时向你确认；它与沙箱模式共同控制操作边界。', 'on-request', '跟随 Codex 默认审批策略', {
     untrusted: '仅可信命令免确认', 'on-request': 'Codex 判断有需要时确认', never: '从不弹出审批确认',
@@ -304,6 +350,8 @@ function reasoningOptionMetadata(): EnglishOptionMetadata {
     minimal: ['Minimal', 'Lowest latency for very simple tasks'], low: ['Low', 'Prioritize speed for simple tasks'],
     medium: ['Medium', 'Balance speed and quality'], high: ['High', 'Complex analysis and multi-step tasks'],
     xhigh: ['Extra high', 'Use deeper reasoning on models that support this level'],
+    max: ['Maximum', 'Use the maximum reasoning level on supported models'],
+    ultra: ['Ultra', 'Use the deepest reasoning level on supported models such as Sol'],
   }
 }
 

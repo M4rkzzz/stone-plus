@@ -17,7 +17,9 @@ import { localizeBackendError, localizeBackendMessage } from '../backend-message
 import { useI18n } from '../i18n'
 import { Badge, PageHeader, relativeTime } from '../ui'
 
-const EXAMPLE_CONFIG = `serverAddr = "your-frps.example.com"
+// eslint-disable-next-line react-refresh/only-export-components
+export function frpExampleConfig(localPort: number): string {
+  return `serverAddr = "your-frps.example.com"
 serverPort = 7000
 
 auth.method = "token"
@@ -27,9 +29,10 @@ auth.token = "replace-with-frp-control-token"
 name = "stone-gateway"
 type = "tcp"
 localIP = "127.0.0.1"
-localPort = 15721
+localPort = ${localPort}
 remotePort = 15721
 `
+}
 
 export function TunnelView({ snapshot, api }: { snapshot: AppSnapshot; api: GatewayApi }) {
   const { t, language, locale } = useI18n()
@@ -43,6 +46,7 @@ export function TunnelView({ snapshot, api }: { snapshot: AppSnapshot; api: Gate
       ?? snapshot.routes.find((candidate) => candidate.client === 'codex'),
     [snapshot.routes]
   )
+  const exampleConfig = useMemo(() => frpExampleConfig(snapshot.gateway.port), [snapshot.gateway.port])
 
   useEffect(() => {
     let active = true
@@ -51,7 +55,7 @@ export function TunnelView({ snapshot, api }: { snapshot: AppSnapshot; api: Gate
         const next = await api.getFrpTunnelState()
         if (!active) return
         setState(next)
-        if (replaceConfig) setConfig(next.config || EXAMPLE_CONFIG)
+        if (replaceConfig) setConfig(next.config || exampleConfig)
       } catch (cause) {
         if (active) setError(localizeBackendError(cause, language, t('无法读取 frpc 状态', 'Unable to read frpc status')))
       }
@@ -59,7 +63,7 @@ export function TunnelView({ snapshot, api }: { snapshot: AppSnapshot; api: Gate
     void load(true)
     const timer = window.setInterval(() => void load(false), 1_500)
     return () => { active = false; window.clearInterval(timer) }
-  }, [api, language, t])
+  }, [api, exampleConfig, language, t])
 
   const run = async (kind: 'save' | 'start' | 'stop', operation: () => Promise<FrpTunnelState>) => {
     setBusy(kind)

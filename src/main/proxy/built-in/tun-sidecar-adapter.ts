@@ -1,6 +1,6 @@
 import { randomBytes, randomUUID } from 'node:crypto'
 import { lookup } from 'node:dns/promises'
-import { mkdir, rename, rm, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
 import { isIP } from 'node:net'
 import {
@@ -20,6 +20,7 @@ import {
   type PlatformCommandResult,
   type PlatformCommandRunner,
   type TemporaryElevatedProcessHandle,
+  type TemporaryElevatedProcessRecoveryRequest,
   type TemporaryElevationLauncher,
   type TemporaryElevationProcessRunner
 } from './platform-adapters'
@@ -112,6 +113,18 @@ interface ActiveTunSidecar {
   exit?: Promise<{ code: number | null; signal: NodeJS.Signals | null }>
 }
 
+interface TunSidecarRecoveryRecord {
+  version: 1
+  id: string
+  pid: number
+  launcher: TemporaryElevationLauncher
+  executablePath: string
+  args: string[]
+  cwd: string
+  configPath: string
+  createdAt: number
+}
+
 type ElevatedProcessExit = Awaited<NonNullable<TemporaryElevatedProcessHandle['exit']>>
 
 /**
@@ -137,6 +150,7 @@ export class ElevatedSingBoxTunAdapter implements TunPlatformAdapter {
   private readonly healthTimeoutMs: number
   private readonly healthIntervalMs: number
   private readonly configDirectory: string
+  private readonly recoveryPath: string
   private readonly sessions = new Map<string, ActiveTunSidecar>()
   private readonly pendingCleanup = new Set<ActiveTunSidecar>()
 
@@ -161,12 +175,14 @@ export class ElevatedSingBoxTunAdapter implements TunPlatformAdapter {
     this.healthTimeoutMs = Math.max(250, options.healthTimeoutMs ?? 10_000)
     this.healthIntervalMs = Math.max(10, options.healthIntervalMs ?? 100)
     this.configDirectory = join(options.userDataPath, 'built-in-proxy', 'tun-sidecar')
+    this.recoveryPath = join(this.configDirectory, 'active-sidecar.json')
     elevationLauncher(this.platform)
   }
 
   public async startTemporaryElevated(
     request: TunPlatformStartRequest
   ): Promise<TunPlatformSession> {
+    if (this.sessions.size === 0) await this.recoverStaleSidecar()
     let runtime: VerifiedSingBoxRuntime
     try {
       runtime = await this.verifyRuntime({
@@ -280,6 +296,30 @@ export class ElevatedSingBoxTunAdapter implements TunPlatformAdapter {
       processStopped: false,
       ...(handle.exit ? { exit: handle.exit } : {})
     }
+    if (!handle.pid) {
+      await this.cleanupSidecar(active).catch(() => undefined)
+      throw new ElevatedSingBoxTunError('tun_start_failed', 'The elevated TUN sidecar did not expose a recoverable process ID.')
+    }
+    try {
+      await this.saveRecoveryRecord({
+        version: 1,
+        id: handle.id,
+        pid: handle.pid,
+        launcher: elevationLauncher(this.platform),
+        executablePath: runtime.executablePath,
+        args: ['run', '-c', configPath],
+        cwd: runtime.runtimePath,
+        configPath,
+        createdAt: Date.now()
+      })
+    } catch (error) {
+      await this.cleanupSidecar(active).catch(() => undefined)
+      throw new ElevatedSingBoxTunError(
+        'tun_cleanup_failed',
+        'Could not persist TUN crash-recovery ownership; the sidecar was stopped.',
+        { cause: error }
+      )
+    }
     this.observeExit(active)
     if (!handle.id?.trim() || this.sessions.has(handle.id)) {
       try {
@@ -360,6 +400,7 @@ export class ElevatedSingBoxTunAdapter implements TunPlatformAdapter {
         { cause: failure.reason }
       )
     }
+    await this.recoverStaleSidecar()
   }
 
   public isElevationDenied(error: unknown): boolean {
@@ -377,6 +418,51 @@ export class ElevatedSingBoxTunAdapter implements TunPlatformAdapter {
       active.processStopped = true
     }
     await this.fileSystem.rm(active.configPath, { force: true })
+    await rm(this.recoveryPath, { force: true })
+  }
+
+  private async recoverStaleSidecar(): Promise<void> {
+    if (this.sessions.size > 0) return
+    let record: TunSidecarRecoveryRecord | undefined
+    try {
+      const parsed: unknown = JSON.parse(await readFile(this.recoveryPath, 'utf8'))
+      record = parseRecoveryRecord(parsed, this.configDirectory, elevationLauncher(this.platform))
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
+      throw new ElevatedSingBoxTunError('tun_cleanup_failed', 'Could not read the TUN crash-recovery ownership record.', { cause: error })
+    }
+    const request: TemporaryElevatedProcessRecoveryRequest = {
+      launcher: record.launcher,
+      executablePath: record.executablePath,
+      args: record.args,
+      cwd: record.cwd,
+      pid: record.pid
+    }
+    let handle: TemporaryElevatedProcessHandle | undefined
+    try {
+      if (!this.processRunner.recover) {
+        throw new Error('The configured elevation runner cannot verify recovered process ownership.')
+      }
+      handle = await this.processRunner.recover(request)
+      if (handle) await handle.stop()
+    } catch (error) {
+      throw new ElevatedSingBoxTunError('tun_cleanup_failed', 'Could not stop the recovered elevated TUN sidecar.', { cause: error })
+    }
+    await this.fileSystem.rm(record.configPath, { force: true })
+    await rm(this.recoveryPath, { force: true })
+  }
+
+  private async saveRecoveryRecord(record: TunSidecarRecoveryRecord): Promise<void> {
+    await mkdir(this.configDirectory, { recursive: true, mode: 0o700 })
+    const temporaryPath = `${this.recoveryPath}.${process.pid}.${Date.now()}.tmp`
+    await writeFile(temporaryPath, `${JSON.stringify(record)}\n`, { encoding: 'utf8', flag: 'wx', mode: 0o600 })
+    await rm(this.recoveryPath, { force: true })
+    try {
+      await rename(temporaryPath, this.recoveryPath)
+    } catch (error) {
+      await rm(temporaryPath, { force: true }).catch(() => undefined)
+      throw error
+    }
   }
 
   private async waitUntilHealthy(
@@ -623,6 +709,40 @@ function validateRandomId(value: string): string {
     throw new ElevatedSingBoxTunError('tun_config_invalid', 'The temporary TUN configuration ID is invalid.')
   }
   return value
+}
+
+function parseRecoveryRecord(
+  value: unknown,
+  configDirectory: string,
+  expectedLauncher: TemporaryElevationLauncher
+): TunSidecarRecoveryRecord {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('Invalid TUN recovery record.')
+  }
+  const record = value as Partial<TunSidecarRecoveryRecord>
+  if (
+    record.version !== 1
+    || typeof record.id !== 'string'
+    || !Number.isInteger(record.pid)
+    || (record.pid ?? 0) <= 0
+    || record.launcher !== expectedLauncher
+    || typeof record.executablePath !== 'string'
+    || typeof record.cwd !== 'string'
+    || typeof record.configPath !== 'string'
+    || !Array.isArray(record.args)
+    || record.args.length !== 3
+    || record.args[0] !== 'run'
+    || record.args[1] !== '-c'
+    || record.args[2] !== record.configPath
+    || dirname(record.configPath) !== configDirectory
+    || !/^sidecar-[A-Za-z0-9_-]{1,128}\.json$/.test(basename(record.configPath))
+    || basename(record.executablePath).toLowerCase() !== (expectedLauncher === 'windows-uac' ? 'sing-box.exe' : 'sing-box')
+    || typeof record.createdAt !== 'number'
+    || !Number.isFinite(record.createdAt)
+  ) {
+    throw new Error('Invalid TUN recovery record.')
+  }
+  return record as TunSidecarRecoveryRecord
 }
 
 function runtimeEnvironment(

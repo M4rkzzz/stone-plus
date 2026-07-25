@@ -345,11 +345,13 @@ export function registerBuiltInProxyApi(
       ? undefined
       : requireIdentifier(profileValue, 'profile id')
     const nodeIds = normalizeOptionalIdentifiers(nodeValues, 'node ids')
-    const key = digestMutationInput({ profileId, nodeIds })
-    return enqueueMutation(`latency:${key}`, () => runRead(
+    // Latency probes are cancellable observations, not lifecycle mutations.
+    // Keeping them on mutationTail can delay disable/crash cleanup for minutes
+    // when controller requests time out across a large profile.
+    return runRead(
       () => runtime.testLatency(profileId, nodeIds),
       projectNodeSummaries,
-    ))
+    )
   })
 
   register(builtInProxyIpcChannels.getTraffic, (event) => {
@@ -693,6 +695,13 @@ const runtimeStateProjection = {
     status: true,
     endpoint: true,
     verifiedAt: true,
+  },
+  platformCapabilities: {
+    platform: true,
+    accessModes: {
+      system: { available: true, unavailableReason: true, authorizationRequired: true },
+      tun: { available: true, unavailableReason: true, authorizationRequired: true },
+    },
   },
   coreVersion: true,
   startedAt: true,

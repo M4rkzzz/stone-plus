@@ -187,7 +187,8 @@ function normalizeSetupState(value: unknown): SetupWizardState | null {
   const sourceMethod = typeof input.sourceMethod === 'string' && setupSourceMethods.has(input.sourceMethod)
     ? input.sourceMethod
     : undefined
-  const client = input.client === 'codex' || input.client === 'claude' || input.client === 'gemini'
+  const client = input.client === 'codex' || input.client === 'claude'
+    || input.client === 'gemini' || input.client === 'grokbuild'
     ? input.client
     : undefined
   return {

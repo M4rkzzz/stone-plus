@@ -24,7 +24,7 @@ export function buildLocalChecks(snapshot: AppSnapshot, proxyId: string, languag
   const enabledRoutePoolIds = new Set(enabledRoutes.map((route) => route.poolId))
   const emptyPools = snapshot.pools.filter((pool) => enabledRoutePoolIds.has(pool.id) && !pool.members.some((member) =>
     member.enabled && snapshot.accounts.some((account) => account.id === member.accountId))).length
-  const expiringOAuth = snapshot.accounts.filter((account) => account.credentialType === 'chatgpt-oauth'
+  const expiringOAuth = snapshot.accounts.filter((account) => (account.credentialType === 'chatgpt-oauth' || account.credentialType === 'grok-oauth')
     && account.credentialExpiresAt !== undefined && account.credentialExpiresAt <= now + 15 * 60_000
     && account.renewable !== true).length
   const proxy = proxyId ? snapshot.proxies.find((candidate) => candidate.id === proxyId) : undefined
@@ -49,11 +49,11 @@ export function buildLocalChecks(snapshot: AppSnapshot, proxyId: string, languag
         : t(`${snapshot.pools.length} 个号池/聚合中转 · ${enabledRoutes.length} 条已启用路由`, `${snapshot.pools.length} pools/aggregates · ${enabledRoutes.length} enabled routes`)
     },
     {
-      id: 'oauth', label: t('ChatGPT OAuth 会话', 'ChatGPT OAuth sessions'),
+      id: 'oauth', label: t('OAuth 会话', 'OAuth sessions'),
       status: expiringOAuth > 0 ? 'warning' : 'success',
       message: expiringOAuth > 0
         ? t(`${expiringOAuth} 个不可续期会话将在 15 分钟内过期，需要重新导入。`, `${expiringOAuth} non-renewable sessions expire within 15 minutes and must be imported again.`)
-        : t('未发现即将到期且无法自动续期的 ChatGPT 会话。', 'No ChatGPT sessions are both near expiry and unable to renew automatically.')
+        : t('未发现即将到期且无法自动续期的 OAuth 会话。', 'No OAuth sessions are both near expiry and unable to renew automatically.')
     },
     {
       id: 'proxy', label: t('本次测试出口', 'Route used for this test'),

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type UIEvent } from 'react'
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type UIEvent } from 'react'
 import {
   Activity,
   Boxes,
@@ -21,7 +21,8 @@ import {
   Square,
   X,
 } from 'lucide-react'
-import type { AppSnapshot, AppUpdateState } from '@shared/types'
+import type { AppSnapshot, AppUpdateState, GatewayApi } from '@shared/types'
+import type { AgentLifecycleOperationResult, AgentLifecycleSnapshot, AgentTarget } from '@shared/agent-lifecycle'
 import { listRouteSources } from '@shared/route-sources'
 import { getGatewayApi } from './api'
 import { OverviewView } from './views/OverviewView'
@@ -47,7 +48,9 @@ import {
   type UpdateAction,
 } from './UpdateDialog'
 import { useI18n } from './i18n'
-import { applyRuntimeDelta, shouldAcceptSnapshotRevision } from './runtime-delta'
+import { applyRuntimeDelta, RuntimeSnapshotReloadCoordinator, shouldAcceptSnapshotRevision } from './runtime-delta'
+import { AgentLifecycleControl, type AgentLifecycleControlAction } from './agent-lifecycle-control'
+import { agentLifecycleRenderKey, appSnapshotAffectsPage } from './app-render-state'
 
 export type PageId = 'overview' | 'setup' | 'providers' | 'proxies' | 'pools' | 'routes' | 'clients' | 'session-repair' | 'tunnel' | 'browser' | 'diagnostics' | 'requests' | 'settings' | 'help'
 export type ActionRunner = (key: string, operation: () => Promise<AppSnapshot>) => Promise<boolean>
@@ -94,6 +97,44 @@ function LoadingScreen() {
   )
 }
 
+interface ActivePageProps {
+  page: PageId
+  snapshot: AppSnapshot
+  api: GatewayApi
+  runAction: ActionRunner
+  busyKeys: Set<string>
+  update: AppUpdateController
+  navigate: (page: PageId) => void
+}
+
+const ActivePage = memo(function ActivePage({
+  page,
+  snapshot,
+  api,
+  runAction,
+  busyKeys,
+  update,
+  navigate,
+}: ActivePageProps) {
+  if (page === 'overview') return <OverviewView snapshot={snapshot} navigate={navigate} />
+  if (page === 'setup') return <SetupWizardView snapshot={snapshot} api={api} onExit={() => navigate('overview')} />
+  if (page === 'providers') return <ProvidersView snapshot={snapshot} api={api} runAction={runAction} busyKeys={busyKeys} />
+  if (page === 'proxies') return <ProxyView snapshot={snapshot} api={api} runAction={runAction} busyKeys={busyKeys} />
+  if (page === 'pools') return <PoolsView snapshot={snapshot} api={api} runAction={runAction} busyKeys={busyKeys} />
+  if (page === 'routes') return <RoutesView snapshot={snapshot} api={api} runAction={runAction} busyKeys={busyKeys} />
+  if (page === 'clients') return <ClientsView snapshot={snapshot} api={api} />
+  if (page === 'session-repair') return <SessionRepairView api={api} />
+  if (page === 'tunnel' && desktopTunnelSupported) return <TunnelView snapshot={snapshot} api={api} />
+  if (page === 'browser') return <BrowserView snapshot={snapshot} api={api} />
+  if (page === 'diagnostics') return <NetworkTestView snapshot={snapshot} api={api} />
+  if (page === 'requests') return <RequestsView snapshot={snapshot} api={api} runAction={runAction} busyKeys={busyKeys} />
+  if (page === 'settings') return <SettingsView snapshot={snapshot} api={api} runAction={runAction} busyKeys={busyKeys} update={update} />
+  if (page === 'help') return <HelpView snapshot={snapshot} api={api} navigate={navigate} />
+  return null
+})
+
+const MemoAgentLifecycleControl = memo(AgentLifecycleControl)
+
 export default function App() {
   const { t, language } = useI18n()
   const api = useMemo(() => getGatewayApi(), [])
@@ -107,8 +148,16 @@ export default function App() {
   const [updateAction, setUpdateAction] = useState<UpdateAction | null>(null)
   const [updateError, setUpdateError] = useState<string | null>(null)
   const [updateDialogOpen, setUpdateDialogOpen] = useState(false)
+  const [agentLifecycleSnapshot, setAgentLifecycleSnapshot] = useState<AgentLifecycleSnapshot | null>(null)
+  const [lastAgentOperation, setLastAgentOperation] = useState<AgentLifecycleOperationResult | undefined>()
+  const [agentOperationPending, setAgentOperationPending] = useState(false)
   const updateRevision = useRef(-1)
   const runtimeRevision = useRef(-1)
+  const agentLifecycleRevision = useRef(-1)
+  const agentLifecycleRenderState = useRef<string | undefined>(undefined)
+  const agentOperationInFlight = useRef(false)
+  const agentLifecycleRefreshInFlight = useRef<Promise<void> | null>(null)
+  const activePageSnapshot = useRef<{ page: PageId; snapshot: AppSnapshot } | undefined>(undefined)
   const scrollbarHideTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
 
   const acceptUpdateState = useCallback((next: AppUpdateState) => {
@@ -120,27 +169,58 @@ export default function App() {
   const acceptSnapshot = useCallback((next: AppSnapshot) => {
     if (next.runtimeRevision !== undefined) {
       if (!shouldAcceptSnapshotRevision(runtimeRevision.current, next.runtimeRevision)) return
+      // Focus and visibility events can both request the same authoritative
+      // snapshot. A repeated revision cannot contain a newer published state,
+      // so retain the existing object graph instead of re-rendering the app.
+      if (runtimeRevision.current === next.runtimeRevision) return
       runtimeRevision.current = next.runtimeRevision
     }
     setSnapshot(next)
   }, [])
 
-  const load = useCallback(async () => {
-    setError(null)
-    try {
-      acceptSnapshot(await api.getSnapshot())
-    } catch (cause) {
+  const acceptAgentLifecycleSnapshot = useCallback((next: AgentLifecycleSnapshot) => {
+    if (!shouldAcceptSnapshotRevision(agentLifecycleRevision.current, next.revision)) return
+    agentLifecycleRevision.current = next.revision
+    const renderState = agentLifecycleRenderKey(next)
+    if (agentLifecycleRenderState.current === renderState) return
+    agentLifecycleRenderState.current = renderState
+    setAgentLifecycleSnapshot(next)
+  }, [])
+
+  const refreshAgentLifecycle = useCallback((): Promise<void> => {
+    if (agentLifecycleRefreshInFlight.current) return agentLifecycleRefreshInFlight.current
+    const request = api.getAgentLifecycleSnapshot()
+      .then(acceptAgentLifecycleSnapshot)
+      .catch(() => undefined)
+    const tracked = request.finally(() => {
+      if (agentLifecycleRefreshInFlight.current === tracked) agentLifecycleRefreshInFlight.current = null
+    })
+    agentLifecycleRefreshInFlight.current = tracked
+    return tracked
+  }, [acceptAgentLifecycleSnapshot, api])
+
+  const snapshotReload = useMemo(() => new RuntimeSnapshotReloadCoordinator({
+    fetchSnapshot: () => api.getSnapshot(),
+    acceptSnapshot,
+    acceptedRevision: () => runtimeRevision.current,
+    onError: (cause) => {
       setError(localizedError(cause, t('无法连接本地服务', 'Unable to connect to the local service'), language))
-    }
-  }, [acceptSnapshot, api, language, t])
+    },
+  }), [acceptSnapshot, api, language, t])
+
+  const load = useCallback((minimumRevision = -1) => {
+    setError(null)
+    return snapshotReload.request(minimumRevision)
+  }, [snapshotReload])
 
   useEffect(() => {
+    snapshotReload.activate()
     void load()
     const unsubscribeSnapshot = api.onSnapshot(acceptSnapshot)
     const unsubscribeRuntime = api.onRuntimeDelta((delta) => {
       if (delta.revision <= runtimeRevision.current) return
       if (runtimeRevision.current < 0 || delta.revision !== runtimeRevision.current + 1) {
-        void load()
+        void load(delta.revision)
         return
       }
       runtimeRevision.current = delta.revision
@@ -149,8 +229,9 @@ export default function App() {
     return () => {
       unsubscribeSnapshot()
       unsubscribeRuntime()
+      snapshotReload.dispose()
     }
-  }, [acceptSnapshot, api, load])
+  }, [acceptSnapshot, api, load, snapshotReload])
 
   useEffect(() => {
     const refreshVisibleSnapshot = () => {
@@ -172,6 +253,22 @@ export default function App() {
       .catch((cause: unknown) => setUpdateError(localizedError(cause, t('无法读取应用更新状态', 'Unable to read the app update status'), language)))
     return unsubscribe
   }, [acceptUpdateState, api, language, t])
+
+  useEffect(() => {
+    void refreshAgentLifecycle()
+    const unsubscribeLifecycle = api.onAgentLifecycleChanged((event) => {
+      acceptAgentLifecycleSnapshot(event.snapshot)
+      if (event.operation) setLastAgentOperation(event.operation)
+    })
+    const refresh = () => void refreshAgentLifecycle()
+    const unsubscribeInstances = api.onManagedClientInstancesChanged(refresh)
+    window.addEventListener('focus', refresh)
+    return () => {
+      unsubscribeLifecycle()
+      unsubscribeInstances()
+      window.removeEventListener('focus', refresh)
+    }
+  }, [acceptAgentLifecycleSnapshot, api, refreshAgentLifecycle])
 
   useEffect(() => {
     const handleHashChange = () => setPage(pageFromHash())
@@ -216,28 +313,54 @@ export default function App() {
     }
   }, [acceptSnapshot, language, t])
 
-  const repairSessionsAndRestartChatGpt = useCallback(async () => {
-    const key = 'chatgpt-repair-restart'
-    setBusyKeys((current) => new Set(current).add(key))
+  const runAgentLifecycle = useCallback(async (
+    operation: () => Promise<AgentLifecycleOperationResult>,
+  ) => {
+    if (agentOperationInFlight.current) return
+    agentOperationInFlight.current = true
+    setAgentOperationPending(true)
     setError(null)
     try {
-      await api.repairCodexSessionsAndRestartChatGpt()
+      const result = await operation()
+      setLastAgentOperation(result)
+      acceptAgentLifecycleSnapshot(result.snapshot)
     } catch (cause) {
-      setError(localizedError(cause, t('关闭、修复或重新开启 Codex 失败', 'Closing, repairing, or reopening Codex failed'), language))
+      setError(localizedError(cause, t('Agent 操作失败', 'Agent operation failed'), language))
     } finally {
-      setBusyKeys((current) => {
-        const next = new Set(current)
-        next.delete(key)
-        return next
-      })
+      agentOperationInFlight.current = false
+      setAgentOperationPending(false)
     }
-  }, [api, language, t])
+  }, [acceptAgentLifecycleSnapshot, language, t])
 
-  const setActivePage = (id: PageId) => {
+  const runAgentAction = useCallback((target: AgentTarget, action: AgentLifecycleControlAction) => {
+    const operation = action === 'close'
+      ? () => api.closeAgent(target)
+      : action === 'restore'
+        ? () => api.restoreAgent(target, { ensureRunning: true })
+        : action === 'restart'
+          ? () => api.restartAgent(target)
+          : () => api.startAgent(target)
+    return runAgentLifecycle(operation)
+  }, [api, runAgentLifecycle])
+
+  const setActivePage = useCallback((id: PageId) => {
     setPage(id)
     window.history.replaceState(null, '', `#${id}`)
     setMobileNavOpen(false)
-  }
+  }, [])
+
+  const repairAllAgents = useCallback(
+    () => runAgentLifecycle(() => api.repairAllAffectedAgents()),
+    [api, runAgentLifecycle],
+  )
+  const closeAllAgents = useCallback(
+    () => runAgentLifecycle(() => api.closeAllManagedAgents()),
+    [api, runAgentLifecycle],
+  )
+  const openClientConfiguration = useCallback(
+    () => setActivePage('clients'),
+    [setActivePage],
+  )
 
   const revealContentScrollbar = useCallback((event: UIEvent<HTMLElement>) => {
     const element = event.currentTarget
@@ -355,7 +478,25 @@ export default function App() {
     openPage: openUpdatePage,
   }), [checkForUpdates, downloadUpdate, ignoreUpdate, installUpdate, openUpdatePage, updateAction, updateError, updateState])
 
-  if (!snapshot) {
+  const lifecycleAgents = useMemo(
+    () => agentLifecycleSnapshot ? Object.values(agentLifecycleSnapshot.agents) : [],
+    [agentLifecycleSnapshot],
+  )
+  const snapshotAccounts = snapshot?.accounts
+  const accountQuota = useMemo(
+    () => snapshotAccounts ? summarizeAccountQuota(snapshotAccounts) : null,
+    [snapshotAccounts],
+  )
+  const pageSnapshot = useMemo(() => {
+    if (!snapshot) return null
+    const previous = activePageSnapshot.current
+    if (!previous || previous.page !== page || appSnapshotAffectsPage(page, previous.snapshot, snapshot)) {
+      activePageSnapshot.current = { page, snapshot }
+    }
+    return activePageSnapshot.current?.snapshot ?? snapshot
+  }, [page, snapshot])
+
+  if (!snapshot || !pageSnapshot) {
     return (
       <>
         <LoadingScreen />
@@ -372,9 +513,7 @@ export default function App() {
   }
 
   const gatewayBusy = busyKeys.has('gateway-power')
-  const chatGptRepairBusy = busyKeys.has('chatgpt-repair-restart')
   const endpoint = gatewayBaseUrl(snapshot.gatewayStatus.host, snapshot.gatewayStatus.port)
-  const accountQuota = summarizeAccountQuota(snapshot.accounts)
   const accountQuotaPercent = accountQuota ? Math.round(accountQuota.percent) : undefined
   const updateReleaseVisible = Boolean(
     updateState?.release
@@ -506,16 +645,18 @@ export default function App() {
               {gatewayBusy ? <RefreshCw size={16} className="spin" /> : snapshot.gatewayStatus.running ? <Square size={14} /> : <Play size={16} />}
               {snapshot.gatewayStatus.running ? t('停止', 'Stop') : t('启动', 'Start')}
             </button>
-            <button
-              className="topbar__chatgpt-restart"
-              type="button"
-              aria-label={t('关闭 Codex、修复会话、重新开启', 'Close Codex, repair sessions, and reopen it')}
-              title={t('关闭 Codex → 修复会话 → 重新开启', 'Close Codex → Repair sessions → Reopen')}
-              disabled={chatGptRepairBusy}
-              onClick={() => void repairSessionsAndRestartChatGpt()}
-            >
-              {chatGptRepairBusy ? <RefreshCw size={17} className="spin" /> : <ChatGptMark />}
-            </button>
+            {agentLifecycleSnapshot && (
+              <MemoAgentLifecycleControl
+                agents={lifecycleAgents}
+                lastOperation={lastAgentOperation}
+                operationPending={agentOperationPending}
+                onRequestRefresh={refreshAgentLifecycle}
+                onAction={runAgentAction}
+                onRepair={repairAllAgents}
+                onCloseAll={closeAllAgents}
+                onOpenClientConfiguration={openClientConfiguration}
+              />
+            )}
           </div>
         </header>
 
@@ -527,20 +668,15 @@ export default function App() {
         )}
 
         <main className="page-content" onScroll={revealContentScrollbar}>
-          {page === 'overview' && <OverviewView snapshot={snapshot} navigate={setActivePage} />}
-          {page === 'setup' && <SetupWizardView snapshot={snapshot} api={api} onExit={() => setActivePage('overview')} />}
-          {page === 'providers' && <ProvidersView snapshot={snapshot} api={api} runAction={runAction} busyKeys={busyKeys} />}
-          {page === 'proxies' && <ProxyView snapshot={snapshot} api={api} runAction={runAction} busyKeys={busyKeys} />}
-          {page === 'pools' && <PoolsView snapshot={snapshot} api={api} runAction={runAction} busyKeys={busyKeys} />}
-          {page === 'routes' && <RoutesView snapshot={snapshot} api={api} runAction={runAction} busyKeys={busyKeys} />}
-          {page === 'clients' && <ClientsView snapshot={snapshot} api={api} />}
-          {page === 'session-repair' && <SessionRepairView api={api} />}
-          {desktopTunnelSupported && page === 'tunnel' && <TunnelView snapshot={snapshot} api={api} />}
-          {page === 'browser' && <BrowserView snapshot={snapshot} api={api} />}
-          {page === 'diagnostics' && <NetworkTestView snapshot={snapshot} api={api} />}
-          {page === 'requests' && <RequestsView snapshot={snapshot} api={api} runAction={runAction} busyKeys={busyKeys} />}
-          {page === 'settings' && <SettingsView snapshot={snapshot} api={api} runAction={runAction} busyKeys={busyKeys} update={updateController} />}
-          {page === 'help' && <HelpView snapshot={snapshot} api={api} navigate={setActivePage} />}
+          <ActivePage
+            page={page}
+            snapshot={pageSnapshot}
+            api={api}
+            runAction={runAction}
+            busyKeys={busyKeys}
+            update={updateController}
+            navigate={setActivePage}
+          />
         </main>
       </div>
       <UpdateDialog
@@ -556,16 +692,5 @@ export default function App() {
         onOpenPage={openUpdatePage}
       />
     </div>
-  )
-}
-
-function ChatGptMark() {
-  return (
-    <svg className="chatgpt-mark" viewBox="0 0 24 24" aria-hidden="true">
-      <path
-        fill="currentColor"
-        d="M22.2819 9.8211a5.9847 5.9847 0 0 0-.5157-4.9108 6.0462 6.0462 0 0 0-6.5098-2.9A6.0651 6.0651 0 0 0 4.9807 4.1818a5.9847 5.9847 0 0 0-3.9977 2.9 6.0462 6.0462 0 0 0 .7427 7.0966 5.98 5.98 0 0 0 .511 4.9107 6.051 6.051 0 0 0 6.5146 2.9001A5.9847 5.9847 0 0 0 13.2599 24a6.0557 6.0557 0 0 0 5.7718-4.2058 5.9894 5.9894 0 0 0 3.9977-2.9001 6.0557 6.0557 0 0 0-.7475-7.0729zm-9.022 12.6081a4.4755 4.4755 0 0 1-2.8764-1.0408l.1419-.0804 4.7783-2.7582a.7948.7948 0 0 0 .3927-.6813v-6.7369l2.02 1.1686a.071.071 0 0 1 .038.052v5.5826a4.504 4.504 0 0 1-4.4945 4.4944zm-9.6607-4.1254a4.4708 4.4708 0 0 1-.5346-3.0137l.142.0852 4.783 2.7582a.7712.7712 0 0 0 .7806 0l5.8428-3.3685v2.3324a.0804.0804 0 0 1-.0332.0615L9.74 19.9502a4.4992 4.4992 0 0 1-6.1408-1.6464zM2.3408 7.8956a4.485 4.485 0 0 1 2.3655-1.9728V11.6a.7664.7664 0 0 0 .3879.6765l5.8144 3.3543-2.0201 1.1685a.0757.0757 0 0 1-.071 0l-4.8303-2.7865A4.504 4.504 0 0 1 2.3408 7.872zm16.5963 3.8558L13.1038 8.364 15.1192 7.2a.0757.0757 0 0 1 .071 0l4.8303 2.7913a4.4944 4.4944 0 0 1-.6765 8.1042v-5.6772a.79.79 0 0 0-.407-.667zm2.0107-3.0231l-.142-.0852-4.7735-2.7818a.7759.7759 0 0 0-.7854 0L9.409 9.2297V6.8974a.0662.0662 0 0 1 .0284-.0615l4.8303-2.7866a4.4992 4.4992 0 0 1 6.6802 4.66zM8.3065 12.863l-2.02-1.1638a.0804.0804 0 0 1-.038-.0567V6.0742a4.4992 4.4992 0 0 1 7.3757-3.4537l-.142.0805L8.704 5.459a.7948.7948 0 0 0-.3927.6813zm1.0976-2.3654l2.602-1.4998 2.6069 1.4998v2.9994l-2.5974 1.4997-2.6067-1.4997Z"
-      />
-    </svg>
   )
 }

@@ -38,6 +38,157 @@ describe('static route preview', () => {
     expect(result.issues).toContainEqual(expect.objectContaining({ code: 'model-mapped' }))
   })
 
+  it('uses a wildcard mapping for an otherwise-unmapped model', () => {
+    const result = previewRoute({
+      route: { ...route, modelMap: { '*': 'grok-4.20' } },
+      requestedModel: 'codex-configured-alias',
+    }, {
+      ...snapshot,
+      providers: snapshot.providers.map((provider) => ({ ...provider, models: ['grok-4.20'] })),
+      accounts: snapshot.accounts.map((account) => ({ ...account, availableModels: ['grok-4.20'] })),
+    })
+    expect(result.status).toBe('ready')
+    expect(result.upstreamModel).toBe('grok-4.20')
+  })
+
+  it('uses the real Grok provider wire protocol instead of treating its logical pool as a conversion', () => {
+    const grokSnapshot = {
+      providers: [{
+        ...snapshot.providers[0],
+        id: 'grok-provider',
+        name: 'Grok OAuth',
+        sourceType: 'oauth-system' as const,
+        kind: 'xai' as const,
+        protocol: 'openai-responses' as const,
+        models: ['grok-4.5'],
+      }],
+      accounts: [{
+        ...snapshot.accounts[0],
+        id: 'grok-account',
+        providerId: 'grok-provider',
+        credentialType: 'grok-oauth' as const,
+        availableModels: ['grok-4.5'],
+        modelPolicy: 'selected' as const,
+        modelAllowlist: ['grok-4.5'],
+      }],
+      pools: [{
+        id: 'grok-pool', name: 'Grok pool', kind: 'standard' as const,
+        protocol: 'grok' as const, strategy: 'priority' as const,
+        members: [{ accountId: 'grok-account', enabled: true }],
+        modelPolicy: 'all' as const, modelAllowlist: [], stickySessions: false,
+        stickyTtlMinutes: 30, maxRetries: 0, createdAt: 1, updatedAt: 1,
+      }],
+    } as unknown as Pick<AppSnapshot, 'providers' | 'accounts' | 'pools'>
+
+    const result = previewRoute({
+      route: { ...route, poolId: 'grok-pool', modelMap: { '*': 'grok-4.5' } },
+      requestedModel: 'codex-model',
+    }, grokSnapshot)
+
+    expect(result).toMatchObject({
+      status: 'ready',
+      sourceProtocol: 'openai-responses',
+      inboundProtocol: 'openai-responses',
+      upstreamModel: 'grok-4.5',
+      eligibleAccountCount: 1,
+    })
+    expect(result.issues).not.toContainEqual(expect.objectContaining({ code: 'protocol-conversion' }))
+
+    const grokBuild = previewRoute({
+      route: { ...route, client: 'grokbuild', poolId: 'grok-pool', modelMap: { '*': 'grok-4.5' } },
+      requestedModel: 'grok-4.5',
+    }, grokSnapshot)
+    expect(grokBuild.status).toBe('ready')
+  })
+
+  it('blocks a Grok Build route backed by a Chat-compatible Grok relay', () => {
+    const chatGrok = {
+      providers: [{
+        ...snapshot.providers[0],
+        id: 'chat-grok-provider',
+        kind: 'xai-compatible' as const,
+        protocol: 'openai-chat' as const,
+      }],
+      accounts: [{
+        ...snapshot.accounts[0],
+        id: 'chat-grok-account',
+        providerId: 'chat-grok-provider',
+      }],
+      pools: [{
+        id: 'chat-grok-pool', name: 'Chat Grok pool', kind: 'standard' as const,
+        protocol: 'grok' as const, strategy: 'priority' as const,
+        members: [{ accountId: 'chat-grok-account', enabled: true }],
+        modelPolicy: 'all' as const, modelAllowlist: [], stickySessions: false,
+        stickyTtlMinutes: 30, maxRetries: 0, createdAt: 1, updatedAt: 1,
+      }],
+    } as unknown as Pick<AppSnapshot, 'providers' | 'accounts' | 'pools'>
+
+    const result = previewRoute({
+      route: { ...route, client: 'grokbuild', poolId: 'chat-grok-pool' },
+    }, chatGrok)
+    expect(result.status).toBe('blocked')
+    expect(result.eligibleAccountCount).toBe(0)
+    expect(result.issues).toContainEqual(expect.objectContaining({
+      code: 'source-unavailable',
+      message: expect.stringContaining('OpenAI Responses'),
+    }))
+  })
+
+  it('fails closed when a persisted Grok pool contains even a disabled OpenAI member', () => {
+    const mixed = {
+      providers: [
+        { ...snapshot.providers[0], id: 'grok-provider', kind: 'xai' as const, sourceType: 'official-api' as const },
+        { ...snapshot.providers[0], id: 'openai-provider' },
+      ],
+      accounts: [
+        { ...snapshot.accounts[0], id: 'grok-account', providerId: 'grok-provider' },
+        { ...snapshot.accounts[0], id: 'openai-account', providerId: 'openai-provider' },
+      ],
+      pools: [{
+        id: 'mixed-grok', name: 'Mixed Grok', kind: 'standard' as const,
+        protocol: 'grok' as const, strategy: 'priority' as const,
+        members: [
+          { accountId: 'grok-account', enabled: true },
+          { accountId: 'openai-account', enabled: false },
+        ],
+        modelPolicy: 'all' as const, modelAllowlist: [], stickySessions: false,
+        stickyTtlMinutes: 30, maxRetries: 0, createdAt: 1, updatedAt: 1,
+      }],
+    } as unknown as Pick<AppSnapshot, 'providers' | 'accounts' | 'pools'>
+
+    const result = previewRoute({ route: { ...route, poolId: 'mixed-grok' } }, mixed)
+    expect(result.status).toBe('blocked')
+    expect(result.eligibleAccountCount).toBe(0)
+    expect(result.issues).toContainEqual(expect.objectContaining({ code: 'source-unavailable' }))
+  })
+
+  it('fails closed when a persisted standard pool mixes OpenAI and Grok relays', () => {
+    const mixed = {
+      providers: [
+        { ...snapshot.providers[0], id: 'openai-provider' },
+        { ...snapshot.providers[0], id: 'grok-provider', kind: 'xai-compatible' as const },
+      ],
+      accounts: [
+        { ...snapshot.accounts[0], id: 'openai-account', providerId: 'openai-provider' },
+        { ...snapshot.accounts[0], id: 'grok-account', providerId: 'grok-provider' },
+      ],
+      pools: [{
+        id: 'mixed-relays', name: 'Mixed relays', kind: 'standard' as const,
+        protocol: 'openai-responses' as const, strategy: 'balanced' as const,
+        members: [
+          { accountId: 'openai-account', enabled: true },
+          { accountId: 'grok-account', enabled: true },
+        ],
+        modelPolicy: 'all' as const, modelAllowlist: [], stickySessions: false,
+        stickyTtlMinutes: 30, maxRetries: 0, createdAt: 1, updatedAt: 1,
+      }],
+    } as unknown as Pick<AppSnapshot, 'providers' | 'accounts' | 'pools'>
+
+    const result = previewRoute({ route: { ...route, poolId: 'mixed-relays' } }, mixed)
+    expect(result.status).toBe('blocked')
+    expect(result.eligibleAccountCount).toBe(0)
+  })
+
   it('blocks explicitly unsupported required capabilities', () => {
     const result = previewRoute({ route, requestedModel: 'alias', requiredCapabilities: ['imageInput'] }, snapshot)
     expect(result.status).toBe('blocked')

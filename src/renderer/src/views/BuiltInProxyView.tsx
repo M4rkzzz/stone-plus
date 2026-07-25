@@ -245,6 +245,14 @@ export interface BuiltInProxyTakeoverPresentation {
   mixedPort?: number
 }
 
+export function shouldPollBuiltInProxyTelemetry(
+  routeReady: boolean,
+  activeWorkspaceTab: BuiltInProxyWorkspaceTab,
+  visibilityState: DocumentVisibilityState,
+): boolean {
+  return routeReady && activeWorkspaceTab === 'activity' && visibilityState === 'visible'
+}
+
 /**
  * Renderer truth boundary: a lifecycle `ready` flag alone must never be
  * presented as takeover. The published route must match the selected access
@@ -561,10 +569,20 @@ export function BuiltInProxyView({
       setConnections([])
       return
     }
-    void refreshTelemetry(false)
-    const timer = window.setInterval(() => void refreshTelemetry(false), 3_000)
-    return () => window.clearInterval(timer)
-  }, [refreshTelemetry, routeReady, telemetryContext])
+    if (activeWorkspaceTab !== 'activity') return
+
+    const refreshIfVisible = () => {
+      if (!shouldPollBuiltInProxyTelemetry(routeReady, activeWorkspaceTab, document.visibilityState)) return
+      void refreshTelemetry(false)
+    }
+    refreshIfVisible()
+    const timer = window.setInterval(refreshIfVisible, 3_000)
+    document.addEventListener('visibilitychange', refreshIfVisible)
+    return () => {
+      window.clearInterval(timer)
+      document.removeEventListener('visibilitychange', refreshIfVisible)
+    }
+  }, [activeWorkspaceTab, refreshTelemetry, routeReady, telemetryContext])
 
   const toggleMaster = async () => {
     if (!runtime || masterBusy) return
@@ -929,6 +947,7 @@ export function BuiltInProxyView({
           groupFilter={groupFilter}
           collapsed={nodePanelPreferences.collapsed}
           disabled={controlsDisabled}
+          latencyEnabled={runtime.status === 'ready' && runtime.settings.activeProfileId === activeProfile?.id}
           pending={pending}
           onSelectProfile={() => undefined}
           onRefreshProfile={() => undefined}
@@ -1209,7 +1228,7 @@ function MasterSwitch({ runtime, checked, busy, loadError, onToggle, onReload, t
         <p>{description}</p>
       </div>
     </div>
-    {loadError ? <button className="button button--secondary" type="button" onClick={onReload}><RefreshCw size={15} />{t('重试读取', 'Retry')}</button> : <button
+    {shouldReplaceMasterSwitchWithReload(runtime, loadError) ? <button className="button button--secondary" type="button" onClick={onReload}><RefreshCw size={15} />{t('重试读取', 'Retry')}</button> : <button
       type="button"
       role="switch"
       aria-checked={checked}
@@ -1222,6 +1241,13 @@ function MasterSwitch({ runtime, checked, busy, loadError, onToggle, onReload, t
       <i aria-hidden="true" />
     </button>}
   </section>
+}
+
+export function shouldReplaceMasterSwitchWithReload(
+  runtime: BuiltInProxyRuntimeState | null,
+  loadError: string | null,
+): boolean {
+  return runtime === null && Boolean(loadError)
 }
 
 function RuntimeError({ runtime, busy, onRetry, t }: {

@@ -11,6 +11,7 @@ import type {
   ClientConfigEditorState,
   ClientConfigFileRole,
   ClientConfigStatus,
+  CodexSessionRepairProgressEvent,
   GatewayApi,
   GatewaySettings,
   FrpTunnelState,
@@ -27,9 +28,20 @@ import type {
   SetupWizardState,
 } from '@shared/types'
 import { previewRoute as buildRoutePreview } from '@shared/route-preview'
-import { supportsFastServiceTier } from '@shared/types'
+import { DEFAULT_ACCOUNT_MAX_CONCURRENCY, supportsFastServiceTier, supportsPoolFastServiceTier } from '@shared/types'
+import { accountMatchesPoolProtocol } from '@shared/pool-protocol'
+import { providerSourceFamily } from '@shared/source-family'
+import {
+  AGENT_CAPABILITIES,
+  AGENT_TARGETS,
+  type AgentLifecycleAction,
+  type AgentLifecycleChangedEvent,
+  type AgentLifecycleOperationResult,
+  type AgentLifecycleSnapshot,
+  type AgentTarget,
+} from '@shared/agent-lifecycle'
 import { summarizeOpenAiTokenCosts } from '@shared/openai-pricing'
-import { hasRouteSourceIdCollision, isAvailableRouteAccount, resolveRouteSource } from '@shared/route-sources'
+import { hasRouteSourceIdCollision, isAvailableRouteAccount, isNativeGrokRouteSource, resolveRouteSource } from '@shared/route-sources'
 import { patchCodexTomlPaths } from '../../main/client-config/toml-format'
 import { buildPoolModelCoverage, pruneModelSelection } from './model-policy'
 
@@ -120,6 +132,18 @@ const providers: ProviderDefinition[] = [
     color: '#5b63d3',
     createdAt: now - 1000 * 60 * 60 * 24 * 9,
     updatedAt: now - 1000 * 60 * 34,
+  },
+  {
+    id: 'provider-grok-oauth',
+    name: 'Grok OAuth',
+    sourceType: 'oauth-system',
+    kind: 'xai',
+    baseUrl: 'https://cli-chat-proxy.grok.com/v1',
+    protocol: 'openai-responses',
+    models: ['grok-4.5'],
+    color: '#111111',
+    createdAt: now - 1000 * 60 * 60 * 24 * 4,
+    updatedAt: now - 1000 * 60 * 12,
   },
   {
     id: 'provider-google',
@@ -296,6 +320,27 @@ const accounts: PublicAccount[] = [
     updatedAt: now - 1000 * 60 * 12,
   },
   {
+    id: 'account-grok-oauth',
+    providerId: 'provider-grok-oauth',
+    name: 'Grok Build 主账号',
+    maskedCredential: 'grok-****oauth',
+    credentialType: 'grok-oauth',
+    renewable: true,
+    status: 'active',
+    priority: 1,
+    weight: 10,
+    maxConcurrency: 1,
+    inFlight: 0,
+    availableModels: ['grok-4.5'],
+    modelsRefreshedAt: now - 12 * 60 * 1000,
+    modelPolicy: 'selected',
+    modelAllowlist: ['grok-4.5'],
+    latencyMs: 688,
+    lastUsedAt: now - 1000 * 60 * 8,
+    createdAt: now - 1000 * 60 * 60 * 24 * 4,
+    updatedAt: now - 1000 * 60 * 8,
+  },
+  {
     id: 'account-google',
     providerId: 'provider-google',
     name: 'Gemini 开发',
@@ -370,6 +415,21 @@ const pools: Pool[] = [
     createdAt: now - 1000 * 60 * 60 * 24 * 5,
     updatedAt: now - 1000 * 60 * 60,
   },
+  {
+    id: 'pool-grok',
+    name: 'Grok Build 专用池',
+    kind: 'standard',
+    protocol: 'grok',
+    strategy: 'balanced',
+    members: [{ accountId: 'account-grok-oauth', enabled: true }],
+    modelPolicy: 'selected',
+    modelAllowlist: ['grok-4.5'],
+    stickySessions: true,
+    stickyTtlMinutes: 30,
+    maxRetries: 1,
+    createdAt: now - 1000 * 60 * 60 * 24 * 4,
+    updatedAt: now - 1000 * 60 * 12,
+  },
 ]
 
 const routes: Route[] = [
@@ -396,6 +456,18 @@ const routes: Route[] = [
     localToken: 'stone_codex_dev_3b21e8',
     createdAt: now - 1000 * 60 * 60 * 24 * 6,
     updatedAt: now - 1000 * 60 * 26,
+  },
+  {
+    id: 'route-grokbuild',
+    client: 'grokbuild',
+    enabled: true,
+    highConcurrencyMode: false,
+    poolId: 'pool-grok',
+    inboundProtocol: 'openai-responses',
+    modelMap: {},
+    localToken: 'stone_grokbuild_dev_46a7c2',
+    createdAt: now - 1000 * 60 * 60 * 24 * 5,
+    updatedAt: now - 1000 * 60 * 52,
   },
   {
     id: 'route-gemini',
@@ -461,6 +533,7 @@ const logs: RequestLog[] = [
 function clientNamesForMock(client: RequestLog['client']): string {
   if (client === 'claude') return 'Claude'
   if (client === 'gemini') return 'Gemini'
+  if (client === 'grokbuild') return 'Grok Build'
   return 'Codex'
 }
 
@@ -492,7 +565,7 @@ const initialSnapshot: AppSnapshot = {
     successRequests: 1261,
   },
   requestLogs: logs,
-  clientProfiles: (['claude', 'codex', 'gemini'] as const).map((client) => ({
+  clientProfiles: (['claude', 'codex', 'gemini', 'grokbuild'] as const).map((client) => ({
     id: `default-${client}`,
     name: '默认配置',
     client,
@@ -584,6 +657,7 @@ const mockAccountNames: Record<string, readonly [string, string]> = {
   'account-openai-main': ['OpenAI 主账号', 'OpenAI Primary'],
   'account-openai-backup': ['OpenAI 扩展账号', 'OpenAI Additional'],
   'account-openrouter': ['OpenRouter 日常', 'OpenRouter Daily'],
+  'account-grok-oauth': ['Grok Build 主账号', 'Grok Build Primary'],
   'account-google': ['Gemini 开发', 'Gemini Development'],
 }
 
@@ -591,6 +665,7 @@ const mockPoolNames: Record<string, readonly [string, string]> = {
   'pool-claude': ['Claude 稳定池', 'Claude Stable Pool'],
   'pool-codex': ['Codex 主线路', 'Codex Primary Route'],
   'pool-gemini': ['Gemini 默认池', 'Gemini Default Pool'],
+  'pool-grok': ['Grok Build 专用池', 'Grok Build Dedicated Pool'],
 }
 
 function localizeMockConversationName(value: string | undefined): string | undefined {
@@ -674,6 +749,12 @@ function localizeMockImportProgress(message: string): string {
 const makeId = (prefix: string) => `${prefix}-${crypto.randomUUID().slice(0, 8)}`
 const pause = (duration = 140) => new Promise((resolve) => window.setTimeout(resolve, duration))
 
+function mockSessionRepairCancelled(): Error {
+  const error = new Error('Session repair cancelled.')
+  error.name = 'AbortError'
+  return error
+}
+
 const mockClientFiles: Record<RouteClient, Array<{ role: ClientConfigFileRole; path: string; containsCredential: boolean }>> = {
   claude: [
     { role: 'claude-settings', path: '~/.claude/settings.json', containsCredential: true },
@@ -687,6 +768,9 @@ const mockClientFiles: Record<RouteClient, Array<{ role: ClientConfigFileRole; p
     { role: 'gemini-settings', path: '~/.gemini/settings.json', containsCredential: false },
     { role: 'gemini-env', path: '~/.gemini/.env', containsCredential: true },
   ],
+  grokbuild: [
+    { role: 'grok-config', path: '~/.grok/config.toml', containsCredential: true },
+  ],
 }
 
 const mockEditorContent: Record<RouteClient, Partial<Record<ClientConfigFileRole, string>>> = {
@@ -696,6 +780,9 @@ const mockEditorContent: Record<RouteClient, Partial<Record<ClientConfigFileRole
   },
   codex: { 'codex-config': 'model_provider = "stone"\nmodel = "gpt-5.6-sol"\nmodel_reasoning_effort = "medium"\nmodel_reasoning_summary = "auto"\nmodel_verbosity = "medium"\npersonality = "pragmatic"\napproval_policy = "on-request"\nsandbox_mode = "workspace-write"\nweb_search = "cached"\ncli_auth_credentials_store = "file"\n\n[features]\nfast_mode = true\nmulti_agent = true\n\n[agents]\nmax_threads = 6\n\n[windows]\nsandbox = "elevated"\n\n[model_providers.stone]\nname = "OpenAI"\nbase_url = "http://127.0.0.1:15720/v1"\nwire_api = "responses"\nrequires_openai_auth = true\n' },
   gemini: { 'gemini-settings': '{\n  "model": { "name": "gemini-2.5-pro" },\n  "general": { "defaultApprovalMode": "default" },\n  "ui": { "theme": "Default" }\n}\n', 'gemini-env': 'GEMINI_API_KEY="__STONE_PROTECTED_VALUE__"\nGOOGLE_GEMINI_BASE_URL="__STONE_PROTECTED_VALUE__"\n' },
+  grokbuild: {
+    'grok-config': '[auth]\npreferred_method = "api_key"\n\n[models]\ndefault = "stoneplus"\n\n[model.stoneplus]\nmodel = "grok-4.5"\nbase_url = "http://127.0.0.1:15721/grokbuild/v1"\nname = "Stone+"\napi_key = "__STONE_PROTECTED_VALUE__"\napi_backend = "responses"\ncontext_window = 500000\n',
+  },
 }
 
 const mockEditorFields: Record<RouteClient, ClientConfigEditorState['fields']> = {
@@ -723,29 +810,86 @@ const mockEditorFields: Record<RouteClient, ClientConfigEditorState['fields']> =
     { id: 'gemini.theme', role: 'gemini-settings', path: ['ui', 'theme'], section: '体验', label: '界面主题', description: 'Gemini CLI 终端界面的主题名称。', control: 'text', value: 'Default' },
     { id: 'gemini.enableAutoUpdate', role: 'gemini-settings', path: ['general', 'enableAutoUpdate'], section: '更新与通知', label: '自动更新', description: '允许 Gemini CLI 自动检查并安装更新。', control: 'toggle', value: true, advanced: true },
   ],
+  grokbuild: [
+    { id: 'grokbuild.model', role: 'grok-config', path: ['model', 'stoneplus', 'model'], section: '模型', label: '默认模型', description: 'Grok Build 通过 Stone+ 启动新会话时使用的模型。', control: 'text', value: 'grok-4.5', defaultValue: null },
+    { id: 'grokbuild.name', role: 'grok-config', path: ['model', 'stoneplus', 'name'], section: '模型', label: '配置名称', description: 'Grok Build 模型选择器中显示的名称。', control: 'text', value: 'Stone+', defaultValue: null },
+    { id: 'grokbuild.contextWindow', role: 'grok-config', path: ['model', 'stoneplus', 'context_window'], section: '模型', label: '上下文窗口', description: 'Grok Build 为当前模型预留的上下文窗口大小。', control: 'number', value: 500000, min: 1, step: 1, defaultValue: null },
+    { id: 'grokbuild.baseUrl', role: 'grok-config', path: ['model', 'stoneplus', 'base_url'], section: 'Stone+ 连接', label: 'base_url', description: 'Stone+ 的 Grok Build 专属 Responses 入口；应用路由时自动维护。', control: 'text', value: 'http://127.0.0.1:15721/grokbuild/v1', readOnly: true, managedByStone: true },
+    { id: 'grokbuild.apiBackend', role: 'grok-config', path: ['model', 'stoneplus', 'api_backend'], section: 'Stone+ 连接', label: 'API 后端', description: 'Grok Build 通过 OpenAI Responses 协议连接 Stone+。', control: 'text', value: 'responses', readOnly: true, managedByStone: true },
+  ],
 }
 
 function mockConfigFormat(role: ClientConfigFileRole): 'json' | 'toml' | 'dotenv' {
-  if (role === 'codex-config') return 'toml'
+  if (role === 'codex-config' || role === 'grok-config') return 'toml'
   if (role === 'gemini-env') return 'dotenv'
   return 'json'
 }
 
 function normalizeLoadedModelPolicies(snapshot: AppSnapshot): AppSnapshot {
+  const normalizedProviders = [
+    ...snapshot.providers,
+    ...providers
+      .filter((fallback) => fallback.id === 'provider-grok-oauth'
+        && !snapshot.providers.some((provider) => provider.id === fallback.id))
+      .map(clone),
+  ]
+  const normalizedAccounts = [
+    ...snapshot.accounts,
+    ...accounts
+      .filter((fallback) => fallback.id === 'account-grok-oauth'
+        && !snapshot.accounts.some((account) => account.id === fallback.id))
+      .map(clone),
+  ]
+  const normalizedPools = [
+    ...snapshot.pools,
+    ...pools
+      .filter((fallback) => fallback.id === 'pool-grok'
+        && !snapshot.pools.some((pool) => pool.id === fallback.id))
+      .map(clone),
+  ]
+  const normalizedRoutes = [
+    ...snapshot.routes,
+    ...routes.filter((fallback) => !snapshot.routes.some((route) => route.client === fallback.client)).map(clone),
+  ].map((route) => {
+    if (route.client !== 'grokbuild') return route
+    const source = resolveRouteSource(route.poolId, {
+      providers: normalizedProviders,
+      accounts: normalizedAccounts,
+      pools: normalizedPools,
+    })
+    return source?.summary.protocol === 'grok' ? route : { ...route, poolId: 'pool-grok' }
+  })
+  const normalizedClientProfiles = [
+    ...snapshot.clientProfiles,
+    ...initialSnapshot.clientProfiles
+      .filter((fallback) => !snapshot.clientProfiles.some((profile) => profile.id === fallback.id))
+      .map(clone),
+  ]
   return {
     ...snapshot,
+    routes: normalizedRoutes,
+    clientProfiles: normalizedClientProfiles,
     accountTags: Array.isArray(snapshot.accountTags) ? snapshot.accountTags : clone(accountTags),
-    providers: snapshot.providers.map((provider) => ({
-      ...provider,
-      sourceType: provider.sourceType ?? (['anthropic', 'openai', 'google'].includes(provider.kind) ? 'official-api' : 'relay'),
-    })),
-    accounts: snapshot.accounts.map((account) => ({
+    providers: normalizedProviders.map((provider) => {
+      const persistedSourceType = provider.sourceType
+        ?? (['anthropic', 'openai', 'xai', 'google'].includes(provider.kind) ? 'official-api' : 'relay')
+      const grokOAuthProvider = provider.kind === 'xai' && persistedSourceType === 'oauth-system'
+      return {
+        ...provider,
+        sourceType: provider.kind === 'xai' && !grokOAuthProvider ? 'official-api' : persistedSourceType,
+        ...(provider.kind === 'xai' ? {
+          baseUrl: grokOAuthProvider ? 'https://cli-chat-proxy.grok.com/v1' : 'https://api.x.ai/v1',
+          protocol: 'openai-responses' as const,
+        } : {}),
+      }
+    }),
+    accounts: normalizedAccounts.map((account) => ({
       ...account,
       availableModels: Array.isArray(account.availableModels) ? account.availableModels : [],
       modelPolicy: account.modelPolicy ?? (account.modelAllowlist?.length ? 'selected' : 'all'),
       modelAllowlist: Array.isArray(account.modelAllowlist) ? account.modelAllowlist : [],
     })),
-    pools: snapshot.pools.map((pool) => ({
+    pools: normalizedPools.map((pool) => ({
       ...pool,
       kind: pool.kind ?? 'standard',
       modelPolicy: pool.modelPolicy ?? (pool.modelAllowlist?.length ? 'selected' : 'all'),
@@ -777,6 +921,24 @@ function loadSnapshot(): AppSnapshot {
   }
 }
 
+function mockAgentLifecycleSnapshot(): AgentLifecycleSnapshot {
+  const agents = Object.fromEntries(AGENT_TARGETS.map((target) => [target, {
+    target,
+    capabilities: AGENT_CAPABILITIES[target],
+    installed: true,
+    enabled: true,
+    configured: true,
+    compatibility: 'native' as const,
+    running: target === 'codex-desktop',
+    managedInstanceCount: target === 'codex-desktop' ? 1 : 0,
+    processControl: target === 'codex-desktop' ? 'full' as const : 'managed-only' as const,
+    attention: 'normal' as const,
+    pendingNewSession: false,
+    needsRestart: false,
+  }])) as AgentLifecycleSnapshot['agents']
+  return { revision: 1, capturedAt: Date.now(), agents, busy: false }
+}
+
 export function createMockApi(): GatewayApi {
   const snapshot = loadSnapshot()
   let frpTunnelState: FrpTunnelState = {
@@ -791,6 +953,11 @@ export function createMockApi(): GatewayApi {
   const accountImportProgressListeners = new Set<(value: AccountImportProgress) => void>()
   const updateListeners = new Set<(value: AppUpdateState) => void>()
   const browserImportListeners = new Set<(value: BrowserImportQueueState) => void>()
+  const agentLifecycleListeners = new Set<(value: AgentLifecycleChangedEvent) => void>()
+  const sessionRepairProgressListeners = new Set<(value: CodexSessionRepairProgressEvent) => void>()
+  const activeSessionRepairOperations = new Set<string>()
+  const cancelledSessionRepairOperations = new Set<string>()
+  let agentLifecycleSnapshot = mockAgentLifecycleSnapshot()
   let browserImportQueue: BrowserImportQueueState = { items: [], readyCount: 0, totalBytes: 0, revision: 0 }
   let browserJsonCache: BrowserJsonCacheState = { items: [], totalBytes: 0 }
   let setupWizardState: Awaited<ReturnType<GatewayApi['getSetupWizardState']>> = null
@@ -963,6 +1130,58 @@ export function createMockApi(): GatewayApi {
     return value
   }
 
+  async function mockAgentOperation(
+    action: AgentLifecycleAction,
+    targets: AgentTarget[],
+    running: boolean,
+  ): Promise<AgentLifecycleOperationResult> {
+    const startedAt = Date.now()
+    const results = targets.map((target) => {
+      const before = agentLifecycleSnapshot.agents[target]
+      return {
+        target,
+        status: 'succeeded' as const,
+        phases: action === 'close' || action === 'close-all-managed'
+          ? ['inspect' as const, 'close' as const]
+          : action === 'install'
+            ? ['inspect' as const, 'install' as const, 'validate' as const]
+            : action === 'restart'
+              ? ['inspect' as const, 'close' as const, 'start' as const]
+            : ['inspect' as const, 'restore-connection' as const, 'validate' as const],
+        wasRunning: before.running,
+        runningAfter: running,
+        changed: true,
+        pendingNewSession: false,
+      }
+    })
+    const agents = { ...agentLifecycleSnapshot.agents }
+    for (const target of targets) {
+      agents[target] = {
+        ...agents[target],
+        ...(action === 'install' ? { installed: true } : {}),
+        running,
+        managedInstanceCount: running ? 1 : 0,
+      }
+    }
+    agentLifecycleSnapshot = {
+      ...agentLifecycleSnapshot,
+      revision: agentLifecycleSnapshot.revision + 1,
+      capturedAt: Date.now(),
+      agents,
+    }
+    const operation: AgentLifecycleOperationResult = {
+      operationId: `mock-agent-${startedAt}`,
+      action,
+      status: 'succeeded',
+      startedAt,
+      completedAt: Date.now(),
+      results,
+      snapshot: clone(agentLifecycleSnapshot),
+    }
+    agentLifecycleListeners.forEach((listener) => listener({ snapshot: operation.snapshot, operation }))
+    return operation
+  }
+
   return {
     async setUiLanguage() {},
     async getSnapshot() {
@@ -972,9 +1191,18 @@ export function createMockApi(): GatewayApi {
     async saveProvider(input: ProviderInput) {
       const timestamp = Date.now()
       const existing = input.id ? snapshot.providers.find((provider) => provider.id === input.id) : undefined
+      const sourceType = input.sourceType ?? existing?.sourceType
+        ?? (['anthropic', 'openai', 'xai', 'google'].includes(input.kind) ? 'official-api' : 'relay')
+      if (input.kind === 'xai' && sourceType !== 'official-api') {
+        throw new Error(mockText('官方 xAI 来源必须使用官方 API 类型', 'Official xAI sources must use the official API type'))
+      }
+      if (input.kind === 'xai' && input.protocol !== 'openai-responses') {
+        throw new Error(mockText('官方 xAI 来源使用原生 OpenAI Responses API', 'Official xAI sources use the native OpenAI Responses API'))
+      }
       const provider: ProviderDefinition = {
         ...input,
-        sourceType: input.sourceType ?? existing?.sourceType ?? (['anthropic', 'openai', 'google'].includes(input.kind) ? 'official-api' : 'relay'),
+        sourceType,
+        ...(input.kind === 'xai' ? { baseUrl: 'https://api.x.ai/v1', protocol: 'openai-responses' as const } : {}),
         id: existing?.id ?? makeId('provider'),
         createdAt: existing?.createdAt ?? timestamp,
         updatedAt: timestamp,
@@ -1133,7 +1361,7 @@ export function createMockApi(): GatewayApi {
         maskedCredential: `chatgpt-****${parsed.account_id?.slice(-4) ?? 'acct'}`,
         credentialType: 'chatgpt-oauth',
         credentialExpiresAt: parsed.expired ? Date.parse(parsed.expired) : timestamp + 3_600_000,
-        renewable: false, tagId: input.tagId || undefined, status: 'active', priority: 10, weight: 10, maxConcurrency: 4, inFlight: 0,
+        renewable: false, tagId: input.tagId || undefined, status: 'active', priority: 10, weight: 10, maxConcurrency: DEFAULT_ACCOUNT_MAX_CONCURRENCY, inFlight: 0,
         availableModels: [], modelPolicy: 'all', modelAllowlist: [], proxyId: selectedProxyId,
         circuitState: 'closed', consecutiveFailures: 0, createdAt: timestamp, updatedAt: timestamp
       }
@@ -1165,6 +1393,66 @@ export function createMockApi(): GatewayApi {
         }
       }
     },
+    async importGrokAccounts(input) {
+      const root = JSON.parse(input.content) as { accounts?: Array<Record<string, unknown>> }
+      const importedAccounts = root.accounts?.filter((item) => item.platform === 'grok' && item.type === 'oauth') ?? []
+      if (!importedAccounts.length) throw new Error(mockText('未找到 Grok OAuth 账号', 'No Grok OAuth account found'))
+      const pool = input.poolId ? snapshot.pools.find((candidate) => candidate.id === input.poolId) : undefined
+      if (input.poolId && !pool) throw new Error(mockText('Grok 号池不存在', 'Grok pool not found'))
+      if (input.proxyId && !snapshot.proxies.some((proxy) => proxy.id === input.proxyId)) {
+        throw new Error(mockText('选择的代理已被删除', 'The selected proxy was deleted'))
+      }
+      if (pool && (pool.kind !== 'standard' || pool.protocol !== 'grok' || pool.members.some((member) => {
+        const account = snapshot.accounts.find((candidate) => candidate.id === member.accountId)
+        const provider = snapshot.providers.find((candidate) => candidate.id === account?.providerId)
+        return !account || !accountMatchesPoolProtocol('grok', account, provider)
+      }))) throw new Error(mockText('Grok OAuth 账号只能加入 Grok 号池', 'Grok OAuth accounts can only join Grok pools'))
+      let provider = snapshot.providers.find((item) => item.kind === 'xai' && item.sourceType === 'oauth-system')
+      const timestamp = Date.now()
+      if (!provider) {
+        provider = { id: makeId('grok-oauth-provider'), name: 'Grok OAuth', sourceType: 'oauth-system', kind: 'xai', baseUrl: 'https://cli-chat-proxy.grok.com/v1', protocol: 'openai-responses', models: ['grok-4.5'], createdAt: timestamp, updatedAt: timestamp }
+        snapshot.providers.push(provider)
+      }
+      let grokTag = snapshot.accountTags.find((tag) => tag.name.localeCompare('Grok', undefined, { sensitivity: 'accent' }) === 0)
+      if (!grokTag) {
+        grokTag = { id: makeId('grok-tag'), name: 'Grok', createdAt: timestamp, updatedAt: timestamp }
+        snapshot.accountTags.push(grokTag)
+      }
+      const importedAccountIds: string[] = []
+      const createdAccountIds: string[] = []
+      const updatedAccountIds: string[] = []
+      for (const [index, imported] of importedAccounts.entries()) {
+        const credentials = imported.credentials as Record<string, unknown> | undefined
+        const name = String(imported.name || credentials?.email || `Grok account ${index + 1}`)
+        const existing = snapshot.accounts.find((account) => account.credentialType === 'grok-oauth'
+          && account.name.toLowerCase() === name.toLowerCase())
+        const parsedExpiration = typeof credentials?.expires_at === 'string' ? Date.parse(credentials.expires_at) : NaN
+        const account: PublicAccount = {
+          id: existing?.id ?? makeId('grok'), providerId: provider.id, name,
+          maskedCredential: 'grok-****oauth', credentialType: 'grok-oauth', renewable: Boolean(credentials?.refresh_token),
+          credentialExpiresAt: Number.isFinite(parsedExpiration) ? parsedExpiration : timestamp + 3_600_000,
+          tagId: grokTag.id,
+          status: 'active', priority: existing?.priority ?? 1, weight: existing?.weight ?? 10,
+          maxConcurrency: existing?.maxConcurrency ?? 1, inFlight: existing?.inFlight ?? 0,
+          availableModels: ['grok-4.5'], modelPolicy: 'selected', modelAllowlist: ['grok-4.5'],
+          proxyId: input.proxyId, circuitState: 'closed', consecutiveFailures: 0,
+          createdAt: existing?.createdAt ?? timestamp, updatedAt: timestamp,
+        }
+        if (existing) {
+          snapshot.accounts = snapshot.accounts.map((candidate) => candidate.id === existing.id ? account : candidate)
+          updatedAccountIds.push(account.id)
+        } else {
+          snapshot.accounts.push(account)
+          createdAccountIds.push(account.id)
+        }
+        importedAccountIds.push(account.id)
+        if (pool && !pool.members.some((member) => member.accountId === account.id)) {
+          pool.members.push({ accountId: account.id, enabled: true })
+          pool.updatedAt = timestamp
+        }
+      }
+      return { snapshot: await changed(), importedAccountIds, createdAccountIds, updatedAccountIds, warnings: [] }
+    },
     async importChatGptAccountFiles(input) {
       emitImportProgress(input.progressId, { phase: 'importing', completed: 0, total: 2, percent: 0, message: '正在导入文件 0/2' })
       await pause(180)
@@ -1182,7 +1470,7 @@ export function createMockApi(): GatewayApi {
         id: accountId, providerId: provider.id, name: 'CPA Plus Account',
         maskedCredential: 'chatgpt-****demo', credentialType: 'chatgpt-oauth',
         credentialExpiresAt: timestamp + 3_600_000, renewable: false, tagId: input.tagId || undefined, status: 'active', priority: 10, weight: 10,
-        maxConcurrency: 4, inFlight: 0, latencyMs: 820, availableModels: [], modelPolicy: 'all', modelAllowlist: [],
+        maxConcurrency: DEFAULT_ACCOUNT_MAX_CONCURRENCY, inFlight: 0, latencyMs: 820, availableModels: [], modelPolicy: 'all', modelAllowlist: [],
         proxyId: input.proxyMode === 'proxy' ? input.proxyId : undefined,
         circuitState: 'closed', consecutiveFailures: 0, createdAt: timestamp, updatedAt: timestamp
       }
@@ -1581,6 +1869,16 @@ export function createMockApi(): GatewayApi {
     async savePool(input: PoolInput) {
       const timestamp = Date.now()
       const existing = input.id ? snapshot.pools.find((pool) => pool.id === input.id) : undefined
+      const selected = input.accountIds.map((accountId) => snapshot.accounts.find((account) => account.id === accountId))
+      if (!selected.length || selected.some((account) => {
+        const provider = snapshot.providers.find((candidate) => candidate.id === account?.providerId)
+        return !account || !accountMatchesPoolProtocol(input.protocol, account, provider)
+      })) throw new Error(mockText('号池成员与对外协议不兼容', 'Pool members are incompatible with its public protocol'))
+      const families = new Set(selected.map((account) => {
+        const provider = snapshot.providers.find((candidate) => candidate.id === account?.providerId)
+        return provider ? providerSourceFamily(provider.kind) : undefined
+      }))
+      if (families.has(undefined) || families.size !== 1) throw new Error(mockText('一个号池只能使用同一种来源', 'A pool can use only one source family'))
       const modelPolicy = input.modelPolicy ?? existing?.modelPolicy ?? 'all'
       const modelAllowlist = modelPolicy === 'selected'
         ? pruneModelSelection(input.modelAllowlist ?? existing?.modelAllowlist ?? [], poolModelCandidates(input.accountIds))
@@ -1597,7 +1895,7 @@ export function createMockApi(): GatewayApi {
         stickySessions: input.stickySessions,
         stickyTtlMinutes: input.stickyTtlMinutes,
         maxRetries: input.maxRetries,
-        forceFastMode: supportsFastServiceTier(input.protocol)
+        forceFastMode: supportsPoolFastServiceTier(input.protocol)
           && (input.forceFastMode ?? existing?.forceFastMode) === true,
         hedgedRequests: input.protocol === 'openai-responses'
           && (input.hedgedRequests ?? existing?.hedgedRequests) === true,
@@ -1627,7 +1925,7 @@ export function createMockApi(): GatewayApi {
       const provider = snapshot.providers.find((candidate) => candidate.id === sourceId)
       if (pool && provider) throw new Error(mockText('来源 ID 与号池 ID 冲突', 'The source ID conflicts with a pool ID'))
       if (pool) {
-        if (input.enabled && !supportsFastServiceTier(pool.protocol)) {
+        if (input.enabled && !supportsPoolFastServiceTier(pool.protocol)) {
           throw new Error(mockText('FAST 仅支持 OpenAI Responses 与 OpenAI Chat', 'FAST supports only OpenAI Responses and OpenAI Chat'))
         }
         snapshot.pools = snapshot.pools.map((candidate) => candidate.id === sourceId
@@ -1748,7 +2046,7 @@ export function createMockApi(): GatewayApi {
       return { ok: true, latencyMs: 120, status: 200, responsePreview: 'OK' }
     },
     async setClientRouteSource(input) {
-      if (input.client !== 'claude' && input.client !== 'codex' && input.client !== 'gemini') {
+      if (input.client !== 'claude' && input.client !== 'codex' && input.client !== 'gemini' && input.client !== 'grokbuild') {
         throw new Error(mockText('不支持的客户端路由', 'Unsupported client route'))
       }
       const sourceId = typeof input.sourceId === 'string' ? input.sourceId.trim() : ''
@@ -1756,6 +2054,9 @@ export function createMockApi(): GatewayApi {
       if (hasRouteSourceIdCollision(sourceId, snapshot)) throw new Error(mockText('所选来源 ID 与现有号池 ID 冲突', 'The selected source ID conflicts with an existing pool ID'))
       const source = resolveRouteSource(sourceId, snapshot)
       if (!source) throw new Error(mockText('所选号池、官方 API 或中转站不存在', 'The selected pool, official API, or relay does not exist'))
+      if (input.client === 'grokbuild' && !isNativeGrokRouteSource(source, snapshot)) {
+        throw new Error(mockText('Grok Build 只能绑定原生 Responses 的 Grok 号池或中转来源', 'Grok Build can only use a Responses-native Grok pool or relay source'))
+      }
       if (!source.accounts.some(isAvailableRouteAccount)) {
         throw new Error(mockText('所选来源没有可用账号', 'The selected source has no available accounts'))
       }
@@ -1771,6 +2072,9 @@ export function createMockApi(): GatewayApi {
         throw new Error(mockText('所选源 ID 与号池 ID 冲突', 'The selected source ID conflicts with a pool ID'))
       }
       const source = resolveRouteSource(route.poolId, snapshot)
+      if (route.client === 'grokbuild' && route.poolId && !isNativeGrokRouteSource(source, snapshot)) {
+        throw new Error(mockText('Grok Build 只能绑定原生 Responses 的 Grok 号池或中转来源', 'Grok Build can only use a Responses-native Grok pool or relay source'))
+      }
       if (route.enabled && !source) throw new Error(mockText('请选择现有号池、官方 API 或中转站', 'Select an existing pool, official API, or relay'))
       if (route.enabled && source?.provider && !source.accounts.some(isAvailableRouteAccount)) {
         throw new Error(mockText('所选 API 来源没有可用账号', 'The selected API source has no available accounts'))
@@ -1941,6 +2245,10 @@ export function createMockApi(): GatewayApi {
       return { format: 'stone-client-profile', version: 1, profile: { name: profile.name, client: profile.client, directory: profile.directory, backupRetention: profile.backupRetention } }
     },
     async importClientProfile(bundle) {
+      const client = bundle.profile.client
+      if (client !== 'claude' && client !== 'codex' && client !== 'gemini' && client !== 'grokbuild') {
+        throw new Error(mockText('不支持的客户端配置 Profile', 'Unsupported client configuration profile'))
+      }
       return this.saveClientProfile(bundle.profile)
     },
     async getClientConfigs(profileId) {
@@ -1951,7 +2259,7 @@ export function createMockApi(): GatewayApi {
         client,
         directory: profile?.client === client && profile.directory
           ? profile.directory
-          : `~/.${client === 'claude' ? 'claude' : client === 'codex' ? 'codex' : 'gemini'}`,
+          : `~/.${client === 'grokbuild' ? 'grok' : client}`,
         directoryExists: client !== 'gemini',
         configured: client !== 'gemini',
         files: mockClientFiles[client].map((file) => ({
@@ -1965,7 +2273,7 @@ export function createMockApi(): GatewayApi {
       }))
     },
     async chooseClientConfigDirectory(client) {
-      return `C:\\Users\\Demo\\.${client}-custom`
+      return `C:\\Users\\Demo\\.${client === 'grokbuild' ? 'grok' : client}-custom`
     },
     async previewClientConfig(client, profileId) {
       await pause()
@@ -2099,19 +2407,26 @@ export function createMockApi(): GatewayApi {
         const file = mockClientFiles[input.client].find((candidate) => candidate.role === draft.role)
         if (file) changedFiles.add(file.path)
       }
-      const codexPatches: Array<{ path: string[]; value: ClientConfigEditorState['fields'][number]['value'] }> = []
+      const tomlPatches: Array<{ path: string[]; value: ClientConfigEditorState['fields'][number]['value'] }> = []
       for (const patch of input.patches) {
         const field = mockEditorFields[input.client].find((candidate) => candidate.id === patch.id)
         if (!field || field.readOnly) continue
         field.value = clone(patch.value)
-        if (input.client === 'codex' && field.role === 'codex-config') {
-          codexPatches.push({ path: field.path, value: patch.value })
+        if ((input.client === 'codex' && field.role === 'codex-config')
+          || (input.client === 'grokbuild' && field.role === 'grok-config')) {
+          tomlPatches.push({ path: field.path, value: patch.value })
         }
       }
-      if (codexPatches.length) {
+      if (tomlPatches.length && input.client === 'codex') {
         mockEditorContent.codex['codex-config'] = patchCodexTomlPaths(
           mockEditorContent.codex['codex-config'],
-          codexPatches,
+          tomlPatches,
+        ).content
+      }
+      if (tomlPatches.length && input.client === 'grokbuild') {
+        mockEditorContent.grokbuild['grok-config'] = patchCodexTomlPaths(
+          mockEditorContent.grokbuild['grok-config'],
+          tomlPatches,
         ).content
       }
       if (input.patches.length) changedFiles.add(mockClientFiles[input.client][0].path)
@@ -2123,6 +2438,19 @@ export function createMockApi(): GatewayApi {
     async startManagedClientInstance() { return [] },
     async stopManagedClientInstance() { return [] },
     onManagedClientInstancesChanged() { return () => undefined },
+    async getAgentLifecycleSnapshot() { return clone(agentLifecycleSnapshot) },
+    async installAgent(target) { return mockAgentOperation('install', [target], false) },
+    async closeAgent(target) { return mockAgentOperation('close', [target], false) },
+    async restoreAgent(target) { return mockAgentOperation('restore', [target], agentLifecycleSnapshot.agents[target].running) },
+    async restartAgent(target) { return mockAgentOperation('restart', [target], true) },
+    async startAgent(target) { return mockAgentOperation('start', [target], true) },
+    async smartRepairAgent(target) { return mockAgentOperation('smart-repair', target ? [target] : [...AGENT_TARGETS], true) },
+    async repairAllAffectedAgents() { return mockAgentOperation('repair-all-affected', [...AGENT_TARGETS], true) },
+    async closeAllManagedAgents() { return mockAgentOperation('close-all-managed', [...AGENT_TARGETS], false) },
+    onAgentLifecycleChanged(listener) {
+      agentLifecycleListeners.add(listener)
+      return () => agentLifecycleListeners.delete(listener)
+    },
     async listPersistentTasks() { return [] },
     async pausePersistentTask() { throw new Error('Persistent task not found.') },
     async resumePersistentTask() { throw new Error('Persistent task not found.') },
@@ -2251,12 +2579,35 @@ export function createMockApi(): GatewayApi {
         skippedFiles: [],
       }
     },
-    async previewCodexSessionRepair(targetProvider) {
+    async analyzeCodexSessionRepair(targetProvider = 'stone', operationId) {
+      if (operationId) {
+        activeSessionRepairOperations.add(operationId)
+        sessionRepairProgressListeners.forEach((listener) => listener({ operationId, stage: 'discover', completed: 0 }))
+        await pause(80)
+        if (cancelledSessionRepairOperations.has(operationId)) {
+          activeSessionRepairOperations.delete(operationId)
+          cancelledSessionRepairOperations.delete(operationId)
+          throw mockSessionRepairCancelled()
+        }
+        sessionRepairProgressListeners.forEach((listener) => listener({ operationId, stage: 'scan', completed: 54, total: 108 }))
+        await pause(80)
+        if (cancelledSessionRepairOperations.has(operationId)) {
+          activeSessionRepairOperations.delete(operationId)
+          cancelledSessionRepairOperations.delete(operationId)
+          throw mockSessionRepairCancelled()
+        }
+        sessionRepairProgressListeners.forEach((listener) => listener({ operationId, stage: 'scan', completed: 108, total: 108 }))
+        activeSessionRepairOperations.delete(operationId)
+        cancelledSessionRepairOperations.delete(operationId)
+      }
       return {
         ...(await this.inspectCodexSessionRepair()),
         targetProvider,
         revision: 'a'.repeat(64),
         rolloutFilesToUpdate: targetProvider === 'stone' ? 18 : 90,
+        rolloutFilesWithSessionMeta: 108,
+        rolloutFilesWithoutSessionMeta: 0,
+        rolloutFilesAlreadyTargetProvider: targetProvider === 'stone' ? 90 : 18,
         sqliteProviderRowsToUpdate: targetProvider === 'stone' ? 21 : 86,
         sqliteUserEventRowsToUpdate: 2,
         sqliteCwdRowsToUpdate: 3,
@@ -2266,8 +2617,30 @@ export function createMockApi(): GatewayApi {
         encryptedSourceProviders: ['openai'],
       }
     },
-    async repairCodexSessions(targetProvider) {
-      await pause(420)
+    async previewCodexSessionRepair(targetProvider, operationId) {
+      return this.analyzeCodexSessionRepair(targetProvider, operationId)
+    },
+    async repairCodexSessions(targetProvider, _expectedRevision, operationId) {
+      if (operationId) activeSessionRepairOperations.add(operationId)
+      for (const [stage, completed, total] of [
+        ['discover', 108, 108],
+        ['scan', 108, 108],
+        ['verify', 18, 18],
+        ['backup', 24, 24],
+        ['apply', 26, 26],
+      ] as const) {
+        if (operationId) sessionRepairProgressListeners.forEach((listener) => listener({ operationId, stage, completed, total }))
+        await pause(80)
+        if (operationId && cancelledSessionRepairOperations.has(operationId)) {
+          activeSessionRepairOperations.delete(operationId)
+          cancelledSessionRepairOperations.delete(operationId)
+          throw mockSessionRepairCancelled()
+        }
+      }
+      if (operationId) {
+        activeSessionRepairOperations.delete(operationId)
+        cancelledSessionRepairOperations.delete(operationId)
+      }
       return {
         targetProvider,
         repairedRolloutFiles: 18,
@@ -2282,9 +2655,18 @@ export function createMockApi(): GatewayApi {
         backupPath: 'C:\\Users\\demo\\.codex\\backups_state\\stone-session-repair\\20260718210000000-demo',
       }
     },
-    async repairCodexSessionsAndRestartChatGpt(targetProvider = 'stone', expectedRevision = 'a'.repeat(64)) {
-      const repair = await this.repairCodexSessions(targetProvider, expectedRevision)
+    async repairCodexSessionsAndRestartChatGpt(targetProvider = 'stone', expectedRevision = 'a'.repeat(64), operationId) {
+      const repair = await this.repairCodexSessions(targetProvider, expectedRevision, operationId)
       return { repair, chatGptWasRunning: true, chatGptRestarted: true }
+    },
+    async cancelCodexSessionRepair(operationId) {
+      if (!activeSessionRepairOperations.has(operationId)) return false
+      cancelledSessionRepairOperations.add(operationId)
+      return true
+    },
+    onCodexSessionRepairProgress(listener) {
+      sessionRepairProgressListeners.add(listener)
+      return () => sessionRepairProgressListeners.delete(listener)
     },
     async previewCodexSessionIndexCleanup() {
       return {

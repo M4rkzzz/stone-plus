@@ -220,7 +220,30 @@ describe('GatewayServer Responses WebSocket', () => {
     await waitFor(() => messages.some((event) => event.type === 'error'))
     expect(messages.find((event) => event.type === 'error')).toMatchObject({
       status: 400,
-      error: { code: 'bad_request' },
+      error: { type: 'invalid_request_error', code: 'bad_request' },
+    })
+    socket.close()
+  })
+
+  it.each([
+    { status: 401, upstreamType: 'invalid_request_error', expectedType: 'authentication_error' },
+    { status: 429, upstreamType: 'rate_limit_error', expectedType: 'rate_limit_error' },
+    { status: 500, upstreamType: 'invalid_request_error', expectedType: 'server_error' },
+  ])('maps HTTP $status failures to $expectedType WebSocket errors', async ({ status, upstreamType, expectedType }) => {
+    const port = await freePort()
+    const fetchImplementation = vi.fn(async () => new Response(JSON.stringify({
+      error: { type: upstreamType, code: `http_${status}`, message: 'Rejected by upstream.' },
+    }), { status, headers: { 'content-type': 'application/json' } })) as unknown as typeof fetch
+    const gateway = makeGateway(port, { responsesWebSocketEnabled: true }, fetchImplementation)
+    running.push(gateway)
+    await gateway.start()
+    const socket = await connect(`ws://127.0.0.1:${port}/v1/responses`, 'local-secret')
+    const messages = collectMessages(socket)
+    socket.send(JSON.stringify({ type: 'response.create', model: 'gpt-test', input: 'hello' }))
+    await waitFor(() => messages.some((event) => event.type === 'error'))
+    expect(messages.find((event) => event.type === 'error')).toMatchObject({
+      status,
+      error: { type: expectedType, code: `http_${status}` },
     })
     socket.close()
   })

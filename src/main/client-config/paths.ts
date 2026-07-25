@@ -35,6 +35,7 @@ export function resolveClientConfigPaths(options: ClientConfigPathOptions): Reso
   const claudeDirectory = pathApi.normalize(options.overrides?.claudeDirectory ?? pathApi.join(home, '.claude'))
   const codexDirectory = pathApi.normalize(options.overrides?.codexDirectory ?? pathApi.join(home, '.codex'))
   const geminiDirectory = pathApi.normalize(options.overrides?.geminiDirectory ?? pathApi.join(home, '.gemini'))
+  const grokbuildDirectory = pathApi.normalize(options.overrides?.grokbuildDirectory ?? pathApi.join(home, '.grok'))
 
   return {
     claude: {
@@ -55,17 +56,27 @@ export function resolveClientConfigPaths(options: ClientConfigPathOptions): Reso
       settings: file('gemini', 'gemini-settings', 'json', pathApi.join(geminiDirectory, 'settings.json'), false),
       env: file('gemini', 'gemini-env', 'dotenv', pathApi.join(geminiDirectory, '.env'), true),
     },
+    grokbuild: {
+      directory: grokbuildDirectory,
+      config: file('grokbuild', 'grok-config', 'toml', pathApi.join(grokbuildDirectory, 'config.toml'), true),
+    },
   }
 }
 
 export function clientFiles(paths: ResolvedClientConfigPaths, client: SupportedClient): ClientConfigFilePath[] {
   if (client === 'claude') return [paths.claude.settings, ...(paths.claude.mcp ? [paths.claude.mcp] : [])]
   if (client === 'codex') return [paths.codex.config, paths.codex.auth]
-  return [paths.gemini.settings, paths.gemini.env]
+  if (client === 'gemini') return [paths.gemini.settings, paths.gemini.env]
+  return [paths.grokbuild.config]
 }
 
 export function allClientFiles(paths: ResolvedClientConfigPaths): ClientConfigFilePath[] {
-  return [...clientFiles(paths, 'claude'), ...clientFiles(paths, 'codex'), ...clientFiles(paths, 'gemini')]
+  return [
+    ...clientFiles(paths, 'claude'),
+    ...clientFiles(paths, 'codex'),
+    ...clientFiles(paths, 'gemini'),
+    ...clientFiles(paths, 'grokbuild'),
+  ]
 }
 
 export function clientDirectory(paths: ResolvedClientConfigPaths, client: SupportedClient): string {

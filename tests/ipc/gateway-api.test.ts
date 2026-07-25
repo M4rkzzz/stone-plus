@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { EventEmitter } from 'node:events'
-import type { Account, AppSnapshot, PersistentTask, ProviderDefinition, PublicProxyDefinition, RequestLog, RouteClient } from '../../src/shared/types'
+import type { Account, AppRuntimeDelta, AppSnapshot, PersistentTask, ProviderDefinition, PublicProxyDefinition, RequestLog, RouteClient } from '../../src/shared/types'
 import type { GatewayController } from '../../src/main/ipc/gateway-api'
 import type { GatewayAccountState, GatewayRuntimeStateUpdate } from '../../src/main/gateway'
 import { rebuildGatewayConnections, registerGatewayApi } from '../../src/main/ipc/gateway-api'
@@ -42,7 +42,12 @@ const electron = vi.hoisted(() => ({
   getAllWindows: vi.fn(() => []),
   getLocale: vi.fn(() => 'zh-CN'),
   showOpenDialog: vi.fn(),
-  openExternal: vi.fn()
+  openExternal: vi.fn(),
+  relaunch: vi.fn(),
+  quit: vi.fn(),
+  isPackaged: false,
+  getLoginItemSettings: vi.fn(() => ({ openAtLogin: false })),
+  setLoginItemSettings: vi.fn(),
 }))
 
 const apiSourceProbe = vi.hoisted(() => ({ run: vi.fn() }))
@@ -53,11 +58,14 @@ vi.mock('../../src/main/sources/api-source-service', () => ({
 
 vi.mock('electron', () => ({
   app: {
+    get isPackaged() { return electron.isPackaged },
     getPath: vi.fn(() => 'C:\\Stone'),
     getVersion: vi.fn(() => '0.7.0'),
     getLocale: electron.getLocale,
-    getLoginItemSettings: vi.fn(() => ({ openAtLogin: false })),
-    setLoginItemSettings: vi.fn()
+    getLoginItemSettings: electron.getLoginItemSettings,
+    setLoginItemSettings: electron.setLoginItemSettings,
+    relaunch: electron.relaunch,
+    quit: electron.quit,
   },
   BrowserWindow: {
     fromWebContents: electron.fromWebContents,
@@ -115,8 +123,28 @@ describe('refresh provider models IPC', () => {
     electron.showOpenDialog.mockReset()
     electron.fromWebContents.mockReturnValue({})
     electron.getLocale.mockReturnValue('zh-CN')
+    electron.relaunch.mockReset()
+    electron.quit.mockReset()
+    electron.isPackaged = false
+    electron.getLoginItemSettings.mockReset().mockReturnValue({ openAtLogin: false })
+    electron.setLoginItemSettings.mockReset()
     vi.stubEnv('ELECTRON_RENDERER_URL', 'http://127.0.0.1:5173')
     apiSourceProbe.run.mockReset()
+  })
+
+  it('registers packaged login startup with a hidden launch argument', async () => {
+    electron.isPackaged = true
+    electron.getLoginItemSettings.mockReturnValue({ openAtLogin: true })
+    createHarness([apiKeyAccount()], {}, vi.fn())
+    const update = electron.handlers.get('stone:update-desktop-runtime-settings')
+    if (!update) throw new Error('Desktop runtime settings handler was not registered')
+    const mainFrame = { url: 'http://127.0.0.1:5173/index.html' }
+    await update({ senderFrame: mainFrame, sender: { mainFrame } }, { launchAtLogin: true })
+    expect(electron.setLoginItemSettings).toHaveBeenCalledWith({
+      openAtLogin: true,
+      openAsHidden: true,
+      args: ['--hidden'],
+    })
   })
 
   it('binds an unsaved-source probe to one exact save without exposing its fingerprint', async () => {
@@ -548,6 +576,85 @@ describe('refresh provider models IPC', () => {
     expect(result).toMatchObject({ rebuiltRoles: ['codex-config'] })
   })
 
+  it('refuses to configure Grok Build against a Chat-compatible Grok relay', async () => {
+    const account = apiKeyAccount()
+    const plan = vi.fn(async () => ({ files: [] }))
+    const clientConfig = { plan } as unknown as ClientConfigService
+    const harness = createHarness(
+      [account],
+      { [account.credentialId]: 'xai-private' },
+      vi.fn(),
+      [],
+      { current: 'discovery-fingerprint' },
+      clientConfig,
+    )
+    const snapshot = harness.store.getSnapshot()
+    snapshot.providers[0] = {
+      ...snapshot.providers[0],
+      sourceType: 'relay',
+      kind: 'xai-compatible',
+      protocol: 'openai-chat',
+    }
+    snapshot.pools.push({
+      id: 'pool-chat-grok', name: 'Chat Grok', kind: 'standard', protocol: 'grok',
+      strategy: 'priority', members: [{ accountId: account.id, enabled: true }],
+      modelPolicy: 'all', modelAllowlist: [], stickySessions: false, stickyTtlMinutes: 30,
+      maxRetries: 0, createdAt: 1, updatedAt: 1,
+    })
+    snapshot.routes.push({
+      id: 'route-grokbuild', client: 'grokbuild', enabled: true, poolId: 'pool-chat-grok',
+      inboundProtocol: 'openai-responses', modelMap: {}, localToken: 'grokbuild-token',
+      createdAt: 1, updatedAt: 1,
+    })
+    const handler = electron.handlers.get('stone:preview-client-config')
+    if (!handler) throw new Error('preview-client-config handler was not registered')
+
+    await expect(handler(rendererEvent(405), 'grokbuild')).rejects.toThrow(/OpenAI Responses Grok/)
+    expect(plan).not.toHaveBeenCalled()
+  })
+
+  it('configures Grok Build directly against a native Responses Grok relay', async () => {
+    const account = apiKeyAccount()
+    const plan = vi.fn(async () => ({ files: [] }))
+    const clientConfig = { plan } as unknown as ClientConfigService
+    const harness = createHarness(
+      [account],
+      { [account.credentialId]: 'xai-private' },
+      vi.fn(),
+      [],
+      { current: 'discovery-fingerprint' },
+      clientConfig,
+    )
+    const snapshot = harness.store.getSnapshot()
+    snapshot.providers[0] = {
+      ...snapshot.providers[0],
+      sourceType: 'relay',
+      kind: 'xai-compatible',
+      protocol: 'openai-responses',
+    }
+    snapshot.pools.push({
+      id: 'pool-native-grok', name: 'Native Grok', kind: 'standard', protocol: 'grok',
+      strategy: 'priority', members: [{ accountId: account.id, enabled: true }],
+      modelPolicy: 'all', modelAllowlist: [], stickySessions: false, stickyTtlMinutes: 30,
+      maxRetries: 0, createdAt: 1, updatedAt: 1,
+    })
+    snapshot.routes.push({
+      id: 'route-grokbuild', client: 'grokbuild', enabled: true, poolId: 'pool-native-grok',
+      inboundProtocol: 'openai-responses', modelMap: {}, localToken: 'grokbuild-token',
+      createdAt: 1, updatedAt: 1,
+    })
+    const handler = electron.handlers.get('stone:preview-client-config')
+    if (!handler) throw new Error('preview-client-config handler was not registered')
+
+    await expect(handler(rendererEvent(406), 'grokbuild')).resolves.toMatchObject({
+      client: 'grokbuild', files: [],
+    })
+    expect(plan).toHaveBeenCalledWith('grokbuild', {
+      gatewayBaseUrl: 'http://127.0.0.1:15721',
+      token: 'grokbuild-token',
+    })
+  })
+
   it('overlays live account concurrency without persisting it in the store snapshot', async () => {
     const oauth = oauthAccount()
     const harness = createHarness([oauth], {}, vi.fn())
@@ -580,6 +687,22 @@ describe('refresh provider models IPC', () => {
     expect(harness.transport.configureOutboundNetwork).toHaveBeenCalledWith('system', 15721)
     expect(harness.transport.reloadSystemProxyConfiguration).toHaveBeenCalledOnce()
     expect(harness.gateway.stop).not.toHaveBeenCalled()
+  })
+
+  it('persists the Codex Micro preference through the gateway IPC without restarting the gateway', async () => {
+    const harness = createHarness([oauthAccount()], {}, vi.fn())
+    const handler = electron.handlers.get('stone:update-gateway')
+    if (!handler) throw new Error('update-gateway handler was not registered')
+
+    const result = await handler(rendererEvent(103), {
+      ...harness.store.getSnapshot().gateway,
+      disableCodexMicro: true,
+    }) as AppSnapshot
+
+    expect(harness.store.updateGateway).toHaveBeenCalledWith(expect.objectContaining({ disableCodexMicro: true }))
+    expect(result.gateway.disableCodexMicro).toBe(true)
+    expect(harness.gateway.stop).not.toHaveBeenCalled()
+    expect(harness.gateway.start).not.toHaveBeenCalled()
   })
 
   it('does not persist automatic backups as enabled when the raw-backup gate is blocked', async () => {
@@ -631,6 +754,45 @@ describe('refresh provider models IPC', () => {
     })
     expect(backupHarness.startAutomaticBackups).toHaveBeenCalledTimes(2)
     expect(backupHarness.listBackups).toHaveBeenCalledOnce()
+  })
+
+  it('publishes restored state, applies restored backup policy, and requests a safe relaunch', async () => {
+    const backupHarness = createBackupServiceHarness()
+    const harness = createHarness(
+      [oauthAccount()], {}, vi.fn(), undefined, undefined, undefined, undefined, backupHarness.services,
+    )
+    backupHarness.restoreBackup.mockImplementationOnce(async () => {
+      Object.assign(harness.store.getSnapshot().gateway, {
+        port: 16661,
+        outboundNetworkMode: 'system',
+        automaticBackups: false,
+        backupRetention: 3,
+      })
+      return {
+        restoredBackup: {
+          id: 'stone-backup-1800000000000-manual-12345678.sqlite3',
+          kind: 'manual', createdAt: 1_800_000_000_000, sizeBytes: 1024, valid: true,
+        },
+        safetyBackup: {
+          id: 'stone-backup-1800000000001-pre-restore-12345679.sqlite3',
+          kind: 'pre-restore', createdAt: 1_800_000_000_001, sizeBytes: 1024, valid: true,
+        },
+        state: {} as PersistedState,
+      }
+    })
+    const handler = electron.handlers.get('stone:restore-state-backup')
+    if (!handler) throw new Error('restore-state-backup handler was not registered')
+
+    await expect(handler(
+      rendererEvent(109),
+      'C:\\Stone\\backups\\stone-backup-1800000000000-manual-12345678.sqlite3',
+    )).resolves.toMatchObject({ restartRequired: true })
+    expect(backupHarness.stopAutomaticBackups).toHaveBeenCalled()
+    expect(backupHarness.setAutomaticRetention).toHaveBeenCalledWith(3)
+    expect(harness.transport.configureOutboundNetwork).toHaveBeenCalledWith('system', 16661)
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    expect(electron.relaunch).toHaveBeenCalledOnce()
+    expect(electron.quit).toHaveBeenCalledOnce()
   })
 
   it('keeps the legacy gateway settings save successful when system PAC reload fails', async () => {
@@ -1340,6 +1502,181 @@ describe('refresh provider models IPC', () => {
     }
   })
 
+  it('reduces foreground IPC cadence under load while preserving the latest request state', async () => {
+    vi.useFakeTimers()
+    const send = vi.fn()
+    electron.getAllWindows.mockReturnValue([{
+      isDestroyed: () => false,
+      isVisible: () => true,
+      isMinimized: () => false,
+      webContents: { send }
+    }])
+    try {
+      const harness = createHarness([oauthAccount()], {}, vi.fn())
+      harness.store.getSnapshot().gatewayStatus.activeRequests = 12
+      const log = {
+        id: 'busy-log', timestamp: Date.now(), client: 'codex', protocol: 'openai-responses',
+        providerName: 'OpenAI', accountName: 'Account', model: 'gpt', status: 'streaming', latencyMs: 1
+      } satisfies RequestLog
+
+      harness.emitLog(log)
+      await Promise.resolve()
+      await vi.advanceTimersByTimeAsync(0)
+      expect(send).toHaveBeenCalledOnce()
+
+      for (let latencyMs = 2; latencyMs <= 40; latencyMs += 1) {
+        harness.emitLog({ ...log, latencyMs })
+      }
+      await Promise.resolve()
+      await vi.advanceTimersByTimeAsync(249)
+      expect(send).toHaveBeenCalledOnce()
+      await vi.advanceTimersByTimeAsync(1)
+
+      expect(send).toHaveBeenCalledTimes(2)
+      expect(send.mock.calls[1][1]).toEqual(expect.objectContaining({
+        requestLogs: [expect.objectContaining({ id: log.id, latencyMs: 40 })]
+      }))
+      expect(send.mock.calls[1][1].gatewayStatus).toBeUndefined()
+    } finally {
+      electron.getAllWindows.mockReturnValue([])
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not let a coalesced streaming update overwrite its durable terminal state', async () => {
+    vi.useFakeTimers()
+    const send = vi.fn()
+    electron.getAllWindows.mockReturnValue([{
+      isDestroyed: () => false,
+      isVisible: () => true,
+      isMinimized: () => false,
+      webContents: { send }
+    }])
+    try {
+      const harness = createHarness([oauthAccount()], {}, vi.fn())
+      harness.store.getSnapshot().gatewayStatus.activeRequests = 8
+      const live = {
+        id: 'terminal-wins', timestamp: Date.now(), client: 'codex', protocol: 'openai-responses',
+        providerName: 'OpenAI', accountName: 'Account', model: 'gpt', status: 'streaming', latencyMs: 10
+      } satisfies RequestLog
+
+      harness.emitLog(live)
+      harness.emitLog({ ...live, status: 'success', statusCode: 200, latencyMs: 15 })
+      await Promise.resolve()
+      await Promise.resolve()
+      await vi.advanceTimersByTimeAsync(0)
+
+      expect(send).toHaveBeenCalledOnce()
+      expect(send.mock.calls[0][1]).toEqual(expect.objectContaining({
+        requestLogs: [expect.objectContaining({ id: live.id, status: 'success', statusCode: 200 })]
+      }))
+    } finally {
+      electron.getAllWindows.mockReturnValue([])
+      vi.useRealTimers()
+    }
+  })
+
+  it('bounds a 1,000-event burst to one IPC update and publishes its terminal state within 50 ms', async () => {
+    vi.useFakeTimers()
+    const send = vi.fn()
+    electron.getAllWindows.mockReturnValue([{
+      isDestroyed: () => false,
+      isVisible: () => true,
+      isMinimized: () => false,
+      webContents: { send }
+    }])
+    try {
+      const harness = createHarness([oauthAccount()], {}, vi.fn())
+      const base = {
+        timestamp: Date.now(), client: 'codex', protocol: 'openai-responses',
+        providerName: 'OpenAI', accountName: 'Account', model: 'gpt',
+        status: 'streaming', latencyMs: 0
+      } satisfies Omit<RequestLog, 'id'>
+
+      for (let index = 0; index < 1_000; index += 1) {
+        harness.emitLog({
+          ...base,
+          id: `burst-${index % 100}`,
+          latencyMs: index,
+        })
+      }
+      await Promise.resolve()
+      await Promise.resolve()
+
+      expect(send).not.toHaveBeenCalled()
+      await vi.advanceTimersByTimeAsync(0)
+
+      expect(harness.store.appendLog).toHaveBeenCalledTimes(1_000)
+      expect(send).toHaveBeenCalledOnce()
+      const burst = send.mock.calls[0][1] as AppRuntimeDelta
+      expect(burst.requestLogs).toHaveLength(100)
+      expect(burst.requestLogs?.find((log) => log.id === 'burst-99')?.latencyMs).toBe(999)
+
+      harness.emitLog({
+        ...base,
+        id: 'burst-42',
+        timestamp: Date.now() + 1,
+        status: 'success',
+        statusCode: 200,
+        latencyMs: 1_042,
+      })
+      await Promise.resolve()
+      await Promise.resolve()
+      await vi.advanceTimersByTimeAsync(49)
+      expect(send).toHaveBeenCalledOnce()
+      await vi.advanceTimersByTimeAsync(1)
+
+      expect(send).toHaveBeenCalledTimes(2)
+      expect(send.mock.calls[1][1]).toEqual(expect.objectContaining({
+        requestLogs: [expect.objectContaining({
+          id: 'burst-42',
+          status: 'success',
+          statusCode: 200,
+        })],
+      }))
+    } finally {
+      electron.getAllWindows.mockReturnValue([])
+      vi.useRealTimers()
+    }
+  })
+
+  it('caps a sustained 1,000-event-per-second stream at 20 renderer IPC updates per second', async () => {
+    vi.useFakeTimers()
+    const send = vi.fn()
+    electron.getAllWindows.mockReturnValue([{
+      isDestroyed: () => false,
+      isVisible: () => true,
+      isMinimized: () => false,
+      webContents: { send }
+    }])
+    try {
+      const harness = createHarness([oauthAccount()], {}, vi.fn())
+      const base = {
+        timestamp: Date.now(), client: 'codex', protocol: 'openai-responses',
+        providerName: 'OpenAI', accountName: 'Account', model: 'gpt',
+        status: 'streaming', latencyMs: 0
+      } satisfies Omit<RequestLog, 'id'>
+
+      for (let tick = 0; tick < 100; tick += 1) {
+        for (let offset = 0; offset < 10; offset += 1) {
+          const index = tick * 10 + offset
+          harness.emitLog({ ...base, id: `sustained-${index % 100}`, latencyMs: index })
+        }
+        await Promise.resolve()
+        await Promise.resolve()
+        await vi.advanceTimersByTimeAsync(10)
+      }
+
+      expect(harness.store.appendLog).toHaveBeenCalledTimes(1_000)
+      expect(send.mock.calls.length).toBeGreaterThanOrEqual(20)
+      expect(send.mock.calls.length).toBeLessThanOrEqual(21)
+      expect(send.mock.calls.every(([channel]) => channel === 'stone:runtime-delta')).toBe(true)
+    } finally {
+      electron.getAllWindows.mockReturnValue([])
+      vi.useRealTimers()
+    }
+  })
+
   it('checkpoints long live requests once per interval instead of persisting every progress event', async () => {
     vi.useFakeTimers()
     try {
@@ -2027,6 +2364,122 @@ describe('refresh provider models IPC', () => {
     )
   })
 
+  it('refreshes Grok Build billing during an account check and persists the remaining percentage', async () => {
+    const grok = grokOAuthAccount()
+    const upstreamFetch = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input)
+      if (url.includes('/billing?format=credits')) {
+        return new Response(JSON.stringify({
+          subscriptionTier: 'SuperGrok Heavy',
+          config: {
+            creditUsagePercent: 42.5,
+            currentPeriod: { type: 'weekly', end: '2026-08-01T00:00:00Z' },
+          },
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      if (url.endsWith('/responses')) return new Response('{}', { status: 200 })
+      throw new Error(`Unexpected Grok request: ${url}`)
+    })
+    const harness = createHarness(
+      [grok],
+      { [grok.credentialId]: grokOAuthCredential() },
+      upstreamFetch,
+    )
+
+    await invokeAccountCheck(harness, grok.id)
+
+    expect(grok).toMatchObject({
+      status: 'active',
+      quotaRemaining: 57.5,
+      quotaUnit: 'percent',
+      grokQuota: {
+        usedPercent: 42.5,
+        remainingPercent: 57.5,
+        paidClassification: 'paid',
+        source: 'grok-build-billing',
+      },
+    })
+    expect(upstreamFetch).toHaveBeenCalledTimes(2)
+  })
+
+  it('force-refreshes Grok OAuth once when the first Billing request returns 401', async () => {
+    const grok = grokOAuthAccount()
+    let billingCalls = 0
+    const upstreamFetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('/billing?format=credits')) {
+        billingCalls += 1
+        if (billingCalls === 1) return new Response('', { status: 401 })
+        expect(new Headers(init?.headers).get('authorization')).toBe(`Bearer ${grokAccessToken('grok-refreshed')}`)
+        return new Response(JSON.stringify({
+          subscriptionTier: 'SuperGrok',
+          config: { monthlyLimit: { val: 100 }, used: { val: 20 } },
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      if (url === 'https://auth.x.ai/oauth2/token') {
+        return new Response(JSON.stringify({
+          access_token: grokAccessToken('grok-refreshed'),
+          refresh_token: 'grok-refresh-rotated',
+          expires_in: 3600,
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      if (url.endsWith('/responses')) {
+        expect(new Headers(init?.headers).get('authorization')).toBe(`Bearer ${grokAccessToken('grok-refreshed')}`)
+        return new Response('{}', { status: 200 })
+      }
+      throw new Error(`Unexpected Grok request: ${url}`)
+    })
+    const harness = createHarness(
+      [grok],
+      { [grok.credentialId]: grokOAuthCredential() },
+      upstreamFetch,
+    )
+
+    await invokeAccountCheck(harness, grok.id)
+
+    expect(billingCalls).toBe(2)
+    expect(grok).toMatchObject({ status: 'active', quotaRemaining: 80, quotaUnit: 'percent' })
+    expect(harness.store.updateGrokOAuthCredential).toHaveBeenCalledOnce()
+  })
+
+  it('keeps last-known-good Grok quota and account health when Billing is unavailable', async () => {
+    const grok = {
+      ...grokOAuthAccount(),
+      quotaRemaining: 61,
+      quotaUnit: 'percent' as const,
+      grokQuota: {
+        usedPercent: 39,
+        remainingPercent: 61,
+        paidClassification: 'paid' as const,
+        observedAt: 1,
+        source: 'grok-build-billing' as const,
+      },
+    }
+    const upstreamFetch = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input)
+      if (url.includes('/billing?format=credits')) return new Response('', { status: 403 })
+      if (url.endsWith('/responses')) return new Response('{}', { status: 200 })
+      throw new Error(`Unexpected Grok request: ${url}`)
+    })
+    const harness = createHarness(
+      [grok],
+      { [grok.credentialId]: grokOAuthCredential() },
+      upstreamFetch,
+    )
+
+    await invokeAccountCheck(harness, grok.id)
+
+    expect(grok).toMatchObject({
+      status: 'active',
+      circuitState: 'closed',
+      quotaRemaining: 61,
+      quotaUnit: 'percent',
+      grokQuota: { remainingPercent: 61, observedAt: 1 },
+    })
+    expect(grok.lastError).toBeUndefined()
+    expect(upstreamFetch).toHaveBeenCalledTimes(2)
+  })
+
   it('does not let delayed success telemetry re-enable a manually disabled account', async () => {
     vi.useFakeTimers()
     try {
@@ -2321,6 +2774,8 @@ function createBackupServiceHarness() {
   const startAutomaticBackups = vi.fn(async () => { running = true })
   const stopAutomaticBackups = vi.fn(() => { running = false })
   const listBackups = vi.fn(async () => [])
+  const restoreBackup = vi.fn()
+  const setAutomaticRetention = vi.fn(async () => undefined)
   const backups = {
     directory: 'C:\\Stone\\backups',
     get automaticBackupsRunning() { return running },
@@ -2328,7 +2783,8 @@ function createBackupServiceHarness() {
     startAutomaticBackups,
     stopAutomaticBackups,
     listBackups,
-    setAutomaticRetention: vi.fn(async () => undefined),
+    restoreBackup,
+    setAutomaticRetention,
   } as unknown as DatabaseBackupService<PersistedState>
   return {
     services: {
@@ -2339,6 +2795,8 @@ function createBackupServiceHarness() {
     startAutomaticBackups,
     stopAutomaticBackups,
     listBackups,
+    restoreBackup,
+    setAutomaticRetention,
   }
 }
 
@@ -2456,6 +2914,7 @@ function createHarness(
     getCredential: vi.fn((credentialId: string) => credentials[credentialId]),
     getProxyPassword: vi.fn(() => undefined),
     updateChatGptCredential: vi.fn(async () => undefined),
+    updateGrokOAuthCredential: vi.fn(async () => undefined),
     importChatGptAccounts: vi.fn(async (input: { proxyMode?: string; proxyId?: string }) => {
       const imported = accounts[0]
       if (!imported) throw new Error('No mock account available for import')
@@ -2680,6 +3139,17 @@ async function invokeAccountRefresh(
   return await handler({ senderFrame: mainFrame, sender: { mainFrame } }, accountId) as AppSnapshot
 }
 
+async function invokeAccountCheck(
+  harness: { store: AppStore; transport: OutboundTransportManager },
+  accountId: string,
+): Promise<AppSnapshot> {
+  void harness
+  const handler = electron.handlers.get('stone:check-account')
+  if (!handler) throw new Error('check-account handler was not registered')
+  const mainFrame = { url: 'http://127.0.0.1:5173/index.html' }
+  return await handler({ senderFrame: mainFrame, sender: { mainFrame } }, accountId) as AppSnapshot
+}
+
 async function invokeAccountModelTest(
   harness: { store: AppStore; transport: OutboundTransportManager },
   accountId: string,
@@ -2707,6 +3177,20 @@ function oauthAccount(): Account {
     maskedCredential: 'chatgpt-****vate',
     credentialExpiresAt: Date.now() + 60 * 60 * 1000,
     renewable: true
+  }
+}
+
+function grokOAuthAccount(): Account {
+  return {
+    ...baseAccount('account-grok-oauth', 'credential-grok-oauth'),
+    name: 'Grok Build',
+    credentialType: 'grok-oauth',
+    maskedCredential: 'grok-****vate',
+    credentialExpiresAt: Date.now() + 60 * 60 * 1000,
+    renewable: true,
+    availableModels: ['grok-4.5'],
+    modelPolicy: 'selected',
+    modelAllowlist: ['grok-4.5'],
   }
 }
 
@@ -2748,6 +3232,27 @@ function oauthCredential(): string {
     accountId: 'acct-team-private',
     expiresAt: Date.now() + 60 * 60 * 1000
   })
+}
+
+function grokOAuthCredential(): string {
+  return JSON.stringify({
+    accessToken: grokAccessToken('grok-original'),
+    refreshToken: 'grok-refresh-private',
+    tokenType: 'Bearer',
+    subjectId: 'grok-subject',
+    clientId: 'b1a00492-073a-47ea-816f-4c329264a828',
+    expiresAt: Date.now() + 60 * 60 * 1000,
+    baseUrl: 'https://cli-chat-proxy.grok.com/v1',
+  })
+}
+
+function grokAccessToken(marker: string): string {
+  const payload = Buffer.from(JSON.stringify({
+    iss: 'https://auth.x.ai',
+    sub: 'grok-subject',
+    marker,
+  })).toString('base64url')
+  return `header.${payload}.signature`
 }
 
 function testProxy(): PublicProxyDefinition {

@@ -1607,6 +1607,20 @@ describe('PoolScheduler', () => {
     })
   })
 
+  it('drops stale runtime cooldown after a newer credential import marks the account active', () => {
+    const scheduler = new PoolScheduler(() => timestamp)
+    const cooling = account('a')
+    scheduler.recordFailure(cooling.id, { baseDelayMs: 60_000, maxDelayMs: 60_000 })
+    const reimported = account('a', {
+      status: 'active', circuitState: 'closed', cooldownUntil: undefined, updatedAt: timestamp + 1,
+    })
+
+    scheduler.hydrate([reimported])
+
+    expect(scheduler.selectAndAcquire({ pool: pool(), accounts: [reimported], model: 'model' }).account.id)
+      .toBe('a')
+  })
+
   it('skips exhausted quota and lowers the priority of a nearly depleted account', () => {
     const scheduler = new PoolScheduler(() => timestamp)
     const exhausted = account('exhausted', {
@@ -1627,6 +1641,27 @@ describe('PoolScheduler', () => {
       accounts: [exhausted, pressured, healthy],
       model: 'model'
     })
+    expect(selected.account.id).toBe('healthy')
+  })
+
+  it('skips exhausted Grok billing quota and deprioritizes low Grok quota', () => {
+    const scheduler = new PoolScheduler(() => timestamp)
+    const grokQuota = (remainingPercent: number) => ({
+      usedPercent: 100 - remainingPercent,
+      remainingPercent,
+      resetAt: timestamp + 60_000,
+      paidClassification: 'paid' as const,
+      observedAt: timestamp,
+      source: 'grok-build-billing' as const,
+    })
+    const exhausted = account('exhausted', { priority: 1, grokQuota: grokQuota(0) })
+    const pressured = account('pressured', { priority: 1, grokQuota: grokQuota(1) })
+    const healthy = account('healthy', { priority: 2, grokQuota: grokQuota(90) })
+
+    const selected = scheduler.selectAndAcquire({
+      pool: pool({ strategy: 'priority' }), accounts: [exhausted, pressured, healthy], model: 'model',
+    })
+
     expect(selected.account.id).toBe('healthy')
   })
 

@@ -53,7 +53,9 @@ export function buildSetupVerificationRequest(
   }
 
   return {
-    url: `${root}/v1/responses`,
+    url: client === 'grokbuild'
+      ? `${root}/grokbuild/v1/responses`
+      : `${root}/v1/responses`,
     init: {
       method: 'POST',
       headers,

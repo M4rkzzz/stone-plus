@@ -4,18 +4,71 @@ import type {
   ClientConfigEditorFile,
   ClientConfigEditorState,
   ClientConfigFileRole,
+  Route,
   RouteClient,
 } from '../../src/shared/types'
 import {
   buildClientConfigWorkbenchPreview,
+  clientSettingOptionClassName,
   clientConfigFieldGuides,
   createInitialClientConfigDrafts,
   getClientConfigFieldGuide,
   isClientConfigWorkbenchDirty,
   localizeClientConfigEditorField,
+  oneClickAgentRuntimeAction,
+  oneClickRouteModelMap,
+  oneClickRouteNeedsUpdate,
   resetClientConfigDrafts,
 } from '../../src/renderer/src/client-config-workbench'
 import { clientConfigEditorFields } from '../../src/main/client-config/catalog'
+
+describe('clientSettingOptionClassName', () => {
+  it.each([
+    ['xhigh', 'active'],
+    ['max', 'active'],
+    ['ultra', 'active active--maximum'],
+  ])('styles the selected raw %s effort consistently', (value, expected) => {
+    expect(clientSettingOptionClassName(value, value)).toBe(expected)
+  })
+
+  it('does not style an unselected option', () => {
+    expect(clientSettingOptionClassName('ultra', 'max')).toBe('')
+  })
+})
+
+describe('one-click client route reconciliation', () => {
+  const route: Route = {
+    id: 'route-claude', client: 'claude', enabled: true, poolId: 'kiro',
+    inboundProtocol: 'anthropic-messages', modelMap: {}, localToken: 'stone-token',
+    createdAt: 1, updatedAt: 1,
+  }
+
+  it('adds a deterministic route fallback when the source exposes one model', () => {
+    expect(oneClickRouteModelMap({}, ['claude-opus-4-8'])).toEqual({ '*': 'claude-opus-4-8' })
+    expect(oneClickRouteNeedsUpdate(route, {
+      ...route,
+      modelMap: { '*': 'claude-opus-4-8' },
+    })).toBe(true)
+  })
+
+  it('does not replace explicit mappings or guess between multiple models', () => {
+    expect(oneClickRouteModelMap({ sonnet: 'claude-sonnet-5' }, ['claude-opus-4-8']))
+      .toEqual({ sonnet: 'claude-sonnet-5' })
+    expect(oneClickRouteModelMap({}, ['claude-opus-4-8', 'claude-opus-5'])).toEqual({})
+    expect(oneClickRouteNeedsUpdate(route, { ...route })).toBe(false)
+  })
+
+  it('restarts only controllable running clients and leaves external sessions to the user', () => {
+    expect(oneClickAgentRuntimeAction({ running: false, processControl: 'managed-only', managedInstanceCount: 0 }))
+      .toBe('none')
+    expect(oneClickAgentRuntimeAction({ running: true, processControl: 'managed-only', managedInstanceCount: 1 }))
+      .toBe('restart')
+    expect(oneClickAgentRuntimeAction({ running: true, processControl: 'full', managedInstanceCount: 0 }))
+      .toBe('restart')
+    expect(oneClickAgentRuntimeAction({ running: true, processControl: 'managed-only', managedInstanceCount: 0 }))
+      .toBe('manual-restart')
+  })
+})
 
 function field(
   id: string,

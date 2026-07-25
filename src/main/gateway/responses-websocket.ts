@@ -331,20 +331,33 @@ async function responseErrorEvent(response: Response): Promise<JsonObject> {
     ? candidate.code
     : typeof candidate?.type === 'string' ? candidate.type : 'upstream_error'
   const message = typeof candidate?.message === 'string' ? candidate.message : `Request failed with HTTP ${response.status}.`
-  return errorEvent(response.status, code, message, candidate?.param)
+  return errorEvent(response.status, code, message, candidate?.param, candidate?.type)
 }
 
-function errorEvent(status: number, code: string, message: string, param?: unknown): JsonObject {
+function errorEvent(status: number, code: string, message: string, param?: unknown, candidateType?: unknown): JsonObject {
   return {
     type: 'error',
     status,
     error: {
-      type: 'invalid_request_error',
+      type: responseErrorType(status, candidateType),
       code,
       message,
       ...(typeof param === 'string' ? { param } : {}),
     },
   }
+}
+
+function responseErrorType(status: number, candidateType?: unknown): string {
+  const expected = status === 401
+    ? 'authentication_error'
+    : status === 403
+      ? 'permission_error'
+      : status === 429
+        ? 'rate_limit_error'
+        : status >= 500
+          ? 'server_error'
+          : 'invalid_request_error'
+  return typeof candidateType === 'string' && candidateType === expected ? candidateType : expected
 }
 
 function dispatchErrorEvent(error: unknown): JsonObject {

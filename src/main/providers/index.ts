@@ -4,12 +4,15 @@ import { customAdapter } from './custom'
 import { googleAdapter } from './google'
 import { openAIAdapter, openAICompatibleAdapter } from './openai'
 import type { ProviderAdapter } from './types'
+import { xAIAdapter, xAICompatibleAdapter } from './xai'
 
 const adapters: Readonly<Record<ProviderKind, ProviderAdapter>> = Object.freeze({
   anthropic: anthropicAdapter,
   openai: openAIAdapter,
+  xai: xAIAdapter,
   google: googleAdapter,
   'openai-compatible': openAICompatibleAdapter,
+  'xai-compatible': xAICompatibleAdapter,
   'anthropic-compatible': anthropicCompatibleAdapter,
   custom: customAdapter
 })
@@ -24,9 +27,36 @@ export {
   customAdapter,
   googleAdapter,
   openAIAdapter,
-  openAICompatibleAdapter
+  openAICompatibleAdapter,
+  xAIAdapter,
+  xAICompatibleAdapter
 }
 export { classifyProviderFailure, parseRetryAfter } from './failure'
+export {
+  applyGrokBuildHeaders,
+  GROK_BUILD_BILLING_URL,
+  GROK_BUILD_CLIENT_IDENTIFIER,
+  GROK_BUILD_CLIENT_VERSION,
+  GROK_BUILD_TOKEN_AUTH,
+  GROK_BUILD_USER_AGENT,
+  GROK_BUILD_USER_URL,
+  parseGrokBuildBillingPayload,
+  queryGrokBuildQuota
+} from './grok-build-quota'
+export type {
+  GrokBuildClientMode,
+  GrokBuildHeaderInput,
+  GrokBuildMonthlyQuota,
+  GrokBuildOnDemandQuota,
+  GrokBuildPaidClassification,
+  GrokBuildQuotaPeriod,
+  GrokBuildQuotaPlan,
+  GrokBuildQuotaQueryOptions,
+  GrokBuildQuotaResult,
+  GrokBuildQuotaSnapshot,
+  GrokBuildQuotaSuccess,
+  GrokBuildQuotaUnavailable
+} from './grok-build-quota'
 export {
   applyChatGptCodexHeaders,
   applyChatGptCodexSearchHeaders,

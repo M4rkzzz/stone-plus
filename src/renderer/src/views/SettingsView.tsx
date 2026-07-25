@@ -46,6 +46,11 @@ import {
 } from '../settings-autosave'
 import { BUILT_IN_PROXY_TAKEOVER_NOTICE, useBuiltInProxyInterlock } from '../built-in-proxy-interlocks'
 
+// eslint-disable-next-line react-refresh/only-export-components
+export function stateBackupsForDisplay<T>(backups: readonly T[], showAll: boolean, collapsedLimit = 6): readonly T[] {
+  return showAll ? backups : backups.slice(0, collapsedLimit)
+}
+
 type GatewaySaveState = 'idle' | 'pending' | 'saving' | 'saved' | 'invalid' | 'error'
 
 interface PendingGatewaySave {
@@ -186,6 +191,7 @@ export function SettingsView({
   const [saveState, setSaveState] = useState<GatewaySaveState>('idle')
   const [saveError, setSaveError] = useState('')
   const [backups, setBackups] = useState<BackupRecordSummary[]>([])
+  const [showAllBackups, setShowAllBackups] = useState(false)
   const [operationNotice, setOperationNotice] = useState('')
   const [connectionNotice, setConnectionNotice] = useState('')
   const [systemProxyStatus, setSystemProxyStatus] = useState<SystemProxyDetectionResult>()
@@ -716,7 +722,7 @@ export function SettingsView({
           </div>
           <SettingRow title={t('应用启动时运行网关', 'Run gateway when the app starts')} control={<Toggle checked={draft.autoStart} onChange={(value) => updateDraft({ autoStart: value }, true)} label={t('应用启动时运行网关', 'Run gateway when the app starts')} />} />
           <SettingRow title={t('Responses WebSocket', 'Responses WebSocket')} description={t('连续对话可减少重复连接，体验可能更顺畅；但仅部分客户端支持，某些代理或网络下更容易断线。一般保持关闭，客户端明确支持时再开启。', 'Consecutive conversations may feel smoother by avoiding repeated connections, but only some clients support it and certain proxies or networks may disconnect more often. Leave it off unless your client explicitly supports it.')} control={<Toggle checked={draft.responsesWebSocketEnabled === true} onChange={(value) => updateDraft({ responsesWebSocketEnabled: value }, true)} label={t('启用 Responses WebSocket', 'Enable Responses WebSocket')} />} />
-          <SettingRow title={t('禁用 Codex Micro', 'Disable Codex Micro')} description={t('右上角重新开启 Codex 时，跳过 Work Louder 设备扫描，缓解部分 Windows 电脑的卡顿；不修改 Codex 安装文件。', 'When Codex is reopened from the top-right button, skip Work Louder device discovery to avoid freezes on some Windows PCs. Codex installation files are not modified.')} control={<Toggle checked={draft.disableCodexMicro === true} onChange={(value) => updateDraft({ disableCodexMicro: value }, true)} label={t('禁用 Codex Micro', 'Disable Codex Micro')} />} />
+          <SettingRow title={t('禁用 Codex Micro', 'Disable Codex Micro')} description={t('仅当 Stone+ 从右上角重新开启 Windows Codex 桌面端时，跳过 Work Louder 设备扫描；不修改 Codex 安装文件或 CLI 配置，其他启动方式不受影响。', 'Only when Stone+ reopens the Windows Codex desktop app from the top-right control, skip Work Louder device discovery. Codex installation files, CLI configuration, and other launch paths are unchanged.')} control={<Toggle checked={draft.disableCodexMicro === true} onChange={(value) => updateDraft({ disableCodexMicro: value }, true)} label={t('禁用 Codex Micro', 'Disable Codex Micro')} />} />
           <SettingRow title={t('登录系统时启动 Stone+', 'Launch Stone+ at login')} control={<Toggle checked={Boolean(draft.launchAtLogin)} onChange={(value) => updateDraft({ launchAtLogin: value }, true)} label={t('登录系统时启动 Stone+', 'Launch Stone+ at login')} />} />
           <SettingRow title={t('桌面健康通知', 'Desktop health notifications')} description={t('账号停用、冷却、额度耗尽或恢复时通知', 'Notify when accounts are disabled, cooling down, out of quota, or recovered')} control={<Toggle checked={draft.desktopNotifications !== false} onChange={(value) => updateDraft({ desktopNotifications: value }, true)} label={t('桌面健康通知', 'Desktop health notifications')} />} />
           <SettingRow
@@ -759,7 +765,11 @@ export function SettingsView({
             {webDavConfiguration.configured && <div className="webdav-backup-list"><div className="webdav-backup-list__heading"><strong>{t('远端备份', 'Remote backups')}</strong><button className="text-button" type="button" disabled={Boolean(webDavBusy)} onClick={() => void refreshWebDav()}><RefreshCw size={14} className={webDavBusy === 'list' ? 'spin' : ''} />{t('刷新', 'Refresh')}</button></div>{webDavEntries.map((entry) => <div key={entry.name}><span><strong>{entry.name}</strong><small>{entry.size === undefined ? '' : `${Math.ceil(entry.size / 1024)} KB`}{entry.modifiedAt ? ` · ${new Date(entry.modifiedAt).toLocaleString(locale)}` : ''}</small></span><button className="button button--secondary" type="button" disabled={Boolean(webDavBusy) || Boolean(portableBusy) || portablePassword.length < 8} onClick={() => void downloadWebDav(entry)}>{webDavBusy === `download:${entry.name}` ? <LoaderCircle size={15} className="spin" /> : <Download size={15} />}{t('下载并导入', 'Download & import')}</button></div>)}{!webDavEntries.length && <span className="muted">{t('暂无远端备份', 'No remote backups')}</span>}</div>}
           </div>
           {operationNotice && <div className="client-config-notice">{operationNotice}</div>}
-          <div className="state-backup-list">{backups.slice(0, 6).map((backup) => <div key={backup.path}><span><strong>{new Date(backup.createdAt).toLocaleString(locale)}</strong><small>{Math.ceil(backup.size / 1024)} KB · {backup.automatic ? t('自动', 'Automatic') : t('手动', 'Manual')} · {backup.integrity === 'valid' ? t('校验通过', 'Verified') : t('损坏', 'Corrupted')}</small></span><button className="icon-button" type="button" disabled={backup.integrity !== 'valid'} title={t('恢复此备份', 'Restore this backup')} onClick={() => void restoreBackup(backup)}><RotateCcw size={15} /></button></div>)}{!backups.length && <span className="muted">{t('暂无状态备份', 'No state backups')}</span>}</div>
+          <div className="state-backup-list">
+            {stateBackupsForDisplay(backups, showAllBackups).map((backup) => <div key={backup.path}><span><strong>{new Date(backup.createdAt).toLocaleString(locale)}</strong><small>{Math.ceil(backup.size / 1024)} KB · {backup.automatic ? t('自动', 'Automatic') : t('手动', 'Manual')} · {backup.integrity === 'valid' ? t('校验通过', 'Verified') : t('损坏', 'Corrupted')}</small></span><button className="icon-button" type="button" disabled={backup.integrity !== 'valid'} title={t('恢复此备份', 'Restore this backup')} onClick={() => void restoreBackup(backup)}><RotateCcw size={15} /></button></div>)}
+            {!backups.length && <span className="muted">{t('暂无状态备份', 'No state backups')}</span>}
+            {backups.length > 6 && <button className="text-button state-backup-list__toggle" type="button" aria-expanded={showAllBackups} onClick={() => setShowAllBackups((current) => !current)}>{showAllBackups ? t('收起较早备份', 'Hide older backups') : t(`查看全部 ${backups.length} 份备份`, `Show all ${backups.length} backups`)}</button>}
+          </div>
         </div>
       </section>
 

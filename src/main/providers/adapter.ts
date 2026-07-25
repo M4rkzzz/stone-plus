@@ -11,9 +11,13 @@ import type {
   ProviderSourceHeaders
 } from './types'
 import { buildVersionedEndpoint } from './url'
-import { filterOpenAIGenerativeModels, parseModelDiscoveryPagination } from './model-parsers'
+import { filterOpenAIGenerativeModels, filterXaiLanguageModels, parseModelDiscoveryPagination } from './model-parsers'
 
 const MAX_MODEL_DISCOVERY_PAGES = 20
+const MAX_MODEL_DISCOVERY_PAGE_BYTES = 2 * 1024 * 1024
+const MAX_DISCOVERED_MODEL_IDS = 10_000
+const MAX_MODEL_ID_LENGTH = 256
+const MAX_PAGINATION_TOKEN_LENGTH = 2_048
 
 export function createProviderAdapter(definition: ProviderAdapterDefinition): ProviderAdapter {
   const adapter: ProviderAdapter = {
@@ -37,8 +41,10 @@ export function createProviderAdapter(definition: ProviderAdapterDefinition): Pr
       headers.set('accept', input.stream ? 'text/event-stream' : (accept ?? 'application/json'))
       if (input.hasBody !== false) headers.set('content-type', 'application/json')
 
-      const userAgent = readSourceHeader(input.sourceHeaders, 'user-agent')
-      if (userAgent) headers.set('user-agent', userAgent)
+      if (definition.forwardUserAgent !== false) {
+        const userAgent = readSourceHeader(input.sourceHeaders, 'user-agent')
+        if (userAgent) headers.set('user-agent', userAgent)
+      }
       definition.applyAuthentication(headers, input)
     },
 
@@ -85,27 +91,42 @@ async function discoverModels(
 
       let payload: unknown
       try {
-        payload = await response.json()
+        payload = await readLimitedDiscoveryJson(response)
       } catch {
         return invalidModelDiscoveryResult(now, startedAt, statusCode)
       }
 
-      models.push(...definition.parseModels(payload))
+      let pageModels: string[]
+      try {
+        pageModels = definition.parseModels(payload)
+      } catch {
+        return invalidModelDiscoveryResult(now, startedAt, statusCode)
+      }
+      if (models.length + pageModels.length > MAX_DISCOVERED_MODEL_IDS
+        || pageModels.some((model) => !isSafeDiscoveredModelId(model))) {
+        return invalidModelDiscoveryResult(now, startedAt, statusCode)
+      }
+      models.push(...pageModels)
       const pagination = parseModelDiscoveryPagination(payload, input.protocol)
       if (pagination.invalid) return invalidModelDiscoveryResult(now, startedAt, statusCode)
       if (!pagination.nextCursor) {
         const normalized = normalizeModels(models)
         return {
           ok: true,
-          models: definition.kind === 'openai' || definition.kind === 'openai-compatible'
-            ? filterOpenAIGenerativeModels(normalized)
-            : normalized,
+          models: definition.kind === 'xai' || definition.kind === 'xai-compatible'
+            ? filterXaiLanguageModels(normalized)
+            : definition.kind === 'openai' || definition.kind === 'openai-compatible'
+              ? filterOpenAIGenerativeModels(normalized)
+              : normalized,
           checkedAt: startedAt,
           latencyMs: elapsed(now, startedAt),
           statusCode
         }
       }
 
+      if (pagination.nextCursor.value.length > MAX_PAGINATION_TOKEN_LENGTH) {
+        return invalidModelDiscoveryResult(now, startedAt, statusCode)
+      }
       const cursorKey = `${pagination.nextCursor.parameter}:${pagination.nextCursor.value}`
       if (seenCursors.has(cursorKey) || page === MAX_MODEL_DISCOVERY_PAGES - 1) {
         return invalidModelDiscoveryResult(now, startedAt, statusCode)
@@ -125,6 +146,37 @@ async function discoverModels(
       failure: adapter.classifyFailure({ error, now: now() })
     }
   }
+}
+
+async function readLimitedDiscoveryJson(response: Response): Promise<unknown> {
+  const declaredLength = response.headers.get('content-length')?.trim()
+  if (declaredLength && /^\d+$/.test(declaredLength)
+    && Number(declaredLength) > MAX_MODEL_DISCOVERY_PAGE_BYTES) {
+    await response.body?.cancel().catch(() => undefined)
+    throw new Error('Provider model catalog response is too large.')
+  }
+
+  const reader = response.body?.getReader()
+  if (!reader) throw new Error('Provider model catalog response is empty.')
+  const decoder = new TextDecoder('utf-8', { fatal: true })
+  let text = ''
+  let size = 0
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      size += value.byteLength
+      if (size > MAX_MODEL_DISCOVERY_PAGE_BYTES) {
+        await reader.cancel()
+        throw new Error('Provider model catalog response is too large.')
+      }
+      text += decoder.decode(value, { stream: true })
+    }
+    text += decoder.decode()
+  } finally {
+    reader.releaseLock()
+  }
+  return JSON.parse(text) as unknown
 }
 
 async function probeHealth(adapter: ProviderAdapter, input: ProviderProbeInput): Promise<ProviderHealthResult> {
@@ -180,7 +232,10 @@ async function fetchProbe(
   return (input.fetchImplementation ?? fetch)(withCursor(endpoint, cursor), {
     method: 'GET',
     headers,
-    signal
+    signal,
+    ...((adapter.kind === 'xai' || adapter.kind === 'xai-compatible')
+      ? { redirect: 'error' as const }
+      : {}),
   })
 }
 
@@ -236,6 +291,20 @@ function normalizeModels(models: string[]): string[] {
     result.push(model)
   }
   return result
+}
+
+function isSafeDiscoveredModelId(candidate: string): boolean {
+  if (typeof candidate !== 'string') return false
+  const model = candidate.trim()
+  if (!model) return true
+  return model.length <= MAX_MODEL_ID_LENGTH && !hasControlCharacters(model)
+}
+
+function hasControlCharacters(value: string): boolean {
+  return [...value].some((character) => {
+    const code = character.charCodeAt(0)
+    return code < 32 || (code >= 127 && code <= 159)
+  })
 }
 
 function elapsed(now: () => number, startedAt: number): number {

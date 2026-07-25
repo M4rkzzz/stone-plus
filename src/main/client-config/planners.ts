@@ -1,4 +1,6 @@
 import { mutateDotenv, validateDotenv } from './dotenv-format'
+import { CLAUDE_RELAY_MODEL_ENV_KEYS, isClaudeClientModelName } from './claude-environment'
+import { planGrokBuildToml } from './grok-build-toml'
 import { mutateJsonObject, objectField, type JsonObject, type TextMutation } from './json-format'
 import { planCodexOfficialLoginToml, planCodexToml, repairCodexToml } from './toml-format'
 import type {
@@ -32,7 +34,7 @@ function normalizedTarget(target: ClientConnectionTarget): ClientConnectionTarge
     throw new ClientConfigValidationError('Gateway base URL must be an HTTP(S) origin without credentials, query, or fragment')
   }
   const baseUrl = url.toString().replace(/\/$/, '')
-  return { gatewayBaseUrl: baseUrl, token: target.token }
+  return { gatewayBaseUrl: baseUrl, token: target.token.trim() }
 }
 
 function mutation(
@@ -58,7 +60,16 @@ export function planClaudeConfig(
   const desired = normalizedTarget(target)
   const source = existing['claude-settings']
   const settings = mutateJsonObject(source, 'claude-settings', (root) => {
+    if (typeof root.model === 'string' && root.model.trim() && !isClaudeClientModelName(root.model)) {
+      delete root.model
+    }
     const environment = objectField(root, 'env', 'claude-settings')
+    // Provider-specific model overrides from a previous relay are not valid
+    // Claude client selections once Stone+ owns the connection. Keep the
+    // user's top-level Claude model preference, but move upstream selection to
+    // Route.modelMap so an OpenAI/Grok identifier is never shown to or
+    // validated by Claude Code itself.
+    for (const key of CLAUDE_RELAY_MODEL_ENV_KEYS) delete environment[key]
     environment.ANTHROPIC_BASE_URL = desired.gatewayBaseUrl
     environment.ANTHROPIC_AUTH_TOKEN = desired.token
   })
@@ -67,6 +78,8 @@ export function planClaudeConfig(
     files: [mutation(paths.settings, source, settings, [
       'env.ANTHROPIC_BASE_URL',
       'env.ANTHROPIC_AUTH_TOKEN',
+      'model (only non-Claude relay values)',
+      ...CLAUDE_RELAY_MODEL_ENV_KEYS.map((key) => `env.${key}`),
     ])],
   }
 }
@@ -166,6 +179,30 @@ export function planGeminiConfig(
   }
 }
 
+export function planGrokBuildConfig(
+  paths: ResolvedClientConfigPaths['grokbuild'],
+  existing: ExistingClientConfig,
+  target: ClientConnectionTarget,
+): ClientConfigPlan {
+  const desired = normalizedTarget(target)
+  const source = existing['grok-config']
+  const config = planGrokBuildToml(
+    source,
+    `${desired.gatewayBaseUrl}/grokbuild/v1`,
+    desired.token,
+  )
+  return {
+    client: 'grokbuild',
+    files: [mutation(paths.config, source, config, [
+      'auth.preferred_method',
+      'models.default (when no custom profile exists)',
+      'model.<selected>.base_url',
+      'model.<selected>.api_key',
+      'model.<selected>.api_backend',
+    ])],
+  }
+}
+
 export function planClientConfig(
   client: SupportedClient,
   paths: ResolvedClientConfigPaths,
@@ -174,13 +211,15 @@ export function planClientConfig(
 ): ClientConfigPlan {
   if (client === 'claude') return planClaudeConfig(paths.claude, existing, target)
   if (client === 'codex') return planCodexConfig(paths.codex, existing, target)
-  return planGeminiConfig(paths.gemini, existing, target)
+  if (client === 'gemini') return planGeminiConfig(paths.gemini, existing, target)
+  return planGrokBuildConfig(paths.grokbuild, existing, target)
 }
 
 const repairableRoles: Readonly<Record<SupportedClient, ReadonlySet<ClientConfigFilePath['role']>>> = {
   claude: new Set(['claude-settings']),
   codex: new Set(['codex-config', 'codex-auth']),
   gemini: new Set(['gemini-settings', 'gemini-env']),
+  grokbuild: new Set(['grok-config']),
 }
 
 function repairObjectField(parent: JsonObject, key: string): JsonObject {
@@ -275,6 +314,21 @@ export function planClientConfigRepair(
       if (!(error instanceof ClientConfigParseError)) throw error
       delete repairInput['gemini-env']
       rebuiltRoles.push('gemini-env')
+    }
+  }
+
+  if (client === 'grokbuild' && repairInput['grok-config'] !== undefined) {
+    try {
+      const desired = normalizedTarget(target)
+      repairInput['grok-config'] = planGrokBuildToml(
+        repairInput['grok-config'],
+        `${desired.gatewayBaseUrl}/grokbuild/v1`,
+        desired.token,
+      ).content
+    } catch (error) {
+      if (!(error instanceof ClientConfigParseError)) throw error
+      delete repairInput['grok-config']
+      rebuiltRoles.push('grok-config')
     }
   }
 

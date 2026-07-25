@@ -9,14 +9,14 @@ import {
 } from '../../src/renderer/src/responses-compact-mode'
 
 describe('Responses compact capability UI boundaries', () => {
-  it('keeps old and malformed relay configurations on the compatible legacy default', () => {
-    expect(effectiveResponsesCompactMode(undefined)).toBe('legacy')
-    expect(effectiveResponsesCompactMode('unsupported')).toBe('legacy')
-    expect(responsesCompactModeForSave('relay', 'openai-responses', undefined)).toBe('legacy')
+  it('upgrades old and malformed relay configurations to the automatic default', () => {
+    expect(effectiveResponsesCompactMode(undefined)).toBe('auto')
+    expect(effectiveResponsesCompactMode('unsupported')).toBe('auto')
+    expect(responsesCompactModeForSave('relay', 'openai-responses', undefined)).toBe('auto')
   })
 
-  it('offers all three modes only for OpenAI Responses relays', () => {
-    expect(responsesCompactModes).toEqual(['legacy', 'passthrough', 'native'])
+  it('offers automatic and advanced modes only for OpenAI Responses relays', () => {
+    expect(responsesCompactModes).toEqual(['auto', 'legacy', 'passthrough', 'native'])
     expect(relayCanConfigureResponsesCompact('relay', 'openai-responses')).toBe(true)
     expect(relayCanConfigureResponsesCompact('relay', 'openai-chat')).toBe(false)
     expect(relayCanConfigureResponsesCompact('official-api', 'openai-responses')).toBe(false)
@@ -41,6 +41,8 @@ describe('Responses compact capability UI boundaries', () => {
       expect(responsesCompactModeCopy[mode].helpEn).toBeTruthy()
     }
     expect(responsesCompactModeCopy.legacy.helpEn).toContain('/responses/compact')
+    expect(responsesCompactModeCopy.auto.helpEn).toContain('native Responses Compact')
+    expect(responsesCompactModeCopy.auto.helpEn).toContain('normal Responses text summary')
     expect(responsesCompactModeCopy.legacy.helpEn).toContain('compaction_trigger')
     expect(responsesCompactModeCopy.legacy.helpEn).toContain('metadata headers are not sent')
     expect(responsesCompactModeCopy.passthrough.helpEn).toContain('encrypted_content')

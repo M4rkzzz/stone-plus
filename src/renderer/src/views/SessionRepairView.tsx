@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   AlertTriangle,
   Archive,
@@ -12,12 +12,14 @@ import {
   ShieldCheck,
   Trash2,
   Wrench,
+  XCircle,
 } from 'lucide-react'
 import type {
   CodexSessionIndexCleanupPreview,
   CodexSessionIndexCleanupResult,
   CodexSessionRepairOverview,
   CodexSessionRepairPreview,
+  CodexSessionRepairProgressEvent,
   CodexSessionRepairResult,
   CodexSessionRepairTargetSource,
   GatewayApi,
@@ -25,6 +27,14 @@ import type {
 import { localizeBackendError, localizeBackendMessage } from '../backend-message'
 import { useI18n } from '../i18n'
 import { CodexSessionManagerPanel } from '../codex-session-manager'
+import {
+  cacheSessionRepairPreview,
+  cachedOrAnalyzeSessionRepairPreview,
+  isSessionRepairCancellation,
+  sessionRepairProgressPercent,
+  repairSessionFromPreview,
+  summarizeSessionRepairChanges,
+} from '../session-repair-ui'
 import { Badge, ConfirmDialog, PageHeader } from '../ui'
 
 export function SessionRepairView({ api }: { api: GatewayApi }) {
@@ -48,20 +58,58 @@ export function SessionRepairView({ api }: { api: GatewayApi }) {
   const [indexRefreshWarning, setIndexRefreshWarning] = useState('')
   const [confirmOpen, setConfirmOpen] = useState(false)
   const [indexConfirmOpen, setIndexConfirmOpen] = useState(false)
+  const [operationId, setOperationId] = useState<string | null>(null)
+  const [progress, setProgress] = useState<CodexSessionRepairProgressEvent | null>(null)
+  const [cancelBusy, setCancelBusy] = useState(false)
+  const operationRef = useRef<string | null>(null)
+  const previewCache = useRef(new Map<string, CodexSessionRepairPreview>())
+
+  const beginSessionOperation = useCallback((kind: 'load' | 'preview' | 'repair'): string | undefined => {
+    if (operationRef.current) return undefined
+    const id = crypto.randomUUID()
+    operationRef.current = id
+    setOperationId(id)
+    setProgress({ operationId: id, stage: 'discover', completed: 0 })
+    setCancelBusy(false)
+    setBusy(kind)
+    return id
+  }, [])
+
+  const finishSessionOperation = useCallback((id: string) => {
+    if (operationRef.current !== id) return
+    operationRef.current = null
+    setOperationId(null)
+    setProgress(null)
+    setCancelBusy(false)
+    setBusy(null)
+  }, [])
+
+  useEffect(() => {
+    const unsubscribe = api.onCodexSessionRepairProgress((event) => {
+      if (event.operationId === operationRef.current) setProgress(event)
+    })
+    return () => {
+      unsubscribe()
+      const active = operationRef.current
+      operationRef.current = null
+      if (active) void api.cancelCodexSessionRepair(active).catch(() => undefined)
+    }
+  }, [api])
 
   const load = useCallback(async () => {
-    setBusy('load')
+    const id = beginSessionOperation('load')
+    if (!id) return
     setError('')
     setRefreshWarning('')
     setIndexRefreshWarning('')
+    setResult(null)
+    previewCache.current.clear()
     try {
-      const next = await api.inspectCodexSessionRepair()
+      const next = await api.analyzeCodexSessionRepair(targetProvider || undefined, id)
+      const provider = next.targetProvider
       setOverview(next)
-      const provider = next.targets.some((target) => target.id === targetProvider)
-        ? targetProvider
-        : next.currentProvider || next.targets[0]?.id || 'openai'
       setTargetProvider(provider)
-      setPreview(await api.previewCodexSessionRepair(provider))
+      setPreview(cacheSessionRepairPreview(previewCache.current, next))
       try {
         setIndexPreview(await api.previewCodexSessionIndexCleanup())
         setSelectedIndexIds([])
@@ -71,11 +119,13 @@ export function SessionRepairView({ api }: { api: GatewayApi }) {
         setIndexError(localizeBackendError(cause, language, t('无法扫描幽灵任务索引', 'Unable to scan the ghost task index')))
       }
     } catch (cause) {
-      setError(localizeBackendError(cause, language, t('无法扫描 Codex 会话', 'Unable to scan Codex sessions')))
+      if (!isSessionRepairCancellation(cause)) {
+        setError(localizeBackendError(cause, language, t('无法扫描 Codex 会话', 'Unable to scan Codex sessions')))
+      }
     } finally {
-      setBusy(null)
+      finishSessionOperation(id)
     }
-  }, [api, language, t, targetProvider])
+  }, [api, beginSessionOperation, finishSessionOperation, language, t, targetProvider])
 
   useEffect(() => {
     void load()
@@ -85,43 +135,76 @@ export function SessionRepairView({ api }: { api: GatewayApi }) {
 
   const runPreview = async (provider = targetProvider) => {
     if (!provider) return
-    setBusy('preview')
+    const cached = previewCache.current.get(provider)
+    if (cached) {
+      setError('')
+      setRefreshWarning('')
+      setResult(null)
+      setOverview(cached)
+      setPreview(cached)
+      return
+    }
+    const id = beginSessionOperation('preview')
+    if (!id) return
     setError('')
     setRefreshWarning('')
     setResult(null)
     try {
-      setPreview(await api.previewCodexSessionRepair(provider))
+      const next = await cachedOrAnalyzeSessionRepairPreview(
+        previewCache.current,
+        provider,
+        id,
+        (target, operation) => api.analyzeCodexSessionRepair(target, operation),
+      )
+      setOverview(next)
+      setPreview(next)
     } catch (cause) {
-      setPreview(null)
-      setError(localizeBackendError(cause, language, t('无法预览会话修复', 'Unable to preview session repair')))
+      if (!isSessionRepairCancellation(cause)) {
+        setError(localizeBackendError(cause, language, t('无法预览会话修复', 'Unable to preview session repair')))
+      }
     } finally {
-      setBusy(null)
+      finishSessionOperation(id)
     }
   }
 
   const repair = async () => {
     if (!preview) return
+    const id = beginSessionOperation('repair')
+    if (!id) return
     setConfirmOpen(false)
-    setBusy('repair')
     setError('')
     setRefreshWarning('')
     try {
-      const next = (await api.repairCodexSessionsAndRestartChatGpt(preview.targetProvider, preview.revision)).repair
+      const next = (await repairSessionFromPreview(api, preview, id)).repair
       setResult(next)
-    } catch (cause) {
-      setError(localizeBackendError(cause, language, t('会话修复失败', 'Session repair failed')))
-      setBusy(null)
-      return
-    }
-    try {
-      const refreshed = await api.inspectCodexSessionRepair()
-      setOverview(refreshed)
-      setPreview(await api.previewCodexSessionRepair(preview.targetProvider))
-    } catch {
+      previewCache.current.clear()
       setPreview(null)
-      setRefreshWarning(t('修复已完成；Codex 重新开启时状态暂未刷新，请稍后重新扫描。', 'Repair completed, but status was not refreshed while Codex reopened. Scan again shortly.'))
+      setRefreshWarning(t('修复已完成；结果已显示。需要最新计数时再重新扫描。', 'Repair completed and the result is shown. Scan again only when you need updated counts.'))
+    } catch (cause) {
+      if (isSessionRepairCancellation(cause)) {
+        previewCache.current.clear()
+        setPreview(null)
+        setRefreshWarning(t('操作已安全取消；Codex 关闭期间状态可能发生变化，请重新扫描后再继续。', 'The operation was safely cancelled. State may have changed while Codex was closed; scan again before continuing.'))
+      } else {
+        setError(localizeBackendError(cause, language, t('会话修复失败', 'Session repair failed')))
+      }
     } finally {
-      setBusy(null)
+      finishSessionOperation(id)
+    }
+  }
+
+  const cancelSessionOperation = async () => {
+    const active = operationRef.current
+    if (!active || cancelBusy) return
+    setCancelBusy(true)
+    try {
+      const accepted = await api.cancelCodexSessionRepair(active)
+      if (!accepted && operationRef.current === active) setCancelBusy(false)
+    } catch (cause) {
+      if (operationRef.current === active) {
+        setCancelBusy(false)
+        setError(localizeBackendError(cause, language, t('无法取消当前操作', 'Unable to cancel the current operation')))
+      }
     }
   }
 
@@ -166,15 +249,25 @@ export function SessionRepairView({ api }: { api: GatewayApi }) {
     }
   }
 
-  const totalRollouts = (overview?.sessionFiles ?? 0) + (overview?.archivedSessionFiles ?? 0)
-  const totalChanges = useMemo(() => preview
-    ? preview.rolloutFilesToUpdate
-      + preview.sqliteProviderRowsToUpdate
-      + preview.sqliteUserEventRowsToUpdate
-      + preview.sqliteCwdRowsToUpdate
-      + preview.globalStateFieldsToUpdate
-    : 0, [preview])
+  const changeSummary = summarizeSessionRepairChanges(overview, preview)
+  const totalRollouts = changeSummary.scannedSessionFiles
+  const totalChanges = changeSummary.totalChanges
   const running = busy !== null
+  const progressPercent = progress ? sessionRepairProgressPercent(progress) : undefined
+  const progressStages: Array<{ id: CodexSessionRepairProgressEvent['stage']; label: string }> = [
+    { id: 'discover', label: t('发现文件', 'Discover') },
+    { id: 'scan', label: t('扫描', 'Scan') },
+    { id: 'verify', label: t('复核', 'Verify') },
+    { id: 'backup', label: t('备份', 'Backup') },
+    { id: 'apply', label: t('应用', 'Apply') },
+  ]
+  const activeProgressStage = progress
+    ? progressStages.findIndex((stage) => stage.id === progress.stage)
+    : -1
+
+  useEffect(() => {
+    if (!changeSummary.requiresRepair) setConfirmOpen(false)
+  }, [changeSummary.requiresRepair])
 
   return (
     <div className="page-stack">
@@ -188,6 +281,27 @@ export function SessionRepairView({ api }: { api: GatewayApi }) {
       />
 
       {error && <div className="error-banner" role="alert"><div><AlertTriangle size={16} /><span>{error}</span></div></div>}
+      {operationId && progress && (
+        <section className="session-repair-progress" aria-live="polite" aria-busy="true">
+          <div className="session-repair-progress__heading">
+            <div>
+              <LoaderCircle size={17} className="spin" />
+              <span><strong>{progressStages[activeProgressStage]?.label ?? t('准备中', 'Preparing')}</strong><small>{progress.total === undefined
+                ? t(`已处理 ${progress.completed}`, `${progress.completed} processed`)
+                : t(`已处理 ${progress.completed} / ${progress.total}`, `${progress.completed} of ${progress.total} processed`)}</small></span>
+            </div>
+            <button className="button button--secondary" type="button" disabled={cancelBusy} onClick={() => void cancelSessionOperation()}>
+              {cancelBusy ? <LoaderCircle size={15} className="spin" /> : <XCircle size={15} />}{cancelBusy ? t('正在取消…', 'Cancelling…') : t('安全取消', 'Cancel safely')}
+            </button>
+          </div>
+          <div className="session-repair-progress__track" role="progressbar" aria-label={t('会话修复进度', 'Session repair progress')} aria-valuemin={0} aria-valuemax={100} aria-valuenow={progressPercent}>
+            <span className={progressPercent === undefined ? 'is-indeterminate' : ''} style={progressPercent === undefined ? undefined : { width: `${progressPercent}%` }} />
+          </div>
+          <ol className="session-repair-progress__stages">
+            {progressStages.map((stage, index) => <li key={stage.id} className={index < activeProgressStage ? 'is-complete' : index === activeProgressStage ? 'is-active' : ''}><span />{stage.label}</li>)}
+          </ol>
+        </section>
+      )}
       {result && (
         <div className="client-config-notice session-repair-notice">
           <CheckCircle2 size={17} />
@@ -220,9 +334,17 @@ export function SessionRepairView({ api }: { api: GatewayApi }) {
           <div className="metric-card__icon metric-card__icon--violet"><Database size={18} /></div>
         </article>
         <article className="metric-card">
-          <span className="metric-card__label">{t('预览改动', 'Proposed changes')}</span>
+          <span className="metric-card__label">{t('待同步改动', 'Changes to synchronize')}</span>
           <strong>{totalChanges}</strong>
-          <span>{preview ? preview.rolloutFilesToUpdate ? t('存在需要同步的历史会话', 'Historical sessions need synchronization') : totalChanges ? t('仅需修复索引', 'Only the index needs repair') : t('当前目标已同步', 'The selected target is already synchronized') : t('等待预览', 'Waiting for preview')}</span>
+          <span>{preview
+            ? changeSummary.unrecognizedSessionFiles
+              ? t(`已扫描 ${totalRollouts} 个会话，${changeSummary.unrecognizedSessionFiles} 个元数据仍无法识别`, `${totalRollouts} sessions scanned; ${changeSummary.unrecognizedSessionFiles} still have unrecognized metadata`)
+              : changeSummary.sessionFilesToUpdate
+              ? t(`已扫描 ${totalRollouts} 个会话，${changeSummary.sessionFilesToUpdate} 个需同步`, `${totalRollouts} sessions scanned; ${changeSummary.sessionFilesToUpdate} need synchronization`)
+              : totalChanges
+                ? t(`已扫描 ${totalRollouts} 个会话；会话均已同步，仅索引需修复`, `${totalRollouts} sessions scanned and synchronized; only indexes need repair`)
+                : t(`已扫描 ${totalRollouts} 个会话，均已同步到 ${preview.targetProvider}`, `${totalRollouts} sessions scanned; all are synchronized to ${preview.targetProvider}`)
+            : t('等待预览', 'Waiting for preview')}</span>
           <div className="metric-card__icon metric-card__icon--amber"><History size={18} /></div>
         </article>
       </section>
@@ -242,8 +364,11 @@ export function SessionRepairView({ api }: { api: GatewayApi }) {
               value={targetProvider}
               disabled={running || !overview?.targets.length}
               onChange={(event) => {
-                setTargetProvider(event.target.value)
-                setPreview(null)
+                const provider = event.target.value
+                const cached = previewCache.current.get(provider) ?? null
+                setTargetProvider(provider)
+                setPreview(cached)
+                if (cached) setOverview(cached)
                 setResult(null)
               }}
             >
@@ -258,8 +383,10 @@ export function SessionRepairView({ api }: { api: GatewayApi }) {
             <button className="button button--secondary" type="button" disabled={running || !targetProvider} onClick={() => void runPreview()}>
               {busy === 'preview' ? <LoaderCircle size={16} className="spin" /> : <RefreshCw size={16} />}{t('预览修复', 'Preview repair')}
             </button>
-            <button className="button button--primary" type="button" disabled={running || !preview || totalChanges === 0} onClick={() => setConfirmOpen(true)}>
-              {busy === 'repair' ? <LoaderCircle size={16} className="spin" /> : <Wrench size={16} />}{t('立即修复历史会话', 'Repair historical sessions now')}
+            <button className="button button--primary" type="button" disabled={running || !changeSummary.requiresRepair} onClick={() => {
+              if (changeSummary.requiresRepair) setConfirmOpen(true)
+            }}>
+              {busy === 'repair' ? <LoaderCircle size={16} className="spin" /> : <Wrench size={16} />}{changeSummary.requiresRepair ? t('立即同步待修复项', 'Synchronize repair items now') : changeSummary.unrecognizedSessionFiles ? t('存在未识别会话', 'Unrecognized sessions') : t('无需修复', 'No repair needed')}
             </button>
           </div>
         </div>
@@ -268,7 +395,7 @@ export function SessionRepairView({ api }: { api: GatewayApi }) {
           <div className="session-repair-loading"><LoaderCircle size={20} className="spin" /><span>{t('正在扫描 rollout 与 SQLite 索引…', 'Scanning rollouts and the SQLite index…')}</span></div>
         ) : preview ? (
           <div className="session-repair-preview">
-            <div><span>rollout provider</span><strong>{preview.rolloutFilesToUpdate}</strong><small>{t('个会话文件', 'session files')}</small></div>
+            <div><span>{t('会话文件待同步', 'Session files pending')}</span><strong>{preview.rolloutFilesToUpdate}</strong><small>{t(`${totalRollouts} 个已扫描 · ${changeSummary.parsedSessionFiles} 个已识别 · ${changeSummary.synchronizedSessionFiles} 个已同步`, `${totalRollouts} scanned · ${changeSummary.parsedSessionFiles} recognized · ${changeSummary.synchronizedSessionFiles} synchronized`)}</small></div>
             <div><span>SQLite provider</span><strong>{preview.sqliteProviderRowsToUpdate}</strong><small>{t('行线程归属', 'thread-owner rows')}</small></div>
             <div><span>{t('用户事件索引', 'User-event index')}</span><strong>{preview.sqliteUserEventRowsToUpdate}</strong><small>{t('行可见性标记', 'visibility rows')}</small></div>
             <div><span>{t('工作区索引', 'Workspace index')}</span><strong>{preview.sqliteCwdRowsToUpdate}</strong><small>{t('行 cwd 路径', 'cwd path rows')}</small></div>
@@ -343,6 +470,9 @@ export function SessionRepairView({ api }: { api: GatewayApi }) {
       {preview?.encryptedSessionFiles ? (
         <div className="warning-banner warning-banner--danger"><div><AlertTriangle size={17} /><div><strong>{t('检测到 encrypted_content', 'encrypted_content detected')}</strong><span>{t(`${preview.encryptedSessionFiles} 个会话来自 ${preview.encryptedSourceProviders.join('、')}。修复可恢复列表可见性，但续聊或压缩旧上下文时仍可能要求原账号/provider。`, `${preview.encryptedSessionFiles} sessions came from ${preview.encryptedSourceProviders.join(', ')}. Repair can restore list visibility, but continuing or compacting older context may still require the original account/provider.`)}</span></div></div></div>
       ) : null}
+      {preview?.rolloutFilesWithoutSessionMeta ? (
+        <div className="warning-banner warning-banner--danger"><div><AlertTriangle size={17} /><div><strong>{t('存在无法识别的会话元数据', 'Unrecognized session metadata detected')}</strong><span>{t(`${preview.rolloutFilesWithoutSessionMeta} 个会话文件没有可识别的 session_meta，Stone+ 不会把它们误报为已同步，也不会盲目改写。`, `${preview.rolloutFilesWithoutSessionMeta} session files have no recognizable session_meta. Stone+ will neither report them as synchronized nor rewrite them blindly.`)}</span></div></div></div>
+      ) : null}
       {preview?.globalStateConflictingFields.length ? (
         <div className="warning-banner"><div><AlertTriangle size={17} /><div><strong>{t('工作区状态存在冲突', 'Workspace-state conflicts detected')}</strong><span>{t(`为避免覆盖不同值，以下字段不会自动规范化：${preview.globalStateConflictingFields.join('、')}`, `To avoid overwriting different values, these fields will not be normalized automatically: ${preview.globalStateConflictingFields.join(', ')}`)}</span></div></div></div>
       ) : null}
@@ -364,7 +494,7 @@ export function SessionRepairView({ api }: { api: GatewayApi }) {
       <ConfirmDialog
         open={confirmOpen}
         title={t('修复 Codex 历史会话', 'Repair Codex session history')}
-        message={t(`将关闭 Codex，把 ${preview?.rolloutFilesToUpdate ?? 0} 个会话文件、${preview ? preview.sqliteProviderRowsToUpdate + preview.sqliteUserEventRowsToUpdate + preview.sqliteCwdRowsToUpdate : 0} 行索引和 ${preview?.globalStateFieldsToUpdate ?? 0} 个工作区状态字段同步到 ${preview?.targetProvider ?? targetProvider}，创建备份后再重新开启。是否继续？`, `Close Codex, synchronize ${preview?.rolloutFilesToUpdate ?? 0} session files, ${preview ? preview.sqliteProviderRowsToUpdate + preview.sqliteUserEventRowsToUpdate + preview.sqliteCwdRowsToUpdate : 0} index rows, and ${preview?.globalStateFieldsToUpdate ?? 0} workspace-state fields to ${preview?.targetProvider ?? targetProvider}, create a backup, then reopen Codex. Continue?`)}
+        message={t(`当前预览已扫描 ${totalRollouts} 个会话并识别 ${preview?.rolloutFilesWithSessionMeta ?? 0} 个，预计同步 ${totalChanges} 项。继续后将关闭 Codex，基于关闭后的最新快照生成一次修复计划，创建备份，安全应用到 ${preview?.targetProvider ?? targetProvider} 后重新开启。是否继续？`, `The current preview scanned ${totalRollouts} sessions, recognized ${preview?.rolloutFilesWithSessionMeta ?? 0}, and estimates ${totalChanges} changes. Continuing closes Codex, builds one repair plan from the latest post-shutdown snapshot, creates a backup, safely applies it to ${preview?.targetProvider ?? targetProvider}, and then reopens Codex. Continue?`)}
         confirmLabel={t('关闭、备份并修复', 'Close, back up, and repair')}
         busy={busy === 'repair'}
         onCancel={() => setConfirmOpen(false)}

@@ -3,7 +3,13 @@ import { createHash, randomUUID } from 'node:crypto'
 import { isIP } from 'node:net'
 import { isAbsolute, join, normalize } from 'node:path'
 import { valid as validSemver } from 'semver'
-import { clientNativeProtocols, supportsFastServiceTier } from '@shared/types'
+import {
+  DEFAULT_ACCOUNT_MAX_CONCURRENCY,
+  clientNativeProtocols,
+  supportsFastServiceTier,
+  supportsPoolFastServiceTier,
+} from '@shared/types'
+import { accountMatchesPoolProtocol } from '@shared/pool-protocol'
 import {
   accumulateOpenAiTokenCost,
   createOpenAiTokenCostAccumulator,
@@ -14,9 +20,12 @@ import {
 import {
   appendRuntimeRouteSourcePools,
   hasRouteSourceIdCollision,
+  isNativeGrokRouteSource,
   isAvailableRouteAccount,
   resolveRouteSource,
 } from '@shared/route-sources'
+import { normalizeRouteModelMap } from '@shared/route-models'
+import { providerSourceFamily } from '@shared/source-family'
 import {
   inferUpstreamCapabilities,
   normalizeCapabilityProfile,
@@ -25,6 +34,7 @@ import {
 import type {
   Account,
   AccountCodexQuotaSnapshot,
+  AccountGrokQuotaSnapshot,
   AccountInput,
   AccountQuotaSnapshot,
   AccountTagAssignmentInput,
@@ -45,6 +55,7 @@ import type {
   ChatGptAccountExportFormat,
   ChatGptAccountImportInput,
   ChatGptAccountImportProxyMode,
+  GrokAccountImportInput,
   CodexQuotaHistoryPoint,
   CodexQuotaCycleCosts,
   GatewaySettings,
@@ -55,6 +66,7 @@ import type {
   Pool,
   PoolInput,
   PoolMember,
+  PoolProtocol,
   ProxyDefinition,
   ProxyInput,
   PublicProxyDefinition,
@@ -90,11 +102,16 @@ import {
   agentIdentitySensitiveValues,
   deserializeChatGptAgentIdentity,
   deserializeChatGptCredential,
+  deserializeGrokOAuthCredential,
+  GROK_OAUTH_BASE_URL,
   matchesChatGptCredential,
+  matchesGrokOAuthCredential,
   parseChatGptAccountImport,
+  parseGrokOAuthImport,
   parseChatGptAgentIdentityImport,
   serializeChatGptAgentIdentity,
-  serializeChatGptCredential
+  serializeChatGptCredential,
+  serializeGrokOAuthCredential
 } from '../auth'
 import { applySetupRoutingDraft } from '../setup/setup-routing'
 import { SetupWizardRepository } from '../setup/setup-state'
@@ -166,8 +183,11 @@ type AccountCheckPatch = Partial<Pick<Account,
   'cooldownReason' |
   'circuitState' |
   'consecutiveFailures' |
+  'quotaRemaining' |
+  'quotaUnit' |
   'quota' |
-  'codexQuota'
+  'codexQuota' |
+  'grokQuota'
 >>
 
 export class AppStore {
@@ -472,6 +492,39 @@ export class AppStore {
     await this.store.mutate((state) => {
       const existing = input.id ? state.providers.find((provider) => provider.id === input.id) : undefined
       const sourceType = input.sourceType ?? existing?.sourceType ?? inferProviderSourceType(input.kind, input.baseUrl)
+      if (input.kind === 'xai-compatible' && sourceType !== 'relay') {
+        throw new Error('xAI-compatible providers are supported only as relay sources.')
+      }
+      if (input.kind === 'xai' && sourceType !== 'official-api') {
+        throw new Error('Official xAI providers must use the official API source type.')
+      }
+      if (input.kind === 'xai' && input.protocol !== 'openai-responses') {
+        throw new Error('Official xAI providers use the native OpenAI Responses API.')
+      }
+      if (existing && (existing.protocol !== input.protocol
+        || existing.sourceType !== sourceType
+        || providerSourceFamily(existing.kind) !== providerSourceFamily(input.kind))) {
+        const providerAccountIds = new Set(state.accounts
+          .filter((account) => account.providerId === existing.id)
+          .map((account) => account.id))
+        const nextFamily = providerSourceFamily(input.kind)
+        const nextProvider = { kind: input.kind, protocol: input.protocol, sourceType }
+        const incompatiblePool = state.pools.find((pool) => pool.members.some((member) => providerAccountIds.has(member.accountId))
+          && pool.members.some((member) => {
+            const account = state.accounts.find((candidate) => candidate.id === member.accountId)
+            if (!account) return true
+            const memberProvider = providerAccountIds.has(member.accountId)
+              ? nextProvider
+              : state.providers.find((candidate) => candidate.id === account.providerId)
+            if (!memberProvider || providerSourceFamily(memberProvider.kind) !== nextFamily) return true
+            return pool.kind === 'relay-aggregate'
+              ? memberProvider.sourceType !== 'relay' || memberProvider.protocol !== pool.protocol
+              : !accountMatchesPoolProtocol(pool.protocol, account, memberProvider)
+          }))
+        if (incompatiblePool) {
+          throw new Error('Remove incompatible pool memberships before changing the provider protocol or family.')
+        }
+      }
       const responsesCompactMode = resolveResponsesCompactModeInput(
         input.responsesCompactMode,
         existing?.responsesCompactMode,
@@ -483,7 +536,7 @@ export class AppStore {
         name,
         sourceType,
         kind: input.kind,
-        baseUrl: normalizeUrl(input.baseUrl),
+        baseUrl: input.kind === 'xai' ? 'https://api.x.ai/v1' : normalizeUrl(input.baseUrl),
         protocol: input.protocol,
         models: normalizeModels(input.models),
         icon: existing?.icon,
@@ -494,14 +547,14 @@ export class AppStore {
         ...(responsesCompactMode ? { responsesCompactMode } : {}),
         capabilityProfile: normalizeCapabilityProfile(
           input.capabilityProfile ?? existing?.capabilityProfile,
-          inferUpstreamCapabilities({ protocol: input.protocol, sourceType, responsesCompactMode }),
+          inferUpstreamCapabilities({ protocol: input.protocol, kind: input.kind, sourceType, responsesCompactMode }),
         ),
         modelCatalog: normalizeModelCatalog(
           input.modelCatalog ?? existing?.modelCatalog,
           normalizeModels(input.models),
           normalizeCapabilityProfile(
             input.capabilityProfile ?? existing?.capabilityProfile,
-            inferUpstreamCapabilities({ protocol: input.protocol, sourceType, responsesCompactMode }),
+            inferUpstreamCapabilities({ protocol: input.protocol, kind: input.kind, sourceType, responsesCompactMode }),
           ),
         ),
         createdAt: existing?.createdAt ?? timestamp,
@@ -512,6 +565,14 @@ export class AppStore {
       } else {
         state.providers.push(provider)
       }
+      assertAffectedGrokBuildSources(state, [
+        provider.id,
+        ...state.pools
+          .filter((pool) => pool.members.some((member) => state.accounts.some((account) => (
+            account.id === member.accountId && account.providerId === provider.id
+          ))))
+          .map((pool) => pool.id),
+      ])
     }, ['providers', 'accounts'])
     return this.getSnapshot()
   }
@@ -561,6 +622,7 @@ export class AppStore {
         !== expectedConnectionFingerprint) return
       const fallback = inferUpstreamCapabilities({
         protocol: provider.protocol,
+        kind: provider.kind,
         sourceType: provider.sourceType,
         responsesCompactMode: provider.responsesCompactMode,
       })
@@ -601,7 +663,8 @@ export class AppStore {
     if (!provider || provider.sourceType === 'oauth-system') return undefined
     const account = state.accounts.find((candidate) => candidate.providerId === sourceId
       && candidate.credentialType !== 'chatgpt-oauth'
-      && candidate.credentialType !== 'chatgpt-agent-identity')
+      && candidate.credentialType !== 'chatgpt-agent-identity'
+      && candidate.credentialType !== 'grok-oauth')
     if (!account) return undefined
     const encrypted = state.credentials[account.credentialId]
     return encrypted ? this.decrypt(encrypted) : undefined
@@ -673,7 +736,7 @@ export class AppStore {
         throw new Error('Choose an existing provider before saving an account.')
       }
       const existing = input.id ? state.accounts.find((account) => account.id === input.id) : undefined
-      if ((existing?.credentialType === 'chatgpt-oauth' || existing?.credentialType === 'chatgpt-agent-identity') && (
+      if ((existing?.credentialType === 'chatgpt-oauth' || existing?.credentialType === 'chatgpt-agent-identity' || existing?.credentialType === 'grok-oauth') && (
         existing.providerId !== input.providerId || input.credential?.trim()
       )) {
         throw new Error('ChatGPT OAuth credentials and providers must be updated by importing a new session.')
@@ -683,6 +746,25 @@ export class AppStore {
       }
       if (existing && existing.providerId !== input.providerId && !input.credential?.trim()) {
         throw new Error('Changing an account provider requires a new credential.')
+      }
+      if (existing && existing.providerId !== input.providerId) {
+        const nextProvider = state.providers.find((provider) => provider.id === input.providerId)
+        const nextFamily = nextProvider ? providerSourceFamily(nextProvider.kind) : undefined
+        const incompatiblePool = state.pools.find((pool) => pool.members.some((member) => member.accountId === existing.id)
+          && pool.members.some((member) => {
+            const memberAccount = state.accounts.find((account) => account.id === member.accountId)
+            if (!memberAccount) return true
+            const memberProvider = member.accountId === existing.id
+              ? nextProvider
+              : state.providers.find((provider) => provider.id === memberAccount.providerId)
+            if (!memberProvider || providerSourceFamily(memberProvider.kind) !== nextFamily) return true
+            return pool.kind === 'relay-aggregate'
+              ? memberProvider.sourceType !== 'relay' || memberProvider.protocol !== pool.protocol
+              : !accountMatchesPoolProtocol(pool.protocol, memberAccount, memberProvider)
+          }))
+        if (incompatiblePool) {
+          throw new Error('Remove incompatible pool memberships before changing the account provider.')
+        }
       }
       if (input.tagId !== undefined && existing?.credentialType !== 'chatgpt-oauth' && existing?.credentialType !== 'chatgpt-agent-identity') {
         throw new Error('Only ChatGPT accounts can use account tags.')
@@ -734,9 +816,12 @@ export class AppStore {
         quotaUnit: existing?.quotaUnit,
         quota: existing?.quota,
         codexQuota: existing?.codexQuota,
-        quotaProtection: input.quotaProtection === undefined
-          ? existing?.quotaProtection
-          : normalizeQuotaProtection(input.quotaProtection),
+        grokQuota: existing?.grokQuota,
+        quotaProtection: existing?.credentialType === 'grok-oauth'
+          ? undefined
+          : input.quotaProtection === undefined
+            ? existing?.quotaProtection
+            : normalizeQuotaProtection(input.quotaProtection),
         cooldownUntil: credentialChanged ? undefined : existing?.cooldownUntil,
         cooldownReason: credentialChanged ? undefined : existing?.cooldownReason,
         circuitState: credentialChanged ? 'closed' : existing?.circuitState,
@@ -759,6 +844,13 @@ export class AppStore {
       if (selectedPolicyChanged) {
         reconcilePoolModelAllowlists(state, timestamp, new Set([account.id]))
       }
+      assertAffectedGrokBuildSources(state, [
+        input.providerId,
+        ...(existing ? [existing.providerId] : []),
+        ...state.pools
+          .filter((pool) => pool.members.some((member) => member.accountId === account.id))
+          .map((pool) => pool.id),
+      ])
     }, ['providers', 'accounts', 'credentials', 'pools'])
     this.pruneCredentialCache()
     return this.getSnapshot()
@@ -810,8 +902,9 @@ export class AppStore {
       if (missing.length > 0) throw new Error('One of the selected accounts no longer exists.')
       if (state.accounts.some((account) => accountIds.includes(account.id)
         && account.credentialType !== 'chatgpt-oauth'
-        && account.credentialType !== 'chatgpt-agent-identity')) {
-        throw new Error('Only ChatGPT accounts can use account tags.')
+        && account.credentialType !== 'chatgpt-agent-identity'
+        && account.credentialType !== 'grok-oauth')) {
+        throw new Error('Only ChatGPT and Grok accounts can use account tags.')
       }
       const tagId = optionalAccountTagId(input.tagId, state.accountTags)
       const selected = new Set(accountIds)
@@ -845,7 +938,7 @@ export class AppStore {
     await this.store.mutate((state) => {
       const proxySelection = normalizeAccountImportProxySelection(input.proxyMode, input.proxyId, state.proxies)
       const tagId = optionalAccountTagId(input.tagId ?? null, state.accountTags)
-      validateChatGptImportPoolId(input.poolId ?? null, state.pools)
+      validateChatGptImportPoolId(input.poolId ?? null, state)
       const provider = ensureOAuthSystemProvider(state, timestamp)
       for (const [index, bundle] of parsed.accounts.entries()) {
         let existing: Account | undefined
@@ -889,7 +982,7 @@ export class AppStore {
           status: credentialBundle.expiresAt <= timestamp ? 'expired' : 'active',
           priority: existing?.priority ?? 10,
           weight: existing?.weight ?? 10,
-          maxConcurrency: existing?.maxConcurrency ?? 4,
+          maxConcurrency: existing?.maxConcurrency ?? DEFAULT_ACCOUNT_MAX_CONCURRENCY,
           inFlight: existing?.inFlight ?? 0,
           availableModels: existing?.availableModels ?? [],
           modelsRefreshedAt: existing?.modelsRefreshedAt,
@@ -898,7 +991,7 @@ export class AppStore {
           proxyId,
           quota: existing?.quota,
           codexQuota: existing?.codexQuota,
-          quotaProtection: existing?.quotaProtection,
+          quotaProtection: undefined,
           cooldownUntil: undefined,
           cooldownReason: undefined,
           circuitState: 'closed',
@@ -932,6 +1025,9 @@ export class AppStore {
         }
         const accountId = existing?.id ?? createId()
         const credentialId = existing?.credentialId ?? createId()
+        const proxyId = proxySelection.mode === 'preserve'
+          ? existing?.proxyId
+          : resolveImportedAccountProxyId(proxySelection, undefined, state.proxies)
         state.credentials[credentialId] = this.encrypt(serializeChatGptAgentIdentity(bundle))
         const account: Account = {
           id: accountId,
@@ -946,13 +1042,13 @@ export class AppStore {
           status: 'active',
           priority: existing?.priority ?? 10,
           weight: existing?.weight ?? 10,
-          maxConcurrency: existing?.maxConcurrency ?? 4,
+          maxConcurrency: existing?.maxConcurrency ?? DEFAULT_ACCOUNT_MAX_CONCURRENCY,
           inFlight: existing?.inFlight ?? 0,
           availableModels: existing?.availableModels ?? [],
           modelsRefreshedAt: existing?.modelsRefreshedAt,
           modelPolicy: existing?.modelPolicy ?? (existing?.modelAllowlist.length ? 'selected' : 'all'),
           modelAllowlist: existing?.modelAllowlist ?? [],
-          proxyId: existing?.proxyId,
+          proxyId,
           quota: existing?.quota,
           codexQuota: existing?.codexQuota,
           circuitState: 'closed',
@@ -992,10 +1088,119 @@ export class AppStore {
     }
   }
 
+  public async importGrokAccounts(input: GrokAccountImportInput) {
+    const parsed = parseGrokOAuthImport(input.content)
+    const importedAccountIds: string[] = []
+    const createdAccountIds: string[] = []
+    const updatedAccountIds: string[] = []
+    const timestamp = Date.now()
+    await this.store.mutate((state) => {
+      const provider = ensureGrokOAuthSystemProvider(state, timestamp)
+      let grokTag = state.accountTags.find((tag) => tag.name.localeCompare('Grok', undefined, { sensitivity: 'accent' }) === 0)
+      if (!grokTag) {
+        grokTag = {
+          id: state.accountTags.some((tag) => tag.id === 'tag-grok') ? createId() : 'tag-grok',
+          name: 'Grok',
+          createdAt: timestamp,
+          updatedAt: timestamp,
+        }
+        state.accountTags.push(grokTag)
+      }
+      const proxyId = optionalProxyId(input.proxyId, state.proxies)
+      const pool = input.poolId ? state.pools.find((candidate) => candidate.id === input.poolId) : undefined
+      if (input.poolId && !pool) throw new Error('Grok account pool not found.')
+      if (pool && (pool.kind !== 'standard' || pool.protocol !== 'grok')) {
+        throw new Error('Grok OAuth accounts require a standard Grok pool.')
+      }
+      if (pool) {
+        const providers = new Map(state.providers.map((candidate) => [candidate.id, candidate]))
+        const foreign = pool.members.some((member) => {
+          const account = state.accounts.find((candidate) => candidate.id === member.accountId)
+          const memberProvider = account ? providers.get(account.providerId) : undefined
+          return !account || !accountMatchesPoolProtocol('grok', account, memberProvider)
+        })
+        if (foreign) throw new Error('A Grok pool cannot contain OpenAI accounts.')
+      }
+      for (const [index, imported] of parsed.accounts.entries()) {
+        let existing: Account | undefined
+        let existingBundle: ReturnType<typeof deserializeGrokOAuthCredential> = undefined
+        for (const candidate of state.accounts) {
+          if (candidate.credentialType !== 'grok-oauth') continue
+          const encrypted = state.credentials[candidate.credentialId]
+          const decrypted = encrypted ? this.decrypt(encrypted) : undefined
+          const saved = decrypted ? deserializeGrokOAuthCredential(decrypted) : undefined
+          if (saved && matchesGrokOAuthCredential(imported.bundle, saved)) {
+            existing = candidate
+            existingBundle = saved
+            break
+          }
+        }
+        const credentialBundle = existingBundle?.refreshToken && !imported.bundle.refreshToken
+          ? {
+              ...existingBundle,
+              ...imported.bundle,
+              refreshToken: existingBundle.refreshToken,
+              idToken: imported.bundle.idToken ?? existingBundle.idToken,
+            }
+          : imported.bundle
+        const accountId = existing?.id ?? createId()
+        const credentialId = existing?.credentialId ?? createId()
+        state.credentials[credentialId] = this.encrypt(serializeGrokOAuthCredential(credentialBundle))
+        const account: Account = {
+          id: accountId,
+          providerId: provider.id,
+          name: requiredName(imported.name || existing?.name || imported.bundle.email || `Grok account ${index + 1}`, 'Account name'),
+          credentialId,
+          maskedCredential: maskAccountId(credentialBundle.email ?? credentialBundle.subjectId),
+          credentialType: 'grok-oauth',
+          credentialExpiresAt: credentialBundle.expiresAt,
+          renewable: Boolean(credentialBundle.refreshToken),
+          tagId: grokTag.id,
+          status: credentialBundle.expiresAt <= timestamp && !credentialBundle.refreshToken ? 'expired' : 'active',
+          priority: existing?.priority ?? Math.min(100, imported.priority ?? 1),
+          weight: existing?.weight ?? 10,
+          maxConcurrency: existing?.maxConcurrency ?? Math.min(100, imported.concurrency ?? 1),
+          inFlight: existing?.inFlight ?? 0,
+          availableModels: provider.models,
+          modelsRefreshedAt: undefined,
+          // Grok OAuth uses a fixed trusted catalog and cannot perform the
+          // generic model-list probe. Treat that catalog as an allowlist so a
+          // Codex model name cannot be sent upstream before route mapping.
+          modelPolicy: 'selected',
+          modelAllowlist: provider.models,
+          proxyId,
+          quotaRemaining: existing?.quotaRemaining,
+          quotaUnit: existing?.quotaUnit,
+          quota: existing?.quota,
+          grokQuota: existing?.grokQuota,
+          quotaProtection: existing?.quotaProtection,
+          cooldownUntil: undefined,
+          cooldownReason: undefined,
+          circuitState: 'closed',
+          consecutiveFailures: 0,
+          latencyMs: existing?.latencyMs,
+          lastUsedAt: existing?.lastUsedAt,
+          lastError: undefined,
+          createdAt: existing?.createdAt ?? timestamp,
+          updatedAt: Math.max(timestamp, (existing?.updatedAt ?? 0) + 1),
+        }
+        if (existing) { replaceById(state.accounts, account); updatedAccountIds.push(accountId) }
+        else { state.accounts.push(account); createdAccountIds.push(accountId) }
+        importedAccountIds.push(accountId)
+        if (pool && !pool.members.some((member) => member.accountId === accountId)) {
+          pool.members.push({ accountId, enabled: true })
+          pool.updatedAt = timestamp
+        }
+      }
+    }, ['providers', 'accounts', 'accountTags', 'credentials', 'pools'])
+    this.pruneCredentialCache()
+    return { snapshot: this.getSnapshot(), importedAccountIds, createdAccountIds, updatedAccountIds, warnings: parsed.warnings }
+  }
+
   public validateChatGptImportAssignments(tagId: string | null | undefined, poolId: string | null | undefined): void {
     const state = this.store.read()
     optionalAccountTagId(tagId ?? null, state.accountTags)
-    validateChatGptImportPoolId(poolId ?? null, state.pools)
+    validateChatGptImportPoolId(poolId ?? null, state)
   }
 
   public async addDetectedChatGptAccountsToPool(
@@ -1007,7 +1212,7 @@ export class AppStore {
     let added = 0
     let alreadyPresent = 0
     await this.store.mutate((state) => {
-      const pool = validateChatGptImportPoolId(poolId, state.pools)
+      const pool = validateChatGptImportPoolId(poolId, state)
       if (!pool) return
       const providersById = new Map(state.providers.map((provider) => [provider.id, provider]))
       for (const accountId of uniqueAccountIds) {
@@ -1125,12 +1330,23 @@ export class AppStore {
     await this.store.mutate((state) => {
       const missing = selectedIds.filter((id) => !state.accounts.some((account) => account.id === id))
       if (missing.length) throw new Error('One of the selected accounts no longer exists.')
-      for (const pool of state.pools) {
+      const deletedPoolIds = new Set<string>()
+      state.pools = state.pools.flatMap((pool) => {
         const members = pool.members.filter((member) => !selectedIdSet.has(member.accountId))
-        if (members.length === pool.members.length) continue
-        pool.members = members
-        pool.updatedAt = timestamp
-      }
+        if (members.length === pool.members.length) return [pool]
+        if (members.length === 0 || (pool.kind === 'relay-aggregate' && members.length < 2)) {
+          deletedPoolIds.add(pool.id)
+          return []
+        }
+        return [{
+          ...pool,
+          members: pool.kind === 'relay-aggregate'
+            ? members.sort((left, right) => (left.order ?? 0) - (right.order ?? 0))
+              .map((member, order) => ({ ...member, order }))
+            : members,
+          updatedAt: timestamp,
+        }]
+      })
       for (const account of state.accounts) {
         if (selectedIdSet.has(account.id)) delete state.credentials[account.credentialId]
       }
@@ -1139,7 +1355,8 @@ export class AppStore {
         .filter((provider) => provider.sourceType === 'official-api' || provider.sourceType === 'relay')
         .filter((provider) => !state.accounts.some((account) => account.providerId === provider.id))
         .map((provider) => provider.id))
-      state.routes = state.routes.map((route) => orphanedSourceIds.has(route.poolId)
+      state.providers = state.providers.filter((provider) => !orphanedSourceIds.has(provider.id))
+      state.routes = state.routes.map((route) => orphanedSourceIds.has(route.poolId) || deletedPoolIds.has(route.poolId)
         ? { ...route, enabled: false, poolId: '', updatedAt: timestamp }
         : route)
       reconcilePoolModelAllowlists(state, timestamp)
@@ -1559,7 +1776,10 @@ export class AppStore {
     if (candidate.format !== 'stone-client-profile' || candidate.version !== 1 || !candidate.profile) {
       throw new Error('Unsupported client profile bundle.')
     }
-    if (candidate.profile.client !== 'claude' && candidate.profile.client !== 'codex' && candidate.profile.client !== 'gemini') {
+    if (candidate.profile.client !== 'claude'
+      && candidate.profile.client !== 'codex'
+      && candidate.profile.client !== 'gemini'
+      && candidate.profile.client !== 'grokbuild') {
       throw new Error('Unsupported client profile target.')
     }
     return this.saveClientProfile({
@@ -1601,26 +1821,44 @@ export class AppStore {
       const incompatible = accountIds.some((accountId) => {
         const account = state.accounts.find((candidate) => candidate.id === accountId)
         const provider = state.providers.find((candidate) => candidate.id === account?.providerId)
-        return provider?.protocol !== input.protocol
+        return !account || !accountMatchesPoolProtocol(input.protocol, account, provider)
       })
       if (incompatible) {
         throw new Error('Every account in a pool must use the pool protocol.')
       }
+      const sourceFamilies = new Set(accountIds.map((accountId) => {
+        const account = state.accounts.find((candidate) => candidate.id === accountId)
+        const provider = state.providers.find((candidate) => candidate.id === account?.providerId)
+        return provider ? providerSourceFamily(provider.kind) : undefined
+      }))
+      if (sourceFamilies.has(undefined) || sourceFamilies.size !== 1) {
+        throw new Error('Every account in a pool must use the same source family.')
+      }
       const requestedModelAllowlist = normalizeModels(input.modelAllowlist ?? existing?.modelAllowlist ?? [])
       const modelPolicy = resolvePoolInputModelPolicy(input.modelPolicy, input.modelAllowlist !== undefined, existing)
+      const members = mergeStandardPoolMembers(existing?.members ?? [], accountIds, input.protocol, state.accounts, state.providers)
+      const finalFamilies = new Set(members.map((member) => {
+        const account = state.accounts.find((candidate) => candidate.id === member.accountId)
+        const provider = state.providers.find((candidate) => candidate.id === account?.providerId)
+        if (!account || !provider || !accountMatchesPoolProtocol(input.protocol, account, provider)) return undefined
+        return providerSourceFamily(provider.kind)
+      }))
+      if (finalFamilies.has(undefined) || finalFamilies.size !== 1) {
+        throw new Error('Every account in a pool must use the same non-relay source family and protocol.')
+      }
       const pool: Pool = {
         id: existing?.id ?? createId(),
         name,
         kind: 'standard',
         protocol: input.protocol,
         strategy: input.strategy,
-        members: mergeStandardPoolMembers(existing?.members ?? [], accountIds, input.protocol, state.accounts, state.providers),
+        members,
         modelPolicy,
         modelAllowlist: modelPolicy === 'selected' ? requestedModelAllowlist : [],
         stickySessions: input.stickySessions,
         stickyTtlMinutes: positiveInteger(input.stickyTtlMinutes, 60),
         maxRetries: nonNegativeInteger(input.maxRetries),
-        forceFastMode: supportsFastServiceTier(input.protocol)
+        forceFastMode: supportsPoolFastServiceTier(input.protocol)
           && (input.forceFastMode ?? existing?.forceFastMode) === true,
         quotaProtection: input.quotaProtection === undefined
           ? existing?.quotaProtection
@@ -1645,6 +1883,7 @@ export class AppStore {
       } else {
         state.pools.push(pool)
       }
+      assertAffectedGrokBuildSources(state, [pool.id])
     }, ['pools'])
     return this.getSnapshot()
   }
@@ -1679,11 +1918,23 @@ export class AppStore {
       if (route.enabled && !routeSource) {
         throw new Error('Choose an existing pool or API source for the route.')
       }
+      if (route.client === 'grokbuild'
+        && route.poolId.trim()
+        && !isNativeGrokRouteSource(routeSource, state)) {
+        throw new Error('Grok Build routes can only use a Responses-native Grok account pool or relay source.')
+      }
       if (route.enabled && routeSource?.provider && !routeSource.accounts.some(isAvailableRouteAccount)) {
         throw new Error('The selected API source has no available account.')
       }
       if (!route.localToken.trim() && route.enabled) {
         throw new Error('An enabled route requires a local token.')
+      }
+      if (route.enabled && state.routes.some((candidate) => (
+        candidate.id !== route.id
+        && candidate.enabled
+        && candidate.localToken.trim() === route.localToken.trim()
+      ))) {
+        throw new Error('Enabled client routes must use different local tokens.')
       }
       const existing = state.routes.find((candidate) => candidate.id === route.id)
       const cleanRoute: Route = {
@@ -1696,7 +1947,7 @@ export class AppStore {
           ? existing?.highConcurrencyMode === true
           : route.highConcurrencyMode === true,
         localToken: route.localToken.trim() || createLocalToken(),
-        modelMap: normalizeModelMap(route.modelMap),
+        modelMap: normalizeRouteModelMap(route.modelMap),
         createdAt: route.createdAt || timestamp,
         updatedAt: timestamp
       }
@@ -1722,6 +1973,13 @@ export class AppStore {
     await this.store.mutate((state) => {
       const route = state.routes.find((candidate) => candidate.client === client)
       if (!route) throw new Error(`The ${client} client route does not exist.`)
+      if (client === 'grokbuild') {
+        const source = resolveRouteSource(cleanSourceId, state)
+        if (!source) throw new Error('Choose an existing Grok account pool or Grok relay source.')
+        if (!isNativeGrokRouteSource(source, state)) {
+          throw new Error('Grok Build routes can only use a Responses-native Grok account pool or relay source.')
+        }
+      }
       replaceById(state.routes, {
         ...route,
         poolId: cleanSourceId,
@@ -2260,6 +2518,8 @@ export class AppStore {
       for (const sensitive of decrypted
         ? account.credentialType === 'chatgpt-agent-identity'
           ? agentIdentitySensitiveValues(decrypted)
+          : account.credentialType === 'grok-oauth'
+            ? grokOAuthSensitiveValues(decrypted)
           : credentialSensitiveValues(decrypted, account.credentialType === 'chatgpt-oauth')
         : []) values.add(sensitive)
     }
@@ -2343,6 +2603,34 @@ export class AppStore {
       candidate.chatgptAccountId = bundle.accountId
       candidate.credentialExpiresAt = bundle.expiresAt
       candidate.renewable = Boolean(bundle.refreshToken)
+      candidate.updatedAt = Date.now()
+    }, previousEncrypted)
+    if (previousEncrypted) this.decryptedCredentialCache.delete(previousEncrypted)
+    this.decryptedCredentialCache.set(encrypted, serialized)
+  }
+
+  public async updateGrokOAuthCredential(
+    accountId: string,
+    serialized: string,
+    expectedSourceSerialized?: string
+  ): Promise<void> {
+    const bundle = deserializeGrokOAuthCredential(serialized)
+    if (!bundle) throw new Error('Refreshed Grok OAuth credential is invalid.')
+    const account = this.store.selectAccount<Account>(accountId)
+    if (!account || account.credentialType !== 'grok-oauth') throw new Error('Grok OAuth account not found.')
+    const previousEncrypted = this.store.select((state) => state.credentials[account.credentialId])
+    if (expectedSourceSerialized !== undefined && (
+      previousEncrypted === undefined || this.decrypt(previousEncrypted) !== expectedSourceSerialized
+    )) throw new Error('Grok OAuth credential changed while it was being rotated.')
+    const encrypted = this.encrypt(serialized)
+    await this.store.updateAccountCredential<Account>(accountId, account.credentialId, encrypted, (candidate) => {
+      if (candidate.credentialType !== 'grok-oauth') throw new Error('Grok OAuth account not found.')
+      candidate.credentialExpiresAt = bundle.expiresAt
+      candidate.renewable = Boolean(bundle.refreshToken)
+      // Token rotation must not revive an account that the user disabled or a
+      // health probe put into cooldown. Only expiration is owned by OAuth.
+      if (bundle.expiresAt <= Date.now()) candidate.status = 'expired'
+      else if (candidate.status === 'expired') candidate.status = 'active'
       candidate.updatedAt = Date.now()
     }, previousEncrypted)
     if (previousEncrypted) this.decryptedCredentialCache.delete(previousEncrypted)
@@ -2448,44 +2736,7 @@ function createInitialState(): PersistedState {
     builtInProxySettings: createDefaultBuiltInProxySettings(timestamp),
     proxyProfiles: [],
     pools: [],
-    routes: [
-      {
-        id: 'route-claude',
-        client: 'claude',
-        enabled: false,
-        highConcurrencyMode: false,
-        poolId: '',
-        inboundProtocol: 'anthropic-messages',
-        modelMap: {},
-        localToken: createLocalToken(),
-        createdAt: timestamp,
-        updatedAt: timestamp
-      },
-      {
-        id: 'route-codex',
-        client: 'codex',
-        enabled: false,
-        highConcurrencyMode: false,
-        poolId: '',
-        inboundProtocol: 'openai-responses',
-        modelMap: {},
-        localToken: createLocalToken(),
-        createdAt: timestamp,
-        updatedAt: timestamp
-      },
-      {
-        id: 'route-gemini',
-        client: 'gemini',
-        enabled: false,
-        highConcurrencyMode: false,
-        poolId: '',
-        inboundProtocol: 'gemini',
-        modelMap: {},
-        localToken: createLocalToken(),
-        createdAt: timestamp,
-        updatedAt: timestamp
-      }
-    ],
+    routes: createDefaultRoutes(timestamp),
     gateway: { ...DEFAULT_GATEWAY },
     requestLogs: [],
     credentials: {},
@@ -2875,13 +3126,18 @@ function normalizePersistedState(
     : DEFAULT_ACCOUNT_TAGS.map((tag) => ({ ...tag, createdAt: timestamp, updatedAt: timestamp }))
   const accountTagIds = new Set(accountTags.map((tag) => tag.id))
   let providers: ProviderDefinition[] = state.providers.map((provider) => {
-    const sourceType = isUpstreamSourceType(provider.sourceType)
+    const persistedSourceType = isUpstreamSourceType(provider.sourceType)
       ? provider.sourceType
       : inferProviderSourceType(provider.kind, provider.baseUrl)
+    const grokOAuthProvider = provider.kind === 'xai' && persistedSourceType === 'oauth-system'
+    const sourceType = provider.kind === 'xai-compatible'
+      ? 'relay'
+      : provider.kind === 'xai' && !grokOAuthProvider ? 'official-api' : persistedSourceType
+    const protocol = provider.kind === 'xai' ? 'openai-responses' : provider.protocol
     const responsesCompactMode = normalizePersistedResponsesCompactMode(
       provider.responsesCompactMode,
       sourceType,
-      provider.protocol
+      protocol
     )
     // Provider rows are JSON payloads, so this capability is forward-compatible
     // without a SQLite schema migration. Rebuild the row to remove stale or
@@ -2890,7 +3146,8 @@ function normalizePersistedState(
     const capabilityProfile = normalizeCapabilityProfile(
       provider.capabilityProfile,
       inferUpstreamCapabilities({
-        protocol: provider.protocol,
+        protocol,
+        kind: provider.kind,
         sourceType,
         responsesCompactMode,
       }),
@@ -2898,8 +3155,10 @@ function normalizePersistedState(
     return {
       ...baseProvider,
       sourceType,
+      baseUrl: provider.kind === 'xai' ? (grokOAuthProvider ? GROK_OAUTH_BASE_URL : 'https://api.x.ai/v1') : baseProvider.baseUrl,
+      protocol,
       forceFastMode: sourceType === 'relay'
-        && supportsFastServiceTier(provider.protocol)
+        && supportsFastServiceTier(protocol)
         && provider.forceFastMode === true,
       ...(responsesCompactMode ? { responsesCompactMode } : {}),
       capabilityProfile,
@@ -2907,16 +3166,28 @@ function normalizePersistedState(
     }
   })
   let accounts: Account[] = state.accounts.map((account) => {
-    const credentialType = account.credentialType === 'chatgpt-agent-identity'
+    const credentialType = account.credentialType === 'grok-oauth'
+      ? 'grok-oauth' as const
+      : account.credentialType === 'chatgpt-agent-identity'
       ? 'chatgpt-agent-identity' as const
       : account.credentialType === 'chatgpt-oauth' || Boolean(account.chatgptAccountId)
         ? 'chatgpt-oauth' as const
         : 'api-key' as const
-    const availableModels = normalizeModels(account.availableModels)
+    const persistedAvailableModels = normalizeModels(account.availableModels)
+    const grokProviderModels = credentialType === 'grok-oauth'
+      ? normalizeModels(providers.find((provider) => provider.id === account.providerId)?.models)
+      : []
+    const availableModels = credentialType === 'grok-oauth'
+      ? (grokProviderModels.length > 0 ? grokProviderModels : persistedAvailableModels)
+      : persistedAvailableModels
     const modelsRefreshedAt = normalizeTimestamp(account.modelsRefreshedAt)
     const persistedAllowlist = normalizeModels(account.modelAllowlist)
-    const modelPolicy = normalizePersistedModelPolicy(account.modelPolicy, persistedAllowlist)
-    const modelAllowlist = modelPolicy === 'selected'
+    const modelPolicy = credentialType === 'grok-oauth'
+      ? 'selected' as const
+      : normalizePersistedModelPolicy(account.modelPolicy, persistedAllowlist)
+    const modelAllowlist = credentialType === 'grok-oauth'
+      ? availableModels
+      : modelPolicy === 'selected'
       ? modelsRefreshedAt === undefined
         ? persistedAllowlist
         : intersectModels(persistedAllowlist, availableModels)
@@ -2928,20 +3199,25 @@ function normalizePersistedState(
       modelsRefreshedAt,
       modelPolicy,
       modelAllowlist,
-      quotaProtection: normalizeQuotaProtection(account.quotaProtection),
-      ...((credentialType !== 'chatgpt-oauth' && credentialType !== 'chatgpt-agent-identity')
+      grokQuota: credentialType === 'grok-oauth' ? normalizePersistedGrokQuota(account.grokQuota) : undefined,
+      quotaProtection: credentialType === 'grok-oauth'
+        ? undefined
+        : normalizeQuotaProtection(account.quotaProtection),
+      ...((credentialType !== 'chatgpt-oauth'
+        && credentialType !== 'chatgpt-agent-identity'
+        && credentialType !== 'grok-oauth')
         || (account.tagId && !accountTagIds.has(account.tagId)) ? { tagId: undefined } : {}),
       ...(account.proxyId && !proxyIds.has(account.proxyId) ? { proxyId: undefined } : {})
     }
   })
   ;({ providers, accounts } = migrateSourceTopology(providers, accounts, timestamp))
-  const pools: Pool[] = state.pools.map((pool): Pool => {
+  const normalizedPools: Pool[] = state.pools.map((pool): Pool => {
     const persistedAllowlist = normalizeModels(pool.modelAllowlist)
     const modelPolicy = normalizePersistedModelPolicy(pool.modelPolicy, persistedAllowlist)
     return {
       ...pool,
       kind: pool.kind === 'relay-aggregate' ? 'relay-aggregate' : 'standard',
-      forceFastMode: supportsFastServiceTier(pool.protocol) && pool.forceFastMode === true,
+      forceFastMode: supportsPoolFastServiceTier(pool.protocol) && pool.forceFastMode === true,
       members: pool.members.map((member, index) => ({
         accountId: member.accountId,
         enabled: member.enabled,
@@ -2956,6 +3232,7 @@ function normalizePersistedState(
       ...(pool.proxyId && !proxyIds.has(pool.proxyId) ? { proxyId: undefined } : {})
     }
   })
+  const pools = migrateGrokPoolProtocols(normalizedPools, accounts, providers)
   const normalized: PersistedState = {
     ...state,
     version: 1,
@@ -2970,10 +3247,7 @@ function normalizePersistedState(
     proxyProfiles,
     accounts,
     pools,
-    routes: state.routes.map((route) => ({
-      ...route,
-      highConcurrencyMode: route.highConcurrencyMode === true,
-    })),
+    routes: normalizePersistedRoutes(state.routes, timestamp),
     gateway: {
       ...DEFAULT_GATEWAY,
       ...state.gateway,
@@ -3034,8 +3308,47 @@ export function enumeratePoolOpenModels(
     : availableModels
 }
 
+function createDefaultRoutes(timestamp: number): Route[] {
+  return (['claude', 'codex', 'gemini', 'grokbuild'] as const).map((client) => ({
+    id: `route-${client}`,
+    client,
+    enabled: false,
+    highConcurrencyMode: false,
+    poolId: '',
+    inboundProtocol: clientNativeProtocols[client],
+    modelMap: {},
+    localToken: createLocalToken(),
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  }))
+}
+
+function normalizePersistedRoutes(routes: readonly Route[] | undefined, timestamp: number): Route[] {
+  const persisted = Array.isArray(routes) ? routes : []
+  const consumed = new Set<Route>()
+  const defaults = createDefaultRoutes(timestamp).map((fallback) => {
+    const existing = persisted.find((route) => route.client === fallback.client)
+      ?? persisted.find((route) => route.id === fallback.id)
+    if (!existing) return fallback
+    consumed.add(existing)
+    return {
+      ...existing,
+      highConcurrencyMode: existing.highConcurrencyMode === true,
+      modelMap: normalizeRouteModelMap(existing.modelMap),
+    }
+  })
+  return [
+    ...defaults,
+    ...persisted.filter((route) => !consumed.has(route)).map((route) => ({
+      ...route,
+      highConcurrencyMode: route.highConcurrencyMode === true,
+      modelMap: normalizeRouteModelMap(route.modelMap),
+    })),
+  ]
+}
+
 function createDefaultClientProfiles(timestamp: number): ClientConfigProfile[] {
-  return (['claude', 'codex', 'gemini'] as const).map((client) => ({
+  return (['claude', 'codex', 'gemini', 'grokbuild'] as const).map((client) => ({
     id: `default-${client}`,
     name: '默认配置',
     client,
@@ -3123,6 +3436,14 @@ function credentialSensitiveValues(decrypted: string, chatGptOAuth: boolean): st
   const bundle = deserializeChatGptCredential(decrypted)
   return bundle
     ? [decrypted, bundle.accessToken, bundle.accountId, bundle.userId, bundle.refreshToken, bundle.idToken]
+      .filter((value): value is string => Boolean(value))
+    : [decrypted]
+}
+
+function grokOAuthSensitiveValues(decrypted: string): string[] {
+  const bundle = deserializeGrokOAuthCredential(decrypted)
+  return bundle
+    ? [decrypted, bundle.accessToken, bundle.refreshToken, bundle.idToken, bundle.subjectId, bundle.teamId]
       .filter((value): value is string => Boolean(value))
     : [decrypted]
 }
@@ -3431,13 +3752,21 @@ function optionalAccountTagId(
   return id
 }
 
-function validateChatGptImportPoolId(value: string | null | undefined, pools: readonly Pool[]): Pool | undefined {
+function validateChatGptImportPoolId(value: string | null | undefined, state: PersistedState): Pool | undefined {
   const id = value?.trim()
   if (!id) return undefined
-  const pool = pools.find((candidate) => candidate.id === id)
+  const pool = state.pools.find((candidate) => candidate.id === id)
   if (!pool) throw new Error('The selected pool no longer exists.')
   if (pool.kind !== 'standard' || pool.protocol !== 'openai-responses') {
     throw new Error('Imported ChatGPT accounts can only join a standard OpenAI Responses pool.')
+  }
+  const nonOpenAiMember = pool.members.some((member) => {
+    const account = state.accounts.find((candidate) => candidate.id === member.accountId)
+    const provider = state.providers.find((candidate) => candidate.id === account?.providerId)
+    return !provider || providerSourceFamily(provider.kind) !== 'openai'
+  })
+  if (nonOpenAiMember) {
+    throw new Error('Imported ChatGPT accounts can only join an OpenAI account pool.')
   }
   return pool
 }
@@ -3465,6 +3794,32 @@ function ensureOAuthSystemProvider(state: PersistedState, timestamp: number): Pr
   return provider
 }
 
+function ensureGrokOAuthSystemProvider(state: PersistedState, timestamp: number): ProviderDefinition {
+  const existing = state.providers.find((provider) => provider.sourceType === 'oauth-system'
+    && provider.kind === 'xai' && provider.protocol === 'openai-responses')
+  if (existing) {
+    Object.assign(existing, {
+      name: 'Grok OAuth',
+      sourceType: 'oauth-system',
+      kind: 'xai',
+      baseUrl: GROK_OAUTH_BASE_URL,
+      protocol: 'openai-responses',
+      models: ['grok-4.5'],
+      updatedAt: timestamp,
+    } satisfies Partial<ProviderDefinition>)
+    return existing
+  }
+  const preferredId = 'provider-grok-oauth'
+  const provider: ProviderDefinition = {
+    id: state.providers.some((candidate) => candidate.id === preferredId) ? createId() : preferredId,
+    name: 'Grok OAuth', sourceType: 'oauth-system', kind: 'xai',
+    baseUrl: GROK_OAUTH_BASE_URL, protocol: 'openai-responses', color: '#000000',
+    models: ['grok-4.5'], createdAt: timestamp, updatedAt: timestamp,
+  }
+  state.providers.push(provider)
+  return provider
+}
+
 function migrateSourceTopology(
   sourceProviders: ProviderDefinition[],
   sourceAccounts: Account[],
@@ -3474,7 +3829,7 @@ function migrateSourceTopology(
   const accounts = sourceAccounts.map((account) => ({ ...account }))
   const oauthAccounts = accounts.filter((account) => account.credentialType === 'chatgpt-oauth'
     || account.credentialType === 'chatgpt-agent-identity')
-  let oauthProvider = providers.find((provider) => provider.sourceType === 'oauth-system')
+  let oauthProvider = providers.find((provider) => provider.sourceType === 'oauth-system' && provider.kind === 'openai')
   if (oauthAccounts.length > 0 && !oauthProvider) {
     let id = 'provider-chatgpt-oauth'
     let suffix = 1
@@ -3504,9 +3859,44 @@ function migrateSourceTopology(
     for (const account of oauthAccounts) account.providerId = oauthProvider.id
   }
 
+  const grokOAuthAccounts = accounts.filter((account) => account.credentialType === 'grok-oauth')
+  let grokOAuthProvider = providers.find((provider) => provider.sourceType === 'oauth-system'
+    && provider.kind === 'xai' && provider.protocol === 'openai-responses')
+  if (grokOAuthAccounts.length > 0 && !grokOAuthProvider) {
+    let id = 'provider-grok-oauth'
+    let suffix = 1
+    while (providers.some((provider) => provider.id === id)) id = `provider-grok-oauth-${suffix++}`
+    grokOAuthProvider = {
+      id,
+      name: 'Grok OAuth',
+      sourceType: 'oauth-system',
+      kind: 'xai',
+      baseUrl: GROK_OAUTH_BASE_URL,
+      protocol: 'openai-responses',
+      color: '#000000',
+      models: ['grok-4.5'],
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    }
+    providers.push(grokOAuthProvider)
+  }
+  if (grokOAuthProvider) {
+    Object.assign(grokOAuthProvider, {
+      name: 'Grok OAuth',
+      sourceType: 'oauth-system',
+      kind: 'xai',
+      baseUrl: GROK_OAUTH_BASE_URL,
+      protocol: 'openai-responses',
+      models: ['grok-4.5'],
+      updatedAt: timestamp,
+    } satisfies Partial<ProviderDefinition>)
+    for (const account of grokOAuthAccounts) account.providerId = grokOAuthProvider.id
+  }
+
   // Corrupt/legacy API-key accounts must never remain under the hidden OAuth provider.
   for (const account of accounts.filter((candidate) => candidate.credentialType !== 'chatgpt-oauth'
-    && candidate.credentialType !== 'chatgpt-agent-identity')) {
+    && candidate.credentialType !== 'chatgpt-agent-identity'
+    && candidate.credentialType !== 'grok-oauth')) {
     const provider = providers.find((candidate) => candidate.id === account.providerId)
     if (!provider || provider.sourceType !== 'oauth-system') continue
     const id = uniqueMigratedProviderId(providers, `${provider.id}--api-${account.id}`)
@@ -3527,7 +3917,8 @@ function migrateSourceTopology(
     if (provider.sourceType === 'oauth-system') continue
     const members = accounts.filter((account) => account.providerId === provider.id
       && account.credentialType !== 'chatgpt-oauth'
-      && account.credentialType !== 'chatgpt-agent-identity')
+      && account.credentialType !== 'chatgpt-agent-identity'
+      && account.credentialType !== 'grok-oauth')
     for (const account of members.slice(1)) {
       const id = uniqueMigratedProviderId(providers, `${provider.id}--account-${account.id}`)
       providers.push({
@@ -3562,6 +3953,7 @@ function inferProviderSourceType(kind: ProviderInput['kind'], baseUrl: string): 
     const hostname = new URL(baseUrl).hostname.toLowerCase()
     if (
       (kind === 'openai' && hostname === 'api.openai.com')
+      || (kind === 'xai' && hostname === 'api.x.ai')
       || (kind === 'anthropic' && hostname === 'api.anthropic.com')
       || (kind === 'google' && hostname === 'generativelanguage.googleapis.com')
     ) return 'official-api'
@@ -3576,7 +3968,7 @@ function isUpstreamSourceType(value: unknown): value is ProviderDefinition['sour
 }
 
 function isResponsesCompactMode(value: unknown): value is ResponsesCompactMode {
-  return value === 'legacy' || value === 'passthrough' || value === 'native'
+  return value === 'auto' || value === 'legacy' || value === 'passthrough' || value === 'native'
 }
 
 function supportsExplicitResponsesCompactMode(
@@ -3594,7 +3986,7 @@ function resolveResponsesCompactModeInput(
 ): ResponsesCompactMode | undefined {
   if (requested !== undefined) {
     if (!isResponsesCompactMode(requested)) {
-      throw new Error('Responses compact mode must be legacy, passthrough, or native.')
+      throw new Error('Responses compact mode must be auto, legacy, passthrough, or native.')
     }
     if (!supportsExplicitResponsesCompactMode(sourceType, protocol)) {
       throw new Error('Responses compact mode can be configured only for OpenAI Responses relay sources.')
@@ -3603,9 +3995,8 @@ function resolveResponsesCompactModeInput(
   }
   // Editing an existing source through an older renderer must not silently
   // reset its capability. A source/protocol change, however, clears the field.
-  return supportsExplicitResponsesCompactMode(sourceType, protocol) && isResponsesCompactMode(existing)
-    ? existing
-    : undefined
+  if (!supportsExplicitResponsesCompactMode(sourceType, protocol)) return undefined
+  return isResponsesCompactMode(existing) ? existing : 'auto'
 }
 
 function normalizePersistedResponsesCompactMode(
@@ -3613,9 +4004,8 @@ function normalizePersistedResponsesCompactMode(
   sourceType: ProviderDefinition['sourceType'],
   protocol: ProviderDefinition['protocol']
 ): ResponsesCompactMode | undefined {
-  return supportsExplicitResponsesCompactMode(sourceType, protocol) && isResponsesCompactMode(value)
-    ? value
-    : undefined
+  if (!supportsExplicitResponsesCompactMode(sourceType, protocol)) return undefined
+  return isResponsesCompactMode(value) ? value : 'auto'
 }
 
 function normalizePersistedAccountTags(value: unknown): AccountTagDefinition[] {
@@ -3717,6 +4107,96 @@ function normalizeTimestamp(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined
 }
 
+function normalizePersistedGrokQuota(value: unknown): AccountGrokQuotaSnapshot | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const quota = value as Record<string, unknown>
+  const observedAt = normalizeTimestamp(quota.observedAt)
+  const paidClassification = quota.paidClassification === 'paid'
+    || quota.paidClassification === 'free'
+    || quota.paidClassification === 'unknown'
+    ? quota.paidClassification
+    : undefined
+  if (!observedAt || quota.source !== 'grok-build-billing' || !paidClassification) return undefined
+  const monthly = normalizeGrokAmountQuota(quota.monthly, 'limit')
+  const onDemand = normalizeGrokOnDemandQuota(quota.onDemand)
+  const period = normalizeGrokQuotaPeriod(quota.period)
+  const plan = normalizeGrokQuotaPlan(quota.plan)
+  return {
+    ...optionalQuotaNumber('usedPercent', quota.usedPercent, true),
+    ...optionalQuotaNumber('remainingPercent', quota.remainingPercent, true),
+    ...optionalQuotaNumber('limit', quota.limit),
+    ...optionalQuotaNumber('used', quota.used),
+    ...optionalQuotaNumber('remaining', quota.remaining),
+    ...(monthly ? { monthly } : {}),
+    ...(onDemand ? { onDemand } : {}),
+    ...optionalQuotaNumber('prepaidBalance', quota.prepaidBalance),
+    ...(typeof quota.unifiedBilling === 'boolean' ? { unifiedBilling: quota.unifiedBilling } : {}),
+    ...(safeQuotaText(quota.topUpMethod) ? { topUpMethod: safeQuotaText(quota.topUpMethod) } : {}),
+    ...(period ? { period } : {}),
+    ...(normalizeTimestamp(quota.resetAt) ? { resetAt: normalizeTimestamp(quota.resetAt) } : {}),
+    ...(plan ? { plan } : {}),
+    paidClassification,
+    observedAt,
+    source: 'grok-build-billing',
+  }
+}
+
+function normalizeGrokAmountQuota(
+  value: unknown,
+  limitKey: 'limit',
+): AccountGrokQuotaSnapshot['monthly'] | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const quota = value as Record<string, unknown>
+  const result = {
+    ...optionalQuotaNumber(limitKey, quota[limitKey]),
+    ...optionalQuotaNumber('used', quota.used),
+    ...optionalQuotaNumber('remaining', quota.remaining),
+  }
+  return Object.keys(result).length ? result : undefined
+}
+
+function normalizeGrokOnDemandQuota(value: unknown): AccountGrokQuotaSnapshot['onDemand'] | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const quota = value as Record<string, unknown>
+  const result = {
+    ...(typeof quota.enabled === 'boolean' ? { enabled: quota.enabled } : {}),
+    ...optionalQuotaNumber('cap', quota.cap),
+    ...optionalQuotaNumber('used', quota.used),
+    ...optionalQuotaNumber('remaining', quota.remaining),
+  }
+  return Object.keys(result).length ? result : undefined
+}
+
+function normalizeGrokQuotaPeriod(value: unknown): AccountGrokQuotaSnapshot['period'] | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const period = value as Record<string, unknown>
+  const type = safeQuotaText(period.type)
+  const start = safeQuotaText(period.start)
+  const end = safeQuotaText(period.end)
+  return type || start || end ? { ...(type ? { type } : {}), ...(start ? { start } : {}), ...(end ? { end } : {}) } : undefined
+}
+
+function normalizeGrokQuotaPlan(value: unknown): AccountGrokQuotaSnapshot['plan'] | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const plan = value as Record<string, unknown>
+  const code = safeQuotaText(plan.code)
+  const name = safeQuotaText(plan.name)
+  return code || name ? { ...(code ? { code } : {}), ...(name ? { name } : {}) } : undefined
+}
+
+function optionalQuotaNumber<K extends string>(
+  key: K,
+  value: unknown,
+  percent = false,
+): Partial<Record<K, number>> {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return {}
+  return { [key]: percent ? Math.min(100, value) : value } as Partial<Record<K, number>>
+}
+
+function safeQuotaText(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim().slice(0, 256) : undefined
+}
+
 function isModelPolicy(value: unknown): value is ModelPolicy {
   return value === 'all' || value === 'selected'
 }
@@ -3752,7 +4232,7 @@ function resolvePoolInputModelPolicy(
 function mergeStandardPoolMembers(
   existingMembers: readonly PoolMember[],
   enabledAccountIds: readonly string[],
-  protocol: ProviderDefinition['protocol'],
+  protocol: PoolProtocol,
   accounts: readonly Account[],
   providers: readonly ProviderDefinition[],
 ): PoolMember[] {
@@ -3768,7 +4248,7 @@ function mergeStandardPoolMembers(
     }
     const account = accountById.get(existingMember.accountId)
     const provider = account ? providerById.get(account.providerId) : undefined
-    if (!existingMember.enabled && provider?.protocol === protocol && provider.sourceType !== 'relay') {
+    if (!existingMember.enabled && account && accountMatchesPoolProtocol(protocol, account, provider)) {
       members.push({ ...existingMember, enabled: false })
     }
   }
@@ -3777,6 +4257,55 @@ function mergeStandardPoolMembers(
     if (remainingEnabledIds.delete(accountId)) members.push({ accountId, enabled: true })
   }
   return members
+}
+
+/**
+ * Existing Grok pools were persisted as OpenAI Responses before the logical
+ * Grok protocol existed. Migrate only unambiguous pools in place so route ids,
+ * bindings and credentials remain untouched. Mixed or damaged pools are kept
+ * verbatim and rejected by normal membership/runtime validation.
+ */
+function migrateGrokPoolProtocols(
+  pools: readonly Pool[],
+  accounts: readonly Account[],
+  providers: readonly ProviderDefinition[],
+): Pool[] {
+  const accountById = new Map(accounts.map((account) => [account.id, account]))
+  const providerById = new Map(providers.map((provider) => [provider.id, provider]))
+  return pools.map((pool) => {
+    if (pool.kind !== 'standard' || pool.protocol === 'grok' || pool.members.length === 0) return pool
+    const allGrok = pool.members.every((member) => {
+      const account = accountById.get(member.accountId)
+      const provider = account ? providerById.get(account.providerId) : undefined
+      return Boolean(account
+        && provider
+        && provider.protocol === pool.protocol
+        && accountMatchesPoolProtocol('grok', account, provider))
+    })
+    if (!allGrok) return pool
+    return {
+      ...pool,
+      protocol: 'grok',
+      forceFastMode: false,
+      hedgedRequests: false,
+      updatedAt: pool.updatedAt,
+    }
+  })
+}
+
+/**
+ * Guard write paths that can change the effective family of an already-bound
+ * source. Route selection validates the same boundary, but provider, account,
+ * and pool editors must not be able to invalidate it behind the route editor.
+ */
+function assertAffectedGrokBuildSources(state: PersistedState, sourceIds: readonly string[]): void {
+  const affected = new Set(sourceIds)
+  for (const route of state.routes) {
+    if (route.client !== 'grokbuild' || !affected.has(route.poolId)) continue
+    if (!isNativeGrokRouteSource(resolveRouteSource(route.poolId, state), state)) {
+      throw new Error('A source used by Grok Build must remain a Responses-native Grok account pool or relay source.')
+    }
+  }
 }
 
 function sameModels(left: readonly string[], right: readonly string[]): boolean {
@@ -3830,7 +4359,8 @@ function apiSourceConnectionFingerprint(
   if (!provider || provider.sourceType === 'oauth-system') throw new Error('API source not found.')
   const account = state.accounts.find((candidate) => candidate.providerId === sourceId
     && candidate.credentialType !== 'chatgpt-oauth'
-    && candidate.credentialType !== 'chatgpt-agent-identity')
+    && candidate.credentialType !== 'chatgpt-agent-identity'
+    && candidate.credentialType !== 'grok-oauth')
   if (!account) throw new Error('API source account not found.')
   const encrypted = state.credentials[account.credentialId]
   const credential = encrypted ? decryptCredential(encrypted) : undefined
@@ -3860,7 +4390,8 @@ function apiSourceProbeInputFingerprint(
   if (!provider || provider.sourceType === 'oauth-system') throw new Error('API source not found.')
   const account = state.accounts.find((candidate) => candidate.providerId === sourceId
     && candidate.credentialType !== 'chatgpt-oauth'
-    && candidate.credentialType !== 'chatgpt-agent-identity')
+    && candidate.credentialType !== 'chatgpt-agent-identity'
+    && candidate.credentialType !== 'grok-oauth')
   if (!account) throw new Error('API source account not found.')
   const suppliedCredential = input.credential?.trim()
   const encrypted = state.credentials[account.credentialId]
@@ -3929,14 +4460,6 @@ function reconcilePoolModelAllowlists(
     pool.modelAllowlist = modelAllowlist
     pool.updatedAt = timestamp
   }
-}
-
-function normalizeModelMap(modelMap: Record<string, string>): Record<string, string> {
-  return Object.fromEntries(
-    Object.entries(modelMap)
-      .map(([source, target]) => [source.trim(), target.trim()] as const)
-      .filter(([source, target]) => source.length > 0 && target.length > 0)
-  )
 }
 
 function requiredName(value: string, label: string): string {

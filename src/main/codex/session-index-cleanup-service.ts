@@ -36,6 +36,21 @@ interface SessionIndexCleanupServiceOptions {
   now?: () => Date
   randomId?: () => string
   blockingCodexPids?: () => Promise<number[]>
+  /** Bounds rollout file IO without changing the conservative classification rules. */
+  scanConcurrency?: number
+  maxRolloutFiles?: number
+  maxReferenceDatabases?: number
+}
+
+export interface SessionIndexCleanupScanProgress {
+  phase: 'rollouts' | 'databases'
+  completed: number
+  total: number
+}
+
+export interface SessionIndexCleanupScanOptions {
+  signal?: AbortSignal
+  onProgress?: (progress: SessionIndexCleanupScanProgress) => void
 }
 
 interface SessionIndexPlan {
@@ -51,6 +66,9 @@ export class CodexSessionIndexCleanupService {
   private readonly now: () => Date
   private readonly randomId: () => string
   private readonly blockingCodexPids: () => Promise<number[]>
+  private readonly scanConcurrency: number
+  private readonly maxRolloutFiles: number
+  private readonly maxReferenceDatabases: number
   private active = false
 
   constructor(options: SessionIndexCleanupServiceOptions) {
@@ -58,30 +76,38 @@ export class CodexSessionIndexCleanupService {
     this.now = options.now ?? (() => new Date())
     this.randomId = options.randomId ?? (() => randomUUID().slice(0, 12))
     this.blockingCodexPids = options.blockingCodexPids ?? findBlockingWindowsCodexPids
+    this.scanConcurrency = positiveInteger(options.scanConcurrency, 8, 'scanConcurrency')
+    this.maxRolloutFiles = positiveInteger(options.maxRolloutFiles, 100_000, 'maxRolloutFiles')
+    this.maxReferenceDatabases = positiveInteger(options.maxReferenceDatabases, 256, 'maxReferenceDatabases')
   }
 
-  async preview(): Promise<CodexSessionIndexCleanupPreview> {
-    const plan = await this.buildPlan()
+  async preview(options: SessionIndexCleanupScanOptions = {}): Promise<CodexSessionIndexCleanupPreview> {
+    const plan = await this.buildPlan(options)
     return plan
       ? { snapshotSha256: plan.snapshotSha256, candidates: plan.candidates }
       : { snapshotSha256: sha256(Buffer.alloc(0)), candidates: [] }
   }
 
   /** The caller must close Codex first; this method independently verifies that boundary twice. */
-  async apply(expectedSnapshotSha256: string, confirmedThreadIds: string[]): Promise<CodexSessionIndexCleanupResult> {
+  async apply(
+    expectedSnapshotSha256: string,
+    confirmedThreadIds: string[],
+    options: SessionIndexCleanupScanOptions = {},
+  ): Promise<CodexSessionIndexCleanupResult> {
     if (!/^[a-f0-9]{64}$/.test(expectedSnapshotSha256)) {
       throw new Error('幽灵索引清理预览无效，请重新扫描。')
     }
     if (!Array.isArray(confirmedThreadIds) || confirmedThreadIds.some((id) => typeof id !== 'string')) {
       throw new Error('幽灵索引确认列表无效，请重新扫描。')
     }
+    throwIfAborted(options.signal)
     if (this.active) throw new Error('已有会话维护正在运行。')
     this.active = true
     let releaseLock: (() => Promise<void>) | undefined
     try {
       await this.assertDesktopStopped()
       releaseLock = await acquireCodexSessionMaintenanceLock(this.codexHome, 'session-index-cleanup', this.now(), this.randomId())
-      const plan = await this.buildPlan()
+      const plan = await this.buildPlan(options)
       if (!plan) throw new Error(`${SESSION_INDEX_FILE} 不存在，无法清理。`)
       if (plan.snapshotSha256 !== expectedSnapshotSha256) {
         throw new Error(`${SESSION_INDEX_FILE} 已在预览后发生变化；为避免覆盖 Codex 新内容，本次清理已中止，请重新扫描。`)
@@ -93,6 +119,7 @@ export class CodexSessionIndexCleanupService {
       }
       const filtered = filterSessionIndex(plan.originalText, selectedIds)
       if (!filtered.removedEntries) return { prunedEntries: 0 }
+      throwIfAborted(options.signal)
 
       const backupPath = await this.createBackup(plan, filtered.removedEntries, [...selectedIds])
       let currentBytes: Buffer
@@ -146,8 +173,9 @@ export class CodexSessionIndexCleanupService {
     }
   }
 
-  private async buildPlan(): Promise<SessionIndexPlan | undefined> {
-    const liveThreadIds = await this.collectLiveThreadIds()
+  private async buildPlan(options: SessionIndexCleanupScanOptions): Promise<SessionIndexPlan | undefined> {
+    throwIfAborted(options.signal)
+    const liveThreadIds = await this.collectLiveThreadIds(options)
     const path = join(this.codexHome, SESSION_INDEX_FILE)
     let originalBytes: Buffer
     try {
@@ -156,6 +184,7 @@ export class CodexSessionIndexCleanupService {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
       throw new Error(`无法读取 ${SESSION_INDEX_FILE}：${messageOf(error)}`)
     }
+    throwIfAborted(options.signal)
     const originalText = decodeUtf8(originalBytes, SESSION_INDEX_FILE)
     const candidatesById = new Map<string, CodexSessionIndexCleanupCandidate>()
     forEachLine(originalText, (line) => {
@@ -173,16 +202,19 @@ export class CodexSessionIndexCleanupService {
     }
   }
 
-  private async collectLiveThreadIds(): Promise<Set<string>> {
+  private async collectLiveThreadIds(options: SessionIndexCleanupScanOptions): Promise<Set<string>> {
     const ids = new Set<string>()
-    for (const path of await this.findRolloutFiles()) {
+    const rolloutFiles = await this.findRolloutFiles(options.signal)
+    options.onProgress?.({ phase: 'rollouts', completed: 0, total: rolloutFiles.length })
+    await mapConcurrent(rolloutFiles, this.scanConcurrency, async (path) => {
+      throwIfAborted(options.signal)
       const filenameId = rolloutThreadIdFromFilename(path)
       if (filenameId) ids.add(filenameId)
       let prefix: { text: string; truncated: boolean }
       try {
         prefix = await readRolloutPrefix(path)
       } catch (error) {
-        if (filenameId && isLockedError(error)) continue
+        if (filenameId && isLockedError(error)) return
         throw new Error(`无法扫描会话来源 ${path}：${messageOf(error)}`)
       }
       let contentIdFound = false
@@ -203,45 +235,13 @@ export class CodexSessionIndexCleanupService {
       if (!filenameId && prefix.truncated && !contentIdFound) {
         throw new Error(`非标准会话文件的 session_meta 未出现在前 ${ROLLOUT_SCAN_BYTES} 字节内，无法安全判断索引来源：${path}`)
       }
-    }
-    for (const path of await this.findThreadReferenceDatabases()) {
-      const database = new DatabaseSync(path, { readOnly: true })
-      try {
-        for (const [table, column] of THREAD_REFERENCE_COLUMNS) {
-          if (!tableColumns(database, table).has(column)) continue
-          const rows = database.prepare(`SELECT DISTINCT ${column} AS thread_id FROM ${table} WHERE COALESCE(${column}, '') <> ''`).all() as Array<Record<string, unknown>>
-          for (const row of rows) if (typeof row.thread_id === 'string' && row.thread_id.trim()) ids.add(row.thread_id.trim())
-        }
-      } finally {
-        database.close()
-      }
-    }
-    return ids
-  }
+    }, (completed) => options.onProgress?.({ phase: 'rollouts', completed, total: rolloutFiles.length }), options.signal)
 
-  private async findRolloutFiles(): Promise<string[]> {
-    const files: string[] = []
-    for (const directory of ['sessions', 'archived_sessions']) {
-      await collectFiles(join(this.codexHome, directory), files, (name) => name.startsWith('rollout-') && name.endsWith('.jsonl'))
-    }
-    return files.sort()
-  }
-
-  private async findThreadReferenceDatabases(): Promise<string[]> {
-    const candidates = new Set<string>()
-    for (const directory of [this.codexHome, join(this.codexHome, 'sqlite')]) {
-      try {
-        for (const entry of await readdir(directory, { withFileTypes: true })) {
-          if (entry.isFile() && SQLITE_EXTENSIONS.has(extname(entry.name).toLowerCase())) {
-            candidates.add(join(directory, entry.name))
-          }
-        }
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
-      }
-    }
-    const result: string[] = []
-    for (const path of [...candidates].sort()) {
+    const databases = await this.findThreadReferenceDatabases(options.signal)
+    options.onProgress?.({ phase: 'databases', completed: 0, total: databases.length })
+    let completedDatabases = 0
+    for (const path of databases) {
+      throwIfAborted(options.signal)
       let database: DatabaseSync
       try {
         database = new DatabaseSync(path, { readOnly: true })
@@ -249,12 +249,56 @@ export class CodexSessionIndexCleanupService {
         throw new Error(`无法验证线程引用数据库 ${path}：${messageOf(error)}`)
       }
       try {
-        if (THREAD_REFERENCE_COLUMNS.some(([table, column]) => tableColumns(database, table).has(column))) result.push(path)
+        const columnsByTable = new Map<string, Set<string>>()
+        for (const [table, column] of THREAD_REFERENCE_COLUMNS) {
+          let columns = columnsByTable.get(table)
+          if (!columns) {
+            columns = tableColumns(database, table)
+            columnsByTable.set(table, columns)
+          }
+          if (!columns.has(column)) continue
+          const rows = database.prepare(`SELECT DISTINCT ${column} AS thread_id FROM ${table} WHERE COALESCE(${column}, '') <> ''`).all() as Array<Record<string, unknown>>
+          for (const row of rows) if (typeof row.thread_id === 'string' && row.thread_id.trim()) ids.add(row.thread_id.trim())
+        }
       } finally {
         database.close()
       }
+      completedDatabases += 1
+      options.onProgress?.({ phase: 'databases', completed: completedDatabases, total: databases.length })
     }
-    return result
+    return ids
+  }
+
+  private async findRolloutFiles(signal?: AbortSignal): Promise<string[]> {
+    const files: string[] = []
+    for (const directory of ['sessions', 'archived_sessions']) {
+      await collectFiles(
+        join(this.codexHome, directory), files,
+        (name) => name.startsWith('rollout-') && name.endsWith('.jsonl'),
+        this.maxRolloutFiles, signal,
+      )
+    }
+    return files.sort()
+  }
+
+  private async findThreadReferenceDatabases(signal?: AbortSignal): Promise<string[]> {
+    const candidates = new Set<string>()
+    for (const directory of [this.codexHome, join(this.codexHome, 'sqlite')]) {
+      throwIfAborted(signal)
+      try {
+        for (const entry of await readdir(directory, { withFileTypes: true })) {
+          if (entry.isFile() && SQLITE_EXTENSIONS.has(extname(entry.name).toLowerCase())) {
+            candidates.add(join(directory, entry.name))
+            if (candidates.size > this.maxReferenceDatabases) {
+              throw new Error(`线程引用数据库数量超过安全扫描上限（${this.maxReferenceDatabases}）；未执行清理。`)
+            }
+          }
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      }
+    }
+    return [...candidates].sort()
   }
 
   private async createBackup(plan: SessionIndexPlan, removedEntries: number, selectedThreadIds: string[]): Promise<string> {
@@ -339,17 +383,76 @@ function tableColumns(database: DatabaseSync, table: string): Set<string> {
     .flatMap((row) => typeof row.name === 'string' ? [row.name] : []))
 }
 
-async function collectFiles(root: string, files: string[], accepts: (name: string) => boolean): Promise<void> {
+async function collectFiles(
+  root: string,
+  files: string[],
+  accepts: (name: string) => boolean,
+  maxFiles: number,
+  signal?: AbortSignal,
+): Promise<void> {
+  throwIfAborted(signal)
   let entries
   try { entries = await readdir(root, { withFileTypes: true }) } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
     throw error
   }
   for (const entry of entries) {
+    throwIfAborted(signal)
     const path = join(root, entry.name)
-    if (entry.isDirectory()) await collectFiles(path, files, accepts)
-    else if (entry.isFile() && accepts(entry.name)) files.push(path)
+    if (entry.isDirectory()) await collectFiles(path, files, accepts, maxFiles, signal)
+    else if (entry.isFile() && accepts(entry.name)) {
+      files.push(path)
+      if (files.length > maxFiles) {
+        throw new Error(`会话文件数量超过安全扫描上限（${maxFiles}）；未执行清理。`)
+      }
+    }
   }
+}
+
+async function mapConcurrent<T>(
+  values: readonly T[],
+  concurrency: number,
+  visit: (value: T) => Promise<void>,
+  onCompleted: (completed: number) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  let nextIndex = 0
+  let completed = 0
+  let hasFailure = false
+  let failure: unknown
+  const worker = async (): Promise<void> => {
+    try {
+      while (!hasFailure) {
+        throwIfAborted(signal)
+        const index = nextIndex
+        nextIndex += 1
+        if (index >= values.length) return
+        await visit(values[index])
+        completed += 1
+        onCompleted(completed)
+      }
+    } catch (error) {
+      if (!hasFailure) {
+        hasFailure = true
+        failure = error
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(concurrency, values.length) }, worker))
+  if (hasFailure) throw failure
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (!signal?.aborted) return
+  const reason = signal.reason
+  if (reason instanceof Error) throw reason
+  throw new Error('会话索引扫描已取消。')
+}
+
+function positiveInteger(value: number | undefined, fallback: number, name: string): number {
+  const resolved = value ?? fallback
+  if (!Number.isSafeInteger(resolved) || resolved <= 0) throw new TypeError(`${name} 必须是正整数。`)
+  return resolved
 }
 
 async function pruneCleanupBackups(preservePath: string): Promise<void> {

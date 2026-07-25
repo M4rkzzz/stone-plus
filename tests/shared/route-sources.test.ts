@@ -2,7 +2,9 @@ import { describe, expect, it } from 'vitest'
 import type { Account, Pool, ProviderDefinition } from '../../src/shared/types'
 import {
   appendRuntimeRouteSourcePools,
+  enumerateRouteSourceModels,
   hasRouteSourceIdCollision,
+  isNativeGrokRouteSource,
   listRouteSources,
   resolveRouteSource,
 } from '../../src/shared/route-sources'
@@ -57,6 +59,63 @@ describe('route sources', () => {
     })
     expect(collections.pools).toEqual([])
     expect(appendRuntimeRouteSourcePools([source.id], collections)).toEqual([resolved?.pool])
+  })
+
+  it('enumerates the effective selected models for one-click route reconciliation', () => {
+    const source = provider('kiro', 'official-api', 'anthropic-messages')
+    source.models = ['claude-opus-4-8', 'claude-opus-5']
+    const sourceAccount = account('kiro-account', source.id)
+    sourceAccount.modelPolicy = 'selected'
+    sourceAccount.modelAllowlist = ['claude-opus-4-8']
+    const collections = { pools: [] as Pool[], providers: [source], accounts: [sourceAccount] }
+
+    expect(enumerateRouteSourceModels(resolveRouteSource(source.id, collections), collections))
+      .toEqual(['claude-opus-4-8'])
+
+    sourceAccount.status = 'disabled'
+    expect(enumerateRouteSourceModels(resolveRouteSource(source.id, collections), collections)).toEqual([])
+  })
+
+  it('exposes an official xAI source as logical Grok while retaining its Chat wire protocol', () => {
+    const source = provider('xai-official', 'official-api', 'openai-chat')
+    source.kind = 'xai'
+    const sourceAccount = account('xai-account', source.id)
+    const resolved = resolveRouteSource(source.id, {
+      pools: [], providers: [source], accounts: [sourceAccount],
+    })
+    expect(resolved).toMatchObject({
+      summary: { protocol: 'grok' },
+      pool: { protocol: 'grok' },
+      provider: { protocol: 'openai-chat' },
+    })
+    expect(isNativeGrokRouteSource(resolved, { providers: [source] })).toBe(false)
+
+    source.protocol = 'openai-responses'
+    expect(isNativeGrokRouteSource(resolved, { providers: [source] })).toBe(true)
+  })
+
+  it('requires at least one enabled Grok Responses member for a native Grok route source', () => {
+    const native = provider('native-grok', 'relay', 'openai-responses')
+    native.kind = 'xai-compatible'
+    const chat = provider('chat-grok', 'relay', 'openai-chat')
+    chat.kind = 'xai-compatible'
+    const nativeAccount = account('native-account', native.id)
+    const chatAccount = account('chat-account', chat.id)
+    const sourcePool = pool('grok-pool', 'standard', 'grok', [nativeAccount.id, chatAccount.id])
+    sourcePool.members[1].enabled = false
+    const collections = {
+      pools: [sourcePool],
+      providers: [native, chat],
+      accounts: [nativeAccount, chatAccount],
+    }
+
+    expect(isNativeGrokRouteSource(resolveRouteSource(sourcePool.id, collections), collections)).toBe(true)
+
+    sourcePool.members[1].enabled = true
+    expect(isNativeGrokRouteSource(resolveRouteSource(sourcePool.id, collections), collections)).toBe(false)
+
+    sourcePool.members.forEach((member) => { member.enabled = false })
+    expect(isNativeGrokRouteSource(resolveRouteSource(sourcePool.id, collections), collections)).toBe(false)
   })
 
   it('rejects OAuth, missing/multiple keys, unavailable menu entries, and id collisions', () => {

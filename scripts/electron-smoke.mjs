@@ -21,6 +21,11 @@ const privateConfigMarker = 'stone-smoke-private-config-marker'
 const proxyPasswordMarker = 'stone-smoke-proxy-password-private-v05'
 const databasePath = join(userData, 'stone-state.sqlite3')
 const legacyStatePath = join(userData, 'stone-state.json')
+const fakeClientRoot = join(artifacts, 'fake-client-e2e')
+const fakeClientScript = join(fakeClientRoot, 'fake-client.cjs')
+const fakeClientLogPath = join(fakeClientRoot, 'events.jsonl')
+const fakeProfileRoot = join(fakeClientRoot, 'profiles')
+const smokeClientPids = new Set()
 const originalClaudeSettings = `${JSON.stringify({
   custom: { marker: privateConfigMarker },
   env: { STONE_SMOKE_KEEP: 'yes' }
@@ -29,7 +34,9 @@ const executablePath = process.env.STONE_ELECTRON_PATH ?? defaultElectronPath(pr
 
 await rm(artifacts, { recursive: true, force: true })
 await mkdir(claudeDirectory, { recursive: true })
+await mkdir(fakeClientRoot, { recursive: true })
 await writeFile(claudeSettingsPath, originalClaudeSettings)
+await writeFile(fakeClientScript, fakeClientSource(), 'utf8')
 const upstream = await startMockUpstream()
 let electronApp
 
@@ -64,14 +71,82 @@ try {
   await window.evaluate(() => window.localStorage.setItem('stone.ui.language', 'zh-CN'))
   await window.reload({ waitUntil: 'domcontentloaded' })
   await window.locator('.app-shell').waitFor({ timeout: 30_000 })
-  const chatGptRepairRestartButton = window.getByRole('button', { name: '关闭 Codex、修复会话、重新开启' })
-  const chatGptRepairRestartButtonVisible = await chatGptRepairRestartButton.isVisible()
-    && await chatGptRepairRestartButton.locator('.chatgpt-mark').isVisible()
+  const agentControlButton = window.getByRole('button', { name: 'Agent 控制' })
+  await agentControlButton.waitFor({ timeout: 30_000 })
+  const chatGptRepairRestartButtonVisible = await agentControlButton.isVisible()
+    && await agentControlButton.getAttribute('aria-haspopup') === 'dialog'
+  await agentControlButton.click()
+  const grokBuildLifecycleVisible = await window.locator('.agent-lifecycle__agent').filter({ hasText: 'Grok Build' }).isVisible()
+  await agentControlButton.click()
   await window.locator('.nav-item').filter({ hasText: '会话修复' }).click()
   await window.getByRole('heading', { name: '会话修复' }).waitFor({ timeout: 30_000 })
   const providerRepairPanel = window.locator('.session-repair-panel:not(.session-index-cleanup-panel)')
   await providerRepairPanel.waitFor({ state: 'visible', timeout: 30_000 })
   const sessionRepairLoaded = await providerRepairPanel.isVisible()
+
+  const { browserControlsCompact, browserViewportResizes } = await (async () => {
+    const originalBounds = await electronApp.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]?.getBounds())
+    const readRects = () => window.evaluate(() => {
+      const rect = (selector) => {
+        const element = document.querySelector(selector)
+        if (!element) return undefined
+        const bounds = element.getBoundingClientRect()
+        return { top: bounds.top, right: bounds.right, bottom: bounds.bottom, left: bounds.left, width: bounds.width, height: bounds.height }
+      }
+      return {
+        shortcuts: rect('.builtin-browser__shortcuts'),
+        shortcutList: rect('.builtin-browser__shortcut-list'),
+        importControls: rect('.browser-import-inline'),
+        toolbar: rect('.builtin-browser__toolbar'),
+        viewport: rect('.builtin-browser__viewport'),
+        pane: rect('.builtin-browser__tab-pane--active'),
+        webview: rect('.builtin-browser__webview'),
+      }
+    })
+    const setWindowSize = (width, height) => electronApp.evaluate(({ BrowserWindow }, size) => {
+      BrowserWindow.getAllWindows()[0]?.setSize(size.width, size.height)
+    }, { width, height })
+    const aligned = (sample) => Boolean(sample.viewport && sample.pane && sample.webview
+      && Math.abs(sample.viewport.width - sample.pane.width) <= 1
+      && Math.abs(sample.viewport.height - sample.pane.height) <= 1
+      && Math.abs(sample.viewport.width - sample.webview.width) <= 1
+      && Math.abs(sample.viewport.height - sample.webview.height) <= 1)
+
+    try {
+      await window.evaluate(() => { window.location.hash = '#browser' })
+      await window.locator('.builtin-browser__webview').waitFor({ state: 'attached', timeout: 15_000 })
+      await setWindowSize(1_040, 680)
+      await window.waitForTimeout(120)
+      const compact = await readRects()
+      await setWindowSize(1_500, 1_000)
+      await window.waitForFunction((minimumHeight) => (
+        (document.querySelector('.builtin-browser__viewport')?.getBoundingClientRect().height ?? 0) > minimumHeight
+      ), (compact.viewport?.height ?? 0) + 120, { timeout: 10_000 })
+      const expanded = await readRects()
+      await window.screenshot({ path: join(artifacts, 'builtin-browser-resized.png') })
+
+      return {
+        browserControlsCompact: Boolean(expanded.shortcuts && expanded.shortcutList && expanded.importControls && expanded.toolbar
+          && expanded.importControls.left >= expanded.shortcutList.right - 1
+          && Math.abs(
+            (expanded.importControls.top + expanded.importControls.height / 2)
+              - (expanded.shortcuts.top + expanded.shortcuts.height / 2),
+          ) <= 1
+          && expanded.importControls.right <= expanded.shortcuts.right + 1
+          && expanded.toolbar.bottom - expanded.shortcuts.top <= 105),
+        browserViewportResizes: aligned(compact)
+          && aligned(expanded)
+          && (expanded.viewport?.height ?? 0) > (compact.viewport?.height ?? 0) + 120
+          && (expanded.webview?.height ?? 0) > (compact.webview?.height ?? 0) + 120,
+      }
+    } finally {
+      if (originalBounds) {
+        await electronApp.evaluate(({ BrowserWindow }, bounds) => {
+          BrowserWindow.getAllWindows()[0]?.setBounds(bounds)
+        }, originalBounds)
+      }
+    }
+  })()
 
   const bootSnapshot = await window.evaluate(() => window.stone.getSnapshot())
   const originalOutboundNetworkMode = bootSnapshot.gateway.outboundNetworkMode ?? 'direct'
@@ -238,14 +313,14 @@ try {
   const oauthProxyOptions = await oauthProxySelect.locator('option').allTextContents()
   await accountAddTag.click()
   const oauthAccountAddUiWorks = await oauthAddTab.getAttribute('aria-selected') === 'true'
-    && await accountAddDialog.getByRole('tabpanel', { name: 'OAuth 授权添加账号' }).isVisible()
+    && await accountAddDialog.getByRole('tabpanel', { name: /^OAuth 授权/ }).isVisible()
     && await accountAddTag.getAttribute('aria-checked') === 'true'
     && !oauthProxyOptions.some((label) => label.includes('沿用文件配置'))
     && await accountAddDialog.getByText('以下设置同时应用于 OAuth 授权和 Token / JSON 导入').isVisible()
   await tokenJsonAddTab.click()
   const tokenJsonProxyOptions = await oauthProxySelect.locator('option').allTextContents()
   const tokenJsonAccountAddUiWorks = await tokenJsonAddTab.getAttribute('aria-selected') === 'true'
-    && await accountAddDialog.getByRole('tabpanel', { name: 'Token 或 JSON 导入账号' }).isVisible()
+    && await accountAddDialog.getByRole('tabpanel', { name: /^Token \/ JSON/ }).isVisible()
     && tokenJsonProxyOptions.some((label) => label.includes('沿用文件配置'))
   await accountAddDialog.getByRole('button', { name: '取消', exact: true }).click()
   await accountAddDialog.waitFor({ state: 'hidden' })
@@ -525,11 +600,24 @@ try {
   const codexConfigAfterSourceSwitch = await readFile(codexConfigPath, 'utf8')
   const agentLimitSetting = window.locator('[data-testid="codex-agent-limit-setting"]')
   const agentLimitInput = agentLimitSetting.locator('#client-codex-agent-limit')
+  const codexConfigBeforeAgentLimit = await readFile(codexConfigPath, 'utf8')
   await agentLimitInput.fill('5')
   await agentLimitSetting.getByRole('button', { name: '保存' }).click()
-  await window.getByText(/子代理上限已设为 5/).waitFor()
+  const agentLimitRestartDialog = window.getByRole('alertdialog').filter({ hasText: '需要重开 Codex' })
+  await agentLimitRestartDialog.waitFor()
+  const agentLimitRestartPromptWorks = await agentLimitRestartDialog.getByRole('button', { name: '保存并重开' }).isVisible()
+  await agentLimitRestartDialog.getByRole('button', { name: '取消' }).click()
+  await agentLimitRestartDialog.waitFor({ state: 'hidden' })
+  const codexConfigAfterAgentLimitCancel = await readFile(codexConfigPath, 'utf8')
+  const agentLimitSaved = await window.evaluate(() => window.stone.saveClientConfigEditor({
+    client: 'codex',
+    patches: [{ id: 'codex.agentsMaxThreads', value: 5 }],
+    files: [],
+  }))
   const codexConfigAfterAgentLimitSave = await readFile(codexConfigPath, 'utf8')
-  const clientAgentLimitSaved = await agentLimitInput.inputValue() === '5'
+  const clientAgentLimitSaved = agentLimitRestartPromptWorks
+    && codexConfigAfterAgentLimitCancel === codexConfigBeforeAgentLimit
+    && agentLimitSaved.changedFiles.includes(codexConfigPath)
     && /(?:^|\n)(?:agents\.)?max_threads = 5(?:\r?\n|$)/.test(codexConfigAfterAgentLimitSave)
   const advancedToggle = window.getByRole('button', { name: /高级设置/ })
   const advancedHiddenByDefault = await window.locator('.client-manager-workbench').count() === 0
@@ -546,6 +634,155 @@ try {
     && advancedEditorAvailable
     && await clientUpstreamSelect.inputValue() === switchTargetId
   await window.screenshot({ path: join(artifacts, 'client-config-easy.png') })
+
+  const grokRelaySnapshot = await window.evaluate(({ port }) => window.stone.saveApiSource({
+    name: 'Smoke Grok Relay',
+    sourceType: 'relay',
+    kind: 'xai-compatible',
+    baseUrl: `http://127.0.0.1:${port}/v1`,
+    protocol: 'openai-responses',
+    credential: 'grok-smoke-private',
+    models: ['grok-smoke'],
+    defaultModel: 'grok-smoke',
+    priority: 1,
+    weight: 1,
+    maxConcurrency: 2,
+  }), { port: upstreamPort })
+  const grokRelayProvider = grokRelaySnapshot.providers.find((provider) => provider.name === 'Smoke Grok Relay')
+  if (!grokRelayProvider) throw new Error('Could not create the native Grok smoke route source.')
+  await window.evaluate((sourceId) => window.stone.setClientRouteSource({ client: 'grokbuild', sourceId }), grokRelayProvider.id)
+
+  const fakeClientDefinitions = [
+    { client: 'claude', target: 'claude-code', name: 'Smoke Fake Claude' },
+    { client: 'codex', target: 'codex-cli', name: 'Smoke Fake Codex' },
+    { client: 'gemini', target: 'gemini-cli', name: 'Smoke Fake Gemini' },
+    { client: 'grokbuild', target: 'grok-build', name: 'Smoke Fake Grok Build' },
+  ]
+  for (const client of ['claude', 'codex', 'gemini']) {
+    await window.evaluate(({ client, sourceId }) => window.stone.setClientRouteSource({ client, sourceId }), {
+      client,
+      sourceId: relayOneProvider.id,
+    })
+  }
+  let managedRouteSnapshot = await window.evaluate(() => window.stone.getSnapshot())
+  for (const definition of fakeClientDefinitions) {
+    const route = managedRouteSnapshot.routes.find((candidate) => candidate.client === definition.client)
+    if (!route) throw new Error(`Could not prepare the ${definition.client} managed-client route.`)
+    managedRouteSnapshot = await window.evaluate((route) => window.stone.updateRoute({ ...route, enabled: true }), route)
+  }
+  const managedSmokeInstances = []
+  for (const definition of fakeClientDefinitions) {
+    const directory = join(fakeProfileRoot, definition.client)
+    await mkdir(directory, { recursive: true })
+    const profileName = `${definition.name} Profile`
+    const profileSnapshot = await window.evaluate(({ name, client, directory }) => window.stone.saveClientProfile({
+      name,
+      client,
+      directory,
+      backupRetention: 2,
+    }), { name: profileName, client: definition.client, directory })
+    const fakeProfile = profileSnapshot.clientProfiles.find((candidate) => candidate.name === profileName)
+    const fakeRoute = managedRouteSnapshot.routes.find((candidate) => candidate.client === definition.client)
+    if (!fakeProfile || !fakeRoute) throw new Error(`Could not prepare the ${definition.client} fake client profile.`)
+    await window.evaluate(({ client, profileId }) => window.stone.repairClientConfig(client, profileId), {
+      client: definition.client,
+      profileId: fakeProfile.id,
+    })
+    const saved = await window.evaluate((input) => window.stone.saveManagedClientInstance(input), {
+      name: definition.name,
+      client: definition.client,
+      configDirectory: directory,
+      workingDirectory: projectRoot,
+      executablePath: process.execPath,
+      launchArgs: [fakeClientScript, definition.client, fakeClientLogPath],
+      launchMode: 'background',
+      routeId: fakeRoute.id,
+      profileId: fakeProfile.id,
+    })
+    const instance = saved.find((candidate) => candidate.name === definition.name && candidate.client === definition.client)
+    if (!instance) throw new Error(`Could not create the ${definition.client} fake managed instance.`)
+    managedSmokeInstances.push({ ...definition, directory, profileId: fakeProfile.id, id: instance.id })
+  }
+
+  const managedInstanceRow = (name) => window.locator('.managed-instances__list article').filter({ hasText: name })
+  for (const instance of managedSmokeInstances) await managedInstanceRow(instance.name).waitFor({ timeout: 15_000 })
+  const firstGeneration = new Map()
+  for (const instance of managedSmokeInstances) {
+    const row = managedInstanceRow(instance.name)
+    await row.getByTitle('启动', { exact: true }).click()
+    const running = await waitForManagedInstanceRunning(window, instance.id)
+    if (!running?.pid || !running.processAlive) throw new Error(`${instance.name} did not expose a live PID after its UI start.`)
+    firstGeneration.set(instance.client, running.pid)
+    smokeClientPids.add(running.pid)
+  }
+  await waitForFakeClientStarts(fakeClientLogPath, fakeClientDefinitions.map(({ client }) => client), 1)
+  const managedClientUiLaunchesRealProcesses = managedSmokeInstances.every((instance) => pidIsAlive(firstGeneration.get(instance.client)))
+
+  for (const instance of managedSmokeInstances) {
+    await window.evaluate((id) => window.stone.stopManagedClientInstance(id), instance.id)
+  }
+  await Promise.all([...firstGeneration.values()].map((pid) => waitForPidStopped(pid)))
+  const managedClientStopsRealProcesses = [...firstGeneration.values()].every((pid) => !pidIsAlive(pid))
+
+  const beforeRepair = new Map()
+  for (const instance of managedSmokeInstances) {
+    await window.evaluate((id) => window.stone.startManagedClientInstance(id), instance.id)
+    const running = await waitForManagedInstanceRunning(window, instance.id)
+    if (!running?.pid || !running.processAlive) throw new Error(`${instance.name} did not restart before repair.`)
+    beforeRepair.set(instance.client, running.pid)
+    smokeClientPids.add(running.pid)
+  }
+  await waitForFakeClientStarts(fakeClientLogPath, fakeClientDefinitions.map(({ client }) => client), 2)
+
+  const repairOperations = new Map()
+  const afterRepair = new Map()
+  for (const instance of managedSmokeInstances) {
+    const operation = await window.evaluate((target) => window.stone.restoreAgent(target, {
+      ensureRunning: true,
+      repairSessions: false,
+      repairWorkspaceIndex: false,
+    }), instance.target)
+    repairOperations.set(instance.client, operation)
+    await window.waitForFunction(async ({ id, previousPid }) => {
+      const current = (await window.stone.listManagedClientInstances()).find((candidate) => candidate.id === id)
+      return current?.status === 'running' && current.processAlive === true && Boolean(current.pid && current.pid !== previousPid)
+    }, { id: instance.id, previousPid: beforeRepair.get(instance.client) }, { timeout: 30_000 })
+    const running = await findManagedInstance(window, instance.id)
+    if (!running?.pid) throw new Error(`${instance.name} did not expose its repaired PID.`)
+    afterRepair.set(instance.client, running.pid)
+    smokeClientPids.add(running.pid)
+  }
+  await waitForFakeClientStarts(fakeClientLogPath, fakeClientDefinitions.map(({ client }) => client), 3)
+  await Promise.all([...beforeRepair.values()].map((pid) => waitForPidStopped(pid)))
+  const fakeClientRecords = await readFakeClientRecords(fakeClientLogPath)
+  const requiredRepairPhases = ['inspect', 'close', 'restore-connection', 'validate', 'start']
+  const managedClientRepairRestartsRealProcesses = managedSmokeInstances.every((instance) => {
+    const previousPid = beforeRepair.get(instance.client)
+    const repairedPid = afterRepair.get(instance.client)
+    const operation = repairOperations.get(instance.client)
+    const targetResult = operation?.results.find((candidate) => candidate.target === instance.target)
+    const starts = fakeClientRecords.filter((record) => record.event === 'start' && record.client === instance.client)
+    return operation?.status === 'succeeded'
+      && targetResult?.status === 'succeeded'
+      && requiredRepairPhases.every((phase) => targetResult.phases.includes(phase))
+      && Number.isInteger(repairedPid)
+      && repairedPid !== previousPid
+      && !pidIsAlive(previousPid)
+      && pidIsAlive(repairedPid)
+      && starts.length === 3
+      && new Set(starts.map(({ pid }) => pid)).size === 3
+  })
+  const managedClientProfilesIsolated = managedSmokeInstances.every((instance) => {
+    const starts = fakeClientRecords.filter((record) => record.event === 'start' && record.client === instance.client)
+    return starts.length === 3 && starts.every((record) => record.configDirectory === instance.directory)
+  })
+  await window.screenshot({ path: join(artifacts, 'managed-client-instances.png') })
+
+  for (const instance of managedSmokeInstances) {
+    await window.evaluate((id) => window.stone.stopManagedClientInstance(id), instance.id)
+  }
+  await Promise.all([...afterRepair.values()].map((pid) => waitForPidStopped(pid)))
+
   await window.locator('.sidebar-help').click()
   await window.getByRole('heading', { name: '帮助中心' }).waitFor()
   await window.locator('.help-assistant').waitFor()
@@ -689,10 +926,10 @@ try {
     stateBackupCreated: Boolean(backupCreated.backup)
       && stateBackups.some((backup) => backup.path === backupCreated.backup?.path)
       && backupVerified.integrity === 'valid',
-    defaultProfilesPresent: initial.clientProfiles.length === 3
+    defaultProfilesPresent: initial.clientProfiles.length === 4
       && initial.clientProfiles.every((candidate) => candidate.isDefault),
     profileCreated: Boolean(profile && profile.client === 'claude' && profile.backupRetention === 2),
-    profileScoped: profileConfigs.length === 3
+    profileScoped: profileConfigs.length === 4
       && profileConfigs.find((config) => config.client === 'claude')?.directory === profileDirectory
       && profilePreview.profileId === profile?.id
       && profilePreview.files.every((file) => file.managedFields.length > 0)
@@ -760,6 +997,10 @@ try {
       && codexConfigBeforeSourceSwitch === codexConfigAfterSourceSwitch,
     clientAgentLimitSaved,
     clientConfigEasyUiWorks,
+    managedClientUiLaunchesRealProcesses,
+    managedClientStopsRealProcesses,
+    managedClientRepairRestartsRealProcesses,
+    managedClientProfilesIsolated,
     gatewayStarted: started.gatewayStatus.running,
     gatewayProbeStatus: probe.status,
     gatewayStopped: !stopped.gatewayStatus.running && gatewayPortReleased,
@@ -767,7 +1008,10 @@ try {
     englishUiWorks,
     languageSwitchWorks,
     chatGptRepairRestartButtonVisible,
+    grokBuildLifecycleVisible,
     sessionRepairLoaded,
+    browserControlsCompact,
+    browserViewportResizes,
     pageErrors
   }
   console.log(JSON.stringify(result, null, 2))
@@ -775,9 +1019,9 @@ try {
   if (
     result.title !== 'Stone+' ||
     result.providers < 1 ||
-    result.routes !== 3 ||
+    result.routes !== 4 ||
     result.credentialsExposed ||
-    result.clientConfigCount !== 3 ||
+    result.clientConfigCount !== 4 ||
     !result.externalProxySurfaceVisible ||
     !result.builtInProxyFirstRunSafe ||
     !result.builtInProxyDisabledCleanly ||
@@ -833,6 +1077,10 @@ try {
     !result.clientRouteSwitchPreservesConfig ||
     !result.clientAgentLimitSaved ||
     !result.clientConfigEasyUiWorks ||
+    !result.managedClientUiLaunchesRealProcesses ||
+    !result.managedClientStopsRealProcesses ||
+    !result.managedClientRepairRestartsRealProcesses ||
+    !result.managedClientProfilesIsolated ||
     !result.gatewayStarted ||
     result.gatewayProbeStatus !== 404 ||
     !result.gatewayStopped ||
@@ -840,7 +1088,10 @@ try {
     !result.englishUiWorks ||
     !result.languageSwitchWorks ||
     !result.chatGptRepairRestartButtonVisible ||
+    !result.grokBuildLifecycleVisible ||
     !result.sessionRepairLoaded ||
+    !result.browserControlsCompact ||
+    !result.browserViewportResizes ||
     result.pageErrors.length > 0
   ) {
     process.exitCode = 1
@@ -849,8 +1100,87 @@ try {
   try {
     if (electronApp) await electronApp.close()
   } finally {
+    for (const pid of smokeClientPids) {
+      try { process.kill(pid, 'SIGTERM') } catch { /* The fake client already exited. */ }
+    }
     await new Promise((resolvePromise, reject) => upstream.close((error) => error ? reject(error) : resolvePromise()))
   }
+}
+
+async function findManagedInstance(window, id) {
+  return window.evaluate((instanceId) => window.stone.listManagedClientInstances()
+    .then((instances) => instances.find((candidate) => candidate.id === instanceId)), id)
+}
+
+async function waitForManagedInstanceRunning(window, id) {
+  await window.waitForFunction(async (instanceId) => {
+    const current = (await window.stone.listManagedClientInstances()).find((candidate) => candidate.id === instanceId)
+    return current?.status === 'failed'
+      || (current?.status === 'running' && current.processAlive === true && Number.isInteger(current.pid))
+  }, id, { timeout: 15_000 })
+  const instance = await findManagedInstance(window, id)
+  if (instance?.status === 'failed') throw new Error(instance.lastError ?? `Managed client ${id} failed to start.`)
+  return instance
+}
+
+function pidIsAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function waitForPidStopped(pid, timeoutMs = 15_000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (!pidIsAlive(pid)) return
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 50))
+  }
+  throw new Error(`Fake managed client PID ${pid} did not stop within ${timeoutMs}ms.`)
+}
+
+async function readFakeClientRecords(path) {
+  const contents = await readFile(path, 'utf8').catch((error) => {
+    if (error?.code === 'ENOENT') return ''
+    throw error
+  })
+  return contents.trim()
+    ? contents.trim().split(/\r?\n/).map((line) => JSON.parse(line))
+    : []
+}
+
+async function waitForFakeClientStarts(path, clients, generations, timeoutMs = 15_000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const records = await readFakeClientRecords(path)
+    if (clients.every((client) => records.filter((record) => record.event === 'start' && record.client === client).length >= generations)) {
+      return records
+    }
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 50))
+  }
+  throw new Error(`Fake managed clients did not reach generation ${generations} within ${timeoutMs}ms.`)
+}
+
+function fakeClientSource() {
+  return String.raw`const { appendFileSync } = require('node:fs')
+const [client, logPath] = process.argv.slice(2)
+const configKeys = {
+  claude: 'CLAUDE_CONFIG_DIR',
+  codex: 'CODEX_HOME',
+  gemini: 'GEMINI_CLI_HOME',
+  grokbuild: 'GROK_HOME',
+}
+appendFileSync(logPath, JSON.stringify({
+  event: 'start',
+  client,
+  pid: process.pid,
+  configDirectory: process.env[configKeys[client]],
+}) + '\n')
+setInterval(() => {}, 1_000)
+`
 }
 
 function isPathInside(root, candidate) {

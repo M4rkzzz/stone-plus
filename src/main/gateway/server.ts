@@ -1,10 +1,14 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { createHash, randomUUID } from 'node:crypto'
+import { isSafeRouteModelMapKey, resolveRouteModel } from '../../shared/route-models'
 import { supportsFastServiceTier } from '../../shared/types'
+import { accountMatchesPoolProtocol, accountPoolProtocol } from '../../shared/pool-protocol'
+import { providerSourceFamily } from '../../shared/source-family'
 import {
   extractProtocolUsage,
   extractRateLimitSignals,
   getProviderAdapter,
+  applyGrokBuildHeaders,
   applyChatGptAgentIdentityHeaders,
   applyChatGptCodexHeaders,
   applyChatGptCodexSearchHeaders,
@@ -19,7 +23,7 @@ import {
   type NormalizedQuotaSignals,
   type ProviderFailure
 } from '../providers'
-import { isInvalidAgentIdentityTaskResponse } from '../auth'
+import { GROK_OAUTH_BASE_URL, GrokOAuthCredentialError, isInvalidAgentIdentityTaskResponse } from '../auth'
 import type {
   Account,
   AccountCodexQuotaSnapshot,
@@ -31,6 +35,7 @@ import type {
   ProviderDefinition,
   RequestLog,
   Route,
+  RouteClient,
   UpstreamCapabilityRequirement
 } from '../../shared/types'
 import {
@@ -38,6 +43,7 @@ import {
   convertRequest,
   convertResponse,
   getRequestModel,
+  InvalidToolBridgeError,
   ResponsesResponseFailedError,
   UnsupportedProtocolConversionError
 } from './protocol'
@@ -67,6 +73,7 @@ import type {
   OutboundFetchResolver,
   ConversationTitleResolver,
   GatewayServerOptions,
+  ProtocolConversionContext,
   ResolvedGatewayCredential
 } from './types'
 
@@ -82,6 +89,7 @@ class CompactFallbackContextOverflowError extends Error {
 interface IncomingRoute {
   protocol: Protocol
   operation: 'generate' | 'codex-search' | 'codex-compact'
+  client?: RouteClient
   geminiMethod?: 'generateContent' | 'streamGenerateContent'
 }
 
@@ -119,6 +127,13 @@ const CODEX_SEARCH_CAPABILITY_TTL_MS = 6 * 60 * 60_000
 // production boundary so the documented 5–600 second control remains truthful.
 const MAX_REQUEST_BODY_IDLE_TIMEOUT_MS = 15_000
 const CLIENT_WRITE_DRAIN_TIMEOUT_MS = 10_000
+// Detailed lifecycle telemetry is useful at ordinary load, but every progress
+// transition eventually becomes an Electron IPC/state update. Once several
+// requests overlap, automatically retain only the initial row, one downstream
+// streaming update, and the terminal row. This changes observability cadence
+// only; routing, retries, replay capture, and the terminal audit record remain
+// untouched unless the route explicitly enabled high-concurrency mode.
+const TELEMETRY_PRESSURE_ACTIVE_REQUESTS = 4
 const MAX_COMPACT_V2_STREAM_BYTES = 10 * 1024 * 1024
 // This is a per-uncommitted-frame/parser-buffer guard, not a response-size
 // limit. Once valid framed events arrive, an arbitrarily long normal response
@@ -175,6 +190,13 @@ const COMPACT_PASSTHROUGH_HEADERS = Object.freeze([
   'x-openai-internal-codex-responses-lite',
   'x-openai-subagent'
 ] as const)
+const GROKBUILD_COMPACT_PASSTHROUGH_HEADERS = Object.freeze([
+  'conversation_id',
+  'session_id',
+  'session-id',
+  'thread-id',
+  'x-client-request-id',
+] as const)
 const RESPONSES_PASSTHROUGH_HEADERS = Object.freeze([
   'openai-model',
   'x-models-etag',
@@ -216,9 +238,37 @@ function buildGatewayConfigIndex(config: GatewayConfig): GatewayConfigIndex {
   const poolIdsByAccountId = new Map<string, string[]>()
   const smartAccountIds = new Set<string>()
   for (const pool of config.pools) {
-    const enabledMemberIds = new Set(
-      pool.members.filter((member) => member.enabled).map((member) => member.accountId)
-    )
+    const declaredAccounts = pool.members.map((member) => accountsById.get(member.accountId))
+    const declaredProviders = declaredAccounts.map((account) => account
+      ? providersById.get(account.providerId)
+      : undefined)
+    const aggregateFamilies = new Set(declaredProviders
+      .filter((provider): provider is ProviderDefinition => provider !== undefined)
+      .map((provider) => providerSourceFamily(provider.kind)))
+    const poolIntegrityValid = declaredAccounts.every((account, index) => {
+      if (!account) return false
+      const provider = declaredProviders[index]
+      if (!provider) return false
+      if (pool.kind === 'relay-aggregate') {
+        return aggregateFamilies.size === 1
+          && provider.sourceType === 'relay'
+          && provider.protocol === pool.protocol
+      }
+      if (pool.protocol === 'grok') {
+        if (provider.sourceType === 'relay') {
+          return account.credentialType === 'api-key'
+            && providerSourceFamily(provider.kind) === 'grok'
+            && accountPoolProtocol(account, provider) === 'grok'
+        }
+        return accountMatchesPoolProtocol('grok', account, provider)
+      }
+      return aggregateFamilies.size === 1 && (provider.sourceType === 'relay'
+        ? account.credentialType !== 'grok-oauth'
+        : accountMatchesPoolProtocol(pool.protocol, account, provider))
+    })
+    const enabledMemberIds = poolIntegrityValid
+      ? new Set(pool.members.filter((member) => member.enabled).map((member) => member.accountId))
+      : new Set<string>()
     accountsByPoolId.set(
       pool.id,
       config.accounts.filter((account) => enabledMemberIds.has(account.id))
@@ -328,7 +378,7 @@ export class GatewayServer implements GatewayController {
       enabled: () => this.config.settings.responsesWebSocketEnabled === true,
       authenticate: (request) => {
         try {
-          this.authenticate(request, 'openai-responses')
+          this.authenticate(request, 'openai-responses', this.configIndex)
           return { ok: true }
         } catch (error) {
           const normalized = normalizeError(error)
@@ -561,9 +611,9 @@ export class GatewayServer implements GatewayController {
     const requestReplayGeneration = this.requestReplayGeneration
     const requestReplayCaptureEnabled = this.requestReplayCaptureEnabled
     const pathname = requestPathname(request.url)
-    const modelListKind = request.method === 'GET' ? classifyModelListRoute(pathname) : undefined
-    if (modelListKind) {
-      await this.handleModelList(request, response, modelListKind, requestIndex)
+    const modelListRoute = request.method === 'GET' ? classifyModelListRoute(pathname) : undefined
+    if (modelListRoute) {
+      await this.handleModelList(request, response, modelListRoute.kind, requestIndex, modelListRoute.client)
       return
     }
     const incoming = request.method === 'POST' ? classifyIncomingRoute(pathname) : undefined
@@ -571,7 +621,7 @@ export class GatewayServer implements GatewayController {
       await this.writeJson(response, 404, { error: { message: 'Route not found', type: 'not_found_error' } })
       return
     }
-    const subagentRequest = isCodexSubagentRequest(request)
+    let subagentRequest = false
     let requestKind: NonNullable<RequestLog['requestKind']> = incoming.operation === 'codex-compact'
       ? 'compaction'
       : incoming.operation === 'codex-search' ? 'search' : 'generation'
@@ -596,6 +646,7 @@ export class GatewayServer implements GatewayController {
     let terminalRequestLog: RequestLog | undefined
     let failureStage: NonNullable<RequestLog['failureStage']> = 'body'
     let model = ''
+    let upstreamModel: string | undefined
     let failoverCount = 0
     let conversationId: string | undefined
     let conversationName: string | undefined
@@ -670,6 +721,7 @@ export class GatewayServer implements GatewayController {
           ? requestIndex.providersById.get(selectedAccount.providerId)?.name
           : undefined,
         model,
+        upstreamModel,
         started,
         finished: current,
         conversationId,
@@ -699,12 +751,14 @@ export class GatewayServer implements GatewayController {
       force = true
     ): void => {
       if (!requestLogId || !logRoute || requestLogFinished) return
-      if (highConcurrencyMode) {
+      const telemetryPressureMode = highConcurrencyMode
+        || this.activeRequests >= TELEMETRY_PRESSURE_ACTIVE_REQUESTS
+      if (telemetryPressureMode) {
         // High-concurrency routes retain one initial lifecycle row, one update
         // after the first downstream byte, and the authoritative terminal row.
-        // All body/scheduler/credential timings and usage continue to be
-        // collected in memory for the terminal record; only UI/control-plane
-        // churn is suppressed.
+        // The same bounded projection is enabled automatically while the
+        // gateway is under pressure. All timings and usage continue to be
+        // collected in memory for the terminal record.
         if (stage !== 'streaming' || clientFirstWriteAt === undefined
           || highConcurrencyStreamProgressScheduled) return
         highConcurrencyStreamProgressScheduled = true
@@ -761,6 +815,7 @@ export class GatewayServer implements GatewayController {
           ? requestIndex.providersById.get((input.account ?? selectedAccount)!.providerId)?.name
           : undefined,
         model,
+        upstreamModel,
         started,
         finished: input.finished,
         conversationId,
@@ -796,8 +851,10 @@ export class GatewayServer implements GatewayController {
       this.emitLog(log)
       return log
     }
-    try {
-      logRoute = this.authenticate(request, incoming.protocol, requestIndex)
+      try {
+        logRoute = this.authenticate(request, incoming.protocol, requestIndex, incoming.client)
+        const authenticatedClient = logRoute.client
+        subagentRequest = logRoute.client === 'codex' && isCodexSubagentRequest(request)
       // Route objects can be mutated and handed back through updateConfig.
       // Pin this request's control-plane policy immediately after auth so a
       // settings edit only affects requests authenticated afterwards.
@@ -852,7 +909,7 @@ export class GatewayServer implements GatewayController {
       }
       const bodyReadyAt = this.now()
       bodyReadMs = Math.max(0, bodyReadyAt - started)
-      if (incoming.protocol === 'openai-responses' && logRoute.client === 'codex') {
+      if (incoming.protocol === 'openai-responses' && isResponsesAgentClient(logRoute.client)) {
         body = materializeStoneCompactFallbackHistory(body)
       }
       model = getRequestModel(incoming.protocol, body, pathname)
@@ -869,43 +926,85 @@ export class GatewayServer implements GatewayController {
         && incoming.protocol === 'openai-responses'
         && isCodexCompactV2Body(body)
       if (codexCompactV2) requestKind = 'compaction'
-      const compactFallbackCompatibilityBody = codexCompactV2 && logRoute.client === 'codex'
+      const compactFallbackCompatibilityBody = codexCompactV2 && isResponsesAgentClient(logRoute.client)
         ? buildCompactFallbackBody(body, model, 0, false, true)
         : undefined
-      const compactFallbackInputUsable = codexCompactV2 && logRoute.client === 'codex'
+      const compactFallbackInputUsable = codexCompactV2 && isResponsesAgentClient(logRoute.client)
         ? compactFallbackBodyIsUsable(body, model)
         : false
 
       failureStage = 'scheduler'
       const pool = requestIndex.poolsById.get(logRoute?.poolId ?? '')
       if (!pool) throw new GatewayHttpError(503, 'The matched route has no available pool')
+      const configuredProviderAccounts = requestIndex.accountsByPoolId.get(pool.id) ?? []
+      let providerAccounts = configuredProviderAccounts
       if (incoming.operation === 'generate') {
         // A V2 trigger is a Codex/OpenAI transport control record, not
         // conversation content. Cross-protocol pools must be checked against
         // the ordinary summary request that Stone+ will actually send rather
         // than rejecting the trigger before compatibility fallback can run.
         const conversionBody = compactFallbackCompatibilityBody ?? body
-        const conversion = analyzeProtocolConversion(incoming.protocol, pool.protocol, conversionBody)
-        if (!conversion.supported) {
-          const first = conversion.issues[0]
+        const analyses = configuredProviderAccounts.map((account) => {
+          const provider = requestIndex.providersById.get(account.providerId)
+          const context = routeConversionContext(authenticatedClient, pool, provider)
+          return {
+            account,
+            conversion: provider
+              ? analyzeProtocolConversion(incoming.protocol, provider.protocol, conversionBody, context)
+              : {
+                  supported: false,
+                  issues: [{
+                    path: 'pool.members',
+                    capability: 'request-option' as const,
+                    reason: 'The account provider is missing.',
+                  }],
+                },
+          }
+        })
+        providerAccounts = analyses
+          .filter(({ conversion }) => conversion.supported)
+          .map(({ account }) => account)
+        if (!providerAccounts.length) {
+          const first = analyses.flatMap(({ conversion }) => conversion.issues)[0]
+          if (!first) {
+            throw new GatewayHttpError(503, 'The matched route has no configured provider account', 'account_unavailable')
+          }
+          const invalidToolBridge = first.reason.startsWith('Grok tool bridge rejected ')
           throw new GatewayHttpError(
             422,
-            `Request cannot be converted without data loss at ${first.path}: ${first.reason}`,
-            'unsupported_conversion',
-            { error: { message: first.reason, type: 'unsupported_conversion', param: first.path }, issues: conversion.issues }
+            invalidToolBridge
+              ? first.reason
+              : `Request cannot be converted without data loss at ${first.path}: ${first.reason}`,
+            invalidToolBridge ? 'invalid_tool_bridge' : 'unsupported_conversion',
+            {
+              error: {
+                message: first.reason,
+                type: invalidToolBridge ? 'invalid_tool_bridge' : 'unsupported_conversion',
+                param: first.path,
+              },
+              issues: analyses.flatMap(({ conversion }) => conversion.issues),
+            }
           )
         }
       }
-      const providerAccounts = requestIndex.accountsByPoolId.get(pool.id) ?? []
       const codexOpaqueCompactHistory = incoming.protocol === 'openai-responses'
         && hasCodexOpaqueCompactHistory(body)
-      const nativeCompactAccounts = codexCompactV2
+      const declaredNativeCompactAccounts = codexCompactV2
         ? providerAccounts.filter((account) => accountSupportsNativeCompact(
             account,
             requestIndex.providersById.get(account.providerId)
           ))
         : []
-      const fallbackCompactAccounts = codexCompactV2 && logRoute.client === 'codex'
+      const nativeCompactAccounts = declaredNativeCompactAccounts.length > 0
+        ? declaredNativeCompactAccounts
+        : codexCompactV2 && codexOpaqueCompactHistory
+          ? providerAccounts.filter((account) => accountSupportsNativeCompact(
+              account,
+              requestIndex.providersById.get(account.providerId),
+              true
+            ))
+          : []
+      const fallbackCompactAccounts = codexCompactV2 && isResponsesAgentClient(logRoute.client)
         ? providerAccounts.filter((account) => {
             const provider = requestIndex.providersById.get(account.providerId)
             if (!provider) return false
@@ -919,15 +1018,27 @@ export class GatewayServer implements GatewayController {
             return analyzeProtocolConversion(
               'openai-responses',
               provider.protocol,
-              compactFallbackCompatibilityBody!
+              compactFallbackCompatibilityBody!,
+              routeConversionContext(authenticatedClient, pool, provider)
             ).supported
           })
         : []
       let codexCompactV2Fallback = codexCompactV2
-        && logRoute.client === 'codex'
+        && isResponsesAgentClient(logRoute.client)
         && nativeCompactAccounts.length === 0
         && fallbackCompactAccounts.length > 0
       const compactSensitive = codexCompactV2 || codexOpaqueCompactHistory
+      const opaqueCompactAccounts = codexOpaqueCompactHistory
+        ? providerAccounts.filter((account) => accountSupportsOpaqueCompactHistory(
+            account,
+            requestIndex.providersById.get(account.providerId)
+          ))
+        : []
+      const declaredOpaqueCompactAccounts = opaqueCompactAccounts.filter((account) => {
+        const provider = requestIndex.providersById.get(account.providerId)
+        return accountSupportsNativeCompact(account, provider)
+          || provider?.responsesCompactMode === 'passthrough'
+      })
       let schedulingAccounts = codexCompactV2
         ? (codexCompactV2Fallback ? fallbackCompactAccounts : nativeCompactAccounts)
           .filter((account) => !codexOpaqueCompactHistory
@@ -936,10 +1047,9 @@ export class GatewayServer implements GatewayController {
               requestIndex.providersById.get(account.providerId)
             ))
         : codexOpaqueCompactHistory
-          ? providerAccounts.filter((account) => accountSupportsOpaqueCompactHistory(
-              account,
-              requestIndex.providersById.get(account.providerId)
-            ))
+          ? (declaredOpaqueCompactAccounts.length > 0
+              ? declaredOpaqueCompactAccounts
+              : opaqueCompactAccounts)
           : providerAccounts
       if (compactSensitive && schedulingAccounts.length === 0) {
         throw new GatewayHttpError(
@@ -971,7 +1081,8 @@ export class GatewayServer implements GatewayController {
             .catch(() => undefined)
         }
       }
-      const targetModel = logRoute.modelMap[model] ?? model
+      const targetModel = resolveRouteModel(logRoute.modelMap, model)
+      upstreamModel = targetModel
       scheduleProgressLog('scheduling')
       const streaming = !codexSearch && !codexCompact
         && (body.stream === true || incoming.geminiMethod === 'streamGenerateContent')
@@ -1119,14 +1230,19 @@ export class GatewayServer implements GatewayController {
             runtimeGeneration,
             account.id
           )
-          if (!highConcurrencyMode) {
+          if (!highConcurrencyMode && this.activeRequests < TELEMETRY_PRESSURE_ACTIVE_REQUESTS) {
             this.emitRuntimeState({ accountIds: [account.id] })
           }
           scheduleProgressLog('resolving-credential')
 
           const provider = requestIndex.providersById.get(account.providerId)
           if (!provider) throw new GatewayHttpError(503, 'The selected account has no provider', 'account_unavailable')
+          const conversionContext = routeConversionContext(authenticatedClient, pool, provider)
           const adapter = getProviderAdapter(provider.kind)
+          const redirectPolicy: Pick<RequestInit, 'redirect'> = provider.kind === 'xai'
+            || provider.kind === 'xai-compatible'
+            ? { redirect: 'error' }
+            : {}
           if ((codexSearch || codexCompact) && provider.protocol !== 'openai-responses') {
             throw new GatewayHttpError(
               400,
@@ -1165,10 +1281,14 @@ export class GatewayServer implements GatewayController {
             ? this.getCodexSearchCapability(account.id, resolvedCredential)
             : undefined
           const preferSearchFallback = cachedSearchCapability === 'responses-fallback'
-          const compactFallback = codexCompact
-            ? !supportsNativeCompact(provider, resolvedCredential.kind)
-            : codexCompactV2 && logRoute.client === 'codex'
-              && (codexCompactV2Fallback || !supportsNativeCompact(provider, resolvedCredential.kind))
+          let compactFallback = codexCompact
+            ? !supportsNativeCompact(provider, resolvedCredential.kind, codexOpaqueCompactHistory)
+            : codexCompactV2 && isResponsesAgentClient(logRoute.client)
+              && (codexCompactV2Fallback || !supportsNativeCompact(
+                provider,
+                resolvedCredential.kind,
+                codexOpaqueCompactHistory
+              ))
           attemptedCompactFallback = codexCompactV2 && compactFallback
           if (attemptedCompactFallback && !codexCompactV2Fallback) {
             // The persisted credential type is only a scheduling hint. The
@@ -1188,16 +1308,16 @@ export class GatewayServer implements GatewayController {
           // (or implement their buffered JSON path incompletely), so use the
           // same proven transport for legacy compact fallback.
           const upstreamStreaming = streaming || compactFallback
-          const convertedBodyKey = `${provider.protocol}\0${targetModel}`
+          const convertedBodyKey = `${provider.id}\0${provider.kind}\0${provider.protocol}\0${targetModel}`
             + `\0${compactFallback ? 'compact-fallback' : 'native'}`
-          let convertedBody = convertedBodies.get(convertedBodyKey)
+          let convertedBody = conversionContext ? undefined : convertedBodies.get(convertedBodyKey)
           if (!convertedBody) {
             convertedBody = compactFallback
-              ? buildProviderCompactFallbackBody(body, targetModel, provider.protocol)
+              ? buildProviderCompactFallbackBody(body, targetModel, provider.protocol, 0, conversionContext)
               : codexSearch || codexCompact
                 ? { ...body, model: targetModel }
-                : convertRequest(incoming.protocol, provider.protocol, body, targetModel).body
-            convertedBodies.set(convertedBodyKey, convertedBody)
+                : convertGatewayRequest(incoming.protocol, provider.protocol, body, targetModel, conversionContext)
+            if (!conversionContext) convertedBodies.set(convertedBodyKey, convertedBody)
           }
           scheduleProgressLog('connecting')
 
@@ -1230,6 +1350,19 @@ export class GatewayServer implements GatewayController {
             if (codexCompact) upstreamHeaders.set('accept', 'application/json')
             if (sessionId && !upstreamHeaders.has('session-id')) upstreamHeaders.set('session-id', sessionId)
           } else {
+            if (resolvedCredential.kind === 'grok-oauth') {
+              const canonicalBaseUrl = provider.baseUrl.replace(/\/+$/, '')
+              if (provider.sourceType !== 'oauth-system'
+                || provider.kind !== 'xai'
+                || provider.protocol !== 'openai-responses'
+                || canonicalBaseUrl !== GROK_OAUTH_BASE_URL) {
+                throw new GatewayHttpError(
+                  503,
+                  'Grok OAuth account requires the canonical Grok OAuth Responses provider',
+                  'account_unavailable'
+                )
+              }
+            }
             adapter.applyRequestHeaders(upstreamHeaders, {
               protocol: provider.protocol,
               credential,
@@ -1237,10 +1370,17 @@ export class GatewayServer implements GatewayController {
               stream: upstreamStreaming,
               hasBody: true
             })
+            if (resolvedCredential.kind === 'grok-oauth') {
+              applyGrokBuildHeaders(upstreamHeaders, {
+                accessToken: credential,
+                mode: 'interactive',
+                accept: upstreamStreaming ? 'text/event-stream' : 'application/json',
+              })
+            }
           }
           const nativeCompactResponses = incoming.protocol === 'openai-responses'
             && provider.protocol === 'openai-responses'
-            && supportsNativeCompact(provider, resolvedCredential.kind)
+            && supportsNativeCompact(provider, resolvedCredential.kind, codexOpaqueCompactHistory)
           const compactResponsePassthrough = (!compactFallback || codexCompact) && (
             nativeCompactResponses
             || (codexOpaqueCompactHistory
@@ -1252,13 +1392,15 @@ export class GatewayServer implements GatewayController {
           // leak compact state metadata into that unrelated endpoint. Native
           // compact and opaque passthrough still need the continuity headers.
           if ((codexCompact && !compactFallback) || compactResponsePassthrough) {
-            copyCompactRequestHeaders(request, upstreamHeaders)
+            copyCompactRequestHeaders(request, upstreamHeaders, logRoute.client)
           }
           if (codexCompactV2 && compactFallback) stripCompactRequestHeaders(upstreamHeaders)
           const outboundBody = codexSearch || codexCompact || compactFallback
             ? convertedBody
             : withStreamingFlag(convertedBody, provider.protocol, streaming)
           const tieredOutboundBody = !codexSearch && !codexCompact && !compactFallback
+            && provider.kind !== 'xai'
+            && provider.kind !== 'xai-compatible'
             && supportsFastServiceTier(provider.protocol)
             ? normalizeOpenAIServiceTier(outboundBody, pool.forceFastMode === true)
             : outboundBody
@@ -1267,16 +1409,16 @@ export class GatewayServer implements GatewayController {
             : isChatGptCodexCredentialKind(resolvedCredential.kind) && !codexSearch && !codexCompact
               ? withChatGptCodexBody(tieredOutboundBody)
               : tieredOutboundBody
-          const serializedBodyKey = `${provider.protocol}\0${targetModel}\0${resolvedCredential.kind}`
+          const serializedBodyKey = `${provider.id}\0${provider.kind}\0${provider.protocol}\0${targetModel}\0${resolvedCredential.kind}`
             + `\0${compactFallback ? 'compact-fallback' : 'native'}`
             + `\0${preferSearchFallback ? 'search-fallback' : 'search-native'}`
             + `\0${pool.forceFastMode === true ? 'fast' : 'standard'}`
-          let serializedUpstreamBody = serializedBodies.get(serializedBodyKey)
+          let serializedUpstreamBody = conversionContext ? undefined : serializedBodies.get(serializedBodyKey)
           if (serializedUpstreamBody === undefined) {
             serializedUpstreamBody = JSON.stringify(upstreamBody)
-            serializedBodies.set(serializedBodyKey, serializedUpstreamBody)
+            if (!conversionContext) serializedBodies.set(serializedBodyKey, serializedUpstreamBody)
           }
-          const upstreamUrl = isChatGptCodexCredentialKind(resolvedCredential.kind)
+          let upstreamUrl = isChatGptCodexCredentialKind(resolvedCredential.kind)
             ? codexSearch
               ? preferSearchFallback ? CHATGPT_CODEX_RESPONSES_URL : CHATGPT_CODEX_SEARCH_URL
               : codexCompact && !compactFallback
@@ -1296,7 +1438,8 @@ export class GatewayServer implements GatewayController {
               method: 'POST',
               headers: upstreamHeaders,
               body: serializedUpstreamBody,
-              signal: attemptSignal
+              signal: attemptSignal,
+              ...redirectPolicy,
             }
             failureStage = 'connect'
             outboundFetchStartMs = Math.max(0, this.now() - started)
@@ -1355,13 +1498,87 @@ export class GatewayServer implements GatewayController {
 
           let errorPayload: JsonObject | undefined
           let codexSearchFallbackPayload: JsonObject | undefined
-          const compactFallbackHistoryItems = compactFallback
+          let compactFallbackHistoryItems = compactFallback
             ? compactFallbackHistoryLength(body)
             : 0
           let compactFallbackDroppedHistoryItems = 0
           let compactFallbackContextRetries = 0
           if (!upstreamResponse.ok) {
             errorPayload = await readUpstreamJson(upstreamResponse, responseBodySignal)
+            const automaticStandaloneFallback = codexCompact
+              && !compactFallback
+              && provider.sourceType === 'relay'
+              && provider.protocol === 'openai-responses'
+              && (provider.responsesCompactMode === 'auto'
+                || provider.responsesCompactMode === 'legacy')
+              && isCompactCapabilityRejection(upstreamResponse.status)
+              && this.now() < responseStartDeadlineAt
+            if (automaticStandaloneFallback) {
+              // Auto mode probes /responses/compact first. Relays that expose
+              // Responses but not the compact extension get the same safe text
+              // summarization path without surfacing the capability mismatch.
+              compactFallback = true
+              compactFallbackHistoryItems = compactFallbackHistoryLength(body)
+              upstreamHeaders = new Headers()
+              adapter.applyRequestHeaders(upstreamHeaders, {
+                protocol: provider.protocol,
+                credential,
+                sourceHeaders: request.headers,
+                stream: true,
+                hasBody: true
+              })
+              copyCompactRequestHeaders(request, upstreamHeaders, logRoute.client)
+              serializedUpstreamBody = JSON.stringify(buildProviderCompactFallbackBody(
+                body,
+                targetModel,
+                provider.protocol,
+                0,
+                conversionContext
+              ))
+              upstreamUrl = adapter.buildEndpoint({
+                baseUrl: provider.baseUrl,
+                protocol: provider.protocol,
+                operation: 'generate',
+                model: targetModel,
+                stream: true
+              })
+              failureStage = 'connect'
+              const fallbackFetched = await awaitWithAbortSignal(
+                fetchWithOptionalHedge(
+                  outboundFetch,
+                  upstreamUrl,
+                  {
+                    method: 'POST',
+                    headers: upstreamHeaders,
+                    body: serializedUpstreamBody,
+                    signal: responseBodySignal,
+                    ...redirectPolicy,
+                  },
+                  provider.protocol,
+                  undefined,
+                  firstBodyTimeoutMs,
+                  this.now,
+                  (headersAt) => {
+                    if (!attemptActive) return
+                    upstreamHeadersAt = headersAt
+                    failureStage = 'first-byte'
+                    scheduleProgressLog('waiting-first-byte')
+                  }
+                ),
+                responseBodySignal
+              )
+              upstreamResponse = fallbackFetched.response
+              upstreamHeadersAt = fallbackFetched.headersAt
+              headerObservedAt = this.now()
+              headerSignals = extractRateLimitSignals(
+                upstreamResponse.headers,
+                provider.protocol,
+                headerObservedAt
+              )
+              errorPayload = upstreamResponse.ok
+                ? undefined
+                : await readUpstreamJson(upstreamResponse, responseBodySignal)
+            }
             if (compactFallback) {
               while (compactFallbackContextRetries < MAX_COMPACT_CONTEXT_RETRIES
                   && !upstreamResponse.ok
@@ -1380,7 +1597,8 @@ export class GatewayServer implements GatewayController {
                   body,
                   targetModel,
                   provider.protocol,
-                  compactFallbackDroppedHistoryItems
+                  compactFallbackDroppedHistoryItems,
+                  conversionContext
                 ))
                 failureStage = 'connect'
                 scheduleProgressLog('retrying')
@@ -1394,7 +1612,8 @@ export class GatewayServer implements GatewayController {
                         method: 'POST',
                         headers: upstreamHeaders,
                         body: serializedUpstreamBody,
-                        signal: responseBodySignal
+                        signal: responseBodySignal,
+                        ...redirectPolicy,
                       },
                       provider.protocol,
                       undefined,
@@ -1473,13 +1692,14 @@ export class GatewayServer implements GatewayController {
               if (codexCompact) upstreamHeaders.set('accept', 'application/json')
               if (sessionId && !upstreamHeaders.has('session-id')) upstreamHeaders.set('session-id', sessionId)
               if ((codexCompact && !compactFallback) || compactResponsePassthrough) {
-                copyCompactRequestHeaders(request, upstreamHeaders)
+                copyCompactRequestHeaders(request, upstreamHeaders, logRoute.client)
               }
               if (codexCompactV2 && compactFallback) stripCompactRequestHeaders(upstreamHeaders)
               upstreamResponse = await awaitWithAbortSignal(
                 outboundFetch(upstreamUrl, {
                   method: 'POST', headers: upstreamHeaders,
-                  body: serializedUpstreamBody, signal: responseBodySignal
+                  body: serializedUpstreamBody, signal: responseBodySignal,
+                  ...redirectPolicy,
                 }),
                 responseBodySignal
               )
@@ -1522,7 +1742,8 @@ export class GatewayServer implements GatewayController {
                     method: 'POST',
                     headers: upstreamHeaders,
                     body: serializedUpstreamBody,
-                    signal: responseBodySignal
+                    signal: responseBodySignal,
+                    ...redirectPolicy,
                   },
                   provider.protocol,
                   undefined,
@@ -1608,7 +1829,8 @@ export class GatewayServer implements GatewayController {
                       method: 'POST',
                       headers: fallbackHeaders,
                       body: JSON.stringify(fallbackBody),
-                      signal: responseBodySignal
+                      signal: responseBodySignal,
+                      ...redirectPolicy,
                     },
                     provider.protocol,
                     undefined,
@@ -1674,13 +1896,14 @@ export class GatewayServer implements GatewayController {
           if (!upstreamResponse.ok) {
             const payload = errorPayload ?? {}
             const safePayload = sanitizeUpstreamPayload(payload, sensitiveValues(resolvedCredential))
-            const providerFailure = isChatGptCodexCredentialKind(resolvedCredential.kind)
+            const providerFailure = modelScopedProviderFailure(upstreamResponse.status, payload)
+              ?? (isChatGptCodexCredentialKind(resolvedCredential.kind)
               ? classifyChatGptCodexFailure(upstreamResponse.status, upstreamResponse.headers, this.now())
               : adapter.classifyFailure({
                   statusCode: upstreamResponse.status,
                   headers: upstreamResponse.headers,
                   now: this.now()
-                })
+                }))
             throw new GatewayHttpError(
               upstreamResponse.status,
               isChatGptCodexCredentialKind(resolvedCredential.kind) ? providerFailure.message : upstreamErrorMessage(safePayload),
@@ -1780,7 +2003,8 @@ export class GatewayServer implements GatewayController {
                       body,
                       targetModel,
                       provider.protocol,
-                      compactFallbackDroppedHistoryItems
+                      compactFallbackDroppedHistoryItems,
+                      conversionContext
                     ))
                     upstreamDeadline?.clear()
                     // Keep every context-recovery attempt inside the original
@@ -1809,7 +2033,8 @@ export class GatewayServer implements GatewayController {
                             method: 'POST',
                             headers: upstreamHeaders,
                             body: serializedUpstreamBody,
-                            signal: compactRetrySignal
+                            signal: compactRetrySignal,
+                            ...redirectPolicy,
                           },
                           provider.protocol,
                           undefined,
@@ -1930,7 +2155,7 @@ export class GatewayServer implements GatewayController {
             if (!codexCompactV2 && !payload) {
               throw new GatewayHttpError(502, 'Compact fallback returned no output history', 'upstream_compact_error')
             }
-            if (!compactFallback) copyResponsesResponseHeaders(upstreamResponse.headers, response)
+            if (!compactFallback) copyResponsesResponseHeaders(upstreamResponse.headers, response, logRoute.client)
             performanceRevision = this.reportAccountSuccess(
               account, attemptStarted, headerSignals, selectedHealthRevision, selectedResetEpoch
             )
@@ -1976,7 +2201,7 @@ export class GatewayServer implements GatewayController {
               onFirstByte: markUpstreamFirstByte,
               onChunk: recordStreamChunk
             })
-            copyResponsesResponseHeaders(upstreamResponse.headers, response)
+            copyResponsesResponseHeaders(upstreamResponse.headers, response, logRoute.client)
             performanceRevision = this.reportAccountSuccess(
               account, attemptStarted, headerSignals, selectedHealthRevision, selectedResetEpoch
             )
@@ -2019,11 +2244,13 @@ export class GatewayServer implements GatewayController {
               onChunk: recordStreamChunk,
               onUsage: recordStreamUsage,
               onBeforeResponseCommit: compactResponsePassthrough
-                ? () => copyResponsesResponseHeaders(upstreamResponse.headers, response)
+                ? () => copyResponsesResponseHeaders(upstreamResponse.headers, response, logRoute!.client)
                 : undefined,
               onResponseCommit: releaseCommittedRequestBody
             }
-            const streamResult = incoming.protocol === provider.protocol
+            const bridgeSameProtocolResponse = incoming.protocol === provider.protocol
+              && conversionContext?.toolBridgePlan?.requiresResponseBridge === true
+            const streamResult = incoming.protocol === provider.protocol && !bridgeSameProtocolResponse
               ? await pipeUpstreamResponse(
                   upstreamResponse,
                   response,
@@ -2037,11 +2264,41 @@ export class GatewayServer implements GatewayController {
                 response,
                 provider.protocol,
                 incoming.protocol,
-                { id: randomUUID(), model },
+                  { id: randomUUID(), model, toolBridgePlan: conversionContext?.toolBridgePlan },
                 sensitiveValues(resolvedCredential),
                   streamTiming
                 )
             streamDiagnostics = streamResult.diagnostics
+            const canonicalErrorPayload = streamResult.canonicalError
+              ? canonicalStreamErrorPayload(streamResult.canonicalError)
+              : undefined
+            const canonicalErrorStatus = canonicalErrorPayload
+              ? providerErrorStatusCode(canonicalErrorPayload.error, canonicalErrorPayload)
+              : undefined
+            // Transport/protocol failures carry the authoritative status and
+            // log message (for example 504 idle timeouts or truncated EOFs).
+            // A parser may also emit a canonical error while constructing that
+            // failure; only an explicit request-level provider error is more
+            // specific than the transport wrapper.
+            if (streamResult.failure && (canonicalErrorStatus === undefined || canonicalErrorStatus >= 500)) {
+              throw streamResult.failure
+            }
+            if (streamResult.canonicalError && canonicalErrorPayload && canonicalErrorStatus !== undefined) {
+              const providerFailure = modelScopedProviderFailure(canonicalErrorStatus, canonicalErrorPayload)
+                ?? adapter.classifyFailure({
+                  statusCode: canonicalErrorStatus,
+                  headers: upstreamResponse.headers,
+                  now: this.now()
+                })
+              throw new GatewayHttpError(
+                canonicalErrorStatus,
+                streamResult.canonicalError.message,
+                `provider_${providerFailure.category}`,
+                canonicalErrorPayload,
+                providerFailure,
+                observedQuotaSignals(headerSignals, this.now())
+              )
+            }
             if (streamResult.failure) throw streamResult.failure
             if (streamResult.error) {
               throw new GatewayHttpError(502, streamResult.error, 'upstream_stream_error')
@@ -2095,7 +2352,8 @@ export class GatewayServer implements GatewayController {
               )
             }
             payload = streamResult.response
-          } else if (provider.protocol === incoming.protocol) {
+          } else if (provider.protocol === incoming.protocol
+            && conversionContext?.toolBridgePlan?.requiresResponseBridge !== true) {
             // Preserve the exact upstream bytes only for the identity path,
             // where they can be forwarded without a second serialization. A
             // converted response does not need that extra Buffer/concat copy;
@@ -2105,6 +2363,37 @@ export class GatewayServer implements GatewayController {
             reusableResponseBytes = parsed.rawJson
           } else {
             payload = await readUpstreamJson(upstreamResponse, responseBodySignal)
+          }
+          // Responses has its own status=failed envelope semantics below,
+          // including request-level classification and deliberately generic
+          // client messages. The generic top-level envelope guard is for
+          // Chat-compatible relays that incorrectly return { error } with 200.
+          const responsesFailureEnvelope = provider.protocol === 'openai-responses'
+            && payload.status === 'failed'
+          const successfulErrorEnvelope = responsesFailureEnvelope
+            ? undefined
+            : providerErrorEnvelope(payload)
+          if (successfulErrorEnvelope) {
+            const safePayload = canonicalProviderErrorBody(
+              payload,
+              sensitiveValues(resolvedCredential),
+              successfulErrorEnvelope
+            )
+            const safeErrorEnvelope = providerErrorEnvelope(safePayload) ?? {}
+            const semanticStatusCode = providerErrorStatusCode(successfulErrorEnvelope, payload)
+            const providerFailure = adapter.classifyFailure({
+              statusCode: semanticStatusCode,
+              headers: upstreamResponse.headers,
+              now: this.now()
+            })
+            throw new GatewayHttpError(
+              semanticStatusCode,
+              providerErrorMessage(safeErrorEnvelope),
+              `provider_${providerFailure.category}`,
+              safePayload,
+              providerFailure,
+              observedQuotaSignals(headerSignals, this.now())
+            )
           }
           // A Responses provider can encode a failed request inside an HTTP
           // 200 JSON envelope. Reject that terminal state before the identity
@@ -2121,10 +2410,10 @@ export class GatewayServer implements GatewayController {
           // already exactly what the client requested.
           const result = reusableResponseBytes
             ? payload
-            : convertResponse(provider.protocol, incoming.protocol, payload, model, this.now)
+            : convertResponse(provider.protocol, incoming.protocol, payload, model, this.now, conversionContext)
           const usage = extractProtocolUsage(provider.protocol, payload)
           if (compactResponsePassthrough) {
-            copyResponsesResponseHeaders(upstreamResponse.headers, response)
+            copyResponsesResponseHeaders(upstreamResponse.headers, response, logRoute.client)
           }
           performanceRevision = this.reportAccountSuccess(
             account, attemptStarted, headerSignals, selectedHealthRevision, selectedResetEpoch
@@ -2166,6 +2455,8 @@ export class GatewayServer implements GatewayController {
           const hardAccountFailure = accountAction === 'disable'
             || gatewayError.providerFailure?.category === 'rate_limit'
             || quotaExhausted
+          const explicitRetryAfterAdmissionFailure = gatewayError.statusCode >= 500
+            && (gatewayError.providerFailure?.retryAfterMs ?? 0) > 0
           const fallbackRequirements = codexCompactV2
             ? requiredUpstreamCapabilities(compactFallbackCompatibilityBody!, true)
             : requiredCapabilities
@@ -2209,12 +2500,12 @@ export class GatewayServer implements GatewayController {
               // global circuit or suppressing its ordinary Responses path.
               nativeCompactCapabilityFailedAccountIds.add(attemptedAccount.id)
             }
-            // Keep the final usable source routable after ordinary transport,
-            // timeout, 5xx, or incomplete-stream failures. With no peer to
-            // fail over to, opening its circuit only converts one failed
-            // request into a pool-wide outage. Hard credential/quota signals
-            // still disable or cool the source to avoid retry storms.
-            if (!compactCapabilityFailure && (hardAccountFailure || hasUsableAlternative)) {
+            if (!compactCapabilityFailure && (
+              accountAction === 'disable'
+              || hasUsableAlternative
+              || hardAccountFailure
+              || explicitRetryAfterAdmissionFailure
+            )) {
               failedAccountIds.add(attemptedAccount.id)
               this.scheduler.recordStickyFailure(schedulingPool.id, sessionId, attemptedAccount.id)
               const retryAfterMs = Math.max(
@@ -2254,6 +2545,7 @@ export class GatewayServer implements GatewayController {
             && retryable
             && attemptedAccount !== undefined
             && this.now() < responseStartDeadlineAt
+            && (hasCurrentModeAlternative || (!hardAccountFailure && !explicitRetryAfterAdmissionFailure))
           const attemptedProvider = attemptedAccount
             ? requestIndex.providersById.get(attemptedAccount.providerId)
             : undefined
@@ -2264,10 +2556,14 @@ export class GatewayServer implements GatewayController {
             && upstreamHeadersAt !== undefined
             && !hardAccountFailure
           const canEnterCompactCompatibilityStage = codexCompactV2
-            && logRoute.client === 'codex'
+            && isResponsesAgentClient(logRoute.client)
             && !codexCompactV2Fallback
             && !attemptedCompactFallback
-            && !codexOpaqueCompactHistory
+            && (!codexOpaqueCompactHistory
+              || (attemptedProvider?.sourceType === 'relay'
+                && attemptedProvider.protocol === 'openai-responses'
+                && (attemptedProvider.responsesCompactMode === 'auto'
+                  || attemptedProvider.responsesCompactMode === 'legacy')))
             && !response.headersSent
             && attemptedAccount !== undefined
             && compactFallbackInputUsable
@@ -2328,7 +2624,29 @@ export class GatewayServer implements GatewayController {
         : clientAbortController.signal.aborted
           ? new GatewayHttpError(499, 'Client closed the request', 'client_closed')
           : normalizedError
-      const successfulSubagentCancellation = clientAbortController.signal.aborted && subagentRequest
+      // Authentication happens before the ordinary request-log lifecycle is
+      // created. Preserve a credential-free diagnostic only when the URL
+      // names a client and that client has exactly one matching enabled route.
+      // Generic /v1 endpoints remain deliberately unattributed: guessing a
+      // route there would turn a bad token into misleading client telemetry.
+      if (
+        !requestLogId
+        && gatewayError.statusCode === 401
+        && gatewayError.type === 'authentication_error'
+      ) {
+        const attributableRoute = attributableClientRoute(incoming, requestIndex)
+        if (attributableRoute) {
+          requestLogId = randomUUID()
+          logRoute = attributableRoute
+          failureStage = 'authentication'
+        }
+      }
+      // A downstream-initiated disconnect is a completed cancellation from the
+      // client's point of view, not a failed upstream request. Keep HTTP 499 as
+      // the diagnostic code, but count the terminal record as successful and
+      // never feed the incomplete attempt into performance scoring.
+      const successfulClientCancellation = !deterministicBodyFailure
+        && clientAbortController.signal.aborted
       if (clientAbortController.signal.aborted && !deterministicBodyFailure) failureStage = 'client'
       if (gatewayError.type === 'request_body_timeout' && !response.headersSent) {
         response.setHeader('connection', 'close')
@@ -2341,32 +2659,32 @@ export class GatewayServer implements GatewayController {
       await this.writeJson(
         response,
         gatewayError.statusCode,
-        gatewayError.responseBody ?? { error: { message: gatewayError.message, type: gatewayError.type } }
+        gatewayErrorResponseBody(incoming.protocol, gatewayError)
       )
       if (!conversationName && conversationId) conversationName = fallbackConversationName(conversationId)
       const finishedLog = finishRequestLog({
-        status: successfulSubagentCancellation ? 'success' : 'error',
+        status: successfulClientCancellation ? 'success' : 'error',
         statusCode: gatewayError.statusCode,
-        error: successfulSubagentCancellation ? undefined : gatewayError.message,
+        error: successfulClientCancellation ? undefined : gatewayError.message,
         accountFirstTokenMs: firstTokenAt === undefined || successfulAttemptStarted === undefined
           ? undefined : Math.max(0, firstTokenAt - successfulAttemptStarted),
-        recordPerformance: !successfulSubagentCancellation
+        recordPerformance: !successfulClientCancellation
       })
-      if (finishedLog && successfulSubagentCancellation) this.successRequests += 1
+      if (finishedLog && successfulClientCancellation) this.successRequests += 1
     } finally {
       cancelScheduledProgressLog()
       if (requestLogId && !requestLogFinished) {
-        const successfulSubagentCancellation = clientAbortController.signal.aborted && subagentRequest
+        const successfulClientCancellation = clientAbortController.signal.aborted
         if (clientAbortController.signal.aborted) failureStage = 'client'
         const finishedLog = finishRequestLog({
-          status: successfulSubagentCancellation ? 'success' : 'error',
+          status: successfulClientCancellation ? 'success' : 'error',
           statusCode: clientAbortController.signal.aborted ? 499 : 500,
-          error: successfulSubagentCancellation
+          error: successfulClientCancellation
             ? undefined
             : clientAbortController.signal.aborted ? 'Client closed the request' : 'Gateway request ended unexpectedly',
-          recordPerformance: !successfulSubagentCancellation
+          recordPerformance: !successfulClientCancellation
         })
-        if (finishedLog && successfulSubagentCancellation) this.successRequests += 1
+        if (finishedLog && successfulClientCancellation) this.successRequests += 1
       }
       request.off('aborted', abortForClientDisconnect)
       response.off('close', abortForClientDisconnect)
@@ -2391,13 +2709,42 @@ export class GatewayServer implements GatewayController {
     })
   }
 
-  private authenticate(request: IncomingMessage, protocol: Protocol, index = this.configIndex): Route {
+  private authenticate(
+    request: IncomingMessage,
+    protocol: Protocol,
+    index = this.configIndex,
+    client?: RouteClient,
+  ): Route {
     const token = readLocalToken(request)
     if (!token) throw new GatewayHttpError(401, 'A local gateway token is required', 'authentication_error')
     const route = (index.enabledRoutesByProtocol.get(protocol) ?? [])
-      .find((candidate) => secureEquals(candidate.localToken, token))
+      .find((candidate) => (
+        (client ? candidate.client === client : candidate.client !== 'grokbuild')
+        && secureEquals(candidate.localToken, token)
+      ))
     if (!route) throw new GatewayHttpError(401, 'Invalid local gateway token', 'authentication_error')
+    this.assertClientRouteSource(route, index)
     return route
+  }
+
+  private assertClientRouteSource(route: Route, index: GatewayConfigIndex): void {
+    if (route.client !== 'grokbuild') return
+    const pool = index.poolsById.get(route.poolId)
+    const enabledMembers = pool?.members.filter((member) => member.enabled) ?? []
+    const nativeGrokResponsesSource = enabledMembers.length > 0
+      && enabledMembers.every((member) => {
+        const account = index.accountsById.get(member.accountId)
+        const provider = account ? index.providersById.get(account.providerId) : undefined
+        return provider?.protocol === 'openai-responses'
+          && providerSourceFamily(provider.kind) === 'grok'
+      })
+    if (!nativeGrokResponsesSource) {
+      throw new GatewayHttpError(
+        503,
+        'The Grok Build route must use a native Grok Responses account pool or relay source.',
+        'invalid_route_source',
+      )
+    }
   }
 
   private async resolveConversationName(sessionId?: string): Promise<string | undefined> {
@@ -2420,10 +2767,11 @@ export class GatewayServer implements GatewayController {
     request: IncomingMessage,
     response: ServerResponse,
     kind: 'openai' | 'gemini',
-    index: GatewayConfigIndex
+    index: GatewayConfigIndex,
+    client?: RouteClient,
   ): Promise<void> {
     try {
-      const route = this.authenticateModelList(request, kind, index)
+      const route = this.authenticateModelList(request, kind, index, client)
       const pool = index.poolsById.get(route.poolId)
       if (!pool) throw new GatewayHttpError(503, 'The matched route has no available pool')
       const accounts = index.accountsByPoolId.get(pool.id) ?? []
@@ -2454,15 +2802,21 @@ export class GatewayServer implements GatewayController {
   private authenticateModelList(
     request: IncomingMessage,
     kind: 'openai' | 'gemini',
-    index: GatewayConfigIndex
+    index: GatewayConfigIndex,
+    client?: RouteClient,
   ): Route {
     const token = readLocalToken(request)
     if (!token) throw new GatewayHttpError(401, 'A local gateway token is required', 'authentication_error')
     const candidates = kind === 'gemini'
       ? index.enabledRoutesByProtocol.get('gemini') ?? []
-      : index.enabledNonGeminiRoutes
-    const route = candidates.find((candidate) => secureEquals(candidate.localToken, token))
+      : client
+        ? index.enabledNonGeminiRoutes
+        : index.enabledNonGeminiRoutes.filter((candidate) => candidate.client !== 'grokbuild')
+    const route = candidates.find((candidate) => (
+      (!client || candidate.client === client) && secureEquals(candidate.localToken, token)
+    ))
     if (!route) throw new GatewayHttpError(401, 'Invalid local gateway token', 'authentication_error')
+    this.assertClientRouteSource(route, index)
     return route
   }
 
@@ -2508,6 +2862,7 @@ export class GatewayServer implements GatewayController {
     account?: Account
     providerName?: string
     model: string
+    upstreamModel?: string
     started: number
     finished?: number
     conversationId?: string
@@ -2556,6 +2911,7 @@ export class GatewayServer implements GatewayController {
       providerName,
       accountName: input.account?.name ?? '等待选择',
       model: input.model,
+      upstreamModel: input.upstreamModel,
       status: input.status,
       progressStage: input.status === 'streaming' ? input.progressStage : undefined,
       statusCode: input.statusCode,
@@ -2571,6 +2927,7 @@ export class GatewayServer implements GatewayController {
       firstTokenMs: input.firstTokenAt === undefined ? undefined : Math.max(0, input.firstTokenAt - input.started),
       inputTokens: usage?.inputTokens,
       outputTokens: usage?.outputTokens,
+      tokenAccountingVersion: 2,
       streamedBytes: input.streamedBytes,
       streamedChunks: input.streamedChunks,
       streamEndReason: input.streamEndReason,
@@ -2580,6 +2937,8 @@ export class GatewayServer implements GatewayController {
       terminalWaitMs: input.terminalWaitMs,
       cachedInputTokens: usage?.cachedInputTokens,
       cacheWriteInputTokens: usage?.cacheCreationInputTokens,
+      cacheWriteInputTokens5m: usage?.cacheCreation5mInputTokens,
+      cacheWriteInputTokens1h: usage?.cacheCreation1hInputTokens,
       reasoningTokens: usage?.reasoningTokens,
       failoverCount: input.failoverCount,
       error: input.error,
@@ -2847,6 +3206,12 @@ function classifyIncomingRoute(pathname: string): IncomingRoute | undefined {
   if (pathname === '/v1/responses') return { protocol: 'openai-responses', operation: 'generate' }
   if (pathname === '/v1/responses/compact') return { protocol: 'openai-responses', operation: 'codex-compact' }
   if (pathname === '/v1/alpha/search') return { protocol: 'openai-responses', operation: 'codex-search' }
+  if (pathname === '/grokbuild/v1/responses') {
+    return { protocol: 'openai-responses', operation: 'generate', client: 'grokbuild' }
+  }
+  if (pathname === '/grokbuild/v1/responses/compact') {
+    return { protocol: 'openai-responses', operation: 'codex-compact', client: 'grokbuild' }
+  }
   if (pathname === '/v1/chat/completions') return { protocol: 'openai-chat', operation: 'generate' }
   if (/^\/v1beta\/models\/[^/]+:generateContent$/.test(pathname)) {
     return { protocol: 'gemini', operation: 'generate', geminiMethod: 'generateContent' }
@@ -2855,6 +3220,22 @@ function classifyIncomingRoute(pathname: string): IncomingRoute | undefined {
     return { protocol: 'gemini', operation: 'generate', geminiMethod: 'streamGenerateContent' }
   }
   return undefined
+}
+
+/**
+ * Resolve a pre-authentication failure without inspecting or retaining the
+ * rejected credential. Only client-scoped URL namespaces are attributable;
+ * the shared /v1 namespace may represent several clients and must never be
+ * guessed from topology alone.
+ */
+function attributableClientRoute(
+  incoming: IncomingRoute,
+  index: GatewayConfigIndex,
+): Route | undefined {
+  if (!incoming.client) return undefined
+  const candidates = (index.enabledRoutesByProtocol.get(incoming.protocol) ?? [])
+    .filter((candidate) => candidate.client === incoming.client)
+  return candidates.length === 1 ? candidates[0] : undefined
 }
 
 function requestPathname(value: string | undefined): string {
@@ -2873,9 +3254,10 @@ function requestPathname(value: string | undefined): string {
   return new URL(raw, 'http://localhost').pathname
 }
 
-function classifyModelListRoute(pathname: string): 'openai' | 'gemini' | undefined {
-  if (pathname === '/v1/models') return 'openai'
-  if (pathname === '/v1beta/models') return 'gemini'
+function classifyModelListRoute(pathname: string): { kind: 'openai' | 'gemini'; client?: RouteClient } | undefined {
+  if (pathname === '/v1/models') return { kind: 'openai' }
+  if (pathname === '/grokbuild/v1/models') return { kind: 'openai', client: 'grokbuild' }
+  if (pathname === '/v1beta/models') return { kind: 'gemini' }
   return undefined
 }
 
@@ -2897,11 +3279,15 @@ function enumerablePoolModels(
 function projectRouteModels(models: string[], modelMap: Record<string, string>): string[] {
   const aliasesByTarget = new Map<string, string[]>()
   for (const [source, target] of Object.entries(modelMap)) {
+    // A wildcard is a runtime fallback, not a literal client-facing model id.
+    if (source === '*' || !isSafeRouteModelMapKey(source)) continue
     const aliases = aliasesByTarget.get(target) ?? []
     aliases.push(source)
     aliasesByTarget.set(target, aliases)
   }
-  return uniqueModels(models.flatMap((model) => [model, ...(aliasesByTarget.get(model) ?? [])]))
+  return uniqueModels(models
+    .filter((model) => model.trim() !== '*')
+    .flatMap((model) => [model, ...(aliasesByTarget.get(model) ?? [])]))
 }
 
 function openAiModelList(models: string[], updatedAt: number): JsonObject {
@@ -2964,7 +3350,7 @@ interface ReadJsonBodyResult {
 }
 
 function requestBodyPolicy(route: Route, incoming: IncomingRoute): RequestBodyPolicy {
-  const largeCodexBody = route.client === 'codex'
+  const largeCodexBody = isResponsesAgentClient(route.client)
     && incoming.protocol === 'openai-responses'
     && (incoming.operation === 'generate' || incoming.operation === 'codex-compact')
   return largeCodexBody
@@ -2973,6 +3359,10 @@ function requestBodyPolicy(route: Route, incoming: IncomingRoute): RequestBodyPo
         largeThresholdBytes: STANDARD_REQUEST_BODY_LIMIT_BYTES
       }
     : { hardLimitBytes: STANDARD_REQUEST_BODY_LIMIT_BYTES }
+}
+
+function isResponsesAgentClient(client: RouteClient): boolean {
+  return client === 'codex' || client === 'grokbuild'
 }
 
 async function readJsonBody(
@@ -3188,30 +3578,38 @@ function withStreamingFlag(body: JsonObject, protocol: Protocol, streaming: bool
 }
 
 function isChatGptCodexCredentialKind(
-  kind: 'api-key' | 'chatgpt-oauth' | 'chatgpt-agent-identity'
+  kind: ResolvedGatewayCredential['kind']
 ): kind is 'chatgpt-oauth' | 'chatgpt-agent-identity' {
   return kind === 'chatgpt-oauth' || kind === 'chatgpt-agent-identity'
 }
 
 function supportsNativeCompact(
   provider: ProviderDefinition,
-  credentialKind: 'api-key' | 'chatgpt-oauth' | 'chatgpt-agent-identity'
+  credentialKind: ResolvedGatewayCredential['kind'],
+  requiresOpaqueContinuity = false
 ): boolean {
   if (provider.protocol !== 'openai-responses') return false
   if (isChatGptCodexCredentialKind(credentialKind)) return true
   if (isOfficialOpenAIResponsesProvider(provider)) return true
-  return provider.sourceType === 'relay'
-    && provider.responsesCompactMode === 'native'
+  return provider.sourceType === 'relay' && (
+    provider.responsesCompactMode === 'native'
+    || provider.responsesCompactMode === 'auto'
+    // An already-created opaque item cannot be reconstructed by Stone+. Give
+    // even a legacy relay one lossless native attempt instead of rejecting a
+    // live OAuth -> relay switch before a capable relay sees the request.
+    || (requiresOpaqueContinuity && provider.responsesCompactMode !== 'passthrough')
+  )
 }
 
 function supportsOpaqueCompactHistory(
   provider: ProviderDefinition,
-  credentialKind: 'api-key' | 'chatgpt-oauth' | 'chatgpt-agent-identity'
+  credentialKind: ResolvedGatewayCredential['kind']
 ): boolean {
   if (supportsNativeCompact(provider, credentialKind)) return true
-  return provider.sourceType === 'relay'
-    && provider.protocol === 'openai-responses'
-    && provider.responsesCompactMode === 'passthrough'
+  // Opaque continuation has no safe lossy fallback. Forward it to Responses
+  // relays with its continuity headers and let normal failover classify a real
+  // upstream incompatibility instead of producing a local 422.
+  return provider.sourceType === 'relay' && provider.protocol === 'openai-responses'
 }
 
 function isOfficialOpenAIResponsesProvider(provider: ProviderDefinition): boolean {
@@ -3222,13 +3620,17 @@ function isOfficialOpenAIResponsesProvider(provider: ProviderDefinition): boolea
 
 function accountSupportsNativeCompact(
   account: Account,
-  provider: ProviderDefinition | undefined
+  provider: ProviderDefinition | undefined,
+  requiresOpaqueContinuity = false
 ): boolean {
   if (!provider || provider.protocol !== 'openai-responses') return false
   if (account.credentialType === 'chatgpt-oauth' || account.credentialType === 'chatgpt-agent-identity') return true
   if (isOfficialOpenAIResponsesProvider(provider)) return true
-  return provider.sourceType === 'relay'
-    && provider.responsesCompactMode === 'native'
+  return provider.sourceType === 'relay' && (
+    provider.responsesCompactMode === 'native'
+    || provider.responsesCompactMode === 'auto'
+    || (requiresOpaqueContinuity && provider.responsesCompactMode !== 'passthrough')
+  )
 }
 
 function accountSupportsOpaqueCompactHistory(
@@ -3236,9 +3638,7 @@ function accountSupportsOpaqueCompactHistory(
   provider: ProviderDefinition | undefined
 ): boolean {
   if (accountSupportsNativeCompact(account, provider)) return true
-  return provider?.sourceType === 'relay'
-    && provider.protocol === 'openai-responses'
-    && provider.responsesCompactMode === 'passthrough'
+  return provider?.sourceType === 'relay' && provider.protocol === 'openai-responses'
 }
 
 function isCodexCompactV2Body(body: JsonObject): boolean {
@@ -3496,7 +3896,8 @@ function buildProviderCompactFallbackBody(
   body: JsonObject,
   model: string,
   protocol: Protocol,
-  dropOldestHistoryItems = 0
+  dropOldestHistoryItems = 0,
+  context?: ProtocolConversionContext,
 ): JsonObject {
   const responsesBody = buildCompactFallbackBody(
     body,
@@ -3505,8 +3906,8 @@ function buildProviderCompactFallbackBody(
     true,
     protocol !== 'openai-responses'
   )
-  if (protocol === 'openai-responses') return responsesBody
-  const conversion = analyzeProtocolConversion('openai-responses', protocol, responsesBody)
+  if (protocol === 'openai-responses' && !context) return responsesBody
+  const conversion = analyzeProtocolConversion('openai-responses', protocol, responsesBody, context)
   if (!conversion.supported) {
     const first = conversion.issues[0]
     throw new GatewayHttpError(
@@ -3516,7 +3917,7 @@ function buildProviderCompactFallbackBody(
     )
   }
   return withStreamingFlag(
-    convertRequest('openai-responses', protocol, responsesBody, model).body,
+    convertRequest('openai-responses', protocol, responsesBody, model, context).body,
     protocol,
     true
   )
@@ -3755,6 +4156,14 @@ function isCompactContextOverflow(statusCode: number, payload: JsonObject | unde
     || /(?:too many|token count[^\n]{0,80}exceeds?)[^\n]{0,80}tokens?/.test(description)
     || /上下文[^\n]{0,80}(?:过长|超出|溢出)/.test(description)
     || /(?:输入|提示)[^\n]{0,80}(?:过长|超出)(?:限制|上限|窗口)?/.test(description)
+}
+
+function isCompactCapabilityRejection(statusCode: number): boolean {
+  return statusCode === 400
+    || statusCode === 404
+    || statusCode === 405
+    || statusCode === 422
+    || statusCode === 501
 }
 
 function compactReplacementPayload(summary: string, input: unknown): JsonObject {
@@ -4115,7 +4524,12 @@ function buildChatGptSearchFallbackBody(body: JsonObject, model: string): JsonOb
   }
 }
 
-function copyResponsesResponseHeaders(source: Headers, target: ServerResponse): void {
+function copyResponsesResponseHeaders(source: Headers, target: ServerResponse, client: RouteClient): void {
+  if (client === 'grokbuild') {
+    const requestId = source.get('x-request-id')
+    if (requestId) target.setHeader('x-request-id', requestId)
+    return
+  }
   for (const name of RESPONSES_PASSTHROUGH_HEADERS) {
     const value = source.get(name)
     if (value) target.setHeader(name, value)
@@ -4125,8 +4539,11 @@ function copyResponsesResponseHeaders(source: Headers, target: ServerResponse): 
   })
 }
 
-function copyCompactRequestHeaders(source: IncomingMessage, target: Headers): void {
-  for (const name of COMPACT_PASSTHROUGH_HEADERS) {
+function copyCompactRequestHeaders(source: IncomingMessage, target: Headers, client: RouteClient): void {
+  const allowed = client === 'grokbuild'
+    ? GROKBUILD_COMPACT_PASSTHROUGH_HEADERS
+    : COMPACT_PASSTHROUGH_HEADERS
+  for (const name of allowed) {
     const value = source.headers[name]
     const first = Array.isArray(value) ? value[0] : value
     if (typeof first === 'string' && first.trim()) target.set(name, first.trim())
@@ -5409,9 +5826,13 @@ interface StreamPipeResult {
     output_tokens?: number
     total_tokens?: number
     cached_input_tokens?: number
+    cache_creation_input_tokens?: number
+    cache_creation_5m_input_tokens?: number
+    cache_creation_1h_input_tokens?: number
     reasoning_tokens?: number
   }
   error?: string
+  canonicalError?: Extract<CanonicalStreamEvent, { type: 'error' }>
   failure?: GatewayHttpError
   diagnostics?: StreamTerminationDiagnostics
 }
@@ -5484,6 +5905,7 @@ async function pipeUpstreamResponse(
   const reader = upstream.body.getReader()
   const usage: NonNullable<StreamPipeResult['usage']> = {}
   let streamError: string | undefined
+  let canonicalStreamError: Extract<CanonicalStreamEvent, { type: 'error' }> | undefined
   let streamFailure: GatewayHttpError | undefined
   let terminalObserved = false
   let stopObserved = false
@@ -5552,11 +5974,23 @@ async function pipeUpstreamResponse(
         if (event.outputTokens !== undefined) usage.output_tokens = event.outputTokens
         if (event.totalTokens !== undefined) usage.total_tokens = event.totalTokens
         if (event.cachedInputTokens !== undefined) usage.cached_input_tokens = event.cachedInputTokens
+        if (event.cacheCreationInputTokens !== undefined) usage.cache_creation_input_tokens = event.cacheCreationInputTokens
+        if (event.cacheCreation5mInputTokens !== undefined) usage.cache_creation_5m_input_tokens = event.cacheCreation5mInputTokens
+        if (event.cacheCreation1hInputTokens !== undefined) usage.cache_creation_1h_input_tokens = event.cacheCreation1hInputTokens
         if (event.reasoningTokens !== undefined) usage.reasoning_tokens = event.reasoningTokens
         const normalizedUsage = normalizeLogUsage(usage)
         if (normalizedUsage) timing.onUsage?.(normalizedUsage)
       } else if (event.type === 'error') {
-        streamError = redactSensitiveText(event.message, secrets)
+        const safeError: Extract<CanonicalStreamEvent, { type: 'error' }> = {
+          type: 'error',
+          message: redactSensitiveText(event.message, secrets),
+          ...(event.code ? { code: redactSensitiveText(event.code, secrets) } : {}),
+          ...(event.errorType ? { errorType: redactSensitiveText(event.errorType, secrets) } : {})
+        }
+        // parser.finish and gateway-generated terminal errors are observed
+        // with acceptTerminal=false; keep their local 502/504 semantics.
+        if (acceptTerminal) canonicalStreamError ??= safeError
+        streamError = safeError.message
       } else if (event.type === 'tool-call-delta') {
         pendingToolCalls.add(event.index)
       } else if (acceptTerminal && event.type === 'tool-call-complete') {
@@ -5568,9 +6002,8 @@ async function pipeUpstreamResponse(
         terminalObserved = true
       } else if (acceptTerminal && event.type === 'stop') {
         stopObserved = true
-        // Keep reading ordinary completions for trailing usage/[DONE]. A fully
-        // materialized tool call can be handed back immediately.
-        if (event.reason === 'tool_calls') terminalObserved = true
+        // Keep reading ordinary completions for trailing usage/[DONE],
+        // including tool-call turns whose usage arrives after finish_reason.
       }
       if (meaningfulStreamEvent(event)) timing.onFirstToken?.()
     }
@@ -5847,7 +6280,14 @@ async function pipeUpstreamResponse(
     response.off('close', cancelOnClose)
     if (response.headersSent && !response.writableEnded && !response.destroyed) response.end()
   }
-  return streamPipeResult(protocolCompletionObserved(), usage, streamError, streamFailure, diagnostics)
+  return streamPipeResult(
+    protocolCompletionObserved(),
+    usage,
+    streamError,
+    streamFailure,
+    diagnostics,
+    canonicalStreamError
+  )
 }
 
 async function pipeConvertedUpstreamResponse(
@@ -5867,6 +6307,7 @@ async function pipeConvertedUpstreamResponse(
   const reader = upstream.body.getReader()
   const usage: NonNullable<StreamPipeResult['usage']> = {}
   let streamError: string | undefined
+  let canonicalStreamError: Extract<CanonicalStreamEvent, { type: 'error' }> | undefined
   let streamFailure: GatewayHttpError | undefined
   let terminalObserved = false
   let stopObserved = false
@@ -5965,10 +6406,14 @@ async function pipeConvertedUpstreamResponse(
         if (safeEvent.outputTokens !== undefined) usage.output_tokens = safeEvent.outputTokens
         if (safeEvent.totalTokens !== undefined) usage.total_tokens = safeEvent.totalTokens
         if (safeEvent.cachedInputTokens !== undefined) usage.cached_input_tokens = safeEvent.cachedInputTokens
+        if (safeEvent.cacheCreationInputTokens !== undefined) usage.cache_creation_input_tokens = safeEvent.cacheCreationInputTokens
+        if (safeEvent.cacheCreation5mInputTokens !== undefined) usage.cache_creation_5m_input_tokens = safeEvent.cacheCreation5mInputTokens
+        if (safeEvent.cacheCreation1hInputTokens !== undefined) usage.cache_creation_1h_input_tokens = safeEvent.cacheCreation1hInputTokens
         if (safeEvent.reasoningTokens !== undefined) usage.reasoning_tokens = safeEvent.reasoningTokens
         const normalizedUsage = normalizeLogUsage(usage)
         if (normalizedUsage) timing.onUsage?.(normalizedUsage)
       } else if (safeEvent.type === 'error') {
+        if (acceptTerminal) canonicalStreamError ??= safeEvent
         streamError = safeEvent.message
       } else if (safeEvent.type === 'tool-call-delta') {
         pendingToolCalls.add(safeEvent.index)
@@ -5981,7 +6426,6 @@ async function pipeConvertedUpstreamResponse(
         terminalObserved = true
       } else if (acceptTerminal && safeEvent.type === 'stop') {
         stopObserved = true
-        if (safeEvent.reason === 'tool_calls') terminalObserved = true
       }
       if (meaningfulStreamEvent(safeEvent)) timing.onFirstToken?.()
       encoded.push(...encoder.encode(safeEvent))
@@ -6168,6 +6612,16 @@ async function pipeConvertedUpstreamResponse(
       }
     }
     if (!responseHeadersCommitted) {
+      if (canonicalStreamError) {
+        return streamPipeResult(
+          protocolCompletionObserved(),
+          usage,
+          streamError,
+          streamFailure,
+          diagnostics,
+          canonicalStreamError
+        )
+      }
       throw streamFailure ?? new GatewayHttpError(
         502,
         streamError ?? 'Upstream stream ended before its first valid event',
@@ -6206,7 +6660,7 @@ async function pipeConvertedUpstreamResponse(
     await forward([
       { type: 'error', message: streamError, errorType: streamFailure?.type ?? 'upstream_stream_error' },
       { type: 'done' }
-    ])
+    ], false)
     const finishChunks = encoder.finish()
     syncEncoderFailure()
     await writeStreamChunks(response, finishChunks, timing.onClientWrite)
@@ -6218,7 +6672,14 @@ async function pipeConvertedUpstreamResponse(
     if (response.headersSent && !response.writableEnded && !response.destroyed) response.end()
   }
 
-  return streamPipeResult(protocolCompletionObserved(), usage, streamError, streamFailure, diagnostics)
+  return streamPipeResult(
+    protocolCompletionObserved(),
+    usage,
+    streamError,
+    streamFailure,
+    diagnostics,
+    canonicalStreamError
+  )
 }
 
 function streamPipeResult(
@@ -6226,12 +6687,14 @@ function streamPipeResult(
   usage: NonNullable<StreamPipeResult['usage']>,
   error?: string,
   failure?: GatewayHttpError,
-  diagnostics?: StreamTerminationDiagnostics
+  diagnostics?: StreamTerminationDiagnostics,
+  canonicalError?: Extract<CanonicalStreamEvent, { type: 'error' }>
 ): StreamPipeResult {
   return {
     completed,
     ...(Object.keys(usage).length > 0 ? { usage } : {}),
     ...(error ? { error } : {}),
+    ...(canonicalError ? { canonicalError } : {}),
     ...(failure ? { failure } : {}),
     ...(diagnostics && Object.values(diagnostics).some((value) => value !== undefined) ? { diagnostics } : {})
   }
@@ -6733,7 +7196,10 @@ function requiredUpstreamCapabilities(
     const object = objectValue(value)
     if (!object) continue
     const type = typeof object.type === 'string' ? object.type.toLowerCase() : ''
-    if (type === 'function' || type === 'tool_use' || type === 'function_call') required.add('toolCalls')
+    if (type === 'function' || type === 'custom' || type === 'namespace'
+      || type === 'tool_use' || type === 'function_call' || type === 'custom_tool_call') {
+      required.add('toolCalls')
+    }
     if (type === 'web_search' || type === 'web_search_preview') required.add('webSearch')
     if (type === 'image_generation') required.add('imageGeneration')
     if (type === 'input_image' || type === 'image_url' || type === 'image'
@@ -6747,6 +7213,18 @@ function requiredUpstreamCapabilities(
     }
   }
   return [...required]
+}
+
+function routeConversionContext(
+  client: RouteClient,
+  pool: Pool,
+  provider?: ProviderDefinition,
+): ProtocolConversionContext | undefined {
+  if (client === 'grokbuild' && provider?.protocol === 'openai-responses') return undefined
+  const aggregateGrokRelay = pool.kind === 'relay-aggregate'
+    && provider?.sourceType === 'relay'
+    && providerSourceFamily(provider.kind) === 'grok'
+  return pool.protocol === 'grok' || aggregateGrokRelay ? { dialect: 'xai-grok' } : undefined
 }
 
 function enabledHeader(value: string | string[] | undefined): boolean {
@@ -6874,14 +7352,101 @@ function gatewayErrorFromResponsesFailure(failure: ResponsesResponseFailedError)
   return new GatewayHttpError(statusCode, failure.message, type, { error })
 }
 
+function convertGatewayRequest(
+  from: Protocol,
+  to: Protocol,
+  body: JsonObject,
+  targetModel: string,
+  context?: ProtocolConversionContext
+): JsonObject {
+  try {
+    return convertRequest(from, to, body, targetModel, context).body
+  } catch (error) {
+    if (error instanceof InvalidToolBridgeError) {
+      throw new GatewayHttpError(422, error.message, 'invalid_tool_bridge', {
+        error: { message: error.message, type: 'invalid_tool_bridge', param: error.path }
+      })
+    }
+    throw error
+  }
+}
+
 function normalizeError(error: unknown): GatewayHttpError {
   if (error instanceof GatewayHttpError) return error
   if (error instanceof ModelNotExposedError) return new GatewayHttpError(404, error.message, 'model_not_found')
   if (error instanceof NoEligibleAccountError) return new GatewayHttpError(503, error.message, 'account_unavailable')
+  if (error instanceof InvalidToolBridgeError) {
+    return new GatewayHttpError(502, error.message, 'upstream_invalid_tool_bridge', {
+      error: { message: error.message, type: 'upstream_invalid_tool_bridge', param: error.path }
+    })
+  }
   if (error instanceof UnsupportedProtocolConversionError) return new GatewayHttpError(400, error.message, 'unsupported_conversion')
   if (error instanceof ResponsesResponseFailedError) return gatewayErrorFromResponsesFailure(error)
+  if (error instanceof GrokOAuthCredentialError && error.code === 'revoked') {
+    return new GatewayHttpError(502, error.message, 'account_unavailable', undefined, {
+      category: 'authentication',
+      message: error.message,
+      retryable: false,
+      accountAction: 'disable',
+    })
+  }
   if (error instanceof Error && error.name === 'TimeoutError') return new GatewayHttpError(504, 'Upstream request timed out', 'timeout_error')
   return new GatewayHttpError(502, error instanceof Error ? error.message : 'Gateway request failed', 'gateway_error')
+}
+
+function gatewayErrorResponseBody(protocol: Protocol, error: GatewayHttpError): JsonObject {
+  const fallback = { error: { message: error.message, type: error.type } }
+  if (protocol === 'openai-chat' || protocol === 'openai-responses') {
+    return error.responseBody ?? fallback
+  }
+
+  const source = error.responseBody ?? fallback
+  const sourceError = objectValue(source.error)
+  const message = typeof sourceError?.message === 'string' && sourceError.message.trim()
+    ? sourceError.message.trim()
+    : error.message
+
+  if (protocol === 'anthropic-messages') {
+    return {
+      type: 'error',
+      error: {
+        type: anthropicGatewayErrorType(error.statusCode),
+        message,
+      },
+    }
+  }
+
+  return {
+    error: {
+      code: error.statusCode,
+      message,
+      status: geminiGatewayErrorStatus(error.statusCode),
+    },
+  }
+}
+
+function anthropicGatewayErrorType(statusCode: number): string {
+  if (statusCode === 401) return 'authentication_error'
+  if (statusCode === 403) return 'permission_error'
+  if (statusCode === 404) return 'not_found_error'
+  if (statusCode === 413) return 'request_too_large'
+  if (statusCode === 429) return 'rate_limit_error'
+  if (statusCode === 529) return 'overloaded_error'
+  if (statusCode >= 500) return 'api_error'
+  return 'invalid_request_error'
+}
+
+function geminiGatewayErrorStatus(statusCode: number): string {
+  if (statusCode === 400 || statusCode === 413 || statusCode === 422) return 'INVALID_ARGUMENT'
+  if (statusCode === 401) return 'UNAUTHENTICATED'
+  if (statusCode === 403) return 'PERMISSION_DENIED'
+  if (statusCode === 404) return 'NOT_FOUND'
+  if (statusCode === 408 || statusCode === 499 || statusCode === 504) return 'DEADLINE_EXCEEDED'
+  if (statusCode === 409) return 'ABORTED'
+  if (statusCode === 429) return 'RESOURCE_EXHAUSTED'
+  if (statusCode === 501) return 'UNIMPLEMENTED'
+  if (statusCode === 502 || statusCode === 503) return 'UNAVAILABLE'
+  return statusCode >= 500 ? 'INTERNAL' : 'UNKNOWN'
 }
 
 function isRetryable(error: GatewayHttpError): boolean {
@@ -6893,6 +7458,108 @@ function isRetryable(error: GatewayHttpError): boolean {
 function upstreamErrorMessage(payload: JsonObject): string {
   const error = objectValue(payload.error)
   return typeof error?.message === 'string' ? error.message : 'Upstream request failed'
+}
+
+function providerErrorEnvelope(payload: JsonObject): JsonObject | undefined {
+  if (typeof payload.error === 'string' && payload.error.trim()) {
+    return { message: payload.error.trim() }
+  }
+  return objectValue(payload.error)
+}
+
+function canonicalStreamErrorPayload(
+  error: Extract<CanonicalStreamEvent, { type: 'error' }>
+): { error: JsonObject } {
+  return {
+    error: {
+      message: error.message,
+      ...(error.code ? { code: error.code } : {}),
+      ...(error.errorType ? { type: error.errorType } : {})
+    }
+  }
+}
+
+function providerErrorMessage(error: JsonObject): string {
+  return typeof error.message === 'string' && error.message.trim()
+    ? error.message.trim()
+    : 'Provider returned an error response.'
+}
+
+function normalizedProviderErrorField(value: unknown): string {
+  return typeof value === 'string'
+    ? value.trim().toLowerCase().replace(/[\s-]+/g, '_')
+    : ''
+}
+
+function providerErrorCode(error: JsonObject): string {
+  return normalizedProviderErrorField(error.code)
+    || normalizedProviderErrorField(error.type)
+    || normalizedProviderErrorField(error.status)
+}
+
+const MODEL_SCOPED_PROVIDER_ERROR_CODES = new Set([
+  'model_access_denied',
+  'model_not_allowed',
+  'model_not_available',
+  'model_not_found',
+  'model_permission_denied',
+  'unsupported_model'
+])
+
+function modelScopedProviderFailure(statusCode: number, payload: JsonObject): ProviderFailure | undefined {
+  if (statusCode !== 403) return undefined
+  const error = providerErrorEnvelope(payload)
+  const code = error ? providerErrorCode(error) : ''
+  if (!MODEL_SCOPED_PROVIDER_ERROR_CODES.has(code)) return undefined
+  return {
+    category: code === 'model_not_found' ? 'not_found' : 'permission',
+    message: 'Provider denied access to the requested model.',
+    retryable: false,
+    accountAction: 'none',
+    statusCode
+  }
+}
+
+function providerErrorStatusCode(error: JsonObject, payload: JsonObject): number {
+  const code = providerErrorCode(error)
+  if (isCompactContextOverflow(400, payload)
+    || code === 'context_length_exceeded'
+    || code === 'context_window_exceeded'
+    || code === 'max_context_length_exceeded') return 400
+  if (code === 'rate_limit'
+    || code === 'rate_limit_error'
+    || code === 'rate_limit_exceeded'
+    || code === 'requests_limit_reached'
+    || code === 'too_many_requests') return 429
+  if (code === 'insufficient_quota' || code === 'payment_required') return 402
+  if (code === 'authentication_error'
+    || code === 'invalid_api_key'
+    || code === 'invalid_authentication') return 401
+  if (code === 'model_not_found' || code === 'not_found') return 404
+  if (MODEL_SCOPED_PROVIDER_ERROR_CODES.has(code)
+    || code === 'permission_denied') return 403
+  if (code === 'bad_request'
+    || code === 'invalid_request'
+    || code === 'invalid_request_error'
+    || code === 'unprocessable_entity') return 400
+  return 502
+}
+
+function canonicalProviderErrorBody(
+  payload: JsonObject,
+  secrets: readonly string[],
+  fallback: JsonObject
+): JsonObject {
+  const safePayload = sanitizeUpstreamPayload(payload, secrets)
+  const safeError = providerErrorEnvelope(safePayload)
+  const fallbackMessage = redactSensitiveText(providerErrorMessage(fallback), secrets)
+  return {
+    ...safePayload,
+    error: {
+      ...(safeError ?? {}),
+      message: safeError ? providerErrorMessage(safeError) : fallbackMessage
+    }
+  }
 }
 
 const sensitiveErrorField = /^(?:api[-_]?key|authorization|access[-_]?token|refresh[-_]?token|token|credential|secret|password)$/i
@@ -6988,6 +7655,9 @@ function normalizeLogUsage(
     output_tokens?: number
     total_tokens?: number
     cached_input_tokens?: number
+    cache_creation_input_tokens?: number
+    cache_creation_5m_input_tokens?: number
+    cache_creation_1h_input_tokens?: number
     reasoning_tokens?: number
   } | undefined
 ): NormalizedTokenUsage | undefined {
@@ -6997,6 +7667,9 @@ function normalizeLogUsage(
     outputTokens: usage.output_tokens,
     totalTokens: usage.total_tokens,
     cachedInputTokens: usage.cached_input_tokens,
+    cacheCreationInputTokens: usage.cache_creation_input_tokens,
+    cacheCreation5mInputTokens: usage.cache_creation_5m_input_tokens,
+    cacheCreation1hInputTokens: usage.cache_creation_1h_input_tokens,
     reasoningTokens: usage.reasoning_tokens
   }
 }

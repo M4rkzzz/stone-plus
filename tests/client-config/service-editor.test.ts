@@ -160,7 +160,7 @@ describe('ClientConfigService editor workflow', () => {
       gatewayBaseUrl: 'http://127.0.0.1:15721',
       token: 'stone-target-token',
     }, {
-      patches: [{ id: 'claude.model', value: 'common-editor-model' }],
+      patches: [{ id: 'claude.model', value: 'claude-opus-4-8' }],
       files: [{
         role: file.role,
         revision: file.revision,
@@ -172,7 +172,7 @@ describe('ClientConfigService editor workflow', () => {
     expect(result.backups).toHaveLength(1)
     expect(await readFile(result.backups[0].backupPath, 'utf8')).toBe(original)
     const saved = JSON.parse(await readFile(service.paths.claude.settings.path, 'utf8'))
-    expect(saved.model).toBe('common-editor-model')
+    expect(saved.model).toBe('claude-opus-4-8')
     expect(saved.unknown.keep).toBe(false)
     expect(saved.env).toEqual({
       ANTHROPIC_BASE_URL: 'http://127.0.0.1:15721',

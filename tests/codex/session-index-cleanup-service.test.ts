@@ -185,4 +185,44 @@ describe('CodexSessionIndexCleanupService', () => {
     const backups = await readdir(join(fixture.codexHome, 'backups_state', 'stone-session-index-cleanup'))
     expect(backups).toHaveLength(1)
   })
+
+  it('reports monotonic scan progress while preserving the existing preview result', async () => {
+    const { service, staleOne, staleTwo } = await createFixture()
+    const progress: Array<{ phase: string; completed: number; total: number }> = []
+
+    const preview = await service.preview({ onProgress: (value) => progress.push(value) })
+
+    expect(preview.candidates.map((candidate) => candidate.id)).toEqual([staleOne, staleTwo])
+    for (const phase of ['rollouts', 'databases']) {
+      const updates = progress.filter((value) => value.phase === phase)
+      expect(updates.length).toBeGreaterThan(0)
+      expect(updates[0].completed).toBe(0)
+      expect(updates.at(-1)?.completed).toBe(updates.at(-1)?.total)
+      expect(updates.map((value) => value.completed)).toEqual(
+        [...updates.map((value) => value.completed)].sort((left, right) => left - right),
+      )
+    }
+  })
+
+  it('supports cancellation without writing or creating a cleanup backup', async () => {
+    const { service, codexHome } = await createFixture()
+    const controller = new AbortController()
+    controller.abort()
+
+    await expect(service.preview({ signal: controller.signal })).rejects.toThrow()
+    await expect(readdir(join(codexHome, 'backups_state'))).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  it('fails closed when the rollout scan exceeds its configured safety limit', async () => {
+    const fixture = await createFixture()
+    const limited = new CodexSessionIndexCleanupService({
+      codexHome: fixture.codexHome,
+      maxRolloutFiles: 1,
+      blockingCodexPids: async () => [],
+    })
+
+    await expect(limited.preview()).rejects.toThrow('安全扫描上限')
+    expect(await readFile(fixture.indexPath, 'utf8')).toBe(fixture.originalIndex)
+    await expect(readdir(join(fixture.codexHome, 'backups_state'))).rejects.toMatchObject({ code: 'ENOENT' })
+  })
 })

@@ -19,13 +19,31 @@ const BACKUP_MARKER = 'Stone+ session repair'
 const PROVIDER_PATTERN = /^[A-Za-z0-9_.-]+$/
 const SQLITE_EXTENSIONS = new Set(['.db', '.sqlite', '.sqlite3'])
 const ROLLOUT_SCAN_BYTES = 1024 * 1024
+const ROLLOUT_META_SEARCH_BYTES = 16 * 1024 * 1024
+const ROLLOUT_READ_CHUNK_BYTES = 64 * 1024
 const GLOBAL_STATE_FILE = '.codex-global-state.json'
+const DEFAULT_SCAN_CONCURRENCY = 8
+const DEFAULT_MAX_ROLLOUT_FILES = 20_000
+
+export interface CodexSessionRepairOperationOptions {
+  signal?: AbortSignal
+  onProgress?: (progress: { stage: 'discover' | 'scan' | 'verify' | 'backup' | 'apply'; completed: number; total?: number }) => void
+}
+
+interface RolloutReadHandle {
+  read(buffer: Buffer, offset: number, length: number, position: number): Promise<{ bytesRead: number }>
+  close(): Promise<void>
+}
 
 interface SessionRepairServiceOptions {
   codexHome: string
   now?: () => Date
   randomId?: () => string
   preserveRolloutMtime?: (path: string, atime: Date, mtime: Date) => Promise<void>
+  /** Internal test seam for bounded-read and handle-lifetime assertions. */
+  openRollout?: (path: string) => Promise<RolloutReadHandle>
+  scanConcurrency?: number
+  maxRolloutFiles?: number
 }
 
 interface RolloutPlan {
@@ -72,6 +90,7 @@ interface GlobalStatePlan {
   nextHash: string
   changedFields: string[]
   conflictingFields: string[]
+  originalValue: Record<string, unknown>
 }
 
 interface RepairPlan {
@@ -90,6 +109,9 @@ export class CodexSessionRepairService {
   private readonly now: () => Date
   private readonly randomId: () => string
   private readonly preserveRolloutMtime: (path: string, atime: Date, mtime: Date) => Promise<void>
+  private readonly openRollout: (path: string) => Promise<RolloutReadHandle>
+  private readonly scanConcurrency: number
+  private readonly maxRolloutFiles: number
   private active = false
 
   public constructor(options: SessionRepairServiceOptions) {
@@ -97,22 +119,55 @@ export class CodexSessionRepairService {
     this.now = options.now ?? (() => new Date())
     this.randomId = options.randomId ?? (() => randomUUID().slice(0, 12))
     this.preserveRolloutMtime = options.preserveRolloutMtime ?? utimes
+    this.openRollout = options.openRollout ?? ((path) => open(path, 'r'))
+    this.scanConcurrency = Math.max(1, Math.min(32, Math.floor(options.scanConcurrency ?? DEFAULT_SCAN_CONCURRENCY)))
+    this.maxRolloutFiles = Math.max(1, Math.floor(options.maxRolloutFiles ?? DEFAULT_MAX_ROLLOUT_FILES))
   }
 
-  public async inspect(): Promise<CodexSessionRepairOverview> {
+  public async inspect(options: CodexSessionRepairOperationOptions = {}): Promise<CodexSessionRepairOverview> {
     const currentProvider = await this.readCurrentProvider()
-    const plan = await this.buildPlan(currentProvider)
+    const plan = await this.buildPlan(currentProvider, currentProvider, options)
     return overviewFor(plan, this.codexHome)
   }
 
-  public async preview(targetProvider: string): Promise<CodexSessionRepairPreview> {
-    const plan = await this.buildPlan(assertProvider(targetProvider))
+  public async preview(targetProvider: string, options: CodexSessionRepairOperationOptions = {}): Promise<CodexSessionRepairPreview> {
+    return this.analyze(targetProvider, options)
+  }
+
+  /**
+   * Builds one immutable repair plan and derives both the overview and preview
+   * from it. Renderer flows should prefer this over calling inspect + preview,
+   * which would scan every rollout twice.
+   */
+  public async analyze(targetProvider?: string, options: CodexSessionRepairOperationOptions = {}): Promise<CodexSessionRepairPreview> {
+    if (targetProvider !== undefined) {
+      const plan = await this.buildPlan(assertProvider(targetProvider), undefined, options)
+      return previewFor(plan, this.codexHome)
+    }
+    const currentProvider = await this.readCurrentProvider()
+    const plan = await this.buildPlan(currentProvider, currentProvider, options)
     return previewFor(plan, this.codexHome)
   }
 
-  public async repair(targetProvider: string, expectedRevision: string): Promise<CodexSessionRepairResult> {
-    const provider = assertProvider(targetProvider)
+  public async repair(targetProvider: string, expectedRevision: string, options: CodexSessionRepairOperationOptions = {}): Promise<CodexSessionRepairResult> {
     if (typeof expectedRevision !== 'string' || !/^[a-f0-9]{64}$/.test(expectedRevision)) {
+      throw new Error('会话修复预览无效，请重新预览。')
+    }
+    return this.analyzeAndRepair(targetProvider, expectedRevision, options)
+  }
+
+  /**
+   * Builds and applies the same in-memory plan under the maintenance lock.
+   * This intentionally has no cross-call cache: Codex may flush state while it
+   * is being closed, so the post-shutdown snapshot must always be fresh.
+   */
+  public async analyzeAndRepair(
+    targetProvider?: string,
+    expectedRevision?: string,
+    options: CodexSessionRepairOperationOptions = {},
+  ): Promise<CodexSessionRepairResult> {
+    const requestedProvider = targetProvider === undefined ? undefined : assertProvider(targetProvider)
+    if (expectedRevision !== undefined && !/^[a-f0-9]{64}$/.test(expectedRevision)) {
       throw new Error('会话修复预览无效，请重新预览。')
     }
     if (this.active) throw new Error('已有会话修复正在运行。')
@@ -120,10 +175,20 @@ export class CodexSessionRepairService {
     let releaseLock: (() => Promise<void>) | undefined
     try {
       releaseLock = await acquireCodexSessionMaintenanceLock(this.codexHome, 'provider-sync', this.now(), this.randomId())
-      const plan = await this.buildPlan(provider)
-      if (plan.revision !== expectedRevision) {
+      const currentProvider = requestedProvider === undefined ? await this.readCurrentProvider() : undefined
+      const provider = requestedProvider ?? currentProvider!
+      const plan = await this.buildPlan(provider, currentProvider, options)
+      if (expectedRevision !== undefined && plan.revision !== expectedRevision) {
         throw new Error('Codex 会话数据已在预览后发生变化；为避免覆盖新内容，本次修复已中止，请重新预览。')
       }
+      return await this.applyPlan(plan, options)
+    } finally {
+      await releaseLock?.().catch(() => undefined)
+      this.active = false
+    }
+  }
+
+  private async applyPlan(plan: RepairPlan, options: CodexSessionRepairOperationOptions): Promise<CodexSessionRepairResult> {
       const changedRollouts = plan.rollouts.filter((item) => item.rewriteNeeded)
       const changedDatabases = plan.databases.filter((item) => item.changes.length > 0)
       const changedGlobalState = plan.globalState?.changedFields.length ? plan.globalState : undefined
@@ -131,14 +196,18 @@ export class CodexSessionRepairService {
         return resultFor(plan, undefined)
       }
 
-      await this.assertRolloutsUnchanged(changedRollouts)
+      throwIfCancelled(options.signal)
+      options.onProgress?.({ stage: 'verify', completed: 0, total: changedRollouts.length })
+      await this.assertRolloutsUnchanged(changedRollouts, options)
       if (changedGlobalState) await this.assertGlobalStateUnchanged(changedGlobalState)
-      const backupPath = await this.createBackup(plan, changedRollouts, changedDatabases, changedGlobalState)
+      throwIfCancelled(options.signal)
+      const backupPath = await this.createBackup(plan, changedRollouts, changedDatabases, changedGlobalState, options)
       const writtenRollouts: RolloutPlan[] = []
       const writtenDatabases: DatabasePlan[] = []
       let writtenGlobalState: GlobalStatePlan | undefined
       try {
         for (const rollout of changedRollouts) {
+          throwIfCancelled(options.signal)
           const backupBytes = await readFile(join(backupPath, 'rollouts', rollout.relativePath))
           const currentBytes = await readFile(rollout.path)
           if (!currentBytes.equals(backupBytes)) {
@@ -152,15 +221,20 @@ export class CodexSessionRepairService {
           // already committed by atomicWriteFile.
           writtenRollouts.push(rollout)
           await this.preserveMtime(rollout)
+          options.onProgress?.({ stage: 'apply', completed: writtenRollouts.length, total: changedRollouts.length + changedDatabases.length + (changedGlobalState ? 1 : 0) })
         }
         for (const database of changedDatabases) {
+          throwIfCancelled(options.signal)
           this.applyDatabasePlan(database)
           writtenDatabases.push(database)
+          options.onProgress?.({ stage: 'apply', completed: writtenRollouts.length + writtenDatabases.length, total: changedRollouts.length + changedDatabases.length + (changedGlobalState ? 1 : 0) })
         }
         if (changedGlobalState) {
+          throwIfCancelled(options.signal)
           await this.assertGlobalStateUnchanged(changedGlobalState)
           await atomicWriteFile(changedGlobalState.path, changedGlobalState.nextText, this.randomId)
           writtenGlobalState = changedGlobalState
+          options.onProgress?.({ stage: 'apply', completed: changedRollouts.length + changedDatabases.length + 1, total: changedRollouts.length + changedDatabases.length + 1 })
         }
       } catch (error) {
         const rollbackFailures = await this.rollback(writtenRollouts, writtenDatabases, writtenGlobalState, backupPath)
@@ -176,30 +250,39 @@ export class CodexSessionRepairService {
         retentionWarning = `会话已修复，但旧备份清理失败：${messageOf(error)}`
       }
       return { ...resultFor(plan, backupPath), ...(retentionWarning ? { retentionWarning } : {}) }
-    } finally {
-      await releaseLock?.().catch(() => undefined)
-      this.active = false
-    }
   }
 
-  private async buildPlan(targetProvider: string): Promise<RepairPlan> {
-    const currentProvider = await this.readCurrentProvider()
+  private async buildPlan(
+    targetProvider: string,
+    knownCurrentProvider?: string,
+    options: CodexSessionRepairOperationOptions = {},
+  ): Promise<RepairPlan> {
+    throwIfCancelled(options.signal)
+    const currentProvider = knownCurrentProvider ?? await this.readCurrentProvider()
     const skippedFiles: string[] = []
-    const rolloutPaths = await this.findRolloutFiles()
-    const rollouts: RolloutPlan[] = []
-    for (const path of rolloutPaths) {
+    options.onProgress?.({ stage: 'discover', completed: 0 })
+    const rolloutPaths = await this.findRolloutFiles(options.signal)
+    options.onProgress?.({ stage: 'discover', completed: rolloutPaths.length, total: rolloutPaths.length })
+    let scanned = 0
+    const rollouts = (await mapConcurrent(rolloutPaths, this.scanConcurrency, async (path) => {
+      throwIfCancelled(options.signal)
       try {
-        rollouts.push(await this.readRollout(path, targetProvider))
+        return await this.readRollout(path, targetProvider, options.signal)
       } catch (error) {
         if (isLockedError(error)) {
           skippedFiles.push(path)
-          continue
+          return undefined
         }
         throw error
+      } finally {
+        scanned += 1
+        options.onProgress?.({ stage: 'scan', completed: scanned, total: rolloutPaths.length })
       }
-    }
+    }, options.signal)).filter((item): item is RolloutPlan => item !== undefined)
 
-    const projectlessThreadIds = await this.readProjectlessThreadIds()
+    throwIfCancelled(options.signal)
+    const globalState = await this.readGlobalStatePlan()
+    const projectlessThreadIds = this.projectlessThreadIds(globalState)
     const userEventThreadIds = new Set(rollouts
       .filter((item) => item.hasUserEvent)
       .flatMap((item) => item.threadId ? [item.threadId] : []))
@@ -208,10 +291,11 @@ export class CodexSessionRepairService {
         ? [[item.threadId, item.cwd] as const]
         : []
     )))
-    const databases = (await this.findSessionDatabases()).map((path) => (
-      this.readDatabasePlan(path, targetProvider, userEventThreadIds, cwdByThreadId)
-    ))
-    const globalState = await this.readGlobalStatePlan()
+    const databases = (await this.findSessionDatabases()).flatMap((path) => {
+      throwIfCancelled(options.signal)
+      const plan = this.readDatabasePlan(path, targetProvider, userEventThreadIds, cwdByThreadId)
+      return plan ? [plan] : []
+    })
     const targets = await this.buildTargets(currentProvider, rollouts, databases)
     const revision = revisionFor(targetProvider, rollouts, databases, globalState)
     return { targetProvider, currentProvider, targets, rollouts, databases, globalState, skippedFiles, revision }
@@ -263,26 +347,19 @@ export class CodexSessionRepairService {
       .sort((left, right) => Number(right.isCurrentProvider) - Number(left.isCurrentProvider) || left.id.localeCompare(right.id))
   }
 
-  private async findRolloutFiles(): Promise<string[]> {
-    const files: string[] = []
-    for (const directory of ['sessions', 'archived_sessions']) {
-      await collectFiles(join(this.codexHome, directory), files, (name) => name.startsWith('rollout-') && name.endsWith('.jsonl'))
-    }
-    return files.sort()
+  private async findRolloutFiles(signal?: AbortSignal): Promise<string[]> {
+    return collectFilesBounded(
+      ['sessions', 'archived_sessions'].map((directory) => join(this.codexHome, directory)),
+      (name) => name.startsWith('rollout-') && name.endsWith('.jsonl'),
+      this.scanConcurrency,
+      this.maxRolloutFiles,
+      signal,
+    )
   }
 
-  private async readRollout(path: string, targetProvider: string): Promise<RolloutPlan> {
+  private async readRollout(path: string, targetProvider: string, signal?: AbortSignal): Promise<RolloutPlan> {
+    throwIfCancelled(signal)
     const info = await stat(path)
-    const handle = await open(path, 'r')
-    let prefix: Buffer
-    try {
-      prefix = Buffer.allocUnsafe(Math.min(info.size, ROLLOUT_SCAN_BYTES))
-      const { bytesRead } = await handle.read(prefix, 0, prefix.length, 0)
-      prefix = prefix.subarray(0, bytesRead)
-    } finally {
-      await handle.close()
-    }
-    const originalText = prefix.toString('utf8')
     let threadId: string | undefined
     let cwd: string | undefined
     let hasUserEvent = false
@@ -290,37 +367,91 @@ export class CodexSessionRepairService {
     let sessionMetaCount = 0
     let rewriteNeeded = false
     const providers: string[] = []
-    for (const segment of originalText.match(/.*(?:\r\n|\n|$)/g) ?? []) {
-      if (!segment) continue
-      const lineEnding = segment.endsWith('\r\n') ? '\r\n' : segment.endsWith('\n') ? '\n' : ''
-      const line = lineEnding ? segment.slice(0, -lineEnding.length) : segment
+    let metadataEnd: number | undefined
+    let firstLine = true
+    const inspectLine = (bytes: Buffer, lineEnd: number) => {
+      const withoutCr = bytes.at(-1) === 0x0d ? bytes.subarray(0, -1) : bytes
+      const rawLine = withoutCr.toString('utf8')
+      const line = firstLine && rawLine.charCodeAt(0) === 0xfeff ? rawLine.slice(1) : rawLine
+      firstLine = false
       if (line.includes('"user_message"') || line.includes('"user_input"')) hasUserEvent = true
       if (line.includes('"encrypted_content"')) encryptedContent = true
-      if (line.includes('"session_meta"')) {
-        try {
-          const record = JSON.parse(line) as Record<string, unknown>
-          if (record.type === 'session_meta' && record.payload && typeof record.payload === 'object' && !Array.isArray(record.payload)) {
-            const payload = record.payload as Record<string, unknown>
-            sessionMetaCount += 1
-            if (!threadId && typeof payload.id === 'string' && payload.id.trim()) threadId = payload.id.trim()
-            if (!cwd && typeof payload.cwd === 'string') cwd = normalizeWorkspacePath(payload.cwd)
-            const originalProvider = typeof payload.model_provider === 'string' ? payload.model_provider : ''
-            if (originalProvider) providers.push(originalProvider)
-            if (originalProvider !== targetProvider) {
-              rewriteNeeded = true
-            }
-          }
-        } catch {
-          // Non-JSON diagnostic lines are preserved byte-for-byte.
-        }
+      if (!line.includes('"session_meta"')) return
+      try {
+        const record = JSON.parse(line) as Record<string, unknown>
+        if (record.type !== 'session_meta' || !record.payload || typeof record.payload !== 'object' || Array.isArray(record.payload)) return
+        const payload = record.payload as Record<string, unknown>
+        sessionMetaCount += 1
+        if (!threadId && typeof payload.id === 'string' && payload.id.trim()) threadId = payload.id.trim()
+        if (!cwd && typeof payload.cwd === 'string') cwd = normalizeWorkspacePath(payload.cwd)
+        const originalProvider = typeof payload.model_provider === 'string' ? payload.model_provider : ''
+        if (originalProvider) providers.push(originalProvider)
+        if (originalProvider !== targetProvider) rewriteNeeded = true
+        metadataEnd ??= lineEnd
+      } catch {
+        // Non-JSON diagnostic lines remain untouched and do not extend the scan.
       }
+    }
+
+    // The scan limit is enforced by positional reads, not after a line parser
+    // emits a complete record. This keeps a huge unterminated suffix or malformed
+    // line from bypassing the budget, while still allowing session_meta itself
+    // to be much larger than the 1 MiB fingerprint prefix.
+    const prefix = Buffer.allocUnsafe(Math.min(info.size, ROLLOUT_SCAN_BYTES))
+    let prefixBytes = 0
+    let position = 0
+    let pendingParts: Buffer[] = []
+    let pendingBytes = 0
+    const chunk = Buffer.allocUnsafe(ROLLOUT_READ_CHUNK_BYTES)
+    const handle = await this.openRollout(path)
+    try {
+      while (position < info.size) {
+        throwIfCancelled(signal)
+        const stopAt = Math.min(
+          info.size,
+          metadataEnd === undefined ? ROLLOUT_META_SEARCH_BYTES : metadataEnd + ROLLOUT_SCAN_BYTES,
+        )
+        if (position >= stopAt) break
+        const { bytesRead } = await handle.read(chunk, 0, Math.min(chunk.length, stopAt - position), position)
+        if (!bytesRead) break
+        if (prefixBytes < prefix.length) {
+          const copyBytes = Math.min(bytesRead, prefix.length - prefixBytes)
+          chunk.copy(prefix, prefixBytes, 0, copyBytes)
+          prefixBytes += copyBytes
+        }
+        let segmentStart = 0
+        for (let offset = 0; offset < bytesRead; offset += 1) {
+          if (chunk[offset] !== 0x0a) continue
+          const segment = chunk.subarray(segmentStart, offset)
+          const line = pendingParts.length
+            ? Buffer.concat([...pendingParts, segment], pendingBytes + segment.length)
+            : segment
+          inspectLine(line, position + offset + 1)
+          pendingParts = []
+          pendingBytes = 0
+          segmentStart = offset + 1
+        }
+        if (segmentStart < bytesRead) {
+          const tail = Buffer.from(chunk.subarray(segmentStart, bytesRead))
+          pendingParts.push(tail)
+          pendingBytes += tail.length
+        }
+        position += bytesRead
+      }
+      // Parse an unterminated final line only at physical EOF. A line cut by the
+      // hard byte budget is deliberately classified as unrecognized metadata.
+      if (position >= info.size && pendingBytes > 0) {
+        inspectLine(Buffer.concat(pendingParts, pendingBytes), position)
+      }
+    } finally {
+      await handle.close()
     }
     const relativePath = safeRelative(this.codexHome, path)
     return {
       path,
       relativePath,
       archived: relativePath.startsWith(`archived_sessions${sep}`),
-      originalHash: rolloutFingerprint(info.size, info.mtimeMs, prefix),
+      originalHash: rolloutFingerprint(info.size, info.mtimeMs, prefix.subarray(0, prefixBytes)),
       originalAtimeMs: info.atimeMs,
       originalMtimeMs: info.mtimeMs,
       providers,
@@ -344,7 +475,7 @@ export class CodexSessionRepairService {
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
     }
-    return candidates.filter((path) => databaseHasThreads(path)).sort()
+    return candidates.sort()
   }
 
   private readDatabasePlan(
@@ -352,9 +483,16 @@ export class CodexSessionRepairService {
     targetProvider: string,
     userEventThreadIds: Set<string>,
     cwdByThreadId: Map<string, string>,
-  ): DatabasePlan {
-    const database = new DatabaseSync(path, { readOnly: true })
+  ): DatabasePlan | undefined {
+    let database: DatabaseSync
     try {
+      database = new DatabaseSync(path, { readOnly: true })
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+      throw error
+    }
+    try {
+      if (!database.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'threads' LIMIT 1").get()) return undefined
       const columns = tableColumns(database, 'threads')
       if (!columns.has('id') || !columns.has('model_provider')) {
         return { path, relativePath: safeRelative(this.codexHome, path), threadCount: 0, providerIds: [], columns, changes: [] }
@@ -402,15 +540,9 @@ export class CodexSessionRepairService {
     }
   }
 
-  private async readProjectlessThreadIds(): Promise<Set<string>> {
-    try {
-      const value = JSON.parse(await readFile(join(this.codexHome, '.codex-global-state.json'), 'utf8')) as Record<string, unknown>
-      const ids = value['projectless-thread-ids']
-      return new Set(Array.isArray(ids) ? ids.filter((id): id is string => typeof id === 'string' && Boolean(id.trim())) : [])
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return new Set()
-      throw new Error(`无法读取 Codex 全局状态：${messageOf(error)}`)
-    }
+  private projectlessThreadIds(plan: GlobalStatePlan | undefined): Set<string> {
+    const ids = plan?.originalValue['projectless-thread-ids']
+    return new Set(Array.isArray(ids) ? ids.filter((id): id is string => typeof id === 'string' && Boolean(id.trim())) : [])
   }
 
   private async readGlobalStatePlan(): Promise<GlobalStatePlan | undefined> {
@@ -440,15 +572,23 @@ export class CodexSessionRepairService {
       nextHash: sha256(nextText),
       changedFields: normalized.changedFields,
       conflictingFields: normalized.conflictingFields,
+      originalValue: value,
     }
   }
 
-  private async assertRolloutsUnchanged(rollouts: RolloutPlan[]): Promise<void> {
-    for (const rollout of rollouts) {
+  private async assertRolloutsUnchanged(
+    rollouts: RolloutPlan[],
+    options: CodexSessionRepairOperationOptions,
+  ): Promise<void> {
+    let completed = 0
+    await mapConcurrent(rollouts, this.scanConcurrency, async (rollout) => {
+      throwIfCancelled(options.signal)
       if (await fastRolloutFingerprint(rollout.path) !== rollout.originalHash) {
         throw new Error(`会话文件在修复前发生变化，请重新预览：${rollout.relativePath}`)
       }
-    }
+      completed += 1
+      options.onProgress?.({ stage: 'verify', completed, total: rollouts.length })
+    }, options.signal)
   }
 
   private async assertGlobalStateUnchanged(plan: GlobalStatePlan): Promise<void> {
@@ -468,55 +608,74 @@ export class CodexSessionRepairService {
     rollouts: RolloutPlan[],
     databases: DatabasePlan[],
     globalState?: GlobalStatePlan,
+    options: CodexSessionRepairOperationOptions = {},
   ): Promise<string> {
     const backupRoot = join(this.codexHome, 'backups_state', 'stone-session-repair')
     const backupPath = join(backupRoot, `${timestampName(this.now())}-${this.randomId()}`)
-    await mkdir(backupRoot, { recursive: true })
-    await mkdir(backupPath, { recursive: false })
-    for (const rollout of rollouts) {
-      const destination = join(backupPath, 'rollouts', rollout.relativePath)
-      await mkdir(dirname(destination), { recursive: true })
-      await copyFile(rollout.path, destination)
-    }
-    for (const databasePlan of databases) {
-      const destination = join(backupPath, 'db', databasePlan.relativePath)
-      await mkdir(dirname(destination), { recursive: true })
-      const database = new DatabaseSync(databasePlan.path, { readOnly: true })
-      try {
-        await backup(database, destination)
-      } finally {
-        database.close()
+    const total = rollouts.length + databases.length + (globalState ? 1 : 0)
+    let completed = 0
+    options.onProgress?.({ stage: 'backup', completed, total })
+    try {
+      throwIfCancelled(options.signal)
+      await mkdir(backupRoot, { recursive: true })
+      await mkdir(backupPath, { recursive: false })
+      await mapConcurrent(rollouts, this.scanConcurrency, async (rollout) => {
+        throwIfCancelled(options.signal)
+        const destination = join(backupPath, 'rollouts', rollout.relativePath)
+        await mkdir(dirname(destination), { recursive: true })
+        await copyFile(rollout.path, destination)
+        completed += 1
+        options.onProgress?.({ stage: 'backup', completed, total })
+      }, options.signal)
+      for (const databasePlan of databases) {
+        throwIfCancelled(options.signal)
+        const destination = join(backupPath, 'db', databasePlan.relativePath)
+        await mkdir(dirname(destination), { recursive: true })
+        const database = new DatabaseSync(databasePlan.path, { readOnly: true })
+        try {
+          await backup(database, destination)
+        } finally {
+          database.close()
+        }
+        completed += 1
+        options.onProgress?.({ stage: 'backup', completed, total })
       }
-    }
-    for (const name of ['config.toml']) {
-      try {
-        await copyFile(join(this.codexHome, name), join(backupPath, name))
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      for (const name of ['config.toml']) {
+        try {
+          await copyFile(join(this.codexHome, name), join(backupPath, name))
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+        }
       }
-    }
-    if (globalState) {
-      await writeFile(join(backupPath, GLOBAL_STATE_FILE), globalState.originalBytes, { mode: 0o600 })
-    } else {
-      try {
-        await copyFile(join(this.codexHome, GLOBAL_STATE_FILE), join(backupPath, GLOBAL_STATE_FILE))
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      if (globalState) {
+        throwIfCancelled(options.signal)
+        await writeFile(join(backupPath, GLOBAL_STATE_FILE), globalState.originalBytes, { mode: 0o600 })
+        completed += 1
+        options.onProgress?.({ stage: 'backup', completed, total })
+      } else {
+        try {
+          await copyFile(join(this.codexHome, GLOBAL_STATE_FILE), join(backupPath, GLOBAL_STATE_FILE))
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+        }
       }
+      await writeFile(join(backupPath, 'metadata.json'), JSON.stringify({
+        version: 1,
+        managedBy: BACKUP_MARKER,
+        createdAt: this.now().toISOString(),
+        codexHome: this.codexHome,
+        targetProvider: plan.targetProvider,
+        revision: plan.revision,
+        changedRolloutFiles: rollouts.map((item) => item.relativePath),
+        changedDatabases: databases.map((item) => item.relativePath),
+        changedGlobalStateFields: globalState?.changedFields ?? [],
+        conflictingGlobalStateFields: globalState?.conflictingFields ?? [],
+      }, null, 2), { encoding: 'utf8', mode: 0o600 })
+      return backupPath
+    } catch (error) {
+      await rm(backupPath, { recursive: true, force: true }).catch(() => undefined)
+      throw error
     }
-    await writeFile(join(backupPath, 'metadata.json'), JSON.stringify({
-      version: 1,
-      managedBy: BACKUP_MARKER,
-      createdAt: this.now().toISOString(),
-      codexHome: this.codexHome,
-      targetProvider: plan.targetProvider,
-      revision: plan.revision,
-      changedRolloutFiles: rollouts.map((item) => item.relativePath),
-      changedDatabases: databases.map((item) => item.relativePath),
-      changedGlobalStateFields: globalState?.changedFields ?? [],
-      conflictingGlobalStateFields: globalState?.conflictingFields ?? [],
-    }, null, 2), { encoding: 'utf8', mode: 0o600 })
-    return backupPath
   }
 
   private applyDatabasePlan(plan: DatabasePlan): void {
@@ -673,6 +832,9 @@ function previewFor(plan: RepairPlan, codexHome: string): CodexSessionRepairPrev
     targetProvider: plan.targetProvider,
     revision: plan.revision,
     rolloutFilesToUpdate: plan.rollouts.filter((item) => item.rewriteNeeded).length,
+    rolloutFilesWithSessionMeta: plan.rollouts.filter((item) => item.sessionMetaCount > 0).length,
+    rolloutFilesWithoutSessionMeta: plan.rollouts.filter((item) => item.sessionMetaCount === 0).length,
+    rolloutFilesAlreadyTargetProvider: plan.rollouts.filter((item) => item.sessionMetaCount > 0 && !item.rewriteNeeded).length,
     sqliteProviderRowsToUpdate: providerRows,
     sqliteUserEventRowsToUpdate: userEventRows,
     sqliteCwdRowsToUpdate: cwdRows,
@@ -739,15 +901,17 @@ function rewriteRollout(originalText: string, targetProvider: string): { nextTex
     const segment = originalText.slice(offset, end)
     const lineEnding = segment.endsWith('\r\n') ? '\r\n' : segment.endsWith('\n') ? '\n' : ''
     const line = lineEnding ? segment.slice(0, -lineEnding.length) : segment
+    const bom = offset === 0 && line.charCodeAt(0) === 0xfeff ? '\ufeff' : ''
+    const jsonLine = bom ? line.slice(1) : line
     let nextLine = line
-    if (line.includes('"session_meta"')) {
+    if (jsonLine.includes('"session_meta"')) {
       try {
-        const record = JSON.parse(line) as Record<string, unknown>
+        const record = JSON.parse(jsonLine) as Record<string, unknown>
         if (record.type === 'session_meta' && record.payload && typeof record.payload === 'object' && !Array.isArray(record.payload)) {
           const payload = record.payload as Record<string, unknown>
           if (payload.model_provider !== targetProvider) {
             payload.model_provider = targetProvider
-            nextLine = JSON.stringify(record)
+            nextLine = bom + JSON.stringify(record)
           }
         }
       } catch {
@@ -798,35 +962,82 @@ async function sha256File(path: string): Promise<string> {
   }
 }
 
-function databaseHasThreads(path: string): boolean {
-  let database: DatabaseSync | undefined
-  try {
-    database = new DatabaseSync(path, { readOnly: true })
-    return Boolean(database.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'threads' LIMIT 1").get())
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
-    throw error
-  } finally {
-    database?.close()
-  }
-}
-
 function tableColumns(database: DatabaseSync, table: string): Set<string> {
   return new Set((database.prepare(`PRAGMA table_info(${table})`).all() as Array<Record<string, unknown>>)
     .flatMap((row) => typeof row.name === 'string' ? [row.name] : []))
 }
 
-async function collectFiles(root: string, files: string[], accepts: (name: string) => boolean): Promise<void> {
-  let entries
-  try { entries = await readdir(root, { withFileTypes: true }) } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
-    throw error
+function throwIfCancelled(signal?: AbortSignal): void {
+  if (!signal?.aborted) return
+  if (signal.reason instanceof Error) throw signal.reason
+  const error = new Error('会话修复已取消。')
+  error.name = 'AbortError'
+  throw error
+}
+
+async function mapConcurrent<T, R>(
+  values: readonly T[],
+  concurrency: number,
+  operation: (value: T, index: number) => Promise<R>,
+  signal?: AbortSignal,
+): Promise<R[]> {
+  const results = new Array<R>(values.length)
+  let nextIndex = 0
+  let failure: unknown
+  const worker = async () => {
+    while (failure === undefined) {
+      try {
+        throwIfCancelled(signal)
+        const index = nextIndex
+        nextIndex += 1
+        if (index >= values.length) return
+        results[index] = await operation(values[index]!, index)
+      } catch (error) {
+        failure ??= error
+      }
+    }
   }
-  for (const entry of entries) {
-    const path = join(root, entry.name)
-    if (entry.isDirectory()) await collectFiles(path, files, accepts)
-    else if (entry.isFile() && accepts(entry.name)) files.push(path)
+  await Promise.all(Array.from({ length: Math.min(concurrency, values.length) }, worker))
+  if (failure !== undefined) throw failure
+  throwIfCancelled(signal)
+  return results
+}
+
+async function collectFilesBounded(
+  roots: string[],
+  accepts: (name: string) => boolean,
+  concurrency: number,
+  maxFiles: number,
+  signal?: AbortSignal,
+): Promise<string[]> {
+  const files: string[] = []
+  let directories = [...roots]
+  while (directories.length) {
+    throwIfCancelled(signal)
+    const current = directories
+    directories = []
+    const batches = await mapConcurrent(current, concurrency, async (root) => {
+      try {
+        return await readdir(root, { withFileTypes: true })
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []
+        throw error
+      }
+    }, signal)
+    for (let index = 0; index < current.length; index += 1) {
+      for (const entry of batches[index]!) {
+        const path = join(current[index]!, entry.name)
+        if (entry.isDirectory()) directories.push(path)
+        else if (entry.isFile() && accepts(entry.name)) {
+          files.push(path)
+          if (files.length > maxFiles) {
+            throw new Error(`会话文件超过安全扫描上限（${maxFiles} 个），请先归档或缩小 Codex 会话目录。`)
+          }
+        }
+      }
+    }
   }
+  return files.sort()
 }
 
 function normalizeWorkspacePath(value: string): string | undefined {

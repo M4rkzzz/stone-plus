@@ -11,6 +11,7 @@ import {
   SingBoxTemporaryTunPlatformAdapter,
   UnsupportedDesktopProxyError,
   WindowsSystemProxyPlatformAdapter,
+  builtInProxyPlatformCapabilities,
   createSystemProxyPlatformAdapter,
   defaultPlatformCommandRunner,
   type PlatformCommandRequest,
@@ -323,8 +324,10 @@ describe('real system-proxy platform adapters', () => {
     expect(emulator.service.pac).toEqual({ enabled: false, url: '' })
     expect(emulator.service.autoDiscovery).toBe(false)
     expect(emulator.service.bypass).toContain('*.stone.internal')
+    await expect(adapter.isSnapshotApplied(mixed)).resolves.toBe(true)
 
     emulator.service.pac = { enabled: true, url: 'https://user.example/new.pac' }
+    await expect(adapter.isSnapshotApplied(mixed)).resolves.toBe(false)
     await expect(adapter.compareAndApplySnapshot(mixed, original)).resolves.toBe('partial')
     expect(emulator.service.web).toEqual(MacNetworksetupEmulator.originalService().web)
     expect(emulator.service.pac).toEqual({ enabled: true, url: 'https://user.example/new.pac' })
@@ -353,6 +356,23 @@ describe('real system-proxy platform adapters', () => {
       mixed: { host: '127.0.0.1', port: 20811 }
     }))).toThrow(UnsupportedDesktopProxyError)
     expect(emulator.calls.filter((call) => call.args[0]?.startsWith('-set'))).toHaveLength(0)
+  })
+
+  it('reads macOS proxy state back instead of trusting successful setter exits', async () => {
+    const emulator = new MacNetworksetupEmulator()
+    const runner: PlatformCommandRunner = async (request) => (
+      request.args[0]?.startsWith('-set') ? ok() : emulator.run(request)
+    )
+    const adapter = new MacOsSystemProxyPlatformAdapter({ runner })
+    const original = await adapter.captureSnapshot()
+    const mixed = adapter.createMixedProxySnapshot(original, normalizeLeaseTarget({
+      mixed: { host: '127.0.0.1', port: 20814 }
+    }))
+
+    await adapter.applySnapshot(mixed)
+
+    await expect(adapter.isSnapshotApplied(mixed)).resolves.toBe(false)
+    await expect(adapter.isSnapshotApplied(original)).resolves.toBe(true)
   })
 
   it('normalizes authentication metadata missing from a legacy macOS v1 recovery journal', async () => {
@@ -418,11 +438,13 @@ describe('real system-proxy platform adapters', () => {
       port: '20820',
       'use-authentication': 'false'
     })
+    await expect(adapter.isSnapshotApplied(mixed)).resolves.toBe(true)
     await expect(adapter.compareAndApplySnapshot(mixed, original)).resolves.toBe('applied')
     expect(emulator.values).toEqual(GSettingsEmulator.originalValues())
 
     await adapter.applySnapshot(mixed)
     emulator.values['org.gnome.system.proxy']['autoconfig-url'] = "'https://user.example/new.pac'"
+    await expect(adapter.isSnapshotApplied(mixed)).resolves.toBe(false)
     await expect(adapter.compareAndApplySnapshot(mixed, original)).resolves.toBe('partial')
     expect(emulator.values['org.gnome.system.proxy']['autoconfig-url'])
       .toBe("'https://user.example/new.pac'")
@@ -470,6 +492,26 @@ describe('real system-proxy platform adapters', () => {
     expect(emulator.values['org.gnome.system.proxy'].mode).toBe("'manual'")
   })
 
+  it('reads GNOME proxy state back instead of trusting successful setter exits', async () => {
+    const emulator = new GSettingsEmulator()
+    const runner: PlatformCommandRunner = async (request) => (
+      request.args[0] === 'set' ? ok() : emulator.run(request)
+    )
+    const adapter = new GnomeSystemProxyPlatformAdapter({
+      runner,
+      desktopEnvironment: 'GNOME'
+    })
+    const original = await adapter.captureSnapshot()
+    const mixed = adapter.createMixedProxySnapshot(original, normalizeLeaseTarget({
+      mixed: { host: '127.0.0.1', port: 20823 }
+    }))
+
+    await adapter.applySnapshot(mixed)
+
+    await expect(adapter.isSnapshotApplied(mixed)).resolves.toBe(false)
+    await expect(adapter.isSnapshotApplied(original)).resolves.toBe(true)
+  })
+
   it('does not let a secondary GNOME marker overwrite a user-owned primary manual route', async () => {
     const emulator = new GSettingsEmulator()
     const adapter = new GnomeSystemProxyPlatformAdapter({
@@ -510,6 +552,30 @@ describe('real system-proxy platform adapters', () => {
     expect(() => createSystemProxyPlatformAdapter({ platform: 'aix', runner }))
       .toThrow(UnsupportedDesktopProxyError)
     expect(runner).not.toHaveBeenCalled()
+  })
+
+  it('reports renderer-safe access capabilities for supported and unsupported desktops', () => {
+    expect(builtInProxyPlatformCapabilities('win32')).toEqual({
+      platform: 'windows',
+      accessModes: {
+        system: { available: true, authorizationRequired: false },
+        tun: { available: true, authorizationRequired: true },
+      },
+    })
+    expect(builtInProxyPlatformCapabilities('linux', 'KDE')).toMatchObject({
+      platform: 'linux',
+      accessModes: {
+        system: { available: false, unavailableReason: 'unsupported-desktop' },
+        tun: { available: true, authorizationRequired: true },
+      },
+    })
+    expect(builtInProxyPlatformCapabilities('aix')).toMatchObject({
+      platform: 'other',
+      accessModes: {
+        system: { available: false, unavailableReason: 'unsupported-platform' },
+        tun: { available: false, unavailableReason: 'unsupported-platform' },
+      },
+    })
   })
 })
 

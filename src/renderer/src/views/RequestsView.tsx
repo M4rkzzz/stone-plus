@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Activity,
   CheckCircle2,
@@ -30,14 +30,22 @@ import {
 } from '../ui'
 import { useI18n } from '../i18n'
 import { accountDisplayName, conversationDisplayName } from '../system-generated-text'
+import { paginateRequestLogs } from '../request-log-page'
+import {
+  displayedRequestFirstTokenMs as displayedFirstTokenMs,
+  filterRequestLogs,
+  summarizeRequestLogs,
+} from '../request-log-view-model'
 
 const clientNames: Record<RouteClient, string> = {
   claude: 'Claude Code',
   codex: 'Codex',
   gemini: 'Gemini CLI',
+  grokbuild: 'Grok Build',
 }
 
 const failureStageLabels: Record<NonNullable<RequestLog['failureStage']>, readonly [string, string]> = {
+  authentication: ['验证客户端', 'Authenticate client'],
   body: ['读取请求体', 'Read request body'],
   scheduler: ['选择账号', 'Select account'],
   credential: ['解析凭据', 'Resolve credentials'],
@@ -57,9 +65,6 @@ interface RequestColumnDefinition {
 }
 
 const REQUEST_COLUMN_STORAGE_KEY = 'stone:request-column-widths:v1'
-const displayedFirstTokenMs = (log: RequestLog): number | undefined => log.requestKind === 'compaction'
-  ? undefined
-  : log.upstreamFirstByteMs ?? log.firstTokenMs
 const requestStartedAt = (log: RequestLog): number => log.startedAt ?? log.timestamp
 const liveElapsedMs = (log: RequestLog, now: number): number => log.status === 'streaming'
   ? Math.max(log.latencyMs, now - requestStartedAt(log))
@@ -133,6 +138,53 @@ function localizeReplayError(cause: unknown, language: string, fallback: string)
   return message
 }
 
+type RequestLogTranslator = (chinese: string, english: string) => string
+
+const RequestLogRow = memo(function RequestLogRow({
+  log,
+  credentialType,
+  dateTimeFormatter,
+  locale,
+  showConversationNames,
+  liveNow,
+  t,
+  onSelect,
+}: {
+  log: RequestLog
+  credentialType: Parameters<typeof requestLogSourceLabel>[1]
+  dateTimeFormatter: Intl.DateTimeFormat
+  locale: string
+  showConversationNames: boolean
+  liveNow: number
+  t: RequestLogTranslator
+  onSelect: (log: RequestLog) => void
+}) {
+  const formattedTimestamp = dateTimeFormatter.format(requestStartedAt(log))
+  const [date, ...timeParts] = formattedTimestamp.split(/\s+/u)
+  const time = timeParts.join(' ') || date
+  const select = () => onSelect(log)
+
+  return (
+    <tr className={log.status === 'streaming' ? 'request-row--live' : ''} tabIndex={0} onClick={select} onKeyDown={(event) => event.key === 'Enter' && select()}>
+      <td><div className="table-primary"><strong>{time}</strong><span>{timeParts.length ? date : ''}</span></div></td>
+      <td><div className="cell-with-icon"><span className={`client-dot client-dot--${log.client}`} />{clientNames[log.client]}</div></td>
+      <td><div className={`table-primary request-conversation${showConversationNames ? '' : ' request-conversation--hidden'}`}>{showConversationNames && <strong title={conversationDisplayName(log.conversationName, t)}>{conversationDisplayName(log.conversationName, t) ?? '—'}</strong>}<span className="mono" title={log.conversationId}>{compactConversationId(log.conversationId)}</span></div></td>
+      <td><div className="table-primary table-model"><strong className="mono">{log.upstreamModel ?? log.model}</strong>{log.upstreamModel && log.upstreamModel !== log.model && <span className="mono" title={t('客户端请求模型', 'Client-requested model')}>← {log.model}</span>}</div></td>
+      <td><div className="table-primary"><strong>{requestLogSourceLabel(log, credentialType)}</strong><span>{accountDisplayName(log.accountName, t)}</span></div></td>
+      <td>{log.status === 'streaming'
+        ? <span className="request-live-status"><i aria-hidden="true" /><span>{t(liveStageLabels[log.progressStage ?? 'receiving-body'][0], liveStageLabels[log.progressStage ?? 'receiving-body'][1])}</span></span>
+        : <><RequestStatusBadge status={log.status} statusCode={log.statusCode} requestKind={log.requestKind} />{log.statusCode && <span className="status-code">{log.statusCode}</span>}</>}</td>
+      <td>{displayedFirstTokenMs(log) !== undefined ? durationLabel(displayedFirstTokenMs(log)!) : '—'}</td>
+      <td className={log.status === 'streaming' ? 'request-live-duration' : ''}>{durationLabel(liveElapsedMs(log, liveNow))}</td>
+      <td>{log.inputTokens !== undefined
+        ? formatCompactNumber((log.inputTokens ?? 0) + (log.outputTokens ?? 0), locale)
+        : log.status === 'streaming' && (log.streamedBytes ?? 0) > 0
+          ? <span className="request-live-bytes" title={t('当前已接收的流数据量，最终 Token 以服务端用量为准', 'Live stream data received; final tokens use the upstream usage report')}>{formatTransferBytes(log.streamedBytes ?? 0)}</span>
+          : '—'}</td>
+    </tr>
+  )
+})
+
 export function RequestsView({
   snapshot,
   api,
@@ -158,11 +210,21 @@ export function RequestsView({
   const [showConversationNames, setShowConversationNames] = useState(false)
   const [columnWidths, setColumnWidths] = useState<RequestColumnWidths>(loadRequestColumnWidths)
   const [liveNow, setLiveNow] = useState(Date.now())
+  const [logPage, setLogPage] = useState(0)
   const resizingColumn = useRef<{ id: RequestColumnId; startX: number; startWidth: number } | null>(null)
   const accountCredentialTypes = useMemo(
     () => new Map(snapshot.accounts.map((account) => [account.id, account.credentialType])),
     [snapshot.accounts],
   )
+  const requestDateTimeFormatter = useMemo(() => new Intl.DateTimeFormat(locale, {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  }), [locale])
+  const summary = useMemo(() => summarizeRequestLogs(snapshot.requestLogs), [snapshot.requestLogs])
 
   useEffect(() => {
     try {
@@ -194,23 +256,27 @@ export function RequestsView({
     }
   }, [])
 
-  const filtered = useMemo(() => {
-    const normalized = query.trim().toLowerCase()
-    return snapshot.requestLogs.filter((log) => {
-      if (status !== 'all' && log.status !== status) return false
-      if (client !== 'all' && log.client !== client) return false
-      if (!normalized) return true
-      return [log.id, log.model, requestLogSourceLabel(log, accountCredentialTypes.get(log.accountId ?? '')), accountDisplayName(log.accountName, t), log.conversationId, conversationDisplayName(log.conversationName, t), log.error]
-        .some((value) => value?.toLowerCase().includes(normalized))
-    })
-  }, [accountCredentialTypes, client, query, snapshot.requestLogs, status, t])
+  const filtered = useMemo(
+    () => filterRequestLogs(snapshot.requestLogs, query, status, client, accountCredentialTypes, t),
+    [accountCredentialTypes, client, query, snapshot.requestLogs, status, t],
+  )
+  const visibleLogPage = useMemo(() => paginateRequestLogs(filtered, logPage), [filtered, logPage])
+  const selectLog = useCallback((log: RequestLog) => setSelected(log), [])
 
   useEffect(() => {
-    if (!snapshot.requestLogs.some((log) => log.status === 'streaming')) return
+    setLogPage(0)
+  }, [client, query, status])
+
+  useEffect(() => {
+    if (logPage !== visibleLogPage.page) setLogPage(visibleLogPage.page)
+  }, [logPage, visibleLogPage.page])
+
+  useEffect(() => {
+    if (!summary.hasStreaming) return
     setLiveNow(Date.now())
-    const timer = window.setInterval(() => setLiveNow(Date.now()), 250)
+    const timer = window.setInterval(() => setLiveNow(Date.now()), 500)
     return () => window.clearInterval(timer)
-  }, [snapshot.requestLogs])
+  }, [summary.hasStreaming])
 
   useEffect(() => {
     if (!selected) return
@@ -244,17 +310,6 @@ export function RequestsView({
     }
   }
 
-  const successCount = snapshot.requestLogs.filter((log) => log.status === 'success').length
-  const errorCount = snapshot.requestLogs.filter((log) => log.status === 'error').length
-  const completedLogs = snapshot.requestLogs.filter((log) => log.status !== 'streaming')
-  const averageLatency = completedLogs.length
-    ? Math.round(completedLogs.reduce((total, log) => total + log.latencyMs, 0) / completedLogs.length)
-    : 0
-  const firstTokenLogs = snapshot.requestLogs.filter((log) => displayedFirstTokenMs(log) !== undefined)
-  const averageFirstToken = firstTokenLogs.length
-    ? Math.round(firstTokenLogs.reduce((total, log) => total + (displayedFirstTokenMs(log) ?? 0), 0) / firstTokenLogs.length)
-    : 0
-  const totalTokens = snapshot.requestLogs.reduce((total, log) => total + (log.inputTokens ?? 0) + (log.outputTokens ?? 0), 0)
   const requestTableWidth = REQUEST_COLUMNS.reduce((total, column) => total + columnWidths[column.id], 0)
 
   const beginColumnResize = (event: React.MouseEvent, column: RequestColumnDefinition) => {
@@ -304,17 +359,17 @@ export function RequestsView({
 
       <section className="request-stats" aria-label={t('日志统计', 'Log statistics')}>
         <div><Activity size={16} /><span>{t('记录', 'Records')}</span><strong>{snapshot.requestLogs.length}</strong></div>
-        <div><CheckCircle2 size={16} /><span>{t('成功', 'Success')}</span><strong>{successCount}</strong></div>
-        <div><TriangleAlert size={16} /><span>{t('失败', 'Failed')}</span><strong>{errorCount}</strong></div>
-        <div><span>{t('平均首字', 'Average First Token')}</span><strong>{averageFirstToken ? durationLabel(averageFirstToken) : '—'}</strong></div>
-        <div><span>{t('平均延迟', 'Average Latency')}</span><strong>{averageLatency ? durationLabel(averageLatency) : '—'}</strong></div>
-        <div><span>Token</span><strong>{formatCompactNumber(totalTokens, locale)}</strong></div>
+        <div><CheckCircle2 size={16} /><span>{t('成功', 'Success')}</span><strong>{summary.successCount}</strong></div>
+        <div><TriangleAlert size={16} /><span>{t('失败', 'Failed')}</span><strong>{summary.errorCount}</strong></div>
+        <div><span>{t('平均首字', 'Average First Token')}</span><strong>{summary.averageFirstToken ? durationLabel(summary.averageFirstToken) : '—'}</strong></div>
+        <div><span>{t('平均延迟', 'Average Latency')}</span><strong>{summary.averageLatency ? durationLabel(summary.averageLatency) : '—'}</strong></div>
+        <div><span>Token</span><strong>{formatCompactNumber(summary.totalTokens, locale)}</strong></div>
       </section>
 
       <section className="panel panel--flush request-log-panel">
         <div className="table-toolbar">
           <label className="search-input"><Search size={16} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={t('搜索对话、模型、供应商或请求 ID', 'Search conversations, models, providers, or request IDs')} /></label>
-          <div className="filter-group"><Filter size={15} /><select value={client} aria-label={t('筛选客户端', 'Filter clients')} onChange={(event) => setClient(event.target.value as 'all' | RouteClient)}><option value="all">{t('全部客户端', 'All Clients')}</option><option value="claude">Claude Code</option><option value="codex">Codex</option><option value="gemini">Gemini CLI</option></select><select value={status} aria-label={t('筛选状态', 'Filter status')} onChange={(event) => setStatus(event.target.value as 'all' | RequestLog['status'])}><option value="all">{t('全部状态', 'All Statuses')}</option><option value="success">{t('成功', 'Success')}</option><option value="error">{t('失败', 'Failed')}</option><option value="streaming">{t('传输中', 'Streaming')}</option></select></div>
+          <div className="filter-group"><Filter size={15} /><select value={client} aria-label={t('筛选客户端', 'Filter clients')} onChange={(event) => setClient(event.target.value as 'all' | RouteClient)}><option value="all">{t('全部客户端', 'All Clients')}</option><option value="claude">Claude Code</option><option value="codex">Codex</option><option value="gemini">Gemini CLI</option><option value="grokbuild">Grok Build</option></select><select value={status} aria-label={t('筛选状态', 'Filter status')} onChange={(event) => setStatus(event.target.value as 'all' | RequestLog['status'])}><option value="all">{t('全部状态', 'All Statuses')}</option><option value="success">{t('成功', 'Success')}</option><option value="error">{t('失败', 'Failed')}</option><option value="streaming">{t('传输中', 'Streaming')}</option></select></div>
         </div>
 
         {filtered.length ? (
@@ -345,29 +400,36 @@ export function RequestsView({
                   </th>
                 ))}</tr></thead>
                 <tbody>
-                  {filtered.map((log) => (
-                    <tr className={log.status === 'streaming' ? 'request-row--live' : ''} key={log.id} tabIndex={0} onClick={() => setSelected(log)} onKeyDown={(event) => event.key === 'Enter' && setSelected(log)}>
-                      <td><div className="table-primary"><strong>{formatDateTime(requestStartedAt(log), locale).split(' ')[1]}</strong><span>{formatDateTime(requestStartedAt(log), locale).split(' ')[0]}</span></div></td>
-                      <td><div className="cell-with-icon"><span className={`client-dot client-dot--${log.client}`} />{clientNames[log.client]}</div></td>
-                      <td><div className={`table-primary request-conversation${showConversationNames ? '' : ' request-conversation--hidden'}`}>{showConversationNames && <strong title={conversationDisplayName(log.conversationName, t)}>{conversationDisplayName(log.conversationName, t) ?? '—'}</strong>}<span className="mono" title={log.conversationId}>{compactConversationId(log.conversationId)}</span></div></td>
-                      <td><span className="mono table-model">{log.model}</span></td>
-                      <td><div className="table-primary"><strong>{requestLogSourceLabel(log, accountCredentialTypes.get(log.accountId ?? ''))}</strong><span>{accountDisplayName(log.accountName, t)}</span></div></td>
-                      <td>{log.status === 'streaming'
-                        ? <span className="request-live-status"><i aria-hidden="true" /><span>{t(liveStageLabels[log.progressStage ?? 'receiving-body'][0], liveStageLabels[log.progressStage ?? 'receiving-body'][1])}</span></span>
-                        : <><RequestStatusBadge status={log.status} statusCode={log.statusCode} requestKind={log.requestKind} />{log.statusCode && <span className="status-code">{log.statusCode}</span>}</>}</td>
-                      <td>{displayedFirstTokenMs(log) !== undefined ? durationLabel(displayedFirstTokenMs(log)!) : '—'}</td>
-                      <td className={log.status === 'streaming' ? 'request-live-duration' : ''}>{durationLabel(liveElapsedMs(log, liveNow))}</td>
-                      <td>{log.inputTokens !== undefined
-                        ? formatCompactNumber((log.inputTokens ?? 0) + (log.outputTokens ?? 0), locale)
-                        : log.status === 'streaming' && (log.streamedBytes ?? 0) > 0
-                          ? <span className="request-live-bytes" title={t('当前已接收的流数据量，最终 Token 以服务端用量为准', 'Live stream data received; final tokens use the upstream usage report')}>{formatTransferBytes(log.streamedBytes ?? 0)}</span>
-                          : '—'}</td>
-                    </tr>
+                  {visibleLogPage.items.map((log) => (
+                    <RequestLogRow
+                      key={log.id}
+                      log={log}
+                      credentialType={accountCredentialTypes.get(log.accountId ?? '')}
+                      dateTimeFormatter={requestDateTimeFormatter}
+                      locale={locale}
+                      showConversationNames={showConversationNames}
+                      liveNow={log.status === 'streaming' ? liveNow : 0}
+                      t={t}
+                      onSelect={selectLog}
+                    />
                   ))}
                 </tbody>
               </table>
             </div>
-            <footer className="table-footer"><span>{t(`显示 ${filtered.length} / ${snapshot.requestLogs.length} 条记录`, `Showing ${filtered.length} / ${snapshot.requestLogs.length} records`)}</span><span>{t('仅保存在本机', 'Stored locally only')}</span></footer>
+            <footer className="table-footer request-log-footer">
+              <span>{t(
+                `显示 ${visibleLogPage.start}–${visibleLogPage.end} / ${filtered.length} 条匹配记录`,
+                `Showing ${visibleLogPage.start}–${visibleLogPage.end} of ${filtered.length} matching records`,
+              )}</span>
+              {visibleLogPage.pageCount > 1 && (
+                <div className="filter-group" aria-label={t('请求日志分页', 'Request log pagination')}>
+                  <button className="text-button" type="button" disabled={visibleLogPage.page === 0} onClick={() => setLogPage((page) => page - 1)}>{t('上一页', 'Previous')}</button>
+                  <span>{visibleLogPage.page + 1} / {visibleLogPage.pageCount}</span>
+                  <button className="text-button" type="button" disabled={visibleLogPage.page + 1 >= visibleLogPage.pageCount} onClick={() => setLogPage((page) => page + 1)}>{t('下一页', 'Next')}</button>
+                </div>
+              )}
+              <span>{t(`共保留 ${snapshot.requestLogs.length} 条 · 仅保存在本机`, `${snapshot.requestLogs.length} retained · Stored locally only`)}</span>
+            </footer>
           </>
         ) : (
           <EmptyState icon={<Activity size={24} />} title={snapshot.requestLogs.length ? t('没有匹配的请求', 'No matching requests') : t('暂无请求日志', 'No request logs')} description={snapshot.requestLogs.length ? t('调整搜索词或筛选条件', 'Adjust the search term or filters') : t('网关收到请求后会在此显示记录', 'Requests will appear here after the gateway receives them')} action={snapshot.requestLogs.length ? <button className="button button--secondary" type="button" onClick={() => { setQuery(''); setClient('all'); setStatus('all') }}>{t('重置筛选', 'Reset Filters')}</button> : undefined} />
@@ -384,7 +446,8 @@ export function RequestsView({
               <DetailItem label={t('对话名称', 'Conversation Name')}>{showConversationNames ? conversationDisplayName(selected.conversationName, t) ?? '—' : t('已隐藏', 'Hidden')}</DetailItem>
               <DetailItem label={t('对话 ID', 'Conversation ID')} mono>{selected.conversationId ?? '—'}</DetailItem>
               <DetailItem label={t('入站协议', 'Inbound Protocol')}>{protocolLabels[selected.protocol]}</DetailItem>
-              <DetailItem label={t('模型', 'Model')} mono>{selected.model}</DetailItem>
+              <DetailItem label={t('请求模型', 'Requested Model')} mono>{selected.model}</DetailItem>
+              <DetailItem label={t('上游模型', 'Upstream Model')} mono>{selected.upstreamModel ?? selected.model}</DetailItem>
               <DetailItem label={t('供应商', 'Provider')}>{requestLogSourceLabel(selected, accountCredentialTypes.get(selected.accountId ?? ''))}</DetailItem>
               <DetailItem label={t('账号', 'Account')}>{accountDisplayName(selected.accountName, t)}</DetailItem>
               {selected.status === 'streaming' && <DetailItem label={t('实时阶段', 'Live Stage')}>{t(liveStageLabels[selected.progressStage ?? 'receiving-body'][0], liveStageLabels[selected.progressStage ?? 'receiving-body'][1])}</DetailItem>}

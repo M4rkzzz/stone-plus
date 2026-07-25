@@ -2,8 +2,9 @@ import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
+import { generateKeyPairSync } from 'node:crypto'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { Account, RequestLog } from '../../src/shared/types'
+import type { Account, RequestLog, RouteClient } from '../../src/shared/types'
 
 vi.mock('electron', () => ({
   safeStorage: {
@@ -407,7 +408,7 @@ describe('AppStore', () => {
       ...input,
       name: 'Invalid mode relay',
       responsesCompactMode: 'future-mode'
-    } as Parameters<AppStore['saveProvider']>[0])).rejects.toThrow(/must be legacy, passthrough, or native/)
+    } as Parameters<AppStore['saveProvider']>[0])).rejects.toThrow(/must be auto, legacy, passthrough, or native/)
     await expect(store.saveProvider({
       ...input,
       name: 'Invalid official override',
@@ -423,7 +424,101 @@ describe('AppStore', () => {
     expect(restarted.getRuntimeProvider(providerId)).toMatchObject({ responsesCompactMode: 'passthrough' })
   })
 
-  it('strips unknown or inapplicable compact capabilities while importing legacy provider JSON', async () => {
+  it('persists xAI-compatible relay providers and enforces their relay-only boundary', async () => {
+    const store = createStore()
+    await store.initialize()
+    const saved = await store.saveProvider({
+      name: 'Grok relay',
+      sourceType: 'relay',
+      kind: 'xai-compatible',
+      baseUrl: 'https://xai-relay.example.test/v1',
+      protocol: 'openai-chat',
+      models: ['grok-4', 'grok-code-fast-1']
+    })
+    const providerId = saved.providers.find((provider) => provider.name === 'Grok relay')!.id
+    expect(store.getRuntimeProvider(providerId)).toMatchObject({
+      sourceType: 'relay',
+      kind: 'xai-compatible',
+      protocol: 'openai-chat',
+      models: ['grok-4', 'grok-code-fast-1'],
+      capabilityProfile: expect.objectContaining({
+        streaming: true,
+        nonStreaming: true,
+        toolCalls: true
+      })
+    })
+
+    await expect(store.saveProvider({
+      name: 'Invalid official xAI',
+      sourceType: 'official-api',
+      kind: 'xai-compatible',
+      baseUrl: 'https://api.x.ai/v1',
+      protocol: 'openai-responses',
+      models: []
+    })).rejects.toThrow(/only as relay sources/)
+
+    await store.close()
+    const restarted = createStore()
+    await restarted.initialize()
+    expect(restarted.getRuntimeProvider(providerId)).toMatchObject({
+      sourceType: 'relay',
+      kind: 'xai-compatible',
+      protocol: 'openai-chat'
+    })
+  })
+
+  it('repairs persisted official xAI providers to the canonical native Responses endpoint', async () => {
+    const legacy = legacyJsonState() as ReturnType<typeof legacyJsonState> & {
+      providers: Array<Record<string, unknown>>
+    }
+    Object.assign(legacy.providers[0], {
+      sourceType: 'relay',
+      kind: 'xai',
+      baseUrl: 'https://credential-capture.example/v1',
+      protocol: 'openai-chat'
+    })
+    await writeFile(join(directory, LEGACY_JSON_FILENAME), `${JSON.stringify(legacy)}\n`, 'utf8')
+
+    const store = createStore()
+    await store.initialize()
+    expect(store.getRuntimeProvider('legacy-provider')).toMatchObject({
+      sourceType: 'official-api',
+      kind: 'xai',
+      baseUrl: 'https://api.x.ai/v1',
+      protocol: 'openai-responses'
+    })
+  })
+
+  it('accepts only native Responses for official xAI providers', async () => {
+    const store = createStore()
+    await store.initialize()
+
+    await expect(store.saveProvider({
+      name: 'Legacy Grok Chat',
+      sourceType: 'official-api',
+      kind: 'xai',
+      baseUrl: 'https://api.x.ai/v1',
+      protocol: 'openai-chat',
+      models: ['grok-4'],
+    })).rejects.toThrow(/native OpenAI Responses API/)
+
+    const snapshot = await store.saveProvider({
+      name: 'Native Grok Responses',
+      sourceType: 'official-api',
+      kind: 'xai',
+      baseUrl: 'https://credential-capture.example/v1',
+      protocol: 'openai-responses',
+      models: ['grok-4'],
+    })
+    expect(snapshot.providers.find((provider) => provider.name === 'Native Grok Responses')).toMatchObject({
+      sourceType: 'official-api',
+      kind: 'xai',
+      baseUrl: 'https://api.x.ai/v1',
+      protocol: 'openai-responses',
+    })
+  })
+
+  it('upgrades unknown relay compact capabilities to auto while stripping inapplicable values', async () => {
     const legacy = legacyJsonState() as ReturnType<typeof legacyJsonState> & {
       providers: Array<Record<string, unknown>>
     }
@@ -436,7 +531,7 @@ describe('AppStore', () => {
 
     const store = createStore()
     await store.initialize()
-    expect(store.getRuntimeProvider('legacy-provider')).not.toHaveProperty('responsesCompactMode')
+    expect(store.getRuntimeProvider('legacy-provider')).toMatchObject({ responsesCompactMode: 'auto' })
   })
 
   it('defaults legacy outbound networking to direct and persists system proxy mode', async () => {
@@ -454,6 +549,32 @@ describe('AppStore', () => {
     const restarted = createStore()
     await restarted.initialize()
     expect(restarted.getSnapshot().gateway.outboundNetworkMode).toBe('system')
+  })
+
+  it('defaults Codex Micro suppression off and persists both toggle states across restarts', async () => {
+    await writeFile(join(directory, LEGACY_JSON_FILENAME), `${JSON.stringify(legacyJsonState())}\n`, 'utf8')
+    const store = createStore()
+    await store.initialize()
+    expect(store.getSnapshot().gateway.disableCodexMicro).toBe(false)
+
+    await store.updateGateway({
+      ...store.getSnapshot().gateway,
+      disableCodexMicro: true,
+    })
+    await store.close()
+
+    const enabled = createStore()
+    await enabled.initialize()
+    expect(enabled.getSnapshot().gateway.disableCodexMicro).toBe(true)
+    await enabled.updateGateway({
+      ...enabled.getSnapshot().gateway,
+      disableCodexMicro: false,
+    })
+    await enabled.close()
+
+    const disabled = createStore()
+    await disabled.initialize()
+    expect(disabled.getSnapshot().gateway.disableCodexMicro).toBe(false)
   })
 
   it('only accepts accounts whose provider protocol matches the pool', async () => {
@@ -478,6 +599,52 @@ describe('AppStore', () => {
       stickyTtlMinutes: 30,
       maxRetries: 1
     })).rejects.toThrow(/pool protocol/)
+  })
+
+  it('rejects mixing OpenAI and Grok accounts in one standard pool', async () => {
+    const store = createStore()
+    await store.initialize()
+    const openai = await store.saveApiSource({
+      name: 'OpenAI account',
+      sourceType: 'official-api',
+      kind: 'openai',
+      baseUrl: 'https://api.openai.com/v1',
+      protocol: 'openai-chat',
+      models: ['gpt-5.2'],
+      credential: 'sk-openai',
+      priority: 1,
+      weight: 1,
+      maxConcurrency: 1,
+    })
+    const grok = await store.saveApiSource({
+      name: 'Grok account',
+      sourceType: 'official-api',
+      kind: 'xai',
+      baseUrl: 'https://untrusted.example/v1',
+      protocol: 'openai-responses',
+      models: ['grok-4'],
+      credential: 'xai-key',
+      priority: 1,
+      weight: 1,
+      maxConcurrency: 1,
+    })
+
+    await expect(store.savePool({
+      name: 'Mixed pool',
+      protocol: 'openai-chat',
+      strategy: 'priority',
+      accountIds: [openai.source.accountId, grok.source.accountId],
+      stickySessions: false,
+      stickyTtlMinutes: 30,
+      maxRetries: 1,
+    })).rejects.toThrow(/pool protocol/)
+
+    const grokProvider = grok.snapshot.providers.find((provider) => provider.id === grok.source.providerId)
+    expect(grokProvider).toMatchObject({
+      kind: 'xai',
+      sourceType: 'official-api',
+      baseUrl: 'https://api.x.ai/v1',
+    })
   })
 
   it('preserves disabled pool members when editing a standard pool', async () => {
@@ -745,6 +912,24 @@ describe('AppStore', () => {
       .toEqual(seeded.routes.filter((candidate) => candidate.client !== 'codex'))
   })
 
+  it('normalizes route mappings without retaining prototype-pollution keys', async () => {
+    const store = createStore()
+    await store.initialize()
+    const route = store.getSnapshot().routes.find((candidate) => candidate.client === 'codex')!
+    const maliciousModelMap = JSON.parse('{"__proto__":{"polluted":true},"constructor":"bad","prototype":"bad"," alias ":" target "," * ":" grok-4.20 "}') as Record<string, string>
+    maliciousModelMap['control\u0000key'] = 'target'
+    maliciousModelMap.controlTarget = 'target\nvalue'
+    maliciousModelMap['m'.repeat(257)] = 'target'
+    maliciousModelMap.oversizedTarget = 'm'.repeat(257)
+
+    const updated = await store.updateRoute({ ...route, modelMap: maliciousModelMap })
+    const saved = updated.routes.find((candidate) => candidate.id === route.id)!
+
+    expect(saved.modelMap).toEqual({ alias: 'target', '*': 'grok-4.20' })
+    expect(Object.prototype.hasOwnProperty.call(saved.modelMap, '__proto__')).toBe(false)
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined()
+  })
+
   it('rejects an empty route source or a client without a route', async () => {
     const state = { ...legacyJsonState(), routes: [] }
     await writeFile(join(directory, LEGACY_JSON_FILENAME), `${JSON.stringify(state)}\n`, 'utf8')
@@ -752,7 +937,7 @@ describe('AppStore', () => {
     await store.initialize()
 
     await expect(store.setRouteSource('codex', '   ')).rejects.toThrow(/route source/i)
-    await expect(store.setRouteSource('codex', 'relay-source')).rejects.toThrow(/route does not exist/i)
+    await expect(store.setRouteSource('missing-client' as RouteClient, 'relay-source')).rejects.toThrow(/route does not exist/i)
   })
 
   it('persists custom client profiles and protects the default profiles', async () => {
@@ -1059,7 +1244,7 @@ describe('AppStore', () => {
     const account = imported.snapshot.accounts.find((candidate) => candidate.id === imported.importedAccountIds[0])!
     expect(account).toMatchObject({
       credentialType: 'chatgpt-oauth',
-      name: 'team@example.com', renewable: false, maskedCredential: 'chatgpt-****port'
+      name: 'team@example.com', renewable: false, maskedCredential: 'chatgpt-****port', maxConcurrency: 20
     })
     expect(account).not.toHaveProperty('chatgptAccountId')
     expect(account).not.toHaveProperty('credentialId')
@@ -1610,6 +1795,32 @@ describe('AppStore', () => {
     expect(JSON.stringify(store.getSnapshot())).not.toContain('not-saved-private-token')
   })
 
+  it('applies an explicit batch proxy to imported Agent Identity accounts', async () => {
+    const store = createStore()
+    await store.initialize()
+    const snapshot = await store.saveProxy({
+      name: 'Agent Identity proxy', protocol: 'http', host: '127.0.0.1', port: 8080,
+    })
+    const proxyId = snapshot.proxies.find((proxy) => proxy.name === 'Agent Identity proxy')!.id
+    const { privateKey } = generateKeyPairSync('ed25519')
+    const content = JSON.stringify({
+      auth_mode: 'agentIdentity',
+      agent_identity: {
+        agent_runtime_id: 'runtime-proxied',
+        agent_private_key: privateKey.export({ format: 'der', type: 'pkcs8' }).toString('base64'),
+        account_id: 'workspace-proxied',
+        chatgpt_user_id: 'user-proxied',
+      },
+    })
+
+    const imported = await store.importChatGptAccounts({
+      content, tagId: null, poolId: null, proxyMode: 'proxy', proxyId,
+    })
+
+    expect(imported.snapshot.accounts.find((account) => account.id === imported.importedAccountIds[0])?.proxyId)
+      .toBe(proxyId)
+  })
+
   it('stores Codex quota history in five-minute buckets and clears it with the account', async () => {
     const store = createStore()
     await store.initialize()
@@ -1930,6 +2141,8 @@ describe('AppStore', () => {
       stickyTtlMinutes: 30,
       maxRetries: 1
     })
+    const route = withPool.routes.find((candidate) => candidate.client === 'codex')!
+    await store.updateRoute({ ...route, poolId: withPool.pools[0].id, enabled: true })
     const withSecondAccount = await store.saveAccount({
       providerId: 'provider-openai', name: 'Unreferenced key', credential: 'sk-second',
       priority: 1, weight: 1, maxConcurrency: 1, modelAllowlist: []
@@ -1938,11 +2151,11 @@ describe('AppStore', () => {
     const afterAccountDelete = await store.deleteAccounts([accountId, secondAccountId])
     expect(afterAccountDelete.accounts.map((account) => account.id)).not.toContain(accountId)
     expect(afterAccountDelete.accounts.map((account) => account.id)).not.toContain(secondAccountId)
-    expect(afterAccountDelete.pools.find((pool) => pool.id === withPool.pools[0].id)?.members).toEqual([])
-
-    const route = withPool.routes.find((candidate) => candidate.client === 'codex')!
-    await store.updateRoute({ ...route, poolId: withPool.pools[0].id, enabled: false })
-    await expect(store.deletePool(withPool.pools[0].id)).rejects.toThrow(/routes/)
+    expect(afterAccountDelete.pools.some((pool) => pool.id === withPool.pools[0].id)).toBe(false)
+    expect(afterAccountDelete.routes.find((candidate) => candidate.id === route.id)).toMatchObject({
+      enabled: false,
+      poolId: '',
+    })
   })
 
   it('imports legacy JSON once, retains a backup, and does not import a later source again', async () => {
@@ -1960,7 +2173,8 @@ describe('AppStore', () => {
       clientProfiles: [
         { id: 'default-claude' },
         { id: 'default-codex' },
-        { id: 'default-gemini' }
+        { id: 'default-gemini' },
+        { id: 'default-grokbuild' }
       ]
     })
     expect(store.getCredential('legacy-credential')).toBe('legacy-secret')
@@ -2519,6 +2733,166 @@ describe('AppStore', () => {
       cachedInputTokens: 400,
       pricedRequestCount: 1
     })
+  })
+
+  it('reprices a retained legacy Grok row exactly when upgrading the lifetime pricing revision', async () => {
+    const legacyGrokLog = {
+      ...requestLog(1, 'legacy-grok-pricing'),
+      model: 'grok-4.5',
+      inputTokens: 100_000,
+      cachedInputTokens: 40_000,
+      outputTokens: 10_000
+    }
+    const store = createStore()
+    await store.initialize()
+    await store.appendLog(legacyGrokLog)
+    await store.close()
+    replaceLifetimeLedgerWithLegacyUnknowns(
+      join(directory, SQLITE_DATABASE_FILENAME),
+      [legacyGrokLog]
+    )
+
+    const upgraded = createStore()
+    await upgraded.initialize()
+    const allTime = upgraded.getSnapshot().observability.tokenCosts.allTime
+    expect(allTime).toMatchObject({
+      totalTokens: 110_000,
+      inputTokens: 100_000,
+      outputTokens: 10_000,
+      standardInputTokens: 60_000,
+      cachedInputTokens: 40_000,
+      cacheWriteInputTokens: 0,
+      pricedTokens: 110_000,
+      unpricedTokens: 0,
+      pricedRequestCount: 1,
+      unpricedRequestCount: 0,
+      longContextRequestCount: 0,
+      unknownModels: []
+    })
+    expect(allTime.inputCostUsd).toBeCloseTo(0.12, 12)
+    expect(allTime.cachedInputCostUsd).toBeCloseTo(0.012, 12)
+    expect(allTime.outputCostUsd).toBeCloseTo(0.06, 12)
+    expect(allTime.totalCostUsd).toBeCloseTo(0.192, 12)
+    expect(readLifetimeLedgerMetadata(join(directory, SQLITE_DATABASE_FILENAME)).pricingRevision).toBe(2)
+  })
+
+  it('keeps cleared legacy Grok history unpriced when no retained row can prove its token split', async () => {
+    const clearedGrokContribution = {
+      ...requestLog(1, 'cleared-legacy-grok-pricing'),
+      model: 'grok-4.5',
+      inputTokens: 100_000,
+      cachedInputTokens: 40_000,
+      outputTokens: 10_000
+    }
+    const store = createStore()
+    await store.initialize()
+    await store.close()
+    replaceLifetimeLedgerWithLegacyUnknowns(
+      join(directory, SQLITE_DATABASE_FILENAME),
+      [clearedGrokContribution]
+    )
+
+    const upgraded = createStore()
+    await upgraded.initialize()
+    expect(upgraded.getSnapshot().requestLogs).toEqual([])
+    expect(upgraded.getSnapshot().observability.tokenCosts.allTime).toMatchObject({
+      totalTokens: 110_000,
+      inputTokens: 100_000,
+      outputTokens: 10_000,
+      standardInputTokens: 0,
+      cachedInputTokens: 0,
+      pricedTokens: 0,
+      unpricedTokens: 110_000,
+      inputCostUsd: 0,
+      cachedInputCostUsd: 0,
+      outputCostUsd: 0,
+      totalCostUsd: 0,
+      pricedRequestCount: 0,
+      unpricedRequestCount: 1,
+      unknownModels: ['grok-4.5']
+    })
+    expect(readLifetimeLedgerMetadata(join(directory, SQLITE_DATABASE_FILENAME)).pricingRevision).toBe(2)
+  })
+
+  it('does not apply the lifetime pricing revision migration twice after restart', async () => {
+    const legacyGrokLog = {
+      ...requestLog(1, 'idempotent-legacy-grok-pricing'),
+      model: 'grok-4.5',
+      inputTokens: 10_000,
+      cachedInputTokens: 4_000,
+      outputTokens: 1_000
+    }
+    const store = createStore()
+    await store.initialize()
+    await store.appendLog(legacyGrokLog)
+    await store.close()
+    const databasePath = join(directory, SQLITE_DATABASE_FILENAME)
+    replaceLifetimeLedgerWithLegacyUnknowns(databasePath, [legacyGrokLog])
+
+    const firstRestart = createStore()
+    await firstRestart.initialize()
+    const firstBreakdown = firstRestart.getSnapshot().observability.tokenCosts.allTime
+    await firstRestart.close()
+    const firstMetadata = readLifetimeLedgerMetadata(databasePath)
+
+    const secondRestart = createStore()
+    await secondRestart.initialize()
+    expect(secondRestart.getSnapshot().observability.tokenCosts.allTime).toEqual(firstBreakdown)
+    await secondRestart.close()
+    expect(readLifetimeLedgerMetadata(databasePath)).toEqual(firstMetadata)
+  })
+
+  it('only reprices legacy Claude cache rows whose v2 token accounting proves their split', async () => {
+    const ambiguousLegacyClaudeLog = {
+      ...requestLog(1, 'ambiguous-legacy-claude-pricing'),
+      model: 'claude-opus-4-8',
+      inputTokens: 100,
+      cachedInputTokens: 40,
+      cacheWriteInputTokens: 20,
+      cacheWriteInputTokens5m: 20,
+      outputTokens: 10
+    }
+    const versionedClaudeLog = {
+      ...requestLog(2, 'versioned-claude-pricing'),
+      model: 'claude-opus-4-8',
+      tokenAccountingVersion: 2 as const,
+      inputTokens: 100,
+      cachedInputTokens: 40,
+      cacheWriteInputTokens: 20,
+      cacheWriteInputTokens5m: 20,
+      outputTokens: 10
+    }
+    const store = createStore()
+    await store.initialize()
+    await store.appendLog(ambiguousLegacyClaudeLog)
+    await store.appendLog(versionedClaudeLog)
+    await store.close()
+    replaceLifetimeLedgerWithLegacyUnknowns(
+      join(directory, SQLITE_DATABASE_FILENAME),
+      [ambiguousLegacyClaudeLog, versionedClaudeLog]
+    )
+
+    const upgraded = createStore()
+    await upgraded.initialize()
+    const allTime = upgraded.getSnapshot().observability.tokenCosts.allTime
+    expect(allTime).toMatchObject({
+      totalTokens: 220,
+      inputTokens: 200,
+      outputTokens: 20,
+      standardInputTokens: 40,
+      cachedInputTokens: 40,
+      cacheWriteInputTokens: 20,
+      pricedTokens: 110,
+      unpricedTokens: 110,
+      pricedRequestCount: 1,
+      unpricedRequestCount: 1,
+      unknownModels: ['claude-opus-4-8']
+    })
+    expect(allTime.inputCostUsd).toBeCloseTo(0.000325, 12)
+    expect(allTime.cachedInputCostUsd).toBeCloseTo(0.00002, 12)
+    expect(allTime.cacheWriteCostUsd).toBeCloseTo(0.000125, 12)
+    expect(allTime.outputCostUsd).toBeCloseTo(0.00025, 12)
+    expect(allTime.totalCostUsd).toBeCloseTo(0.000595, 12)
   })
 
   it('does not silently replace a corrupted lifetime ledger with only the retained log fragment', async () => {
@@ -3191,6 +3565,10 @@ describe('AppStore', () => {
     const restarted = createStore()
     await restarted.initialize()
     expect(restarted.getSnapshot().accounts).toHaveLength(1)
+    expect((await readdir(directory)).some((name) => (
+      name.startsWith(`${SQLITE_DATABASE_FILENAME}.pre-migration-v1-to-v${SQLITE_SCHEMA_VERSION}-`)
+      && name.endsWith('.bak')
+    ))).toBe(true)
     const restartedAccount = restarted.getSnapshot().accounts[0]
     expect(restarted.getCredential(restarted.getRuntimeAccount(restartedAccount.id)!.credentialId)).toBe('migration-secret')
     await restarted.close()
@@ -3199,7 +3577,7 @@ describe('AppStore', () => {
     expect(readSchemaVersion(database)).toBe(SQLITE_SCHEMA_VERSION)
     expect(database.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'index' AND name = 'accounts_ordinal_unique'").get())
       .toEqual({ count: 1 })
-    expect(database.prepare('SELECT COUNT(*) AS count FROM client_profiles').get()).toEqual({ count: 3 })
+    expect(database.prepare('SELECT COUNT(*) AS count FROM client_profiles').get()).toEqual({ count: 4 })
     database.close()
   })
 
@@ -3263,6 +3641,10 @@ describe('AppStore', () => {
 
     const failingStore = createStore()
     await expect(failingStore.initialize()).rejects.toThrow(/migration 2 failed/)
+    expect((await readdir(directory)).some((name) => (
+      name.startsWith(`${SQLITE_DATABASE_FILENAME}.pre-migration-v1-to-v${SQLITE_SCHEMA_VERSION}-`)
+      && name.endsWith('.bak')
+    ))).toBe(true)
 
     const inspected = new DatabaseSync(databasePath)
     expect(readSchemaVersion(inspected)).toBe(1)
@@ -3370,6 +3752,74 @@ function requestLog(index: number, id = `log-${index}`): RequestLog {
     statusCode: 200,
     latencyMs: index
   }
+}
+
+function replaceLifetimeLedgerWithLegacyUnknowns(
+  databasePath: string,
+  contributions: readonly RequestLog[]
+): void {
+  const inputTokens = contributions.reduce((total, log) => total + finiteTokens(log.inputTokens), 0)
+  const outputTokens = contributions.reduce((total, log) => total + finiteTokens(log.outputTokens), 0)
+  const unknownModelCounts = contributions.reduce<Record<string, number>>((counts, log) => {
+    const model = log.upstreamModel?.trim() || log.model.trim() || '未知模型'
+    counts[model] = (counts[model] ?? 0) + 1
+    return counts
+  }, Object.create(null) as Record<string, number>)
+  const timestamp = 1_700_000_000_000
+  const legacyLedger = {
+    version: 1,
+    // pricingRevision deliberately omitted: this is the exact pre-revision
+    // shape read as catalog revision 1 by the migration.
+    breakdown: {
+      totalTokens: inputTokens + outputTokens,
+      inputTokens,
+      outputTokens,
+      standardInputTokens: 0,
+      cachedInputTokens: 0,
+      cacheWriteInputTokens: 0,
+      pricedTokens: 0,
+      unpricedTokens: inputTokens + outputTokens,
+      inputCostUsd: 0,
+      cachedInputCostUsd: 0,
+      cacheWriteCostUsd: 0,
+      outputCostUsd: 0,
+      totalCostUsd: 0,
+      pricedRequestCount: 0,
+      unpricedRequestCount: contributions.length,
+      longContextRequestCount: 0,
+      unknownModels: Object.keys(unknownModelCounts).sort((left, right) => left.localeCompare(right))
+    },
+    unknownModelCounts,
+    initializedAt: timestamp,
+    updatedAt: timestamp
+  }
+
+  const database = new DatabaseSync(databasePath)
+  try {
+    const result = database.prepare(`
+      UPDATE app_metadata SET value = ? WHERE key = 'lifetime_token_costs_v1'
+    `).run(JSON.stringify(legacyLedger))
+    if (result.changes !== 1) throw new Error('Lifetime token ledger metadata was not initialized')
+  } finally {
+    database.close()
+  }
+}
+
+function readLifetimeLedgerMetadata(databasePath: string): Record<string, unknown> {
+  const database = new DatabaseSync(databasePath, { readOnly: true })
+  try {
+    const row = database.prepare(`
+      SELECT value FROM app_metadata WHERE key = 'lifetime_token_costs_v1'
+    `).get() as { value: string } | undefined
+    if (!row) throw new Error('Lifetime token ledger metadata is missing')
+    return JSON.parse(row.value) as Record<string, unknown>
+  } finally {
+    database.close()
+  }
+}
+
+function finiteTokens(value: number | undefined): number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0
 }
 
 function downgradeDatabaseToVersionOne(path: string): void {

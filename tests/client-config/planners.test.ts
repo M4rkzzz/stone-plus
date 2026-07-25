@@ -8,6 +8,7 @@ import {
   planCodexOfficialLoginToml,
   planCodexToml,
   planGeminiConfig,
+  planGrokBuildConfig,
   resolveClientConfigPaths,
 } from '../../src/main/client-config'
 
@@ -16,21 +17,45 @@ const target = { gatewayBaseUrl: 'http://127.0.0.1:15721/', token: 'stone_local_
 
 describe('Claude Code planning', () => {
   it('updates env in settings.json without removing unknown fields', () => {
-    const source = '{\r\n\t"permissions": {\r\n\t\t"allow": ["Read"]\r\n\t},\r\n\t"env": {\r\n\t\t"KEEP_ME": "yes",\r\n\t\t"ANTHROPIC_BASE_URL": "https://old.example"\r\n\t}\r\n}\r\n'
+    const source = '{\r\n\t"model": "sonnet",\r\n\t"permissions": {\r\n\t\t"allow": ["Read"]\r\n\t},\r\n\t"env": {\r\n\t\t"KEEP_ME": "yes",\r\n\t\t"ANTHROPIC_BASE_URL": "https://old.example",\r\n\t\t"ANTHROPIC_MODEL": "gpt-5.5",\r\n\t\t"ANTHROPIC_DEFAULT_HAIKU_MODEL": "gpt-5.5",\r\n\t\t"ANTHROPIC_DEFAULT_OPUS_MODEL": "gpt-5.5",\r\n\t\t"ANTHROPIC_DEFAULT_SONNET_MODEL": "gpt-5.5",\r\n\t\t"ANTHROPIC_SMALL_FAST_MODEL": "gpt-5.5",\r\n\t\t"ANTHROPIC_REASONING_MODEL": "gpt-5.5"\r\n\t}\r\n}\r\n'
     const plan = planClaudeConfig(paths.claude, { 'claude-settings': source }, target)
     const output = plan.files[0].content
     const parsed = JSON.parse(output)
 
     expect(parsed.permissions.allow).toEqual(['Read'])
+    expect(parsed.model).toBe('sonnet')
     expect(parsed.env.KEEP_ME).toBe('yes')
     expect(parsed.env.ANTHROPIC_BASE_URL).toBe('http://127.0.0.1:15721')
     expect(parsed.env.ANTHROPIC_AUTH_TOKEN).toBe(target.token)
+    expect(JSON.stringify(parsed)).not.toContain('gpt-5.5')
     expect(plan.files[0].managedFields).toEqual([
       'env.ANTHROPIC_BASE_URL',
       'env.ANTHROPIC_AUTH_TOKEN',
+      'model (only non-Claude relay values)',
+      'env.ANTHROPIC_MODEL',
+      'env.ANTHROPIC_DEFAULT_HAIKU_MODEL',
+      'env.ANTHROPIC_DEFAULT_OPUS_MODEL',
+      'env.ANTHROPIC_DEFAULT_SONNET_MODEL',
+      'env.ANTHROPIC_SMALL_FAST_MODEL',
+      'env.ANTHROPIC_REASONING_MODEL',
     ])
     expect(output).toContain('\r\n\t"permissions"')
     expect(output.endsWith('\r\n')).toBe(true)
+
+    const repeated = planClaudeConfig(paths.claude, { 'claude-settings': output }, target)
+    expect(repeated.files[0].changed).toBe(false)
+  })
+
+  it('removes an upstream relay model from Claude model selection while preserving native aliases', () => {
+    const legacy = planClaudeConfig(paths.claude, {
+      'claude-settings': JSON.stringify({ model: 'gpt-5.5', env: {} }),
+    }, target)
+    const native = planClaudeConfig(paths.claude, {
+      'claude-settings': JSON.stringify({ model: 'claude-opus-4-8', env: {} }),
+    }, target)
+
+    expect(JSON.parse(legacy.files[0].content).model).toBeUndefined()
+    expect(JSON.parse(native.files[0].content).model).toBe('claude-opus-4-8')
   })
 
   it('rejects a non-object env instead of overwriting it', () => {
@@ -271,7 +296,44 @@ describe('Gemini CLI planning', () => {
   })
 })
 
+describe('Grok Build planning', () => {
+  it('reports the fail-closed API-key auth pin as a managed connection field', () => {
+    const plan = planGrokBuildConfig(paths.grokbuild, {}, target)
+
+    expect(plan.files[0].managedFields).toEqual([
+      'auth.preferred_method',
+      'models.default (when no custom profile exists)',
+      'model.<selected>.base_url',
+      'model.<selected>.api_key',
+      'model.<selected>.api_backend',
+    ])
+    expect(plan.files[0].content).toContain('auth.preferred_method = "api_key"')
+  })
+})
+
 describe('target validation', () => {
+  it('normalizes surrounding token whitespace for every supported client', () => {
+    const whitespaceTarget = {
+      gatewayBaseUrl: 'http://127.0.0.1:15721/',
+      token: '  stone_local_secret  ',
+    }
+
+    const claude = planClaudeConfig(paths.claude, {}, whitespaceTarget)
+    const codex = planCodexConfig(paths.codex, {}, whitespaceTarget)
+    const gemini = planGeminiConfig(paths.gemini, {}, whitespaceTarget)
+    const grok = planGrokBuildConfig(paths.grokbuild, {}, whitespaceTarget)
+
+    expect(JSON.parse(claude.files[0].content).env.ANTHROPIC_AUTH_TOKEN).toBe('stone_local_secret')
+    expect(JSON.parse(codex.files.find((file) => file.role === 'codex-auth')!.content).OPENAI_API_KEY)
+      .toBe('stone_local_secret')
+    expect(gemini.files.find((file) => file.role === 'gemini-env')!.content)
+      .toContain('GEMINI_API_KEY="stone_local_secret"')
+    expect(grok.files[0].content).toContain('api_key = "stone_local_secret"')
+    for (const plan of [claude, codex, gemini, grok]) {
+      expect(plan.files.some((file) => file.content.includes(whitespaceTarget.token))).toBe(false)
+    }
+  })
+
   it('rejects unsafe base URL shapes without including the token in the error', () => {
     let caught: unknown
     try {

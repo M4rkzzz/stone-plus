@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import {
   Activity,
   ArrowDown,
@@ -43,6 +43,10 @@ const EMPTY_FILTERS: TelemetryConnectionFilters = {
   outbound: 'all',
 }
 
+export const TELEMETRY_CONNECTION_PAGE_SIZE = 120
+
+const timestampFormatters = new Map<string, Intl.DateTimeFormat>()
+
 export function TelemetryWorkspace({
   traffic,
   connections,
@@ -65,12 +69,25 @@ export function TelemetryWorkspace({
     () => proxyConnectionFilterOptions(currentConnections),
     [currentConnections],
   )
+  useEffect(() => {
+    setFilters((current) => normalizeTelemetryFilters(current, options))
+  }, [options])
   const filteredConnections = useMemo(
     () => filterProxyConnections(currentConnections, filters),
     [currentConnections, filters],
   )
+  const [visibleConnectionLimit, setVisibleConnectionLimit] = useState(TELEMETRY_CONNECTION_PAGE_SIZE)
+  useEffect(() => {
+    setVisibleConnectionLimit(TELEMETRY_CONNECTION_PAGE_SIZE)
+  }, [filters.network, filters.outbound, filters.query, filters.target])
+  const visibleConnections = useMemo(
+    () => limitProxyConnectionsForDisplay(filteredConnections, visibleConnectionLimit),
+    [filteredConnections, visibleConnectionLimit],
+  )
+  const hiddenConnectionCount = filteredConnections.length - visibleConnections.length
   const hasFilters = !sameTelemetryFilters(filters, EMPTY_FILTERS)
   const disabled = actionsDisabled || !ready
+  const capturedNow = Date.now()
 
   return <section
     className={`telemetry-workspace telemetry-workspace--${state}`}
@@ -182,10 +199,15 @@ export function TelemetryWorkspace({
     </div>
 
     <div className="telemetry-workspace__result-bar">
-      <span className="telemetry-workspace__result-count" aria-live="polite" aria-atomic="true">{t(
-        `显示 ${filteredConnections.length} / ${currentConnections.length} 个连接`,
-        `Showing ${filteredConnections.length} of ${currentConnections.length} connections`,
-      )}</span>
+      <span className="telemetry-workspace__result-count" aria-live="polite" aria-atomic="true">{hiddenConnectionCount > 0
+        ? t(
+            `已匹配 ${filteredConnections.length} / ${currentConnections.length} 个连接，当前展示 ${visibleConnections.length} 个`,
+            `${filteredConnections.length} of ${currentConnections.length} connections matched; showing ${visibleConnections.length}`,
+          )
+        : t(
+            `显示 ${filteredConnections.length} / ${currentConnections.length} 个连接`,
+            `Showing ${filteredConnections.length} of ${currentConnections.length} connections`,
+          )}</span>
       {currentTraffic && <time dateTime={new Date(currentTraffic.capturedAt).toISOString()}>{t(
         `快照 ${formatTelemetryTimestamp(currentTraffic.capturedAt, locale)}`,
         `Snapshot ${formatTelemetryTimestamp(currentTraffic.capturedAt, locale)}`,
@@ -202,7 +224,7 @@ export function TelemetryWorkspace({
           <th>{t('已连接', 'Connected')}</th>
           <th><span className="sr-only">{t('操作', 'Actions')}</span></th>
         </tr></thead>
-        <tbody>{filteredConnections.map((connection) => {
+        <tbody>{visibleConnections.map((connection) => {
           const closing = closingConnectionIds.has(connection.id)
           return <tr key={connection.id}>
             <td className="telemetry-workspace__cell telemetry-workspace__cell--endpoint"><div className="telemetry-workspace__endpoint">
@@ -217,7 +239,7 @@ export function TelemetryWorkspace({
               <span title={t('下载', 'Download')}><ArrowDown size={12} />{formatTelemetryBytes(connection.downloadBytes)}</span>
               <span title={t('上传', 'Upload')}><ArrowUp size={12} />{formatTelemetryBytes(connection.uploadBytes)}</span>
             </span></td>
-            <td className="telemetry-workspace__cell telemetry-workspace__cell--age"><span className="telemetry-workspace__age" title={formatTelemetryTimestamp(connection.startedAt, locale)}>{formatConnectionAge(connection.startedAt, Date.now(), t)}</span></td>
+            <td className="telemetry-workspace__cell telemetry-workspace__cell--age"><span className="telemetry-workspace__age" title={formatTelemetryTimestamp(connection.startedAt, locale)}>{formatConnectionAge(connection.startedAt, capturedNow, t)}</span></td>
             <td className="telemetry-workspace__cell telemetry-workspace__cell--action"><button
               type="button"
               className="telemetry-workspace__close"
@@ -232,6 +254,16 @@ export function TelemetryWorkspace({
           </tr>
         })}</tbody>
       </table>
+      {ready && hiddenConnectionCount > 0 && <div className="telemetry-workspace__load-more">
+        <span>{t(
+          `还有 ${hiddenConnectionCount} 个匹配连接`,
+          `${hiddenConnectionCount} more matching connection(s)`,
+        )}</span>
+        <button
+          type="button"
+          onClick={() => setVisibleConnectionLimit((current) => current + TELEMETRY_CONNECTION_PAGE_SIZE)}
+        >{t('显示更多', 'Show more')}</button>
+      </div>}
       {ready && filteredConnections.length === 0 && <TelemetryEmpty
         filtered={hasFilters}
         onClear={() => setFilters(EMPTY_FILTERS)}
@@ -324,6 +356,20 @@ export function proxyConnectionFilterOptions(connections: readonly ProxyConnecti
   }
 }
 
+export function normalizeTelemetryFilters(
+  filters: TelemetryConnectionFilters,
+  options: ReturnType<typeof proxyConnectionFilterOptions>,
+): TelemetryConnectionFilters {
+  const target = filters.target === 'all' || options.targets.includes(filters.target)
+    ? filters.target
+    : 'all'
+  const outbound = filters.outbound === 'all' || options.outbounds.includes(filters.outbound)
+    ? filters.outbound
+    : 'all'
+  if (target === filters.target && outbound === filters.outbound) return filters
+  return { ...filters, target, outbound }
+}
+
 export function formatTelemetryBytes(value: number): string {
   if (!Number.isFinite(value) || value <= 0) return '0 B'
   const units = ['B', 'KB', 'MB', 'GB', 'TB'] as const
@@ -339,11 +385,16 @@ function formatTelemetryCount(value: number, locale: string): string {
 
 function formatTelemetryTimestamp(value: number, locale: string): string {
   if (!Number.isFinite(value)) return '—'
-  return new Intl.DateTimeFormat(locale, {
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-  }).format(new Date(value))
+  let formatter = timestampFormatters.get(locale)
+  if (!formatter) {
+    formatter = new Intl.DateTimeFormat(locale, {
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+    })
+    timestampFormatters.set(locale, formatter)
+  }
+  return formatter.format(new Date(value))
 }
 
 function formatConnectionAge(
@@ -364,6 +415,14 @@ function sameTelemetryFilters(left: TelemetryConnectionFilters, right: Telemetry
     && left.target === right.target
     && left.network === right.network
     && left.outbound === right.outbound
+}
+
+export function limitProxyConnectionsForDisplay(
+  connections: readonly ProxyConnectionSummary[],
+  limit: number,
+): readonly ProxyConnectionSummary[] {
+  const safeLimit = Number.isFinite(limit) ? Math.max(0, Math.trunc(limit)) : 0
+  return connections.length <= safeLimit ? connections : connections.slice(0, safeLimit)
 }
 
 function uniqueSorted(values: string[]): string[] {

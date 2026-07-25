@@ -1,15 +1,42 @@
+import type {
+  AgentLifecycleChangedEvent,
+  AgentLifecycleOperationResult,
+  AgentLifecycleSnapshot,
+  AgentRestoreOptions,
+  AgentStartOptions,
+  AgentInstallChannel,
+  AgentTarget,
+} from './agent-lifecycle'
+
 export type Protocol = 'anthropic-messages' | 'openai-responses' | 'openai-chat' | 'gemini'
+/**
+ * User-facing protocol exposed by a pool. `grok` is a logical dialect: the
+ * provider retains its actual OpenAI Responses or Chat wire protocol. Grok
+ * Build accepts only Responses-native Grok sources; other clients may still
+ * use Stone+'s explicit xAI compatibility bridge when required.
+ */
+export type PoolProtocol = Protocol | 'grok'
+
+/** Default capacity for newly created accounts and standalone API/relay sources. */
+export const DEFAULT_ACCOUNT_MAX_CONCURRENCY = 20
 
 /** Protocols whose OpenAI-compatible request body supports the priority service tier. */
 export function supportsFastServiceTier(protocol: Protocol): boolean {
   return protocol === 'openai-responses' || protocol === 'openai-chat'
 }
 
+/** Logical Grok pools do not expose an OpenAI service-tier control. */
+export function supportsPoolFastServiceTier(protocol: PoolProtocol): boolean {
+  return protocol !== 'grok' && supportsFastServiceTier(protocol)
+}
+
 export type ProviderKind =
   | 'anthropic'
   | 'openai'
+  | 'xai'
   | 'google'
   | 'openai-compatible'
+  | 'xai-compatible'
   | 'anthropic-compatible'
   | 'custom'
 
@@ -61,6 +88,19 @@ export interface BuiltInProxyAccessState {
   /** The checked local mixed endpoint. No captured system-proxy settings are exposed. */
   endpoint?: string
   verifiedAt?: number
+}
+
+export interface BuiltInProxyAccessModeCapability {
+  available: boolean
+  /** Stable renderer-safe reason; absent when the mode is available. */
+  unavailableReason?: 'unsupported-platform' | 'unsupported-desktop'
+  /** The OS may show a native authorization prompt when this mode starts or stops. */
+  authorizationRequired: boolean
+}
+
+export interface BuiltInProxyPlatformCapabilities {
+  platform: 'windows' | 'macos' | 'linux' | 'other'
+  accessModes: Record<BuiltInProxyAccessMode, BuiltInProxyAccessModeCapability>
 }
 
 /** Durable built-in proxy preferences. External gateway routing remains independent. */
@@ -139,6 +179,8 @@ export interface BuiltInProxyRuntimeState {
   effectiveRoute: EffectiveOutboundRoute
   /** `ready` is published only while the selected system lease or TUN is verifiably active. */
   accessState: BuiltInProxyAccessState
+  /** Optional for backward compatibility with older main processes and saved mocks. */
+  platformCapabilities?: BuiltInProxyPlatformCapabilities
   coreVersion?: string
   startedAt?: number
   lastReadyAt?: number
@@ -208,12 +250,13 @@ export interface ProxyDefinition {
 
 export type PublicProxyDefinition = Omit<ProxyDefinition, 'credentialId'>
 
-export type RouteClient = 'claude' | 'codex' | 'gemini'
+export type RouteClient = 'claude' | 'codex' | 'gemini' | 'grokbuild'
 
 export const clientNativeProtocols: Readonly<Record<RouteClient, Protocol>> = {
   claude: 'anthropic-messages',
   codex: 'openai-responses',
-  gemini: 'gemini'
+  gemini: 'gemini',
+  grokbuild: 'openai-responses'
 }
 
 export type ClientConfigFileRole =
@@ -223,6 +266,7 @@ export type ClientConfigFileRole =
   | 'codex-auth'
   | 'gemini-settings'
   | 'gemini-env'
+  | 'grok-config'
 
 export type ClientConfigFileFormat = 'json' | 'toml' | 'dotenv'
 export type ClientConfigFieldValue = string | number | boolean | string[] | null
@@ -485,7 +529,7 @@ export interface ClientConfigRestoreResult {
   safetyBackup?: ClientConfigBackup
 }
 
-export type ResponsesCompactMode = 'legacy' | 'passthrough' | 'native'
+export type ResponsesCompactMode = 'auto' | 'legacy' | 'passthrough' | 'native'
 
 /**
  * A credential-free, persisted description of features exposed by an upstream.
@@ -562,7 +606,7 @@ export interface Account {
   name: string
   credentialId: string
   maskedCredential: string
-  credentialType?: 'api-key' | 'chatgpt-oauth' | 'chatgpt-agent-identity'
+  credentialType?: 'api-key' | 'chatgpt-oauth' | 'chatgpt-agent-identity' | 'grok-oauth'
   chatgptAccountId?: string
   credentialExpiresAt?: number
   renewable?: boolean
@@ -581,6 +625,7 @@ export interface Account {
   quotaUnit?: 'usd' | 'requests' | 'tokens' | 'percent'
   quota?: AccountQuotaSnapshot
   codexQuota?: AccountCodexQuotaSnapshot
+  grokQuota?: AccountGrokQuotaSnapshot
   /** Optional quota reserve guard. Omitted policies preserve legacy scheduling. */
   quotaProtection?: QuotaProtectionPolicy
   cooldownUntil?: number
@@ -648,6 +693,26 @@ export interface AccountQuotaSnapshot {
   observedAt: number
 }
 
+/** Detached, non-sensitive billing metadata returned by the Grok Build control plane. */
+export interface AccountGrokQuotaSnapshot {
+  usedPercent?: number
+  remainingPercent?: number
+  limit?: number
+  used?: number
+  remaining?: number
+  monthly?: { limit?: number; used?: number; remaining?: number }
+  onDemand?: { enabled?: boolean; cap?: number; used?: number; remaining?: number }
+  prepaidBalance?: number
+  unifiedBilling?: boolean
+  topUpMethod?: string
+  period?: { type?: string; start?: string; end?: string }
+  resetAt?: number
+  plan?: { code?: string; name?: string }
+  paidClassification: 'paid' | 'free' | 'unknown'
+  observedAt: number
+  source: 'grok-build-billing'
+}
+
 export interface CodexQuotaWindow {
   usedPercent: number
   windowSeconds?: number
@@ -709,7 +774,7 @@ export interface Pool {
   id: string
   name: string
   kind: PoolKind
-  protocol: Protocol
+  protocol: PoolProtocol
   strategy: PoolStrategy
   members: PoolMember[]
   modelPolicy: ModelPolicy
@@ -819,14 +884,40 @@ export type OpenAiPricedModelFamily =
   | 'gpt-5.4-pro'
   | 'gpt-5.4-mini'
   | 'gpt-5.4-nano'
+  | 'grok-4.5'
+  | 'claude-fable-5'
+  | 'claude-mythos-5'
+  | 'claude-opus-5'
+  | 'claude-opus-4-8'
+  | 'claude-opus-4-7'
+  | 'claude-opus-4-6'
+  | 'claude-opus-4-5'
+  | 'claude-opus-4-1'
+  | 'claude-opus-4'
+  | 'claude-sonnet-5'
+  | 'claude-sonnet-4-6'
+  | 'claude-sonnet-4-5'
+  | 'claude-sonnet-4'
+  | 'claude-3-7-sonnet'
+  | 'claude-3-5-sonnet'
+  | 'claude-haiku-4-5'
+  | 'claude-3-5-haiku'
+  | 'claude-3-opus'
+  | 'claude-3-sonnet'
+  | 'claude-3-haiku'
 
 export interface OpenAiModelPricing {
   family: OpenAiPricedModelFamily
   inputUsdPerMillion: number
   cachedInputUsdPerMillion: number
+  /** Five-minute prompt-cache write price. */
   cacheWriteUsdPerMillion: number
+  /** One-hour prompt-cache write price; defaults to the ordinary write price. */
+  cacheWrite1hUsdPerMillion?: number
   outputUsdPerMillion: number
   longContextThresholdTokens?: number
+  /** Some providers define the threshold as `>=`; legacy OpenAI/Claude tiers use `>`. */
+  longContextThresholdInclusive?: boolean
   longContextInputMultiplier?: number
   longContextOutputMultiplier?: number
 }
@@ -884,12 +975,15 @@ export interface RequestLog {
   protocol: Protocol
   providerName: string
   accountName: string
+  /** Model requested by the local client before route mapping. */
   model: string
+  /** Model actually selected by the route and sent upstream. */
+  upstreamModel?: string
   status: 'success' | 'error' | 'streaming'
   /** Fine-grained lifecycle stage for an in-progress request. */
   progressStage?: 'receiving-body' | 'scheduling' | 'resolving-credential' | 'connecting' | 'waiting-first-byte' | 'streaming' | 'retrying'
   /** Stage in which a failed request terminated. */
-  failureStage?: 'body' | 'scheduler' | 'credential' | 'connect' | 'first-byte' | 'stream' | 'client'
+  failureStage?: 'authentication' | 'body' | 'scheduler' | 'credential' | 'connect' | 'first-byte' | 'stream' | 'client'
   statusCode?: number
   latencyMs: number
   /** Time from request acceptance until the complete JSON request body has been read and parsed. */
@@ -911,6 +1005,8 @@ export interface RequestLog {
   firstTokenMs?: number
   inputTokens?: number
   outputTokens?: number
+  /** Version 2 guarantees inputTokens includes ordinary, cached-read, and cache-write input. */
+  tokenAccountingVersion?: 2
   /** Upstream response bytes observed while a stream is in progress. */
   streamedBytes?: number
   /** Upstream response chunks observed while a stream is in progress. */
@@ -929,6 +1025,10 @@ export interface RequestLog {
   cachedInputTokens?: number
   /** Input tokens written into a prompt cache when the upstream reports them separately. */
   cacheWriteInputTokens?: number
+  /** Five-minute subset of cacheWriteInputTokens when reported by Anthropic. */
+  cacheWriteInputTokens5m?: number
+  /** One-hour subset of cacheWriteInputTokens when reported by Anthropic. */
+  cacheWriteInputTokens1h?: number
   reasoningTokens?: number
   failoverCount?: number
 }
@@ -1078,6 +1178,20 @@ export interface ChatGptAccountImportInput {
   /** Preserve a valid file proxy by default, explicitly clear it, or override the whole batch. */
   proxyMode?: ChatGptAccountImportProxyMode
   proxyId?: string
+}
+
+export interface GrokAccountImportInput {
+  content: string
+  poolId?: string | null
+  proxyId?: string
+}
+
+export interface GrokAccountImportResult {
+  snapshot: AppSnapshot
+  importedAccountIds: string[]
+  createdAccountIds: string[]
+  updatedAccountIds: string[]
+  warnings: string[]
 }
 
 export type ChatGptAccountImportProxyMode = 'preserve' | 'direct' | 'proxy'
@@ -1278,7 +1392,7 @@ export interface PoolInput {
   id?: string
   name: string
   kind?: PoolKind
-  protocol: Protocol
+  protocol: PoolProtocol
   strategy: PoolStrategy
   accountIds: string[]
   modelPolicy?: ModelPolicy
@@ -1384,7 +1498,7 @@ export interface RoutePreviewResult {
   status: 'ready' | 'warning' | 'blocked'
   sourceId: string
   sourceName?: string
-  sourceProtocol?: Protocol
+  sourceProtocol?: PoolProtocol
   inboundProtocol: Protocol
   requestedModel?: string
   upstreamModel?: string
@@ -1692,6 +1806,9 @@ export interface CodexSessionRepairPreview extends CodexSessionRepairOverview {
   targetProvider: string
   revision: string
   rolloutFilesToUpdate: number
+  rolloutFilesWithSessionMeta: number
+  rolloutFilesWithoutSessionMeta: number
+  rolloutFilesAlreadyTargetProvider: number
   sqliteProviderRowsToUpdate: number
   sqliteUserEventRowsToUpdate: number
   sqliteCwdRowsToUpdate: number
@@ -1714,6 +1831,16 @@ export interface CodexSessionRepairResult {
   encryptedSourceProviders: string[]
   backupPath?: string
   retentionWarning?: string
+}
+
+export type CodexSessionRepairProgressStage = 'discover' | 'scan' | 'verify' | 'backup' | 'apply'
+
+/** Progress for one renderer-owned, cancellable session-maintenance operation. */
+export interface CodexSessionRepairProgressEvent {
+  operationId: string
+  stage: CodexSessionRepairProgressStage
+  completed: number
+  total?: number
 }
 
 export interface ChatGptDesktopRestartState {
@@ -1805,6 +1932,7 @@ export interface GatewayApi {
   refreshAccountModels(id: string): Promise<AppSnapshot>
   testAccountModel(accountId: string, model: string): Promise<AccountModelTestResult>
   importChatGptAccounts(input: ChatGptAccountImportInput): Promise<ChatGptAccountImportResult>
+  importGrokAccounts(input: GrokAccountImportInput): Promise<GrokAccountImportResult>
   importChatGptAccountFiles(input: ChatGptAccountFileImportInput): Promise<ChatGptAccountFileImportResult>
   startChatGptOAuth(input: ChatGptOAuthStartInput): Promise<ChatGptOAuthSessionStart>
   openChatGptOAuth(sessionId: string): Promise<void>
@@ -1936,9 +2064,21 @@ export interface GatewayApi {
   stopFrpTunnel(): Promise<FrpTunnelState>
   clearFrpTunnelLogs(): Promise<FrpTunnelState>
   inspectCodexSessionRepair(): Promise<CodexSessionRepairOverview>
-  previewCodexSessionRepair(targetProvider: string): Promise<CodexSessionRepairPreview>
-  repairCodexSessions(targetProvider: string, expectedRevision: string): Promise<CodexSessionRepairResult>
-  repairCodexSessionsAndRestartChatGpt(targetProvider?: string, expectedRevision?: string): Promise<CodexSessionRepairRestartResult>
+  analyzeCodexSessionRepair(targetProvider?: string, operationId?: string): Promise<CodexSessionRepairPreview>
+  previewCodexSessionRepair(targetProvider: string, operationId?: string): Promise<CodexSessionRepairPreview>
+  repairCodexSessions(targetProvider: string, expectedRevision: string, operationId?: string): Promise<CodexSessionRepairResult>
+  repairCodexSessionsAndRestartChatGpt(targetProvider?: string, expectedRevision?: string, operationId?: string): Promise<CodexSessionRepairRestartResult>
+  cancelCodexSessionRepair(operationId: string): Promise<boolean>
+  onCodexSessionRepairProgress(listener: (event: CodexSessionRepairProgressEvent) => void): () => void
+  getAgentLifecycleSnapshot(): Promise<AgentLifecycleSnapshot>
+  installAgent(target: AgentTarget, channel?: AgentInstallChannel): Promise<AgentLifecycleOperationResult>
+  closeAgent(target: AgentTarget): Promise<AgentLifecycleOperationResult>
+  restoreAgent(target: AgentTarget, options?: AgentRestoreOptions): Promise<AgentLifecycleOperationResult>
+  restartAgent(target: AgentTarget): Promise<AgentLifecycleOperationResult>
+  startAgent(target: AgentTarget, options?: AgentStartOptions): Promise<AgentLifecycleOperationResult>
+  smartRepairAgent(target?: AgentTarget): Promise<AgentLifecycleOperationResult>
+  repairAllAffectedAgents(): Promise<AgentLifecycleOperationResult>
+  closeAllManagedAgents(): Promise<AgentLifecycleOperationResult>
   previewCodexSessionIndexCleanup(): Promise<CodexSessionIndexCleanupPreview>
   cleanupCodexSessionIndexAndRestart(snapshotSha256: string, threadIds: string[]): Promise<CodexSessionIndexCleanupRestartResult>
   listCodexSessions(query?: CodexSessionQuery): Promise<CodexManagedSession[]>
@@ -1953,6 +2093,7 @@ export interface GatewayApi {
   onBrowserImportQueue(listener: (state: BrowserImportQueueState) => void): () => void
   onBrowserOpenTab(listener: (request: BrowserOpenTabRequest) => void): () => void
   onUpdateState(listener: (state: AppUpdateState) => void): () => void
+  onAgentLifecycleChanged(listener: (event: AgentLifecycleChangedEvent) => void): () => void
 }
 
 export type ProjectPage = 'source' | 'license' | 'notices' | 'trademarks'

@@ -110,6 +110,18 @@ describe('NodesWorkspace node table wiring', () => {
     expect(renderedRow(markup, 'Tokyo Failure')).toContain('badge--danger')
     expect(renderedRow(markup, 'Tokyo Failure')).toContain('Error')
   })
+
+  it('disables latency actions until the active proxy core is ready', () => {
+    const markup = renderToStaticMarkup(renderWorkspace(workspaceProfile(), {
+      query: '',
+      sort: 'current',
+      groupFilter: 'all',
+      latencyEnabled: false,
+    }))
+
+    expect(markup).toContain('Latency testing is available after the proxy core is ready')
+    expect(markup.match(/aria-label="Test latency for node [^"]+"[^>]*disabled=""/g)).toHaveLength(7)
+  })
 })
 
 function renderWorkspace(
@@ -119,6 +131,7 @@ function renderWorkspace(
     sort: 'current' | 'latency' | 'name'
     groupFilter: string
     onSelectNode?: NodesWorkspaceProps['onSelectNode']
+    latencyEnabled?: boolean
   },
 ): ReactElement {
   mockedUseState
@@ -130,6 +143,7 @@ function renderWorkspace(
     activeProfileId: profile.id,
     groupFilter: input.groupFilter,
     collapsed: false,
+    latencyEnabled: input.latencyEnabled,
     onSelectProfile: vi.fn(),
     onRefreshProfile: vi.fn(),
     onDeleteProfile: vi.fn(),

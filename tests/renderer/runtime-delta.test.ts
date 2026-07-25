@@ -1,6 +1,10 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import type { AppSnapshot, HealthEvent, RequestLog } from '../../src/shared/types'
-import { applyRuntimeDelta, shouldAcceptSnapshotRevision } from '../../src/renderer/src/runtime-delta'
+import {
+  applyRuntimeDelta,
+  RuntimeSnapshotReloadCoordinator,
+  shouldAcceptSnapshotRevision,
+} from '../../src/renderer/src/runtime-delta'
 
 const baseSnapshot = (): AppSnapshot => ({
   runtimeRevision: 10,
@@ -65,5 +69,101 @@ describe('runtime delta reconciliation', () => {
 
     expect(result.healthEvents.map((event) => event.id)).toEqual(['newest', 'newer', 'existing'])
     expect(result.healthEvents.at(-1)?.timestamp).toBe(2)
+  })
+
+  it('single-flights full snapshot reloads and catches the newest requested revision', async () => {
+    const resolvers: Array<(snapshot: AppSnapshot) => void> = []
+    const fetchSnapshot = vi.fn(() => new Promise<AppSnapshot>((resolve) => resolvers.push(resolve)))
+    const accepted: number[] = []
+    let acceptedRevision = -1
+    const coordinator = new RuntimeSnapshotReloadCoordinator({
+      fetchSnapshot,
+      acceptSnapshot: (snapshot) => {
+        acceptedRevision = snapshot.runtimeRevision ?? acceptedRevision
+        accepted.push(acceptedRevision)
+      },
+      acceptedRevision: () => acceptedRevision,
+      onError: vi.fn(),
+    })
+
+    const first = coordinator.request(11)
+    const shared = coordinator.request(14)
+    coordinator.request(13)
+    expect(shared).toBe(first)
+    expect(fetchSnapshot).toHaveBeenCalledOnce()
+
+    resolvers.shift()?.({ ...baseSnapshot(), runtimeRevision: 12 })
+    await vi.waitFor(() => expect(fetchSnapshot).toHaveBeenCalledTimes(2))
+    resolvers.shift()?.({ ...baseSnapshot(), runtimeRevision: 14 })
+    await first
+
+    expect(accepted).toEqual([12, 14])
+  })
+
+  it('reactivates an in-flight reload after a StrictMode-style effect cleanup', async () => {
+    let resolveSnapshot: ((snapshot: AppSnapshot) => void) | undefined
+    const accepted: number[] = []
+    let acceptedRevision = -1
+    const coordinator = new RuntimeSnapshotReloadCoordinator({
+      fetchSnapshot: () => new Promise<AppSnapshot>((resolve) => { resolveSnapshot = resolve }),
+      acceptSnapshot: (snapshot) => {
+        acceptedRevision = snapshot.runtimeRevision ?? acceptedRevision
+        accepted.push(acceptedRevision)
+      },
+      acceptedRevision: () => acceptedRevision,
+      onError: vi.fn(),
+    })
+
+    const firstMount = coordinator.request()
+    coordinator.dispose()
+    coordinator.activate()
+    const secondMount = coordinator.request()
+    expect(secondMount).toBe(firstMount)
+
+    resolveSnapshot?.({ ...baseSnapshot(), runtimeRevision: 10 })
+    await secondMount
+    expect(accepted).toEqual([10])
+  })
+
+  it('reconciles 1,000 log events in 20 bounded updates and keeps the latest terminal state', () => {
+    let snapshot = baseSnapshot()
+    let updateCount = 0
+    const startedAt = performance.now()
+
+    for (let batch = 0; batch < 20; batch += 1) {
+      const requestLogs = Array.from({ length: 50 }, (_, offset) => {
+        const index = batch * 50 + offset
+        return { ...log(`request-${index}`), timestamp: index, latencyMs: index }
+      })
+      snapshot = applyRuntimeDelta(snapshot, {
+        revision: 11 + batch,
+        requestLogs,
+      })
+      updateCount += 1
+    }
+
+    expect(performance.now() - startedAt).toBeLessThan(250)
+    expect(updateCount).toBe(20)
+    expect(snapshot.requestLogs).toHaveLength(500)
+    expect(snapshot.requestLogs[0]?.id).toBe('request-999')
+    expect(snapshot.requestLogs.at(-1)?.id).toBe('request-500')
+
+    snapshot = applyRuntimeDelta(snapshot, {
+      revision: 31,
+      requestLogs: [{
+        ...log('request-999'),
+        status: 'success',
+        statusCode: 200,
+        latencyMs: 1_100,
+      }],
+    })
+
+    expect(snapshot.requestLogs).toHaveLength(500)
+    expect(snapshot.requestLogs[0]).toMatchObject({
+      id: 'request-999',
+      status: 'success',
+      statusCode: 200,
+      latencyMs: 1_100,
+    })
   })
 })

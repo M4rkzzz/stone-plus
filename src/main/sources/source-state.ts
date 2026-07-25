@@ -1,16 +1,20 @@
 import { randomUUID } from 'node:crypto'
-import { supportsFastServiceTier } from '@shared/types'
+import { supportsFastServiceTier, supportsPoolFastServiceTier } from '@shared/types'
 import {
   buildModelCatalog,
   inferUpstreamCapabilities,
   normalizeCapabilityProfile,
   normalizeModelCatalog,
 } from '@shared/source-capabilities'
+import { providerSourceFamily, type ProviderSourceFamily } from '@shared/source-family'
+import { accountMatchesPoolProtocol } from '@shared/pool-protocol'
+import { isNativeGrokRouteSource, resolveRouteSource } from '@shared/route-sources'
 import type {
   Account,
   AggregateRelayInput,
   ApiSourceInput,
   Pool,
+  PoolProtocol,
   Protocol,
   ProviderDefinition,
   ProviderKind,
@@ -50,7 +54,7 @@ export interface RouteSourceFastModeDraftResult {
 
 export class SourcePoolCompatibilityError extends Error {
   constructor(readonly poolIds: string[]) {
-    super('Change or remove incompatible pool memberships before changing the source protocol.')
+    super('Change or remove incompatible pool memberships before changing the source protocol or family.')
     this.name = 'SourcePoolCompatibilityError'
   }
 }
@@ -62,6 +66,10 @@ const OFFICIAL_SOURCES: Readonly<Partial<Record<ProviderKind, {
   openai: {
     baseUrl: 'https://api.openai.com/v1',
     protocols: ['openai-responses', 'openai-chat']
+  },
+  xai: {
+    baseUrl: 'https://api.x.ai/v1',
+    protocols: ['openai-responses']
   },
   anthropic: {
     baseUrl: 'https://api.anthropic.com',
@@ -75,6 +83,7 @@ const OFFICIAL_SOURCES: Readonly<Partial<Record<ProviderKind, {
 
 const RELAY_PROTOCOLS: Readonly<Partial<Record<ProviderKind, readonly Protocol[]>>> = Object.freeze({
   'openai-compatible': ['openai-responses', 'openai-chat'],
+  'xai-compatible': ['openai-responses', 'openai-chat'],
   'anthropic-compatible': ['anthropic-messages'],
   custom: ['anthropic-messages', 'openai-responses', 'openai-chat', 'gemini']
 })
@@ -106,7 +115,8 @@ export function saveApiSourceDraft(
     ? state.accounts.filter((account) => account.providerId === existingProvider.id)
     : []
   if (existingAccounts.some((account) => account.credentialType === 'chatgpt-oauth'
-    || account.credentialType === 'chatgpt-agent-identity')) {
+    || account.credentialType === 'chatgpt-agent-identity'
+    || account.credentialType === 'grok-oauth')) {
     throw new Error('OAuth accounts cannot be converted into API-key sources.')
   }
   if (existingAccounts.length > 1) {
@@ -122,19 +132,43 @@ export function saveApiSourceDraft(
 
   const suppliedCredential = input.credential?.trim() || undefined
   if (!existingAccount && !suppliedCredential) throw new Error('An API Key is required for a new source.')
+  const trustBoundaryChanged = existingProvider !== undefined && (
+    existingProvider.sourceType !== input.sourceType
+    || providerSourceFamily(existingProvider.kind) !== providerSourceFamily(sourceConfiguration.kind)
+  )
+  if (existingAccount && trustBoundaryChanged && !suppliedCredential) {
+    throw new Error('Enter the API Key again when changing the source type or family.')
+  }
   if (existingAccount && !suppliedCredential && !state.credentials[existingAccount.credentialId]) {
     throw new Error('The stored API Key is unavailable; enter it again before saving.')
   }
   const protocolChanged = existingProvider !== undefined
     && existingProvider.protocol !== sourceConfiguration.protocol
-  if (protocolChanged && existingAccount) {
+  const familyChanged = existingProvider !== undefined
+    && providerSourceFamily(existingProvider.kind) !== providerSourceFamily(sourceConfiguration.kind)
+  if ((protocolChanged || familyChanged || trustBoundaryChanged) && existingAccount) {
+    const nextFamily = providerSourceFamily(sourceConfiguration.kind)
     const incompatiblePoolIds = state.pools
       .filter((pool) => pool.members.some((member) => member.accountId === existingAccount.id))
-      .filter((pool) => pool.protocol !== sourceConfiguration.protocol)
+      .filter((pool) => !poolAcceptsSourceChange(
+        pool,
+        existingAccount.id,
+        sourceConfiguration.protocol,
+        nextFamily,
+        input.sourceType,
+        state,
+      ))
       .map((pool) => pool.id)
     if (incompatiblePoolIds.length > 0) {
       if (!input.unlinkIncompatiblePools) throw new SourcePoolCompatibilityError(incompatiblePoolIds)
-      unlinkIncompatiblePoolMemberships(state, existingAccount.id, sourceConfiguration.protocol, timestamp)
+      unlinkIncompatiblePoolMemberships(
+        state,
+        existingAccount.id,
+        sourceConfiguration.protocol,
+        nextFamily,
+        input.sourceType,
+        timestamp,
+      )
     }
   }
 
@@ -157,6 +191,7 @@ export function saveApiSourceDraft(
 
   const inferredCapabilities = inferUpstreamCapabilities({
     protocol: sourceConfiguration.protocol,
+    kind: sourceConfiguration.kind,
     sourceType: input.sourceType,
     responsesCompactMode,
   })
@@ -217,6 +252,7 @@ export function saveApiSourceDraft(
   if (existingAccount) replaceById(state.accounts, account)
   else state.accounts.push(account)
   if (encryptedCredential !== undefined) state.credentials[credentialId] = encryptedCredential
+  assertBoundGrokBuildSource(state, providerId)
 
   return {
     sourceId: providerId,
@@ -233,11 +269,14 @@ function unlinkIncompatiblePoolMemberships(
   state: PersistedState,
   accountId: string,
   nextProtocol: Protocol,
+  nextFamily: ProviderSourceFamily,
+  nextSourceType: ApiSourceInput['sourceType'],
   timestamp: number
 ): void {
   const deletedPoolIds = new Set<string>()
   state.pools = state.pools.flatMap((pool) => {
-    if (pool.protocol === nextProtocol || !pool.members.some((member) => member.accountId === accountId)) return [pool]
+    if (!pool.members.some((member) => member.accountId === accountId)
+      || poolAcceptsSourceChange(pool, accountId, nextProtocol, nextFamily, nextSourceType, state)) return [pool]
     const members = pool.members.filter((member) => member.accountId !== accountId)
     if ((pool.kind === 'relay-aggregate' && members.length < 2) || members.length === 0) {
       deletedPoolIds.add(pool.id)
@@ -259,6 +298,32 @@ function unlinkIncompatiblePoolMemberships(
     : route)
 }
 
+function poolAcceptsSourceChange(
+  pool: Pool,
+  accountId: string,
+  nextProtocol: Protocol,
+  nextFamily: ProviderSourceFamily,
+  nextSourceType: ApiSourceInput['sourceType'],
+  state: PersistedState,
+): boolean {
+  if (pool.kind === 'relay-aggregate') {
+    if (pool.protocol !== nextProtocol || nextSourceType !== 'relay') return false
+  } else {
+    const nextPoolProtocol: PoolProtocol = nextFamily === 'grok' ? 'grok' : nextProtocol
+    if (pool.protocol !== nextPoolProtocol || nextSourceType === 'relay') return false
+  }
+  return pool.members
+    .filter((member) => member.accountId !== accountId)
+    .every((member) => {
+      const account = state.accounts.find((candidate) => candidate.id === member.accountId)
+      const provider = state.providers.find((candidate) => candidate.id === account?.providerId)
+      if (!account || !provider || providerSourceFamily(provider.kind) !== nextFamily) return false
+      return pool.kind === 'relay-aggregate'
+        ? provider.sourceType === 'relay' && provider.protocol === pool.protocol
+        : accountMatchesPoolProtocol(pool.protocol, account, provider)
+    })
+}
+
 /**
  * Cascades a source deletion through its account, credential and pool members.
  * Aggregate relays that would have fewer than two members are removed and their
@@ -275,7 +340,8 @@ export function deleteApiSourceDraft(
   if (provider.sourceType === 'oauth-system') throw new Error('The system OAuth source cannot be deleted here.')
   const accounts = state.accounts.filter((account) => account.providerId === sourceId)
   if (accounts.some((account) => account.credentialType === 'chatgpt-oauth'
-    || account.credentialType === 'chatgpt-agent-identity')) {
+    || account.credentialType === 'chatgpt-agent-identity'
+    || account.credentialType === 'grok-oauth')) {
     throw new Error('OAuth accounts must be managed from the account page.')
   }
   const accountIds = accounts.map((account) => account.id)
@@ -366,6 +432,7 @@ export function saveAggregateRelayDraft(
   }
   if (existing) replaceById(state.pools, pool)
   else state.pools.push(pool)
+  assertBoundGrokBuildSource(state, pool.id)
   return { poolId: pool.id, created: !existing }
 }
 
@@ -411,14 +478,14 @@ export function setRouteSourceFastModeDraft(
   return { sourceId, enabled: input.enabled, target: 'relay' }
 }
 
-function assertFastProtocol(protocol: Protocol, enabled: boolean): void {
-  if (enabled && !supportsFastServiceTier(protocol)) {
+function assertFastProtocol(protocol: PoolProtocol, enabled: boolean): void {
+  if (enabled && !supportsPoolFastServiceTier(protocol)) {
     throw new Error('FAST is supported only by OpenAI Responses and OpenAI Chat sources.')
   }
 }
 
 function isResponsesCompactMode(value: unknown): value is ResponsesCompactMode {
-  return value === 'legacy' || value === 'passthrough' || value === 'native'
+  return value === 'auto' || value === 'legacy' || value === 'passthrough' || value === 'native'
 }
 
 function resolveResponsesCompactModeInput(
@@ -430,7 +497,7 @@ function resolveResponsesCompactModeInput(
   const supported = sourceType === 'relay' && protocol === 'openai-responses'
   if (requested !== undefined) {
     if (!isResponsesCompactMode(requested)) {
-      throw new Error('Responses compact mode must be legacy, passthrough, or native.')
+      throw new Error('Responses compact mode must be auto, legacy, passthrough, or native.')
     }
     if (!supported) {
       throw new Error('Responses compact mode can be configured only for OpenAI Responses relay sources.')
@@ -439,7 +506,7 @@ function resolveResponsesCompactModeInput(
   }
   // Preserve an existing explicit relay capability when an older renderer
   // edits unrelated fields, while clearing it on a source/protocol change.
-  return supported && isResponsesCompactMode(existing) ? existing : undefined
+  return supported ? (isResponsesCompactMode(existing) ? existing : 'auto') : undefined
 }
 
 function normalizeSourceConfiguration(input: ApiSourceInput): {
@@ -449,7 +516,7 @@ function normalizeSourceConfiguration(input: ApiSourceInput): {
 } {
   if (input.sourceType === 'official-api') {
     const definition = OFFICIAL_SOURCES[input.kind]
-    if (!definition) throw new Error('Official API sources support OpenAI, Anthropic, or Google only.')
+    if (!definition) throw new Error('Official API sources support OpenAI, xAI, Anthropic, or Google only.')
     if (!definition.protocols.includes(input.protocol)) {
       throw new Error(`${input.kind} does not support the ${input.protocol} protocol.`)
     }
@@ -517,22 +584,28 @@ function normalizeAggregateMembers(input: AggregateRelayInput, state: PersistedS
   if (input.members.length < 2) throw new Error('An aggregate relay requires at least two members.')
   const accountIds = new Set<string>()
   const orders = new Set<number>()
+  let aggregateFamily: ProviderSourceFamily | undefined
   const indexed = input.members.map((member, index) => {
     const accountId = member.accountId.trim()
     if (!accountId || accountIds.has(accountId)) throw new Error('Aggregate relay members must be unique.')
     accountIds.add(accountId)
     const account = state.accounts.find((candidate) => candidate.id === accountId)
     if (!account) throw new Error('One of the selected aggregate relay members no longer exists.')
-    if (account.credentialType === 'chatgpt-oauth' || account.credentialType === 'chatgpt-agent-identity') {
+    if (account.credentialType === 'chatgpt-oauth' || account.credentialType === 'chatgpt-agent-identity' || account.credentialType === 'grok-oauth') {
       throw new Error('OAuth accounts cannot be aggregate relay members.')
     }
     const provider = state.providers.find((candidate) => candidate.id === account.providerId)
-    if (!provider || (provider.sourceType !== 'official-api' && provider.sourceType !== 'relay')) {
-      throw new Error('Aggregate relay members must be API-key sources.')
+    if (!provider || provider.sourceType !== 'relay') {
+      throw new Error('Aggregate relay members must be relay API-key sources.')
     }
     if (provider.protocol !== input.protocol) {
       throw new Error('Every aggregate relay member must use the aggregate protocol.')
     }
+    const family = providerSourceFamily(provider.kind)
+    if (aggregateFamily !== undefined && aggregateFamily !== family) {
+      throw new Error('Every aggregate relay member must use the same source family.')
+    }
+    aggregateFamily = family
     if (!Number.isInteger(member.order) || member.order < 0 || orders.has(member.order)) {
       throw new Error('Aggregate relay member order must be unique non-negative integers.')
     }
@@ -543,6 +616,19 @@ function normalizeAggregateMembers(input: AggregateRelayInput, state: PersistedS
   return indexed
     .sort((left, right) => left.order - right.order || left.index - right.index)
     .map((member, order) => ({ accountId: member.accountId, enabled: true, order, weight: member.weight }))
+}
+
+/**
+ * Source editors run independently from the route editor. A Grok Build route
+ * therefore has to be revalidated inside the same transaction whenever its
+ * bound source is rewritten, otherwise a family/protocol edit could leave the
+ * saved route pointing at an ordinary OpenAI source until the next UI visit.
+ */
+function assertBoundGrokBuildSource(state: PersistedState, sourceId: string): void {
+  if (!state.routes.some((route) => route.client === 'grokbuild' && route.poolId === sourceId)) return
+  if (!isNativeGrokRouteSource(resolveRouteSource(sourceId, state), state)) {
+    throw new Error('A source used by Grok Build must remain a Responses-native Grok account pool or relay source.')
+  }
 }
 
 function trimPoolModelAllowlist(

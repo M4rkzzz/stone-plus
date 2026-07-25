@@ -1,5 +1,12 @@
 import type { Protocol } from '../../shared/types'
-import type { ProtocolRequest } from './types'
+import { createHash } from 'node:crypto'
+import type {
+  ProtocolConversionContext,
+  ProtocolRequest,
+  ToolBridgeBinding,
+  ToolBridgePlan,
+  ToolCallBridgeBinding
+} from './types'
 
 type JsonObject = Record<string, unknown>
 
@@ -38,6 +45,13 @@ export class InvalidToolChoiceError extends Error {
   }
 }
 
+export class InvalidToolBridgeError extends Error {
+  constructor(public readonly path: string, reason: string) {
+    super(`Grok tool bridge rejected ${path}: ${reason}`)
+    this.name = 'InvalidToolBridgeError'
+  }
+}
+
 export interface ProtocolConversionIssue {
   path: string
   capability: 'image-input' | 'builtin-tool' | 'content-part' | 'request-option'
@@ -55,8 +69,51 @@ export interface ProtocolConversionAnalysis {
 export function analyzeProtocolConversion(
   from: Protocol,
   to: Protocol,
-  body: JsonObject
+  body: JsonObject,
+  context?: ProtocolConversionContext
 ): ProtocolConversionAnalysis {
+  if (context?.dialect === 'xai-grok' && from === 'openai-responses') {
+    try {
+      body = prepareXaiResponsesSource(body, context)
+    } catch (error) {
+      if (error instanceof InvalidToolBridgeError) {
+        return {
+          supported: false,
+          issues: [{ path: error.path, capability: 'builtin-tool', reason: error.message }],
+        }
+      }
+      throw error
+    }
+  }
+  if (context?.dialect === 'xai-grok' && from === 'openai-responses' && to === 'openai-responses') {
+    const opaqueIndex = arrayOfObjects(body.input).findIndex((item) => {
+      const type = stringValue(item.type)
+      return type === 'compaction_trigger'
+        || ((type === 'compaction' || type === 'compaction_summary')
+          && typeof item.encrypted_content === 'string'
+          && Boolean(item.encrypted_content.trim()))
+    })
+    if (opaqueIndex >= 0) {
+      return {
+        supported: false,
+        issues: [{
+          path: `input[${opaqueIndex}]`,
+          capability: 'content-part',
+          reason: 'Responses compaction state cannot be discarded or expanded safely for Grok',
+        }],
+      }
+    }
+    if (body.previous_response_id !== null && body.previous_response_id !== undefined) {
+      return {
+        supported: false,
+        issues: [{
+          path: 'previous_response_id',
+          capability: 'request-option',
+          reason: 'Responses conversation chaining cannot be discarded or expanded safely for Grok',
+        }],
+      }
+    }
+  }
   if (from === to) return { supported: true, issues: [] }
   const issues: ProtocolConversionIssue[] = []
   const add = (path: string, capability: ProtocolConversionIssue['capability'], reason: string): void => {
@@ -66,16 +123,22 @@ export function analyzeProtocolConversion(
     const type = stringValue(tool.type)
     const isFunction = type === 'function' || (from === 'anthropic-messages' && !type && optionalString(tool.name))
     const isGeminiFunctionGroup = from === 'gemini' && Array.isArray(tool.functionDeclarations)
-    if (!isFunction && !isGeminiFunctionGroup) {
+    const isXaiCustom = context?.dialect === 'xai-grok'
+      && from === 'openai-responses'
+      && to === 'openai-chat'
+      && type === 'custom'
+    if (!isFunction && !isGeminiFunctionGroup && !isXaiCustom) {
       add(`tools[${index}]`, 'builtin-tool', `Tool type ${type || 'unknown'} has no lossless ${to} mapping`)
     }
     const strict = from === 'openai-chat'
       ? booleanValue(objectValue(tool.function)?.strict)
       : from === 'openai-responses'
         ? booleanValue(tool.strict)
-        : undefined
-    const targetPreservesStrict = (from === 'openai-chat' && to === 'openai-responses')
-      || (from === 'openai-responses' && to === 'openai-chat')
+        : from === 'anthropic-messages'
+          ? booleanValue(tool.strict)
+          : undefined
+    const strictProtocols = new Set<Protocol>(['openai-chat', 'openai-responses', 'anthropic-messages'])
+    const targetPreservesStrict = strictProtocols.has(from) && strictProtocols.has(to)
     if (strict === true && !targetPreservesStrict) {
       add(
         from === 'openai-chat' ? `tools[${index}].function.strict` : `tools[${index}].strict`,
@@ -105,8 +168,31 @@ export function analyzeProtocolConversion(
         add('text.format', 'request-option', `Structured response formats have no lossless ${to} mapping`)
       }
     }
+    const unsupportedOptions = [
+      ['max_tool_calls', body.max_tool_calls],
+      ['prompt', body.prompt],
+      ['truncation', body.truncation],
+      ['background', body.background],
+    ] as const
+    for (const [path, value] of unsupportedOptions) {
+      if (value !== undefined && value !== null && value !== false) {
+        add(path, 'request-option', `Responses option ${path} has no lossless ${to} mapping`)
+      }
+    }
+    if (Array.isArray(body.include) && body.include.length > 0) {
+      add('include', 'request-option', `Requested Responses include fields have no lossless ${to} mapping`)
+    }
+    if (body.store === true && to !== 'openai-chat') {
+      add('store', 'request-option', `Stored Responses state has no lossless ${to} mapping`)
+    }
+    if (body.service_tier !== undefined && to !== 'openai-chat') {
+      add('service_tier', 'request-option', `Responses service tier has no lossless ${to} mapping`)
+    }
+    if (objectValue(body.reasoning) && to === 'gemini') {
+      add('reasoning', 'request-option', 'Responses reasoning controls have no lossless Gemini mapping')
+    }
   }
-  const hasDeclaredTools = hasCompatibleFunctionDeclaration(from, body)
+  const hasDeclaredTools = hasCompatibleFunctionDeclaration(from, body, context)
   const requiredToolChoice = requiredToolChoicePath(from, body)
   const choiceRequiresTool = requiredToolChoice !== undefined
   if (choiceRequiresTool && !hasDeclaredTools) {
@@ -132,7 +218,7 @@ export function analyzeProtocolConversion(
           `input[${itemIndex}].output`,
           add
         )
-      } else if (type === 'function_call') {
+      } else if (type === 'function_call' || (type === 'custom_tool_call' && context?.dialect === 'xai-grok' && to === 'openai-chat')) {
         if (targetRequiresObjectToolArguments(to) && !isJsonObjectArgument(item.arguments)) {
           add(
             `input[${itemIndex}].arguments`,
@@ -140,7 +226,7 @@ export function analyzeProtocolConversion(
             `Function-call arguments must be a JSON object for ${to}`
           )
         }
-      } else {
+      } else if (type !== 'custom_tool_call_output' || context?.dialect !== 'xai-grok' || to !== 'openai-chat') {
         add(`input[${itemIndex}]`, 'content-part', `Input item type ${type || 'unknown'} has no lossless ${to} mapping`)
       }
     }
@@ -181,8 +267,17 @@ export function analyzeProtocolConversion(
         new Set(['text', 'image', 'tool_use', 'tool_result']),
         add
       )
+      let sawToolUse = false
       for (const [blockIndex, block] of arrayOfObjects(message.content).entries()) {
         const type = stringValue(block.type)
+        if (type === 'tool_use') sawToolUse = true
+        else if (to === 'openai-chat' && sawToolUse && type === 'text' && stringValue(block.text)) {
+          add(
+            `messages[${messageIndex}].content[${blockIndex}]`,
+            'content-part',
+            'Text after an Anthropic tool_use block has no lossless OpenAI Chat mapping'
+          )
+        }
         if (type === 'tool_result') {
           validateToolResultContent(
             'anthropic-messages',
@@ -337,10 +432,11 @@ function validateImageDetail(
   }
 }
 
-function hasCompatibleFunctionDeclaration(from: Protocol, body: JsonObject): boolean {
+function hasCompatibleFunctionDeclaration(from: Protocol, body: JsonObject, context?: ProtocolConversionContext): boolean {
   return arrayOfObjects(body.tools).some((tool) => {
     const type = stringValue(tool.type)
     if (type === 'function') return true
+    if (type === 'custom' && from === 'openai-responses' && context?.dialect === 'xai-grok') return true
     if (from === 'anthropic-messages' && !type) return Boolean(optionalString(tool.name))
     if (from !== 'gemini') return false
     return arrayOfObjects(tool.functionDeclarations ?? tool.function_declarations)
@@ -362,7 +458,7 @@ function requiredToolChoicePath(from: Protocol, body: JsonObject): string | unde
   const choice = body.tool_choice ?? body.toolChoice
   if (choice === 'required' || choice === 'any') return 'tool_choice'
   const choiceObject = objectValue(choice)
-  return choiceObject && ['function', 'tool', 'any'].includes(stringValue(choiceObject.type))
+  return choiceObject && ['function', 'custom', 'tool', 'any'].includes(stringValue(choiceObject.type))
     ? 'tool_choice'
     : undefined
 }
@@ -395,57 +491,79 @@ export function convertRequest(
   from: Protocol,
   to: Protocol,
   body: JsonObject,
-  targetModel: string
+  targetModel: string,
+  context?: ProtocolConversionContext
 ): ProtocolRequest {
-  if (from === to) {
-    return { protocol: to, body: withModel(body, to, targetModel), model: targetModel }
+  if (context?.dialect === 'xai-grok' && from === 'openai-responses') {
+    body = prepareXaiResponsesSource(body, context)
   }
-  const requiredChoice = requiredToolChoicePath(from, body)
-  if (requiredChoice && !hasCompatibleFunctionDeclaration(from, body)) {
+  prepareXaiBridgeContext(from, to, body, context)
+  if (from === to) {
+    // The Grok CLI endpoint advertises a Responses-shaped URL, but its Rust
+    // ModelInput enum is intentionally narrower than Codex's Responses wire
+    // format.  Do the same loss-minimizing bridge used for Chat relays even
+    // when both sides claim Responses, otherwise Codex-only items such as
+    // compaction records and hosted tools reach Grok unchanged and produce a
+    // generic 422 deserialization error.
+    const identityBody = context?.dialect === 'xai-grok' && to === 'openai-responses'
+      ? normalizeXaiResponsesRequest(body, targetModel, context)
+      : withModel(body, to, targetModel)
+    return {
+      protocol: to,
+      body: to === 'openai-chat' ? applyXaiChatRequestOptions(identityBody, context) : identityBody,
+      model: targetModel,
+      ...(context ? { conversionContext: context } : {})
+    }
+  }
+  const nativeXaiResponses = context?.dialect === 'xai-grok'
+    && from === 'openai-responses'
+    && to === 'openai-responses'
+  const requiredChoice = nativeXaiResponses ? undefined : requiredToolChoicePath(from, body)
+  if (requiredChoice && !hasCompatibleFunctionDeclaration(from, body, context)) {
     throw new InvalidToolChoiceError(requiredChoice)
   }
 
   if (to === 'openai-chat') {
     if (from === 'anthropic-messages') {
-      return { protocol: to, body: anthropicRequestToChat(body, targetModel), model: targetModel }
+      return { protocol: to, body: anthropicRequestToChat(body, targetModel), model: targetModel, ...(context ? { conversionContext: context } : {}) }
     }
     if (from === 'openai-responses') {
-      return { protocol: to, body: responsesRequestToChat(body, targetModel), model: targetModel }
+      return { protocol: to, body: responsesRequestToChat(body, targetModel, context), model: targetModel, ...(context ? { conversionContext: context } : {}) }
     }
     if (from === 'gemini') {
-      return { protocol: to, body: geminiRequestToChat(body, targetModel), model: targetModel }
+      return { protocol: to, body: geminiRequestToChat(body, targetModel), model: targetModel, ...(context ? { conversionContext: context } : {}) }
     }
   }
   if (from === 'openai-chat' && to === 'anthropic-messages') {
-    return { protocol: to, body: chatRequestToAnthropic(body, targetModel), model: targetModel }
+    return { protocol: to, body: chatRequestToAnthropic(body, targetModel), model: targetModel, ...(context ? { conversionContext: context } : {}) }
   }
   if (from === 'openai-chat' && to === 'openai-responses') {
-    return { protocol: to, body: chatRequestToResponses(body, targetModel), model: targetModel }
+    return { protocol: to, body: chatRequestToResponses(body, targetModel, context), model: targetModel, ...(context ? { conversionContext: context } : {}) }
   }
   if (from === 'openai-chat' && to === 'gemini') {
-    return { protocol: to, body: chatRequestToGemini(body), model: targetModel }
+    return { protocol: to, body: chatRequestToGemini(body), model: targetModel, ...(context ? { conversionContext: context } : {}) }
   }
   if (from === 'openai-responses' && to === 'anthropic-messages') {
-    return { protocol: to, body: responsesRequestToAnthropic(body, targetModel), model: targetModel }
+    return { protocol: to, body: responsesRequestToAnthropic(body, targetModel), model: targetModel, ...(context ? { conversionContext: context } : {}) }
   }
   if (from === 'anthropic-messages' && to === 'openai-responses') {
-    return { protocol: to, body: anthropicRequestToResponses(body, targetModel), model: targetModel }
+    return { protocol: to, body: anthropicRequestToResponses(body, targetModel), model: targetModel, ...(context ? { conversionContext: context } : {}) }
   }
   if (from === 'openai-responses' && to === 'gemini') {
-    return { protocol: to, body: responsesRequestToGemini(body), model: targetModel }
+    return { protocol: to, body: responsesRequestToGemini(body), model: targetModel, ...(context ? { conversionContext: context } : {}) }
   }
   if (from === 'gemini' && to === 'openai-responses') {
-    return { protocol: to, body: geminiRequestToResponses(body, targetModel), model: targetModel }
+    return { protocol: to, body: geminiRequestToResponses(body, targetModel), model: targetModel, ...(context ? { conversionContext: context } : {}) }
   }
   if (from === 'anthropic-messages' && to === 'gemini') {
-    return { protocol: to, body: anthropicRequestToGemini(body), model: targetModel }
+    return { protocol: to, body: anthropicRequestToGemini(body), model: targetModel, ...(context ? { conversionContext: context } : {}) }
   }
   if (from === 'gemini' && to === 'anthropic-messages') {
-    return { protocol: to, body: geminiRequestToAnthropic(body, targetModel), model: targetModel }
+    return { protocol: to, body: geminiRequestToAnthropic(body, targetModel), model: targetModel, ...(context ? { conversionContext: context } : {}) }
   }
   if (from !== 'openai-chat' && to !== 'openai-chat') {
-    const intermediate = convertRequest(from, 'openai-chat', body, targetModel)
-    return convertRequest('openai-chat', to, intermediate.body, targetModel)
+    const intermediate = convertRequest(from, 'openai-chat', body, targetModel, context)
+    return convertRequest('openai-chat', to, intermediate.body, targetModel, context)
   }
   throw new UnsupportedProtocolConversionError(from, to)
 }
@@ -455,11 +573,18 @@ export function convertResponse(
   to: Protocol,
   body: JsonObject,
   fallbackModel: string,
-  now = Date.now
+  now = Date.now,
+  context?: ProtocolConversionContext
 ): JsonObject {
-  if (from === to) return body
   if (from === 'openai-responses' && stringValue(body.status).trim().toLowerCase() === 'failed') {
     throw new ResponsesResponseFailedError(body)
+  }
+  if (from === to) {
+    return context?.dialect === 'xai-grok'
+      && from === 'openai-responses'
+      && context.toolBridgePlan
+      ? restoreXaiResponsesToolCalls(body, context)
+      : body
   }
   if (to === 'openai-chat') {
     if (from === 'anthropic-messages') return anthropicResponseToChat(body, fallbackModel, now)
@@ -470,7 +595,7 @@ export function convertResponse(
     return chatResponseToAnthropic(body, fallbackModel, now)
   }
   if (from === 'openai-chat' && to === 'openai-responses') {
-    return chatResponseToResponses(body, fallbackModel, now)
+    return chatResponseToResponses(body, fallbackModel, now, context)
   }
   if (from === 'openai-chat' && to === 'gemini') {
     return chatResponseToGemini(body, fallbackModel)
@@ -494,8 +619,8 @@ export function convertResponse(
     return geminiResponseToAnthropic(body, fallbackModel, now)
   }
   if (from !== 'openai-chat' && to !== 'openai-chat') {
-    const intermediate = convertResponse(from, 'openai-chat', body, fallbackModel, now)
-    return convertResponse('openai-chat', to, intermediate, fallbackModel, now)
+    const intermediate = convertResponse(from, 'openai-chat', body, fallbackModel, now, context)
+    return convertResponse('openai-chat', to, intermediate, fallbackModel, now, context)
   }
   throw new UnsupportedProtocolConversionError(from, to)
 }
@@ -506,6 +631,664 @@ function withModel(body: JsonObject, protocol: Protocol, model: string): JsonObj
   // already copy before changing fields.
   if (protocol === 'gemini' || body.model === model) return body
   return { ...body, model }
+}
+
+function prepareXaiBridgeContext(
+  from: Protocol,
+  to: Protocol,
+  body: JsonObject,
+  context?: ProtocolConversionContext
+): void {
+  if (context?.dialect !== 'xai-grok') return
+  if (from === 'openai-responses' && to === 'openai-chat') {
+    context.toolBridgePlan ??= buildXaiToolBridgePlan(body)
+  }
+}
+
+const XAI_NATIVE_RESPONSES_TOOL_TYPES = new Set([
+  'function',
+  'web_search',
+  'x_search',
+  'image_generation',
+  'collections_search',
+  'file_search',
+  'code_execution',
+  'code_interpreter',
+  'mcp',
+  'shell',
+])
+
+interface XaiNamespaceBinding {
+  namespace: string
+  name: string
+  wireName: string
+}
+
+/** Prepare Codex's Responses extensions before either native or Chat routing. */
+function prepareXaiResponsesSource(
+  body: JsonObject,
+  context: ProtocolConversionContext,
+): JsonObject {
+  const prepared = structuredClone(body)
+  promoteXaiAdditionalTools(prepared)
+  const namespaces = flattenXaiNamespaceTools(prepared)
+  context.toolBridgePlan = buildXaiToolBridgePlan(prepared, namespaces)
+  return prepared
+}
+
+function promoteXaiAdditionalTools(body: JsonObject): void {
+  if (!Array.isArray(body.input)) return
+  const input = arrayOfObjects(body.input)
+  if (!input.some((item) => stringValue(item.type) === 'additional_tools')) return
+  const tools = arrayOfObjects(body.tools)
+  const seen = new Set(tools.map(xaiToolDedupKey))
+  const promoted = [...tools]
+  const filteredInput: JsonObject[] = []
+  for (const item of input) {
+    if (stringValue(item.type) !== 'additional_tools') {
+      filteredInput.push(item)
+      continue
+    }
+    for (const tool of arrayOfObjects(item.tools)) {
+      const key = xaiToolDedupKey(tool)
+      if (seen.has(key)) continue
+      seen.add(key)
+      promoted.push(tool)
+    }
+  }
+  body.input = filteredInput
+  if (promoted.length > 0) body.tools = promoted
+}
+
+function xaiToolDedupKey(tool: JsonObject): string {
+  const type = stringValue(tool.type)
+  const name = optionalString(tool.name)
+  if (type && name) return `${type}\0${name}`
+  if (type === 'mcp' && optionalString(tool.server_label)) return `mcp\0${stringValue(tool.server_label)}`
+  return jsonString(tool)
+}
+
+function flattenXaiNamespaceTools(body: JsonObject): Map<string, XaiNamespaceBinding> {
+  const sourceTools = arrayOfObjects(body.tools)
+  const namespaces = new Map<string, XaiNamespaceBinding>()
+  if (!sourceTools.some((tool) => stringValue(tool.type) === 'namespace')) return namespaces
+
+  const occupied = new Set(sourceTools.flatMap((tool) => {
+    const type = stringValue(tool.type)
+    const name = optionalString(tool.name)
+    return name && (type === 'function' || type === 'custom') ? [name] : []
+  }))
+  const flattened: JsonObject[] = []
+  for (const [toolIndex, tool] of sourceTools.entries()) {
+    if (stringValue(tool.type) !== 'namespace') {
+      flattened.push(tool)
+      continue
+    }
+    const namespace = optionalString(tool.name)
+    if (!namespace) continue
+    const children = arrayOfObjects(tool.tools ?? tool.children)
+    for (const [childIndex, child] of children.entries()) {
+      if (stringValue(child.type) !== 'function') continue
+      const name = optionalString(child.name)
+      if (!name) continue
+      const wireName = xaiNamespaceWireName(namespace, name)
+      const existing = namespaces.get(wireName)
+      if (occupied.has(wireName) || (existing && (existing.namespace !== namespace || existing.name !== name))) {
+        throw new InvalidToolBridgeError(
+          `tools[${toolIndex}].tools[${childIndex}].name`,
+          `namespace tool ${namespace}/${name} collides with ${wireName}`,
+        )
+      }
+      if (existing) continue
+      namespaces.set(wireName, { namespace, name, wireName })
+      flattened.push({ ...child, type: 'function', name: wireName })
+    }
+  }
+  body.tools = flattened
+  rewriteXaiNamespaceCalls(body.input, namespaces)
+  const choice = objectValue(body.tool_choice)
+  if (stringValue(choice?.type) === 'namespace') {
+    body.tool_choice = 'auto'
+  } else if (choice) {
+    rewriteXaiNamespaceCall(choice, namespaces)
+  }
+  return namespaces
+}
+
+function xaiNamespaceWireName(namespace: string, name: string): string {
+  const joined = `${namespace}__${name}`
+  if (safeXaiWireName(joined)) return joined
+  const slug = joined.replace(/[^A-Za-z0-9_-]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 30) || 'tool'
+  const digest = createHash('sha256').update(`namespace:${namespace}\0${name}`, 'utf8').digest('hex').slice(0, 16)
+  return `sp_ns_${slug}_${digest}`.slice(0, 64)
+}
+
+function rewriteXaiNamespaceCalls(value: unknown, namespaces: ReadonlyMap<string, XaiNamespaceBinding>): void {
+  if (Array.isArray(value)) {
+    for (const item of value) rewriteXaiNamespaceCalls(item, namespaces)
+    return
+  }
+  const object = objectValue(value)
+  if (!object) return
+  if (stringValue(object.type) === 'function_call') rewriteXaiNamespaceCall(object, namespaces)
+  for (const child of Object.values(object)) rewriteXaiNamespaceCalls(child, namespaces)
+}
+
+function rewriteXaiNamespaceCall(
+  item: JsonObject,
+  namespaces: ReadonlyMap<string, XaiNamespaceBinding>,
+): void {
+  const namespace = optionalString(item.namespace)
+  const name = optionalString(item.name)
+  if (!namespace || !name) return
+  const match = [...namespaces.values()].find((binding) => binding.namespace === namespace && binding.name === name)
+  if (!match) return
+  item.name = match.wireName
+  delete item.namespace
+}
+
+function normalizeXaiResponsesRequest(
+  body: JsonObject,
+  targetModel: string,
+  context: ProtocolConversionContext
+): JsonObject {
+  const safeBody = structuredClone(body)
+  const opaqueIndex = arrayOfObjects(safeBody.input).findIndex((item) => {
+    const type = stringValue(item.type)
+    return type === 'compaction_trigger'
+      || ((type === 'compaction' || type === 'compaction_summary')
+        && typeof item.encrypted_content === 'string'
+        && Boolean(item.encrypted_content.trim()))
+  })
+  if (opaqueIndex >= 0) {
+    throw new InvalidToolBridgeError(
+      `input[${opaqueIndex}]`,
+      'Responses compaction state cannot be discarded or expanded safely',
+    )
+  }
+  if (safeBody.previous_response_id !== null && safeBody.previous_response_id !== undefined) {
+    throw new InvalidToolBridgeError(
+      'previous_response_id',
+      'Responses conversation chaining cannot be discarded or expanded safely',
+    )
+  }
+  const plan = context.toolBridgePlan ?? buildXaiToolBridgePlan(safeBody)
+  context.toolBridgePlan = plan
+
+  const hasUnsupportedInput = Array.isArray(safeBody.input)
+    && arrayOfObjects(safeBody.input).some((item) => !isSupportedXaiResponsesInputItem(item))
+  const hasUnsupportedTool = Array.isArray(safeBody.tools)
+    && arrayOfObjects(safeBody.tools).some((tool) => {
+      const type = stringValue(tool.type)
+      return type !== 'custom' && !XAI_NATIVE_RESPONSES_TOOL_TYPES.has(type)
+    })
+  const hasUnsupportedState = [
+    'previous_response_id',
+    'include',
+    'prompt_cache_key',
+    'prompt_cache_retention',
+    'safety_identifier',
+    'truncation',
+    'text',
+    'service_tier',
+    'stream_options',
+  ].some((field) => safeBody[field] !== undefined)
+  const hasPrivateNestedState = containsXaiField(safeBody, 'external_web_access')
+  const hasGrok45Sampling = xaiModelSuffix(targetModel) === 'grok-4.5'
+    && ['presence_penalty', 'presencePenalty', 'frequency_penalty', 'frequencyPenalty', 'stop']
+      .some((field) => safeBody[field] !== undefined)
+  if (!plan.requiresResponseBridge
+    && !hasUnsupportedInput
+    && !hasUnsupportedTool
+    && !hasUnsupportedState
+    && !hasPrivateNestedState
+    && !hasGrok45Sampling) {
+    return withModel(safeBody, 'openai-responses', targetModel)
+  }
+
+  for (const field of [
+    'previous_response_id',
+    'include',
+    'prompt_cache_key',
+    'prompt_cache_retention',
+    'safety_identifier',
+    'truncation',
+    'text',
+    'service_tier',
+    'stream_options',
+  ]) delete safeBody[field]
+  removeXaiFieldRecursive(safeBody, 'external_web_access')
+  if (xaiModelSuffix(targetModel) === 'grok-4.5') {
+    for (const field of ['presence_penalty', 'presencePenalty', 'frequency_penalty', 'frequencyPenalty', 'stop']) {
+      delete safeBody[field]
+    }
+  }
+
+  if (Array.isArray(safeBody.input)) safeBody.input = normalizeXaiNativeInput(safeBody.input, context)
+  const tools = normalizeXaiNativeTools(safeBody.tools, context)
+  if (tools.length > 0) {
+    safeBody.tools = tools
+    const toolChoice = normalizeXaiNativeToolChoice(safeBody.tool_choice, tools, context)
+    if (toolChoice === undefined) delete safeBody.tool_choice
+    else safeBody.tool_choice = toolChoice
+  } else {
+    delete safeBody.tools
+    delete safeBody.tool_choice
+    delete safeBody.parallel_tool_calls
+  }
+  delete safeBody.reasoning
+  applyXaiReasoning(body, safeBody)
+  return withModel(safeBody, 'openai-responses', targetModel)
+}
+
+function removeXaiFieldRecursive(value: unknown, field: string): void {
+  if (Array.isArray(value)) {
+    for (const item of value) removeXaiFieldRecursive(item, field)
+    return
+  }
+  const object = objectValue(value)
+  if (!object) return
+  delete object[field]
+  for (const child of Object.values(object)) removeXaiFieldRecursive(child, field)
+}
+
+function containsXaiField(value: unknown, field: string): boolean {
+  if (Array.isArray(value)) return value.some((item) => containsXaiField(item, field))
+  const object = objectValue(value)
+  if (!object) return false
+  return Object.hasOwn(object, field) || Object.values(object).some((child) => containsXaiField(child, field))
+}
+
+function xaiModelSuffix(model: string): string {
+  return model.trim().split('/').at(-1)?.trim().toLowerCase() ?? ''
+}
+
+function normalizeXaiNativeInput(value: unknown, context: ProtocolConversionContext): JsonObject[] {
+  return arrayOfObjects(value).flatMap((item, index) => {
+    const type = stringValue(item.type)
+    if (type === 'message' || (!type && typeof item.role === 'string')) return [item]
+    if (type === 'function_call') {
+      const binding = findXaiToolInPlan(context.toolBridgePlan!, 'function', stringValue(item.name))
+      if (!binding) throw new InvalidToolBridgeError(`input[${index}].name`, `unknown function ${stringValue(item.name) || '<empty>'}`)
+      const normalized: JsonObject = { ...item, name: binding.wireName }
+      delete normalized.namespace
+      return [normalized]
+    }
+    if (type === 'custom_tool_call') {
+      const binding = findXaiToolInPlan(context.toolBridgePlan!, 'custom', stringValue(item.name))
+      if (!binding) throw new InvalidToolBridgeError(`input[${index}].name`, `unknown custom tool ${stringValue(item.name) || '<empty>'}`)
+      return [{
+        ...item,
+        type: 'function_call',
+        name: binding.wireName,
+        arguments: jsonString({ input: item.input }),
+        input: undefined,
+      }]
+    }
+    if (type === 'function_call_output') return [item]
+    if (type === 'custom_tool_call_output') return [{ ...item, type: 'function_call_output' }]
+    return []
+  }).map(omitUndefined)
+}
+
+function normalizeXaiNativeTools(value: unknown, context: ProtocolConversionContext): JsonObject[] {
+  const plan = context.toolBridgePlan
+  if (!plan) throw new InvalidToolBridgeError('tools', 'conversion plan is missing')
+  return arrayOfObjects(value).flatMap((tool) => {
+    const type = stringValue(tool.type)
+    if (type === 'function') {
+      const binding = findXaiToolInPlan(plan, 'function', stringValue(tool.name))
+      return binding ? [{ ...tool, name: binding.wireName }] : []
+    }
+    if (type === 'custom') {
+      const binding = findXaiToolInPlan(plan, 'custom', stringValue(tool.name))
+      if (!binding) return []
+      return [{
+        type: 'function',
+        name: binding.wireName,
+        description: [
+          optionalString(tool.description),
+          'The argument must be a JSON object with one string property named input.',
+        ].filter(Boolean).join(' '),
+        parameters: {
+          type: 'object',
+          properties: { input: { type: 'string' } },
+          required: ['input'],
+          additionalProperties: false,
+        },
+      }]
+    }
+    return XAI_NATIVE_RESPONSES_TOOL_TYPES.has(type) ? [tool] : []
+  })
+}
+
+function normalizeXaiNativeToolChoice(
+  value: unknown,
+  tools: readonly JsonObject[],
+  context: ProtocolConversionContext,
+): unknown {
+  if (typeof value === 'string') return ['auto', 'none', 'required'].includes(value) ? value : undefined
+  const choice = objectValue(value)
+  const type = stringValue(choice?.type)
+  const choiceName = optionalString(choice?.name) ?? optionalString(objectValue(choice?.function)?.name)
+  if ((type === 'function' || type === 'custom') && choiceName) {
+    const binding = findXaiToolInPlan(context.toolBridgePlan!, type, choiceName)
+    if (!binding || binding.declared === false || !tools.some((tool) => stringValue(tool.type) === 'function' && stringValue(tool.name) === binding.wireName)) return undefined
+    return { type: 'function', name: binding.wireName }
+  }
+  if (type === 'function' || type === 'custom') return undefined
+  if (XAI_NATIVE_RESPONSES_TOOL_TYPES.has(type) && tools.some((tool) => stringValue(tool.type) === type)) return choice
+  return undefined
+}
+
+function restoreXaiResponsesToolCalls(
+  body: JsonObject,
+  context: ProtocolConversionContext
+): JsonObject {
+  if (!Array.isArray(body.output)) return body
+  const sourceOutput = arrayOfObjects(body.output)
+  for (const [index, item] of sourceOutput.entries()) {
+    if (stringValue(item.type) === 'custom_tool_call') {
+      throw new InvalidToolBridgeError(`output[${index}].type`, 'upstream returned an unbridged custom tool call')
+    }
+  }
+  validateXaiResponseCallIds(sourceOutput.filter((item) => stringValue(item.type) === 'function_call'), context, 'output')
+  const output = sourceOutput.map((item, index) => {
+    if (stringValue(item.type) !== 'function_call') return item
+    const wireName = stringValue(item.name)
+    const binding = findXaiToolByWire(context, wireName)
+    if (!binding) {
+      throw new InvalidToolBridgeError(`output[${index}].name`, `unknown tool alias ${wireName || '<empty>'}`)
+    }
+    const callId = stringValue(item.call_id, stringValue(item.id))
+    if (!callId) throw new InvalidToolBridgeError(`output[${index}].call_id`, 'tool call id is required')
+    rememberXaiChatCall(context, callId, binding)
+    if (binding.sourceType === 'custom') {
+      const { arguments: _arguments, namespace: _untrustedNamespace, ...rest } = item
+      return {
+        ...rest,
+        type: 'custom_tool_call',
+        call_id: callId,
+        name: binding.sourceName,
+        input: parseXaiCustomWrapper(item.arguments, `output[${index}].arguments`)
+      }
+    }
+    const { namespace: _untrustedNamespace, ...rest } = item
+    return {
+      ...rest,
+      call_id: callId,
+      name: binding.sourceName,
+      ...(binding.sourceNamespace ? { namespace: binding.sourceNamespace } : {}),
+    }
+  })
+  return { ...body, output }
+}
+
+function validateXaiResponseCallIds(
+  calls: readonly JsonObject[],
+  context: ProtocolConversionContext | undefined,
+  path: string
+): void {
+  const plan = context?.toolBridgePlan
+  if (!plan) return
+  if (plan.parallelToolCalls === false && calls.length > 1) {
+    throw new InvalidToolBridgeError(path, 'upstream returned parallel tool calls when disabled')
+  }
+  const used = new Set(plan.calls.map((call) => call.callId))
+  for (const [index, call] of calls.entries()) {
+    const callId = stringValue(call.call_id, stringValue(call.id))
+    if (!callId) throw new InvalidToolBridgeError(`${path}[${index}].call_id`, 'tool call id is required')
+    if (used.has(callId)) {
+      throw new InvalidToolBridgeError(`${path}[${index}].call_id`, `duplicate tool call id ${callId}`)
+    }
+    used.add(callId)
+  }
+}
+
+function isSupportedXaiResponsesInputItem(item: JsonObject): boolean {
+  const type = stringValue(item.type)
+  return type === 'message'
+    || type === 'function_call'
+    || type === 'function_call_output'
+    || type === 'custom_tool_call'
+    || type === 'custom_tool_call_output'
+    || (!type && typeof item.role === 'string')
+}
+
+function buildXaiToolBridgePlan(
+  body: JsonObject,
+  namespaces: ReadonlyMap<string, XaiNamespaceBinding> = new Map(),
+): ToolBridgePlan {
+  const plan: ToolBridgePlan = { dialect: 'xai-grok', tools: [], calls: [] }
+  if (typeof body.parallel_tool_calls === 'boolean') {
+    plan.parallelToolCalls = body.parallel_tool_calls
+  }
+  const declaredFunctions: JsonObject[] = []
+  const declaredCustoms: JsonObject[] = []
+  for (const [index, tool] of arrayOfObjects(body.tools).entries()) {
+    const type = stringValue(tool.type)
+    if (type === 'function') declaredFunctions.push(tool)
+    else if (type === 'custom') declaredCustoms.push(tool)
+    // Hosted/private tools are handled by the native whitelist after the
+    // function/custom bridge plan is built. Unsupported entries are dropped
+    // without turning an otherwise usable Codex request into a 422.
+    else if (!type && Object.keys(tool).length === 0) {
+      throw new InvalidToolBridgeError(`tools[${index}]`, 'empty tool declaration')
+    }
+  }
+  const functionNames = new Set<string>()
+  const customNames = new Set<string>()
+  const usedWireNames = new Set<string>()
+  for (const tool of declaredFunctions) {
+    const name = optionalString(tool.name)
+    if (!name) throw new InvalidToolBridgeError('tools[].name', 'function name is required')
+    if (functionNames.has(name)) throw new InvalidToolBridgeError('tools[].name', `duplicate function ${name}`)
+    functionNames.add(name)
+    if (safeXaiWireName(name)) usedWireNames.add(name)
+  }
+  for (const tool of declaredFunctions) {
+    const name = stringValue(tool.name)
+    const namespace = namespaces.get(name)
+    const wireName = namespace?.wireName ?? (safeXaiWireName(name) ? name : makeXaiAlias('fn', name, usedWireNames))
+    usedWireNames.add(wireName)
+    plan.tools.push({
+      sourceType: 'function',
+      sourceName: namespace?.name ?? name,
+      ...(namespace ? { sourceNamespace: namespace.namespace } : {}),
+      wireName,
+      declared: true,
+    })
+  }
+  for (const tool of declaredCustoms) {
+    const name = optionalString(tool.name)
+    if (!name) throw new InvalidToolBridgeError('tools[].name', 'custom tool name is required')
+    if (customNames.has(name)) throw new InvalidToolBridgeError('tools[].name', `duplicate custom tool ${name}`)
+    customNames.add(name)
+    const wireName = makeXaiAlias('custom', name, usedWireNames)
+    usedWireNames.add(wireName)
+    plan.tools.push({ sourceType: 'custom', sourceName: name, wireName, declared: true })
+  }
+  const seenHistoryCalls = new Set<string>()
+  for (const [index, item] of arrayOfObjects(body.input).entries()) {
+    const type = stringValue(item.type)
+    if (type !== 'function_call' && type !== 'custom_tool_call' && type !== 'custom_tool_call_output' && type !== 'function_call_output') continue
+    const callId = optionalString(item.call_id) ?? optionalString(item.id)
+    if (!callId) throw new InvalidToolBridgeError(`input[${index}].call_id`, 'tool call id is required')
+    const sourceType = type.startsWith('custom_') ? 'custom' : 'function'
+    const isCall = type === 'function_call' || type === 'custom_tool_call'
+    if (!isCall) {
+      const existing = plan.calls.find((call) => call.callId === callId)
+      if (!existing) throw new InvalidToolBridgeError(`input[${index}].call_id`, `orphan tool output ${callId}`)
+      if (existing.sourceType !== sourceType) {
+        throw new InvalidToolBridgeError(`input[${index}].type`, `tool output kind does not match call ${callId}`)
+      }
+      continue
+    }
+    if (seenHistoryCalls.has(callId)) {
+      throw new InvalidToolBridgeError(`input[${index}].call_id`, `duplicate tool call id ${callId}`)
+    }
+    seenHistoryCalls.add(callId)
+    const sourceName = optionalString(item.name)
+    if (!sourceName) throw new InvalidToolBridgeError(`input[${index}].name`, 'tool name is required')
+    const sourceNamespace = type === 'function_call' ? optionalString(item.namespace) : undefined
+    if (type === 'custom_tool_call' && typeof item.input !== 'string') {
+      throw new InvalidToolBridgeError(`input[${index}].input`, 'custom tool input must be a string')
+    }
+    if (type === 'function_call' && typeof item.arguments !== 'string') {
+      throw new InvalidToolBridgeError(`input[${index}].arguments`, 'function arguments must be a string')
+    }
+    let binding = sourceNamespace
+      ? plan.tools.find((candidate) => candidate.sourceType === sourceType
+        && candidate.sourceName === sourceName
+        && candidate.sourceNamespace === sourceNamespace)
+      : findXaiToolInPlan(plan, sourceType, sourceName)
+    if (sourceName && !binding) {
+      const namespaceWireName = sourceNamespace ? xaiNamespaceWireName(sourceNamespace, sourceName) : undefined
+      if (namespaceWireName && usedWireNames.has(namespaceWireName)) {
+        throw new InvalidToolBridgeError(`input[${index}].name`, `namespace history collides with ${namespaceWireName}`)
+      }
+      const wireName = namespaceWireName
+        ?? (sourceType === 'function' && safeXaiWireName(sourceName) && !usedWireNames.has(sourceName)
+          ? sourceName
+          : makeXaiAlias(sourceType === 'custom' ? 'custom' : 'fn', sourceName, usedWireNames))
+      binding = {
+        sourceType,
+        sourceName,
+        ...(sourceNamespace ? { sourceNamespace } : {}),
+        wireName,
+        declared: false,
+      }
+      plan.tools.push(binding)
+      usedWireNames.add(wireName)
+    }
+    if (sourceNamespace && binding) {
+      item.name = binding.wireName
+      delete item.namespace
+    }
+    rememberXaiCallBinding(plan, {
+      callId,
+      sourceType,
+      sourceName: binding?.sourceName ?? sourceName,
+      sourceNamespace: binding?.sourceNamespace,
+      wireName: binding?.wireName,
+    })
+  }
+  // Once a current request declares a callable tool, every response must pass
+  // through the request-scoped authorizer. This keeps safe-name functions and
+  // aliased/custom/namespace functions on identical fail-closed semantics.
+  plan.requiresResponseBridge = plan.tools.length > 0
+  return plan
+}
+
+function safeXaiWireName(name: string): boolean {
+  return /^[A-Za-z0-9_-]{1,64}$/.test(name)
+}
+
+function makeXaiAlias(kind: 'fn' | 'custom', sourceName: string, used: ReadonlySet<string>): string {
+  const slug = sourceName.replace(/[^A-Za-z0-9_-]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 30) || 'tool'
+  const digest = createHash('sha256').update(`${kind}:${sourceName}`, 'utf8').digest('hex')
+  for (let length = 12; length <= digest.length; length += 4) {
+    const alias = `sp_${kind}_${slug}_${digest.slice(0, length)}`.slice(0, 64)
+    if (!used.has(alias)) return alias
+  }
+  throw new InvalidToolBridgeError('tools[].name', `could not create a collision-free alias for ${sourceName}`)
+}
+
+function findXaiTool(context: ProtocolConversionContext | undefined, sourceType: ToolBridgeBinding['sourceType'], sourceName: string): ToolBridgeBinding | undefined {
+  return context?.toolBridgePlan?.tools.find((binding) => binding.sourceType === sourceType
+    && (binding.sourceName === sourceName || (binding.sourceNamespace !== undefined && binding.wireName === sourceName)))
+}
+
+function findXaiToolByWire(context: ProtocolConversionContext | undefined, wireName: string): ToolBridgeBinding | undefined {
+  return context?.toolBridgePlan?.tools.find((binding) => binding.wireName === wireName && binding.declared !== false)
+}
+
+function findXaiToolInPlan(plan: ToolBridgePlan, sourceType: ToolBridgeBinding['sourceType'], sourceName: string): ToolBridgeBinding | undefined {
+  return plan.tools.find((binding) => binding.sourceType === sourceType
+    && (binding.sourceName === sourceName || (binding.sourceNamespace !== undefined && binding.wireName === sourceName)))
+}
+
+function findXaiCall(context: ProtocolConversionContext | undefined, callId: string): ToolCallBridgeBinding | undefined {
+  return context?.toolBridgePlan?.calls.find((binding) => binding.callId === callId)
+}
+
+function rememberXaiCallBinding(plan: ToolBridgePlan, binding: ToolCallBridgeBinding): void {
+  const existing = plan.calls.find((call) => call.callId === binding.callId)
+  if (existing) {
+    if (existing.sourceType !== binding.sourceType
+      || (existing.wireName && binding.wireName && existing.wireName !== binding.wireName)
+      || (existing.sourceNamespace && binding.sourceNamespace && existing.sourceNamespace !== binding.sourceNamespace)) {
+      throw new InvalidToolBridgeError('input[].call_id', `call id ${binding.callId} changes tool kind`)
+    }
+    if (!existing.sourceName && binding.sourceName) existing.sourceName = binding.sourceName
+    if (!existing.sourceNamespace && binding.sourceNamespace) existing.sourceNamespace = binding.sourceNamespace
+    if (!existing.wireName && binding.wireName) existing.wireName = binding.wireName
+    return
+  }
+  plan.calls.push(binding)
+}
+
+function rememberXaiCall(context: ProtocolConversionContext | undefined, item: JsonObject, sourceType: ToolBridgeBinding['sourceType']): void {
+  const plan = context?.toolBridgePlan
+  if (!plan) return
+  const callId = optionalString(item.call_id) ?? optionalString(item.id)
+  if (!callId) return
+  const sourceName = optionalString(item.name)
+  const binding = sourceName ? findXaiTool(plan === undefined ? undefined : context, sourceType, sourceName) : undefined
+  rememberXaiCallBinding(plan, {
+    callId,
+    sourceType,
+    sourceName: binding?.sourceName ?? sourceName,
+    sourceNamespace: binding?.sourceNamespace,
+    wireName: binding?.wireName,
+  })
+}
+
+function rememberXaiOutput(context: ProtocolConversionContext | undefined, item: JsonObject, sourceType?: ToolBridgeBinding['sourceType']): void {
+  const plan = context?.toolBridgePlan
+  if (!plan) return
+  const callId = optionalString(item.call_id) ?? optionalString(item.id)
+  if (!callId) return
+  const existing = findXaiCall(context, callId)
+  if (existing || !sourceType) return
+  rememberXaiCallBinding(plan, { callId, sourceType })
+}
+
+function rememberXaiChatCall(context: ProtocolConversionContext | undefined, callId: string, binding: ToolBridgeBinding): void {
+  if (context?.toolBridgePlan) rememberXaiCallBinding(context.toolBridgePlan, {
+    callId,
+    sourceType: binding.sourceType,
+    sourceName: binding.sourceName,
+    sourceNamespace: binding.sourceNamespace,
+    wireName: binding.wireName,
+  })
+}
+
+function parseXaiCustomWrapper(value: unknown, path: string): string {
+  let parsed: unknown = value
+  if (typeof value === 'string') {
+    try { parsed = JSON.parse(value) as unknown } catch { throw new InvalidToolBridgeError(path, 'custom arguments are not valid JSON') }
+  }
+  const object = objectValue(parsed)
+  if (!object || typeof object.input !== 'string' || Object.keys(object).some((key) => key !== 'input')) {
+    throw new InvalidToolBridgeError(path, 'custom arguments must be exactly { input: string }')
+  }
+  return object.input
+}
+
+function applyXaiReasoning(body: JsonObject, output: JsonObject): void {
+  const effort = stringValue(objectValue(body.reasoning)?.effort).trim().toLowerCase()
+  const mapped = effort === 'minimal' || effort === 'low' ? 'low'
+    : effort === 'medium' ? 'medium'
+      : effort === 'high' || effort === 'xhigh' || effort === 'max' ? 'high'
+        : undefined
+  if (mapped) output.reasoning_effort = mapped
+}
+
+function applyXaiChatRequestOptions(body: JsonObject, context?: ProtocolConversionContext): JsonObject {
+  if (context?.dialect !== 'xai-grok' || body.stream !== true) return body
+  const current = objectValue(body.stream_options)
+  return { ...body, stream_options: { ...current, include_usage: true } }
 }
 
 function anthropicRequestToChat(body: JsonObject, model: string): JsonObject {
@@ -593,7 +1376,7 @@ function chatRequestToAnthropic(body: JsonObject, model: string): JsonObject {
   return omitUndefined(output)
 }
 
-function responsesRequestToChat(body: JsonObject, model: string): JsonObject {
+function responsesRequestToChat(body: JsonObject, model: string, context?: ProtocolConversionContext): JsonObject {
   const messages: JsonObject[] = []
   const instructions = textValue(body.instructions)
   if (instructions) messages.push({ role: 'system', content: instructions })
@@ -613,21 +1396,23 @@ function responsesRequestToChat(body: JsonObject, model: string): JsonObject {
         functionCallMessage = stringValue(message.role) === 'assistant' ? message : undefined
         continue
       }
-      if (type === 'function_call') {
+      if (type === 'function_call' || type === 'custom_tool_call') {
         if (!functionCallMessage) {
           functionCallMessage = { role: 'assistant', content: null, tool_calls: [] }
           messages.push(functionCallMessage)
         }
         const toolCalls = arrayValue(functionCallMessage.tool_calls)
-        functionCallMessage.tool_calls = [...toolCalls, responsesFunctionCallToChat(item)]
+        functionCallMessage.tool_calls = [...toolCalls, responsesFunctionCallToChat(item, context)]
+        rememberXaiCall(context, item, type === 'custom_tool_call' ? 'custom' : 'function')
         continue
       }
-      if (type === 'function_call_output') {
+      if (type === 'function_call_output' || type === 'custom_tool_call_output') {
         messages.push({
           role: 'tool',
           tool_call_id: stringValue(item.call_id, stringValue(item.id)),
           content: responsesFunctionOutputToChat(item.output)
         })
+        rememberXaiOutput(context, item, type === 'custom_tool_call_output' ? 'custom' : undefined)
         functionCallMessage = undefined
         continue
       }
@@ -640,15 +1425,37 @@ function responsesRequestToChat(body: JsonObject, model: string): JsonObject {
     max_tokens: numberValue(body.max_output_tokens),
     stream: booleanValue(body.stream)
   }
-  copyOptional(body, output, ['temperature', 'top_p', 'metadata', 'parallel_tool_calls'])
-  const tools = responsesToolsToChat(body.tools)
+  copyOptional(body, output, [
+    'temperature', 'top_p', 'metadata', 'parallel_tool_calls',
+    'store', 'service_tier', 'safety_identifier', 'user',
+  ])
+  const reasoningEffort = normalizeReasoningEffort(objectValue(body.reasoning)?.effort)
+  if (reasoningEffort) output.reasoning_effort = reasoningEffort
+  const tools = context?.dialect === 'xai-grok'
+    ? xaiResponsesToolsToChat(body.tools, context)
+    : responsesToolsToChat(body.tools)
   if (tools.length > 0) output.tools = tools
-  const toolChoice = responsesToolChoiceToChat(body.tool_choice)
-  if (toolChoice !== undefined) output.tool_choice = toolChoice
+  if (tools.length > 0) {
+    const toolChoice = context?.dialect === 'xai-grok'
+      ? xaiResponsesToolChoiceToChat(body.tool_choice, context)
+      : responsesToolChoiceToChat(body.tool_choice)
+    if (toolChoice !== undefined) output.tool_choice = toolChoice
+  } else if (context?.dialect === 'xai-grok') {
+    delete output.parallel_tool_calls
+  }
+  if (context?.dialect === 'xai-grok') {
+    applyXaiReasoning(body, output)
+    return applyXaiChatRequestOptions(omitUndefined(output), context)
+  }
   return omitUndefined(output)
 }
 
-function chatRequestToResponses(body: JsonObject, model: string): JsonObject {
+function chatRequestToResponses(
+  body: JsonObject,
+  model: string,
+  context?: ProtocolConversionContext,
+  keepXaiWireTools = false
+): JsonObject {
   const input: JsonObject[] = []
   const instructions: string[] = []
   for (const message of arrayOfObjects(body.messages)) {
@@ -659,9 +1466,15 @@ function chatRequestToResponses(body: JsonObject, model: string): JsonObject {
       continue
     }
     if (role === 'tool' || role === 'function') {
+      const callId = stringValue(message.tool_call_id, stringValue(message.name))
+      const binding = findXaiCall(context, callId)
+      if (context?.dialect === 'xai-grok' && !binding) {
+        throw new InvalidToolBridgeError(`messages[].tool_call_id`, `unknown tool call ${callId || '<empty>'}`)
+      }
       input.push({
-        type: 'function_call_output',
-        call_id: stringValue(message.tool_call_id, stringValue(message.name)),
+        type: keepXaiWireTools ? 'function_call_output'
+          : binding?.sourceType === 'custom' ? 'custom_tool_call_output' : 'function_call_output',
+        call_id: callId,
         output: chatToolOutputToResponses(message.content)
       })
       continue
@@ -670,7 +1483,9 @@ function chatRequestToResponses(body: JsonObject, model: string): JsonObject {
     if (role === 'assistant') {
       if (content.length > 0) input.push({ type: 'message', role: 'assistant', content })
       for (const toolCall of chatMessageToolCalls(message)) {
-        input.push(chatFunctionCallToResponses(toolCall))
+        input.push(keepXaiWireTools
+          ? chatFunctionCallToXaiResponsesWire(toolCall, context)
+          : chatFunctionCallToResponses(toolCall, context))
       }
       continue
     }
@@ -684,10 +1499,22 @@ function chatRequestToResponses(body: JsonObject, model: string): JsonObject {
   }
   if (instructions.length > 0) output.instructions = instructions.join('\n\n')
   copyOptional(body, output, ['temperature', 'top_p', 'metadata', 'parallel_tool_calls'])
-  const tools = chatToolsToResponses(body.tools)
+  const tools = keepXaiWireTools
+    ? chatToolsToResponses(body.tools)
+    : context?.dialect === 'xai-grok'
+    ? xaiChatToolsToResponses(body.tools, context)
+    : chatToolsToResponses(body.tools)
   if (tools.length > 0) output.tools = tools
-  const toolChoice = chatToolChoiceToResponses(body.tool_choice)
-  if (toolChoice !== undefined) output.tool_choice = toolChoice
+  if (tools.length > 0) {
+    const toolChoice = keepXaiWireTools
+      ? chatToolChoiceToResponses(body.tool_choice)
+      : context?.dialect === 'xai-grok'
+      ? xaiChatToolChoiceToResponses(body.tool_choice, context)
+      : chatToolChoiceToResponses(body.tool_choice)
+    if (toolChoice !== undefined) output.tool_choice = toolChoice
+  } else if (context?.dialect === 'xai-grok') {
+    delete output.parallel_tool_calls
+  }
   return omitUndefined(output)
 }
 
@@ -779,6 +1606,7 @@ function responsesRequestToAnthropic(body: JsonObject, model: string): JsonObjec
   if (tools.length > 0) output.tools = tools
   const toolChoice = responsesToolChoiceToAnthropic(body.tool_choice, body.parallel_tool_calls)
   if (toolChoice !== undefined) output.tool_choice = toolChoice
+  applyResponsesReasoningToAnthropic(body, output, model)
   return omitUndefined(output)
 }
 
@@ -792,14 +1620,20 @@ function anthropicRequestToResponses(body: JsonObject, model: string): JsonObjec
       ? [{ type: 'text', text: message.content }]
       : arrayOfObjects(message.content)
     if (role === 'assistant') {
-      const textParts: string[] = []
-      const toolUses: JsonObject[] = []
+      let textContent: JsonObject[] = []
+      const flushText = (): void => {
+        if (textContent.length === 0) return
+        input.push({ type: 'message', role: 'assistant', content: textContent })
+        textContent = []
+      }
       for (const block of blocks) {
         const type = stringValue(block.type)
         if (type === 'text') {
-          textParts.push(stringValue(block.text))
+          const text = stringValue(block.text)
+          if (text) textContent.push({ type: 'output_text', text })
         } else if (type === 'tool_use') {
-          toolUses.push({
+          flushText()
+          input.push({
             type: 'function_call',
             call_id: stringValue(block.id),
             name: stringValue(block.name),
@@ -807,9 +1641,7 @@ function anthropicRequestToResponses(body: JsonObject, model: string): JsonObjec
           })
         }
       }
-      const text = textParts.join('')
-      if (text) input.push({ type: 'message', role: 'assistant', content: [{ type: 'output_text', text }] })
-      input.push(...toolUses)
+      flushText()
       continue
     }
 
@@ -859,7 +1691,78 @@ function anthropicRequestToResponses(body: JsonObject, model: string): JsonObjec
   if (tools.length > 0) output.tools = tools
   const toolChoice = anthropicToolChoiceToResponses(body.tool_choice)
   if (toolChoice !== undefined) output.tool_choice = toolChoice
+  applyAnthropicReasoningToResponses(body, output)
   return omitUndefined(output)
+}
+
+function applyResponsesReasoningToAnthropic(body: JsonObject, output: JsonObject, model: string): void {
+  const effort = normalizeReasoningEffort(objectValue(body.reasoning)?.effort)
+  if (!effort) return
+  const family = claudeThinkingFamily(model)
+  if (family === 'adaptive') {
+    output.thinking = { type: 'adaptive', display: 'omitted' }
+    output.output_config = { effort: claudeAdaptiveEffort(effort, model) }
+    delete output.temperature
+    return
+  }
+  if (family !== 'legacy') return
+  const maxTokens = numberValue(output.max_tokens)
+  if (maxTokens === undefined || maxTokens <= 1_024) return
+  const requestedBudget = effort === 'low' ? 1_024
+    : effort === 'medium' ? 4_096
+      : effort === 'high' ? 8_192
+        : effort === 'xhigh' ? 16_384 : 32_768
+  output.thinking = {
+    type: 'enabled',
+    budget_tokens: Math.min(requestedBudget, maxTokens - 1),
+    display: 'omitted'
+  }
+  delete output.temperature
+}
+
+function applyAnthropicReasoningToResponses(body: JsonObject, output: JsonObject): void {
+  const thinking = objectValue(body.thinking)
+  const thinkingType = stringValue(thinking?.type).trim().toLowerCase()
+  const configuredEffort = normalizeReasoningEffort(objectValue(body.output_config)?.effort)
+  if (configuredEffort) {
+    output.reasoning = { effort: configuredEffort }
+    return
+  }
+  if (thinkingType === 'adaptive' || thinkingType === 'enabled') output.reasoning = { effort: 'high' }
+}
+
+type NormalizedReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+
+function normalizeReasoningEffort(value: unknown): NormalizedReasoningEffort | undefined {
+  const effort = stringValue(value).trim().toLowerCase()
+  if (effort === 'minimal' || effort === 'low') return 'low'
+  if (effort === 'medium' || effort === 'high' || effort === 'xhigh' || effort === 'max') return effort
+  return undefined
+}
+
+function claudeThinkingFamily(model: string): 'adaptive' | 'legacy' | undefined {
+  const normalized = model.trim().toLowerCase()
+  if (!normalized.includes('claude')) return undefined
+  if (/mythos(?:[-_. ]preview)?/.test(normalized)) return 'adaptive'
+  const familyFirst = normalized.match(/(?:opus|sonnet|haiku|fable|mythos)[-_. ]+(\d+)(?:[-_. ]+(\d+))?/)
+  const versionFirst = normalized.match(/claude[-_. ]+(\d+)(?:[-_. ]+(\d+))?[-_. ]+(?:opus|sonnet|haiku|fable|mythos)/)
+  const version = versionFirst ?? familyFirst
+  if (!version) return undefined
+  const major = Number(version[1])
+  const parsedMinor = Number(version[2] ?? 0)
+  // Older Anthropic IDs put a release date immediately after the major
+  // version (for example claude-opus-4-20250514); it is not model 4.20M.
+  const minor = parsedMinor >= 1_000 ? 0 : parsedMinor
+  if (major >= 5) return 'adaptive'
+  if (major === 4 && minor >= 6 && /(?:opus|sonnet)/.test(normalized)) return 'adaptive'
+  return 'legacy'
+}
+
+function claudeAdaptiveEffort(effort: NormalizedReasoningEffort, model: string): NormalizedReasoningEffort {
+  if (effort !== 'xhigh') return effort
+  const normalized = model.trim().toLowerCase()
+  const supportsXhigh = /(?:opus[-_. ]+4[-_. ]+(?:7|8)|claude[-_. ]+4[-_. ]+(?:7|8)[-_. ]+opus|sonnet[-_. ]+5|claude[-_. ]+5[-_. ]+sonnet|fable[-_. ]+5|mythos)/.test(normalized)
+  return supportsXhigh ? 'xhigh' : 'high'
 }
 
 /** Direct Responses -> Gemini conversion. */
@@ -1072,24 +1975,23 @@ function anthropicRequestToGemini(body: JsonObject): JsonObject {
         if (message.content) parts.push({ text: message.content })
       } else {
         const blocks = arrayOfObjects(message.content)
-        const textParts: string[] = []
         for (const block of blocks) {
-          if (stringValue(block.type) === 'text') textParts.push(stringValue(block.text))
-        }
-        const text = textParts.join('')
-        if (text) parts.push({ text })
-        for (const block of blocks) {
-          if (stringValue(block.type) !== 'tool_use') continue
-          const id = stringValue(block.id)
-          const name = stringValue(block.name)
-          if (id) callNames.set(id, name)
-          parts.push({
-            functionCall: omitUndefined({
-              id: optionalString(id),
-              name,
-              args: parseJsonObject(block.input, 'Anthropic tool_use.input')
+          const type = stringValue(block.type)
+          if (type === 'text') {
+            const text = stringValue(block.text)
+            if (text) parts.push({ text })
+          } else if (type === 'tool_use') {
+            const id = stringValue(block.id)
+            const name = stringValue(block.name)
+            if (id) callNames.set(id, name)
+            parts.push({
+              functionCall: omitUndefined({
+                id: optionalString(id),
+                name,
+                args: parseJsonObject(block.input, 'Anthropic tool_use.input')
+              })
             })
-          })
+          }
         }
       }
       if (parts.length === 0) parts.push({ text: '' })
@@ -1497,12 +2399,18 @@ function responsesResponseToChat(body: JsonObject, fallbackModel: string, now: (
   }
 }
 
-function chatResponseToResponses(body: JsonObject, fallbackModel: string, now: () => number): JsonObject {
+function chatResponseToResponses(
+  body: JsonObject,
+  fallbackModel: string,
+  now: () => number,
+  context?: ProtocolConversionContext
+): JsonObject {
   const choice = objectValue(arrayValue(body.choices)[0]) ?? {}
   const message = objectValue(choice.message) ?? {}
   const timestamp = now()
   const responseId = stringValue(body.id, timestamp.toString())
   const toolCalls = arrayOfObjects(message.tool_calls)
+  validateXaiResponseCallIds(toolCalls, context, 'choices[0].message.tool_calls')
   const completion = responsesStatusFields(chatCompletionReason(
     stringValue(choice.finish_reason),
     toolCalls.length > 0
@@ -1516,21 +2424,52 @@ function chatResponseToResponses(body: JsonObject, fallbackModel: string, now: (
   }
   for (const toolCall of toolCalls) {
     const functionValue = objectValue(toolCall.function) ?? {}
-    output.push({
-      type: 'function_call',
-      id: stringValue(toolCall.id),
-      call_id: stringValue(toolCall.id),
-      name: stringValue(functionValue.name),
-      arguments: stringValue(functionValue.arguments, '{}'),
-      status: completion.status
-    })
+    const wireName = stringValue(functionValue.name)
+    const binding = findXaiToolByWire(context, wireName)
+    if (context?.dialect === 'xai-grok' && !binding) {
+      throw new InvalidToolBridgeError('choices[0].message.tool_calls[].function.name', `unknown tool alias ${wireName || '<empty>'}`)
+    }
+    const callId = stringValue(toolCall.id)
+    if (!callId) throw new InvalidToolBridgeError('choices[0].message.tool_calls[].id', 'tool call id is required')
+    if (binding?.sourceType === 'custom') {
+      output.push({
+        type: 'custom_tool_call',
+        id: callId,
+        call_id: callId,
+        name: binding.sourceName,
+        input: parseXaiCustomWrapper(functionValue.arguments, 'choices[0].message.tool_calls[].function.arguments'),
+        status: completion.status
+      })
+      rememberXaiChatCall(context, callId, binding)
+    } else {
+      output.push({
+        type: 'function_call',
+        id: callId,
+        call_id: callId,
+        name: binding?.sourceName ?? wireName,
+        arguments: stringValue(functionValue.arguments, '{}'),
+        status: completion.status
+      })
+      if (binding) rememberXaiChatCall(context, callId, binding)
+    }
   }
   if (output.length === 0) {
     output.push({ id: `msg_${responseId}`, type: 'message', role: 'assistant', status: completion.status, content })
   }
   const usage = objectValue(body.usage)
-  const inputTokens = numberValue(usage?.prompt_tokens) ?? 0
-  const outputTokens = numberValue(usage?.completion_tokens) ?? 0
+  const inputTokens = numberValue(usage?.prompt_tokens)
+  const outputTokens = numberValue(usage?.completion_tokens)
+  const usageDetails: JsonObject = {}
+  const cachedTokens = numberValue(objectValue(usage?.prompt_tokens_details)?.cached_tokens)
+  const reasoningTokens = numberValue(objectValue(usage?.completion_tokens_details)?.reasoning_tokens)
+  if (cachedTokens !== undefined) usageDetails.input_tokens_details = { cached_tokens: cachedTokens }
+  if (reasoningTokens !== undefined) usageDetails.output_tokens_details = { reasoning_tokens: reasoningTokens }
+  const responseUsage = omitUndefined({
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    total_tokens: numberValue(usage?.total_tokens) ?? (inputTokens !== undefined && outputTokens !== undefined ? inputTokens + outputTokens : undefined),
+    ...usageDetails
+  })
   return {
     id: `resp_${responseId}`,
     object: 'response',
@@ -1538,7 +2477,7 @@ function chatResponseToResponses(body: JsonObject, fallbackModel: string, now: (
     ...completion,
     model: stringValue(body.model, fallbackModel),
     output,
-    usage: { input_tokens: inputTokens, output_tokens: outputTokens, total_tokens: inputTokens + outputTokens }
+    ...(Object.keys(responseUsage).length > 0 ? { usage: responseUsage } : {})
   }
 }
 
@@ -1591,15 +2530,17 @@ function anthropicResponseToResponses(
   const intermediateId = stringValue(body.id, `chatcmpl_${timestamp}`)
   const completion = responsesStatusFields(anthropicCompletionReason(stringValue(body.stop_reason)))
   const contentBlocks = arrayOfObjects(body.content)
-  const textParts: string[] = []
   const output: JsonObject[] = []
-  for (const block of contentBlocks) {
-    if (stringValue(block.type) === 'text') textParts.push(stringValue(block.text))
-  }
-  const text = textParts.join('')
-  if (text) {
+  let textParts: string[] = []
+  let messageIndex = 0
+  const flushText = (): void => {
+    const text = textParts.join('')
+    textParts = []
+    if (!text) return
+    const id = messageIndex === 0 ? `msg_${intermediateId}` : `msg_${intermediateId}_${messageIndex}`
+    messageIndex += 1
     output.push({
-      id: `msg_${intermediateId}`,
+      id,
       type: 'message',
       role: 'assistant',
       status: completion.status,
@@ -1607,7 +2548,12 @@ function anthropicResponseToResponses(
     })
   }
   for (const block of contentBlocks) {
+    if (stringValue(block.type) === 'text') {
+      textParts.push(stringValue(block.text))
+      continue
+    }
     if (stringValue(block.type) !== 'tool_use') continue
+    flushText()
     const id = stringValue(block.id)
     output.push({
       type: 'function_call',
@@ -1618,6 +2564,7 @@ function anthropicResponseToResponses(
       status: completion.status
     })
   }
+  flushText()
   if (output.length === 0) {
     output.push({
       id: `msg_${intermediateId}`,
@@ -1628,8 +2575,12 @@ function anthropicResponseToResponses(
     })
   }
   const usage = objectValue(body.usage)
-  const inputTokens = numberValue(usage?.input_tokens) ?? 0
+  const uncachedInputTokens = numberValue(usage?.input_tokens) ?? 0
+  const cachedInputTokens = numberValue(usage?.cache_read_input_tokens) ?? 0
+  const cacheCreationInputTokens = numberValue(usage?.cache_creation_input_tokens) ?? 0
+  const inputTokens = uncachedInputTokens + cachedInputTokens + cacheCreationInputTokens
   const outputTokens = numberValue(usage?.output_tokens) ?? 0
+  const reasoningTokens = numberValue(objectValue(usage?.output_tokens_details)?.thinking_tokens)
   return {
     id: `resp_${intermediateId}`,
     object: 'response',
@@ -1637,7 +2588,13 @@ function anthropicResponseToResponses(
     ...completion,
     model: stringValue(body.model, fallbackModel),
     output,
-    usage: { input_tokens: inputTokens, output_tokens: outputTokens, total_tokens: inputTokens + outputTokens }
+    usage: omitUndefined({
+      input_tokens: inputTokens,
+      output_tokens: outputTokens,
+      total_tokens: inputTokens + outputTokens,
+      input_tokens_details: cachedInputTokens > 0 ? { cached_tokens: cachedInputTokens } : undefined,
+      output_tokens_details: reasoningTokens === undefined ? undefined : { reasoning_tokens: reasoningTokens }
+    })
   }
 }
 
@@ -1982,12 +2939,31 @@ function chatToolContentToAnthropic(value: unknown): unknown {
   return jsonString(value ?? '')
 }
 
-function responsesFunctionCallToChat(item: JsonObject): JsonObject {
+function responsesFunctionCallToChat(item: JsonObject, context?: ProtocolConversionContext): JsonObject {
+  const sourceType = stringValue(item.type) === 'custom_tool_call' ? 'custom' : 'function'
+  const sourceName = stringValue(item.name)
+  const binding = sourceType === 'custom' ? findXaiTool(context, 'custom', sourceName) : findXaiTool(context, 'function', sourceName)
+  if (context?.dialect === 'xai-grok' && sourceType === 'custom' && !binding) {
+    throw new InvalidToolBridgeError('input[].name', `custom tool ${sourceName || '<empty>'} was not declared`)
+  }
+  const name = binding?.wireName ?? sourceName
+  if (!name || name.length > 64) throw new InvalidToolBridgeError('input[].name', 'tool name is empty or too long')
+  if (sourceType === 'custom') {
+    const input = typeof item.input === 'string' ? item.input : stringValue(item.input)
+    return {
+      id: stringValue(item.call_id, stringValue(item.id)),
+      type: 'function',
+      function: {
+        name,
+        arguments: JSON.stringify({ input })
+      }
+    }
+  }
   return {
     id: stringValue(item.call_id, stringValue(item.id)),
     type: 'function',
     function: {
-      name: stringValue(item.name),
+      name,
       arguments: typeof item.arguments === 'string' ? item.arguments : jsonString(item.arguments ?? {})
     }
   }
@@ -2095,12 +3071,68 @@ function chatMessageToolCalls(message: JsonObject): JsonObject[] {
   return arrayOfObjects(message.tool_calls)
 }
 
-function chatFunctionCallToResponses(toolCall: JsonObject): JsonObject {
+function chatFunctionCallToResponses(toolCall: JsonObject, context?: ProtocolConversionContext): JsonObject {
   const definition = objectValue(toolCall.function) ?? {}
+  const wireName = stringValue(definition.name)
+  const callId = stringValue(toolCall.id)
+  const historicalCall = callId ? findXaiCall(context, callId) : undefined
+  const historicalBinding = historicalCall?.wireName === wireName
+    ? context?.toolBridgePlan?.tools.find((candidate) => candidate.declared === false
+      && candidate.wireName === wireName
+      && candidate.sourceType === historicalCall.sourceType
+      && candidate.sourceName === historicalCall.sourceName)
+    : undefined
+  const binding = findXaiToolByWire(context, wireName) ?? historicalBinding
+  if (context?.dialect === 'xai-grok' && !binding) {
+    throw new InvalidToolBridgeError('messages[].tool_calls[].function.name', `unknown tool alias ${wireName || '<empty>'}`)
+  }
+  if (binding?.sourceType === 'custom') {
+    if (!callId) throw new InvalidToolBridgeError('messages[].tool_calls[].id', 'tool call id is required')
+    const input = parseXaiCustomWrapper(definition.arguments, 'messages[].tool_calls[].function.arguments')
+    rememberXaiChatCall(context, callId, binding)
+    return {
+      type: 'custom_tool_call',
+      call_id: callId,
+      name: binding.sourceName,
+      input
+    }
+  }
   return {
     type: 'function_call',
-    call_id: stringValue(toolCall.id),
-    name: stringValue(definition.name),
+    call_id: callId,
+    name: binding?.sourceName ?? wireName,
+    ...(binding?.sourceNamespace ? { namespace: binding.sourceNamespace } : {}),
+    arguments: typeof definition.arguments === 'string'
+      ? definition.arguments
+      : jsonString(definition.arguments ?? {})
+  }
+}
+
+function chatFunctionCallToXaiResponsesWire(
+  toolCall: JsonObject,
+  context?: ProtocolConversionContext
+): JsonObject {
+  const definition = objectValue(toolCall.function) ?? {}
+  const wireName = stringValue(definition.name)
+  const callId = stringValue(toolCall.id)
+  const historicalCall = callId ? findXaiCall(context, callId) : undefined
+  const declaredBinding = findXaiToolByWire(context, wireName)
+  const historicalBinding = historicalCall?.wireName === wireName
+    ? context?.toolBridgePlan?.tools.find((candidate) => candidate.declared === false
+      && candidate.wireName === wireName
+      && candidate.sourceType === historicalCall.sourceType
+      && candidate.sourceName === historicalCall.sourceName)
+    : undefined
+  const binding = declaredBinding ?? historicalBinding
+  if (!binding) {
+    throw new InvalidToolBridgeError('messages[].tool_calls[].function.name', `unknown tool alias ${wireName || '<empty>'}`)
+  }
+  if (!callId) throw new InvalidToolBridgeError('messages[].tool_calls[].id', 'tool call id is required')
+  rememberXaiChatCall(context, callId, binding)
+  return {
+    type: 'function_call',
+    call_id: callId,
+    name: binding.wireName,
     arguments: typeof definition.arguments === 'string'
       ? definition.arguments
       : jsonString(definition.arguments ?? {})
@@ -2141,7 +3173,8 @@ function anthropicToolsToChat(value: unknown): JsonObject[] {
       function: omitUndefined({
         name,
         description: optionalString(tool.description),
-        parameters: objectValue(tool.input_schema) ?? { type: 'object', properties: {} }
+        parameters: objectValue(tool.input_schema) ?? { type: 'object', properties: {} },
+        strict: booleanValue(tool.strict)
       })
     })
   }
@@ -2167,6 +3200,38 @@ function responsesToolsToChat(value: unknown): JsonObject[] {
   return tools
 }
 
+function xaiResponsesToolsToChat(value: unknown, context: ProtocolConversionContext): JsonObject[] {
+  const plan = context.toolBridgePlan
+  if (!plan) throw new InvalidToolBridgeError('tools', 'conversion plan is missing')
+  const tools: JsonObject[] = []
+  for (const binding of plan.tools.filter((candidate) => candidate.declared !== false)) {
+    if (binding.sourceType === 'function') {
+      const sourceName = binding.sourceNamespace ? binding.wireName : binding.sourceName
+      const source = arrayOfObjects(value).find((tool) => stringValue(tool.type) === 'function' && stringValue(tool.name) === sourceName)
+      const definition = source ?? {}
+      tools.push({ type: 'function', function: omitUndefined({
+        name: binding.wireName,
+        description: optionalString(definition.description),
+        parameters: objectValue(definition.parameters) ?? { type: 'object', properties: {} },
+        strict: booleanValue(definition.strict)
+      }) })
+      continue
+    }
+    const source = arrayOfObjects(value).find((tool) => stringValue(tool.type) === 'custom' && stringValue(tool.name) === binding.sourceName)
+    tools.push({ type: 'function', function: omitUndefined({
+      name: binding.wireName,
+      description: [optionalString(source?.description), 'The argument must be a JSON object with one string property named input.'].filter(Boolean).join(' '),
+      parameters: {
+        type: 'object',
+        properties: { input: { type: 'string' } },
+        required: ['input'],
+        additionalProperties: false
+      }
+    }) })
+  }
+  return tools
+}
+
 function responsesToolsToAnthropic(value: unknown): JsonObject[] {
   const tools: JsonObject[] = []
   for (const tool of arrayOfObjects(value)) {
@@ -2176,7 +3241,8 @@ function responsesToolsToAnthropic(value: unknown): JsonObject[] {
     tools.push(omitUndefined({
       name,
       description: optionalString(tool.description),
-      input_schema: objectValue(tool.parameters) ?? { type: 'object', properties: {} }
+      input_schema: objectValue(tool.parameters) ?? { type: 'object', properties: {} },
+      strict: booleanValue(tool.strict)
     }))
   }
   return tools
@@ -2191,7 +3257,8 @@ function anthropicToolsToResponses(value: unknown): JsonObject[] {
       type: 'function',
       name,
       description: optionalString(tool.description),
-      parameters: objectValue(tool.input_schema) ?? { type: 'object', properties: {} }
+      parameters: objectValue(tool.input_schema) ?? { type: 'object', properties: {} },
+      strict: booleanValue(tool.strict)
     }))
   }
   return tools
@@ -2269,7 +3336,8 @@ function chatToolsToAnthropic(value: unknown): JsonObject[] {
     tools.push(omitUndefined({
       name,
       description: optionalString(definition.description),
-      input_schema: objectValue(definition.parameters) ?? { type: 'object', properties: {} }
+      input_schema: objectValue(definition.parameters) ?? { type: 'object', properties: {} },
+      strict: booleanValue(definition.strict)
     }))
   }
   return tools
@@ -2291,6 +3359,29 @@ function chatToolsToResponses(value: unknown): JsonObject[] {
     }))
   }
   return tools
+}
+
+function xaiChatToolsToResponses(value: unknown, context: ProtocolConversionContext): JsonObject[] {
+  const plan = context.toolBridgePlan
+  if (!plan) throw new InvalidToolBridgeError('tools', 'conversion plan is missing')
+  const sourceTools = arrayOfObjects(value)
+  return plan.tools.filter((binding) => binding.declared !== false).map((binding) => {
+    const wire = sourceTools.find((tool) => {
+      const definition = objectValue(tool.function)
+      return stringValue(tool.type) === 'function' && stringValue(definition?.name) === binding.wireName
+    })
+    const definition = objectValue(wire?.function) ?? {}
+    if (binding.sourceType === 'custom') {
+      return { type: 'custom', name: binding.sourceName, description: optionalString(definition.description) }
+    }
+    return omitUndefined({
+      type: 'function',
+      name: binding.sourceName,
+      description: optionalString(definition.description),
+      parameters: objectValue(definition.parameters) ?? { type: 'object', properties: {} },
+      strict: booleanValue(definition.strict)
+    })
+  })
 }
 
 function anthropicToolChoiceToChat(value: unknown): unknown {
@@ -2317,6 +3408,18 @@ function responsesToolChoiceToChat(value: unknown): unknown {
   const choice = objectValue(value)
   if (stringValue(choice?.type) === 'function' && optionalString(choice?.name)) {
     return { type: 'function', function: { name: stringValue(choice?.name) } }
+  }
+  return undefined
+}
+
+function xaiResponsesToolChoiceToChat(value: unknown, context: ProtocolConversionContext): unknown {
+  if (typeof value === 'string') return value === 'auto' || value === 'required' || value === 'none' ? value : undefined
+  const choice = objectValue(value)
+  const type = stringValue(choice?.type)
+  if ((type === 'function' || type === 'custom') && optionalString(choice?.name)) {
+    const binding = findXaiTool(context, type === 'custom' ? 'custom' : 'function', stringValue(choice?.name))
+    if (!binding || binding.declared === false) throw new InvalidToolBridgeError('tool_choice.name', `unknown tool ${stringValue(choice?.name)}`)
+    return { type: 'function', function: { name: binding.wireName } }
   }
   return undefined
 }
@@ -2455,6 +3558,16 @@ function chatToolChoiceToResponses(value: unknown): unknown {
     return { type: 'function', name: stringValue(definition?.name) }
   }
   return undefined
+}
+
+function xaiChatToolChoiceToResponses(value: unknown, context: ProtocolConversionContext): unknown {
+  if (typeof value === 'string') return value === 'auto' || value === 'required' || value === 'none' ? value : undefined
+  const choice = objectValue(value)
+  const definition = objectValue(choice?.function)
+  if (stringValue(choice?.type) !== 'function' || !optionalString(definition?.name)) return undefined
+  const binding = findXaiToolByWire(context, stringValue(definition?.name))
+  if (!binding) throw new InvalidToolBridgeError('tool_choice.function.name', `unknown tool alias ${stringValue(definition?.name)}`)
+  return { type: binding.sourceType, name: binding.sourceName }
 }
 
 function chatMessageToAnthropicContent(message: JsonObject): JsonObject[] {

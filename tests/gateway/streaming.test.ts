@@ -5,7 +5,8 @@ import {
   createCanonicalStreamParser,
   createOpenAiResponsesStreamCollector,
   createProtocolStreamTransform,
-  type CanonicalStreamEvent
+  type CanonicalStreamEvent,
+  type ToolBridgePlan
 } from '../../src/main/gateway'
 
 const encoder = new TextEncoder()
@@ -67,6 +68,26 @@ const geminiJsonRecording = JSON.stringify([
 ])
 
 describe('canonical streaming protocol conversion', () => {
+  it('maps Anthropic cache/thinking usage without exposing thinking deltas', () => {
+    const parser = createCanonicalStreamParser('anthropic-messages')
+    const wire = [
+      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_thinking","model":"claude-opus-4-8","usage":{"input_tokens":10,"cache_read_input_tokens":30,"cache_creation_input_tokens":20,"cache_creation":{"ephemeral_5m_input_tokens":12,"ephemeral_1h_input_tokens":8},"output_tokens":0}}}\n\n',
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"private thought"}}\n\n',
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":12,"output_tokens_details":{"thinking_tokens":7}}}\n\n',
+      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    ].join('')
+    const events = parser.push(encoder.encode(wire))
+    expect(events).toContainEqual({
+      type: 'usage', inputTokens: 60, outputTokens: 0, totalTokens: 60, cachedInputTokens: 30,
+      cacheCreationInputTokens: 20, cacheCreation5mInputTokens: 12, cacheCreation1hInputTokens: 8,
+    })
+    expect(events).toContainEqual({
+      type: 'usage', inputTokens: 60, outputTokens: 12, totalTokens: 72, cachedInputTokens: 30, reasoningTokens: 7,
+      cacheCreationInputTokens: 20, cacheCreation5mInputTokens: 12, cacheCreation1hInputTokens: 8,
+    })
+    expect(JSON.stringify(events)).not.toContain('private thought')
+  })
+
   it('captures cached input and reasoning token details from Responses usage', () => {
     const parser = createCanonicalStreamParser('openai-responses')
     const events = parser.push(encoder.encode(
@@ -246,6 +267,73 @@ describe('canonical streaming protocol conversion', () => {
     expect(events).not.toContainEqual(expect.objectContaining({ type: 'done' }))
   })
 
+  it('recovers a terminal-only Responses function call', () => {
+    const parser = createCanonicalStreamParser('openai-responses')
+    const events = parser.push(encoder.encode([
+      'event: response.completed',
+      'data: {"type":"response.completed","response":{"id":"resp_terminal_tool","status":"completed","output":[{"id":"fc_terminal","type":"function_call","call_id":"call_terminal","name":"sp_custom_exec","arguments":"{\\"input\\":\\"rg --files\\"}","status":"completed"}]}}',
+      '',
+      '',
+    ].join('\n')))
+    expect(events).toContainEqual({
+      type: 'tool-call-delta', index: 0, id: 'call_terminal', name: 'sp_custom_exec',
+      arguments: '{"input":"rg --files"}',
+    })
+    expect(events).toContainEqual({ type: 'tool-call-complete', index: 0 })
+    expect(events).toContainEqual({ type: 'stop', reason: 'tool_calls' })
+  })
+
+  it('uses a complete Responses arguments snapshot to recover a missing final delta', () => {
+    const parser = createCanonicalStreamParser('openai-responses')
+    const events = parser.push(encoder.encode([
+      'event: response.output_item.added',
+      'data: {"type":"response.output_item.added","output_index":0,"item":{"id":"fc_partial","type":"function_call","call_id":"call_partial","name":"sp_custom_exec","arguments":""}}',
+      '',
+      'event: response.function_call_arguments.delta',
+      'data: {"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\\"input\\":\\"rg "}',
+      '',
+      'event: response.function_call_arguments.done',
+      'data: {"type":"response.function_call_arguments.done","output_index":0,"arguments":"{\\"input\\":\\"rg --files\\"}"}',
+      '',
+      '',
+    ].join('\n')))
+    expect(events).toContainEqual({ type: 'tool-call-delta', index: 0, arguments: '--files"}' })
+    expect(events).toContainEqual({ type: 'tool-call-complete', index: 0 })
+  })
+
+  it('recovers terminal-only Responses text while a tool bridge is active', () => {
+    const parser = createCanonicalStreamParser('openai-responses')
+    const events = parser.push(encoder.encode([
+      'event: response.completed',
+      'data: {"type":"response.completed","response":{"id":"resp_terminal_text","status":"completed","output":[{"id":"msg_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"terminal answer"}]}]}}',
+      '',
+      '',
+    ].join('\n')))
+    expect(events).toContainEqual({ type: 'text-delta', text: 'terminal answer', index: 0, contentType: 'text' })
+    expect(events).toContainEqual({ type: 'message-complete', index: 0 })
+    expect(events).toContainEqual({ type: 'stop', reason: 'stop' })
+  })
+
+  it('deduplicates replayed output-item snapshots and keeps explicit duplicate call ids separate', () => {
+    const parser = createCanonicalStreamParser('openai-responses')
+    const events = parser.push(encoder.encode([
+      'event: response.output_item.added',
+      'data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"duplicate","name":"exec","arguments":"{}"}}',
+      '',
+      'event: response.output_item.added',
+      'data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"duplicate","name":"exec","arguments":"{}"}}',
+      '',
+      'event: response.output_item.added',
+      'data: {"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","call_id":"duplicate","name":"exec","arguments":"{\\"second\\":true}"}}',
+      '',
+      '',
+    ].join('\n')))
+    expect(events.filter((event) => event.type === 'tool-call-delta')).toEqual([
+      { type: 'tool-call-delta', index: 0, id: 'duplicate', name: 'exec', arguments: '{}' },
+      { type: 'tool-call-delta', index: 1, id: 'duplicate', name: 'exec', arguments: '{"second":true}' },
+    ])
+  })
+
   it('marks a completed Responses assistant message before response.completed', () => {
     const parser = createCanonicalStreamParser('openai-responses')
     const events = parser.push(encoder.encode([
@@ -296,6 +384,101 @@ describe('canonical streaming protocol conversion', () => {
     expect(events.at(-2)).toEqual({ type: 'stop', reason: 'stop', rawReason: 'stop' })
     expect(events.at(-1)).toEqual({ type: 'done' })
     expect(events).not.toContainEqual(expect.objectContaining({ type: 'error' }))
+  })
+
+  it('does not let a bare Chat DONE marker turn partial output into success', () => {
+    const recording = [
+      'data: {"id":"chat_done_only","choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}\n\n',
+      'data: [DONE]\n\n'
+    ].join('')
+    const events = parseChunks('openai-chat', byteChunks(recording, 3))
+
+    expect(events).toContainEqual({ type: 'text-delta', text: 'partial' })
+    expect(events.slice(-3)).toEqual([
+      {
+        type: 'error',
+        message: 'Stream ended before a semantic finish reason',
+        errorType: 'incomplete_stream'
+      },
+      { type: 'stop', reason: 'error', rawReason: 'incomplete_stream' },
+      { type: 'done' }
+    ])
+    expect(events).not.toContainEqual(expect.objectContaining({ type: 'stop', reason: 'stop' }))
+  })
+
+  it('consumes only Chat choice index zero without mixing alternate text, tools or stops', () => {
+    const recording = [
+      'data: {"id":"chat_choices","choices":[{"index":1,"delta":{"content":"alternate","tool_calls":[{"index":0,"id":"call_wrong","function":{"name":"wrong_tool","arguments":"{}"}}]},"finish_reason":"tool_calls"},{"index":0,"delta":{"content":"primary"},"finish_reason":null}]}\n\n',
+      'data: {"id":"chat_choices","choices":[{"index":1,"delta":{"content":"ignored-tail"},"finish_reason":"stop"},{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
+      'data: [DONE]\n\n'
+    ].join('')
+    const events = parseChunks('openai-chat', byteChunks(recording, 5))
+
+    expect(events.filter((event) => event.type === 'text-delta')).toEqual([
+      { type: 'text-delta', text: 'primary' }
+    ])
+    expect(events).not.toContainEqual(expect.objectContaining({ type: 'tool-call-delta' }))
+    expect(events.filter((event) => event.type === 'stop')).toEqual([
+      { type: 'stop', reason: 'stop', rawReason: 'stop' }
+    ])
+  })
+
+  it('normalizes a flat Chat SSE error event with its provider classification', () => {
+    const recording = [
+      'event: error\n',
+      'data: {"message":"xAI overloaded","type":"server_error","code":"xai_overloaded"}\n\n'
+    ].join('')
+    const events = parseChunks('openai-chat', byteChunks(recording, 2))
+
+    expect(events).toContainEqual({
+      type: 'error',
+      message: 'xAI overloaded',
+      code: 'xai_overloaded',
+      errorType: 'server_error'
+    })
+    expect(events.at(-1)).toEqual({ type: 'done' })
+  })
+
+  it('preserves a flat xAI data error and its top-level code without an event field', () => {
+    const events = parseChunks(
+      'openai-chat',
+      byteChunks('data: {"error":"capacity exhausted","code":"resource_exhausted"}\n\n', 4)
+    )
+
+    expect(events).toContainEqual({
+      type: 'error',
+      message: 'capacity exhausted',
+      code: 'resource_exhausted'
+    })
+    expect(events.at(-1)).toEqual({ type: 'done' })
+  })
+
+  it('reports Grok reasoning as content-free progress without leaking private fields', () => {
+    const parser = createCanonicalStreamParser('openai-chat', { emitReasoningProgress: true })
+    const privateReasoning = 'private-reasoning-must-not-leak'
+    const privateSignature = 'private-signature-must-not-leak'
+    const events = parser.push(encoder.encode([
+      `data: {"id":"chat_reasoning","choices":[{"index":0,"delta":{"reasoning_content":"${privateReasoning}"},"finish_reason":null}]}\n\n`,
+      `data: {"id":"chat_reasoning","choices":[{"index":0,"delta":{"reasoning_details":[{"type":"reasoning.encrypted","signature":"${privateSignature}"}]},"finish_reason":null}]}\n\n`,
+      'data: {"id":"chat_reasoning","choices":[{"index":0,"delta":{"content":"visible answer"},"finish_reason":"stop"}]}\n\n',
+      'data: [DONE]\n\n'
+    ].join('')))
+
+    expect(events.filter((event) => event.type === 'reasoning-progress')).toEqual([
+      { type: 'reasoning-progress' },
+      { type: 'reasoning-progress' }
+    ])
+    expect(JSON.stringify(events)).not.toContain(privateReasoning)
+    expect(JSON.stringify(events)).not.toContain(privateSignature)
+
+    const responsesEncoder = createCanonicalStreamEncoder('openai-responses', {
+      id: 'resp_reasoning_safe',
+      model: 'grok'
+    })
+    const wire = new TextDecoder().decode(joinBytes(events.flatMap((event) => responsesEncoder.encode(event))))
+    expect(wire).toContain('visible answer')
+    expect(wire).not.toContain(privateReasoning)
+    expect(wire).not.toContain(privateSignature)
   })
 
   it('classifies a payload cut mid-JSON as an incomplete stream', () => {
@@ -391,6 +574,167 @@ describe('canonical streaming protocol conversion', () => {
       { type: 'usage', inputTokens: 10, outputTokens: 6, totalTokens: 16 },
       { type: 'done' }
     ])
+  })
+
+  it('restores an authorized Grok custom wrapper only after the complete input is available', () => {
+    const rawInput = '*** Begin Patch\n+替换 "quoted" value\n*** End Patch'
+    const wrapper = JSON.stringify({ input: rawInput })
+    const plan: ToolBridgePlan = {
+      dialect: 'xai-grok',
+      tools: [{ sourceType: 'custom', sourceName: 'apply_patch', wireName: 'sp_custom_apply_patch', declared: true }],
+      calls: []
+    }
+    const streamEncoder = createCanonicalStreamEncoder('openai-responses', {
+      id: 'resp_custom_bridge', model: 'grok', toolBridgePlan: plan
+    })
+    const early = [
+      ...streamEncoder.encode({
+        type: 'tool-call-delta', index: 0, id: 'call_patch', name: 'sp_custom_', arguments: wrapper.slice(0, 17)
+      }),
+      ...streamEncoder.encode({
+        type: 'tool-call-delta', index: 0, name: 'apply_patch', arguments: wrapper.slice(17)
+      })
+    ]
+    const earlyWire = new TextDecoder().decode(joinBytes(early))
+    expect(earlyWire).not.toContain('custom_tool_call')
+    expect(earlyWire).not.toContain(rawInput)
+
+    const completed = [
+      ...streamEncoder.encode({ type: 'tool-call-complete', index: 0 }),
+      ...streamEncoder.encode({ type: 'stop', reason: 'tool_calls' }),
+      ...streamEncoder.encode({ type: 'done' })
+    ]
+    const wire = new TextDecoder().decode(joinBytes(completed))
+    expect(wire).toContain('event: response.custom_tool_call_input.delta')
+    expect(wire).toContain('event: response.custom_tool_call_input.done')
+    expect(wire).toContain('"type":"custom_tool_call"')
+    expect(wire).toContain('"call_id":"call_patch"')
+    expect(wire).toContain('"name":"apply_patch"')
+    expect(wire).toContain(JSON.stringify(rawInput).slice(1, -1))
+    expect(wire).not.toContain('sp_custom_apply_patch')
+    expect(streamEncoder.getFailure()).toBeUndefined()
+  })
+
+  it('keeps tool-first Responses output indices consistent with the terminal output array', () => {
+    const streamEncoder = createCanonicalStreamEncoder('openai-responses', {
+      id: 'resp_tool_first', model: 'claude-bridge'
+    })
+    const output = [
+      ...streamEncoder.encode({
+        type: 'tool-call-delta', index: 0, id: 'call_lookup', name: 'lookup', arguments: '{"q":"stone"}'
+      }),
+      ...streamEncoder.encode({ type: 'tool-call-complete', index: 0 }),
+      ...streamEncoder.encode({ type: 'text-delta', index: 1, text: 'After the tool.' }),
+      ...streamEncoder.encode({ type: 'message-complete', index: 1 }),
+      ...streamEncoder.encode({ type: 'stop', reason: 'tool_calls' }),
+      ...streamEncoder.encode({ type: 'done' })
+    ]
+    const events = new TextDecoder().decode(joinBytes(output))
+      .split('\n')
+      .filter((line) => line.startsWith('data: '))
+      .map((line) => JSON.parse(line.slice(6)) as Record<string, unknown>)
+    const toolAdded = events.find((event) => event.type === 'response.output_item.added') as {
+      output_index: number; item: { type: string }
+    }
+    const textAdded = events.find((event) => event.type === 'response.content_part.added') as {
+      output_index: number
+    }
+    const completed = events.find((event) => event.type === 'response.completed') as {
+      response: { output: Array<{ type: string }> }
+    }
+
+    expect(toolAdded).toMatchObject({ output_index: 0, item: { type: 'function_call' } })
+    expect(textAdded.output_index).toBe(1)
+    expect(completed.response.output.map((item) => item.type)).toEqual(['function_call', 'message'])
+  })
+
+  it('restores function aliases and de-duplicates repeated complete Chat ids and names', () => {
+    const plan: ToolBridgePlan = {
+      dialect: 'xai-grok',
+      tools: [{ sourceType: 'function', sourceName: 'mcp__weather__lookup', wireName: 'sp_fn_weather', declared: true }],
+      calls: []
+    }
+    const streamEncoder = createCanonicalStreamEncoder('openai-responses', {
+      id: 'resp_function_bridge', model: 'grok', toolBridgePlan: plan
+    })
+    const output = [
+      ...streamEncoder.encode({
+        type: 'tool-call-delta', index: 0, id: 'call_weather', name: 'sp_fn_weather', arguments: '{"city":'
+      }),
+      ...streamEncoder.encode({
+        type: 'tool-call-delta', index: 0, id: 'call_weather', name: 'sp_fn_weather', arguments: '"深圳"}'
+      }),
+      ...streamEncoder.encode({ type: 'tool-call-complete', index: 0 }),
+      ...streamEncoder.encode({ type: 'stop', reason: 'tool_calls' }),
+      ...streamEncoder.encode({ type: 'done' })
+    ]
+    const wire = new TextDecoder().decode(joinBytes(output))
+    expect(wire).toContain('"call_id":"call_weather"')
+    expect(wire).not.toContain('call_weathercall_weather')
+    expect(wire).toContain('"name":"mcp__weather__lookup"')
+    expect(wire).not.toContain('sp_fn_weathersp_fn_weather')
+    expect(wire).toContain('"arguments":"{\\"city\\":\\"深圳\\"}"')
+    expect(streamEncoder.getFailure()).toBeUndefined()
+  })
+
+  it.each([
+    {
+      label: 'an undeclared alias',
+      name: 'server_side_web_search',
+      arguments: '{}',
+      code: 'unknown_tool_alias'
+    },
+    {
+      label: 'a malformed custom wrapper',
+      name: 'sp_custom_exec',
+      arguments: '{"input":7,"extra":true}',
+      code: 'invalid_custom_tool_arguments'
+    }
+  ])('fails closed for $label without exposing a consumable tool item', ({ name, arguments: toolArguments, code }) => {
+    const plan: ToolBridgePlan = {
+      dialect: 'xai-grok',
+      tools: [{ sourceType: 'custom', sourceName: 'exec', wireName: 'sp_custom_exec', declared: true }],
+      calls: []
+    }
+    const streamEncoder = createCanonicalStreamEncoder('openai-responses', {
+      id: 'resp_rejected_bridge', model: 'grok', toolBridgePlan: plan
+    })
+    const output = [
+      ...streamEncoder.encode({
+        type: 'tool-call-delta', index: 0, id: 'call_bad', name, arguments: toolArguments
+      }),
+      ...streamEncoder.encode({ type: 'stop', reason: 'tool_calls' }),
+      ...streamEncoder.encode({ type: 'done' })
+    ]
+    const wire = new TextDecoder().decode(joinBytes(output))
+    expect(wire).toContain('event: error')
+    expect(wire).toContain(`"code":"${code}"`)
+    expect(wire).not.toContain('response.output_item.added')
+    expect(wire).not.toContain('response.completed')
+    expect(streamEncoder.getFailure()).toMatchObject({
+      type: 'error', errorType: 'invalid_tool_bridge', code
+    })
+  })
+
+  it('rejects multiple Grok calls when the originating request disabled parallel tools', () => {
+    const plan: ToolBridgePlan = {
+      dialect: 'xai-grok',
+      tools: [{ sourceType: 'function', sourceName: 'lookup', wireName: 'lookup', declared: true }],
+      calls: [],
+      parallelToolCalls: false
+    }
+    const streamEncoder = createCanonicalStreamEncoder('openai-responses', {
+      id: 'resp_parallel_bridge', model: 'grok', toolBridgePlan: plan
+    })
+    const output = [
+      ...streamEncoder.encode({ type: 'tool-call-delta', index: 0, id: 'call_0', name: 'lookup', arguments: '{}' }),
+      ...streamEncoder.encode({ type: 'tool-call-delta', index: 1, id: 'call_1', name: 'lookup', arguments: '{}' }),
+      ...streamEncoder.encode({ type: 'stop', reason: 'tool_calls' }),
+      ...streamEncoder.encode({ type: 'done' })
+    ]
+    const wire = new TextDecoder().decode(joinBytes(output))
+    expect(wire).toContain('"code":"invalid_tool_bridge"')
+    expect(wire).not.toContain('response.output_item.added')
   })
 
   it('tracks exact Responses terminal metadata across CRLF fragments and event-name fallback', () => {

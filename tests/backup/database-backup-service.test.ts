@@ -252,9 +252,45 @@ describe('DatabaseBackupService', () => {
     expect(result.safetyBackup).toMatchObject({ kind: 'pre-restore', valid: true })
     expect((await service.verifyBackup(result.safetyBackup.id)).integrityCheck).toEqual(['ok'])
 
+    await expect(store.updateGateway(gatewaySettings(16003)))
+      .rejects.toThrow(/read-only after database restore/i)
+    await expect(service.restoreBackup(result.safetyBackup.id))
+      .rejects.toThrow(/restore is already in progress/i)
+
+    await service.close()
+    await store.close()
+    store = new AppStore(directory)
+    await store.initialize()
+    service = createService()
+    await service.initialize()
     const recovered = await service.restoreBackup(result.safetyBackup.id)
     expect(recovered.state.gateway.port).toBe(16002)
     expect(store.getSnapshot().gateway.port).toBe(16002)
+  })
+
+  it('rejects a stale concurrent mutation after the restore maintenance barrier starts', async () => {
+    await store.updateGateway(gatewaySettings(16101))
+    const original = await service.createBackup()
+    await store.updateGateway(gatewaySettings(16102))
+    const repository = store.getStateRepository()
+    const restoreFrom = repository.restoreFrom.bind(repository)
+    let enteredResolve!: () => void
+    let releaseResolve!: () => void
+    const entered = new Promise<void>((resolve) => { enteredResolve = resolve })
+    const release = new Promise<void>((resolve) => { releaseResolve = resolve })
+    vi.spyOn(repository, 'restoreFrom').mockImplementation(async (...args) => {
+      enteredResolve()
+      await release
+      return restoreFrom(...args)
+    })
+
+    const restoring = service.restoreBackup(original.id)
+    await entered
+    await expect(store.updateGateway(gatewaySettings(16103)))
+      .rejects.toThrow(/read-only after database restore/i)
+    releaseResolve()
+    await expect(restoring).resolves.toMatchObject({ state: { gateway: { port: 16101 } } })
+    expect(store.getSnapshot().gateway.port).toBe(16101)
   })
 
   it('rejects a raw restore whose credentials cannot be decrypted by the current vault', async () => {

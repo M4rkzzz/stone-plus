@@ -5,6 +5,8 @@ export { CodexSessionManager } from './session-manager'
 export { WindowsCodexMicroDisabledLauncher } from './codex-micro-launcher'
 export {
   CodexRepairAndRestartService,
+  MacChatGptDesktopController,
+  UnsupportedChatGptDesktopController,
   WindowsChatGptDesktopController,
   type ChatGptDesktopController,
   type CodexRepairAndRestartOptions,

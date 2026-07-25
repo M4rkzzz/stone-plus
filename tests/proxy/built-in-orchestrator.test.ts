@@ -72,20 +72,23 @@ describe('BuiltInProxyOrchestrator', () => {
     expect(harness.core.start).not.toHaveBeenCalled()
   })
 
-  it('blocks a persisted enabled route when auto-start is off until the user retries', async () => {
+  it('restores a normal disabled external route when auto-start is off', async () => {
     const harness = createHarness({ desiredEnabled: true, autoStart: false, hasEverActivated: true })
 
     await harness.orchestrator.initialize()
 
     expect(harness.routes.getSnapshot()).toMatchObject({
-      status: 'error',
-      effectiveRoute: { kind: 'blocked' },
-      error: { category: 'health-check', retryable: true },
+      status: 'disabled',
+      desiredEnabled: false,
+      effectiveRoute: { kind: 'external' },
     })
+    expect(harness.store.settings.desiredEnabled).toBe(false)
     expect(harness.core.start).not.toHaveBeenCalled()
 
-    await harness.orchestrator.retry()
-    expect(harness.routes.getSnapshot()).toMatchObject({ status: 'ready', effectiveRoute: { kind: 'built-in-mixed' } })
+    const profileless = createHarness({ desiredEnabled: true, autoStart: false, withProfile: false })
+    await profileless.orchestrator.initialize()
+    expect(profileless.store.settings.desiredEnabled).toBe(false)
+    expect(profileless.routes.getSnapshot()).toMatchObject({ status: 'disabled', effectiveRoute: { kind: 'external' } })
   })
 
   it('remembers first-run intent without starting or taking over when no profile exists', async () => {
@@ -768,6 +771,41 @@ describe('BuiltInProxyOrchestrator', () => {
     expect(completed).toBe(11)
   })
 
+  it('cancels an unresponsive latency batch before disabling and releasing access', async () => {
+    const harness = createHarness()
+    await harness.orchestrator.setEnabled(true)
+    harness.core.testLatency.mockImplementation(() => new Promise(() => undefined))
+
+    const latency = harness.orchestrator.testLatency('profile-one', ['node-one'])
+    await vi.waitFor(() => expect(harness.core.testLatency).toHaveBeenCalledOnce())
+
+    await harness.orchestrator.setEnabled(false)
+
+    await expect(latency).rejects.toThrow('cancelled')
+    expect(harness.system.release).toHaveBeenCalledOnce()
+    expect(harness.routes.getSnapshot()).toMatchObject({
+      status: 'disabled',
+      effectiveRoute: { kind: 'external' },
+    })
+  })
+
+  it('cancels an unresponsive latency batch before crash cleanup', async () => {
+    const harness = createHarness()
+    await harness.orchestrator.setEnabled(true)
+    harness.core.testLatency.mockImplementation(() => new Promise(() => undefined))
+
+    const latency = harness.orchestrator.testLatency('profile-one', ['node-one'])
+    await vi.waitFor(() => expect(harness.core.testLatency).toHaveBeenCalledOnce())
+    harness.coreControl.crash()
+
+    await expect(latency).rejects.toThrow('cancelled')
+    await vi.waitFor(() => expect(harness.system.release).toHaveBeenCalledOnce())
+    expect(harness.routes.getSnapshot()).toMatchObject({
+      status: 'error',
+      effectiveRoute: { kind: 'blocked' },
+    })
+  })
+
   it('writes first-activation metadata only after the verified route is atomically ready', async () => {
     const harness = createHarness()
     const persistActivation = harness.store.markBuiltInProxyActivated.bind(harness.store)
@@ -1280,6 +1318,7 @@ function fakeTunController(events: string[]) {
     retryStart: vi.fn(async () => ({ status: 'ready' as const, desiredEnabled: true })),
     stop: vi.fn(async () => { events.push('tun:stop'); status = 'stopped'; bypass = undefined; session = undefined; return { status: 'stopped' as const, desiredEnabled: false } }),
     retryStop: vi.fn(async () => ({ status: 'stopped' as const, desiredEnabled: false })),
+    recoverStale: vi.fn(async () => undefined),
     onEvent: vi.fn((listener: (event: unknown) => void) => {
       listeners.add(listener)
       return () => listeners.delete(listener)

@@ -77,6 +77,11 @@ describe('client configuration field catalog', () => {
       'codex.discovered.future_option': 'keep',
       'codex.discovered.features/parallel': true,
     })
+    expect(clientConfigEditorFields('codex', existing)
+      .find((field) => field.id === 'codex.reasoningEffort')?.options
+      ?.map((option) => option.value)).toEqual([
+        'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'
+      ])
 
     const patched = applyClientConfigFieldPatches('codex', existing, [
       { id: 'codex.model', value: 'gpt-updated' },

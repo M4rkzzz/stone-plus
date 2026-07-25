@@ -4,6 +4,7 @@ import {
   googleAdapter,
   openAIAdapter,
   openAICompatibleAdapter,
+  xAIAdapter,
   probeChatGptCodexModel,
   probeProviderModel
 } from '../../src/main/providers'
@@ -24,6 +25,14 @@ describe('provider model probes', () => {
       protocol: 'openai-chat' as const,
       baseUrl: 'https://chat.example/v1',
       endpoint: 'https://chat.example/v1/chat/completions',
+      payload: { choices: [{ message: { role: 'assistant', content: 'OK' } }] }
+    },
+    {
+      name: 'official xAI Chat',
+      adapter: xAIAdapter,
+      protocol: 'openai-chat' as const,
+      baseUrl: 'https://api.x.ai/v1',
+      endpoint: 'https://api.x.ai/v1/chat/completions',
       payload: { choices: [{ message: { role: 'assistant', content: 'OK' } }] }
     },
     {
@@ -66,6 +75,7 @@ describe('provider model probes', () => {
     const [url, init] = fetchImplementation.mock.calls[0]
     expect(String(url)).toBe(endpoint)
     expect(init?.method).toBe('POST')
+    expect(init?.redirect).toBe(adapter.kind === 'xai' ? 'error' : undefined)
     const body = JSON.parse(String(init?.body)) as Record<string, unknown>
     if (protocol !== 'gemini') expect(body).toMatchObject({ model: 'test-model' })
     expect(body).not.toMatchObject({ stream: true })

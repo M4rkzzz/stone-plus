@@ -1,15 +1,21 @@
 import { supportsFastServiceTier } from './types'
+import { accountPoolProtocol } from './pool-protocol'
+import { providerSourceFamily } from './source-family'
 import type {
   Account,
   Pool,
   PoolKind,
-  Protocol,
+  PoolProtocol,
   ProviderDefinition,
   PublicAccount,
   UpstreamSourceType,
 } from './types'
 
 type RouteSourceAccount = Pick<Account, 'id' | 'providerId' | 'credentialType' | 'status' | 'updatedAt'>
+type RouteSourceModelAccount = RouteSourceAccount & Pick<
+  Account,
+  'modelPolicy' | 'modelAllowlist' | 'availableModels' | 'modelsRefreshedAt'
+>
 
 export type RouteSourceKind = PoolKind | Exclude<UpstreamSourceType, 'oauth-system'>
 
@@ -17,7 +23,7 @@ export interface RouteSourceSummary {
   id: string
   name: string
   kind: RouteSourceKind
-  protocol: Protocol
+  protocol: PoolProtocol
   accountCount: number
 }
 
@@ -77,11 +83,12 @@ export function resolveRouteSource<TAccount extends RouteSourceAccount>(
   const providerAccounts = collections.accounts.filter((account) => account.providerId === provider.id)
   if (providerAccounts.length !== 1 || providerAccounts[0].credentialType !== 'api-key') return undefined
   const account = providerAccounts[0]
+  const logicalProtocol = accountPoolProtocol(account, provider)
   const pool: Pool = {
     id: provider.id,
     name: provider.name,
     kind: 'standard',
-    protocol: provider.protocol,
+    protocol: logicalProtocol,
     strategy: 'priority',
     members: [{ accountId: account.id, enabled: true, order: 0, weight: 1 }],
     modelPolicy: 'all',
@@ -98,7 +105,7 @@ export function resolveRouteSource<TAccount extends RouteSourceAccount>(
       id: provider.id,
       name: provider.name,
       kind: provider.sourceType,
-      protocol: provider.protocol,
+      protocol: logicalProtocol,
       accountCount: 1,
     },
     pool,
@@ -129,6 +136,84 @@ export function listRouteSources<TAccount extends RouteSourceAccount>(
     result.push(resolved.summary)
   }
   return result
+}
+
+/** Effective upstream models exposed by the currently enabled, available
+ * members of one route source. Account selections remain authoritative over a
+ * broader provider catalog. */
+export function enumerateRouteSourceModels<TAccount extends RouteSourceModelAccount>(
+  source: ResolvedRouteSource<TAccount> | undefined,
+  collections: Pick<RouteSourceCollections<TAccount>, 'providers'>,
+): string[] {
+  if (!source) return []
+  const providersById = new Map(collections.providers.map((provider) => [provider.id, provider]))
+  const models: string[] = []
+  for (const account of source.accounts.filter(isAvailableRouteAccount)) {
+    const providerModels = providersById.get(account.providerId)?.models ?? []
+    const catalog = account.modelsRefreshedAt === undefined
+      ? [...providerModels, ...account.modelAllowlist]
+      : account.availableModels
+    const allowed = account.modelPolicy === 'selected'
+      ? new Set(account.modelAllowlist.map((model) => model.trim()).filter(Boolean))
+      : undefined
+    for (const candidate of catalog) {
+      const model = candidate.trim()
+      if (!model || allowed && !allowed.has(model) || models.includes(model)) continue
+      models.push(model)
+    }
+  }
+  if (source.pool.modelPolicy !== 'selected') return models
+  const available = new Set(models)
+  return source.pool.modelAllowlist
+    .map((model) => model.trim())
+    .filter((model, index, all) => Boolean(model) && available.has(model) && all.indexOf(model) === index)
+}
+
+/**
+ * Grok Build is deliberately a Grok-only client. Logical Grok pools and
+ * standalone xAI-compatible relays expose `protocol: grok`; older aggregate
+ * relay records retain their concrete wire protocol, so validate their member
+ * family explicitly instead of treating every Responses relay as Grok.
+ */
+export function isGrokRouteSource<TAccount extends RouteSourceAccount>(
+  source: ResolvedRouteSource<TAccount> | undefined,
+  collections: Pick<RouteSourceCollections<TAccount>, 'providers'>,
+): boolean {
+  if (!source) return false
+  if (source.summary.protocol === 'grok') return true
+  if (source.pool.kind !== 'relay-aggregate' || source.accounts.length === 0) return false
+  const providersById = new Map(collections.providers.map((provider) => [provider.id, provider]))
+  return source.accounts.every((account) => {
+    const provider = providersById.get(account.providerId)
+    return provider?.sourceType === 'relay'
+      && provider.protocol === source.pool.protocol
+      && providerSourceFamily(provider.kind) === 'grok'
+  })
+}
+
+/**
+ * Grok Build speaks the Responses wire protocol natively. It may therefore
+ * bind only to enabled Grok-family members whose providers also speak
+ * OpenAI Responses on the wire; Chat-compatible Grok relays require a bridge
+ * and are intentionally excluded from this native path.
+ */
+export function isNativeGrokRouteSource<TAccount extends RouteSourceAccount>(
+  source: ResolvedRouteSource<TAccount> | undefined,
+  collections: Pick<RouteSourceCollections<TAccount>, 'providers'>,
+): boolean {
+  if (!source) return false
+  const enabledAccountIds = new Set(
+    source.pool.members.filter((member) => member.enabled).map((member) => member.accountId),
+  )
+  if (enabledAccountIds.size === 0) return false
+  const accountsById = new Map(source.accounts.map((account) => [account.id, account]))
+  const providersById = new Map(collections.providers.map((provider) => [provider.id, provider]))
+  return [...enabledAccountIds].every((accountId) => {
+    const account = accountsById.get(accountId)
+    const provider = account ? providersById.get(account.providerId) : undefined
+    return provider?.protocol === 'openai-responses'
+      && providerSourceFamily(provider.kind) === 'grok'
+  })
 }
 
 /** Adds only provider-backed virtual pools that are referenced by a route. */

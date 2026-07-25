@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.9.8
+
+- 新增 Grok OAuth、xAI API Key 与 xAI-compatible 中转支持，引入独立 Grok 号池协议与
+  Grok Build 原生反代端点；完善 Sub2API 凭据导入、刷新令牌轮换保存、Grok Tag、
+  模型目录及 Codex 工具调用桥接。
+- 完善 OpenAI Responses 与 Anthropic Messages 的双向转换，覆盖系统提示、图文输入、
+  函数工具、流式事件、停止原因、reasoning/thinking 及 Token 用量；清理 Claude 客户端
+  中残留的 GPT/xAI 模型覆盖。
+- 重构 Agent 客户端管理，统一 Codex Desktop、Codex CLI、Claude Code、Gemini CLI 和
+  Grok Build 的启停与重启事务，强化 Windows 进程树终止、配置/会话修复、启动就绪确认和失败回滚。
+- 修复 Windows 系统代理接管未实际写入 mixed 地址、系统代理/TUN/LAN 切换竞态、
+  延迟测试失真与节点选择不持久化；核心异常继续 fail-closed，不回退直连。
+- 优化前台高并发下的运行时增量同步、请求记录分页与有界渲染，并修复 Windows 原生
+  titlebar 与主内容区之间的阴影断层。
+- 新增 Grok 4.5 和 Anthropic Claude 系列的标准 API 等价计价，区分 5 分钟/1 小时
+  缓存写入、缓存读取与长上下文阶梯；按路由后的实际上游模型计价并安全迁移可证明的历史账本。
+- 加固 IPC 来源、路由模型映射、OAuth 上游边界、Windows 更新签名指纹与 GitHub Release
+  供应链，继续生成对应源码、SHA-256 和 Artifact Attestation provenance。
+
 ## 0.9.7
 
 - 为 Codex Responses Compact V2 增加按能力自动适配：优先使用支持原生 opaque compact 的来源，

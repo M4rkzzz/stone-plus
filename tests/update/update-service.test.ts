@@ -7,6 +7,13 @@ import {
   UpdateService,
   type UpdatePreferenceStore
 } from '../../src/main/update'
+import {
+  isUntrustedRootStatus,
+  normalizeThumbprint,
+  publisherMatchesSubject,
+  STONEPLUS_RELEASE_CERTIFICATE_SHA1,
+  validateStonePlusWindowsUpdateSignature,
+} from '../../src/main/update/windows-signature'
 
 class FakeUpdater extends EventEmitter {
   autoDownload = true
@@ -20,6 +27,7 @@ class FakeUpdater extends EventEmitter {
   downloadCalls = 0
   quitCalls = 0
   quitArguments: [boolean | undefined, boolean | undefined] | undefined
+  quitError: Error | undefined
   onDownload: (() => void) | undefined
   onQuit: (() => void) | undefined
 
@@ -47,6 +55,7 @@ class FakeUpdater extends EventEmitter {
   quitAndInstall(isSilent?: boolean, isForceRunAfter?: boolean): void {
     this.quitCalls += 1
     this.quitArguments = [isSilent, isForceRunAfter]
+    if (this.quitError) this.emit('error', this.quitError)
     this.onQuit?.()
   }
 }
@@ -294,6 +303,17 @@ describe('UpdateService', () => {
     expect(service.getState().status).toBe('installing')
   })
 
+  it('surfaces a synchronous installer error instead of remaining stuck installing', async () => {
+    const { service, updater } = createHarness()
+    updater.quitError = new Error('installer could not be started')
+    await service.initialize()
+    await service.checkForUpdates()
+    await service.downloadUpdate()
+
+    await expect(service.installUpdate()).rejects.toThrow('在线更新失败')
+    expect(service.getState().status).toBe('error')
+  })
+
   it('absorbs a late updater error after closing', () => {
     const { service, updater } = createHarness()
 
@@ -326,6 +346,51 @@ describe('UpdateService', () => {
       'https://github.com/M4rkzzz/stone-plus/blob/main/THIRD_PARTY_NOTICES.md',
       'https://github.com/M4rkzzz/stone-plus/blob/main/TRADEMARKS.md'
     ])
+  })
+})
+
+describe('Windows update certificate pinning', () => {
+  it('normalizes the published certificate thumbprint', () => {
+    expect(normalizeThumbprint(' faa6 6b58-91f1 acd2 70f2 bd72 3266 3eb7 d0d9 ec3d '))
+      .toBe(STONEPLUS_RELEASE_CERTIFICATE_SHA1)
+  })
+
+  it('matches the expected publisher CN without accepting a different certificate subject', () => {
+    expect(publisherMatchesSubject('StonePlus Open Source Release', 'CN=StonePlus Open Source Release, O=StonePlus Contributors')).toBe(true)
+    expect(publisherMatchesSubject('StonePlus Open Source Release', 'CN=Other Publisher, O=StonePlus Contributors')).toBe(false)
+  })
+
+  it('recognizes localized untrusted-root status messages only', () => {
+    expect(isUntrustedRootStatus('A certificate chain processed, but terminated in a root certificate which is not trusted by the trust provider')).toBe(true)
+    expect(isUntrustedRootStatus('证书链在不受信任的根证书中终止')).toBe(true)
+    expect(isUntrustedRootStatus('The hash does not match')).toBe(false)
+  })
+
+  it('accepts the pinned self-signed release certificate on a clean Windows trust store', () => {
+    expect(validateStonePlusWindowsUpdateSignature(
+      ['StonePlus Open Source Release'],
+      'C:\\Users\\test user\\AppData\\Local\\stone-desktop-updater\\pending\\installer.exe',
+      {
+        Status: 1,
+        StatusMessage: 'A certificate chain processed, but terminated in a root certificate which is not trusted by the trust provider',
+        Path: 'C:\\Users\\test user\\AppData\\Local\\stone-desktop-updater\\pending\\installer.exe',
+        Subject: 'CN=StonePlus Open Source Release, O=StonePlus Contributors',
+        Thumbprint: STONEPLUS_RELEASE_CERTIFICATE_SHA1,
+      },
+    )).toBeNull()
+  })
+
+  it('rejects a different signer even when the publisher CN is copied', () => {
+    expect(validateStonePlusWindowsUpdateSignature(
+      ['StonePlus Open Source Release'],
+      'C:\\update.exe',
+      {
+        Status: 0,
+        Path: 'C:\\update.exe',
+        Subject: 'CN=StonePlus Open Source Release, O=StonePlus Contributors',
+        Thumbprint: '0000000000000000000000000000000000000000',
+      },
+    )).toContain('verification failed')
   })
 })
 
@@ -390,10 +455,13 @@ describe('GitHub release parsing', () => {
 })
 
 describe('automatic update support', () => {
-  it('allows installed Windows and Linux AppImage but not portable, deb, macOS, or development', () => {
+  it('allows only installed Windows and fails closed for unsigned Linux updates', () => {
     expect(determineAutomaticUpdateSupport(true, 'win32', {}).supported).toBe(true)
     expect(determineAutomaticUpdateSupport(true, 'win32', { PORTABLE_EXECUTABLE_FILE: 'Stone.exe' }).supported).toBe(false)
-    expect(determineAutomaticUpdateSupport(true, 'linux', { APPIMAGE: '/tmp/Stone.AppImage' }).supported).toBe(true)
+    expect(determineAutomaticUpdateSupport(true, 'linux', { APPIMAGE: '/tmp/Stone.AppImage' })).toMatchObject({
+      supported: false,
+      reason: expect.stringMatching(/独立发布签名/),
+    })
     expect(determineAutomaticUpdateSupport(true, 'linux', {}).supported).toBe(false)
     expect(determineAutomaticUpdateSupport(true, 'darwin', {}).supported).toBe(false)
     expect(determineAutomaticUpdateSupport(false, 'win32', {}).supported).toBe(false)

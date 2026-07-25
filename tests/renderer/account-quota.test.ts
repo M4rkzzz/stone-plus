@@ -32,6 +32,14 @@ describe('account quota summary', () => {
     ])).toEqual({ percent: 60, accountCount: 2 })
   })
 
+  it('includes known Grok OAuth billing percentages and keeps unknown Grok accounts out of the average', () => {
+    expect(summarizeAccountQuota([
+      { ...baseAccount, credentialType: 'grok-oauth', quotaRemaining: 57.5, quotaUnit: 'percent' },
+      { ...baseAccount, id: 'grok-unknown', credentialType: 'grok-oauth' },
+      { ...baseAccount, id: 'grok-empty', credentialType: 'grok-oauth', quotaRemaining: 0, quotaUnit: 'percent' },
+    ])).toEqual({ percent: 28.75, accountCount: 2 })
+  })
+
   it('derives percentages from standard quota windows and clamps bad upstream values', () => {
     expect(accountRemainingPercent({
       ...baseAccount,

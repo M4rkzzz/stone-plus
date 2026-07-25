@@ -80,6 +80,81 @@ describe('API source state changes', () => {
     }))
   })
 
+  it('accepts xAI-compatible relays on both OpenAI protocols and rejects official or foreign protocols', () => {
+    const state = emptyState()
+    const encrypt = (value: string) => `encrypted:${value}`
+    const created = saveApiSourceDraft(state, relayInput({
+      name: 'Grok relay',
+      kind: 'xai-compatible',
+      protocol: 'openai-responses',
+      credential: 'xai-key',
+      models: ['grok-4']
+    }), encrypt, NOW)
+
+    expect(state.providers[0]).toMatchObject({
+      id: created.providerId,
+      sourceType: 'relay',
+      kind: 'xai-compatible',
+      protocol: 'openai-responses',
+      models: ['grok-4']
+    })
+    expect(state.providers[0].capabilityProfile).toMatchObject({
+      streaming: true,
+      nonStreaming: true,
+      toolCalls: true
+    })
+
+    saveApiSourceDraft(state, relayInput({
+      id: created.sourceId,
+      name: 'Grok relay',
+      kind: 'xai-compatible',
+      protocol: 'openai-chat',
+      credential: ''
+    }), encrypt, NOW + 1)
+    expect(state.providers[0]).toMatchObject({ kind: 'xai-compatible', protocol: 'openai-chat' })
+
+    expect(() => saveApiSourceDraft(emptyState(), sourceInput({
+      sourceType: 'official-api',
+      kind: 'xai-compatible',
+      protocol: 'openai-chat'
+    }), encrypt, NOW)).toThrow(/Official API sources support/)
+    expect(() => saveApiSourceDraft(emptyState(), relayInput({
+      kind: 'xai-compatible',
+      protocol: 'anthropic-messages'
+    }), encrypt, NOW)).toThrow(/does not support/)
+  })
+
+  it('locks official xAI credentials to the native Responses endpoint', () => {
+    const state = emptyState()
+    const saved = saveApiSourceDraft(state, sourceInput({
+      name: 'Grok account',
+      kind: 'xai',
+      baseUrl: 'https://untrusted.example/v1',
+      protocol: 'openai-responses',
+      credential: 'xai-official-key',
+      models: ['grok-4'],
+    }), (value) => `encrypted:${value}`, NOW)
+
+    expect(state.providers[0]).toMatchObject({
+      id: saved.providerId,
+      sourceType: 'official-api',
+      kind: 'xai',
+      baseUrl: 'https://api.x.ai/v1',
+      protocol: 'openai-responses',
+    })
+    expect(state.accounts[0]).toMatchObject({
+      id: saved.accountId,
+      credentialType: 'api-key',
+      maskedCredential: '****-key',
+    })
+    expect(() => saveApiSourceDraft(emptyState(), sourceInput({
+      name: 'Legacy Grok Chat account',
+      kind: 'xai',
+      protocol: 'openai-chat',
+      credential: 'xai-chat-key',
+    }), (value) => `encrypted:${value}`, NOW)).toThrow(/does not support the openai-chat protocol/)
+  })
+
   it('requires a key on create and leaves the state unchanged on failure', () => {
     const state = emptyState()
     const before = structuredClone(state)
@@ -155,7 +230,7 @@ describe('API source state changes', () => {
 
     saveApiSourceDraft(state, relayInput({
       id: created.sourceId,
-      credential: '',
+      credential: 'anthropic-key',
       kind: 'anthropic-compatible',
       protocol: 'anthropic-messages'
     }), encrypt, NOW + 3)
@@ -257,7 +332,7 @@ describe('API source state changes', () => {
       withResponsesCompactMode(relayInput({ credential: 'relay-key' }), 'future-mode'),
       encrypt,
       NOW
-    )).toThrow(/must be legacy, passthrough, or native/)
+    )).toThrow(/must be auto, legacy, passthrough, or native/)
   })
 
   it('clears stale health and discovered models when URL, proxy, protocol, kind, or key changes', () => {
@@ -348,6 +423,27 @@ describe('API source state changes', () => {
     expect((error as SourcePoolCompatibilityError).poolIds).toEqual(['standard-pool'])
     expect(state).toEqual(before)
     expect(encrypt).toHaveBeenCalledTimes(1)
+  })
+
+  it('requires incompatible pool membership to be removed before crossing the relay trust boundary', () => {
+    const state = emptyState()
+    const encrypt = vi.fn((value: string) => `encrypted:${value}`)
+    const created = saveApiSourceDraft(state, sourceInput({
+      sourceType: 'official-api', kind: 'openai', baseUrl: 'https://api.openai.com/v1',
+      protocol: 'openai-responses', credential: 'official-key',
+    }), encrypt, NOW)
+    state.pools.push(standardPool('standard-pool', 'openai-responses', [created.accountId]))
+    const before = structuredClone(state)
+
+    const error = captureError(() => saveApiSourceDraft(state, relayInput({
+      id: created.sourceId,
+      protocol: 'openai-responses',
+      credential: 'relay-key',
+    }), encrypt, NOW + 100))
+
+    expect(error).toBeInstanceOf(SourcePoolCompatibilityError)
+    expect((error as SourcePoolCompatibilityError).poolIds).toEqual(['standard-pool'])
+    expect(state).toEqual(before)
   })
 
   it('locks official vendors to their canonical endpoint and protocol matrix', () => {
@@ -535,6 +631,38 @@ describe('aggregate relay state changes', () => {
       { accountId: responses.accountId, order: 0, weight: 10 },
       { accountId: chat.accountId, order: 1, weight: 10 }
     ]), NOW + 2)).toThrow('aggregate protocol')
+    expect(state).toEqual(before)
+  })
+
+  it('rejects mixed OpenAI and Grok aggregate members atomically', () => {
+    const state = emptyState()
+    const encrypt = (value: string) => `encrypted:${value}`
+    const openai = saveApiSourceDraft(state, relayInput({
+      name: 'OpenAI relay', credential: 'openai-key', kind: 'openai-compatible'
+    }), encrypt, NOW)
+    const grok = saveApiSourceDraft(state, relayInput({
+      name: 'Grok relay', credential: 'grok-key', kind: 'xai-compatible'
+    }), encrypt, NOW + 1)
+    const before = structuredClone(state)
+
+    expect(() => saveAggregateRelayDraft(state, aggregateInput([
+      { accountId: openai.accountId, order: 0, weight: 10 },
+      { accountId: grok.accountId, order: 1, weight: 10 },
+    ]), NOW + 2)).toThrow(/same source family/)
+    expect(state).toEqual(before)
+  })
+
+  it('rejects official API members from aggregate relays atomically', () => {
+    const state = emptyState()
+    const encrypt = (value: string) => `encrypted:${value}`
+    const first = saveApiSourceDraft(state, sourceInput({ name: 'Official one', credential: 'key-one' }), encrypt, NOW)
+    const second = saveApiSourceDraft(state, sourceInput({ name: 'Official two', credential: 'key-two' }), encrypt, NOW + 1)
+    const before = structuredClone(state)
+
+    expect(() => saveAggregateRelayDraft(state, aggregateInput([
+      { accountId: first.accountId, order: 0, weight: 10 },
+      { accountId: second.accountId, order: 1, weight: 10 },
+    ]), NOW + 2)).toThrow(/relay API-key sources/)
     expect(state).toEqual(before)
   })
 })

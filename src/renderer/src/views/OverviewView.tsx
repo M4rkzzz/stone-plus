@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { memo, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Activity,
   ArrowRight,
@@ -29,6 +29,7 @@ import {
   durationLabel,
   formatCompactNumber,
   PageHeader,
+  ProviderAvatar,
   relativeTime,
   RequestStatusBadge,
 } from '../ui'
@@ -39,6 +40,7 @@ const clientNames: Record<RouteClient, string> = {
   claude: 'Claude Code',
   codex: 'Codex',
   gemini: 'Gemini CLI',
+  grokbuild: 'Grok Build',
 }
 
 type TokenRateRange = keyof TokenRateSeries
@@ -53,8 +55,8 @@ const tokenRateRanges: Array<{ id: TokenRateRange; label: readonly [string, stri
 ]
 
 const TOKEN_COST_TOOLTIP_ZH = [
-  '按 OpenAI 2026-07-19 标准 API 价格估算（每 100 万 Token）：',
-  '每条请求均按自身日志中的 model 字符串匹配价格，不使用当前模型统一套价。',
+  '按 2026-07-25 可核验的 OpenAI、xAI 与 Anthropic 标准 API 价格估算（每 100 万 Token）。',
+  '路由发生模型映射时，按实际上游模型计价；旧日志没有上游模型时才使用请求模型。',
   'gpt-5.6 / Sol：输入 $5、缓存读取 $0.5、输出 $30；',
   'Terra：$2.5 / $0.25 / $15；Luna：$1 / $0.1 / $6。',
   'gpt-5.5：$5 / $0.5 / $30；5.5 Pro：$30 / $30 / $180。',
@@ -65,12 +67,15 @@ const TOKEN_COST_TOOLTIP_ZH = [
   '5.6 缓存写入若由上游单独上报则按输入价 1.25 倍计入输入成本；未单独上报时计入普通输入。',
   '5.4、5.4 Pro、5.5、5.5 Pro 单次输入超过 272K Token 时，整次输入价格 2 倍、输出价格 1.5 倍；恰好 272K 不加价。5.6 不套用该规则。',
   'Pro 没有缓存读取折扣，缓存读取按普通输入价格计算。',
-  '未知模型会显示为未计价，不会套用猜测价格。'
+  'Grok 4.5：输入 $2、缓存读取 $0.30、输出 $6；输入达到 200K 时分别为 $4 / $0.60 / $12。',
+  'Claude 缓存依次按 5 分钟写入 / 1 小时写入 / 读取计价：Fable 5、Mythos 5 为 $10 / $12.5 / $20 / $1 / $50；Opus 5、4.8–4.5 为 $5 / $6.25 / $10 / $0.5 / $25；Opus 4.1、4 为 $15 / $18.75 / $30 / $1.5 / $75。',
+  'Sonnet 5 在 2026-08-31 前为 $2 / $2.5 / $4 / $0.2 / $10，2026-09-01 起为 $3 / $3.75 / $6 / $0.3 / $15；Sonnet 4.6–4 使用后一组价格。Haiku 4.5 为 $1 / $1.25 / $2 / $0.1 / $5，Haiku 3.5 为 $0.8 / $1 / $1.6 / $0.08 / $4。',
+  '未知模型或无法证明缓存口径的旧日志会显示为未计价，不会套用猜测价格。这是标准 API 等价估算，不包含中转加价、服务端工具或优先级费用。'
 ].join(' ')
 
 const TOKEN_COST_TOOLTIP_EN = [
-  'Estimated using OpenAI standard API pricing as of 2026-07-19 (per 1 million Tokens):',
-  'Each request is priced using the model string in its own log, rather than applying one current-model price to all requests.',
+  'Estimated from verifiable OpenAI, xAI, and Anthropic standard API pricing as of 2026-07-25 (per 1 million Tokens).',
+  'When a route maps the model, pricing uses the actual upstream model; old logs fall back to the requested model only when no upstream model was recorded.',
   'gpt-5.6 / Sol: $5 input, $0.5 cached input, $30 output;',
   'Terra: $2.5 / $0.25 / $15; Luna: $1 / $0.1 / $6.',
   'gpt-5.5: $5 / $0.5 / $30; 5.5 Pro: $30 / $30 / $180.',
@@ -81,7 +86,10 @@ const TOKEN_COST_TOOLTIP_EN = [
   'Separately reported 5.6 cache writes are priced at 1.25x input; otherwise they count as regular input.',
   'For 5.4, 5.4 Pro, 5.5, and 5.5 Pro requests above 272K input Tokens, all input costs 2x and output costs 1.5x. Exactly 272K is not surcharged. This rule does not apply to 5.6.',
   'Pro models do not receive a cached-input discount.',
-  'Unknown models are shown as unpriced instead of using an estimated price.',
+  'Grok 4.5: $2 input, $0.30 cached input, and $6 output; at 200K input or more, $4 / $0.60 / $12.',
+  'Claude rates are input / 5-minute cache write / 1-hour cache write / cache read / output: Fable 5 and Mythos 5 are $10 / $12.5 / $20 / $1 / $50; Opus 5 and 4.8–4.5 are $5 / $6.25 / $10 / $0.5 / $25; Opus 4.1 and 4 are $15 / $18.75 / $30 / $1.5 / $75.',
+  'Sonnet 5 is $2 / $2.5 / $4 / $0.2 / $10 through 2026-08-31 and $3 / $3.75 / $6 / $0.3 / $15 from 2026-09-01; Sonnet 4.6–4 use the latter rates. Haiku 4.5 is $1 / $1.25 / $2 / $0.1 / $5 and Haiku 3.5 is $0.8 / $1 / $1.6 / $0.08 / $4.',
+  'Unknown models and legacy logs whose cache accounting cannot be proven remain unpriced instead of using guessed rates. This is a standard-API-equivalent estimate and excludes relay markups, server tools, and priority charges.',
 ].join(' ')
 
 function formatUsd(value: number): string {
@@ -91,7 +99,7 @@ function formatUsd(value: number): string {
   return `$${value.toFixed(6)}`
 }
 
-function TokenCostCard({
+const TokenCostCard = memo(function TokenCostCard({
   title,
   cost
 }: {
@@ -149,7 +157,7 @@ function TokenCostCard({
       </footer>}
     </article>
   )
-}
+})
 
 function initialTokenRateRange(): TokenRateRange {
   try {
@@ -187,7 +195,7 @@ function linePath(points: Array<{ x: number; y: number; active: boolean }>): str
     .join(' ')
 }
 
-function TokenRateChart({ points, range }: { points: TokenRatePoint[]; range: TokenRateRange }) {
+const TokenRateChart = memo(function TokenRateChart({ points, range }: { points: TokenRatePoint[]; range: TokenRateRange }) {
   const { t, locale } = useI18n()
   const containerRef = useRef<HTMLDivElement>(null)
   const [width, setWidth] = useState(1000)
@@ -246,7 +254,7 @@ function TokenRateChart({ points, range }: { points: TokenRatePoint[]; range: To
       {!activePoints.length && <div className="token-rate-chart__empty">{t('所选时段暂无可计算的输出数据', 'No calculable output data for the selected period')}</div>}
     </div>
   )
-}
+})
 
 function uptimeLabel(startedAt: number | undefined, language: UiLanguage) {
   if (!startedAt) return '—'
@@ -388,7 +396,7 @@ export function OverviewView({ snapshot, navigate }: { snapshot: AppSnapshot; na
               const source = resolveRouteSource(route.poolId, snapshot)
               return (
                 <div className="route-summary__row" key={route.id}>
-                  <div className={`client-glyph client-glyph--${route.client}`}>{route.client.slice(0, 1).toUpperCase()}</div>
+                  <div className={`client-glyph client-glyph--${route.client}`}>{route.client === 'grokbuild' ? 'X' : route.client.slice(0, 1).toUpperCase()}</div>
                   <div className="route-summary__name">
                     <strong>{clientNames[route.client]}</strong>
                     <span>{source ? setupPoolDisplayName(source.summary.name, t) : t('未选择源', 'No source selected')}</span>
@@ -458,9 +466,7 @@ export function OverviewView({ snapshot, navigate }: { snapshot: AppSnapshot; na
             return (
               <div className="health-strip__item" key={account.id}>
                 <div className="health-strip__top">
-                  <span className="provider-avatar" style={{ '--provider-color': provider?.color ?? '#61736f' } as React.CSSProperties}>
-                    {provider?.name.slice(0, 1) ?? '?'}
-                  </span>
+                  <ProviderAvatar kind={provider?.kind} name={provider?.name} color={provider?.color} />
                   <div><strong>{account.name}</strong><span>{provider?.name}</span></div>
                   <AccountStatusBadge status={account.status} circuitState={account.circuitState} />
                 </div>

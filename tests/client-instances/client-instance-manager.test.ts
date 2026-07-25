@@ -1,11 +1,13 @@
 import { EventEmitter } from 'node:events'
-import { mkdtemp, mkdir, rm, stat, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   ClientInstanceManager,
   clientInstanceNodeSpawnOptions,
+  resolveClientInstanceSpawnInvocation,
+  waitForClientProcessReady,
   type ClientInstanceProcess,
 } from '../../src/main/client-instances'
 
@@ -105,6 +107,54 @@ describe('ClientInstanceManager', () => {
     expect(restarted.initialize()).toEqual([])
   })
 
+  it('does not inherit provider model overrides when launching Claude through Stone+', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'stone-client-instance-claude-env-'))
+    directories.push(root)
+    const executable = join(root, 'claude.exe')
+    const configDirectory = join(root, 'config')
+    await writeFile(executable, '')
+    const spawn = vi.fn(() => new FakeProcess())
+    const manager = new ClientInstanceManager({
+      store: new MemoryMetadata(),
+      processAdapter: { spawn },
+      baseEnvironment: {
+        KEEP_ME: 'yes',
+        ANTHROPIC_MODEL: 'gpt-5.5',
+        ANTHROPIC_DEFAULT_HAIKU_MODEL: 'gpt-5.5',
+        ANTHROPIC_DEFAULT_OPUS_MODEL: 'gpt-5.5',
+        ANTHROPIC_DEFAULT_SONNET_MODEL: 'gpt-5.5',
+        ANTHROPIC_SMALL_FAST_MODEL: 'gpt-5.5',
+        ANTHROPIC_REASONING_MODEL: 'gpt-5.5',
+      },
+      resolveBinding: () => ({
+        env: { ANTHROPIC_BASE_URL: 'http://127.0.0.1:15721', ANTHROPIC_AUTH_TOKEN: 'stone-token' },
+      }),
+    })
+    manager.initialize()
+    const [instance] = await manager.save({
+      name: 'Claude', client: 'claude', configDirectory, executablePath: executable,
+    })
+
+    await manager.start(instance.id)
+
+    const environment = spawn.mock.calls[0][2].env
+    expect(environment).toMatchObject({
+      KEEP_ME: 'yes',
+      CLAUDE_CONFIG_DIR: configDirectory,
+      ANTHROPIC_BASE_URL: 'http://127.0.0.1:15721',
+      ANTHROPIC_AUTH_TOKEN: 'stone-token',
+    })
+    for (const key of [
+      'ANTHROPIC_MODEL',
+      'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+      'ANTHROPIC_DEFAULT_OPUS_MODEL',
+      'ANTHROPIC_DEFAULT_SONNET_MODEL',
+      'ANTHROPIC_SMALL_FAST_MODEL',
+      'ANTHROPIC_REASONING_MODEL',
+    ]) expect(environment).not.toHaveProperty(key)
+    await manager.stop(instance.id)
+  })
+
   it('forces a bounded stop when a child never emits exit', async () => {
     const root = await mkdtemp(join(tmpdir(), 'stone-client-instance-stuck-'))
     directories.push(root)
@@ -124,15 +174,79 @@ describe('ClientInstanceManager', () => {
     manager.initialize()
     const [instance] = await manager.save({ name: 'Stuck', client: 'codex', configDirectory, executablePath: executable })
     await manager.start(instance.id)
-    const stopped = await manager.stop(instance.id)
+    await expect(manager.stop(instance.id)).rejects.toThrow('Client process did not exit after forced termination.')
 
     expect(signals).toEqual(['SIGTERM', 'SIGKILL'])
-    expect(stopped[0]).toMatchObject({
+    expect(manager.list()[0]).toMatchObject({
       status: 'failed',
       pid: 9191,
       processAlive: true,
       stopError: 'Client process did not exit after forced termination.'
     })
+  })
+
+  it('recovers only an exact cross-restart process identity and safely stops it by PID', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'stone-client-instance-recovery-'))
+    directories.push(root)
+    const executable = join(root, 'codex.exe')
+    const configDirectory = join(root, 'config')
+    const identity = { executablePath: executable, commandLine: `"${executable}" --search`, startedAt: 1234 }
+    const metadata = new MemoryMetadata()
+    metadata.values.set('managed_client_instances_v1', JSON.stringify([{
+      id: 'recover-me', name: 'Recovered Codex', client: 'codex', configDirectory,
+      executablePath: executable, launchArgs: ['--search'], launchMode: 'background', status: 'running',
+      createdAt: 1, updatedAt: 1,
+      processJournal: { instanceId: 'recover-me', pid: 7777, ...identity },
+    }]))
+    let alive = true
+    const terminatePidTree = vi.fn(async () => { alive = false })
+    const manager = new ClientInstanceManager({
+      store: metadata,
+      processAdapter: { spawn: () => new FakeProcess() },
+      platform: 'win32',
+      inspectProcess: async () => alive ? identity : undefined,
+      terminatePidTree,
+    })
+
+    manager.initialize()
+    expect(await manager.recoverOrphanedProcesses()).toEqual([
+      expect.objectContaining({ id: 'recover-me', status: 'running', pid: 7777, processAlive: true }),
+    ])
+    await manager.stop('recover-me')
+    expect(terminatePidTree).toHaveBeenCalledWith(7777)
+    expect(manager.list()[0]).toMatchObject({ status: 'stopped', processAlive: false })
+  })
+
+  it('keeps a recovered process journal when forced tree termination does not remove the exact process', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'stone-client-instance-recovery-stuck-'))
+    directories.push(root)
+    const executable = join(root, 'grok.exe')
+    const identity = { executablePath: executable, commandLine: `"${executable}"`, startedAt: 4321 }
+    const metadata = new MemoryMetadata()
+    metadata.values.set('managed_client_instances_v1', JSON.stringify([{
+      id: 'still-running', name: 'Recovered Grok Build', client: 'grokbuild', configDirectory: root,
+      executablePath: executable, launchArgs: [], launchMode: 'terminal', status: 'running',
+      createdAt: 1, updatedAt: 1,
+      processJournal: { instanceId: 'still-running', pid: 8787, ...identity },
+    }]))
+    const manager = new ClientInstanceManager({
+      store: metadata,
+      processAdapter: { spawn: () => new FakeProcess() },
+      platform: 'win32',
+      inspectProcess: async () => identity,
+      terminatePidTree: async () => undefined,
+    })
+
+    manager.initialize()
+    await manager.recoverOrphanedProcesses()
+    await expect(manager.stop('still-running')).rejects.toThrow('remained alive')
+
+    expect(manager.list()[0]).toMatchObject({
+      status: 'failed', pid: 8787, processAlive: true,
+      stopError: 'Recovered client process tree remained alive after forced termination.',
+    })
+    expect(JSON.parse(metadata.values.get('managed_client_instances_v1')!)[0].processJournal)
+      .toMatchObject({ instanceId: 'still-running', pid: 8787 })
   })
 
   it('keeps legacy definitions in background mode while new instances use the platform-safe default', async () => {
@@ -288,10 +402,93 @@ describe('ClientInstanceManager', () => {
       stdio: 'ignore',
     })
     expect(clientInstanceNodeSpawnOptions('win32', 'terminal', false)).toEqual({
-      windowsHide: false,
-      detached: true,
-      stdio: 'inherit',
+      windowsHide: true,
+      detached: false,
+      stdio: 'ignore',
     })
+  })
+
+  it('does not report startup success when the native child exits during the stability window', async () => {
+    const child = new EventEmitter() as EventEmitter & { exitCode: number | null }
+    child.exitCode = null
+    const ready = waitForClientProcessReady(child as never, 20)
+    queueMicrotask(() => child.emit('exit', 1, null))
+    await expect(ready).rejects.toThrow('exited during startup')
+
+    const stable = new EventEmitter() as EventEmitter & { exitCode: number | null }
+    stable.exitCode = null
+    await expect(waitForClientProcessReady(stable as never, 1)).resolves.toBeUndefined()
+  })
+
+  it('wraps Windows batch shims through cmd.exe so CreateProcess can launch them', () => {
+    expect(resolveClientInstanceSpawnInvocation('win32', 'C:\\Tools\\claude.cmd', ['--version'])).toEqual({
+      command: process.env.ComSpec?.trim() || 'cmd.exe',
+      args: ['/d', '/s', '/c', 'C:\\Tools\\claude.cmd', '--version'],
+    })
+    expect(resolveClientInstanceSpawnInvocation('win32', 'C:\\Tools\\tool.bat', [])).toEqual({
+      command: process.env.ComSpec?.trim() || 'cmd.exe',
+      args: ['/d', '/s', '/c', 'C:\\Tools\\tool.bat'],
+    })
+    expect(resolveClientInstanceSpawnInvocation('win32', 'C:\\Tools\\grok.exe', ['chat'])).toEqual({
+      command: 'C:\\Tools\\grok.exe',
+      args: ['chat'],
+    })
+    expect(resolveClientInstanceSpawnInvocation('win32', 'C:\\Tools\\codex.ps1', ['--version'])).toEqual({
+      command: process.env.SystemRoot
+        ? `${process.env.SystemRoot}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`
+        : 'powershell.exe',
+      args: ['-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', 'C:\\Tools\\codex.ps1', '--version'],
+    })
+    expect(resolveClientInstanceSpawnInvocation('linux', '/usr/bin/claude', ['--version'])).toEqual({
+      command: '/usr/bin/claude',
+      args: ['--version'],
+    })
+    const commandProcessor = process.env.ComSpec?.trim() || 'cmd.exe'
+    expect(resolveClientInstanceSpawnInvocation('win32', 'C:\\Program Files\\Codex\\codex.exe', ['--search'], 'terminal')).toEqual({
+      command: commandProcessor,
+      args: ['/d', '/s', '/c', 'start', 'Stone+ Client', '/wait', 'C:\\Program Files\\Codex\\codex.exe', '--search'],
+    })
+    expect(resolveClientInstanceSpawnInvocation('win32', 'C:\\Program Files\\Claude\\claude.cmd', ['--model', 'sonnet'], 'terminal')).toEqual({
+      command: commandProcessor,
+      args: ['/d', '/s', '/c', 'start', 'Stone+ Client', '/wait', commandProcessor, '/d', '/s', '/c', 'C:\\Program Files\\Claude\\claude.cmd', '--model', 'sonnet'],
+    })
+  })
+
+  it('resolves an extensionless Windows PATH shim to its launchable sibling before spawn', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'stone-client-instance-windows-shim-'))
+    directories.push(root)
+    const extensionless = join(root, 'codex')
+    const commandShim = `${extensionless}.cmd`
+    const configDirectory = join(root, 'config')
+    await writeFile(extensionless, '#!/bin/sh')
+    await writeFile(commandShim, '@echo off')
+    const spawn = vi.fn(() => new FakeProcess())
+    const manager = new ClientInstanceManager({
+      store: new MemoryMetadata(), processAdapter: { spawn }, platform: 'win32',
+    })
+    manager.initialize()
+    const [instance] = await manager.save({
+      name: 'Codex shim', client: 'codex', configDirectory, executablePath: extensionless, launchMode: 'background',
+    })
+    await manager.start(instance.id)
+    expect(spawn).toHaveBeenCalledWith(commandShim, [], expect.objectContaining({ launchMode: 'background' }))
+  })
+
+  it.skipIf(process.platform !== 'win32')('launches a PowerShell shim through the default native adapter', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'stone-client-instance-powershell-'))
+    directories.push(root)
+    const output = join(root, 'launched.txt')
+    const configDirectory = join(root, 'config')
+    const script = join(process.cwd(), 'tests', 'fixtures', 'client-instances', 'write-marker.ps1')
+    const manager = new ClientInstanceManager({ store: new MemoryMetadata(), platform: 'win32' })
+    manager.initialize()
+    const [instance] = await manager.save({
+      name: 'PowerShell shim', client: 'codex', configDirectory, executablePath: script,
+      launchArgs: [output], launchMode: 'background',
+    })
+
+    await expect(manager.start(instance.id)).rejects.toThrow('exited during startup')
+    expect(await readFile(output, 'utf8')).toBe('powershell-shim-launched')
   })
 
   it('rejects a new unavailable POSIX terminal mode at save and a legacy one at start', async () => {
@@ -393,7 +590,7 @@ describe('ClientInstanceManager', () => {
       pid: 8181,
       error: 'Client process did not exit after forced termination.',
     }])
-  })
+  }, 10_000)
 
   it('cancels a pending start during stopAll and never spawns after shutdown begins', async () => {
     const root = await mkdtemp(join(tmpdir(), 'stone-client-instance-shutdown-start-'))
@@ -485,7 +682,7 @@ describe('ClientInstanceManager', () => {
     await vi.waitFor(() => {
       expect(JSON.parse(metadata.values.get('managed_client_instances_v1')!)[0]).toMatchObject({ status: 'stopped' })
     })
-  })
+  }, 10_000)
 
   it('finishes an exiting generation before a concurrent restart can persist the next one', async () => {
     const root = await mkdtemp(join(tmpdir(), 'stone-client-instance-generation-'))

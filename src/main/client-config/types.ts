@@ -16,6 +16,7 @@ export interface ClientConfigPathOverrides {
   claudeDirectory?: string
   codexDirectory?: string
   geminiDirectory?: string
+  grokbuildDirectory?: string
 }
 
 export interface ClientConfigPathOptions {
@@ -47,6 +48,10 @@ export interface ResolvedClientConfigPaths {
     directory: string
     settings: ClientConfigFilePath
     env: ClientConfigFilePath
+  }
+  grokbuild: {
+    directory: string
+    config: ClientConfigFilePath
   }
 }
 

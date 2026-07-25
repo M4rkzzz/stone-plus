@@ -2,6 +2,7 @@ import type {
   ModelCapabilityDefinition,
   Protocol,
   ProviderDefinition,
+  ProviderKind,
   ResponsesCompactMode,
   UpstreamCapabilityProfile,
   UpstreamCapabilityRequirement,
@@ -26,6 +27,7 @@ const capabilityKeys: readonly UpstreamCapabilityRequirement[] = [
 
 export function inferUpstreamCapabilities(input: {
   protocol: Protocol
+  kind?: ProviderKind
   sourceType?: ProviderDefinition['sourceType']
   responsesCompactMode?: ResponsesCompactMode
   modelDiscovery?: boolean
@@ -35,9 +37,13 @@ export function inferUpstreamCapabilities(input: {
   checkedAt?: number
 }): UpstreamCapabilityProfile {
   const responses = input.protocol === 'openai-responses'
-  const officialResponses = responses && input.sourceType === 'official-api'
+  const officialResponses = responses && input.sourceType === 'official-api' && input.kind === 'openai'
   const compact = responses
-    ? officialResponses || input.responsesCompactMode === 'native' || input.responsesCompactMode === 'passthrough'
+    ? officialResponses
+      || input.responsesCompactMode === 'auto'
+      || input.responsesCompactMode === 'native'
+      || input.responsesCompactMode === 'passthrough'
+      || input.responsesCompactMode === 'legacy'
     : false
   return {
     version: 1,
@@ -62,7 +68,7 @@ export function inferUpstreamCapabilities(input: {
 }
 
 export function effectiveProviderCapabilities(provider: ProviderDefinition): UpstreamCapabilityProfile {
-  const fallback = inferUpstreamCapabilities(provider)
+  const fallback = inferUpstreamCapabilities({ ...provider, kind: provider.kind })
   return normalizeCapabilityProfile(provider.capabilityProfile, fallback)
 }
 

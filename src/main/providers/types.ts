@@ -125,6 +125,8 @@ export interface ProviderAdapter {
 export interface ProviderAdapterDefinition {
   kind: ProviderKind
   capabilities: ProviderCapabilityMatrix
+  /** Whether a downstream client User-Agent may be forwarded to this provider. */
+  forwardUserAgent?: boolean
   defaultVersion: string | ((input: ProviderEndpointInput) => string)
   buildOperationPath(input: ProviderEndpointInput): {
     path: string

@@ -1,8 +1,11 @@
 import { randomUUID } from 'node:crypto'
 import { clientNativeProtocols } from '@shared/types'
-import type { SetupRoutingInput, SetupRoutingResult } from '@shared/types'
+import type { PoolProtocol, SetupRoutingInput, SetupRoutingResult } from '@shared/types'
+import { accountPoolProtocol } from '@shared/pool-protocol'
+import { providerSourceFamily } from '@shared/source-family'
 import { evaluateSourceEligibility } from '../../shared/source-eligibility'
-import { isAvailableRouteAccount } from '../../shared/route-sources'
+import { isSafeRouteModelMapKey, normalizeRouteModelMap } from '../../shared/route-models'
+import { isAvailableRouteAccount, isNativeGrokRouteSource, resolveRouteSource } from '../../shared/route-sources'
 import type { PersistedState } from '../store/types'
 
 export interface ApplySetupRoutingOptions {
@@ -24,6 +27,11 @@ export function applySetupRoutingDraft(
   if (!source) throw new Error('向导选择的来源已不存在。')
   const provider = state.providers.find((candidate) => candidate.id === source.providerId)
   if (!provider) throw new Error('向导选择的来源缺少上游定义。')
+  const logicalProtocol = accountPoolProtocol(source, provider)
+  if (input.client === 'grokbuild'
+    && (providerSourceFamily(provider.kind) !== 'grok' || provider.protocol !== 'openai-responses')) {
+    throw new Error('Grok Build 只能连接原生 OpenAI Responses 协议的 Grok 号池或 Grok 中转站。')
+  }
 
   let pool = input.aggregatePoolId
     ? state.pools.find((candidate) => candidate.id === input.aggregatePoolId)
@@ -40,7 +48,7 @@ export function applySetupRoutingDraft(
   if (!pool && options.preferredPoolId) {
     const candidate = state.pools.find((item) => item.id === options.preferredPoolId)
     if (candidate?.kind === 'standard'
-      && candidate.protocol === provider.protocol
+      && candidate.protocol === logicalProtocol
       && candidate.members.some((member) => member.accountId === source.id)
       && poolSupportsSetupRequest(state, candidate, model)) {
       pool = candidate
@@ -49,21 +57,23 @@ export function applySetupRoutingDraft(
 
   if (!pool) {
     pool = state.pools.find((candidate) => candidate.kind === 'standard'
-      && candidate.protocol === provider.protocol
+      && candidate.protocol === logicalProtocol
       && candidate.members.some((member) => member.accountId === source.id)
       && poolSupportsSetupRequest(state, candidate, model))
   }
 
   let createdPool = false
   if (!pool) {
-    const memberIds = source.credentialType === 'chatgpt-oauth' || source.credentialType === 'chatgpt-agent-identity'
-      ? healthyOAuthPeers(state, provider.protocol, source.id, model)
+    const memberIds = source.credentialType === 'chatgpt-oauth'
+      || source.credentialType === 'chatgpt-agent-identity'
+      || source.credentialType === 'grok-oauth'
+      ? healthyOAuthPeers(state, logicalProtocol, source.id, model)
       : [source.id]
     pool = {
       id: randomUUID(),
       name: memberIds.length > 1 ? '向导·OAuth 智能均衡' : `向导·${source.name}`,
       kind: 'standard',
-      protocol: provider.protocol,
+      protocol: logicalProtocol,
       strategy: memberIds.length > 1 ? 'balanced' : 'priority',
       members: memberIds.map((accountId) => ({ accountId, enabled: true })),
       modelPolicy: 'all',
@@ -78,6 +88,10 @@ export function applySetupRoutingDraft(
     createdPool = true
   }
 
+  if (input.client === 'grokbuild' && !isNativeGrokRouteSource(resolveRouteSource(pool.id, state), state)) {
+    throw new Error('Grok Build 只能连接原生 OpenAI Responses 协议的 Grok 号池或 Grok 中转站。')
+  }
+
   if (!poolSupportsSetupRequest(state, pool, model)) {
     throw new Error('选择的号池没有可完成向导验证的模型与基础生成能力。')
   }
@@ -85,6 +99,21 @@ export function applySetupRoutingDraft(
   const inboundProtocol = clientNativeProtocols[input.client]
   const existingRoute = state.routes.find((candidate) => candidate.client === input.client)
   const routeId = existingRoute?.id ?? randomUUID()
+  const modelMap = normalizeRouteModelMap(existingRoute?.modelMap)
+  const codexToClaude = input.client === 'codex' && provider.protocol === 'anthropic-messages'
+  const claudeToOpenAi = input.client === 'claude'
+    && (provider.protocol === 'openai-responses' || provider.protocol === 'openai-chat')
+  if (input.client === 'grokbuild'
+    || (input.client === 'codex' && (provider.kind === 'xai' || provider.kind === 'xai-compatible'))
+    || codexToClaude
+    || claudeToOpenAi) {
+    // Cross-protocol clients normally request their own model aliases rather
+    // than the verified upstream identifier. Preserve the client config and
+    // route every otherwise-unmapped alias to the setup-tested model.
+    modelMap['*'] = model
+  } else if (isSafeRouteModelMapKey(model)) {
+    modelMap[model] = model
+  }
   const route = {
     // Preserve fields owned by other route features. The setup wizard only
     // changes the source, enablement and model mapping below.
@@ -95,7 +124,7 @@ export function applySetupRoutingDraft(
     highConcurrencyMode: existingRoute?.highConcurrencyMode === true,
     poolId: pool.id,
     inboundProtocol,
-    modelMap: { ...(existingRoute?.modelMap ?? {}), [model]: model },
+    modelMap,
     localToken: existingRoute?.localToken?.trim() || createLocalToken(),
     createdAt: existingRoute?.createdAt ?? timestamp,
     updatedAt: timestamp,
@@ -106,12 +135,17 @@ export function applySetupRoutingDraft(
   return { poolId: pool.id, routeId, createdPool }
 }
 
-function healthyOAuthPeers(state: PersistedState, protocol: string, selectedId: string, model: string): string[] {
+function healthyOAuthPeers(state: PersistedState, protocol: PoolProtocol, selectedId: string, model: string): string[] {
   const providerById = new Map(state.providers.map((provider) => [provider.id, provider]))
   const candidates = state.accounts
-    .filter((account) => (account.credentialType === 'chatgpt-oauth' || account.credentialType === 'chatgpt-agent-identity')
-      && isAvailableRouteAccount(account)
-      && providerById.get(account.providerId)?.protocol === protocol)
+    .filter((account) => {
+      if (account.credentialType !== 'chatgpt-oauth'
+        && account.credentialType !== 'chatgpt-agent-identity'
+        && account.credentialType !== 'grok-oauth') return false
+      if (!isAvailableRouteAccount(account)) return false
+      const provider = providerById.get(account.providerId)
+      return Boolean(provider && accountPoolProtocol(account, provider) === protocol)
+    })
   const peers = evaluateSourceEligibility({
     accounts: candidates,
     providers: state.providers,

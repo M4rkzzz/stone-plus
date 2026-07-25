@@ -52,6 +52,8 @@ const reasoningOptions = [
   option('medium', '中', '速度与质量均衡', true),
   option('high', '高', '复杂分析和多步骤任务'),
   option('xhigh', '超高', '支持该档位的模型进行更深入推理'),
+  option('max', '最高', '对支持该档位的模型使用最高推理投入'),
+  option('ultra', '极限', '对 Sol 等支持模型使用极限推理投入'),
 ]
 
 const fields: readonly FieldDefinition[] = Object.freeze([

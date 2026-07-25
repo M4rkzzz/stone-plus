@@ -188,18 +188,23 @@ export function SettingsWorkspace({
           {accessModes.map((mode) => {
             const selected = settings.accessMode === mode
             const applying = pending.accessMode === mode
+            const capability = runtime.platformCapabilities?.accessModes[mode]
+            const unavailableReason = capability?.available === false
+              ? accessModeUnavailableReason(mode, runtime, t)
+              : undefined
             const modeLabelId = `${headingId}-${mode}-label`
             const modeDescriptionId = `${headingId}-${mode}-description`
             return (
               <label
                 key={mode}
-                className={`built-in-proxy-settings-workspace__mode ${selected ? 'is-selected' : ''} ${applying ? 'is-applying' : ''}`}
+                className={`built-in-proxy-settings-workspace__mode ${selected ? 'is-selected' : ''} ${applying ? 'is-applying' : ''} ${unavailableReason ? 'is-unavailable' : ''}`}
               >
                 <input
                   type="radio"
                   name={`${headingId}-access-mode`}
                   value={mode}
                   checked={selected}
+                  disabled={capability?.available === false}
                   aria-labelledby={modeLabelId}
                   aria-describedby={`${modeDescriptionId} ${statusId}`}
                   aria-busy={applying || undefined}
@@ -221,6 +226,7 @@ export function SettingsWorkspace({
                         '覆盖不遵循系统代理的应用；每次启动都需要临时提权。',
                         'Cover applications that ignore the system proxy; temporary elevation is required on every start.',
                       )}</small>
+                  {unavailableReason && <em className="built-in-proxy-settings-workspace__mode-unavailable">{unavailableReason}</em>}
                 </span>
                 <span className="built-in-proxy-settings-workspace__mode-state" aria-hidden="true">
                   {applying ? <LoaderCircle size={15} className="spin" /> : selected ? <Check size={15} /> : null}
@@ -407,6 +413,26 @@ function resolveAccessPresentation(
     || runtime.error
   ) return 'error'
   return 'idle'
+}
+
+function accessModeUnavailableReason(
+  mode: BuiltInProxyAccessMode,
+  runtime: BuiltInProxyRuntimeState,
+  t: <T>(chinese: T, english: T) => T,
+): string {
+  const capability = runtime.platformCapabilities?.accessModes[mode]
+  if (!capability || capability.available) return ''
+  if (capability.unavailableReason === 'unsupported-desktop') {
+    return t('当前 Linux 桌面环境不支持系统代理接入', 'System proxy mode is unavailable in this Linux desktop environment')
+  }
+  const platform = runtime.platformCapabilities?.platform ?? 'other'
+  const platformLabel = platform === 'windows' ? 'Windows'
+    : platform === 'macos' ? 'macOS'
+      : platform === 'linux' ? 'Linux'
+        : t('当前平台', 'this platform')
+  return mode === 'tun'
+    ? t(`${platformLabel} 暂不支持 TUN 接入`, `TUN mode is unavailable on ${platformLabel}`)
+    : t(`${platformLabel} 暂不支持系统代理接入`, `System proxy mode is unavailable on ${platformLabel}`)
 }
 
 function resolveMixedPort(runtime: BuiltInProxyRuntimeState, useEffectiveRoute: boolean): number | undefined {

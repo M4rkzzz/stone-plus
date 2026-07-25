@@ -34,6 +34,7 @@ const stone: GatewayApi = {
   refreshAccountModels: (id) => ipcRenderer.invoke('stone:refresh-account-models', id),
   testAccountModel: (accountId, model) => ipcRenderer.invoke('stone:test-account-model', accountId, model),
   importChatGptAccounts: (input) => ipcRenderer.invoke('stone:import-chatgpt-accounts', input),
+  importGrokAccounts: (input) => ipcRenderer.invoke('stone:import-grok-accounts', input),
   importChatGptAccountFiles: (input) => ipcRenderer.invoke('stone:import-chatgpt-account-files', input),
   startChatGptOAuth: (input) => ipcRenderer.invoke('stone:start-chatgpt-oauth', input),
   openChatGptOAuth: (sessionId) => ipcRenderer.invoke('stone:open-chatgpt-oauth', sessionId),
@@ -162,9 +163,20 @@ const stone: GatewayApi = {
   stopFrpTunnel: () => ipcRenderer.invoke('stone:stop-frp-tunnel'),
   clearFrpTunnelLogs: () => ipcRenderer.invoke('stone:clear-frp-tunnel-logs'),
   inspectCodexSessionRepair: () => ipcRenderer.invoke('stone:inspect-codex-session-repair'),
-  previewCodexSessionRepair: (targetProvider) => ipcRenderer.invoke('stone:preview-codex-session-repair', targetProvider),
-  repairCodexSessions: (targetProvider, expectedRevision) => ipcRenderer.invoke('stone:repair-codex-sessions', targetProvider, expectedRevision),
-  repairCodexSessionsAndRestartChatGpt: (targetProvider, expectedRevision) => ipcRenderer.invoke('stone:repair-codex-sessions-and-restart-chatgpt', targetProvider, expectedRevision),
+  analyzeCodexSessionRepair: (targetProvider, operationId) => ipcRenderer.invoke('stone:analyze-codex-session-repair', targetProvider, operationId),
+  previewCodexSessionRepair: (targetProvider, operationId) => ipcRenderer.invoke('stone:preview-codex-session-repair', targetProvider, operationId),
+  repairCodexSessions: (targetProvider, expectedRevision, operationId) => ipcRenderer.invoke('stone:repair-codex-sessions', targetProvider, expectedRevision, operationId),
+  repairCodexSessionsAndRestartChatGpt: (targetProvider, expectedRevision, operationId) => ipcRenderer.invoke('stone:repair-codex-sessions-and-restart-chatgpt', targetProvider, expectedRevision, operationId),
+  cancelCodexSessionRepair: (operationId) => ipcRenderer.invoke('stone:cancel-codex-session-repair', operationId),
+  getAgentLifecycleSnapshot: () => ipcRenderer.invoke('stone:get-agent-lifecycle-snapshot'),
+  installAgent: (target, channel) => ipcRenderer.invoke('stone:install-agent', target, channel),
+  closeAgent: (target) => ipcRenderer.invoke('stone:close-agent', target),
+  restoreAgent: (target, options) => ipcRenderer.invoke('stone:restore-agent', target, options),
+  restartAgent: (target) => ipcRenderer.invoke('stone:restart-agent', target),
+  startAgent: (target, options) => ipcRenderer.invoke('stone:start-agent', target, options),
+  smartRepairAgent: (target) => ipcRenderer.invoke('stone:smart-repair-agent', target),
+  repairAllAffectedAgents: () => ipcRenderer.invoke('stone:repair-all-affected-agents'),
+  closeAllManagedAgents: () => ipcRenderer.invoke('stone:close-all-managed-agents'),
   previewCodexSessionIndexCleanup: () => ipcRenderer.invoke('stone:preview-codex-session-index-cleanup'),
   cleanupCodexSessionIndexAndRestart: (snapshotSha256, threadIds) => ipcRenderer.invoke('stone:cleanup-codex-session-index-and-restart', snapshotSha256, threadIds),
   listCodexSessions: (query) => ipcRenderer.invoke('stone:list-codex-sessions', query),
@@ -199,6 +211,16 @@ const stone: GatewayApi = {
     }
     ipcRenderer.on('stone:managed-client-instances', handler)
     return () => ipcRenderer.removeListener('stone:managed-client-instances', handler)
+  },
+  onAgentLifecycleChanged: (listener) => {
+    const handler = (_event: Electron.IpcRendererEvent, update: Parameters<typeof listener>[0]) => listener(update)
+    ipcRenderer.on('stone:agent-lifecycle-changed', handler)
+    return () => ipcRenderer.removeListener('stone:agent-lifecycle-changed', handler)
+  },
+  onCodexSessionRepairProgress: (listener) => {
+    const handler = (_event: Electron.IpcRendererEvent, progress: Parameters<typeof listener>[0]) => listener(progress)
+    ipcRenderer.on('stone:codex-session-repair-progress', handler)
+    return () => ipcRenderer.removeListener('stone:codex-session-repair-progress', handler)
   },
   onAccountImportProgress: (listener) => {
     const handler = (_event: Electron.IpcRendererEvent, progress: Parameters<typeof listener>[0]) => {

@@ -1,8 +1,9 @@
 import { execFile, spawn, type ChildProcess } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { mkdir, stat } from 'node:fs/promises'
-import { isAbsolute, resolve } from 'node:path'
+import { extname, isAbsolute, resolve } from 'node:path'
 import type { ManagedClientInstance, ManagedClientInstanceInput, ManagedClientLaunchMode, RouteClient } from '@shared/types'
+import { withoutClaudeRelayModelEnvironment } from '../client-config/claude-environment'
 
 const METADATA_KEY = 'managed_client_instances_v1'
 const SHUTDOWN_PERSIST_TIMEOUT_MS = 250
@@ -28,6 +29,7 @@ export interface ClientInstanceProcessAdapter {
   }): ClientInstanceProcess
   terminateTree?(child: ClientInstanceProcess): Promise<void>
   isAlive?(child: ClientInstanceProcess): Promise<boolean>
+  waitForReady?(child: ClientInstanceProcess): Promise<void>
 }
 
 export interface ClientInstanceLaunchBinding {
@@ -59,6 +61,19 @@ export interface ClientInstanceManagerOptions {
   hasControllingTerminal?: () => boolean
   now?: () => number
   stopTimeoutMs?: number
+  inspectProcess?: (pid: number) => Promise<ClientInstanceProcessIdentity | undefined>
+  terminatePidTree?: (pid: number) => Promise<void>
+}
+
+export interface ClientInstanceProcessIdentity {
+  executablePath: string
+  commandLine: string
+  startedAt: number
+}
+
+interface ClientInstanceProcessJournal extends ClientInstanceProcessIdentity {
+  instanceId: string
+  pid: number
 }
 
 interface RunningInstance {
@@ -84,6 +99,8 @@ interface ShutdownSignal {
 export class ClientInstanceManager {
   private definitions: ManagedClientInstance[] = []
   private readonly running = new Map<string, RunningInstance>()
+  private readonly recovered = new Map<string, ClientInstanceProcessJournal>()
+  private readonly processJournals = new Map<string, ClientInstanceProcessJournal>()
   private readonly listeners = new Set<(instances: ManagedClientInstance[]) => void>()
   private readonly startFlights = new Map<string, Promise<ManagedClientInstance[]>>()
   private readonly stopFlights = new Map<string, Promise<ManagedClientInstance[]>>()
@@ -91,6 +108,8 @@ export class ClientInstanceManager {
   private readonly now: () => number
   private readonly stopTimeoutMs: number
   private readonly platform: NodeJS.Platform
+  private readonly inspectProcess: NonNullable<ClientInstanceManagerOptions['inspectProcess']>
+  private readonly terminatePidTree: NonNullable<ClientInstanceManagerOptions['terminatePidTree']>
   private readonly shutdown = createShutdownSignal()
   private nextGeneration = 0
   private persistenceTail: Promise<void> = Promise.resolve()
@@ -100,17 +119,57 @@ export class ClientInstanceManager {
     this.now = options.now ?? (() => Date.now())
     this.stopTimeoutMs = Math.max(100, Math.min(30_000, options.stopTimeoutMs ?? 5_000))
     this.platform = options.platform ?? process.platform
+    this.inspectProcess = options.inspectProcess ?? ((pid) => inspectClientProcess(pid, this.platform))
+    this.terminatePidTree = options.terminatePidTree ?? ((pid) => terminateClientPidTree(pid, this.platform))
   }
 
   public initialize(): ManagedClientInstance[] {
-    this.definitions = parseDefinitions(this.options.store.readAppMetadata(METADATA_KEY))
+    const raw = this.options.store.readAppMetadata(METADATA_KEY)
+    this.definitions = parseDefinitions(raw)
       .map((instance) => ({ ...instance, status: 'stopped', pid: undefined }))
+    this.processJournals.clear()
+    for (const journal of parseProcessJournals(raw)) {
+      if (this.definitions.some((definition) => definition.id === journal.instanceId)) {
+        this.processJournals.set(journal.instanceId, journal)
+      }
+    }
+    return this.list()
+  }
+
+  public async recoverOrphanedProcesses(): Promise<ManagedClientInstance[]> {
+    for (const [id, journal] of [...this.processJournals]) {
+      let live: ClientInstanceProcessIdentity | undefined
+      try {
+        live = await this.inspectProcess(journal.pid)
+      } catch (error) {
+        this.recovered.set(id, journal)
+        const instance = this.definitions.find((candidate) => candidate.id === id)
+        if (instance) this.replace({
+          ...instance,
+          status: 'failed',
+          pid: journal.pid,
+          processAlive: true,
+          lastError: `Could not verify the previous client process: ${errorMessage(error)}`,
+          updatedAt: this.now(),
+        })
+        continue
+      }
+      if (!live || !sameProcessIdentity(live, journal, this.platform)) {
+        this.processJournals.delete(id)
+        continue
+      }
+      this.recovered.set(id, journal)
+      const instance = this.definitions.find((candidate) => candidate.id === id)
+      if (instance) this.replace({ ...instance, status: 'running', pid: journal.pid, processAlive: true, updatedAt: this.now() })
+    }
+    await this.persist()
     return this.list()
   }
 
   public list(): ManagedClientInstance[] {
     return this.definitions.map((definition) => {
       const active = this.running.get(definition.id)
+      const recovered = this.recovered.get(definition.id)
       return structuredClone(active
         ? {
             ...definition,
@@ -118,7 +177,9 @@ export class ClientInstanceManager {
             pid: active.child.pid,
             processAlive: true
           }
-        : { ...definition, processAlive: false })
+        : recovered
+          ? { ...definition, status: definition.status === 'failed' ? 'failed' : 'running', pid: recovered.pid, processAlive: true }
+          : { ...definition, processAlive: false })
     })
   }
 
@@ -197,11 +258,12 @@ export class ClientInstanceManager {
     this.assertStartAllowed()
     const stopping = this.stopFlights.get(id)
     if (stopping) await this.awaitStartStep(stopping)
-    if (this.running.has(id)) return this.list()
+    if (this.running.has(id) || this.recovered.has(id)) return this.list()
     const instance = this.required(id)
     if (!instance.executablePath) throw new Error('Choose an executable before starting this instance.')
     this.assertLaunchModeSupported(instance.launchMode)
-    await this.awaitStartStep(assertFile(instance.executablePath, 'Client executable'))
+    const launchExecutable = await this.awaitStartStep(resolveClientExecutable(instance.executablePath, this.platform))
+    await this.awaitStartStep(assertFile(launchExecutable, 'Client executable'))
     if (instance.workingDirectory) {
       await this.awaitStartStep(assertDirectory(instance.workingDirectory, 'Working directory'))
     }
@@ -210,11 +272,11 @@ export class ClientInstanceManager {
     const binding = this.options.resolveBinding?.(structuredClone(instance))
     const plan: ClientInstanceLaunchPlan = Object.freeze({
       instanceId: instance.id,
-      executable: instance.executablePath,
+      executable: launchExecutable,
       args: Object.freeze([...instance.launchArgs]),
       ...(instance.workingDirectory ? { cwd: instance.workingDirectory } : {}),
       env: Object.freeze({
-        ...(this.options.baseEnvironment ?? process.env),
+        ...clientBaseEnvironment(instance.client, this.options.baseEnvironment ?? process.env),
         ...configDirectoryEnvironment(instance.client, instance.configDirectory),
         ...(binding?.env ?? {}),
       }),
@@ -237,6 +299,10 @@ export class ClientInstanceManager {
       })
       const generation = ++this.nextGeneration
       launched = this.trackRunning(id, generation, child, timestamp)
+      if (this.processAdapter.waitForReady) {
+        await this.awaitStartStep(this.processAdapter.waitForReady(child))
+      }
+      const identity = child.pid ? await this.inspectProcess(child.pid).catch(() => undefined) : undefined
       // A defensive adapter may synchronously report a launch failure while
       // the listeners are installed. Never resurrect that completed
       // generation as running.
@@ -244,13 +310,17 @@ export class ClientInstanceManager {
         await launched.finalized
         return this.list()
       }
+      if (child.pid && identity) this.processJournals.set(id, { instanceId: id, pid: child.pid, ...identity })
       this.replace({ ...this.required(id), status: 'running', pid: child.pid, lastStartedAt: timestamp, updatedAt: timestamp })
       await this.awaitStartStep(this.persist())
       return this.list()
     } catch (error) {
       if (launched && this.isCurrent(id, launched.generation)) {
         const stopped = await this.terminateRunning(launched)
-        if (stopped && this.isCurrent(id, launched.generation)) this.running.delete(id)
+        if (stopped && this.isCurrent(id, launched.generation)) {
+          this.running.delete(id)
+          this.processJournals.delete(id)
+        }
       }
       const stillRunning = launched && this.isCurrent(id, launched.generation)
       if (error instanceof ClientInstanceStartCancelledError && !stillRunning) {
@@ -297,6 +367,34 @@ export class ClientInstanceManager {
     if (starting && !this.shutdown.requested) await starting.catch(() => undefined)
     const instance = this.required(id)
     const active = this.running.get(id)
+    const recovered = this.recovered.get(id)
+    if (recovered) {
+      this.replace({ ...instance, status: 'stopping', updatedAt: this.now() })
+      await this.persistBeforeTermination()
+      try {
+        const live = await this.inspectProcess(recovered.pid)
+        if (live && sameProcessIdentity(live, recovered, this.platform)) {
+          await this.terminatePidTree(recovered.pid)
+          const remaining = await this.inspectProcess(recovered.pid)
+          if (remaining && sameProcessIdentity(remaining, recovered, this.platform)) {
+            throw new Error('Recovered client process tree remained alive after forced termination.')
+          }
+        }
+      } catch (error) {
+        const message = errorMessage(error)
+        this.replace({
+          ...this.required(id), status: 'failed', pid: recovered.pid, processAlive: true,
+          stopError: message, lastError: message, updatedAt: this.now(),
+        })
+        await this.persistForLifecycle()
+        throw error
+      }
+      this.recovered.delete(id)
+      this.processJournals.delete(id)
+      this.replace({ ...this.required(id), status: 'stopped', pid: undefined, processAlive: false, stopError: undefined, lastStoppedAt: this.now(), updatedAt: this.now() })
+      await this.persistForLifecycle()
+      return this.list()
+    }
     if (!active) {
       if (instance.status !== 'stopped') {
         this.replace({ ...instance, status: 'stopped', pid: undefined, updatedAt: this.now() })
@@ -306,6 +404,56 @@ export class ClientInstanceManager {
     }
     this.replace({ ...instance, status: 'stopping', updatedAt: this.now() })
     await this.persistBeforeTermination()
+    // Windows terminal launches and npm/PowerShell shims are supervised by a
+    // wrapper process. Killing that wrapper first makes it disappear from the
+    // process table while its real Agent child keeps running, so taskkill can
+    // no longer find the root of the tree. Terminate the verified live tree
+    // while the supervisor PID still exists and only then finalize state.
+    if (this.platform === 'win32' && this.processAdapter.terminateTree) {
+      if (!this.isCurrent(id, active.generation)) {
+        await active.finalized
+        return this.list()
+      }
+      try {
+        await this.processAdapter.terminateTree(active.child)
+      } catch (error) {
+        // taskkill can race a natural exit. Only surface a failure while the
+        // original tracked child still exists.
+        const alive = this.isCurrent(id, active.generation)
+          && await this.confirmAlive(active.child).catch(() => true)
+        if (alive) {
+          const message = errorMessage(error)
+          this.replace({
+            ...this.required(id), status: 'failed', pid: active.child.pid, processAlive: true,
+            stopError: message, lastError: message, updatedAt: this.now(),
+          })
+          await this.persistForLifecycle()
+          throw error
+        }
+      }
+      const emittedExit = await waitForExit(active.exit, Math.min(250, this.stopTimeoutMs))
+      if (emittedExit) {
+        await active.finalized
+      } else if (this.isCurrent(id, active.generation)) {
+        const stillAlive = this.processAdapter.isAlive
+          ? await this.processAdapter.isAlive(active.child).catch(() => true)
+          : false
+        if (stillAlive) {
+          const error = new Error('Client process tree remained alive after forced termination.')
+          this.replace({
+            ...this.required(id), status: 'failed', pid: active.child.pid, processAlive: true,
+            stopError: error.message, lastError: error.message, updatedAt: this.now(),
+          })
+          await this.persistForLifecycle()
+          throw error
+        }
+        // Successful process adapters guarantee the tree is gone. Some test
+        // and platform adapters cannot emit a ChildProcess exit event, so
+        // synthesize the same idempotent finalization in that case.
+        await this.handleExit(id, active.generation, { code: 0, signal: null })
+      }
+      return this.list()
+    }
     let graceful = false
     try {
       active.child.kill('SIGTERM')
@@ -325,7 +473,7 @@ export class ClientInstanceManager {
           stopError: message, lastError: message, updatedAt: this.now()
         })
         await this.persistForLifecycle()
-        return this.list()
+        throw error
       }
       const forcedExit = await waitForExit(active.exit, Math.min(1_000, this.stopTimeoutMs))
       if (forcedExit) await active.finalized
@@ -341,6 +489,7 @@ export class ClientInstanceManager {
           updatedAt: this.now()
         })
         await this.persistForLifecycle()
+        throw error
       }
     }
     return this.list()
@@ -350,19 +499,20 @@ export class ClientInstanceManager {
     stopped: string[]
     stillRunning: Array<{ id: string; pid?: number; error?: string }>
   }> {
-    const ids = new Set([...this.running.keys(), ...this.startFlights.keys()])
+    const ids = new Set([...this.running.keys(), ...this.recovered.keys(), ...this.startFlights.keys()])
     const pendingStarts = [...this.startFlights.values()]
     this.shutdown.request()
     for (const id of this.running.keys()) ids.add(id)
-    const stopping = [...this.running.keys()].map((id) => this.stop(id).catch(() => undefined))
+    const stopping = [...new Set([...this.running.keys(), ...this.recovered.keys()])].map((id) => this.stop(id).catch(() => undefined))
     await Promise.all([
       ...stopping.map((flight) => settleWithin(flight, this.stopTimeoutMs + 2_000)),
       settleWithin(Promise.allSettled(pendingStarts), SHUTDOWN_START_DRAIN_TIMEOUT_MS),
     ])
     const stillRunning = [...ids].flatMap((id) => {
       const active = this.running.get(id)
+      const recovered = this.recovered.get(id)
       const instance = this.definitions.find((candidate) => candidate.id === id)
-      return active ? [{ id, pid: active.child.pid, error: instance?.stopError ?? instance?.lastError }] : []
+      return active || recovered ? [{ id, pid: active?.child.pid ?? recovered?.pid, error: instance?.stopError ?? instance?.lastError }] : []
     })
     const runningIds = new Set(stillRunning.map((item) => item.id))
     return { stopped: [...ids].filter((id) => !runningIds.has(id)), stillRunning }
@@ -435,6 +585,7 @@ export class ClientInstanceManager {
   private async handleExit(id: string, generation: number, outcome: ProcessExit): Promise<void> {
     if (!this.isCurrent(id, generation)) return
     this.running.delete(id)
+    this.processJournals.delete(id)
     const instance = this.definitions.find((candidate) => candidate.id === id)
     if (!instance) return
     const timestamp = this.now()
@@ -463,6 +614,20 @@ export class ClientInstanceManager {
   }
 
   private async terminateRunning(active: RunningInstance): Promise<boolean> {
+    if (this.platform === 'win32' && this.processAdapter.terminateTree) {
+      try {
+        await this.processAdapter.terminateTree(active.child)
+      } catch {
+        return !await this.confirmAlive(active.child).catch(() => true)
+      }
+      if (await waitForExit(active.exit, Math.min(250, this.stopTimeoutMs))) {
+        await active.finalized
+        return true
+      }
+      return this.processAdapter.isAlive
+        ? !await this.processAdapter.isAlive(active.child).catch(() => true)
+        : true
+    }
     try { active.child.kill('SIGTERM') } catch { /* Continue to the forced tree termination. */ }
     if (await waitForExit(active.exit, Math.min(500, this.stopTimeoutMs))) {
       await active.finalized
@@ -488,10 +653,16 @@ export class ClientInstanceManager {
   }
 
   private async persist(): Promise<void> {
-    const durable = this.definitions.map(({ pid: _pid, ...definition }) => ({
-      ...definition,
-      status: this.running.has(definition.id) ? definition.status : definition.status === 'failed' ? 'failed' : 'stopped'
-    }))
+    const durable = this.definitions.map(({ pid: _pid, ...definition }) => {
+      const processJournal = this.processJournals.get(definition.id)
+      return {
+        ...definition,
+        status: this.running.has(definition.id) || this.recovered.has(definition.id)
+          ? definition.status
+          : definition.status === 'failed' ? 'failed' : 'stopped',
+        ...(processJournal ? { processJournal } : {}),
+      }
+    })
     const snapshot = this.list()
     const write = this.persistenceTail
       .catch(() => undefined)
@@ -560,7 +731,11 @@ class NodeClientInstanceProcessAdapter implements ClientInstanceProcessAdapter {
       options.launchMode,
       Boolean(process.stdin.isTTY && process.stdout.isTTY),
     )
-    return spawn(executable, [...args], {
+    // npm and similar installers expose Windows CLIs as .cmd/.bat shims.
+    // CreateProcess cannot launch those directly (spawn EINVAL), so wrap them
+    // through cmd.exe while keeping the managed executable path unchanged.
+    const invocation = resolveClientInstanceSpawnInvocation(process.platform, executable, args, options.launchMode)
+    return spawn(invocation.command, invocation.args, {
       cwd: options.cwd,
       env: options.env,
       ...processOptions,
@@ -589,6 +764,39 @@ class NodeClientInstanceProcessAdapter implements ClientInstanceProcessAdapter {
       return (error as NodeJS.ErrnoException).code === 'EPERM'
     }
   }
+
+  async waitForReady(child: ClientInstanceProcess): Promise<void> {
+    await waitForClientProcessReady(child as ChildProcess)
+  }
+}
+
+export async function waitForClientProcessReady(nativeChild: ChildProcess, stabilityMs = 350): Promise<void> {
+  if (nativeChild.exitCode !== null) throw new Error(`Client process exited during startup with code ${String(nativeChild.exitCode)}.`)
+  await new Promise<void>((resolve, reject) => {
+      let ready = false
+      const timer = setTimeout(() => {
+        ready = true
+        cleanup()
+        resolve()
+      }, stabilityMs)
+      const onSpawn = (): void => { /* The stability timer remains authoritative. */ }
+      const onError = (error: Error): void => { if (!ready) { cleanup(); reject(error) } }
+      const onExit = (code: number | null, signal: NodeJS.Signals | null): void => {
+        if (!ready) {
+          cleanup()
+          reject(new Error(`Client process exited during startup (${code === null ? signal ?? 'unknown status' : `code ${code}`}).`))
+        }
+      }
+      const cleanup = (): void => {
+        clearTimeout(timer)
+        nativeChild.off('spawn', onSpawn)
+        nativeChild.off('error', onError)
+        nativeChild.off('exit', onExit)
+      }
+      nativeChild.once('spawn', onSpawn)
+      nativeChild.once('error', onError)
+      nativeChild.once('exit', onExit)
+  })
 }
 
 export interface ClientInstanceNodeSpawnOptions {
@@ -597,14 +805,24 @@ export interface ClientInstanceNodeSpawnOptions {
   stdio: 'inherit' | 'ignore'
 }
 
+export interface ClientInstanceSpawnInvocation {
+  command: string
+  args: string[]
+}
+
 /**
  * Resolve the direct Node spawn contract without silently turning an
  * interactive POSIX launch into a detached background process.
  *
- * Windows can allocate a separate console for a detached child. POSIX cannot;
- * it needs a real controlling terminal inherited from Stone+'s process. A
+ * Windows terminal launches use a hidden `cmd start /wait` supervisor which
+ * allocates the interactive console. POSIX needs a real controlling terminal
+ * inherited from Stone+'s process. A
  * packaged desktop launch therefore fails clearly and lets the user choose the
  * explicit background mode instead of starting an unusable hidden CLI.
+ *
+ * The Windows supervisor keeps stdio ignored because a packaged Electron main
+ * process has no console to inherit; only the supervised CLI receives the new
+ * visible console.
  */
 export function clientInstanceNodeSpawnOptions(
   platform: NodeJS.Platform,
@@ -618,10 +836,76 @@ export function clientInstanceNodeSpawnOptions(
     throw new Error('Visible terminal launch requires Stone+ to run from a controlling terminal on this platform. Choose background mode otherwise.')
   }
   return {
-    windowsHide: false,
-    detached: platform === 'win32',
-    stdio: 'inherit',
+    windowsHide: platform === 'win32',
+    detached: false,
+    stdio: platform === 'win32' ? 'ignore' : 'inherit',
   }
+}
+
+/**
+ * Map a configured executable onto an argv that Node's CreateProcess-based
+ * spawn can actually launch. Windows batch shims must go through cmd.exe.
+ */
+export function resolveClientInstanceSpawnInvocation(
+  platform: NodeJS.Platform,
+  executable: string,
+  args: readonly string[],
+  launchMode: ManagedClientLaunchMode = 'background',
+): ClientInstanceSpawnInvocation {
+  if (platform === 'win32' && launchMode === 'terminal') {
+    const commandProcessor = windowsCommandProcessor()
+    const target = isWindowsBatchScript(executable)
+      ? [commandProcessor, '/d', '/s', '/c', executable, ...args]
+      : executable.toLowerCase().endsWith('.ps1')
+        ? [windowsPowerShellExecutable(), '-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', executable, ...args]
+        : [executable, ...args]
+    return {
+      command: commandProcessor,
+      // `start /wait` is deliberate: it gives the CLI a real console/TTY while
+      // retaining a wrapper PID whose process tree Stone+ can terminate.
+      args: ['/d', '/s', '/c', 'start', 'Stone+ Client', '/wait', ...target],
+    }
+  }
+  if (platform === 'win32' && executable.toLowerCase().endsWith('.ps1')) {
+    return {
+      command: windowsPowerShellExecutable(),
+      args: ['-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', executable, ...args],
+    }
+  }
+  if (platform === 'win32' && isWindowsBatchScript(executable)) {
+    return {
+      command: windowsCommandProcessor(),
+      // /d disables AutoRun, /s keeps /c parsing simple for a path + args list.
+      args: ['/d', '/s', '/c', executable, ...args],
+    }
+  }
+  return { command: executable, args: [...args] }
+}
+
+function isWindowsBatchScript(executable: string): boolean {
+  const lower = executable.toLowerCase()
+  return lower.endsWith('.cmd') || lower.endsWith('.bat')
+}
+
+function windowsCommandProcessor(): string {
+  const comspec = process.env.ComSpec?.trim()
+  return comspec && comspec.length > 0 ? comspec : 'cmd.exe'
+}
+
+function windowsPowerShellExecutable(): string {
+  const systemRoot = process.env.SystemRoot?.trim()
+  return systemRoot ? `${systemRoot}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe` : 'powershell.exe'
+}
+
+async function resolveClientExecutable(executable: string, platform: NodeJS.Platform): Promise<string> {
+  if (platform !== 'win32' || extname(executable)) return executable
+  // where.exe can return extensionless npm shims and WindowsApps aliases ahead
+  // of their launchable siblings. Prefer the native/batch sibling deterministically.
+  for (const suffix of ['.exe', '.cmd', '.bat', '.ps1']) {
+    const candidate = `${executable}${suffix}`
+    if ((await stat(candidate).catch(() => undefined))?.isFile()) return candidate
+  }
+  return executable
 }
 
 async function waitForExit(exit: Promise<ProcessExit>, timeoutMs: number): Promise<boolean> {
@@ -709,7 +993,12 @@ function configDirectoryEnvironment(client: RouteClient, directory: string): Nod
     case 'codex': return { CODEX_HOME: directory }
     case 'claude': return { CLAUDE_CONFIG_DIR: directory }
     case 'gemini': return { GEMINI_CLI_HOME: directory }
+    case 'grokbuild': return { GROK_HOME: directory }
   }
+}
+
+function clientBaseEnvironment(client: RouteClient, environment: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return client === 'claude' ? withoutClaudeRelayModelEnvironment(environment) : { ...environment }
 }
 
 async function assertDirectory(path: string, label: string): Promise<void> {
@@ -729,7 +1018,9 @@ function requiredName(value: string): string {
 }
 
 function supportedClient(value: RouteClient): RouteClient {
-  if (value !== 'claude' && value !== 'codex' && value !== 'gemini') throw new Error('Unsupported client instance type.')
+  if (value !== 'claude' && value !== 'codex' && value !== 'gemini' && value !== 'grokbuild') {
+    throw new Error('Unsupported client instance type.')
+  }
   return value
 }
 
@@ -771,6 +1062,75 @@ function optionalIdentifier(value: string | undefined): string | undefined {
 
 function finiteTimestamp(value: number | undefined): number | undefined {
   return Number.isFinite(value) && value! >= 0 ? Number(value) : undefined
+}
+
+function parseProcessJournals(raw: string | undefined): ClientInstanceProcessJournal[] {
+  if (!raw) return []
+  try {
+    const parsed = JSON.parse(raw) as unknown
+    if (!Array.isArray(parsed)) return []
+    return parsed.flatMap((definition) => {
+      const value = definition && typeof definition === 'object'
+        ? (definition as { processJournal?: unknown }).processJournal
+        : undefined
+      if (!value || typeof value !== 'object') return []
+      const item = value as Partial<ClientInstanceProcessJournal>
+      return typeof item.instanceId === 'string' && Number.isSafeInteger(item.pid) && item.pid! > 0
+        && typeof item.executablePath === 'string' && typeof item.commandLine === 'string'
+        && typeof item.startedAt === 'number' && Number.isFinite(item.startedAt)
+        ? [item as ClientInstanceProcessJournal]
+        : []
+    })
+  } catch { return [] }
+}
+
+function sameProcessIdentity(
+  live: ClientInstanceProcessIdentity,
+  journal: ClientInstanceProcessIdentity,
+  platform: NodeJS.Platform,
+): boolean {
+  const normalize = (value: string): string => platform === 'win32' ? value.trim().toLowerCase() : value.trim()
+  return normalize(live.executablePath) === normalize(journal.executablePath)
+    && live.commandLine === journal.commandLine
+    && live.startedAt === journal.startedAt
+}
+
+function inspectClientProcess(pid: number, platform: NodeJS.Platform): Promise<ClientInstanceProcessIdentity | undefined> {
+  if (platform === 'win32') {
+    const script = `$p=Get-CimInstance Win32_Process -Filter 'ProcessId = ${pid}' -ErrorAction SilentlyContinue; if($p){[Console]::Out.Write(($p | Select-Object ExecutablePath,CommandLine,CreationDate | ConvertTo-Json -Compress))}`
+    return executeProcessInspection('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script]).then((stdout) => {
+      if (!stdout.trim()) return undefined
+      const value = JSON.parse(stdout) as { ExecutablePath?: unknown; CommandLine?: unknown; CreationDate?: unknown }
+      const startedAt = typeof value.CreationDate === 'string' ? Date.parse(value.CreationDate) : NaN
+      return typeof value.ExecutablePath === 'string' && typeof value.CommandLine === 'string' && Number.isFinite(startedAt)
+        ? { executablePath: value.ExecutablePath, commandLine: value.CommandLine, startedAt }
+        : undefined
+    })
+  }
+  return executeProcessInspection('/bin/ps', ['-p', String(pid), '-o', 'lstart=', '-o', 'comm=', '-o', 'args=']).then((stdout) => {
+    const match = /^(.{24})\s+(\S+)\s+(.+)$/s.exec(stdout.trim())
+    if (!match) return undefined
+    const startedAt = Date.parse(match[1])
+    return Number.isFinite(startedAt) ? { executablePath: match[2], commandLine: match[3], startedAt } : undefined
+  })
+}
+
+function executeProcessInspection(file: string, args: string[]): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile(file, args, { encoding: 'utf8', windowsHide: true }, (error, stdout) => error ? reject(error) : resolve(stdout))
+  })
+}
+
+async function terminateClientPidTree(pid: number, platform: NodeJS.Platform): Promise<void> {
+  if (platform === 'win32') {
+    await new Promise<void>((resolve, reject) => {
+      execFile('taskkill.exe', ['/PID', String(pid), '/T', '/F'], { windowsHide: true }, (error) => error ? reject(error) : resolve())
+    })
+    return
+  }
+  try { process.kill(pid, 'SIGKILL') } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error
+  }
 }
 
 function errorMessage(error: unknown): string {

@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type {
   BuiltInProxyImportInput,
+  BuiltInProxyNodeSummary,
   BuiltInProxyRuntimeState,
   ProxyConnectionSummary,
   ProxyTrafficSnapshot,
@@ -368,6 +369,24 @@ describe('built-in proxy IPC', () => {
     await invoke(builtInProxyIpcChannels.setEnabled, true)
 
     expect(harness.runtime.setEnabled.mock.calls.map(([enabled]) => enabled)).toEqual([true, false, true])
+  })
+
+  it('does not serialize lifecycle mutations behind an unresponsive latency read', async () => {
+    const harness = createHarness()
+    let finishLatency!: (nodes: BuiltInProxyNodeSummary[]) => void
+    harness.runtime.testLatency.mockImplementation(() => new Promise((resolve) => {
+      finishLatency = resolve
+    }))
+    registerBuiltInProxyApi(harness.store, harness.runtime)
+
+    const latency = invoke(builtInProxyIpcChannels.testLatency, 'profile-imported', ['node-imported'])
+    await vi.waitFor(() => expect(harness.runtime.testLatency).toHaveBeenCalledOnce())
+
+    await invoke(builtInProxyIpcChannels.setEnabled, true)
+    expect(harness.runtime.setEnabled).toHaveBeenCalledWith(true)
+
+    finishLatency(profileSummary().nodes)
+    await expect(latency).resolves.toEqual(expect.any(Array))
   })
 
   it('whitelists runtime, event, latency, traffic, and connection projections', async () => {

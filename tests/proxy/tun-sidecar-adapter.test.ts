@@ -16,6 +16,7 @@ import {
 import type {
   PlatformCommandRequest,
   TemporaryElevatedProcessHandle,
+  TemporaryElevatedProcessRecoveryRequest,
   TemporaryElevatedProcessRequest,
   TemporaryElevationProcessRunner
 } from '../../src/main/proxy/built-in/platform-adapters'
@@ -94,6 +95,46 @@ describe('elevated sing-box TUN sidecar configuration', () => {
 })
 
 describe('ElevatedSingBoxTunAdapter lifecycle', () => {
+  it('recovers and stops an authenticated sidecar journal left by a prior main process', async () => {
+    const directory = await temporaryDirectory()
+    const runner = new FakeProcessRunner()
+    const first = new ElevatedSingBoxTunAdapter({
+      userDataPath: directory,
+      runtimeRoot: join(directory, 'runtime'),
+      platform: 'win32',
+      verifyRuntime: async () => verifiedRuntime(directory, 'win32'),
+      commandRunner: async () => ({ stdout: '', stderr: '', exitCode: 0, signal: null }),
+      processRunner: runner,
+      randomId: () => 'crash-recovery-session',
+      resolveHost: resolveTestHost,
+      fetchImplementation: healthyTunFetch
+    })
+    const session = await first.startTemporaryElevated({ bypass: sidecarBypass() })
+    const recoveredStop = vi.fn(async () => undefined)
+    runner.recoveryHandle = { id: 'recovered', pid: session.pid, stop: recoveredStop }
+
+    const restarted = new ElevatedSingBoxTunAdapter({
+      userDataPath: directory,
+      runtimeRoot: join(directory, 'runtime'),
+      platform: 'win32',
+      verifyRuntime: async () => verifiedRuntime(directory, 'win32'),
+      commandRunner: async () => ({ stdout: '', stderr: '', exitCode: 0, signal: null }),
+      processRunner: runner,
+      resolveHost: resolveTestHost,
+      fetchImplementation: healthyTunFetch
+    })
+    await restarted.cleanupPending()
+
+    expect(runner.recover).toHaveBeenCalledWith(expect.objectContaining({
+      pid: session.pid,
+      launcher: 'windows-uac',
+      args: ['run', '-c', expect.stringContaining('sidecar-crash-recovery-session.json')]
+    }))
+    expect(recoveredStop).toHaveBeenCalledOnce()
+    await expect(readFile(join(directory, 'built-in-proxy', 'tun-sidecar', 'active-sidecar.json'), 'utf8'))
+      .rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
   it('verifies runtime, atomically writes mode-0600 config, checks it, elevates it, and cleans up on stop', async () => {
     const directory = await temporaryDirectory()
     const runtime = verifiedRuntime(directory, 'win32')
@@ -369,6 +410,8 @@ class FakeProcessRunner implements TemporaryElevationProcessRunner {
   public readonly requests: TemporaryElevatedProcessRequest[] = []
   public startError?: unknown
   public readonly stop = vi.fn(async () => undefined)
+  public readonly recover = vi.fn(async (_request: TemporaryElevatedProcessRecoveryRequest) => this.recoveryHandle)
+  public recoveryHandle?: TemporaryElevatedProcessHandle
 
   public async start(request: TemporaryElevatedProcessRequest): Promise<TemporaryElevatedProcessHandle> {
     this.requests.push({ ...request, args: [...request.args] })

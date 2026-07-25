@@ -4,6 +4,7 @@ import type { AppSnapshot, GatewayApi, ProxyInput, ProxyProtocol, PublicProxyDef
 import type { ActionRunner } from '../App'
 import { localizeBackendMessage } from '../backend-message'
 import { useI18n } from '../i18n'
+import { nextProxyProtocolDraft } from '../proxy-manager-state'
 import { Badge, ConfirmDialog, durationLabel, EmptyState, FieldError, Modal, relativeTime } from '../ui'
 
 const protocolLabels: Record<ProxyProtocol, string> = {
@@ -37,6 +38,7 @@ export function ProxyManager({
   const [modalOpen, setModalOpen] = useState(false)
   const [draft, setDraft] = useState<ProxyInput>(emptyProxy)
   const [existingHasPassword, setExistingHasPassword] = useState(false)
+  const [clearPasswordExplicitlySelected, setClearPasswordExplicitlySelected] = useState(false)
   const [errors, setErrors] = useState<Record<string, string>>({})
   const [deleteTarget, setDeleteTarget] = useState<PublicProxyDefinition | null>(null)
 
@@ -44,6 +46,7 @@ export function ProxyManager({
     setModalOpen(false)
     setDraft({ ...emptyProxy })
     setExistingHasPassword(false)
+    setClearPasswordExplicitlySelected(false)
     setErrors({})
   }
 
@@ -59,6 +62,7 @@ export function ProxyManager({
       clearPassword: false,
     } : { ...emptyProxy })
     setExistingHasPassword(Boolean(proxy?.hasPassword))
+    setClearPasswordExplicitlySelected(false)
     setErrors({})
     setModalOpen(true)
   }
@@ -127,12 +131,12 @@ export function ProxyManager({
       >
         <form id="proxy-form" className="form-grid" onSubmit={(event) => void submit(event)}>
           <label className="field field--full"><span>{t('显示名称', 'Display name')}</span><input autoFocus value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} placeholder={t('例如：Clash 本地出口', 'e.g. Local Clash proxy')} /><FieldError>{errors.name}</FieldError></label>
-          <label className="field"><span>{t('协议', 'Protocol')}</span><select value={draft.protocol} onChange={(event) => setDraft({ ...draft, protocol: event.target.value as ProxyProtocol, password: event.target.value === 'socks4' ? '' : draft.password, clearPassword: event.target.value === 'socks4' && existingHasPassword ? true : draft.clearPassword })}>{(Object.keys(protocolLabels) as ProxyProtocol[]).map((protocol) => <option key={protocol} value={protocol}>{protocolLabels[protocol]}</option>)}</select></label>
+          <label className="field"><span>{t('协议', 'Protocol')}</span><select value={draft.protocol} onChange={(event) => setDraft(nextProxyProtocolDraft(draft, event.target.value as ProxyProtocol, existingHasPassword, clearPasswordExplicitlySelected))}>{(Object.keys(protocolLabels) as ProxyProtocol[]).map((protocol) => <option key={protocol} value={protocol}>{protocolLabels[protocol]}</option>)}</select></label>
           <label className="field"><span>{t('端口', 'Port')}</span><input className="mono" type="number" min={1} max={65_535} value={draft.port} onChange={(event) => setDraft({ ...draft, port: Number(event.target.value) })} /><FieldError>{errors.port}</FieldError></label>
           <label className="field field--full"><span>{t('主机 / IP', 'Host / IP')}</span><input className="mono" value={draft.host} onChange={(event) => setDraft({ ...draft, host: event.target.value })} placeholder="127.0.0.1" /><FieldError>{errors.host}</FieldError></label>
           <label className="field"><span>{draft.protocol === 'socks4' ? t('User ID（可选）', 'User ID (optional)') : t('用户名（可选）', 'Username (optional)')}</span><input autoComplete="off" value={draft.username ?? ''} onChange={(event) => setDraft({ ...draft, username: event.target.value })} /></label>
           <label className="field"><span>{t('密码（可选）', 'Password (optional)')}</span><input type="password" autoComplete="new-password" disabled={draft.protocol === 'socks4'} value={draft.password ?? ''} onChange={(event) => setDraft({ ...draft, password: event.target.value, clearPassword: false })} placeholder={existingHasPassword ? t('留空表示保留现有密码', 'Leave blank to keep the current password') : ''} /><FieldError>{errors.password}</FieldError></label>
-          {existingHasPassword && draft.protocol !== 'socks4' && <label className="proxy-clear-auth field--full"><input type="checkbox" checked={Boolean(draft.clearPassword)} onChange={(event) => setDraft({ ...draft, clearPassword: event.target.checked, password: event.target.checked ? '' : draft.password })} /><span>{t('清除已保存的代理密码', 'Clear the saved proxy password')}</span></label>}
+          {existingHasPassword && draft.protocol !== 'socks4' && <label className="proxy-clear-auth field--full"><input type="checkbox" checked={Boolean(draft.clearPassword)} onChange={(event) => { setClearPasswordExplicitlySelected(event.target.checked); setDraft({ ...draft, clearPassword: event.target.checked, password: event.target.checked ? '' : draft.password }) }} /><span>{t('清除已保存的代理密码', 'Clear the saved proxy password')}</span></label>}
           <div className="form-context field--full"><Gauge size={16} /><span>{t('入口', 'Endpoint')}</span><code>{draft.host ? entryAddress(draft as Pick<PublicProxyDefinition, 'protocol' | 'host' | 'port'>) : '—'}</code></div>
         </form>
       </Modal>

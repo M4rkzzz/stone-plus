@@ -12,6 +12,19 @@ export {
 } from './chatgpt-account'
 export type { ChatGptCredentialBundle, ParsedChatGptAccounts } from './chatgpt-account'
 export {
+  deserializeGrokOAuthCredential,
+  GrokOAuthCredentialError,
+  GROK_OAUTH_BASE_URL,
+  GROK_OAUTH_CLIENT_ID,
+  GROK_OAUTH_TOKEN_URL,
+  matchesGrokOAuthCredential,
+  parseGrokOAuthImport,
+  refreshGrokOAuthCredential,
+  resolveGrokOAuthCredential,
+  serializeGrokOAuthCredential,
+} from './grok-account'
+export type { GrokOAuthCredentialBundle, ParsedGrokOAuthAccounts } from './grok-account'
+export {
   buildAuthorizationUrl,
   ChatGptOAuthFlowManager,
   CHATGPT_OAUTH_CALLBACK_PATH,

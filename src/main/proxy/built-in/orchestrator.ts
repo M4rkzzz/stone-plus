@@ -2,6 +2,7 @@ import type {
   BuiltInProxyErrorCategory,
   BuiltInProxyImportInput,
   BuiltInProxyNodeSummary,
+  BuiltInProxyPlatformCapabilities,
   BuiltInProxyRuntimeState,
   BuiltInProxySettings,
   OutboundNetworkMode,
@@ -116,7 +117,7 @@ export type BuiltInSystemProxyLease = Pick<
 
 export type BuiltInTunController = Pick<
   TunController,
-  'getState' | 'start' | 'retryStart' | 'stop' | 'retryStop' | 'onEvent'
+  'getState' | 'start' | 'retryStart' | 'stop' | 'retryStop' | 'recoverStale' | 'onEvent'
 >
 
 export interface BuiltInProxyOrchestratorOptions {
@@ -143,6 +144,7 @@ export interface BuiltInProxyOrchestratorOptions {
   now?: () => number
   subscriptionTimeoutMs?: number
   logger?: Pick<Console, 'warn' | 'error'>
+  platformCapabilities?: BuiltInProxyPlatformCapabilities
 }
 
 interface PersistenceSnapshot {
@@ -205,6 +207,7 @@ export class BuiltInProxyOrchestrator implements BuiltInProxyStoreFacade, BuiltI
   private readonly now: () => number
   private readonly subscriptionTimeoutMs: number
   private readonly logger: Pick<Console, 'warn' | 'error'>
+  private readonly platformCapabilities?: BuiltInProxyPlatformCapabilities
   private readonly listeners = new Set<(state: BuiltInProxyRuntimeState) => void>()
   private operationTail: Promise<void> = Promise.resolve()
   private unsubscribeRoute: () => void
@@ -220,6 +223,7 @@ export class BuiltInProxyOrchestrator implements BuiltInProxyStoreFacade, BuiltI
   private readonly blockedCoreGenerations = new Set<number>()
   private crashRecoveryPending = false
   private crashEpoch = 0
+  private latencyAbort?: AbortController
   private closing = false
   private closeFlight?: Promise<void>
   private closed = false
@@ -247,6 +251,7 @@ export class BuiltInProxyOrchestrator implements BuiltInProxyStoreFacade, BuiltI
     this.now = options.now ?? Date.now
     this.subscriptionTimeoutMs = Math.max(1_000, options.subscriptionTimeoutMs ?? DEFAULT_SUBSCRIPTION_TIMEOUT_MS)
     this.logger = options.logger ?? console
+    this.platformCapabilities = options.platformCapabilities
     this.routes.setRetryHandler(() => this.retry())
     this.unsubscribeRoute = this.routes.subscribe(() => this.emit())
     this.unsubscribeCore = this.core.onEvent((event) => this.onCoreEvent(event))
@@ -267,6 +272,7 @@ export class BuiltInProxyOrchestrator implements BuiltInProxyStoreFacade, BuiltI
       profiles: this.store.listBuiltInProxyProfiles(),
       effectiveRoute: route.effectiveRoute,
       accessState: this.accessState(settings, route),
+      ...(this.platformCapabilities ? { platformCapabilities: structuredClone(this.platformCapabilities) } : {}),
       coreVersion: core.version,
       ...(core.startedAt !== undefined ? { startedAt: core.startedAt } : {}),
       ...(this.lastReadyAt !== undefined ? { lastReadyAt: this.lastReadyAt } : {}),
@@ -285,9 +291,23 @@ export class BuiltInProxyOrchestrator implements BuiltInProxyStoreFacade, BuiltI
    * starting the gateway or issuing background upstream requests.
    */
   public initialize(): Promise<void> {
+    this.cancelLatencyTests()
     return this.enqueue(async () => {
       this.assertOpen()
       const persisted = this.store.getBuiltInProxySettings()
+      try {
+        // TUN sidecars are independently elevated processes. Recover any
+        // ownership journal left by a hard main-process crash before ordinary
+        // networking or a replacement sidecar can start.
+        await this.tunController.recoverStale()
+      } catch (error) {
+        const failure = classifyError(error, 'tun-elevation')
+        this.transitionError = failure
+        if (persisted.desiredEnabled && persisted.hasEverActivated) this.routes.failClosed(failure)
+        else this.routes.reportError(failure)
+        this.emit()
+        throw new BuiltInProxyOperationError(failure.category, failure.message, true, error)
+      }
       try {
         const recovery = await this.systemProxyLease.recoverStaleLease()
         // If an earlier bootstrap repair was transiently unable to restore the
@@ -313,20 +333,20 @@ export class BuiltInProxyOrchestrator implements BuiltInProxyStoreFacade, BuiltI
         this.emit()
         return
       }
+      if (!settings.autoStart) {
+        // desiredEnabled describes the live route. A previous session may have
+        // been enabled while auto-start was later turned off; on a fresh boot
+        // that intent must become a normal disabled/external route, not an
+        // artificial fail-closed error requiring a retry.
+        await this.store.setBuiltInProxyDesiredEnabled(false)
+        this.transitionError = undefined
+        if (this.routes.isIntercepting()) this.routes.completeDisable()
+        this.emit()
+        return
+      }
       const profile = this.resolveActiveProfile()
       if (!profile && !settings.hasEverActivated) {
         this.handleMissingProfile(settings)
-        return
-      }
-      if (!settings.autoStart) {
-        const failure: BuiltInProxyRouteError = {
-          category: 'health-check',
-          message: 'Built-in proxy auto-start is disabled while the enabled route is persisted; retry to start it.',
-          retryable: true,
-        }
-        this.transitionError = failure
-        this.routes.failClosed(failure)
-        this.emit()
         return
       }
       if (profile) await this.enableExclusive(false)
@@ -335,6 +355,7 @@ export class BuiltInProxyOrchestrator implements BuiltInProxyStoreFacade, BuiltI
   }
 
   public setEnabled(enabled: boolean): Promise<void> {
+    this.cancelLatencyTests()
     return this.enqueue(async () => {
       this.assertOpen()
       await this.store.setBuiltInProxyDesiredEnabled(enabled)
@@ -352,6 +373,7 @@ export class BuiltInProxyOrchestrator implements BuiltInProxyStoreFacade, BuiltI
   }
 
   public retry(): Promise<void> {
+    this.cancelLatencyTests()
     return this.enqueue(async () => {
       this.assertOpen()
       this.transitionError = undefined
@@ -368,6 +390,7 @@ export class BuiltInProxyOrchestrator implements BuiltInProxyStoreFacade, BuiltI
   }
 
   public reconcile(reason: BuiltInProxyReconcileReason): Promise<void> {
+    this.cancelLatencyTests()
     return this.enqueue(() => this.reconcileExclusive(reason))
   }
 
@@ -375,6 +398,7 @@ export class BuiltInProxyOrchestrator implements BuiltInProxyStoreFacade, BuiltI
     reason: BuiltInProxyReconcileReason,
     mutation: () => Promise<void>,
   ): Promise<void> {
+    this.cancelLatencyTests()
     return this.enqueue(async () => {
       this.assertOpen()
       const before = this.capturePersistence()
@@ -504,7 +528,10 @@ export class BuiltInProxyOrchestrator implements BuiltInProxyStoreFacade, BuiltI
   }
 
   public testLatency(profileId?: string, nodeIds?: string[]): Promise<BuiltInProxyNodeSummary[]> {
-    return this.enqueue(async () => {
+    this.cancelLatencyTests()
+    const controller = new AbortController()
+    this.latencyAbort = controller
+    const flight = (async () => {
       this.assertOpen()
       const profile = profileId ? this.requireProfile(profileId) : this.resolveActiveProfile()
       if (!profile) throw new BuiltInProxyOperationError('configuration-invalid', 'No active proxy profile is available.', false)
@@ -519,25 +546,37 @@ export class BuiltInProxyOrchestrator implements BuiltInProxyStoreFacade, BuiltI
       const selectedIds = nodeIds?.length ? new Set(nodeIds) : undefined
       const nodes = profile.nodes.filter((node) => !selectedIds || selectedIds.has(node.id))
       for (const node of nodes) {
+        throwIfAborted(controller.signal)
         await this.store.setBuiltInProxyNodeLatency(profile.id, node.id, { latencyStatus: 'testing' })
       }
       await forEachWithConcurrency(nodes, LATENCY_TEST_CONCURRENCY, async (node) => {
+        throwIfAborted(controller.signal)
         try {
-          const result = await this.core.testLatency(outboundTagForNodeId(node.id))
+          const result = await raceWithAbort(
+            this.core.testLatency(outboundTagForNodeId(node.id)),
+            controller.signal,
+          )
+          throwIfAborted(controller.signal)
           await this.store.setBuiltInProxyNodeLatency(profile.id, node.id, {
             latencyStatus: 'available',
             latencyMs: result.delayMs,
             lastTestedAt: result.testedAt,
           })
         } catch (error) {
+          if (controller.signal.aborted) throw latencyCancelledError()
           await this.store.setBuiltInProxyNodeLatency(profile.id, node.id, {
             latencyStatus: isTimeoutError(error) ? 'timeout' : 'error',
             lastTestedAt: this.now(),
           })
         }
-      })
+      }, controller.signal)
+      throwIfAborted(controller.signal)
       return this.requireProfile(profile.id).nodes
-    })
+    })()
+    void flight.finally(() => {
+      if (this.latencyAbort === controller) this.latencyAbort = undefined
+    }).catch(() => undefined)
+    return flight
   }
 
   public getTraffic(): Promise<ProxyTrafficSnapshot> {
@@ -571,6 +610,7 @@ export class BuiltInProxyOrchestrator implements BuiltInProxyStoreFacade, BuiltI
     // drained; later renderer/background work is rejected instead of slipping
     // behind the shutdown barrier.
     this.closing = true
+    this.cancelLatencyTests()
     const flight = (async () => {
       await this.operationTail.catch(() => undefined)
       try {
@@ -1288,6 +1328,7 @@ export class BuiltInProxyOrchestrator implements BuiltInProxyStoreFacade, BuiltI
   private onCoreEvent(event: SingBoxRuntimeEvent): void {
     if (this.closed || this.closing) return
     if (event.type === 'crash') {
+      this.cancelLatencyTests()
       if (!this.store.getBuiltInProxySettings().desiredEnabled && !this.routes.isIntercepting()) return
       const activeGeneration = this.activeAccess?.core.generation
       const pendingGeneration = this.pendingAccess?.core.generation
@@ -1342,6 +1383,7 @@ export class BuiltInProxyOrchestrator implements BuiltInProxyStoreFacade, BuiltI
   private onTunEvent(event: TunControllerEvent): void {
     if (this.closed || this.closing || event.type !== 'unexpected-exit') return
     if (!this.store.getBuiltInProxySettings().desiredEnabled && !this.routes.isIntercepting()) return
+    this.cancelLatencyTests()
     const pendingMatches = this.pendingAccess
       ? this.tunEventMatches(event, this.pendingAccess)
       : false
@@ -1375,6 +1417,7 @@ export class BuiltInProxyOrchestrator implements BuiltInProxyStoreFacade, BuiltI
   private onSystemProxyEvent(event: SystemProxyLeaseEvent): void {
     if (this.closed || this.closing || event.type !== 'unexpected-drift') return
     if (!this.store.getBuiltInProxySettings().desiredEnabled && !this.routes.isIntercepting()) return
+    this.cancelLatencyTests()
     const failedLeaseId = event.state.leaseId
     const pendingMatches = Boolean(
       this.pendingAccess?.mode === 'system'
@@ -1629,6 +1672,11 @@ export class BuiltInProxyOrchestrator implements BuiltInProxyStoreFacade, BuiltI
     return result
   }
 
+  private cancelLatencyTests(): void {
+    this.latencyAbort?.abort()
+    this.latencyAbort = undefined
+  }
+
   private assertOpen(): void {
     if (this.closed) throw new BuiltInProxyOperationError('unknown', 'The built-in proxy orchestrator is closed.', false)
   }
@@ -1638,17 +1686,36 @@ async function forEachWithConcurrency<T>(
   values: readonly T[],
   concurrency: number,
   operation: (value: T, index: number) => Promise<void>,
+  signal?: AbortSignal,
 ): Promise<void> {
   let nextIndex = 0
   const workerCount = Math.min(values.length, Math.max(1, Math.floor(concurrency)))
   const workers = Array.from({ length: workerCount }, async () => {
     while (nextIndex < values.length) {
+      if (signal?.aborted) throw latencyCancelledError()
       const index = nextIndex
       nextIndex += 1
       await operation(values[index], index)
     }
   })
   await Promise.all(workers)
+}
+
+function raceWithAbort<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(latencyCancelledError())
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => reject(latencyCancelledError())
+    signal.addEventListener('abort', onAbort, { once: true })
+    void operation.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort))
+  })
+}
+
+function throwIfAborted(signal: AbortSignal): void {
+  if (signal.aborted) throw latencyCancelledError()
+}
+
+function latencyCancelledError(): BuiltInProxyOperationError {
+  return new BuiltInProxyOperationError('unknown', 'Latency testing was cancelled by a proxy lifecycle change.', true)
 }
 
 export class BuiltInProxyOperationError extends Error {

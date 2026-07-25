@@ -1222,6 +1222,12 @@
   color: var(--accent-strong);
 }
 
+.client-setting-options > span.active--maximum {
+  border-color: color-mix(in srgb, var(--violet) 48%, var(--border));
+  background: var(--violet-soft);
+  color: var(--violet);
+}
+
 .client-setting-options strong {
   font-weight: 680;
 }
@@ -1380,7 +1386,7 @@
   counter-reset: line;
 }
 
-.client-code-preview > button {
+.client-code-preview > div {
   display: grid;
   grid-template-columns: 42px minmax(max-content, 1fr);
   width: 100%;
@@ -1396,21 +1402,26 @@
   cursor: default;
 }
 
-.client-code-preview > button:hover {
+.client-code-preview > div:hover {
   background: rgb(255 255 255 / 3%);
 }
 
-.client-code-preview > button.is-highlighted {
+.client-code-preview > div.is-highlighted {
   border-left-color: #51c397;
   background: var(--client-manager-highlight);
   color: #f1fbf7;
 }
 
-.client-code-preview > button > span {
+.client-code-preview > div > span {
   padding-right: 9px;
   color: #64736d;
   text-align: right;
   user-select: none;
+}
+
+.client-code-preview:focus-visible {
+  outline: 2px solid #51c397;
+  outline-offset: -2px;
 }
 
 .client-code-preview code {
@@ -1506,6 +1517,291 @@
   font-size: 10px;
 }
 
+/* Guided client installation. Keep the default action obvious; paths stay in Advanced. */
+.client-install-list {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 10px;
+}
+
+.client-install-list.is-pair { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+
+.client-install {
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--surface);
+  box-shadow: var(--shadow-sm);
+}
+
+.client-install__main {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  min-height: 82px;
+  align-items: center;
+  gap: 18px;
+  padding: 13px 14px;
+}
+
+.client-install__identity {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 11px;
+}
+
+.client-install__icon {
+  display: inline-flex;
+  width: 40px;
+  height: 40px;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-subtle);
+}
+
+.client-install__icon img,
+.client-install__icon > svg {
+  width: 25px;
+  height: 25px;
+  object-fit: contain;
+}
+
+.client-install__copy {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.client-install__title {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.client-install__title strong {
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 18px;
+}
+
+.client-install__description {
+  max-width: 680px;
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 15px;
+  overflow-wrap: anywhere;
+}
+
+.client-install__status {
+  display: inline-flex;
+  min-height: 20px;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 7px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-subtle);
+  color: var(--muted);
+  font-size: 8px;
+  font-weight: 650;
+  line-height: 16px;
+  white-space: nowrap;
+}
+
+.client-install__status.is-installed {
+  border-color: #c7ddd5;
+  background: #f1f8f5;
+  color: var(--accent-strong);
+}
+
+.client-install__status.is-missing {
+  border-color: #eadfc7;
+  background: #fffbf3;
+  color: #936514;
+}
+
+.client-install__status.is-error {
+  border-color: #ecd1cf;
+  background: #fff7f6;
+  color: var(--danger);
+}
+
+.client-install__actions {
+  display: flex;
+  min-width: 176px;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 7px;
+}
+
+.client-install__actions .button {
+  min-width: 104px;
+  height: 36px;
+  flex: 0 0 auto;
+  justify-content: center;
+  white-space: nowrap;
+}
+
+.client-install__actions .icon-button {
+  width: 34px;
+  height: 34px;
+  flex: 0 0 auto;
+}
+
+.client-install__actions .client-install__primary { min-width: 138px; }
+
+.client-install__progress,
+.client-install__error {
+  display: flex;
+  min-height: 36px;
+  align-items: flex-start;
+  gap: 7px;
+  padding: 8px 14px;
+  border-top: 1px solid var(--border);
+  font-size: 9px;
+  line-height: 16px;
+  overflow-wrap: anywhere;
+}
+
+.client-install__progress {
+  background: #f6faf8;
+  color: var(--accent-strong);
+}
+
+.client-install__error {
+  background: #fff7f6;
+  color: var(--danger);
+}
+
+.client-install__progress > svg,
+.client-install__error > svg {
+  flex: 0 0 auto;
+  margin-top: 1px;
+}
+
+.client-install__advanced {
+  border-top: 1px solid var(--border);
+  background: #fbfcfb;
+}
+
+.client-install__advanced-toggle {
+  display: flex;
+  width: 100%;
+  min-height: 39px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 6px 14px;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 9px;
+  font-weight: 620;
+  text-align: left;
+  cursor: pointer;
+  list-style: none;
+}
+
+.client-install__advanced-toggle::-webkit-details-marker { display: none; }
+
+.client-install__advanced-toggle:hover:not(:disabled) {
+  background: #f5f8f6;
+  color: var(--text);
+}
+
+.client-install__advanced-toggle:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 35%, transparent);
+  outline-offset: -2px;
+}
+
+.client-install__advanced-toggle > span {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 7px;
+}
+
+.client-install__advanced-toggle > svg {
+  flex: 0 0 auto;
+  transition: transform 160ms ease;
+}
+
+.client-install__advanced.is-open .client-install__advanced-toggle > svg,
+.client-install__advanced[open] > .client-install__advanced-toggle > svg {
+  transform: rotate(180deg);
+}
+
+.client-install__advanced-body {
+  padding: 10px 14px 12px;
+  border-top: 1px solid var(--border);
+}
+
+.client-install__advanced-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px 14px;
+}
+
+.client-install__field {
+  display: grid;
+  min-width: 0;
+  align-content: start;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 8px;
+  font-weight: 650;
+}
+
+.client-install__field input,
+.client-install__field select {
+  width: 100%;
+  min-width: 0;
+  height: 34px;
+  padding: 0 9px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  outline: 0;
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-size: 10px;
+  font-weight: 450;
+}
+
+.client-install__field input:focus,
+.client-install__field select:focus {
+  border-color: #8db9aa;
+  box-shadow: 0 0 0 2px rgb(47 118 104 / 9%);
+}
+
+.client-install__path {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+}
+
+.client-install__path input { flex: 1; }
+.client-install__path .button,
+.client-install__path .icon-button { flex: 0 0 auto; }
+
+.client-install__hint {
+  margin: 9px 0 0;
+  color: var(--faint);
+  font-size: 8px;
+  font-weight: 450;
+  line-height: 13px;
+  overflow-wrap: anywhere;
+}
+
 @media (max-width: 1260px) {
   .client-manager-context {
     grid-template-columns: minmax(270px, 1fr) minmax(300px, 1fr);
@@ -1543,6 +1839,8 @@
 
 @media (max-width: 980px) {
   .page-stack.client-manager-page { padding: 8px 18px 32px; }
+
+  .client-install-list.is-pair { grid-template-columns: minmax(0, 1fr); }
 
   .client-easy-route {
     grid-template-columns: minmax(220px, 1fr) 28px minmax(210px, 1fr);
@@ -1600,6 +1898,21 @@
 }
 
 @media (max-width: 720px) {
+  .client-install__main {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 11px;
+  }
+
+  .client-install__actions {
+    width: 100%;
+    min-width: 0;
+    justify-content: flex-start;
+  }
+
+  .client-install__advanced-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
   .client-manager-tabs {
     overflow-x: auto;
   }
@@ -1686,6 +1999,35 @@
   .client-easy-actions { padding-right: 10px; padding-left: 10px; }
 
   .client-easy-problem { margin-right: 10px; margin-left: 10px; }
+
+  .client-install__main,
+  .client-install__advanced-toggle,
+  .client-install__advanced-body,
+  .client-install__progress,
+  .client-install__error {
+    padding-right: 10px;
+    padding-left: 10px;
+  }
+
+  .client-install__identity { align-items: flex-start; }
+
+  .client-install__actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .client-install__actions .button,
+  .client-install__actions .client-install__primary {
+    width: 100%;
+    min-width: 0;
+  }
+
+  .client-install__path {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .client-install__path .button { width: 100%; }
 
   .client-manager-tabs .client-manager-tabs__state {
     display: none;

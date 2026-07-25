@@ -7,6 +7,7 @@ import { previewRoute } from '@shared/route-preview'
 import {
   hasRouteSourceIdCollision,
   isAvailableRouteAccount,
+  isNativeGrokRouteSource,
   resolveRouteSource
 } from '@shared/route-sources'
 import type {
@@ -32,7 +33,7 @@ import type {
   UiLanguage
 } from '@shared/types'
 import type { GatewayAccountState, GatewayConfig, GatewayRuntimeStateUpdate } from '../gateway'
-import { checkChatGptAccountAuthorized, codexQuotaCooldownUntil, codexQuotaIsExhausted, getProviderAdapter, probeChatGptAccountAuthorized, probeChatGptCodexModel, probeProviderModel, queryChatGptCodexModels, queryChatGptCodexModelsAuthorized, queryChatGptCodexQuota, queryChatGptCodexQuotaAuthorized, resolveChatGptCredential, type ProviderFailure } from '../providers'
+import { applyGrokBuildHeaders, checkChatGptAccountAuthorized, codexQuotaCooldownUntil, codexQuotaIsExhausted, getProviderAdapter, probeChatGptAccountAuthorized, probeChatGptCodexModel, probeProviderModel, queryChatGptCodexModels, queryChatGptCodexModelsAuthorized, queryChatGptCodexQuota, queryChatGptCodexQuotaAuthorized, queryGrokBuildQuota, resolveChatGptCredential, type GrokBuildQuotaResult, type GrokBuildQuotaSnapshot, type ProviderFailure } from '../providers'
 import { validateAccountImportProxySelection, type AppStore } from '../store/app-store'
 import type { ClientConfigService } from '../client-config'
 import { WebDavBackupService, type DatabaseBackupService } from '../backup'
@@ -50,7 +51,7 @@ import type { BrowserImportQueue } from '../browser-import-queue'
 import { verifySetupRouteRequest } from '../setup/setup-verification'
 import { probeApiSource as runApiSourceProbe } from '../sources/api-source-service'
 import { ChatGptOAuthFlowManager, type ChatGptOAuthSessionController } from '../auth/chatgpt-oauth-flow'
-import { resolveChatGptAgentIdentity, serializeChatGptCredential } from '../auth'
+import { GROK_OAUTH_BASE_URL, resolveChatGptAgentIdentity, resolveGrokOAuthCredential, serializeChatGptCredential } from '../auth'
 import type { LocalEventServer } from '../events'
 
 export interface GatewayController {
@@ -94,6 +95,8 @@ export function registerGatewayApi(
     temporaryDirectory: join(app.getPath('userData'), 'webdav-transfer'),
   }) : undefined)
   const runtimeDeltaPublishIntervalMs = 50
+  const busyRuntimeDeltaPublishIntervalMs = 250
+  const busyRuntimeDeltaRequestThreshold = 4
   const accountStateFlushDelayMs = 250
   const requestLogCheckpointIntervalMs = 10_000
   const noEligibleProbeCooldownMs = 30_000
@@ -108,6 +111,7 @@ export function registerGatewayApi(
   const pendingRuntimeAccountIds = new Set<string>()
   const pendingHealthEvents = new Map<string, AppSnapshot['healthEvents'][number]>()
   const publishedAccountRuntimeKeys = new Map<string, string>()
+  let publishedGatewayStatusKey: string | undefined
   let scheduledAccountStateFlush: ReturnType<typeof setTimeout> | undefined
   let accountStateFlushFlight: Promise<void> | undefined
   const pendingActiveAccountStates = new Map<string, GatewayAccountState>()
@@ -302,6 +306,7 @@ export function registerGatewayApi(
     pendingRuntimeAccountIds.clear()
     pendingHealthEvents.clear()
     const enriched = withRuntimeMetrics(snapshot, ++runtimeRevision)
+    publishedGatewayStatusKey = JSON.stringify(enriched.gatewayStatus)
     publishedAccountRuntimeKeys.clear()
     for (const account of enriched.accounts) publishedAccountRuntimeKeys.set(account.id, JSON.stringify(account))
     for (const window of BrowserWindow.getAllWindows()) {
@@ -367,9 +372,15 @@ export function registerGatewayApi(
       publishedAccountRuntimeKeys.set(account.id, key)
       return true
     })
+    const candidateGatewayStatus = sendGatewayStatus ? gateway.getStatus() : undefined
+    const gatewayStatusKey = candidateGatewayStatus ? JSON.stringify(candidateGatewayStatus) : undefined
+    const gatewayStatus = candidateGatewayStatus && gatewayStatusKey !== publishedGatewayStatusKey
+      ? candidateGatewayStatus
+      : undefined
+    if (gatewayStatus && gatewayStatusKey) publishedGatewayStatusKey = gatewayStatusKey
     const delta: AppRuntimeDelta = {
       revision: ++runtimeRevision,
-      ...(sendGatewayStatus ? { gatewayStatus: gateway.getStatus() } : {}),
+      ...(gatewayStatus ? { gatewayStatus } : {}),
       ...(logs.length ? { requestLogs: logs } : {}),
       ...(accounts.length ? { accounts } : {}),
       ...(healthEvents.length ? { healthEvents } : {}),
@@ -400,10 +411,13 @@ export function registerGatewayApi(
     if (options.healthEvent) pendingHealthEvents.set(options.healthEvent.id, options.healthEvent)
     if (options.observability) pendingObservability = true
     if (scheduledRuntimeDeltaPublish) return
+    const publishIntervalMs = gateway.getStatus().activeRequests >= busyRuntimeDeltaRequestThreshold
+      ? busyRuntimeDeltaPublishIntervalMs
+      : runtimeDeltaPublishIntervalMs
     const elapsed = lastRuntimeDeltaPublishAt === undefined
-      ? runtimeDeltaPublishIntervalMs
+      ? publishIntervalMs
       : Date.now() - lastRuntimeDeltaPublishAt
-    const delay = Math.max(0, runtimeDeltaPublishIntervalMs - elapsed)
+    const delay = Math.max(0, publishIntervalMs - elapsed)
     scheduledRuntimeDeltaPublish = setTimeout(flushRuntimeDelta, delay)
     scheduledRuntimeDeltaPublish.unref?.()
   }
@@ -600,7 +614,13 @@ export function registerGatewayApi(
         lastUsedAt: now,
         cooldownUntil,
         cooldownReason: exhausted ? 'quota' : undefined,
-        ...(result.codexQuota ? { codexQuota: result.codexQuota } : {})
+        ...(result.codexQuota ? { codexQuota: result.codexQuota } : {}),
+        ...(result.grokQuota ? {
+          grokQuota: result.grokQuota,
+          ...(Object.hasOwn(result, 'quotaRemaining')
+            ? { quotaRemaining: result.quotaRemaining, quotaUnit: result.quotaUnit }
+            : {}),
+        } : {})
       }, () => accountProbeOwners.get(id)?.token === token && !signal?.aborted)
       signal?.throwIfAborted()
       if (!persisted.applied || accountProbeOwners.get(id)?.token !== token) {
@@ -1363,6 +1383,37 @@ export function registerGatewayApi(
     emitImportProgress(event.sender, input?.progressId, { phase: 'complete', completed: imported.importedAccountIds.length, total: imported.importedAccountIds.length, percent: 100, message: nativeText('导入、状态刷新与模型查询已完成', 'Import, status refresh, and model lookup complete') })
     return { ...imported, detectionResults, assignmentSummary, snapshot: store.getSnapshot() }
   })
+  ipcMain.handle('stone:import-grok-accounts', async (event, input: Parameters<GatewayApi['importGrokAccounts']>[0]) => {
+    assertTrustedSender(event)
+    const imported = await store.importGrokAccounts(input)
+    publish(refreshRuntime())
+    // Populate quota without making import wait for every remote control-plane
+    // call or spending inference tokens. Results are account-local and only a
+    // newer snapshot may win; transient Billing failures leave last-known-good
+    // data and account health untouched.
+    void mapConcurrent([...new Set(imported.importedAccountIds)], 3, async (accountId) => {
+      if (closed) return
+      const account = store.getRuntimeAccount(accountId)
+      if (!account || account.credentialType !== 'grok-oauth') return
+      const fetchImplementation = accountFetchImplementation(store, outboundTransport, account)
+      const result = await queryGrokOAuthAccountBilling(store, account, fetchImplementation)
+      if (!result.billing.ok || closed) return
+      const quota = result.billing.quota
+      const quotaPatch = grokQuotaAccountPatch(quota)
+      const persisted = await store.setAccountCheckResultIf(accountId, quotaPatch, () => {
+        const current = store.getRuntimeAccount(accountId)
+        return current?.credentialType === 'grok-oauth'
+          && (current.grokQuota?.observedAt ?? 0) <= quota.observedAt
+      })
+      if (!persisted.applied) return
+      const refreshed = store.getRuntimeAccount(accountId)
+      if (refreshed) gateway.updateRuntimeAccounts([refreshed])
+      publishRuntimeAccount(accountId)
+    }).catch((error: unknown) => {
+      console.error('Stone+ could not refresh imported Grok account quota', error)
+    })
+    return { ...imported, snapshot: store.getSnapshot() }
+  })
   ipcMain.handle('stone:start-chatgpt-oauth', async (event, input: Parameters<GatewayApi['startChatGptOAuth']>[0]) => {
     assertTrustedSender(event)
     if (!input || typeof input !== 'object') throw new Error('OAuth 授权参数无效。')
@@ -1842,7 +1893,8 @@ export function registerGatewayApi(
       const existingAccount = input.id
         ? store.getRuntimeAccounts().find((account) => account.providerId === input.id
           && account.credentialType !== 'chatgpt-oauth'
-          && account.credentialType !== 'chatgpt-agent-identity')
+          && account.credentialType !== 'chatgpt-agent-identity'
+          && account.credentialType !== 'grok-oauth')
         : undefined
       const selectedProxyId = typeof normalized.proxyId === 'string' && normalized.proxyId.trim()
         ? normalized.proxyId.trim()
@@ -2282,7 +2334,13 @@ export function registerGatewayApi(
   })
   ipcMain.handle('stone:update-desktop-runtime-settings', (event, settings: { launchAtLogin: boolean }) => {
     assertTrustedSender(event)
-    if (app.isPackaged) app.setLoginItemSettings({ openAtLogin: Boolean(settings.launchAtLogin) })
+    if (app.isPackaged) {
+      app.setLoginItemSettings({
+        openAtLogin: Boolean(settings.launchAtLogin),
+        openAsHidden: Boolean(settings.launchAtLogin),
+        args: settings.launchAtLogin ? ['--hidden'] : [],
+      })
+    }
     return { launchAtLogin: app.isPackaged ? app.getLoginItemSettings().openAtLogin : false, supported: app.isPackaged }
   })
   ipcMain.handle('stone:export-diagnostics', (event) => {
@@ -2344,8 +2402,25 @@ export function registerGatewayApi(
       if (wasRunning) await gateway.stop({ force: true })
       try {
         const result = await backups.restoreBackup(backupIdFromPath(path))
+        const restoredGateway = store.getSnapshot().gateway
+        // The repository is deliberately read-only after a committed restore.
+        // Do not let the previous generation's timer run with restored policy
+        // or retention, and refresh the public snapshot before relaunching.
+        backups.stopAutomaticBackups()
+        await backups.setAutomaticRetention(restoredGateway.backupRetention ?? 10).catch((error: unknown) => {
+          console.error('Stone+ could not prune backups to the restored retention before relaunch', error)
+        })
+        outboundTransport.configureOutboundNetwork(
+          restoredGateway.outboundNetworkMode ?? 'direct',
+          restoredGateway.port,
+        )
         gateway.updateConfig(toGatewayConfig(store))
         store.setGatewayStatus(gateway.getStatus())
+        publish(store.getSnapshot())
+        setImmediate(() => {
+          app.relaunch()
+          app.quit()
+        })
         return { restored: toBackupSummary(result.restoredBackup), restartRequired: true }
       } catch (error) {
         if (wasRunning) {
@@ -2661,6 +2736,10 @@ function clientConnectionTarget(store: AppStore, client: RouteClient): { gateway
   if (route.inboundProtocol !== clientNativeProtocols[client]) {
     throw new Error(`The ${client} route does not use its native client protocol.`)
   }
+  if (client === 'grokbuild'
+    && !isNativeGrokRouteSource(resolveRouteSource(route.poolId, snapshot), snapshot)) {
+    throw new Error('Choose a native OpenAI Responses Grok account pool or Grok relay source before configuring Grok Build.')
+  }
   const host = snapshot.gateway.host.includes(':') ? `[${snapshot.gateway.host}]` : snapshot.gateway.host
   return {
     gatewayBaseUrl: `http://${host}:${snapshot.gateway.port}`,
@@ -2669,7 +2748,7 @@ function clientConnectionTarget(store: AppStore, client: RouteClient): { gateway
 }
 
 function assertRouteClient(value: unknown): asserts value is RouteClient {
-  if (value !== 'claude' && value !== 'codex' && value !== 'gemini') {
+  if (value !== 'claude' && value !== 'codex' && value !== 'gemini' && value !== 'grokbuild') {
     throw new Error('Unsupported client configuration target.')
   }
 }
@@ -2702,6 +2781,10 @@ function normalizeApiSourceProbeInput(
     }
     return { ...input, baseUrl: 'https://api.openai.com/v1' }
   }
+  if (input.kind === 'xai') {
+    if (input.protocol !== 'openai-chat') throw new Error('xAI 官方 API 当前使用 Chat Completions 兼容桥。')
+    return { ...input, baseUrl: 'https://api.x.ai/v1' }
+  }
   if (input.kind === 'anthropic') {
     if (input.protocol !== 'anthropic-messages') throw new Error('Anthropic 官方 API 仅支持 Messages。')
     return { ...input, baseUrl: 'https://api.anthropic.com' }
@@ -2710,7 +2793,7 @@ function normalizeApiSourceProbeInput(
     if (input.protocol !== 'gemini') throw new Error('Google 官方 API 仅支持 Gemini。')
     return { ...input, baseUrl: 'https://generativelanguage.googleapis.com' }
   }
-  throw new Error('官方 API 仅支持 OpenAI、Anthropic 和 Google Gemini。')
+  throw new Error('官方 API 仅支持 OpenAI、xAI、Anthropic 和 Google Gemini。')
 }
 
 function apiSourceProbeConnectionFingerprint(input: Pick<
@@ -2874,7 +2957,13 @@ async function checkAccount(
   outboundTransport: OutboundTransportManager,
   accountId: string,
   signal?: AbortSignal,
-): Promise<{ latencyMs: number; codexQuota?: AppSnapshot['accounts'][number]['codexQuota'] }> {
+): Promise<{
+  latencyMs: number
+  codexQuota?: AppSnapshot['accounts'][number]['codexQuota']
+  grokQuota?: AppSnapshot['accounts'][number]['grokQuota']
+  quotaRemaining?: number
+  quotaUnit?: AppSnapshot['accounts'][number]['quotaUnit']
+}> {
   signal?.throwIfAborted()
   const snapshot = store.getSnapshot()
   const account = store.getRuntimeAccount(accountId)
@@ -2907,6 +2996,14 @@ async function checkAccount(
     }, fetchImplementation, boundedAbortSignal(signal, 30_000))
     if (!result.ok) throw new AccountProbeError(result.failure)
     return { latencyMs: result.latencyMs, ...(result.quota ? { codexQuota: result.quota } : {}) }
+  }
+  if (account.credentialType === 'grok-oauth') {
+    const result = await probeGrokOAuthAccount(store, account, fetchImplementation, account.modelAllowlist[0] ?? 'grok-4.5', signal)
+    if (!result.ok) throw new AccountProbeError(result.failure)
+    return {
+      latencyMs: result.latencyMs,
+      ...(result.quotaPatch ?? {}),
+    }
   }
   const credential = store.getCredential(account.credentialId)
   if (!credential) throw new Error('This account has no readable credential.')
@@ -2943,8 +3040,11 @@ function accountCheckState(account: Account): Parameters<AppStore['setAccountChe
     cooldownReason: account.cooldownReason,
     circuitState: account.circuitState,
     consecutiveFailures: account.consecutiveFailures,
+    quotaRemaining: account.quotaRemaining,
+    quotaUnit: account.quotaUnit,
     quota: account.quota,
     codexQuota: account.codexQuota,
+    grokQuota: account.grokQuota,
   }
 }
 
@@ -2976,6 +3076,8 @@ export async function discoverAccountModels(
   const provider = snapshot.providers.find((candidate) => candidate.id === account.providerId)
   if (!provider) throw new Error('The account provider no longer exists.')
   const fetchImplementation = accountFetchImplementation(store, outboundTransport, account)
+
+  if (account.credentialType === 'grok-oauth') return provider.models.length ? provider.models : ['grok-4.5']
 
   if (account.credentialType === 'chatgpt-agent-identity') {
     const authorization = await resolveAgentIdentityForOperation(store, account, fetchImplementation)
@@ -3066,6 +3168,12 @@ export async function testAccountModel(
     })
   }
 
+  if (account.credentialType === 'grok-oauth') {
+    const result = await probeGrokOAuthAccount(store, account, fetchImplementation, model, signal)
+    if (!result.ok) throw new AccountProbeError(result.failure)
+    return { ok: true, model, latencyMs: result.latencyMs, statusCode: result.statusCode }
+  }
+
   const credential = store.getCredential(account.credentialId)
   if (!credential) throw new Error('The selected account has no readable credential.')
   return probeProviderModel({
@@ -3077,6 +3185,129 @@ export async function testAccountModel(
     fetchImplementation,
     signal
   })
+}
+
+async function queryGrokOAuthAccountBilling(
+  store: AppStore,
+  account: Account,
+  fetchImplementation: typeof fetch,
+  parentSignal?: AbortSignal,
+): Promise<{
+  accessToken: string
+  subjectId: string
+  email?: string
+  billing: GrokBuildQuotaResult
+}> {
+  const serialized = store.getCredential(account.credentialId)
+  if (!serialized) throw new Error('This Grok OAuth account has no readable credential.')
+  const signal = boundedAbortSignal(parentSignal, 10_000)
+  let resolved = await resolveGrokOAuthCredential(
+    serialized,
+    (rotated, expectedSource) => store.updateGrokOAuthCredential(account.id, rotated, expectedSource),
+    fetchImplementation,
+    Date.now(),
+    { refreshKey: account.id, signal },
+  )
+  const query = () => queryGrokBuildQuota(resolved.bundle.accessToken, {
+    fetchImplementation,
+    signal,
+    timeoutMs: 10_000,
+    subjectId: resolved.bundle.subjectId,
+    email: resolved.bundle.email,
+  })
+  let billing = await query()
+  if (!billing.ok && billing.statusCode === 401 && resolved.bundle.refreshToken && !parentSignal?.aborted) {
+    try {
+      resolved = await resolveGrokOAuthCredential(
+        resolved.serialized,
+        (rotated, expectedSource) => store.updateGrokOAuthCredential(account.id, rotated, expectedSource),
+        fetchImplementation,
+        Date.now(),
+        { refreshKey: account.id, signal, forceRefresh: true },
+      )
+      billing = await query()
+    } catch {
+      // Billing is auxiliary. Keep testing inference with the last usable
+      // access token instead of converting a control-plane failure into an
+      // account disable.
+    }
+  }
+  return {
+    accessToken: resolved.bundle.accessToken,
+    subjectId: resolved.bundle.subjectId,
+    ...(resolved.bundle.email ? { email: resolved.bundle.email } : {}),
+    billing,
+  }
+}
+
+async function probeGrokOAuthAccount(
+  store: AppStore,
+  account: Account,
+  fetchImplementation: typeof fetch,
+  model: string,
+  parentSignal?: AbortSignal,
+): Promise<{
+  ok: boolean
+  latencyMs: number
+  statusCode?: number
+  failure?: ProviderFailure
+  quotaPatch?: Partial<Pick<Account, 'grokQuota' | 'quotaRemaining' | 'quotaUnit'>>
+}> {
+  const resolved = await queryGrokOAuthAccountBilling(store, account, fetchImplementation, parentSignal)
+  const signal = boundedAbortSignal(parentSignal, 30_000)
+  const started = Date.now()
+  try {
+    const headers = new Headers({ 'content-type': 'application/json' })
+    applyGrokBuildHeaders(headers, {
+      accessToken: resolved.accessToken,
+      mode: 'interactive',
+      accept: 'text/event-stream',
+      subjectId: resolved.subjectId,
+      email: resolved.email,
+    })
+    const response = await fetchImplementation(`${GROK_OAUTH_BASE_URL}/responses`, {
+      method: 'POST', redirect: 'error', signal,
+      headers,
+      body: JSON.stringify({ model, stream: true, input: [{ role: 'user', content: [{ type: 'input_text', text: 'Reply with OK.' }] }] }),
+    })
+    const latencyMs = Math.max(1, Date.now() - started)
+    if (response.ok) {
+      await response.body?.cancel().catch(() => undefined)
+      return {
+        ok: true,
+        latencyMs,
+        statusCode: response.status,
+        ...(resolved.billing.ok ? { quotaPatch: grokQuotaAccountPatch(resolved.billing.quota) } : {}),
+      }
+    }
+    return {
+      ok: false, latencyMs, statusCode: response.status,
+      failure: getProviderAdapter('xai').classifyFailure({ statusCode: response.status, headers: response.headers }),
+    }
+  } catch (error) {
+    return {
+      ok: false, latencyMs: Math.max(1, Date.now() - started),
+      failure: getProviderAdapter('xai').classifyFailure({ error }),
+    }
+  }
+}
+
+function grokQuotaAccountPatch(
+  quota: GrokBuildQuotaSnapshot,
+): Partial<Pick<Account, 'grokQuota' | 'quotaRemaining' | 'quotaUnit'>> {
+  const base = { grokQuota: quota }
+  if (quota.remainingPercent !== undefined) {
+    return { ...base, quotaRemaining: quota.remainingPercent, quotaUnit: 'percent' }
+  }
+  if (quota.prepaidBalance !== undefined && quota.prepaidBalance > 0) {
+    return { ...base, quotaRemaining: quota.prepaidBalance, quotaUnit: 'usd' }
+  }
+  // An explicitly Free account invalidates an older paid snapshot. Ambiguous
+  // all-zero responses remain unknown and preserve the last known scalar.
+  if (quota.paidClassification === 'free') {
+    return { ...base, quotaRemaining: undefined, quotaUnit: undefined }
+  }
+  return base
 }
 
 async function refreshAccountCodexQuota(
