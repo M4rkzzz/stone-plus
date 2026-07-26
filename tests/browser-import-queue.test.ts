@@ -28,6 +28,19 @@ describe('BrowserImportQueue', () => {
     const browserSession = new EventEmitter()
     const cacheDirectory = join(root, 'cache')
     const queue = new BrowserImportQueue(join(root, 'staging'), cacheDirectory)
+    const queueInternals = queue as unknown as {
+      cacheDownload: (item: unknown) => Promise<void>
+    }
+    const cacheDownload = queueInternals.cacheDownload.bind(queue)
+    let releaseCacheWrite!: () => void
+    let notifyCacheWriteStarted!: () => void
+    const cacheWriteGate = new Promise<void>((resolve) => { releaseCacheWrite = resolve })
+    const cacheWriteStarted = new Promise<void>((resolve) => { notifyCacheWriteStarted = resolve })
+    queueInternals.cacheDownload = async (item) => {
+      notifyCacheWriteStarted()
+      await cacheWriteGate
+      await cacheDownload(item)
+    }
     queue.watch(browserSession as unknown as Session)
     const download = new FakeDownload('accounts.json', 'application/json', 'https://aiprobe.top/download?token=secret')
 
@@ -35,6 +48,10 @@ describe('BrowserImportQueue', () => {
     expect(download.savePath).toMatch(/\.json$/)
     await writeFile(download.savePath, JSON.stringify({ access_token: 'test-token' }), 'utf8')
     download.emit('done', {}, 'completed')
+    await cacheWriteStarted
+    expect(queue.getState().items[0]?.status).toBe('downloading')
+    expect(queue.getCacheState().items).toHaveLength(0)
+    releaseCacheWrite()
     await waitFor(() => queue.getState().readyCount === 1)
 
     expect(queue.getState()).toMatchObject({

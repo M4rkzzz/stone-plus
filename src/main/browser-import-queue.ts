@@ -253,13 +253,13 @@ export class BrowserImportQueue {
       JSON.parse(content)
       item.content = content
       item.sizeBytes = info.size
-      item.status = 'ready'
       delete item.error
       try {
         await this.cacheDownload(item)
       } catch (error) {
         item.error = `JSON 已挂起，但写入下载缓存失败：${queueErrorMessage(error)}`
       }
+      item.status = 'ready'
     } catch (error) {
       item.status = 'failed'
       item.sizeBytes = 0
