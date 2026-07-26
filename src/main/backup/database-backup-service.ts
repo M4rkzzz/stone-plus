@@ -128,7 +128,7 @@ export class DatabaseBackupService<T> {
     const createdAt = this.now()
     const id = createBackupId(createdAt, kind, this.randomId())
     const targetPath = this.pathForId(id)
-    const temporaryPath = join(this.backupDirectory, `.${id}.${this.randomId()}.tmp`)
+    const temporaryPath = createBackupTemporaryPath(this.backupDirectory, this.randomId(), '.sqlite3.tmp')
 
     try {
       await this.store.backupTo(temporaryPath)
@@ -162,7 +162,7 @@ export class DatabaseBackupService<T> {
     portable: PortableBackupInfo
   }> {
     const backup = await this.createBackup('manual')
-    const stagingPath = join(this.backupDirectory, `.${backup.id}.${this.randomId()}.portable-export`)
+    const stagingPath = createBackupTemporaryPath(this.backupDirectory, this.randomId(), '.portable-export')
     try {
       await preparePortableExportDatabase(
         this.pathForId(backup.id), stagingPath, password, this.portableSecretVault,
@@ -186,7 +186,7 @@ export class DatabaseBackupService<T> {
     const createdAt = this.now()
     const id = createBackupId(createdAt, 'manual', this.randomId())
     const targetPath = this.pathForId(id)
-    const temporaryPath = join(this.backupDirectory, `.${id}.${this.randomId()}.portable-import`)
+    const temporaryPath = createBackupTemporaryPath(this.backupDirectory, this.randomId(), '.portable-import')
     try {
       const portable = await decryptPortableBackup(sourcePath, temporaryPath, password)
       await preparePortableImportedDatabase(temporaryPath, password, portable.version, this.portableSecretVault)
@@ -240,7 +240,7 @@ export class DatabaseBackupService<T> {
         throw new Error(`Cannot restore an invalid database backup: ${sourceVerification.issue ?? 'integrity check failed'}`)
       }
 
-      stagedPath = join(this.backupDirectory, `.${id}.${this.randomId()}.restore`)
+      stagedPath = createBackupTemporaryPath(this.backupDirectory, this.randomId(), '.restore')
       safetyCreatedAt = this.now()
       safetyId = createBackupId(safetyCreatedAt, 'pre-restore', this.randomId())
       safetyPath = this.pathForId(safetyId)
@@ -567,6 +567,12 @@ function createBackupId(createdAt: number, kind: DatabaseBackupKind, randomId: s
   const safeRandomId = randomId.toLowerCase().replace(/[^0-9a-f-]/g, '')
   if (safeRandomId.length < 8) throw new Error('Backup random identifier is too short')
   return `stone-backup-${createdAt}-${kind}-${safeRandomId}.sqlite3`
+}
+
+function createBackupTemporaryPath(directory: string, randomId: string, suffix: string): string {
+  const safeRandomId = randomId.toLowerCase().replace(/[^0-9a-f]/g, '').slice(0, 16)
+  if (safeRandomId.length < 8) throw new Error('Backup temporary identifier is too short')
+  return join(directory, `.stone-backup-tmp-${safeRandomId}${suffix}`)
 }
 
 function parseBackupId(id: string): { createdAt: number; kind: DatabaseBackupKind } | undefined {

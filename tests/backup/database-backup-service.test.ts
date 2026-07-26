@@ -1,6 +1,6 @@
 import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -44,6 +44,7 @@ describe('DatabaseBackupService', () => {
   })
 
   it('creates a SQLite-consistent backup with inspectable metadata', async () => {
+    const backupTo = vi.spyOn(store.getStateRepository(), 'backupTo')
     const proxyPassword = 'backup-proxy-password-private'
     const withProxy = await store.saveProxy({
       name: 'Backup proxy',
@@ -77,6 +78,7 @@ describe('DatabaseBackupService', () => {
     const listed = await service.listBackups()
 
     expect(backup).toMatchObject({ kind: 'manual', valid: true, schemaVersion: SQLITE_SCHEMA_VERSION })
+    expect(basename(backupTo.mock.calls[0][0])).toMatch(/^\.stone-backup-tmp-[0-9a-f]{8,16}\.sqlite3\.tmp$/)
     expect(backup.sizeBytes).toBeGreaterThan(0)
     expect(verification.integrityCheck).toEqual(['ok'])
     expect(listed).toEqual([backup])
