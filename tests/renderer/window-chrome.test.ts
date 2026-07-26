@@ -13,8 +13,13 @@ describe('Electron window chrome CSS contract', () => {
     expect(titlebarRule).toContain('height: env(titlebar-area-height, 38px)')
   })
 
-  it('does not paint a blurred workspace layer upward into native window controls', () => {
-    expect(stylesheet).not.toMatch(/html\.is-electron \.workspace::before/u)
+  it('keeps the workspace seam below the native controls without an upward blur', () => {
+    const seamRule = stylesheet.match(/html\.is-electron \.workspace::before\s*\{(?<body>[^}]*)\}/u)?.groups?.body ?? ''
+
+    expect(seamRule).toContain('top: 0')
+    expect(seamRule).toContain('height: 1px')
+    expect(seamRule).toContain('background: var(--chrome-divider)')
+    expect(seamRule).not.toContain('filter: blur')
     expect(stylesheet).not.toMatch(/top:\s*-\d+px[\s\S]{0,180}filter:\s*blur/u)
   })
 })

@@ -2,8 +2,12 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { createHash, randomUUID } from 'node:crypto'
 import { isSafeRouteModelMapKey, resolveRouteModel } from '../../shared/route-models'
 import { supportsFastServiceTier } from '../../shared/types'
-import { accountMatchesPoolProtocol, accountPoolProtocol } from '../../shared/pool-protocol'
 import { providerSourceFamily } from '../../shared/source-family'
+import {
+  createRouteSourceTopologyIndex,
+  hasVerifiedKiroToolBridge,
+  isRouteSourcePoolTopologyValid,
+} from '../../shared/route-sources'
 import {
   extractProtocolUsage,
   extractRateLimitSignals,
@@ -56,10 +60,23 @@ import {
   createCanonicalStreamEncoder,
   createCanonicalStreamParser,
   createOpenAiResponsesStreamCollector,
+  type CanonicalStreamParser,
   type CanonicalStreamEvent,
   type StreamEncodingOptions,
   type ResponsesTerminalEvent
 } from './streaming'
+import {
+  convertAnthropicMessagesToKiroClaude,
+  KiroClaudeRequestConversionError,
+  type KiroClaudeRequestConversion,
+} from './kiro-claude-request'
+import {
+  createKiroEventStreamCollector,
+  createKiroEventStreamParser,
+  isKiroEventStreamContentType,
+  type KiroCollectedResponse,
+  type KiroEventStreamDiagnostics,
+} from './kiro-event-stream'
 import { ResponsesWebSocketAdapter, type ResponsesWebSocketDispatchInput } from './responses-websocket'
 import { RequestReplayStore } from './request-replay'
 import type {
@@ -86,9 +103,19 @@ class CompactFallbackContextOverflowError extends Error {
   }
 }
 
+class KiroBufferedCollectionError extends Error {
+  constructor(
+    readonly cause: unknown,
+    readonly upstreamSemanticObserved: boolean
+  ) {
+    super(cause instanceof Error ? cause.message : 'Unable to read Kiro Claude EventStream')
+    this.name = 'KiroBufferedCollectionError'
+  }
+}
+
 interface IncomingRoute {
   protocol: Protocol
-  operation: 'generate' | 'codex-search' | 'codex-compact'
+  operation: 'generate' | 'count-tokens' | 'codex-search' | 'codex-compact'
   client?: RouteClient
   geminiMethod?: 'generateContent' | 'streamGenerateContent'
 }
@@ -135,6 +162,8 @@ const CLIENT_WRITE_DRAIN_TIMEOUT_MS = 10_000
 // untouched unless the route explicitly enabled high-concurrency mode.
 const TELEMETRY_PRESSURE_ACTIVE_REQUESTS = 4
 const MAX_COMPACT_V2_STREAM_BYTES = 10 * 1024 * 1024
+const MAX_UPSTREAM_JSON_RESPONSE_BYTES = 10 * 1024 * 1024
+const MAX_UPSTREAM_ERROR_BODY_BYTES = 1024 * 1024
 // This is a per-uncommitted-frame/parser-buffer guard, not a response-size
 // limit. Once valid framed events arrive, an arbitrarily long normal response
 // continues to stream without being accumulated here.
@@ -204,6 +233,11 @@ const RESPONSES_PASSTHROUGH_HEADERS = Object.freeze([
   'x-reasoning-included',
   'x-request-id'
 ] as const)
+const ANTHROPIC_RESPONSE_PASSTHROUGH_HEADERS = Object.freeze([
+  'request-id',
+  'x-request-id',
+  'retry-after',
+] as const)
 
 type CodexSearchCapability = 'native' | 'responses-fallback'
 
@@ -221,51 +255,23 @@ function snapshotGatewayConfig(config: GatewayConfig): GatewayConfig {
 }
 
 function buildGatewayConfigIndex(config: GatewayConfig): GatewayConfigIndex {
-  const providersById = new Map<string, ProviderDefinition>()
-  for (const provider of config.providers) {
-    if (!providersById.has(provider.id)) providersById.set(provider.id, provider)
-  }
+  // Build account/provider identity exactly once. The topology index preserves
+  // first-wins lookup semantics while retaining duplicate-id evidence so every
+  // referenced corrupt identity fails closed without an O(pools * accounts)
+  // rebuild during config handoff.
+  const topologyIndex = createRouteSourceTopologyIndex(config)
+  const providersById = topologyIndex.providersById
+  const accountsById = topologyIndex.accountsById
   const poolsById = new Map<string, Pool>()
-  const accountsById = new Map<string, Account>()
   for (const pool of config.pools) {
     if (!poolsById.has(pool.id)) poolsById.set(pool.id, pool)
-  }
-  for (const account of config.accounts) {
-    if (!accountsById.has(account.id)) accountsById.set(account.id, account)
   }
 
   const accountsByPoolId = new Map<string, Account[]>()
   const poolIdsByAccountId = new Map<string, string[]>()
   const smartAccountIds = new Set<string>()
   for (const pool of config.pools) {
-    const declaredAccounts = pool.members.map((member) => accountsById.get(member.accountId))
-    const declaredProviders = declaredAccounts.map((account) => account
-      ? providersById.get(account.providerId)
-      : undefined)
-    const aggregateFamilies = new Set(declaredProviders
-      .filter((provider): provider is ProviderDefinition => provider !== undefined)
-      .map((provider) => providerSourceFamily(provider.kind)))
-    const poolIntegrityValid = declaredAccounts.every((account, index) => {
-      if (!account) return false
-      const provider = declaredProviders[index]
-      if (!provider) return false
-      if (pool.kind === 'relay-aggregate') {
-        return aggregateFamilies.size === 1
-          && provider.sourceType === 'relay'
-          && provider.protocol === pool.protocol
-      }
-      if (pool.protocol === 'grok') {
-        if (provider.sourceType === 'relay') {
-          return account.credentialType === 'api-key'
-            && providerSourceFamily(provider.kind) === 'grok'
-            && accountPoolProtocol(account, provider) === 'grok'
-        }
-        return accountMatchesPoolProtocol('grok', account, provider)
-      }
-      return aggregateFamilies.size === 1 && (provider.sourceType === 'relay'
-        ? account.credentialType !== 'grok-oauth'
-        : accountMatchesPoolProtocol(pool.protocol, account, provider))
-    })
+    const poolIntegrityValid = isRouteSourcePoolTopologyValid(pool, topologyIndex)
     const enabledMemberIds = poolIntegrityValid
       ? new Set(pool.members.filter((member) => member.enabled).map((member) => member.accountId))
       : new Set<string>()
@@ -663,6 +669,12 @@ export class GatewayServer implements GatewayController {
     let streamedBytes = 0
     let streamedChunks = 0
     let streamDiagnostics: StreamTerminationDiagnostics | undefined
+    let countTokensUpstreamResponseHeaders: Headers | undefined
+    let toolsCount: number | undefined
+    let toolResultCount: number | undefined
+    let toolUseCount: number | undefined
+    let stopReason: string | undefined
+    let kiroStructuralRecoveryCount: number | undefined
     let lastProgressLogAt = 0
     let progressStage: NonNullable<RequestLog['progressStage']> = 'receiving-body'
     let scheduledProgressLog: ReturnType<typeof setImmediate> | undefined
@@ -737,7 +749,12 @@ export class GatewayServer implements GatewayController {
         clientFirstWriteAt,
         streamedBytes,
         streamedChunks,
-        ...streamDiagnostics
+        ...streamDiagnostics,
+        toolsCount,
+        toolResultCount,
+        toolUseCount,
+        stopReason,
+        kiroStructuralRecoveryCount,
       }))
     }
     const cancelScheduledProgressLog = (): void => {
@@ -834,7 +851,12 @@ export class GatewayServer implements GatewayController {
         accountFirstTokenMs: input.accountFirstTokenMs,
         streamedBytes,
         streamedChunks,
-        ...streamDiagnostics
+        ...streamDiagnostics,
+        toolsCount,
+        toolResultCount,
+        toolUseCount,
+        stopReason,
+        kiroStructuralRecoveryCount,
       })
       if (
         input.status === 'success'
@@ -912,10 +934,15 @@ export class GatewayServer implements GatewayController {
       if (incoming.protocol === 'openai-responses' && isResponsesAgentClient(logRoute.client)) {
         body = materializeStoneCompactFallbackHistory(body)
       }
+      const anthropicToolTurn = incoming.protocol === 'anthropic-messages'
+        && incoming.operation === 'generate'
+        ? inspectAnthropicToolTurn(body)
+        : { hasToolState: false, hasToolResult: false }
       model = getRequestModel(incoming.protocol, body, pathname)
       if (!model) throw new GatewayHttpError(400, 'A model is required')
       const codexSearch = incoming.operation === 'codex-search'
       const codexCompact = incoming.operation === 'codex-compact'
+      const countTokens = incoming.operation === 'count-tokens'
       if (codexSearch && (typeof body.id !== 'string' || !body.id.trim())) {
         throw new GatewayHttpError(400, 'A search session id is required')
       }
@@ -938,7 +965,18 @@ export class GatewayServer implements GatewayController {
       if (!pool) throw new GatewayHttpError(503, 'The matched route has no available pool')
       const configuredProviderAccounts = requestIndex.accountsByPoolId.get(pool.id) ?? []
       let providerAccounts = configuredProviderAccounts
-      if (incoming.operation === 'generate') {
+      if (countTokens) {
+        providerAccounts = configuredProviderAccounts.filter((account) => (
+          requestIndex.providersById.get(account.providerId)?.protocol === 'anthropic-messages'
+        ))
+        if (!providerAccounts.length) {
+          throw new GatewayHttpError(
+            501,
+            'Token counting requires a native Anthropic Messages provider; cross-protocol token estimates are not supported.',
+            'unsupported_operation'
+          )
+        }
+      } else if (incoming.operation === 'generate') {
         // A V2 trigger is a Codex/OpenAI transport control record, not
         // conversation content. Cross-protocol pools must be checked against
         // the ordinary summary request that Stone+ will actually send rather
@@ -950,7 +988,7 @@ export class GatewayServer implements GatewayController {
           return {
             account,
             conversion: provider
-              ? analyzeProtocolConversion(incoming.protocol, provider.protocol, conversionBody, context)
+              ? analyzeGatewayProtocolConversion(incoming.protocol, provider.protocol, conversionBody, context)
               : {
                   supported: false,
                   issues: [{
@@ -1083,8 +1121,61 @@ export class GatewayServer implements GatewayController {
       }
       const targetModel = resolveRouteModel(logRoute.modelMap, model)
       upstreamModel = targetModel
+      const kiroProviderAccounts = providerAccounts.filter((account) => (
+        requestIndex.providersById.get(account.providerId)?.protocol === 'kiro-claude'
+      ))
+      const kiroClaudeRoute = pool.protocol === 'kiro-claude' || kiroProviderAccounts.length > 0
+      if (kiroClaudeRoute && kiroProviderAccounts.length !== providerAccounts.length) {
+        throw new GatewayHttpError(
+          503,
+          'The Kiro Claude route contains a provider using a different wire protocol.',
+          'account_unavailable'
+        )
+      }
+      if (kiroClaudeRoute && kiroProviderAccounts.some((account) => {
+        const provider = requestIndex.providersById.get(account.providerId)
+        return !hasVerifiedKiroToolBridge(provider)
+      })) {
+        throw new GatewayHttpError(
+          503,
+          'Kiro Claude requires a relay that passed the native two-round tool probe.',
+          'account_unavailable'
+        )
+      }
+      let kiroRequestConversion: KiroClaudeRequestConversion | undefined
+      let kiroDeclaredToolNames: readonly string[] = []
+      let kiroDeclaredTools: ReadonlyArray<{
+        name: string
+        inputSchema: Record<string, unknown>
+      }> = []
+      if (kiroClaudeRoute) {
+        if (incoming.protocol !== 'anthropic-messages' || incoming.operation !== 'generate') {
+          throw new GatewayHttpError(
+            400,
+            'Kiro Claude accepts only Anthropic Messages generation requests.',
+            'unsupported_conversion'
+          )
+        }
+        if (pool.kind === 'relay-aggregate' && !sessionId) {
+          throw new GatewayHttpError(
+            422,
+            'Kiro Claude aggregate routes require a stable Claude Code session identifier.',
+            'invalid_session_id'
+          )
+        }
+        kiroRequestConversion = convertKiroGatewayRequest(body, targetModel, sessionId ?? requestLogId ?? randomUUID())
+        toolsCount = kiroRequestConversion.diagnostics.toolsCount
+        toolResultCount = kiroRequestConversion.diagnostics.toolResultCount
+        const declaredTools = kiroRequestConversion.body.conversationState.currentMessage.userInputMessage
+          .userInputMessageContext?.tools ?? []
+        kiroDeclaredToolNames = declaredTools.map((tool) => tool.toolSpecification.name)
+        kiroDeclaredTools = declaredTools.map((tool) => ({
+          name: tool.toolSpecification.name,
+          inputSchema: tool.toolSpecification.inputSchema.json
+        }))
+      }
       scheduleProgressLog('scheduling')
-      const streaming = !codexSearch && !codexCompact
+      const streaming = !countTokens && !codexSearch && !codexCompact
         && (body.stream === true || incoming.geminiMethod === 'streamGenerateContent')
       let requiredCapabilities = requiredUpstreamCapabilities(
         codexCompactV2Fallback ? buildCompactFallbackBody(body, targetModel) : body,
@@ -1100,7 +1191,14 @@ export class GatewayServer implements GatewayController {
         this.responsesProgressIdleTimeoutMs
       )
       const responsesLite = incoming.protocol === 'openai-responses' && isChatGptCodexResponsesLiteBody(body)
-      const schedulingPool = sessionId && (codexSearch || codexCompact || compactSensitive || responsesLite)
+      const schedulingPool = sessionId && (
+        codexSearch
+        || codexCompact
+        || compactSensitive
+        || responsesLite
+        || anthropicToolTurn.hasToolState
+        || (pool.kind === 'relay-aggregate' && kiroClaudeRoute)
+      )
         ? { ...pool, stickySessions: true }
         : pool
       const retryLimit = Number.isFinite(pool.maxRetries) ? Math.max(0, Math.floor(pool.maxRetries)) : 0
@@ -1115,12 +1213,14 @@ export class GatewayServer implements GatewayController {
       let lastAttemptError: GatewayHttpError | undefined
       let ordinaryRetriesUsed = 0
       let compactCompatibilityRetriesUsed = 0
+      let kiroInvalidStateRetryUsed = false
       const failedAccountIds = new Set<string>()
       const nativeCompactCapabilityFailedAccountIds = new Set<string>()
       const currentExcludedAccountIds = (): string[] => codexCompactV2 && !codexCompactV2Fallback
         ? [...new Set([...failedAccountIds, ...nativeCompactCapabilityFailedAccountIds])]
         : [...failedAccountIds]
       for (;;) {
+        if (countTokens) countTokensUpstreamResponseHeaders = undefined
         let release: (() => void) | undefined
         let attemptedAccount: Account | undefined
         let attemptedCompactFallback = false
@@ -1140,10 +1240,19 @@ export class GatewayServer implements GatewayController {
         clientFirstWriteAt = undefined
         successfulAttemptStarted = attemptStarted
         try {
+          const schedulingBudgetMs = responseStartDeadlineAt - this.now()
+          if (schedulingBudgetMs <= 0) {
+            throw new GatewayHttpError(504, 'Upstream request timed out', 'timeout_error')
+          }
+          upstreamDeadline = createAbortDeadline(schedulingBudgetMs)
+          attemptSignal = AbortSignal.any([
+            clientAbortController.signal,
+            upstreamDeadline.signal
+          ])
           let scheduled
           const schedulerSelectStarted = this.now()
           try {
-            scheduled = this.scheduler.selectAndAcquire({
+            scheduled = await this.scheduler.selectAndAcquireWhenAvailable({
               pool: schedulingPool,
               accounts: schedulingAccounts,
               model: targetModel,
@@ -1151,7 +1260,7 @@ export class GatewayServer implements GatewayController {
               excludedAccountIds: currentExcludedAccountIds(),
               providers: requestConfig.providers,
               requiredCapabilities
-            })
+            }, attemptSignal, responseStartDeadlineAt)
           } catch (error) {
             let selectionError: unknown = error
             if (
@@ -1173,7 +1282,7 @@ export class GatewayServer implements GatewayController {
                 true
               )
               try {
-                scheduled = this.scheduler.selectAndAcquire({
+                scheduled = await this.scheduler.selectAndAcquireWhenAvailable({
                   pool: schedulingPool,
                   accounts: schedulingAccounts,
                   model: targetModel,
@@ -1181,7 +1290,7 @@ export class GatewayServer implements GatewayController {
                   excludedAccountIds: currentExcludedAccountIds(),
                   providers: requestConfig.providers,
                   requiredCapabilities
-                })
+                }, attemptSignal, responseStartDeadlineAt)
               } catch (fallbackError) {
                 selectionError = fallbackError
               }
@@ -1239,10 +1348,11 @@ export class GatewayServer implements GatewayController {
           if (!provider) throw new GatewayHttpError(503, 'The selected account has no provider', 'account_unavailable')
           const conversionContext = routeConversionContext(authenticatedClient, pool, provider)
           const adapter = getProviderAdapter(provider.kind)
-          const redirectPolicy: Pick<RequestInit, 'redirect'> = provider.kind === 'xai'
-            || provider.kind === 'xai-compatible'
-            ? { redirect: 'error' }
-            : {}
+          // Every request below carries the selected account credential. Never
+          // let Fetch replay those headers through an upstream redirect,
+          // regardless of provider family or whether the destination happens
+          // to remain on the same origin today.
+          const redirectPolicy: Pick<RequestInit, 'redirect'> = { redirect: 'error' }
           if ((codexSearch || codexCompact) && provider.protocol !== 'openai-responses') {
             throw new GatewayHttpError(
               400,
@@ -1257,12 +1367,9 @@ export class GatewayServer implements GatewayController {
           const credentialResolveStarted = this.now()
           let resolvedValue: Awaited<ReturnType<CredentialResolver>>
           try {
-            const responseStartTimeoutMs = Math.max(1, responseStartDeadlineAt - this.now())
-            upstreamDeadline = createAbortDeadline(responseStartTimeoutMs)
-            attemptSignal = AbortSignal.any([
-              clientAbortController.signal,
-              upstreamDeadline.signal
-            ])
+            if (!attemptSignal) {
+              throw new GatewayHttpError(504, 'Upstream request timed out', 'timeout_error')
+            }
             resolvedValue = await awaitWithAbortSignal(
               Promise.resolve(this.credentialResolver(account, outboundFetch, attemptSignal)),
               attemptSignal
@@ -1307,12 +1414,14 @@ export class GatewayServer implements GatewayController {
           // request. Many Responses-compatible relays only implement that path
           // (or implement their buffered JSON path incompletely), so use the
           // same proven transport for legacy compact fallback.
-          const upstreamStreaming = streaming || compactFallback
+          const upstreamStreaming = streaming || compactFallback || provider.protocol === 'kiro-claude'
           const convertedBodyKey = `${provider.id}\0${provider.kind}\0${provider.protocol}\0${targetModel}`
             + `\0${compactFallback ? 'compact-fallback' : 'native'}`
           let convertedBody = conversionContext ? undefined : convertedBodies.get(convertedBodyKey)
           if (!convertedBody) {
-            convertedBody = compactFallback
+            convertedBody = provider.protocol === 'kiro-claude'
+              ? kiroRequestConversion?.body as unknown as JsonObject
+              : compactFallback
               ? buildProviderCompactFallbackBody(body, targetModel, provider.protocol, 0, conversionContext)
               : codexSearch || codexCompact
                 ? { ...body, model: targetModel }
@@ -1431,6 +1540,15 @@ export class GatewayServer implements GatewayController {
                 model: targetModel,
                 stream: upstreamStreaming
               }), codexCompact && !compactFallback)
+          if (countTokens) upstreamUrl = countTokensUpstreamUrl(upstreamUrl)
+          const hedgeDelayMs = provider.protocol !== 'kiro-claude'
+            && streaming && !codexSearch && !compactSensitive
+            && !anthropicToolTurn.hasToolState
+            && !highConcurrencyMode
+            && pool.hedgedRequests === true
+            && requestBodyByteLength <= HEDGE_REQUEST_BODY_LIMIT_BYTES
+            ? Math.max(250, Math.min(15_000, pool.hedgeDelayMs ?? 2_500))
+            : undefined
           let upstreamResponse: Response
           try {
             if (!attemptSignal) throw new GatewayHttpError(504, 'Upstream request timed out', 'timeout_error')
@@ -1449,12 +1567,7 @@ export class GatewayServer implements GatewayController {
                 upstreamUrl,
                 upstreamInit,
                 provider.protocol,
-                streaming && !codexSearch && !compactSensitive
-                  && !highConcurrencyMode
-                  && pool.hedgedRequests === true
-                  && requestBodyByteLength <= HEDGE_REQUEST_BODY_LIMIT_BYTES
-                  ? Math.max(250, Math.min(15_000, pool.hedgeDelayMs ?? 2_500))
-                  : undefined,
+                hedgeDelayMs,
                 firstBodyTimeoutMs,
                 this.now,
                 (headersAt) => {
@@ -1464,12 +1577,21 @@ export class GatewayServer implements GatewayController {
                     failureStage = 'first-byte'
                     scheduleProgressLog('waiting-first-byte')
                   }
-                }
+                },
+                hedgeDelayMs === undefined
+                  ? undefined
+                  : () => {
+                      const acquired = this.scheduler.tryAcquireAccount(account, schedulingPool)
+                      if (!acquired) return undefined
+                      if (!highConcurrencyMode) this.emitRuntimeState({ accountIds: [account.id] })
+                      return this.runtimeTrackedRelease(acquired, runtimeGeneration, account.id)
+                    }
               ),
               attemptSignal
             )
             upstreamResponse = fetched.response
             upstreamHeadersAt = fetched.headersAt
+            if (countTokens) countTokensUpstreamResponseHeaders = new Headers(upstreamResponse.headers)
           } catch (error) {
             throw gatewayErrorFromProviderFailure(adapter.classifyFailure({ error, now: this.now() }))
           }
@@ -1916,6 +2038,117 @@ export class GatewayServer implements GatewayController {
             )
           }
 
+          if (provider.protocol === 'kiro-claude'
+            && !isKiroEventStreamContentType(upstreamResponse.headers.get('content-type'))) {
+            const providerFailure = adapter.classifyFailure({
+              statusCode: 502,
+              headers: upstreamResponse.headers,
+              now: this.now()
+            })
+            throw new GatewayHttpError(
+              502,
+              'Kiro Claude returned an unexpected response content type.',
+              'upstream_invalid_response',
+              undefined,
+              providerFailure
+            )
+          }
+          const retryKiroConversationAfterInvalidState = async (): Promise<void> => {
+            if (provider.protocol !== 'kiro-claude' || !kiroRequestConversion) {
+              throw new GatewayHttpError(502, 'Kiro Claude retry state is unavailable.', 'upstream_invalid_state')
+            }
+            if (kiroInvalidStateRetryUsed) {
+              throw new GatewayHttpError(502, 'Kiro Claude remained in an invalid conversation state.', 'upstream_invalid_state')
+            }
+            kiroInvalidStateRetryUsed = true
+            kiroRequestConversion = withKiroConversationId(kiroRequestConversion, randomUUID())
+            serializedUpstreamBody = JSON.stringify(kiroRequestConversion.body)
+            const remainingMs = responseStartDeadlineAt - this.now()
+            if (remainingMs <= 0) {
+              throw new GatewayHttpError(504, 'Upstream request timed out', 'timeout_error')
+            }
+            const retryDeadline = createAbortDeadline(remainingMs)
+            const retrySignal = AbortSignal.any([clientAbortController.signal, retryDeadline.signal])
+            try {
+              failureStage = 'connect'
+              scheduleProgressLog('retrying')
+              const retried = await awaitWithAbortSignal(
+                fetchWithOptionalHedge(
+                  outboundFetch,
+                  upstreamUrl,
+                  {
+                    method: 'POST',
+                    headers: upstreamHeaders,
+                    body: serializedUpstreamBody,
+                    signal: retrySignal,
+                    ...redirectPolicy,
+                  },
+                  provider.protocol,
+                  undefined,
+                  firstBodyTimeoutMs,
+                  this.now,
+                  (headersAt) => {
+                    if (!attemptActive) return
+                    upstreamHeadersAt = headersAt
+                    failureStage = 'first-byte'
+                    scheduleProgressLog('waiting-first-byte')
+                  }
+                ),
+                retrySignal
+              )
+              upstreamResponse = retried.response
+              upstreamHeadersAt = retried.headersAt
+              headerObservedAt = this.now()
+              headerSignals = extractRateLimitSignals(
+                upstreamResponse.headers,
+                provider.protocol,
+                headerObservedAt
+              )
+              selectedHealthRevision = this.applyExhaustedQuotaHeaders(
+                account,
+                headerSignals,
+                headerObservedAt,
+                selectedHealthRevision,
+                selectedResetEpoch
+              )
+              if (!upstreamResponse.ok) {
+                const payload = await readUpstreamJson(upstreamResponse, retrySignal)
+                const safePayload = sanitizeUpstreamPayload(payload, sensitiveValues(resolvedCredential))
+                const providerFailure = adapter.classifyFailure({
+                  statusCode: upstreamResponse.status,
+                  headers: upstreamResponse.headers,
+                  now: this.now()
+                })
+                throw new GatewayHttpError(
+                  upstreamResponse.status,
+                  upstreamErrorMessage(safePayload),
+                  `provider_${providerFailure.category}`,
+                  safePayload,
+                  providerFailure
+                )
+              }
+              if (!isKiroEventStreamContentType(upstreamResponse.headers.get('content-type'))) {
+                const providerFailure = adapter.classifyFailure({
+                  statusCode: 502,
+                  headers: upstreamResponse.headers,
+                  now: this.now()
+                })
+                throw new GatewayHttpError(
+                  502,
+                  'Kiro Claude returned an unexpected response content type.',
+                  'upstream_invalid_response',
+                  undefined,
+                  providerFailure
+                )
+              }
+            } catch (error) {
+              if (error instanceof GatewayHttpError) throw error
+              throw gatewayErrorFromProviderFailure(adapter.classifyFailure({ error, now: this.now() }))
+            } finally {
+              retryDeadline.clear()
+            }
+          }
+
           // The absolute deadline remains active while a non-2xx response body
           // is decoded. Any successful upstream SSE body switches to the
           // transport/protocol idle guards after its headers are accepted.
@@ -1923,7 +2156,8 @@ export class GatewayServer implements GatewayController {
           // caller requested a buffered JSON response.
           const upstreamResponseIsStream = compactFallback
             ? false
-            : streaming
+            : provider.protocol === 'kiro-claude'
+              || streaming
               || codexCompactV2
               || (isChatGptCodexCredentialKind(resolvedCredential.kind) && !codexSearch && !codexCompact)
           if (upstreamResponseIsStream) {
@@ -2250,7 +2484,30 @@ export class GatewayServer implements GatewayController {
             }
             const bridgeSameProtocolResponse = incoming.protocol === provider.protocol
               && conversionContext?.toolBridgePlan?.requiresResponseBridge === true
-            const streamResult = incoming.protocol === provider.protocol && !bridgeSameProtocolResponse
+            let kiroParser = provider.protocol === 'kiro-claude'
+              ? createKiroEventStreamParser({
+                  declaredToolNames: kiroDeclaredToolNames,
+                  declaredTools: kiroDeclaredTools
+                })
+              : undefined
+            const pipeCurrentConvertedStream = async (): Promise<StreamPipeResult> => (
+              await pipeConvertedUpstreamResponse(
+                upstreamResponse,
+                response,
+                provider.protocol,
+                incoming.protocol,
+                { id: randomUUID(), model, toolBridgePlan: conversionContext?.toolBridgePlan },
+                sensitiveValues(resolvedCredential),
+                streamTiming,
+                kiroParser ? {
+                  parser: kiroParser,
+                  skipFrameGuard: true,
+                  acceptFinishTerminal: true,
+                  commitOnlyOnOutputOrTerminal: true,
+                } : undefined
+              )
+            )
+            let streamResult = incoming.protocol === provider.protocol && !bridgeSameProtocolResponse
               ? await pipeUpstreamResponse(
                   upstreamResponse,
                   response,
@@ -2259,16 +2516,26 @@ export class GatewayServer implements GatewayController {
                   sensitiveValues(resolvedCredential),
                   streamTiming
                 )
-              : await pipeConvertedUpstreamResponse(
-                upstreamResponse,
-                response,
-                provider.protocol,
-                incoming.protocol,
-                  { id: randomUUID(), model, toolBridgePlan: conversionContext?.toolBridgePlan },
-                sensitiveValues(resolvedCredential),
-                  streamTiming
-                )
+              : await pipeCurrentConvertedStream()
+            if (kiroParser
+              && streamResult.canonicalError
+              && isKiroInvalidStateError(streamResult.canonicalError)
+              && !response.headersSent
+              && !kiroInvalidStateRetryUsed) {
+              await retryKiroConversationAfterInvalidState()
+              kiroParser = createKiroEventStreamParser({
+                declaredToolNames: kiroDeclaredToolNames,
+                declaredTools: kiroDeclaredTools
+              })
+              streamResult = await pipeCurrentConvertedStream()
+            }
+            if (kiroParser) {
+              const diagnostics = kiroParser.getDiagnostics()
+              toolUseCount = diagnostics.completedToolUseCount
+              kiroStructuralRecoveryCount = diagnostics.structuralRecoveryCount
+            }
             streamDiagnostics = streamResult.diagnostics
+            if (streamResult.stopReason) stopReason = streamResult.stopReason
             const canonicalErrorPayload = streamResult.canonicalError
               ? canonicalStreamErrorPayload(streamResult.canonicalError)
               : undefined
@@ -2284,16 +2551,22 @@ export class GatewayServer implements GatewayController {
               throw streamResult.failure
             }
             if (streamResult.canonicalError && canonicalErrorPayload && canonicalErrorStatus !== undefined) {
-              const providerFailure = modelScopedProviderFailure(canonicalErrorStatus, canonicalErrorPayload)
+              const classifiedFailure = modelScopedProviderFailure(canonicalErrorStatus, canonicalErrorPayload)
                 ?? adapter.classifyFailure({
                   statusCode: canonicalErrorStatus,
                   headers: upstreamResponse.headers,
                   now: this.now()
                 })
+              const providerFailure = provider.protocol === 'kiro-claude'
+                && isKiroInvalidStateError(streamResult.canonicalError)
+                ? { ...classifiedFailure, retryable: false, accountAction: 'none' as const }
+                : classifiedFailure
               throw new GatewayHttpError(
                 canonicalErrorStatus,
                 streamResult.canonicalError.message,
-                `provider_${providerFailure.category}`,
+                provider.protocol === 'kiro-claude' && isKiroInvalidStateError(streamResult.canonicalError)
+                  ? 'kiro_invalid_state'
+                  : `provider_${providerFailure.category}`,
                 canonicalErrorPayload,
                 providerFailure,
                 observedQuotaSignals(headerSignals, this.now())
@@ -2335,7 +2608,81 @@ export class GatewayServer implements GatewayController {
 
           let payload: JsonObject
           let reusableResponseBytes: Buffer | undefined
-          if (isChatGptCodexCredentialKind(resolvedCredential.kind)) {
+          let kiroBufferedUsage: NormalizedTokenUsage | undefined
+          if (provider.protocol === 'kiro-claude') {
+            const collectCurrentKiroResponse = async (): Promise<KiroClaudeCollectionResult> => {
+              try {
+                return await collectKiroClaudeUpstream(upstreamResponse, {
+                  declaredToolNames: kiroDeclaredToolNames,
+                  declaredTools: kiroDeclaredTools,
+                  firstBodyTimeoutMs,
+                  idleTimeoutMs: streamIdleTimeoutMs,
+                  signal: responseBodySignal,
+                  onFirstByte: markUpstreamFirstByte,
+                  onChunk: recordStreamChunk,
+                })
+              } catch (error) {
+                if (error instanceof KiroBufferedCollectionError) {
+                  throw kiroBufferedTransportError(
+                    error,
+                    sensitiveValues(resolvedCredential),
+                    response.headersSent || clientFirstWriteAt !== undefined
+                  )
+                }
+                throw error
+              }
+            }
+            let collected = await collectCurrentKiroResponse()
+            if (collected.result.error
+              && isKiroInvalidStateError(collected.result.error)
+              && !collected.upstreamSemanticObserved
+              && !kiroInvalidStateRetryUsed) {
+              await retryKiroConversationAfterInvalidState()
+              collected = await collectCurrentKiroResponse()
+            }
+            const diagnostics = collected.diagnostics
+            toolUseCount = diagnostics.completedToolUseCount
+            kiroStructuralRecoveryCount = diagnostics.structuralRecoveryCount
+            stopReason = collected.result.stopReason
+            if (collected.result.error) {
+              const secrets = sensitiveValues(resolvedCredential)
+              const safeCanonicalError: Extract<CanonicalStreamEvent, { type: 'error' }> = {
+                ...collected.result.error,
+                message: redactSensitiveText(collected.result.error.message, secrets),
+                ...(collected.result.error.code
+                  ? { code: redactSensitiveText(collected.result.error.code, secrets) }
+                  : {}),
+                ...(collected.result.error.errorType
+                  ? { errorType: redactSensitiveText(collected.result.error.errorType, secrets) }
+                  : {}),
+              }
+              const canonicalPayload = canonicalStreamErrorPayload(safeCanonicalError)
+              const semanticStatusCode = providerErrorStatusCode(canonicalPayload.error, canonicalPayload)
+              const classifiedFailure = adapter.classifyFailure({
+                statusCode: semanticStatusCode,
+                headers: upstreamResponse.headers,
+                now: this.now()
+              })
+              const downstreamCommitted = response.headersSent || clientFirstWriteAt !== undefined
+              const providerFailure = downstreamCommitted
+                || isKiroInvalidStateError(collected.result.error)
+                ? { ...classifiedFailure, retryable: false, accountAction: 'none' as const }
+                : classifiedFailure
+              throw new GatewayHttpError(
+                semanticStatusCode,
+                safeCanonicalError.message,
+                isKiroInvalidStateError(collected.result.error)
+                  ? 'kiro_invalid_state'
+                  : `provider_${providerFailure.category}`,
+                canonicalPayload,
+                providerFailure
+              )
+            }
+            payload = kiroCollectedToAnthropicMessage(collected.result, model)
+            kiroBufferedUsage = normalizedKiroUsage(collected.result)
+            if (collected.upstreamSemanticObserved) markFirstToken()
+            if (kiroBufferedUsage) recordStreamUsage(kiroBufferedUsage)
+          } else if (isChatGptCodexCredentialKind(resolvedCredential.kind)) {
             const streamResult = await collectOpenAiResponsesUpstream(
               upstreamResponse,
               { id: randomUUID(), model, now: this.now },
@@ -2408,13 +2755,18 @@ export class GatewayServer implements GatewayController {
           // Same-protocol JSON can be sent byte-for-byte. Avoid a second
           // protocol walk/allocating a converted object when the wire shape is
           // already exactly what the client requested.
-          const result = reusableResponseBytes
+          const result = provider.protocol === 'kiro-claude'
+            ? payload
+            : reusableResponseBytes
             ? payload
             : convertResponse(provider.protocol, incoming.protocol, payload, model, this.now, conversionContext)
-          const usage = extractProtocolUsage(provider.protocol, payload)
+          const usage = provider.protocol === 'kiro-claude'
+            ? kiroBufferedUsage
+            : extractProtocolUsage(provider.protocol, payload)
           if (compactResponsePassthrough) {
             copyResponsesResponseHeaders(upstreamResponse.headers, response, logRoute.client)
           }
+          if (countTokens) copyAnthropicResponseHeaders(upstreamResponse.headers, response)
           performanceRevision = this.reportAccountSuccess(
             account, attemptStarted, headerSignals, selectedHealthRevision, selectedResetEpoch
           )
@@ -2448,6 +2800,7 @@ export class GatewayServer implements GatewayController {
           const gatewayError = normalizeError(error)
           const retryable = isRetryable(gatewayError)
           const accountAction = gatewayError.providerFailure?.accountAction
+          const requestScopedModelFailure = isModelScopedProviderFailure(gatewayError.providerFailure)
           const failureNow = this.now()
           const actualResetAt = quotaSignalCooldownUntil(gatewayError.quotaSignals, failureNow)
           const quotaExhausted = codexQuotaIsExhausted(gatewayError.quotaSignals?.codexQuota, failureNow)
@@ -2483,15 +2836,25 @@ export class GatewayServer implements GatewayController {
               fallbackRequirements,
               [...failedAccountIds]
             )
-          const provenAccountFailure = retryable
-            || accountAction === 'disable'
-            || accountAction === 'cooldown'
-            || gatewayError.statusCode === 502
-            || gatewayError.statusCode === 504
+          const provenAccountFailure = gatewayError.type !== 'kiro_invalid_state' && (
+            retryable
+              || accountAction === 'disable'
+              || accountAction === 'cooldown'
+              || gatewayError.statusCode === 502
+              || gatewayError.statusCode === 504
+          )
           const compactCapabilityFailure = codexCompactV2
             && !attemptedCompactFallback
             && !hardAccountFailure
-          if (attemptedAccount && provenAccountFailure) {
+          if (attemptedAccount && requestScopedModelFailure && hasCurrentModeAlternative) {
+            // A model-scoped denial says nothing about the account's other
+            // models or overall credential health. Exclude it only from this
+            // request and let a peer try the same model without opening a
+            // global circuit or persisting a disabled/cooldown state.
+            failedAccountIds.add(attemptedAccount.id)
+            this.scheduler.recordStickyFailure(schedulingPool.id, sessionId, attemptedAccount.id)
+          }
+          if (attemptedAccount && provenAccountFailure && !requestScopedModelFailure) {
             const hasUsableAlternative = hasCurrentModeAlternative || hasCompactFallbackPeer
             if (compactCapabilityFailure && hasUsableAlternative) {
               // A malformed native compact stream proves only that this
@@ -2544,7 +2907,14 @@ export class GatewayServer implements GatewayController {
             && !response.headersSent
             && retryable
             && attemptedAccount !== undefined
+            // A Claude tool-result continuation belongs to the source that
+            // emitted the matching tool_use. Retrying it through another
+            // account/relay can detach stateful Anthropic-compatible bridges
+            // from that call. Native Kiro owns its separate, explicit
+            // invalid-state recovery path and is intentionally unaffected.
+            && !(anthropicToolTurn.hasToolResult && !kiroClaudeRoute)
             && this.now() < responseStartDeadlineAt
+            && (!requestScopedModelFailure || hasCurrentModeAlternative)
             && (hasCurrentModeAlternative || (!hardAccountFailure && !explicitRetryAfterAdmissionFailure))
           const attemptedProvider = attemptedAccount
             ? requestIndex.providersById.get(attemptedAccount.providerId)
@@ -2559,6 +2929,7 @@ export class GatewayServer implements GatewayController {
             && isResponsesAgentClient(logRoute.client)
             && !codexCompactV2Fallback
             && !attemptedCompactFallback
+            && !requestScopedModelFailure
             && (!codexOpaqueCompactHistory
               || (attemptedProvider?.sourceType === 'relay'
                 && attemptedProvider.protocol === 'openai-responses'
@@ -2656,10 +3027,17 @@ export class GatewayServer implements GatewayController {
       // upstream attempt can need the parsed request, so release its shared
       // parsing budget before writing the terminal response.
       releaseCommittedRequestBody()
+      if (incoming.operation === 'count-tokens' && countTokensUpstreamResponseHeaders) {
+        copyAnthropicResponseHeaders(countTokensUpstreamResponseHeaders, response)
+      }
       await this.writeJson(
         response,
         gatewayError.statusCode,
-        gatewayErrorResponseBody(incoming.protocol, gatewayError)
+        gatewayErrorResponseBody(
+          incoming.protocol,
+          gatewayError,
+          incoming.operation === 'count-tokens'
+        )
       )
       if (!conversationName && conversationId) conversationName = fallbackConversationName(conversationId)
       const finishedLog = finishRequestLog({
@@ -2890,6 +3268,11 @@ export class GatewayServer implements GatewayController {
     streamLastEventType?: string
     streamLastSequenceNumber?: number
     terminalWaitMs?: number
+    toolsCount?: number
+    toolResultCount?: number
+    toolUseCount?: number
+    stopReason?: string
+    kiroStructuralRecoveryCount?: number
   }): RequestLog {
     const providerName = input.providerName
       ?? (input.account
@@ -2941,6 +3324,11 @@ export class GatewayServer implements GatewayController {
       cacheWriteInputTokens1h: usage?.cacheCreation1hInputTokens,
       reasoningTokens: usage?.reasoningTokens,
       failoverCount: input.failoverCount,
+      toolsCount: input.toolsCount,
+      toolResultCount: input.toolResultCount,
+      toolUseCount: input.toolUseCount,
+      stopReason: input.stopReason,
+      kiroStructuralRecoveryCount: input.kiroStructuralRecoveryCount,
       error: input.error,
       failureStage: input.failureStage
     }
@@ -3203,6 +3591,9 @@ class GatewayHttpError extends Error {
 
 function classifyIncomingRoute(pathname: string): IncomingRoute | undefined {
   if (pathname === '/v1/messages') return { protocol: 'anthropic-messages', operation: 'generate' }
+  if (pathname === '/v1/messages/count_tokens') {
+    return { protocol: 'anthropic-messages', operation: 'count-tokens' }
+  }
   if (pathname === '/v1/responses') return { protocol: 'openai-responses', operation: 'generate' }
   if (pathname === '/v1/responses/compact') return { protocol: 'openai-responses', operation: 'codex-compact' }
   if (pathname === '/v1/alpha/search') return { protocol: 'openai-responses', operation: 'codex-search' }
@@ -3573,7 +3964,7 @@ function abortSignalReason(signal: AbortSignal): unknown {
 }
 
 function withStreamingFlag(body: JsonObject, protocol: Protocol, streaming: boolean): JsonObject {
-  if (!streaming || protocol === 'gemini') return body
+  if (!streaming || protocol === 'gemini' || protocol === 'kiro-claude') return body
   return { ...body, stream: true }
 }
 
@@ -3807,6 +4198,12 @@ function compactUpstreamUrl(generationEndpoint: string, compact: boolean): strin
   return url.toString()
 }
 
+function countTokensUpstreamUrl(messagesEndpoint: string): string {
+  const url = new URL(messagesEndpoint)
+  url.pathname = `${url.pathname.replace(/\/$/, '')}/count_tokens`
+  return url.toString()
+}
+
 function buildCompactFallbackBody(
   body: JsonObject,
   model: string,
@@ -3814,7 +4211,18 @@ function buildCompactFallbackBody(
   requireHistory = true,
   portableHistory = false
 ): JsonObject {
-  const history = Array.isArray(body.input)
+  const originalInstructions = typeof body.instructions === 'string' && body.instructions.trim()
+    ? body.instructions.trim()
+    : undefined
+  const history = [
+    ...(originalInstructions
+      ? [compactFallbackPrivilegedDataMessage(
+          { type: 'instructions', text: originalInstructions },
+          'request instructions',
+          0
+        )]
+      : []),
+    ...(Array.isArray(body.input)
     ? body.input.filter((item) => {
         const type = objectValue(item)?.type
         // Neither item is conversation content. `additional_tools` is a Codex
@@ -3822,9 +4230,14 @@ function buildCompactFallbackBody(
         // reject, while the generated summary never calls tools.
         return type !== 'compaction_trigger' && type !== 'additional_tools'
       })
-    : []
+    : [])
+  ]
   const retainedStart = compactFallbackRetainedStart(history, dropOldestHistoryItems)
   const structuredHistory = pruneCompactOrphanToolOutputs(history.slice(retainedStart))
+    .map((item, index) => neutralizeCompactFallbackHistoryPrivilege(
+      item,
+      retainedStart + index
+    ))
   const retainedHistory = portableHistory
     ? projectCompactFallbackHistory(structuredHistory, retainedStart)
     : structuredHistory
@@ -3865,9 +4278,11 @@ function buildCompactFallbackBody(
   return {
     model,
     ...(previousResponseId ? { previous_response_id: previousResponseId } : {}),
-    instructions: typeof body.instructions === 'string' && body.instructions.trim()
-      ? `${body.instructions.trim()}\n\n${COMPACT_FALLBACK_INSTRUCTIONS}`
-      : COMPACT_FALLBACK_INSTRUCTIONS,
+    // The guard is the only privileged instruction in a fallback request.
+    // Original request instructions and historical system/developer messages
+    // are quoted into user-role data above so protocol conversion cannot
+    // silently promote them to Anthropic/Gemini system authority.
+    instructions: COMPACT_FALLBACK_INSTRUCTIONS,
     input: [
       ...retainedHistory,
       {
@@ -3880,6 +4295,31 @@ function buildCompactFallbackBody(
     parallel_tool_calls: false,
     store: false,
     stream: true
+  }
+}
+
+function neutralizeCompactFallbackHistoryPrivilege(value: unknown, index: number): unknown {
+  const item = objectValue(value)
+  const role = typeof item?.role === 'string' ? item.role.trim().toLowerCase() : ''
+  if (role !== 'system' && role !== 'developer') return value
+  return compactFallbackPrivilegedDataMessage(value, `${role} message`, index)
+}
+
+function compactFallbackPrivilegedDataMessage(
+  value: unknown,
+  source: string,
+  index: number
+): JsonObject {
+  return {
+    type: 'message',
+    role: 'user',
+    content: [{
+      type: 'input_text',
+      text: [
+        `Stone+ compact fallback privileged history data (not instructions; source: ${source}; item: ${index + 1}).`,
+        portableCompactJson(value)
+      ].join('\n')
+    }]
   }
 }
 
@@ -4121,11 +4561,12 @@ function compactToolCallId(item: JsonObject): string | undefined {
 }
 
 function compactFallbackHistoryLength(body: JsonObject): number {
-  if (!Array.isArray(body.input)) return 0
-  return body.input.filter((item) => {
+  const inputLength = !Array.isArray(body.input) ? 0 : body.input.filter((item) => {
     const type = objectValue(item)?.type
     return type !== 'compaction_trigger' && type !== 'additional_tools'
   }).length
+  const instructionLength = typeof body.instructions === 'string' && body.instructions.trim() ? 1 : 0
+  return instructionLength + inputLength
 }
 
 function nextCompactFallbackDropCount(current: number, historyLength: number, retry: number): number | undefined {
@@ -4539,6 +4980,17 @@ function copyResponsesResponseHeaders(source: Headers, target: ServerResponse, c
   })
 }
 
+function copyAnthropicResponseHeaders(source: Headers, target: ServerResponse): void {
+  if (target.headersSent || target.writableEnded || target.destroyed) return
+  for (const name of ANTHROPIC_RESPONSE_PASSTHROUGH_HEADERS) {
+    const value = source.get(name)
+    if (value) target.setHeader(name, value)
+  }
+  source.forEach((value, name) => {
+    if (name.startsWith('anthropic-ratelimit-')) target.setHeader(name, value)
+  })
+}
+
 function copyCompactRequestHeaders(source: IncomingMessage, target: Headers, client: RouteClient): void {
   const allowed = client === 'grokbuild'
     ? GROKBUILD_COMPACT_PASSTHROUGH_HEADERS
@@ -4574,6 +5026,15 @@ async function readUpstreamJsonWithBytes(
     }
     return { payload: {} }
   }
+  const maximumBytes = response.ok
+    ? MAX_UPSTREAM_JSON_RESPONSE_BYTES
+    : MAX_UPSTREAM_ERROR_BODY_BYTES
+  const declaredLength = response.headers.get('content-length')?.trim()
+  if (declaredLength && /^\d+$/.test(declaredLength)
+    && Number(declaredLength) > maximumBytes) {
+    await response.body.cancel().catch(() => undefined)
+    throw upstreamResponseTooLargeError()
+  }
   const reader = response.body.getReader()
   const chunks: Buffer[] = []
   let byteLength = 0
@@ -4608,8 +5069,9 @@ async function readUpstreamJsonWithBytes(
         result.value.byteOffset,
         result.value.byteLength
       )
-      chunks.push(chunk)
       byteLength += chunk.byteLength
+      if (byteLength > maximumBytes) throw upstreamResponseTooLargeError()
+      chunks.push(chunk)
     }
   } finally {
     signal?.removeEventListener('abort', dispose)
@@ -4632,7 +5094,10 @@ async function readUpstreamJsonWithBytes(
     : chunks.length === 1
       ? chunks[0]
       : Buffer.concat(chunks, byteLength)
-  const text = rawJson.toString('utf8')
+  // Match Fetch's text decoding semantics, including stripping one leading
+  // UTF-8 BOM. Buffer.toString() preserves the BOM and would reject otherwise
+  // valid JSON relays that Response.text() historically accepted.
+  const text = new TextDecoder().decode(rawJson)
   if (!text) {
     if (response.ok) {
       throw new GatewayHttpError(
@@ -4669,62 +5134,15 @@ async function readUpstreamJsonWithBytes(
 }
 
 async function readUpstreamJson(response: Response, signal?: AbortSignal): Promise<JsonObject> {
-  if (!response.body) {
-    if (response.ok) {
-      throw new GatewayHttpError(
-        502,
-        'Upstream returned an empty JSON response',
-        'upstream_invalid_response'
-      )
-    }
-    return {}
-  }
-  // `Response.text()` lets Undici collect the body once instead of retaining
-  // a chunk array, making Buffer.concat, and then allocating a second UTF-8
-  // string. The fetch/attempt signal is still observed explicitly so a proxy
-  // that leaves the body pending cannot outlive the gateway request.
-  let text: string
-  try {
-    const reading = response.text()
-    text = signal ? await awaitWithAbortSignal(reading, signal) : await reading
-  } catch (error) {
-    if (signal?.aborted) throw abortSignalReason(signal)
-    throw error
-  }
-  if (signal?.aborted) throw abortSignalReason(signal)
-  if (!text) {
-    if (response.ok) {
-      throw new GatewayHttpError(
-        502,
-        'Upstream returned an empty JSON response',
-        'upstream_invalid_response'
-      )
-    }
-    return {}
-  }
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(text) as unknown
-  } catch {
-    if (response.ok) {
-      throw new GatewayHttpError(
-        502,
-        'Upstream returned a non-JSON response',
-        'upstream_invalid_response'
-      )
-    }
-    return { error: { message: 'Upstream returned a non-JSON response' }, raw: text.slice(0, 2000) }
-  }
-  const payload = objectValue(parsed)
-  if (payload) return payload
-  if (response.ok) {
-    throw new GatewayHttpError(
-      502,
-      'Upstream returned a non-object JSON response',
-      'upstream_invalid_response'
-    )
-  }
-  return { error: { message: 'Upstream returned a non-object JSON response' } }
+  return (await readUpstreamJsonWithBytes(response, signal)).payload
+}
+
+function upstreamResponseTooLargeError(): GatewayHttpError {
+  return new GatewayHttpError(
+    502,
+    'Upstream buffered response exceeds the gateway safety limit',
+    'upstream_response_too_large'
+  )
 }
 
 async function readBoundedCompactFallbackJson(
@@ -5160,8 +5578,163 @@ function compactFallbackPayloadProtocol(payload: JsonObject, configured: Protoco
 }
 
 function compactFallbackIsRequestError(errorType: string | undefined, errorCode: string | undefined): boolean {
+  if (errorCode === 'unsupported_pause_turn') return false
+  if (errorType === 'incomplete_stream'
+    || errorType === 'unsupported_pause_turn'
+    || errorType === 'invalid_compact_output'
+    || errorType === 'response_too_large') return false
   const description = `${errorType ?? ''} ${errorCode ?? ''}`.toLowerCase()
   return /invalid[_ -]?request|bad[_ -]?request|unsupported|unknown[_ -]?(?:parameter|model)|model[_ -]?not[_ -]?found/.test(description)
+}
+
+interface KiroClaudeCollectionOptions {
+  declaredToolNames: Iterable<string>
+  declaredTools?: Iterable<{ name: string; inputSchema: Record<string, unknown> }>
+  firstBodyTimeoutMs: number
+  idleTimeoutMs: number
+  signal?: AbortSignal
+  onFirstByte?: () => void
+  onChunk?: (byteLength: number) => void
+}
+
+interface KiroClaudeCollectionResult {
+  result: KiroCollectedResponse
+  diagnostics: KiroEventStreamDiagnostics
+  upstreamSemanticObserved: boolean
+}
+
+async function collectKiroClaudeUpstream(
+  upstream: Response,
+  options: KiroClaudeCollectionOptions
+): Promise<KiroClaudeCollectionResult> {
+  const collector = createKiroEventStreamCollector({
+    declaredToolNames: options.declaredToolNames,
+    declaredTools: options.declaredTools
+  })
+  if (!upstream.body) {
+    return {
+      result: collector.finish(),
+      diagnostics: collector.getDiagnostics(),
+      upstreamSemanticObserved: false,
+    }
+  }
+  const reader = upstream.body.getReader()
+  let upstreamSemanticObserved = false
+  const updateUpstreamSemanticState = (): void => {
+    const diagnostics = collector.getDiagnostics()
+    upstreamSemanticObserved ||= diagnostics.assistantResponseEventCount > 0
+      || diagnostics.toolUseEventCount > 0
+  }
+  const cancelOnAbort = (): void => cancelStreamReader(reader)
+  if (options.signal?.aborted) {
+    cancelOnAbort()
+    throw new KiroBufferedCollectionError(abortSignalReason(options.signal), false)
+  }
+  options.signal?.addEventListener('abort', cancelOnAbort, { once: true })
+  try {
+    let next = await readFirstStreamChunk(reader, options.firstBodyTimeoutMs, options.signal)
+    while (!next.done) {
+      if (next.value.byteLength > 0) {
+        options.onFirstByte?.()
+        options.onChunk?.(next.value.byteLength)
+        collector.push(next.value)
+        updateUpstreamSemanticState()
+      }
+      if (collector.isComplete()) {
+        cancelStreamReader(reader)
+        break
+      }
+      next = await readIdleStreamChunk(reader, options.idleTimeoutMs, options.signal)
+    }
+    const result = collector.finish()
+    updateUpstreamSemanticState()
+    return { result, diagnostics: collector.getDiagnostics(), upstreamSemanticObserved }
+  } catch (error) {
+    cancelStreamReader(reader)
+    updateUpstreamSemanticState()
+    throw new KiroBufferedCollectionError(error, upstreamSemanticObserved)
+  } finally {
+    options.signal?.removeEventListener('abort', cancelOnAbort)
+  }
+}
+
+function kiroBufferedTransportError(
+  error: KiroBufferedCollectionError,
+  secrets: readonly string[],
+  downstreamCommitted: boolean
+): GatewayHttpError {
+  const normalized = normalizeError(error.cause)
+  const message = redactSensitiveText(normalized.message, secrets)
+  const responseBody = normalized.responseBody
+    ? sanitizeUpstreamPayload(normalized.responseBody, secrets)
+    : undefined
+  const statusCode = normalized.statusCode
+  const category: ProviderFailure['category'] = statusCode === 504 ? 'timeout' : 'upstream'
+  const providerFailure: ProviderFailure = {
+    category,
+    message,
+    // Buffered Kiro output is still private gateway state until response
+    // headers or bytes reach the client. A parsed text/tool event therefore
+    // must not suppress safe peer failover after a later frame fails.
+    retryable: !downstreamCommitted,
+    accountAction: downstreamCommitted ? 'none' : 'cooldown',
+    statusCode,
+  }
+  return new GatewayHttpError(
+    statusCode,
+    message,
+    normalized.type,
+    responseBody,
+    providerFailure
+  )
+}
+
+function kiroCollectedToAnthropicMessage(result: KiroCollectedResponse, model: string): JsonObject {
+  const content: JsonObject[] = []
+  if (result.text) content.push({ type: 'text', text: result.text })
+  for (const tool of result.tools) {
+    content.push({
+      type: 'tool_use',
+      id: tool.id,
+      name: tool.name,
+      input: tool.input,
+    })
+  }
+  const usage = result.usage
+  return {
+    id: `msg_${randomUUID().replace(/-/g, '')}`,
+    type: 'message',
+    role: 'assistant',
+    model,
+    content,
+    stop_reason: result.tools.length > 0
+      ? 'tool_use'
+      : result.stopReason === 'length' ? 'max_tokens' : 'end_turn',
+    stop_sequence: null,
+    usage: {
+      input_tokens: usage?.inputTokens ?? 0,
+      output_tokens: usage?.outputTokens ?? 0,
+      ...(usage?.cachedInputTokens === undefined
+        ? {} : { cache_read_input_tokens: usage.cachedInputTokens }),
+      ...(usage?.cacheCreationInputTokens === undefined
+        ? {} : { cache_creation_input_tokens: usage.cacheCreationInputTokens }),
+    },
+  }
+}
+
+function normalizedKiroUsage(result: KiroCollectedResponse): NormalizedTokenUsage | undefined {
+  const usage = result.usage
+  if (!usage) return undefined
+  return {
+    inputTokens: usage.inputTokens,
+    outputTokens: usage.outputTokens,
+    totalTokens: usage.totalTokens,
+    cachedInputTokens: usage.cachedInputTokens,
+    cacheCreationInputTokens: usage.cacheCreationInputTokens,
+    cacheCreation5mInputTokens: usage.cacheCreation5mInputTokens,
+    cacheCreation1hInputTokens: usage.cacheCreation1hInputTokens,
+    reasoningTokens: usage.reasoningTokens,
+  }
 }
 
 function isJsonUpstreamResponse(response: Response): boolean {
@@ -5586,6 +6159,13 @@ async function writeBufferedResponsesStream(
 interface TimedFetchResponse {
   response: Response
   headersAt: number
+  /** The prefetched canonical stream event was an explicit provider error. */
+  canonicalError?: boolean
+}
+
+interface PrefetchedCanonicalResponse {
+  response: Response
+  canonicalError: boolean
 }
 
 async function fetchWithOptionalHedge(
@@ -5596,7 +6176,8 @@ async function fetchWithOptionalHedge(
   hedgeDelayMs?: number,
   firstBodyTimeoutMs?: number,
   now: () => number = Date.now,
-  onHeaders?: (headersAt: number) => void
+  onHeaders?: (headersAt: number) => void,
+  tryAcquireHedgeSlot?: () => (() => void) | undefined
 ): Promise<TimedFetchResponse> {
   if (hedgeDelayMs === undefined) {
     const response = await fetchImplementation(input, init)
@@ -5622,11 +6203,17 @@ async function fetchWithOptionalHedge(
     // A successful streaming fetch resolves as soon as headers arrive. Wait for
     // a real canonical event, rather than any non-empty transport byte, so an
     // SSE comment/partial frame cannot cancel a useful competing lane.
+    if (!response.ok) return { response, headersAt }
+    const prefetched = await responseWithPrefetchedCanonicalEvent(
+      response,
+      protocol,
+      firstBodyTimeoutMs,
+      signal
+    )
     return {
-      response: response.ok
-        ? await responseWithPrefetchedCanonicalEvent(response, protocol, firstBodyTimeoutMs, signal)
-        : response,
-      headersAt
+      response: prefetched.response,
+      headersAt,
+      ...(prefetched.canonicalError ? { canonicalError: true } : {})
     }
   }
   const primaryController = new AbortController()
@@ -5643,6 +6230,8 @@ async function fetchWithOptionalHedge(
   ])
   if (first.kind === 'response') return first.result
 
+  let hedgeSlotRelease = tryAcquireHedgeSlot?.()
+  if (tryAcquireHedgeSlot && !hedgeSlotRelease) return primary
   const secondaryController = new AbortController()
   const secondary = start('secondary', secondaryController)
   type Outcome = { source: 'primary' | 'secondary'; result?: TimedFetchResponse; error?: unknown }
@@ -5652,39 +6241,55 @@ async function fetchWithOptionalHedge(
   )
   const primaryOutcome = outcome('primary', primary)
   const secondaryOutcome = outcome('secondary', secondary)
-  const firstOutcome = await Promise.race([primaryOutcome, secondaryOutcome])
-  let winner = firstOutcome
-  if (!winner.result) {
-    const other = await (winner.source === 'primary' ? secondaryOutcome : primaryOutcome)
-    winner = other
-  } else if (!winner.result.response.ok) {
-    // Give the other lane only a short grace window to replace a fast 429/5xx;
-    // never turn a quick upstream error into a full request-timeout wait.
-    const otherSource = winner.source === 'primary' ? 'secondary' : 'primary'
-    const otherOutcome = otherSource === 'primary' ? primaryOutcome : secondaryOutcome
-    let other = await settleWithin(
-      otherOutcome,
-      HEDGE_ERROR_GRACE_MS
-    )
-    if (other?.result?.response.ok) winner = other
-    else if (successfulHeaders[otherSource]) {
-      // A fast hedge error must never cancel a candidate whose HTTP response
-      // has already been confirmed successful. Wait for that candidate's first
-      // body chunk; the shared attempt signal still enforces the global
-      // response-start deadline, so a bad 200 cannot hold the slot forever.
-      other = await otherOutcome
-      if (other.result?.response.ok) winner = other
+  try {
+    const firstOutcome = await Promise.race([primaryOutcome, secondaryOutcome])
+    let winner = firstOutcome
+    if (!winner.result) {
+      const other = await (winner.source === 'primary' ? secondaryOutcome : primaryOutcome)
+      winner = other
+    } else if (!healthyHedgeResult(winner.result)) {
+      // Give the other lane only a short grace window to replace a fast HTTP or
+      // canonical stream error; a 200 status is not a healthy hedge candidate
+      // when its first protocol event explicitly reports failure.
+      const otherSource = winner.source === 'primary' ? 'secondary' : 'primary'
+      const otherOutcome = otherSource === 'primary' ? primaryOutcome : secondaryOutcome
+      let other = await settleWithin(
+        otherOutcome,
+        HEDGE_ERROR_GRACE_MS
+      )
+      if (other?.result && healthyHedgeResult(other.result)) winner = other
+      else if (successfulHeaders[otherSource]) {
+        // A fast hedge error must never cancel a candidate whose HTTP response
+        // has already been confirmed successful. Wait for that candidate's first
+        // canonical event; the shared attempt signal still enforces the global
+        // response-start deadline, so a bad 200 cannot hold the slot forever.
+        other = await otherOutcome
+        if (other.result && healthyHedgeResult(other.result)) winner = other
+      }
     }
-  }
-  if (!winner.result) throw winner.error
+    if (!winner.result) throw winner.error
 
-  const loserController = winner.source === 'primary' ? secondaryController : primaryController
-  const loserOutcome = winner.source === 'primary' ? secondaryOutcome : primaryOutcome
-  loserController.abort(new DOMException('Hedged request lost the response race', 'AbortError'))
-  void loserOutcome.then(async (loser) => {
-    await loser.result?.response.body?.cancel().catch(() => undefined)
-  })
-  return winner.result
+    const loserController = winner.source === 'primary' ? secondaryController : primaryController
+    const loserOutcome = winner.source === 'primary' ? secondaryOutcome : primaryOutcome
+    loserController.abort(new DOMException('Hedged request lost the response race', 'AbortError'))
+    if (hedgeSlotRelease) {
+      // Keep the extra physical permit until the losing transport really
+      // settles. The original attempt permit then accounts for whichever lane
+      // won, regardless of whether that lane was primary or secondary.
+      const releaseAfterLoser = hedgeSlotRelease
+      hedgeSlotRelease = undefined
+      void loserOutcome.then(async (loser) => {
+        await loser.result?.response.body?.cancel().catch(() => undefined)
+      }).finally(releaseAfterLoser)
+    } else {
+      void loserOutcome.then(async (loser) => {
+        await loser.result?.response.body?.cancel().catch(() => undefined)
+      })
+    }
+    return winner.result
+  } finally {
+    hedgeSlotRelease?.()
+  }
 }
 
 async function responseWithPrefetchedCanonicalEvent(
@@ -5692,7 +6297,7 @@ async function responseWithPrefetchedCanonicalEvent(
   protocol: Protocol,
   timeoutMs = MAX_FIRST_BODY_TIMEOUT_MS,
   signal?: AbortSignal | null
-): Promise<Response> {
+): Promise<PrefetchedCanonicalResponse> {
   if (!response.body) {
     throw new GatewayHttpError(
       502,
@@ -5706,6 +6311,7 @@ async function responseWithPrefetchedCanonicalEvent(
   const frameGuard = new ProtocolStreamFrameGuard(protocol, MAX_STREAM_FRAME_BYTES)
   let prefetchedBytes = 0
   let reachedEof = false
+  let canonicalError = false
   const canonicalDeadlineAt = Date.now() + timeoutMs
   try {
     for (;;) {
@@ -5720,7 +6326,8 @@ async function responseWithPrefetchedCanonicalEvent(
       const next = await readFirstStreamChunk(reader, remainingMs, signal ?? undefined)
       if (next.done) {
         reachedEof = true
-        parser.finish()
+        const events = parser.finish()
+        canonicalError ||= events.some((event) => event.type === 'error')
         break
       }
       if (!next.value?.byteLength) continue
@@ -5734,7 +6341,8 @@ async function responseWithPrefetchedCanonicalEvent(
         )
       }
       prefetched.push(next.value)
-      parser.push(next.value)
+      const events = parser.push(next.value)
+      canonicalError ||= events.some((event) => event.type === 'error')
       if (parser.getRecognizedEventCount() > 0) break
     }
   } catch (error) {
@@ -5796,7 +6404,11 @@ async function responseWithPrefetchedCanonicalEvent(
     redirected: { value: response.redirected },
     type: { value: response.type }
   })
-  return prepared
+  return { response: prepared, canonicalError }
+}
+
+function healthyHedgeResult(result: TimedFetchResponse): boolean {
+  return result.response.ok && result.canonicalError !== true
 }
 
 async function settleWithin<T>(promise: Promise<T>, timeoutMs: number): Promise<T | undefined> {
@@ -5832,6 +6444,7 @@ interface StreamPipeResult {
     reasoning_tokens?: number
   }
   error?: string
+  stopReason?: string
   canonicalError?: Extract<CanonicalStreamEvent, { type: 'error' }>
   failure?: GatewayHttpError
   diagnostics?: StreamTerminationDiagnostics
@@ -5851,6 +6464,15 @@ interface StreamTimingCallbacks {
   onBeforeResponseCommit?: () => void
   /** Release request-side resources only after headers are formally committed. */
   onResponseCommit?: () => void
+}
+
+interface ConvertedStreamBridgeOptions {
+  parser?: CanonicalStreamParser
+  skipFrameGuard?: boolean
+  /** Kiro declares its healthy terminal state only when the EventStream reaches EOF. */
+  acceptFinishTerminal?: boolean
+  /** Keep metadata/reasoning frames retryable until model output or a healthy terminal is known. */
+  commitOnlyOnOutputOrTerminal?: boolean
 }
 
 interface AbortDeadline {
@@ -5934,6 +6556,8 @@ async function pipeUpstreamResponse(
   const protocolCompletionObserved = (): boolean => (
     protocol === 'openai-responses'
       ? parser.getProtocolState().responsesTerminalEvent !== undefined
+        && canonicalStreamError === undefined
+        && streamError === undefined
       : logicalCompletionObserved()
   )
   const transportTerminalObserved = (): boolean => (
@@ -5952,7 +6576,9 @@ async function pipeUpstreamResponse(
     diagnostics.streamLastEventType = state.responsesLastEventType
     diagnostics.streamLastSequenceNumber = state.responsesLastSequenceNumber
     if (state.responsesTerminalEvent) {
-      diagnostics.streamEndReason = state.responsesTerminalEvent === 'response.failed'
+      diagnostics.streamEndReason = canonicalStreamError || streamError
+        ? 'explicit-error'
+        : state.responsesTerminalEvent === 'response.failed'
         ? 'explicit-error'
         : 'protocol-terminal'
       if (terminalWaitStartedAt !== undefined) {
@@ -6297,9 +6923,10 @@ async function pipeConvertedUpstreamResponse(
   to: Protocol,
   options: StreamEncodingOptions,
   secrets: readonly string[],
-  timing: StreamTimingCallbacks
+  timing: StreamTimingCallbacks,
+  bridge: ConvertedStreamBridgeOptions = {}
 ): Promise<StreamPipeResult> {
-  const parser = createCanonicalStreamParser(from)
+  const parser = bridge.parser ?? createCanonicalStreamParser(from)
   const encoder = createCanonicalStreamEncoder(to, options)
   if (!upstream.body) {
     throw new GatewayHttpError(502, 'Upstream stream ended before its first body chunk', 'upstream_stream_error')
@@ -6309,6 +6936,7 @@ async function pipeConvertedUpstreamResponse(
   let streamError: string | undefined
   let canonicalStreamError: Extract<CanonicalStreamEvent, { type: 'error' }> | undefined
   let streamFailure: GatewayHttpError | undefined
+  let canonicalStopReason: string | undefined
   let terminalObserved = false
   let stopObserved = false
   let completedToolCallObserved = false
@@ -6321,9 +6949,12 @@ async function pipeConvertedUpstreamResponse(
   let responseHeadersCommitted = false
   const pendingPrecommitChunks: Uint8Array[] = []
   let pendingPrecommitBytes = 0
-  const frameGuard = new ProtocolStreamFrameGuard(from, MAX_STREAM_FRAME_BYTES)
+  const frameGuard = bridge.skipFrameGuard
+    ? undefined
+    : new ProtocolStreamFrameGuard(from, MAX_STREAM_FRAME_BYTES)
   const diagnostics: StreamTerminationDiagnostics = {}
   const pendingToolCalls = new Set<number>()
+  let commitEligibleEventObserved = false
   const syncEncoderFailure = (): void => {
     const failure = encoder.getFailure()
     if (!failure) return
@@ -6344,6 +6975,8 @@ async function pipeConvertedUpstreamResponse(
   const protocolCompletionObserved = (): boolean => (
     from === 'openai-responses'
       ? parser.getProtocolState().responsesTerminalEvent !== undefined
+        && canonicalStreamError === undefined
+        && streamError === undefined
       : logicalCompletionObserved()
   )
   const transportTerminalObserved = (): boolean => (
@@ -6362,7 +6995,9 @@ async function pipeConvertedUpstreamResponse(
     diagnostics.streamLastEventType = state.responsesLastEventType
     diagnostics.streamLastSequenceNumber = state.responsesLastSequenceNumber
     if (state.responsesTerminalEvent) {
-      diagnostics.streamEndReason = state.responsesTerminalEvent === 'response.failed'
+      diagnostics.streamEndReason = canonicalStreamError || streamError
+        ? 'explicit-error'
+        : state.responsesTerminalEvent === 'response.failed'
         ? 'explicit-error'
         : 'protocol-terminal'
       if (terminalWaitStartedAt !== undefined) {
@@ -6426,6 +7061,12 @@ async function pipeConvertedUpstreamResponse(
         terminalObserved = true
       } else if (acceptTerminal && safeEvent.type === 'stop') {
         stopObserved = true
+        canonicalStopReason = safeEvent.rawReason ?? safeEvent.reason
+      }
+      if (safeEvent.type === 'text-delta' || safeEvent.type === 'tool-call-delta') {
+        commitEligibleEventObserved = true
+      } else if (acceptTerminal && (safeEvent.type === 'stop' || safeEvent.type === 'done')) {
+        commitEligibleEventObserved = true
       }
       if (meaningfulStreamEvent(safeEvent)) timing.onFirstToken?.()
       encoded.push(...encoder.encode(safeEvent))
@@ -6444,7 +7085,10 @@ async function pipeConvertedUpstreamResponse(
           'upstream_stream_error'
         )
       }
-      if (parser.getRecognizedEventCount() === 0 || streamError) return true
+      const readyToCommit = bridge.commitOnlyOnOutputOrTerminal
+        ? commitEligibleEventObserved
+        : parser.getRecognizedEventCount() > 0
+      if (!readyToCommit || streamError) return true
       commitResponseHeaders()
       const written = await writeStreamChunks(response, pendingPrecommitChunks, timing.onClientWrite)
       pendingPrecommitChunks.length = 0
@@ -6466,7 +7110,7 @@ async function pipeConvertedUpstreamResponse(
     }
     timing.onChunk?.(first.value.byteLength)
     if (from === 'openai-responses') responsesTransportActivityWithoutProgress = true
-    frameGuard.push(first.value)
+    frameGuard?.push(first.value)
     if (!await forward(parser.push(first.value))) {
       cancelStreamReader(reader)
       diagnostics.streamEndReason = 'client-closed'
@@ -6565,7 +7209,7 @@ async function pipeConvertedUpstreamResponse(
         if (from === 'openai-responses' && value.byteLength > 0) {
           responsesTransportActivityWithoutProgress = true
         }
-        frameGuard.push(value)
+        frameGuard?.push(value)
         if (!await forward(parser.push(value))) {
           cancelStreamReader(reader)
           diagnostics.streamEndReason = 'client-closed'
@@ -6606,7 +7250,7 @@ async function pipeConvertedUpstreamResponse(
           'upstream_stream_error'
         )
       }
-      if (!await forward(finishEvents, false)) {
+      if (!await forward(finishEvents, bridge.acceptFinishTerminal === true)) {
         diagnostics.streamEndReason = 'client-closed'
         return streamPipeResult(protocolCompletionObserved(), usage, streamError, undefined, diagnostics)
       }
@@ -6678,7 +7322,8 @@ async function pipeConvertedUpstreamResponse(
     streamError,
     streamFailure,
     diagnostics,
-    canonicalStreamError
+    canonicalStreamError,
+    canonicalStopReason
   )
 }
 
@@ -6688,13 +7333,15 @@ function streamPipeResult(
   error?: string,
   failure?: GatewayHttpError,
   diagnostics?: StreamTerminationDiagnostics,
-  canonicalError?: Extract<CanonicalStreamEvent, { type: 'error' }>
+  canonicalError?: Extract<CanonicalStreamEvent, { type: 'error' }>,
+  stopReason?: string
 ): StreamPipeResult {
   return {
     completed,
     ...(Object.keys(usage).length > 0 ? { usage } : {}),
     ...(error ? { error } : {}),
     ...(canonicalError ? { canonicalError } : {}),
+    ...(stopReason ? { stopReason } : {}),
     ...(failure ? { failure } : {}),
     ...(diagnostics && Object.values(diagnostics).some((value) => value !== undefined) ? { diagnostics } : {})
   }
@@ -7150,7 +7797,13 @@ async function endAndWaitForFinish(
 }
 
 function getSessionId(request: IncomingMessage, body: JsonObject): string | undefined {
-  const headerNames = ['x-stone-session-id', 'session-id', 'session_id', 'thread-id'] as const
+  const headerNames = [
+    'x-claude-code-session-id',
+    'x-stone-session-id',
+    'session-id',
+    'session_id',
+    'thread-id',
+  ] as const
   for (const name of headerNames) {
     const value = request.headers[name]
     const first = Array.isArray(value) ? value[0] : value
@@ -7166,6 +7819,35 @@ function getSessionId(request: IncomingMessage, body: JsonObject): string | unde
     body.id
   ]
   return candidates.find((value): value is string => typeof value === 'string' && Boolean(value.trim()))?.trim()
+}
+
+/**
+ * Detects only the presence of Anthropic tool state needed by transport
+ * policy. This deliberately does not validate or rewrite conversation
+ * history; malformed histories remain the upstream protocol's responsibility.
+ */
+function inspectAnthropicToolTurn(body: JsonObject): {
+  hasToolState: boolean
+  hasToolResult: boolean
+} {
+  let hasToolState = Array.isArray(body.tools) && body.tools.length > 0
+  let hasToolResult = false
+  if (!Array.isArray(body.messages)) return { hasToolState, hasToolResult }
+
+  for (const value of body.messages) {
+    const message = objectValue(value)
+    if (!message || !Array.isArray(message.content)) continue
+    for (const content of message.content) {
+      const block = objectValue(content)
+      if (!block) continue
+      if (block.type === 'tool_use') hasToolState = true
+      if (block.type === 'tool_result') {
+        hasToolState = true
+        hasToolResult = true
+      }
+    }
+  }
+  return { hasToolState, hasToolResult }
 }
 
 function requiredUpstreamCapabilities(
@@ -7352,6 +8034,70 @@ function gatewayErrorFromResponsesFailure(failure: ResponsesResponseFailedError)
   return new GatewayHttpError(statusCode, failure.message, type, { error })
 }
 
+function analyzeGatewayProtocolConversion(
+  from: Protocol,
+  to: Protocol,
+  body: JsonObject,
+  context?: ProtocolConversionContext
+): ReturnType<typeof analyzeProtocolConversion> {
+  if (to === 'kiro-claude') {
+    return from === 'anthropic-messages'
+      ? { supported: true, issues: [] }
+      : {
+          supported: false,
+          issues: [{
+            path: 'body',
+            capability: 'content-part',
+            reason: 'Kiro Claude accepts only native Anthropic Messages input.',
+          }],
+        }
+  }
+  if (from === 'kiro-claude') {
+    return {
+      supported: false,
+      issues: [{
+        path: 'body',
+        capability: 'content-part',
+        reason: 'Kiro Claude is an upstream-only wire protocol.',
+      }],
+    }
+  }
+  return analyzeProtocolConversion(from, to, body, context)
+}
+
+function convertKiroGatewayRequest(
+  body: JsonObject,
+  targetModel: string,
+  conversationId: string
+): KiroClaudeRequestConversion {
+  try {
+    return convertAnthropicMessagesToKiroClaude(body, { model: targetModel, conversationId })
+  } catch (error) {
+    if (error instanceof KiroClaudeRequestConversionError) {
+      throw new GatewayHttpError(error.statusCode, error.message, error.code, {
+        error: { message: error.message, type: error.code, param: error.path }
+      })
+    }
+    throw error
+  }
+}
+
+function withKiroConversationId(
+  conversion: KiroClaudeRequestConversion,
+  conversationId: string
+): KiroClaudeRequestConversion {
+  return {
+    diagnostics: conversion.diagnostics,
+    body: {
+      ...conversion.body,
+      conversationState: {
+        ...conversion.body.conversationState,
+        conversationId,
+      },
+    },
+  }
+}
+
 function convertGatewayRequest(
   from: Protocol,
   to: Protocol,
@@ -7394,7 +8140,11 @@ function normalizeError(error: unknown): GatewayHttpError {
   return new GatewayHttpError(502, error instanceof Error ? error.message : 'Gateway request failed', 'gateway_error')
 }
 
-function gatewayErrorResponseBody(protocol: Protocol, error: GatewayHttpError): JsonObject {
+function gatewayErrorResponseBody(
+  protocol: Protocol,
+  error: GatewayHttpError,
+  preserveAnthropicEnvelope = false
+): JsonObject {
   const fallback = { error: { message: error.message, type: error.type } }
   if (protocol === 'openai-chat' || protocol === 'openai-responses') {
     return error.responseBody ?? fallback
@@ -7407,6 +8157,7 @@ function gatewayErrorResponseBody(protocol: Protocol, error: GatewayHttpError): 
     : error.message
 
   if (protocol === 'anthropic-messages') {
+    if (preserveAnthropicEnvelope && isAnthropicErrorEnvelope(source)) return source
     return {
       type: 'error',
       error: {
@@ -7423,6 +8174,13 @@ function gatewayErrorResponseBody(protocol: Protocol, error: GatewayHttpError): 
       status: geminiGatewayErrorStatus(error.statusCode),
     },
   }
+}
+
+function isAnthropicErrorEnvelope(value: JsonObject): boolean {
+  const error = objectValue(value.error)
+  return value.type === 'error'
+    && typeof error?.type === 'string'
+    && typeof error.message === 'string'
 }
 
 function anthropicGatewayErrorType(statusCode: number): string {
@@ -7479,6 +8237,12 @@ function canonicalStreamErrorPayload(
   }
 }
 
+function isKiroInvalidStateError(
+  error: Extract<CanonicalStreamEvent, { type: 'error' }>
+): boolean {
+  return error.errorType === 'kiro_invalid_state'
+}
+
 function providerErrorMessage(error: JsonObject): string {
   return typeof error.message === 'string' && error.message.trim()
     ? error.message.trim()
@@ -7506,7 +8270,11 @@ const MODEL_SCOPED_PROVIDER_ERROR_CODES = new Set([
   'unsupported_model'
 ])
 
-function modelScopedProviderFailure(statusCode: number, payload: JsonObject): ProviderFailure | undefined {
+interface ModelScopedProviderFailure extends ProviderFailure {
+  readonly scope: 'model'
+}
+
+function modelScopedProviderFailure(statusCode: number, payload: JsonObject): ModelScopedProviderFailure | undefined {
   if (statusCode !== 403) return undefined
   const error = providerErrorEnvelope(payload)
   const code = error ? providerErrorCode(error) : ''
@@ -7514,10 +8282,20 @@ function modelScopedProviderFailure(statusCode: number, payload: JsonObject): Pr
   return {
     category: code === 'model_not_found' ? 'not_found' : 'permission',
     message: 'Provider denied access to the requested model.',
-    retryable: false,
+    // Retryable means another pool member may satisfy this request. The scope
+    // marker below prevents the ordinary retry path from mutating account-wide
+    // health for a denial tied only to one model.
+    retryable: true,
     accountAction: 'none',
-    statusCode
+    statusCode,
+    scope: 'model'
   }
+}
+
+function isModelScopedProviderFailure(
+  failure: ProviderFailure | undefined
+): failure is ModelScopedProviderFailure {
+  return Boolean(failure && (failure as Partial<ModelScopedProviderFailure>).scope === 'model')
 }
 
 function providerErrorStatusCode(error: JsonObject, payload: JsonObject): number {
@@ -7530,17 +8308,27 @@ function providerErrorStatusCode(error: JsonObject, payload: JsonObject): number
     || code === 'rate_limit_error'
     || code === 'rate_limit_exceeded'
     || code === 'requests_limit_reached'
+    || code === 'resource_exhausted'
+    || code === 'service_quota_exceeded_exception'
+    || code === 'throttling_exception'
     || code === 'too_many_requests') return 429
   if (code === 'insufficient_quota' || code === 'payment_required') return 402
   if (code === 'authentication_error'
     || code === 'invalid_api_key'
     || code === 'invalid_authentication') return 401
   if (code === 'model_not_found' || code === 'not_found') return 404
+  if (code === 'resource_not_found_exception') return 404
   if (MODEL_SCOPED_PROVIDER_ERROR_CODES.has(code)
+    || code === 'access_denied_exception'
     || code === 'permission_denied') return 403
+  if (code === 'conflict_exception') return 409
+  if (code === 'timeout_exception') return 504
+  if (code === 'internal_server_exception') return 500
+  if (code === 'service_unavailable_exception') return 503
   if (code === 'bad_request'
     || code === 'invalid_request'
     || code === 'invalid_request_error'
+    || code === 'validation_exception'
     || code === 'unprocessable_entity') return 400
   return 502
 }

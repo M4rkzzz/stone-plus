@@ -50,6 +50,33 @@ describe('client configuration field catalog', () => {
     expect(result.unknownTopLevel).toEqual({ keep: 'yes' })
   })
 
+  it('exposes nonessential traffic as an advanced opt-in and removes the key when disabled', () => {
+    const existing = {
+      'claude-settings': JSON.stringify({
+        env: {
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '0',
+          KEEP: 'yes',
+        },
+      }),
+    }
+    const field = clientConfigEditorFields('claude', existing)
+      .find((candidate) => candidate.id === 'claude.disableNonessentialTraffic')
+
+    expect(field).toMatchObject({ control: 'select', value: '1', advanced: true })
+    expect(field?.options?.map((option) => option.value)).toEqual(['1'])
+
+    const disabled = JSON.parse(applyClientConfigFieldPatches('claude', existing, [
+      { id: 'claude.disableNonessentialTraffic', value: null },
+    ])['claude-settings']!)
+    expect(disabled.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC).toBeUndefined()
+    expect(disabled.env.KEEP).toBe('yes')
+
+    const enabled = JSON.parse(applyClientConfigFieldPatches('claude', {
+      'claude-settings': JSON.stringify({ env: {} }),
+    }, [{ id: 'claude.disableNonessentialTraffic', value: '1' }])['claude-settings']!)
+    expect(enabled.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC).toBe('1')
+  })
+
   it('extracts and patches Codex fields while preserving unknown TOML and removing null fields', () => {
     const existing = {
       'codex-config': [

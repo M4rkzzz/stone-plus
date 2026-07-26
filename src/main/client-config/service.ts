@@ -170,6 +170,13 @@ export class ClientConfigService {
     const files = clientFiles(this.paths, client)
     const fileByRole = new Map(files.map((file) => [file.role, file]))
     const existing = await this.readExisting(client)
+    const currentPermissionMode = client === 'claude'
+      ? clientConfigEditorFields(client, existing).find((field) => field.id === 'claude.permissionMode')?.value
+      : undefined
+    const requestedPermissionMode = client === 'claude'
+      ? changes.patches.find((patch) => patch.id === 'claude.permissionMode')?.value
+      : undefined
+    const requiresNewConversation = requestedPermissionMode === 'auto' && currentPermissionMode !== 'auto'
     const edited: ExistingClientConfig = { ...existing }
     const submitted = new Set<ClientConfigFilePath['role']>()
     for (const draft of changes.files) {
@@ -203,7 +210,10 @@ export class ClientConfigService {
         })),
       ],
     }
-    return this.applyPlan(client, plan, options, existing)
+    const result = await this.applyPlan(client, plan, options, existing)
+    return requiresNewConversation && result.changedFiles.length > 0
+      ? { ...result, requiresNewConversation: true }
+      : result
   }
 
   async apply(

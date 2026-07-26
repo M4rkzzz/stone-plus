@@ -23,6 +23,7 @@ const invokeBuiltInProxy = async (channel: string, ...args: unknown[]) => {
 
 const stone: GatewayApi = {
   setUiLanguage: (language) => ipcRenderer.invoke('stone:set-ui-language', language),
+  setUiTheme: (theme, preference) => ipcRenderer.invoke('stone:set-ui-theme', theme, preference),
   getSnapshot: () => ipcRenderer.invoke('stone:get-snapshot'),
   saveProvider: (input) => ipcRenderer.invoke('stone:save-provider', input),
   refreshProviderModels: (id) => ipcRenderer.invoke('stone:refresh-provider-models', id),
@@ -177,6 +178,7 @@ const stone: GatewayApi = {
   smartRepairAgent: (target) => ipcRenderer.invoke('stone:smart-repair-agent', target),
   repairAllAffectedAgents: () => ipcRenderer.invoke('stone:repair-all-affected-agents'),
   closeAllManagedAgents: () => ipcRenderer.invoke('stone:close-all-managed-agents'),
+  restoreClaudeDesktopOfficialMode: () => ipcRenderer.invoke('stone:restore-claude-desktop-official-mode'),
   previewCodexSessionIndexCleanup: () => ipcRenderer.invoke('stone:preview-codex-session-index-cleanup'),
   cleanupCodexSessionIndexAndRestart: (snapshotSha256, threadIds) => ipcRenderer.invoke('stone:cleanup-codex-session-index-and-restart', snapshotSha256, threadIds),
   listCodexSessions: (query) => ipcRenderer.invoke('stone:list-codex-sessions', query),

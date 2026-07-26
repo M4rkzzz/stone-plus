@@ -1,4 +1,5 @@
 import { execFile, type ChildProcess } from 'node:child_process'
+import { basename, isAbsolute, normalize, resolve } from 'node:path'
 
 export interface FileExecutionResult {
   stdout: string
@@ -18,6 +19,37 @@ export type ExecuteFile = (
   options?: FileExecutionOptions
 ) => Promise<FileExecutionResult>
 
+/**
+ * Windows PowerShell treats everything after `-Command` as command text and
+ * reparses it. Dynamic values must be passed through the child environment;
+ * this helper deliberately has no trailing-argument API so paths containing
+ * whitespace or PowerShell metacharacters can never become command source.
+ */
+export function createWindowsPowerShellCommandArgs(
+  script: string,
+): string[] {
+  return [
+    '-NoProfile',
+    '-NonInteractive',
+    '-ExecutionPolicy',
+    'Bypass',
+    '-Command',
+    `& {\n${script.trim()}\n}`,
+  ]
+}
+
+/**
+ * Pin ACL and Authenticode cmdlets to the inbox Windows PowerShell module.
+ * This avoids inheriting a PSModulePath that resolves a PowerShell 7 module
+ * which Windows PowerShell 5.1 cannot load.
+ *
+ * Keep this after any `param(...)` declaration and before security cmdlet use.
+ */
+export const WINDOWS_POWERSHELL_SECURITY_MODULE_IMPORT = String.raw`
+$stoneSecurityModule = Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell\v1.0\Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1'
+Import-Module -Name $stoneSecurityModule -Force -ErrorAction Stop
+`.trim()
+
 export async function executeFile(
   executable: string,
   args: readonly string[],
@@ -33,9 +65,14 @@ export async function executeFile(
       encoding: 'utf8'
     }, (error, stdout, stderr) => {
       if (error) {
-        const failure = new Error(error.message, { cause: error }) as Error & { stdout?: string; stderr?: string }
+        const failure = new Error(error.message, { cause: error }) as Error & {
+          stdout?: string
+          stderr?: string
+          code?: string | number | null
+        }
         failure.stdout = String(stdout ?? '')
         failure.stderr = String(stderr ?? '')
+        failure.code = error.code
         reject(failure)
         return
       }
@@ -92,9 +129,21 @@ export type TerminateProcessTree = (child: ChildProcess, platform?: NodeJS.Platf
 export async function terminateProcessTree(
   child: ChildProcess,
   platform: NodeJS.Platform = process.platform,
-  execute: ExecuteFile = executeFile
+  execute: ExecuteFile = executeFile,
+  exitTimeoutMs = 2_000,
 ): Promise<void> {
   if (child.exitCode !== null || child.signalCode !== null) return
+
+  const identity = expectedChildIdentity(child)
+  if (child.pid && identity) {
+    const stillOwned = await assertProcessIdentity(child.pid, identity, platform, execute)
+    if (!stillOwned) {
+      if (platform !== 'win32' && processGroupExists(child.pid)) {
+        throw new Error(`Process ${child.pid} exited but its remaining process group cannot be identity-verified.`)
+      }
+      return
+    }
+  }
 
   if (platform === 'win32') {
     if (child.pid) {
@@ -116,12 +165,15 @@ export async function terminateProcessTree(
         // A pid-less failed spawn may already be closed.
       }
     }
-    await waitForProcessExit(child, 2_000)
+    const exited = await waitForProcessExit(child, exitTimeoutMs)
+    if (!exited) {
+      await assertProcessGone(child.pid, identity, platform, execute)
+    }
     return
   }
 
   signalProcessTree(child, platform, 'SIGTERM')
-  const rootExited = await waitForProcessExit(child, 2_000)
+  const rootExited = await waitForProcessExit(child, exitTimeoutMs)
   if (!rootExited || processGroupExists(child.pid)) {
     try {
       signalProcessTree(child, platform, 'SIGKILL')
@@ -129,7 +181,13 @@ export async function terminateProcessTree(
       // A process group disappearing between the probe and signal is expected.
     }
   }
-  await waitForProcessExit(child, 2_000)
+  const exited = await waitForProcessExit(child, exitTimeoutMs)
+  if (!exited || processGroupExists(child.pid)) {
+    await assertProcessGone(child.pid, identity, platform, execute)
+    if (processGroupExists(child.pid)) {
+      throw new Error(`Process group ${child.pid ?? 'unknown'} is still alive after forced termination.`)
+    }
+  }
 }
 
 export function exitDescription(code: number | null, signal: NodeJS.Signals | null): string {
@@ -163,4 +221,119 @@ function processGroupExists(pid: number | undefined): boolean {
   } catch {
     return false
   }
+}
+
+interface ExpectedProcessIdentity {
+  imagePath: string
+  commandArguments: readonly string[]
+}
+
+interface ObservedProcessIdentity {
+  imagePath: string
+  commandLine: string
+}
+
+function expectedChildIdentity(child: ChildProcess): ExpectedProcessIdentity | undefined {
+  const processChild = child as ChildProcess & { spawnfile?: string; spawnargs?: string[] }
+  const imagePath = processChild.spawnfile?.trim()
+  if (!imagePath) return undefined
+  const spawnArgs = processChild.spawnargs ?? []
+  return {
+    imagePath,
+    commandArguments: spawnArgs.length > 0 ? spawnArgs.slice(1) : [],
+  }
+}
+
+async function assertProcessIdentity(
+  pid: number,
+  expected: ExpectedProcessIdentity,
+  platform: NodeJS.Platform,
+  execute: ExecuteFile,
+): Promise<boolean> {
+  const observed = await inspectProcessIdentity(pid, platform, execute)
+  if (!observed) return false
+  const imageMatches = sameImage(observed.imagePath, expected.imagePath, platform)
+  const commandMatches = expected.commandArguments.every((argument) => (
+    !argument || observed.commandLine.includes(argument)
+  ))
+  if (!imageMatches || !commandMatches) {
+    throw new Error(`Refusing to terminate process ${pid}: its image or command line no longer matches Stone+ ownership.`)
+  }
+  return true
+}
+
+async function assertProcessGone(
+  pid: number | undefined,
+  expected: ExpectedProcessIdentity | undefined,
+  platform: NodeJS.Platform,
+  execute: ExecuteFile,
+): Promise<void> {
+  if (!pid) throw new Error('The process did not exit and has no PID for final verification.')
+  if (!expected) {
+    throw new Error(`Process ${pid} is still alive after forced termination and lacks a verifiable image/command identity.`)
+  }
+  const observed = await inspectProcessIdentity(pid, platform, execute)
+  if (!observed) return
+  const stillOwned = sameImage(observed.imagePath, expected.imagePath, platform)
+    && expected.commandArguments.every((argument) => !argument || observed.commandLine.includes(argument))
+  if (stillOwned) throw new Error(`Stone+ process ${pid} is still alive after forced termination.`)
+  throw new Error(`PID ${pid} is still alive after forced termination and cannot be safely released.`)
+}
+
+async function inspectProcessIdentity(
+  pid: number,
+  platform: NodeJS.Platform,
+  execute: ExecuteFile,
+): Promise<ObservedProcessIdentity | undefined> {
+  try {
+    if (platform === 'win32') {
+      const script = String.raw`
+$p = Get-CimInstance Win32_Process -Filter ('ProcessId = ${pid}') -ErrorAction SilentlyContinue
+if ($null -eq $p) { [Console]::Out.Write('missing'); exit 0 }
+[ordered]@{ imagePath = [string]$p.ExecutablePath; commandLine = [string]$p.CommandLine } | ConvertTo-Json -Compress
+`.trim()
+      const result = await execute('powershell.exe', [
+        '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script,
+      ], { timeoutMs: 5_000 })
+      if (result.stdout.trim() === 'missing') return undefined
+      const parsed = JSON.parse(result.stdout.trim()) as Partial<ObservedProcessIdentity>
+      if (!parsed.imagePath || !parsed.commandLine) throw new Error(`Windows withheld process identity for PID ${pid}.`)
+      return { imagePath: parsed.imagePath, commandLine: parsed.commandLine }
+    }
+    const image = await execute('/usr/bin/readlink', [`/proc/${pid}/exe`], { timeoutMs: 5_000 })
+      .catch(async () => execute('/bin/ps', ['-p', String(pid), '-o', 'comm='], { timeoutMs: 5_000 }))
+    const command = await execute('/bin/ps', ['-p', String(pid), '-o', 'command='], { timeoutMs: 5_000 })
+    const imagePath = image.stdout.trim()
+    const commandLine = command.stdout.trim()
+    return imagePath && commandLine ? { imagePath, commandLine } : undefined
+  } catch (error) {
+    const cause = error as Error & {
+      code?: unknown
+      cause?: { code?: unknown }
+      stdout?: string
+      stderr?: string
+    }
+    const code = cause.code ?? cause.cause?.code
+    if (code === 'ESRCH' || (platform !== 'win32' && (code === 1 || code === 3))) return undefined
+    const output = `${(error as Error & { stdout?: string; stderr?: string }).stdout ?? ''}\n${(error as Error & { stderr?: string }).stderr ?? ''}`
+    if (
+      platform !== 'win32'
+      && /no process|not found|cannot find|failed to open|exit code 3/i.test(`${String((error as Error).message)}\n${output}`)
+    ) return undefined
+    throw error
+  }
+}
+
+function sameImage(observed: string, expected: string, platform: NodeJS.Platform): boolean {
+  const normalizePath = (value: string): string => {
+    const normalized = normalize(resolve(value))
+    return platform === 'win32' ? normalized.toLowerCase() : normalized
+  }
+  if (normalizePath(observed) === normalizePath(expected)) return true
+  if (isAbsolute(observed) && isAbsolute(expected)) return false
+  const observedName = basename(observed)
+  const expectedName = basename(expected)
+  return platform === 'win32'
+    ? observedName.toLowerCase() === expectedName.toLowerCase()
+    : observedName === expectedName
 }

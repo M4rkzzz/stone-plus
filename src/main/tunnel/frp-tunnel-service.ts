@@ -2,10 +2,12 @@ import { spawn, execFile, type ChildProcessByStdio } from 'node:child_process'
 import { access, chmod, mkdir, readFile, realpath, rename, unlink, writeFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import type { Readable } from 'node:stream'
-import { parse } from 'smol-toml'
+import { parse, stringify } from 'smol-toml'
 import type { FrpTunnelState } from '@shared/types'
 
 const MAX_LOG_LINES = 120
+const REDACTED_TUNNEL_SECRET = '[REDACTED]'
+const SENSITIVE_TUNNEL_KEY = /(token|secret|password|credential|authorization)/i
 type FrpcProcess = ChildProcessByStdio<null, Readable, Readable>
 
 interface ParsedTunnelEndpoint {
@@ -18,6 +20,8 @@ export interface FrpTunnelServiceOptions {
   userDataPath: string
   binaryPath: string
   binaryExists?: (path: string) => Promise<boolean>
+  /** Must compare the executable against a digest anchored in packaged app code/metadata. */
+  verifyBinaryIntegrity?: (path: string) => Promise<void>
   platform?: NodeJS.Platform
   inspectProcess?: (pid: number) => Promise<{ executablePath: string; commandLine: string } | undefined>
   terminateProcessTree?: (pid: number) => Promise<void>
@@ -35,6 +39,7 @@ export class FrpTunnelService {
   private readonly configPath: string
   private readonly binaryPath: string
   private readonly binaryExists: (path: string) => Promise<boolean>
+  private readonly verifyBinaryIntegrity: (path: string) => Promise<void>
   private readonly markerPath: string
   private readonly platform: NodeJS.Platform
   private readonly inspectProcess: NonNullable<FrpTunnelServiceOptions['inspectProcess']>
@@ -50,6 +55,7 @@ export class FrpTunnelService {
     this.configPath = join(options.userDataPath, 'frp', 'frpc.toml')
     this.binaryPath = options.binaryPath
     this.binaryExists = options.binaryExists ?? fileExists
+    this.verifyBinaryIntegrity = options.verifyBinaryIntegrity ?? missingBinaryIntegrityVerifier
     this.markerPath = join(options.userDataPath, 'frp', 'frpc-process.json')
     this.platform = options.platform ?? process.platform
     this.inspectProcess = options.inspectProcess ?? ((pid) => inspectNativeProcess(pid, this.platform))
@@ -108,6 +114,14 @@ export class FrpTunnelService {
     if (!await this.binaryExists(this.binaryPath)) {
       throw new Error('The embedded frpc executable is unavailable or was blocked by antivirus software.')
     }
+    try {
+      await this.verifyBinaryIntegrity(this.binaryPath)
+    } catch (cause) {
+      const detail = sanitizeLogLine(cause instanceof Error ? cause.message : String(cause))
+      this.lastError = `frpc binary integrity verification failed${detail ? `: ${detail}` : '.'}`
+      this.appendLog(this.lastError)
+      throw new Error(this.lastError)
+    }
     parseTunnelEndpoint(this.config, true)
     await verifyConfiguration(this.binaryPath, this.configPath)
     this.lastError = undefined
@@ -123,8 +137,8 @@ export class FrpTunnelService {
     pipeLines(child.stdout, (line) => this.appendLog(line))
     pipeLines(child.stderr, (line) => this.appendLog(line))
     child.once('error', (error) => {
-      this.lastError = error.message
-      this.appendLog(`frpc error: ${error.message}`)
+      this.lastError = sanitizeLogLine(error.message) || 'frpc process error.'
+      this.appendLog(`frpc error: ${this.lastError}`)
     })
     child.once('exit', (code, signal) => {
       if (this.child !== child) return
@@ -211,6 +225,27 @@ export class FrpTunnelService {
       await this.clearProcessMarker()
       return
     }
+    const expectedExecutable = await canonicalPath(this.binaryPath)
+    const expectedConfig = resolve(this.configPath)
+    const markerExecutableMatches = samePath(marker.executablePath, expectedExecutable, this.platform)
+    const markerConfigMatches = samePath(marker.configPath, expectedConfig, this.platform)
+    if (!markerExecutableMatches || !markerConfigMatches) {
+      this.lastError = `Discarded stale frpc recovery state (marker executable: ${markerExecutableMatches}, config: ${markerConfigMatches}).`
+      await this.clearProcessMarker()
+      return
+    }
+    try {
+      // The marker is untrusted persisted state. Verify the packaged executable
+      // before inspecting or adopting its PID so a failed recovery can never
+      // make Stone+ terminate an unknown process later.
+      await this.verifyBinaryIntegrity(expectedExecutable)
+    } catch (cause) {
+      const detail = sanitizeLogLine(cause instanceof Error ? cause.message : String(cause))
+      this.lastError = `Discarded frpc recovery state because binary integrity verification failed${detail ? `: ${detail}` : '.'}`
+      this.appendLog(this.lastError)
+      await this.clearProcessMarker()
+      return
+    }
     let live: Awaited<ReturnType<NonNullable<FrpTunnelServiceOptions['inspectProcess']>>>
     try {
       live = await this.inspectProcess(marker.pid)
@@ -220,17 +255,14 @@ export class FrpTunnelService {
       // require an explicit stop/retry instead.
       this.recoveredPid = marker.pid
       this.startedAt = marker.startedAt
-      this.lastError = `Could not verify the recovered frpc process: ${error instanceof Error ? error.message : String(error)}`
+      const detail = sanitizeLogLine(error instanceof Error ? error.message : String(error))
+      this.lastError = `Could not verify the recovered frpc process${detail ? `: ${detail}` : '.'}`
       return
     }
-    const expectedExecutable = await canonicalPath(this.binaryPath)
-    const expectedConfig = resolve(this.configPath)
     const liveExecutableMatches = Boolean(live && samePath(live.executablePath, expectedExecutable, this.platform))
-    const markerExecutableMatches = samePath(marker.executablePath, expectedExecutable, this.platform)
-    const markerConfigMatches = samePath(marker.configPath, expectedConfig, this.platform)
     const commandMatches = Boolean(live && commandLineContainsPath(live.commandLine, expectedConfig, this.platform))
-    if (!liveExecutableMatches || !markerExecutableMatches || !markerConfigMatches || !commandMatches) {
-      this.lastError = `Discarded stale frpc recovery state (live executable: ${liveExecutableMatches}, marker executable: ${markerExecutableMatches}, config: ${markerConfigMatches}, command: ${commandMatches}).`
+    if (!liveExecutableMatches || !commandMatches) {
+      this.lastError = `Discarded stale frpc recovery state (live executable: ${liveExecutableMatches}, command: ${commandMatches}).`
       await this.clearProcessMarker()
       return
     }
@@ -295,41 +327,91 @@ function normalizeConfig(content: string): string {
 }
 
 function redactTunnelConfig(content: string): string {
-  return transformTunnelSecrets(content, () => '"[REDACTED]"')
+  if (!content.trim()) return content
+  const document = parseTomlDocument(content)
+  const redacted = transformTomlSecrets(document, undefined, [], 'redact')
+  if (!isTomlTable(redacted)) throw new Error('frpc redaction did not produce a TOML document.')
+  return serializeTomlDocument(redacted)
 }
 
 function restoreRedactedSecrets(content: string, current: string): string {
-  const currentSecrets = collectTunnelSecrets(current)
-  return transformTunnelSecrets(content, (path, value) => {
-    return /^(['"]?)\[REDACTED\]\1$/i.test(value.trim()) ? currentSecrets.get(path) ?? value : value
-  })
+  if (!content.includes(REDACTED_TUNNEL_SECRET)) return content
+  const candidate = parseTomlDocument(content)
+  const persisted = current.trim() ? parseTomlDocument(current) : undefined
+  const restored = transformTomlSecrets(candidate, persisted, [], 'restore')
+  if (!isTomlTable(restored)) throw new Error('frpc secret restoration did not produce a TOML document.')
+  return serializeTomlDocument(restored)
 }
 
-function collectTunnelSecrets(content: string): Map<string, string> {
-  const secrets = new Map<string, string>()
-  transformTunnelSecrets(content, (path, value) => {
-    secrets.set(path, value)
-    return value
-  })
-  return secrets
+type TomlDocument = Record<string, unknown>
+type TunnelSecretMode = 'redact' | 'restore'
+
+function parseTomlDocument(content: string): TomlDocument {
+  const value = parse(content)
+  if (!isTomlTable(value)) throw new Error('frpc configuration root must be a TOML table.')
+  return value
 }
 
-function transformTunnelSecrets(content: string, replace: (path: string, value: string) => string): string {
-  let section = ''
-  return content.split(/(\r?\n)/).map((line) => {
-    if (/^\r?\n$/.test(line)) return line
-    const sectionMatch = /^\s*\[([^\]]+)\]\s*(?:#.*)?$/.exec(line)
-    if (sectionMatch) {
-      section = sectionMatch[1].trim().toLowerCase()
-      return line
+function serializeTomlDocument(document: TomlDocument): string {
+  const serialized = stringify(document).replace(/\r\n/g, '\n').trimEnd()
+  return serialized ? `${serialized}\n` : ''
+}
+
+function transformTomlSecrets(
+  candidate: unknown,
+  persisted: unknown,
+  path: Array<string | number>,
+  mode: TunnelSecretMode,
+): unknown {
+  if (Array.isArray(candidate)) {
+    const persistedItems = Array.isArray(persisted) ? persisted : []
+    return candidate.map((item, index) => transformTomlSecrets(
+      item,
+      matchingPersistedArrayItem(item, index, persistedItems),
+      [...path, index],
+      mode,
+    ))
+  }
+  if (!isTomlTable(candidate)) return candidate
+
+  const persistedTable = isTomlTable(persisted) ? persisted : undefined
+  return Object.fromEntries(Object.entries(candidate).map(([key, value]) => {
+    const nextPath = [...path, key]
+    const previous = persistedTable?.[key]
+    if (SENSITIVE_TUNNEL_KEY.test(key)) {
+      if (mode === 'redact') return [key, REDACTED_TUNNEL_SECRET]
+      if (value === REDACTED_TUNNEL_SECRET) {
+        if (previous === undefined) {
+          throw new Error(`The redacted frpc secret at ${formatTomlPath(nextPath)} has no stored secret to restore.`)
+        }
+        return [key, cloneTomlValue(previous)]
+      }
+      return [key, value]
     }
-    const assignment = /^(\s*)([A-Za-z0-9_.-]+)(\s*=\s*)(.*)$/.exec(line)
-    if (!assignment) return line
-    const key = assignment[2].toLowerCase()
-    const path = key.includes('.') ? key : section ? `${section}.${key}` : key
-    if (path !== 'auth.token' && path !== 'auth.oidc.clientsecret') return line
-    return `${assignment[1]}${assignment[2]}${assignment[3]}${replace(path, assignment[4])}`
-  }).join('')
+    return [key, transformTomlSecrets(value, previous, nextPath, mode)]
+  }))
+}
+
+function matchingPersistedArrayItem(candidate: unknown, index: number, persisted: unknown[]): unknown {
+  if (!isTomlTable(candidate) || typeof candidate.name !== 'string') return persisted[index]
+  const matches = persisted.filter((item) => isTomlTable(item) && item.name === candidate.name)
+  return matches.length === 1 ? matches[0] : undefined
+}
+
+function cloneTomlValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(cloneTomlValue)
+  if (isTomlTable(value)) return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, cloneTomlValue(item)]))
+  return value
+}
+
+function isTomlTable(value: unknown): value is TomlDocument {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value) && !(value instanceof Date)
+}
+
+function formatTomlPath(path: Array<string | number>): string {
+  return path.reduce<string>((result, part) => {
+    return typeof part === 'number' ? `${result}[${part}]` : result ? `${result}.${part}` : part
+  }, '')
 }
 
 async function verifyConfiguration(binaryPath: string, configPath: string): Promise<void> {
@@ -435,10 +517,26 @@ function pipeLines(stream: Readable, listener: (line: string) => void): void {
 
 function sanitizeLogLine(value: string): string {
   return value
-    .replace(/\b(auth\.token|token)\s*=\s*(?:"[^"]*"|'[^']*'|\S+)/gi, '$1 = [REDACTED]')
+    .replace(
+      /\b(["']?authorization[A-Za-z0-9_.-]*["']?)\s*[:=]\s*(?:["']?)(?:Bearer|Basic)\s+[^\s,;}"']+/gi,
+      '$1 = [REDACTED]',
+    )
+    .replace(
+      /\b(["']?[A-Za-z0-9_.-]*(?:token|secret|password|credential|authorization)[A-Za-z0-9_.-]*["']?)\s*[:=]\s*(?:Bearer\s+)?(?:"[^"]*"|'[^']*'|[^\s,;}]+)/gi,
+      '$1 = [REDACTED]',
+    )
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer [REDACTED]')
+    .replace(
+      /([?&][A-Za-z0-9_.-]*(?:token|secret|password|credential|authorization)[A-Za-z0-9_.-]*=)[^&\s]*/gi,
+      '$1[REDACTED]',
+    )
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, 2_000)
+}
+
+async function missingBinaryIntegrityVerifier(): Promise<void> {
+  throw new Error('Bundled frpc binary integrity verifier is unavailable.')
 }
 
 async function fileExists(path: string): Promise<boolean> {

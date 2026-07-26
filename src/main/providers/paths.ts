@@ -19,6 +19,8 @@ export function protocolOperationPath(input: ProviderEndpointInput): {
       return { path: 'chat/completions' }
     case 'anthropic-messages':
       return { path: 'messages' }
+    case 'kiro-claude':
+      throw new Error('Kiro Claude requires its dedicated exact-endpoint provider adapter')
     case 'gemini': {
       const model = input.model?.trim()
       if (!model) throw new Error('A model is required for a Gemini provider endpoint')

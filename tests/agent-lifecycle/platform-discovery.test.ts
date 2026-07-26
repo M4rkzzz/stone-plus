@@ -213,6 +213,150 @@ describe('agent platform discovery', () => {
     expect(runCommand).not.toHaveBeenCalled()
   })
 
+  it('discovers Claude Code Desktop from the fixed Windows package identity', async () => {
+    const findCommand = vi.fn()
+    const runCommand = vi.fn(async () => ({
+      stdout: 'Claude_pzs8sxrjxfjjc\r\nC:\\Program Files\\WindowsApps\\Claude_1.2.3.0_x64__pzs8sxrjxfjjc\r\n',
+      stderr: '',
+    }))
+    const result = await discoverAgentExecutable('claude-code-desktop', {
+      platform: 'win32', homeDir: 'C:\\Users\\Alice', environment: {},
+      fileExists: async () => false, findCommand, runCommand,
+    })
+
+    expect(result).toMatchObject({
+      target: 'claude-code-desktop',
+      installed: true,
+      launchTarget: 'claude://code/new',
+      source: 'windows-app',
+      processControl: 'unavailable',
+    })
+    expect(result.executablePath).toBeUndefined()
+    expect(result.inspectedPaths).toEqual([
+      'C:\\Program Files\\WindowsApps\\Claude_1.2.3.0_x64__pzs8sxrjxfjjc',
+    ])
+    expect(runCommand).toHaveBeenCalledTimes(1)
+    expect(runCommand.mock.calls[0][0]).toBe('powershell.exe')
+    expect(runCommand.mock.calls[0][1].at(-1)).toContain("Get-AppxPackage -Name 'Claude'")
+    expect(findCommand).not.toHaveBeenCalled()
+  })
+
+  it('does not fall through to a CLI when Claude Code Desktop is absent on Windows', async () => {
+    const findCommand = vi.fn(async () => ['C:\\Tools\\grok.exe'])
+    const fileExists = vi.fn(async () => true)
+    const result = await discoverAgentExecutable('claude-code-desktop', {
+      platform: 'win32', homeDir: 'C:\\Users\\Alice', environment: {},
+      fileExists, findCommand,
+      runCommand: async () => ({ stdout: '', stderr: '' }),
+    })
+
+    expect(result).toEqual({
+      target: 'claude-code-desktop', platform: 'win32', supported: true, installed: false,
+      source: 'unavailable', processControl: 'unavailable', inspectedPaths: [],
+    })
+    expect(findCommand).not.toHaveBeenCalled()
+    expect(fileExists).not.toHaveBeenCalled()
+  })
+
+  it('discovers the Claude Desktop app bundle on macOS through its exact app path', async () => {
+    const runCommand = vi.fn()
+    const result = await discoverAgentExecutable('claude-code-desktop', {
+      platform: 'darwin', homeDir: '/Users/alice', environment: {}, runCommand,
+      fileExists: async (path) => path === '/Applications/Claude.app/Contents/MacOS/Claude',
+    })
+
+    expect(result).toMatchObject({
+      target: 'claude-code-desktop',
+      installed: true,
+      executablePath: '/Applications/Claude.app/Contents/MacOS/Claude',
+      launchTarget: 'claude://code/new',
+      source: 'macos-app',
+      processControl: 'unavailable',
+    })
+    expect(runCommand).not.toHaveBeenCalled()
+  })
+
+  it('uses only the official claude-desktop executable name on Linux', async () => {
+    const checked: string[] = []
+    const findCommand = vi.fn(async () => ['/home/alice/.local/bin/claude'])
+    const result = await discoverAgentExecutable('claude-code-desktop', {
+      platform: 'linux', homeDir: '/home/alice', environment: {}, findCommand,
+      fileExists: async (path) => { checked.push(path); return path === '/usr/bin/claude-desktop' },
+    })
+
+    expect(result).toMatchObject({
+      target: 'claude-code-desktop', installed: true,
+      executablePath: '/usr/bin/claude-desktop',
+      launchTarget: 'claude://code/new',
+      source: 'well-known-path', processControl: 'unavailable',
+    })
+    expect(checked).toEqual(['/usr/bin/claude-desktop'])
+    expect(findCommand).not.toHaveBeenCalled()
+  })
+
+  it('discovers the exact official Claude Code extension in stable VS Code', async () => {
+    const findCommand = vi.fn()
+    const fileExists = vi.fn()
+    const readDirectoryNames = vi.fn(async (path: string) => path.endsWith('\\.vscode\\extensions')
+      ? ['anthropic.claude-code-2.1.216-win32-x64', 'anthropic.claude-code-evil', 'other.extension-1.0.0']
+      : [])
+    const result = await discoverAgentExecutable('claude-code-vsc', {
+      platform: 'win32', homeDir: 'C:\\Users\\Alice', environment: {},
+      findCommand, fileExists, readDirectoryNames,
+    })
+
+    expect(result).toMatchObject({
+      target: 'claude-code-vsc', installed: true,
+      launchTarget: 'vscode://anthropic.claude-code/open',
+      source: 'well-known-path', processControl: 'unavailable',
+    })
+    expect(result.executablePath).toBeUndefined()
+    expect(result.inspectedPaths).toContain(
+      'C:\\Users\\Alice\\.vscode\\extensions\\anthropic.claude-code-2.1.216-win32-x64',
+    )
+    expect(findCommand).not.toHaveBeenCalled()
+    expect(fileExists).not.toHaveBeenCalled()
+  })
+
+  it('falls back to the official extension in VS Code Insiders', async () => {
+    const readDirectoryNames = vi.fn(async (path: string) => {
+      if (path.endsWith('/.vscode/extensions')) throw new Error('missing stable extensions')
+      return ['anthropic.claude-code-2.1.216-linux-x64']
+    })
+    const result = await discoverAgentExecutable('claude-code-vsc', {
+      platform: 'linux', homeDir: '/home/alice', environment: {}, readDirectoryNames,
+    })
+
+    expect(result).toMatchObject({
+      installed: true,
+      launchTarget: 'vscode-insiders://anthropic.claude-code/open',
+      processControl: 'unavailable',
+    })
+    expect(readDirectoryNames).toHaveBeenNthCalledWith(1, '/home/alice/.vscode/extensions')
+    expect(readDirectoryNames).toHaveBeenNthCalledWith(2, '/home/alice/.vscode-insiders/extensions')
+  })
+
+  it('rejects lookalike VS Code extensions without probing a Grok executable', async () => {
+    const findCommand = vi.fn(async () => ['C:\\Tools\\grok.exe'])
+    const fileExists = vi.fn(async () => true)
+    const result = await discoverAgentExecutable('claude-code-vsc', {
+      platform: 'win32', homeDir: 'C:\\Users\\Alice', environment: {},
+      findCommand, fileExists,
+      readDirectoryNames: async () => [
+        'anthropic.claude-code-evil',
+        'anthropic.claude-code-2.1',
+        'someone.claude-code-2.1.216-win32-x64',
+      ],
+    })
+
+    expect(result).toMatchObject({
+      target: 'claude-code-vsc', installed: false,
+      source: 'unavailable', processControl: 'unavailable',
+    })
+    expect(findCommand).not.toHaveBeenCalled()
+    expect(fileExists).not.toHaveBeenCalled()
+  })
+
   it('reports a missing CLI as supported without granting control of external processes', async () => {
     const result = await discoverAgentExecutable('codex-cli', {
       platform: 'linux', homeDir: '/home/alice', environment: {},

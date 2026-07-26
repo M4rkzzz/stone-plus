@@ -95,6 +95,47 @@ describe('non-streaming tool protocol conversion', () => {
     ])
   })
 
+  it('preserves every Responses message and its order around tool calls when converting responses', () => {
+    const source = {
+      id: 'resp_ordered',
+      model: 'gpt-source',
+      status: 'completed',
+      output: [
+        {
+          id: 'msg_before', type: 'message', role: 'assistant', status: 'completed',
+          content: [{ type: 'output_text', text: 'Before.' }],
+        },
+        {
+          id: 'fc_ordered', type: 'function_call', status: 'completed',
+          call_id: 'call_ordered', name: 'lookup', arguments: '{"city":"Paris"}',
+        },
+        {
+          id: 'msg_after', type: 'message', role: 'assistant', status: 'completed',
+          content: [{ type: 'output_text', text: 'After.' }],
+        },
+      ],
+      usage: { input_tokens: 4, output_tokens: 3 },
+    }
+
+    expect(convertResponse(
+      'openai-responses', 'anthropic-messages', source, 'claude-target'
+    ).content).toEqual([
+      { type: 'text', text: 'Before.' },
+      { type: 'tool_use', id: 'call_ordered', name: 'lookup', input: { city: 'Paris' } },
+      { type: 'text', text: 'After.' },
+    ])
+
+    expect(convertResponse('openai-responses', 'openai-chat', source, 'chat-target'))
+      .toMatchObject({ choices: [{ message: { content: 'Before.After.' } }] })
+
+    expect(convertResponse('openai-responses', 'gemini', source, 'gemini-target'))
+      .toMatchObject({ candidates: [{ content: { parts: [
+        { text: 'Before.' },
+        { functionCall: { id: 'call_ordered', name: 'lookup', args: { city: 'Paris' } } },
+        { text: 'After.' },
+      ] } }] })
+  })
+
   it('converts a multi-round Responses request to Anthropic without losing tool semantics', () => {
     const converted = convertRequest('openai-responses', 'anthropic-messages', {
       model: 'gpt-source',

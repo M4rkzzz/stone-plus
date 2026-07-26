@@ -85,6 +85,44 @@ function pageFromHash(): PageId {
 }
 
 const SETUP_AUTO_SHOWN_STORAGE_KEY = 'stone.setup.auto-shown.v1'
+const MOBILE_NAVIGATION_QUERY = '(max-width: 780px)'
+const mobileSidebarFocusableSelector = [
+  'a[href]',
+  'button:not([disabled])',
+  'input:not([disabled])',
+  'select:not([disabled])',
+  'textarea:not([disabled])',
+  '[tabindex]:not([tabindex="-1"])',
+].join(',')
+
+function mobileSidebarFocusables(sidebar: HTMLElement): HTMLElement[] {
+  return Array.from(sidebar.querySelectorAll<HTMLElement>(mobileSidebarFocusableSelector))
+    .filter((element) => !element.closest('[inert], [hidden], [aria-hidden="true"]'))
+}
+
+function focusMobileSidebarElement(element: HTMLElement | undefined): void {
+  if (!element) return
+  try {
+    element.focus({ preventScroll: true })
+  } catch {
+    element.focus()
+  }
+}
+
+function trapMobileSidebarTabKey(event: KeyboardEvent, sidebar: HTMLElement): void {
+  if (event.key !== 'Tab') return
+  const focusable = mobileSidebarFocusables(sidebar)
+  if (!focusable.length) {
+    event.preventDefault()
+    focusMobileSidebarElement(sidebar)
+    return
+  }
+  const activeIndex = focusable.findIndex((element) => element === sidebar.ownerDocument.activeElement)
+  if (activeIndex < 0 || (event.shiftKey ? activeIndex === 0 : activeIndex === focusable.length - 1)) {
+    event.preventDefault()
+    focusMobileSidebarElement(event.shiftKey ? focusable[focusable.length - 1] : focusable[0])
+  }
+}
 
 function LoadingScreen() {
   const { t } = useI18n()
@@ -141,6 +179,7 @@ export default function App() {
   const [snapshot, setSnapshot] = useState<AppSnapshot | null>(null)
   const [page, setPage] = useState<PageId>(pageFromHash)
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
+  const [mobileLayout, setMobileLayout] = useState(() => window.matchMedia?.(MOBILE_NAVIGATION_QUERY).matches ?? false)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [busyKeys, setBusyKeys] = useState<Set<string>>(new Set())
   const [error, setError] = useState<string | null>(null)
@@ -159,6 +198,8 @@ export default function App() {
   const agentLifecycleRefreshInFlight = useRef<Promise<void> | null>(null)
   const activePageSnapshot = useRef<{ page: PageId; snapshot: AppSnapshot } | undefined>(undefined)
   const scrollbarHideTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+  const mobileSidebarRef = useRef<HTMLElement>(null)
+  const mobileNavTriggerRef = useRef<HTMLButtonElement>(null)
 
   const acceptUpdateState = useCallback((next: AppUpdateState) => {
     if (next.revision <= updateRevision.current) return
@@ -271,10 +312,52 @@ export default function App() {
   }, [acceptAgentLifecycleSnapshot, api, refreshAgentLifecycle])
 
   useEffect(() => {
-    const handleHashChange = () => setPage(pageFromHash())
+    const handleHashChange = () => {
+      setPage(pageFromHash())
+      setMobileNavOpen(false)
+    }
     window.addEventListener('hashchange', handleHashChange)
     return () => window.removeEventListener('hashchange', handleHashChange)
   }, [])
+
+  useEffect(() => {
+    const media = window.matchMedia?.(MOBILE_NAVIGATION_QUERY)
+    if (!media) return
+    const syncLayout = () => {
+      setMobileLayout(media.matches)
+      if (!media.matches) setMobileNavOpen(false)
+    }
+    syncLayout()
+    media.addEventListener('change', syncLayout)
+    return () => media.removeEventListener('change', syncLayout)
+  }, [])
+
+  useEffect(() => {
+    if (!mobileLayout || !mobileNavOpen) return
+    const sidebar = mobileSidebarRef.current
+    if (!sidebar) return
+    const restoreFocusTo = mobileNavTriggerRef.current
+    const closeNavigation = () => setMobileNavOpen(false)
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        event.stopPropagation()
+        closeNavigation()
+        return
+      }
+      trapMobileSidebarTabKey(event, sidebar)
+    }
+    document.addEventListener('keydown', handleKeyDown)
+    focusMobileSidebarElement(sidebar.querySelector<HTMLElement>('[data-mobile-sidebar-initial-focus]') ?? mobileSidebarFocusables(sidebar)[0] ?? sidebar)
+    return () => {
+      document.removeEventListener('keydown', handleKeyDown)
+      queueMicrotask(() => {
+        if (window.matchMedia?.(MOBILE_NAVIGATION_QUERY).matches && restoreFocusTo?.isConnected) {
+          focusMobileSidebarElement(restoreFocusTo)
+        }
+      })
+    }
+  }, [mobileLayout, mobileNavOpen])
 
   useEffect(() => {
     if (!snapshot || page === 'setup' || window.localStorage.getItem(SETUP_AUTO_SHOWN_STORAGE_KEY) === 'true') return
@@ -515,6 +598,8 @@ export default function App() {
   const gatewayBusy = busyKeys.has('gateway-power')
   const endpoint = gatewayBaseUrl(snapshot.gatewayStatus.host, snapshot.gatewayStatus.port)
   const accountQuotaPercent = accountQuota ? Math.round(accountQuota.percent) : undefined
+  const mobileSidebarHidden = mobileLayout && !mobileNavOpen
+  const mobileWorkspaceHidden = mobileLayout && mobileNavOpen
   const updateReleaseVisible = Boolean(
     updateState?.release
     && updateState.ignoredVersion !== updateState.release.version
@@ -530,7 +615,17 @@ export default function App() {
   return (
     <div className={`app-shell ${sidebarCollapsed ? 'app-shell--collapsed' : ''}`}>
       {mobileNavOpen && <button className="nav-scrim" type="button" aria-label={t('关闭导航', 'Close navigation')} onClick={() => setMobileNavOpen(false)} />}
-      <aside className={`sidebar ${mobileNavOpen ? 'sidebar--open' : ''}`}>
+      <aside
+        ref={mobileSidebarRef}
+        id="stone-primary-navigation"
+        className={`sidebar ${mobileNavOpen ? 'sidebar--open' : ''}`}
+        role={mobileLayout ? 'dialog' : undefined}
+        aria-modal={mobileLayout && mobileNavOpen || undefined}
+        aria-label={mobileLayout ? t('主导航', 'Main navigation') : undefined}
+        aria-hidden={mobileSidebarHidden || undefined}
+        inert={mobileSidebarHidden || undefined}
+        tabIndex={mobileLayout ? -1 : undefined}
+      >
         <div className="sidebar__brand">
           <StoneMark />
           <div className="sidebar__brand-text">
@@ -541,7 +636,7 @@ export default function App() {
                   className="brand-update-link"
                   type="button"
                   title={t(`更新到 v${updateState?.release?.version}`, `Update to v${updateState?.release?.version}`)}
-                  onClick={() => setUpdateDialogOpen(true)}
+                  onClick={() => { setMobileNavOpen(false); setUpdateDialogOpen(true) }}
                 >
                   {t('更新', 'Update')}
                 </button>
@@ -549,7 +644,7 @@ export default function App() {
             </div>
             <span>Local Gateway</span>
           </div>
-          <button className="icon-button sidebar__mobile-close" type="button" onClick={() => setMobileNavOpen(false)} title={t('关闭导航', 'Close navigation')}>
+          <button className="icon-button sidebar__mobile-close" type="button" data-mobile-sidebar-initial-focus onClick={() => setMobileNavOpen(false)} title={t('关闭导航', 'Close navigation')} aria-label={t('关闭导航', 'Close navigation')}>
             <X size={18} />
           </button>
         </div>
@@ -605,10 +700,10 @@ export default function App() {
         </div>
       </aside>
 
-      <div className="workspace">
+      <div className="workspace" inert={mobileWorkspaceHidden || undefined} aria-hidden={mobileWorkspaceHidden || undefined}>
         <header className="topbar">
           <div className="topbar__left">
-            <button className="icon-button topbar__menu" type="button" onClick={() => setMobileNavOpen(true)} title={t('打开导航', 'Open navigation')}>
+            <button ref={mobileNavTriggerRef} className="icon-button topbar__menu" type="button" aria-controls="stone-primary-navigation" aria-expanded={mobileNavOpen} onClick={() => setMobileNavOpen(true)} title={t('打开导航', 'Open navigation')} aria-label={t('打开导航', 'Open navigation')}>
               <Menu size={19} />
             </button>
             <div className="gateway-state">

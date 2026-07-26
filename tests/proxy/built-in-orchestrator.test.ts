@@ -72,6 +72,154 @@ describe('BuiltInProxyOrchestrator', () => {
     expect(harness.core.start).not.toHaveBeenCalled()
   })
 
+  it('keeps a disabled external route off and reruns failed startup artifact cleanup on retry', async () => {
+    const harness = createHarness({ desiredEnabled: false })
+    harness.core.cleanupStaleRuntimeConfigs.mockRejectedValueOnce(Object.assign(
+      new Error('runtime ACL unavailable'),
+      { code: 'config_invalid' },
+    ))
+
+    await expect(harness.orchestrator.initialize()).rejects.toMatchObject({
+      category: 'configuration-invalid',
+      retryable: true,
+    })
+
+    expect(harness.orchestrator.getState()).toMatchObject({
+      desiredEnabled: false,
+      status: 'error',
+      effectiveRoute: { kind: 'external' },
+      error: { category: 'configuration-invalid', retryable: true },
+    })
+    expect(harness.tun.recoverStale).not.toHaveBeenCalled()
+    expect(harness.system.recoverStaleLease).not.toHaveBeenCalled()
+
+    await harness.orchestrator.retry()
+
+    expect(harness.core.cleanupStaleRuntimeConfigs).toHaveBeenCalledTimes(2)
+    expect(harness.tun.recoverStale).toHaveBeenCalledOnce()
+    expect(harness.system.recoverStaleLease).toHaveBeenCalledOnce()
+    expect(harness.core.stop).not.toHaveBeenCalled()
+    expect(harness.orchestrator.getState()).toMatchObject({
+      desiredEnabled: false,
+      status: 'disabled',
+      effectiveRoute: { kind: 'external' },
+    })
+    expect(harness.orchestrator.getState()).not.toHaveProperty('error')
+  })
+
+  it('preserves a disabled startup maintenance error until the repeated cleanup succeeds', async () => {
+    const harness = createHarness({ desiredEnabled: false })
+    harness.core.cleanupStaleRuntimeConfigs.mockRejectedValue(Object.assign(
+      new Error('runtime directory remains locked'),
+      { code: 'config_invalid' },
+    ))
+
+    await expect(harness.orchestrator.initialize()).rejects.toMatchObject({ category: 'configuration-invalid' })
+    await expect(harness.orchestrator.retry()).rejects.toMatchObject({ category: 'configuration-invalid' })
+
+    expect(harness.core.cleanupStaleRuntimeConfigs).toHaveBeenCalledTimes(2)
+    expect(harness.orchestrator.getState()).toMatchObject({
+      desiredEnabled: false,
+      status: 'error',
+      effectiveRoute: { kind: 'external' },
+      error: { category: 'configuration-invalid' },
+    })
+  })
+
+  it('does not let an enable IPC call bypass a disabled external maintenance failure', async () => {
+    const harness = createHarness({ desiredEnabled: false })
+    const locked = Object.assign(new Error('runtime directory remains locked'), { code: 'config_invalid' })
+    harness.core.cleanupStaleRuntimeConfigs.mockRejectedValue(locked)
+
+    await expect(harness.orchestrator.initialize()).rejects.toMatchObject({ category: 'configuration-invalid' })
+    await expect(harness.orchestrator.setEnabled(false)).rejects.toMatchObject({ category: 'configuration-invalid' })
+    await expect(harness.orchestrator.setEnabled(true)).rejects.toMatchObject({ category: 'configuration-invalid' })
+
+    expect(harness.store.settings.desiredEnabled).toBe(false)
+    expect(harness.core.start).not.toHaveBeenCalled()
+    expect(harness.orchestrator.getState()).toMatchObject({
+      desiredEnabled: false,
+      status: 'error',
+      effectiveRoute: { kind: 'external' },
+    })
+
+    harness.core.cleanupStaleRuntimeConfigs.mockResolvedValue(undefined)
+    await harness.orchestrator.setEnabled(true)
+
+    expect(harness.core.cleanupStaleRuntimeConfigs).toHaveBeenCalledTimes(4)
+    expect(harness.store.settings.desiredEnabled).toBe(true)
+    expect(harness.orchestrator.getState()).toMatchObject({
+      desiredEnabled: true,
+      status: 'ready',
+      effectiveRoute: { kind: 'built-in-mixed' },
+    })
+  })
+
+  it('does not let first-profile import reconciliation bypass disabled maintenance recovery', async () => {
+    const harness = createHarness({ withProfile: false, desiredEnabled: false })
+    const locked = Object.assign(new Error('runtime directory remains locked'), { code: 'config_invalid' })
+    harness.core.cleanupStaleRuntimeConfigs.mockRejectedValue(locked)
+    const importProfile = () => harness.orchestrator.importProfile({
+      source: 'import' as const,
+      name: 'Local',
+      content: 'socks5://127.0.0.1:1080#Local',
+      format: 'uri-list' as const,
+    })
+
+    await expect(harness.orchestrator.initialize()).rejects.toMatchObject({ category: 'configuration-invalid' })
+    await expect(harness.orchestrator.coordinateMutation('profile-imported', importProfile)).rejects.toMatchObject({
+      category: 'configuration-invalid',
+    })
+
+    expect(harness.store.settings.desiredEnabled).toBe(false)
+    expect(harness.store.profiles).toHaveLength(0)
+    expect(harness.core.start).not.toHaveBeenCalled()
+    expect(harness.orchestrator.getState()).toMatchObject({
+      desiredEnabled: false,
+      status: 'error',
+      effectiveRoute: { kind: 'external' },
+    })
+
+    harness.core.cleanupStaleRuntimeConfigs.mockResolvedValue(undefined)
+    await harness.orchestrator.coordinateMutation('profile-imported', importProfile)
+
+    expect(harness.core.cleanupStaleRuntimeConfigs).toHaveBeenCalledTimes(3)
+    expect(harness.store.settings.desiredEnabled).toBe(true)
+    expect(harness.orchestrator.getState()).toMatchObject({
+      desiredEnabled: true,
+      status: 'ready',
+      effectiveRoute: { kind: 'built-in-mixed' },
+    })
+  })
+
+  it('retries the external Chromium reload after stale lease recovery already removed its journal', async () => {
+    const harness = createHarness({ desiredEnabled: false, outboundNetworkMode: 'system' })
+    harness.system.recoverStaleLease
+      .mockResolvedValueOnce({ status: 'restored', leaseId: 'stale-lease' })
+      .mockResolvedValueOnce({ status: 'none' })
+    harness.options.reloadExternalSystemProxy
+      .mockRejectedValueOnce(new Error('Chromium reload timed out'))
+      .mockResolvedValueOnce(undefined)
+
+    await expect(harness.orchestrator.initialize()).rejects.toMatchObject({ category: 'system-proxy' })
+    expect(harness.orchestrator.getState()).toMatchObject({
+      desiredEnabled: false,
+      status: 'error',
+      effectiveRoute: { kind: 'external', externalMode: 'system' },
+    })
+
+    await harness.orchestrator.retry()
+
+    expect(harness.system.recoverStaleLease).toHaveBeenCalledTimes(2)
+    expect(harness.options.reloadExternalSystemProxy).toHaveBeenCalledTimes(2)
+    expect(harness.orchestrator.getState()).toMatchObject({
+      desiredEnabled: false,
+      status: 'disabled',
+      effectiveRoute: { kind: 'external', externalMode: 'system' },
+    })
+    expect(harness.orchestrator.getState()).not.toHaveProperty('error')
+  })
+
   it('restores a normal disabled external route when auto-start is off', async () => {
     const harness = createHarness({ desiredEnabled: true, autoStart: false, hasEverActivated: true })
 
@@ -782,6 +930,9 @@ describe('BuiltInProxyOrchestrator', () => {
     await harness.orchestrator.setEnabled(false)
 
     await expect(latency).rejects.toThrow('cancelled')
+    expect(harness.store.getBuiltInProxyProfile('profile-one')?.nodes[0]).toMatchObject({
+      latencyStatus: 'untested',
+    })
     expect(harness.system.release).toHaveBeenCalledOnce()
     expect(harness.routes.getSnapshot()).toMatchObject({
       status: 'disabled',
@@ -803,6 +954,31 @@ describe('BuiltInProxyOrchestrator', () => {
     expect(harness.routes.getSnapshot()).toMatchObject({
       status: 'error',
       effectiveRoute: { kind: 'blocked' },
+    })
+  })
+
+  it('prevents a cancelled latency batch from overwriting a newer batch', async () => {
+    const harness = createHarness()
+    await harness.orchestrator.setEnabled(true)
+    let resolveOld!: (value: { proxyName: string; delayMs: number; testedAt: number }) => void
+    harness.core.testLatency
+      .mockImplementationOnce((_proxyName: string) => new Promise((resolve) => { resolveOld = resolve }))
+      .mockImplementationOnce(async (proxyName: string) => ({ proxyName, delayMs: 23, testedAt: 230 }))
+
+    const oldBatch = harness.orchestrator.testLatency('profile-one', ['node-one'])
+    await vi.waitFor(() => expect(harness.core.testLatency).toHaveBeenCalledOnce())
+    const newBatch = harness.orchestrator.testLatency('profile-one', ['node-one'])
+
+    await expect(oldBatch).rejects.toThrow('cancelled')
+    await expect(newBatch).resolves.toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'node-one', latencyStatus: 'available', latencyMs: 23 }),
+    ]))
+    resolveOld({ proxyName: 'stone-node-one', delayMs: 999, testedAt: 999 })
+    await Promise.resolve()
+    expect(harness.store.getBuiltInProxyProfile('profile-one')?.nodes[0]).toMatchObject({
+      latencyStatus: 'available',
+      latencyMs: 23,
+      lastTestedAt: 230,
     })
   })
 
@@ -1145,6 +1321,7 @@ function fakeCore(events: string[]): { core: BuiltInProxyCore & Record<string, R
   })
   const core = {
     getState: vi.fn(() => structuredClone(state)),
+    cleanupStaleRuntimeConfigs: vi.fn(async () => undefined),
     start,
     retry: vi.fn(async () => {
       if (!lastRequest) throw new Error('no request')

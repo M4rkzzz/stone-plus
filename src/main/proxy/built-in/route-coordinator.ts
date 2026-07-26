@@ -50,6 +50,8 @@ export interface BuiltInProxyRouteCoordinatorOptions {
   directLoopbackPorts?: readonly number[]
   /** Maximum grace period for a response body captured by a retired route. */
   retirementDrainTimeoutMs?: number
+  /** Absolute safety bound for a retired generation that is still being consumed. */
+  retirementFinalTimeoutMs?: number
   /** Maximum time retirement waits for Chromium/core disposal callbacks. */
   disposalTimeoutMs?: number
 }
@@ -68,8 +70,12 @@ interface BuiltInRouteGeneration {
   effectiveRoute: BuiltInProxyEffectiveRoute
   directLoopbackPorts: ReadonlySet<number>
   inFlight: number
+  pendingFetches: number
+  activeBodyReads: number
+  lastActivityAt: number
   retired: boolean
   disposalStarted: boolean
+  retirementDeadlineAt?: number
   finishRetirement?: () => void
   retirementTimer?: ReturnType<typeof setTimeout>
 }
@@ -114,6 +120,7 @@ export class BuiltInProxyRouteCoordinator {
   private externalMode: OutboundNetworkMode
   private readonly now: () => number
   private readonly retirementDrainTimeoutMs: number
+  private readonly retirementFinalTimeoutMs: number
   private readonly disposalTimeoutMs: number
   private retry?: () => Promise<void> | void
   private nextGeneration = 1
@@ -134,6 +141,10 @@ export class BuiltInProxyRouteCoordinator {
     this.externalMode = options.externalMode ?? 'direct'
     this.now = options.now ?? (() => Date.now())
     this.retirementDrainTimeoutMs = Math.max(1, options.retirementDrainTimeoutMs ?? 5_000)
+    this.retirementFinalTimeoutMs = Math.max(
+      this.retirementDrainTimeoutMs,
+      options.retirementFinalTimeoutMs ?? 60 * 60_000,
+    )
     this.disposalTimeoutMs = Math.max(1, options.disposalTimeoutMs ?? 5_000)
     this.retry = options.retry
     this.addDirectLoopbackPorts(options.directLoopbackPorts ?? [])
@@ -232,8 +243,12 @@ export class BuiltInProxyRouteCoordinator {
       effectiveRoute,
       directLoopbackPorts: generationDirectLoopbackPorts,
       inFlight: 0,
+      pendingFetches: 0,
+      activeBodyReads: 0,
+      lastActivityAt: Date.now(),
       retired: false,
       disposalStarted: false,
+      retirementDeadlineAt: undefined,
       finishRetirement: undefined,
       retirementTimer: undefined
     }
@@ -381,7 +396,10 @@ export class BuiltInProxyRouteCoordinator {
   }
 
   /** Wait for dispose callbacks belonging to atomically retired generations. */
-  public async drainRetired(): Promise<void> {
+  public async drainRetired(options: { force?: boolean } = {}): Promise<void> {
+    if (options.force) {
+      for (const route of this.retiredRoutes) this.startDisposal(route)
+    }
     while (this.retirements.size > 0) {
       await Promise.allSettled([...this.retirements])
     }
@@ -401,7 +419,7 @@ export class BuiltInProxyRouteCoordinator {
     if (options.force) {
       for (const route of this.retiredRoutes) this.startDisposal(route)
     }
-    await this.drainRetired()
+    await this.drainRetired({ force: options.force })
   }
 
   private async runRebuild(): Promise<void> {
@@ -448,6 +466,7 @@ export class BuiltInProxyRouteCoordinator {
     init?: Parameters<typeof fetch>[1]
   ): Promise<Response> {
     route.inFlight += 1
+    route.pendingFetches += 1
     let released = false
     const release = (): void => {
       if (released) return
@@ -457,12 +476,26 @@ export class BuiltInProxyRouteCoordinator {
     }
     try {
       const response = await route.fetchImplementation(input, init)
+      route.pendingFetches = Math.max(0, route.pendingFetches - 1)
+      route.lastActivityAt = Date.now()
       if (!response.body) {
         release()
         return response
       }
-      return responseWithTrackedBody(response, release)
+      return responseWithTrackedBody(
+        response,
+        release,
+        () => {
+          route.activeBodyReads += 1
+          route.lastActivityAt = Date.now()
+        },
+        () => {
+          route.activeBodyReads = Math.max(0, route.activeBodyReads - 1)
+          route.lastActivityAt = Date.now()
+        },
+      )
     } catch (error) {
+      route.pendingFetches = Math.max(0, route.pendingFetches - 1)
       release()
       throw error
     }
@@ -478,6 +511,7 @@ export class BuiltInProxyRouteCoordinator {
     if (route.retired) return
     route.retired = true
     this.retiredRoutes.add(route)
+    route.retirementDeadlineAt = Date.now() + this.retirementFinalTimeoutMs
     let finishRetirement!: () => void
     const retirement = new Promise<void>((resolve) => { finishRetirement = resolve })
     route.finishRetirement = finishRetirement
@@ -486,9 +520,43 @@ export class BuiltInProxyRouteCoordinator {
     if (route.inFlight === 0) {
       this.startDisposal(route)
     } else {
-      route.retirementTimer = setTimeout(() => this.startDisposal(route), this.retirementDrainTimeoutMs)
-      route.retirementTimer.unref?.()
+      this.scheduleRetirementCheck(route)
     }
+  }
+
+  private scheduleRetirementCheck(route: BuiltInRouteGeneration): void {
+    if (route.disposalStarted || route.retirementTimer) return
+    const remaining = Math.max(1, (route.retirementDeadlineAt ?? Date.now()) - Date.now())
+    route.retirementTimer = setTimeout(() => {
+      route.retirementTimer = undefined
+      this.checkRetirement(route)
+    }, Math.min(this.retirementDrainTimeoutMs, remaining))
+    route.retirementTimer.unref?.()
+  }
+
+  private checkRetirement(route: BuiltInRouteGeneration): void {
+    if (route.disposalStarted) return
+    if (route.inFlight === 0) {
+      this.startDisposal(route)
+      return
+    }
+    if (Date.now() >= (route.retirementDeadlineAt ?? 0)) {
+      this.startDisposal(route)
+      return
+    }
+    // A fetch awaiting headers or a body read awaiting the next SSE chunk is
+    // actively consumed work. Keep its generation alive until it settles or
+    // the absolute safety bound is reached. A delivered body with no pending
+    // read is abandoned/paused and is retired after the ordinary grace.
+    if (route.pendingFetches > 0 || route.activeBodyReads > 0) {
+      this.scheduleRetirementCheck(route)
+      return
+    }
+    if (Date.now() - route.lastActivityAt < this.retirementDrainTimeoutMs) {
+      this.scheduleRetirementCheck(route)
+      return
+    }
+    this.startDisposal(route)
   }
 
   private startDisposal(route: BuiltInRouteGeneration): void {
@@ -639,11 +707,17 @@ function validPortSet(ports: readonly number[]): ReadonlySet<number> {
   return new Set(ports.filter((port) => Number.isInteger(port) && port >= 1 && port <= 65_535))
 }
 
-function responseWithTrackedBody(response: Response, release: () => void): Response {
+function responseWithTrackedBody(
+  response: Response,
+  release: () => void,
+  beginRead: () => void,
+  endRead: () => void,
+): Response {
   try {
     const reader = response.body!.getReader()
     const body = new ReadableStream<Uint8Array>({
       async pull(controller) {
+        beginRead()
         try {
           const result = await reader.read()
           if (result.done) {
@@ -655,6 +729,8 @@ function responseWithTrackedBody(response: Response, release: () => void): Respo
         } catch (error) {
           release()
           controller.error(error)
+        } finally {
+          endRead()
         }
       },
       cancel(reason) {
@@ -663,7 +739,7 @@ function responseWithTrackedBody(response: Response, release: () => void): Respo
         release()
         return reader.cancel(reason)
       }
-    })
+    }, { highWaterMark: 0 })
     const tracked = new Response(body, {
       status: response.status,
       statusText: response.statusText,

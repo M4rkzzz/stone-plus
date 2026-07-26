@@ -1,10 +1,12 @@
 import { describe, expect, it } from 'vitest'
 import {
+  KIRO_COMPATIBLE_KIND,
   newRelayConnectionDefaults,
   protocolAfterProviderKindChange,
   protocolOptionLabel,
   protocolsByProviderKind,
   providerKindLabelsZh,
+  relayProtocolSelectLocked,
   XAI_COMPATIBLE_KIND,
 } from '../../src/renderer/src/grok-relay-ui'
 import { protocolLabels } from '../../src/renderer/src/ui'
@@ -32,5 +34,14 @@ describe('Grok/xAI relay renderer defaults', () => {
     expect(protocolAfterProviderKindChange(XAI_COMPATIBLE_KIND, 'openai-chat')).toBe('openai-responses')
     expect(protocolAfterProviderKindChange('openai-compatible', 'openai-chat')).toBe('openai-chat')
     expect(protocolAfterProviderKindChange('anthropic-compatible', 'openai-chat')).toBe('anthropic-messages')
+  })
+
+  it('locks the Kiro Claude relay kind to the dedicated native protocol', () => {
+    expect(providerKindLabelsZh[KIRO_COMPATIBLE_KIND]).toBe('Kiro Claude 中转')
+    expect(protocolsByProviderKind[KIRO_COMPATIBLE_KIND]).toEqual(['kiro-claude'])
+    expect(protocolAfterProviderKindChange(KIRO_COMPATIBLE_KIND, 'anthropic-messages')).toBe('kiro-claude')
+    expect(protocolOptionLabel(KIRO_COMPATIBLE_KIND, 'kiro-claude', protocolLabels, (zh) => zh)).toBe('Kiro Claude')
+    expect(relayProtocolSelectLocked(KIRO_COMPATIBLE_KIND)).toBe(true)
+    expect(relayProtocolSelectLocked(XAI_COMPATIBLE_KIND)).toBe(false)
   })
 })

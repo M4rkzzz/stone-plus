@@ -1,7 +1,12 @@
 {
   "name": "stone-desktop",
-  "version": "0.9.8",
+  "version": "0.9.9",
   "private": true,
+  "packageManager": "npm@10.9.3",
+  "engines": {
+    "node": "22.20.0",
+    "npm": "10.9.3"
+  },
   "description": "StonePlus project — Stone+ local-first AI gateway desktop application",
   "author": {
     "name": "StonePlus Contributors"
@@ -18,6 +23,8 @@
   "main": "out/main/index.js",
   "type": "module",
   "scripts": {
+    "preinstall": "node scripts/verify-toolchain.mjs",
+    "toolchain:verify": "node scripts/verify-toolchain.mjs",
     "dev": "electron-vite dev",
     "dev:web": "vite --host 127.0.0.1 --port 5173",
     "build": "electron-vite build",
@@ -27,6 +34,7 @@
     "smoke:electron": "node scripts/electron-smoke.mjs",
     "release:check": "node scripts/validate-release-tag.mjs",
     "frp:fetch": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/fetch-frpc.ps1",
+    "frp:verify": "node scripts/verify-frpc-runtime.mjs",
     "sing-box:fetch": "pwsh -NoProfile -File scripts/fetch-sing-box.ps1",
     "sing-box:verify": "node scripts/verify-sing-box-runtime.mjs --all",
     "sing-box:source": "pwsh -NoProfile -File scripts/prepare-sing-box-source.ps1",
@@ -150,6 +158,10 @@
         "to": "licenses/LicenseRef-StonePlus-Source-Available-1.0.txt"
       },
       {
+        "from": "LICENSES/npm/lazy-val-1.0.5-MIT.txt",
+        "to": "licenses/npm/lazy-val-1.0.5-MIT.txt"
+      },
+      {
         "from": "build/sing-box/runtime-manifest.json",
         "to": "sing-box/runtime-manifest.json"
       },
@@ -188,6 +200,13 @@
     ],
     "beforePack": "./scripts/electron-builder-before-pack.mjs",
     "asar": true,
+    "electronFuses": {
+      "runAsNode": false,
+      "enableNodeOptionsEnvironmentVariable": false,
+      "enableNodeCliInspectArguments": false,
+      "enableEmbeddedAsarIntegrityValidation": true,
+      "onlyLoadAppFromAsar": true
+    },
     "mac": {
       "category": "public.app-category.developer-tools",
       "icon": "build/icon.icns",
@@ -223,6 +242,10 @@
         {
           "from": "build/frp/LICENSE.frp.txt",
           "to": "frp/LICENSE.frp.txt"
+        },
+        {
+          "from": "build/frp/runtime-manifest.json",
+          "to": "frp/runtime-manifest.json"
         },
         {
           "from": "build/sing-box/win-${arch}",

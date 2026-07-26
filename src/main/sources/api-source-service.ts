@@ -11,6 +11,15 @@ import {
   probeProviderModel
 } from '../providers'
 import type { ProviderAdapter, ProviderFailure } from '../providers'
+import {
+  AnthropicToolProbeFailure,
+  probeAnthropicMessagesToolRoundtrip,
+  type AnthropicToolProbeValues,
+} from './anthropic-tool-probe'
+import {
+  probeKiroClaudeSource,
+  type KiroClaudeProbeValues,
+} from './kiro-claude-probe'
 
 const DEFAULT_PROBE_TIMEOUT_MS = 15_000
 const DEFAULT_GENERATION_TIMEOUT_MS = 30_000
@@ -25,6 +34,10 @@ export interface ApiSourceProbeDependencies {
   probeModel?: typeof probeProviderModel
   timeoutMs?: number
   generationTimeoutMs?: number
+  /** Deterministic injection point for tests; production values remain random and memory-only. */
+  createKiroProbeValues?: () => KiroClaudeProbeValues
+  /** Deterministic injection point for tests; production values remain random and memory-only. */
+  createAnthropicToolProbeValues?: () => AnthropicToolProbeValues
   now?: () => number
 }
 
@@ -43,11 +56,15 @@ export async function probeApiSource(
   const startedAt = now()
   const stages: ApiSourceProbeStage[] = []
   const warnings: string[] = []
+  const kiroClaude = input.protocol === 'kiro-claude'
+  const anthropicRelayToolProbe = isAnthropicRelayToolProbe(input)
   let capabilityProfile = inferUpstreamCapabilities({
     protocol: input.protocol,
     kind: input.kind,
     sourceType: input.sourceType,
     responsesCompactMode: input.responsesCompactMode,
+    ...(kiroClaude ? { modelDiscovery: false, streaming: true, toolCalls: false } : {}),
+    ...(anthropicRelayToolProbe ? { toolCalls: false } : {}),
   })
   const credential = resolveCredential(input.credential, dependencies.storedCredential)
   const secrets = [credential, input.credential, dependencies.storedCredential]
@@ -56,6 +73,7 @@ export async function probeApiSource(
     stages.push(skippedStage('network', '尚未发起网络请求。'))
     stages.push(errorStage('authentication', '请输入 API Key；编辑已有来源时可留空以保留原 Key。'))
     appendSkippedStages(stages, ['models', 'generation'], '缺少可用凭据，未继续检测。')
+    if (kiroClaude || anthropicRelayToolProbe) stages.push(skippedStage('tool-roundtrip', '缺少可用凭据，未检测两轮工具链。'))
     return failedResult(stages, [], warnings, '缺少可用凭据。', now, startedAt, capabilityProfile)
   }
 
@@ -63,6 +81,7 @@ export async function probeApiSource(
   if (baseUrlError) {
     stages.push(errorStage('network', baseUrlError))
     appendSkippedStages(stages, ['authentication', 'models', 'generation'], '来源地址无效，未继续检测。')
+    if (kiroClaude || anthropicRelayToolProbe) stages.push(skippedStage('tool-roundtrip', '来源地址无效，未检测两轮工具链。'))
     return failedResult(stages, [], warnings, baseUrlError, now, startedAt, capabilityProfile)
   }
 
@@ -75,14 +94,23 @@ export async function probeApiSource(
     responsesCompactMode: input.responsesCompactMode,
     modelDiscovery: adapter.capabilities.modelDiscovery,
     streaming: protocolCapabilities?.streaming,
-    toolCalls: protocolCapabilities?.toolCalls,
+    toolCalls: anthropicRelayToolProbe ? false : protocolCapabilities?.toolCalls,
   })
   if (!protocolCapabilities) {
     const message = '所选供应商类型不支持当前协议。'
+    if (kiroClaude) {
+      stages.push(skippedStage('network', '协议配置无效，尚未发起网络请求。'))
+      stages.push(skippedStage('authentication', '协议配置无效，未检测认证。'))
+      stages.push(skippedStage('models', 'Kiro Claude 不提供模型发现。'))
+      stages.push(skippedStage('generation', '协议配置无效，未执行通用单轮生成。'))
+      stages.push(errorStage('tool-roundtrip', message))
+      return failedResult(stages, [], warnings, message, now, startedAt, capabilityProfile)
+    }
     stages.push(skippedStage('network', '协议配置无效，尚未发起网络请求。'))
     stages.push(skippedStage('authentication', '协议配置无效，未检测认证。'))
     stages.push(errorStage('models', message))
     stages.push(skippedStage('generation', '协议配置无效，未发起生成请求。'))
+    if (anthropicRelayToolProbe) stages.push(skippedStage('tool-roundtrip', '协议配置无效，未检测两轮工具链。'))
     return failedResult(stages, [], warnings, message, now, startedAt, capabilityProfile)
   }
 
@@ -92,6 +120,20 @@ export async function probeApiSource(
     dependencies.generationTimeoutMs,
     DEFAULT_GENERATION_TIMEOUT_MS
   )
+
+  if (input.protocol === 'kiro-claude') {
+    return probeKiroClaudeSource({
+      input,
+      credential,
+      model: normalizeModel(input.model),
+      adapter,
+      fetchImplementation,
+      timeoutMs: generationTimeoutMs,
+      now,
+      startedAt,
+      createProbeValues: dependencies.createKiroProbeValues,
+    })
+  }
 
   let healthFailure: ProviderFailure | undefined
   try {
@@ -113,6 +155,7 @@ export async function probeApiSource(
         const message = safeFailureMessage(healthFailure, secrets, '无法连接上游服务。')
         stages.push(errorStage('network', message, health.latencyMs))
         appendSkippedStages(stages, ['authentication', 'models', 'generation'], '网络连接失败，未继续检测。')
+        if (anthropicRelayToolProbe) stages.push(skippedStage('tool-roundtrip', '网络连接失败，未检测两轮工具链。'))
         return failedResult(stages, [], warnings, message, now, startedAt, capabilityProfile)
       }
 
@@ -121,6 +164,7 @@ export async function probeApiSource(
         const message = safeFailureMessage(healthFailure, secrets, '上游拒绝了 API Key。')
         stages.push(errorStage('authentication', message, health.latencyMs))
         appendSkippedStages(stages, ['models', 'generation'], '认证未通过，未继续检测。')
+        if (anthropicRelayToolProbe) stages.push(skippedStage('tool-roundtrip', '认证未通过，未检测两轮工具链。'))
         return failedResult(stages, [], warnings, message, now, startedAt, capabilityProfile)
       }
 
@@ -133,6 +177,7 @@ export async function probeApiSource(
     const message = '来源基础检测未能完成。'
     stages.push(errorStage('network', message))
     appendSkippedStages(stages, ['authentication', 'models', 'generation'], '基础检测失败，未继续检测。')
+    if (anthropicRelayToolProbe) stages.push(skippedStage('tool-roundtrip', '基础检测失败，未检测两轮工具链。'))
     return failedResult(stages, [], warnings, message, now, startedAt, capabilityProfile)
   }
 
@@ -161,6 +206,7 @@ export async function probeApiSource(
           replaceStage(stages, 'authentication', errorStage('authentication', message, discovery.latencyMs))
           stages.push(errorStage('models', message, discovery.latencyMs))
           stages.push(skippedStage('generation', '模型发现时认证失败，未发起生成请求。'))
+          if (anthropicRelayToolProbe) stages.push(skippedStage('tool-roundtrip', '模型发现时认证失败，未检测两轮工具链。'))
           return failedResult(stages, models, warnings, message, now, startedAt, capabilityProfile)
         }
         stages.push(warningStage('models', message, discovery.latencyMs))
@@ -177,6 +223,7 @@ export async function probeApiSource(
   if (!model) {
     const message = '未提供测试模型，且无法从上游发现可用模型。'
     stages.push(errorStage('generation', message))
+    if (anthropicRelayToolProbe) stages.push(skippedStage('tool-roundtrip', '缺少测试模型，未检测两轮工具链。'))
     return failedResult(stages, models, warnings, message, now, startedAt, capabilityProfile)
   }
 
@@ -199,6 +246,36 @@ export async function probeApiSource(
         successStage('authentication', '真实生成请求已确认 API Key 可用。', generation.latencyMs)
       )
     }
+    if (anthropicRelayToolProbe) {
+      const roundtrip = await probeAnthropicMessagesToolRoundtrip({
+        baseUrl: input.baseUrl.trim(),
+        credential,
+        model,
+        adapter,
+        fetchImplementation,
+        timeoutMs: generationTimeoutMs,
+        now,
+        createProbeValues: dependencies.createAnthropicToolProbeValues,
+      })
+      stages.push(successStage(
+        'tool-roundtrip',
+        `Anthropic 两轮工具链已通过：第一轮 tools=${roundtrip.diagnostics.firstTurn.toolsCount}, tool_use=${roundtrip.diagnostics.firstTurn.toolUseCount}, stop_reason=${roundtrip.diagnostics.firstTurn.stopReason}；第二轮 tool_result=${roundtrip.diagnostics.secondTurn.toolResultCount}, tool_use=${roundtrip.diagnostics.secondTurn.toolUseCount}, stop_reason=${roundtrip.diagnostics.secondTurn.stopReason}。`,
+        roundtrip.latencyMs,
+      ))
+      capabilityProfile = { ...capabilityProfile, toolCalls: true, origin: 'probed', checkedAt: now() }
+      return {
+        ok: true,
+        stages,
+        models,
+        testedModel: model,
+        latencyMs: elapsed(now, startedAt),
+        warnings: unique(warnings),
+        capabilityProfile,
+        modelCatalog: buildModelCatalog(models, capabilityProfile, capabilityProfile.checkedAt),
+        toolRoundtrip: roundtrip.diagnostics,
+      }
+    }
+
     capabilityProfile = { ...capabilityProfile, origin: 'probed', checkedAt: now() }
     return {
       ok: true,
@@ -211,6 +288,23 @@ export async function probeApiSource(
       modelCatalog: buildModelCatalog(models, capabilityProfile, capabilityProfile.checkedAt),
     }
   } catch (error) {
+    if (anthropicRelayToolProbe && error instanceof AnthropicToolProbeFailure) {
+      if (error.kind === 'authentication') {
+        replaceStage(stages, 'authentication', errorStage('authentication', error.message))
+      }
+      stages.push(errorStage('tool-roundtrip', error.message))
+      capabilityProfile = { ...capabilityProfile, toolCalls: false, origin: 'inferred' }
+      return failedResult(
+        stages,
+        models,
+        warnings,
+        error.message,
+        now,
+        startedAt,
+        capabilityProfile,
+        model,
+      )
+    }
     const failure = error instanceof AccountModelProbeError ? error.failure : undefined
     const message = failure
       ? safeFailureMessage(failure, secrets, '最小真实生成请求失败。')
@@ -219,6 +313,7 @@ export async function probeApiSource(
       replaceStage(stages, 'authentication', errorStage('authentication', message))
     }
     stages.push(errorStage('generation', message))
+    if (anthropicRelayToolProbe) stages.push(skippedStage('tool-roundtrip', '最小生成失败，未检测两轮工具链。'))
     return failedResult(stages, models, warnings, message, now, startedAt, capabilityProfile, model)
   }
 }
@@ -226,6 +321,12 @@ export async function probeApiSource(
 function resolveCredential(inputCredential: string | undefined, storedCredential: string | undefined): string {
   const candidate = inputCredential?.trim()
   return candidate || storedCredential?.trim() || ''
+}
+
+function isAnthropicRelayToolProbe(input: ApiSourceProbeInput): boolean {
+  return input.sourceType === 'relay'
+    && input.kind === 'anthropic-compatible'
+    && input.protocol === 'anthropic-messages'
 }
 
 function validateBaseUrl(value: string): string | undefined {

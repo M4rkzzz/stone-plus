@@ -37,6 +37,9 @@ export interface ChatGptModelProbeInput {
  * reasoning content never leave this module.
  */
 export async function probeProviderModel(input: ProviderModelProbeInput): Promise<AccountModelTestResult> {
+  if (input.protocol === 'kiro-claude') {
+    throw new Error('Kiro Claude model tests require the dedicated two-round API source probe.')
+  }
   const model = normalizeModel(input.model)
   const now = input.now ?? (() => Date.now())
   const startedAt = now()
@@ -61,7 +64,7 @@ export async function probeProviderModel(input: ProviderModelProbeInput): Promis
       headers,
       body: JSON.stringify(probeBody(input.protocol, model)),
       signal: input.signal,
-      ...(input.adapter.kind === 'xai' ? { redirect: 'error' as const } : {}),
+      redirect: 'error',
     })
   } catch (error) {
     throw new AccountModelProbeError(input.adapter.classifyFailure({ error, now: now() }))
@@ -116,7 +119,8 @@ export async function probeChatGptCodexModel(input: ChatGptModelProbeInput): Pro
         instructions: 'Return only the requested short answer. Do not include reasoning.',
         input: [{ role: 'user', content: [{ type: 'input_text', text: MODEL_PROBE_PROMPT }] }]
       })),
-      signal: input.signal
+      signal: input.signal,
+      redirect: 'error'
     })
   } catch (error) {
     throw new AccountModelProbeError(networkFailure(error, 'ChatGPT Codex model test could not be reached.'))
@@ -166,34 +170,36 @@ export class AccountModelProbeError extends Error {
 }
 
 function probeBody(protocol: Protocol, model: string): Record<string, unknown> {
-  if (protocol === 'openai-responses') {
-    return {
-      model,
-      instructions: 'Return only the requested short answer. Do not include reasoning.',
-      input: MODEL_PROBE_PROMPT,
-      max_output_tokens: 64,
-      stream: false
-    }
-  }
-  if (protocol === 'openai-chat') {
-    return {
-      model,
-      messages: [{ role: 'user', content: MODEL_PROBE_PROMPT }],
-      max_tokens: 16,
-      stream: false
-    }
-  }
-  if (protocol === 'anthropic-messages') {
-    return {
-      model,
-      max_tokens: 16,
-      messages: [{ role: 'user', content: MODEL_PROBE_PROMPT }],
-      stream: false
-    }
-  }
-  return {
-    contents: [{ role: 'user', parts: [{ text: MODEL_PROBE_PROMPT }] }],
-    generationConfig: { maxOutputTokens: 64, temperature: 0 }
+  switch (protocol) {
+    case 'openai-responses':
+      return {
+        model,
+        instructions: 'Return only the requested short answer. Do not include reasoning.',
+        input: MODEL_PROBE_PROMPT,
+        max_output_tokens: 64,
+        stream: false
+      }
+    case 'openai-chat':
+      return {
+        model,
+        messages: [{ role: 'user', content: MODEL_PROBE_PROMPT }],
+        max_tokens: 16,
+        stream: false
+      }
+    case 'anthropic-messages':
+      return {
+        model,
+        max_tokens: 16,
+        messages: [{ role: 'user', content: MODEL_PROBE_PROMPT }],
+        stream: false
+      }
+    case 'gemini':
+      return {
+        contents: [{ role: 'user', parts: [{ text: MODEL_PROBE_PROMPT }] }],
+        generationConfig: { maxOutputTokens: 64, temperature: 0 }
+      }
+    case 'kiro-claude':
+      throw new Error('Kiro Claude model tests require the dedicated two-round API source probe.')
   }
 }
 
@@ -297,28 +303,34 @@ async function readLimitedResponseText(response: Response): Promise<string> {
 function extractAnswerText(protocol: Protocol, payload: unknown): string {
   const object = objectValue(payload)
   if (!object) return ''
-  if (protocol === 'openai-responses') return extractOpenAiResponsesText(object)
-  if (protocol === 'openai-chat') {
-    const choice = arrayValue(object.choices).map(objectValue).find(Boolean)
-    const message = objectValue(choice?.message)
-    return contentText(message?.content)
+  switch (protocol) {
+    case 'openai-responses':
+      return extractOpenAiResponsesText(object)
+    case 'openai-chat': {
+      const choice = arrayValue(object.choices).map(objectValue).find(Boolean)
+      const message = objectValue(choice?.message)
+      return contentText(message?.content)
+    }
+    case 'anthropic-messages':
+      return arrayValue(object.content)
+        .map(objectValue)
+        .filter((part) => part?.type === 'text')
+        .map((part) => stringValue(part?.text))
+        .filter((text): text is string => Boolean(text))
+        .join('')
+    case 'gemini': {
+      const candidate = arrayValue(object.candidates).map(objectValue).find(Boolean)
+      const content = objectValue(candidate?.content)
+      return arrayValue(content?.parts)
+        .map(objectValue)
+        .filter((part) => part?.thought !== true && typeof part?.text === 'string')
+        .map((part) => stringValue(part?.text))
+        .filter((text): text is string => Boolean(text))
+        .join('')
+    }
+    case 'kiro-claude':
+      throw new Error('Kiro Claude replies require the dedicated Amazon event-stream parser.')
   }
-  if (protocol === 'anthropic-messages') {
-    return arrayValue(object.content)
-      .map(objectValue)
-      .filter((part) => part?.type === 'text')
-      .map((part) => stringValue(part?.text))
-      .filter((text): text is string => Boolean(text))
-      .join('')
-  }
-  const candidate = arrayValue(object.candidates).map(objectValue).find(Boolean)
-  const content = objectValue(candidate?.content)
-  return arrayValue(content?.parts)
-    .map(objectValue)
-    .filter((part) => part?.thought !== true && typeof part?.text === 'string')
-    .map((part) => stringValue(part?.text))
-    .filter((text): text is string => Boolean(text))
-    .join('')
 }
 
 function extractOpenAiResponsesText(response: Record<string, unknown> | undefined): string {

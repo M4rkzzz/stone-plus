@@ -4,6 +4,13 @@ import { lstat, readFile, readdir } from 'node:fs/promises'
 import { basename, join, relative, resolve, sep } from 'node:path'
 
 export const SING_BOX_VERSION = '1.13.14' as const
+/**
+ * Trust anchor compiled into Stone+'s application code. The external manifest
+ * can describe packaged files, but it cannot authorize a replacement runtime.
+ * Release packaging must additionally seal app.asar (Electron ASAR-integrity
+ * fuse) so this anchor is covered by the signed application executable.
+ */
+export const TRUSTED_RUNTIME_MANIFEST_SHA256 = '4882f06349e095d08862d3dbe6bd9fd8a58b32aaec77e67a5c7179def178ffb3' as const
 
 export type SupportedSingBoxTarget =
   | 'win-x64'
@@ -129,10 +136,15 @@ export async function verifyBundledSingBoxRuntime(options: {
   manifestPath?: string
   platform?: NodeJS.Platform
   architecture?: string
+  /** Test/build fixture override; production callers must use the compiled trust anchor. */
+  trustedManifestSha256?: string
 }): Promise<VerifiedSingBoxRuntime> {
   const layout = resolveSingBoxTarget(options.platform, options.architecture)
   const manifestPath = options.manifestPath ?? join(options.runtimeRoot, 'runtime-manifest.json')
-  const manifest = await readManifest(manifestPath)
+  const manifest = await readManifest(
+    manifestPath,
+    options.trustedManifestSha256 ?? TRUSTED_RUNTIME_MANIFEST_SHA256,
+  )
   if (manifest.version !== SING_BOX_VERSION) {
     throw new SingBoxManifestError(
       'manifest_invalid',
@@ -196,7 +208,7 @@ export async function verifyBundledSingBoxRuntime(options: {
   }
 }
 
-async function readManifest(path: string): Promise<SingBoxBinaryManifest> {
+async function readManifest(path: string, trustedSha256: string): Promise<SingBoxBinaryManifest> {
   let source: string
   try {
     source = await readFile(path, 'utf8')
@@ -207,6 +219,16 @@ async function readManifest(path: string): Promise<SingBoxBinaryManifest> {
   }
   if (Buffer.byteLength(source, 'utf8') > 1_000_000) {
     throw new SingBoxManifestError('manifest_invalid', 'Bundled sing-box manifest is unexpectedly large.')
+  }
+  if (!/^[a-f0-9]{64}$/i.test(trustedSha256)) {
+    throw new SingBoxManifestError('manifest_invalid', 'The compiled sing-box manifest trust anchor is invalid.')
+  }
+  const digest = createHash('sha256').update(source, 'utf8').digest('hex')
+  if (digest !== trustedSha256.toLowerCase()) {
+    throw new SingBoxManifestError(
+      'runtime_untrusted',
+      'Bundled sing-box manifest does not match the Stone+ trusted release manifest.',
+    )
   }
   let value: unknown
   try {

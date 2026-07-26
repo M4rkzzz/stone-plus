@@ -3,21 +3,29 @@ import type {
   AccountCircuitState,
   AccountFitnessSnapshot,
   Pool,
+  PoolStrategy,
   ProviderDefinition,
   QuotaProtectionPolicy,
   RequestLog,
   UpstreamCapabilityRequirement
 } from '../../shared/types'
 import { codexQuotaIsExhausted } from '../providers/quota'
-import { evaluateSourceEligibility } from '../../shared/source-eligibility'
+import {
+  evaluateSourceEligibility,
+  hasRouteAccountCapacity,
+  isRouteAccountRuntimeAvailable,
+  routeAccountConcurrencyLimit,
+} from '../../shared/source-eligibility'
 import type { ScheduledAccount, SchedulerSelectionInput } from './types'
 
 interface StickyAssignment {
+  poolId: string
   accountId: string
   expiresAt: number
 }
 
 interface StickyFailureAvoidance {
+  poolId: string
   accountId: string
   expiresAt: number
 }
@@ -49,6 +57,36 @@ interface AccountModelIndex {
   modelsRefreshedAt?: number
   source: string[]
   allowed: Set<string>
+}
+
+type ScheduledSelection = ScheduledAccount & {
+  healthRevision: number
+  resetEpoch: number
+}
+
+interface CapacityWaiter {
+  id: number
+  input: SchedulerSelectionInput
+  accountIds: Set<string>
+  poolId: string
+  deadlineAt: number
+  signal?: AbortSignal
+  timer: ReturnType<typeof setTimeout>
+  abortListener?: () => void
+  resolve(selection: ScheduledSelection): void
+  reject(error: unknown): void
+}
+
+interface StickyLruEntry {
+  poolId: string
+  kind: 'assignment' | 'avoidance'
+}
+
+export interface PoolSchedulerOptions {
+  maxStickyEntries?: number
+  maxStickyEntriesPerPool?: number
+  maxPendingAcquisitions?: number
+  maxPendingAcquisitionsPerPool?: number
 }
 
 export interface AccountRuntimeHealth {
@@ -149,6 +187,15 @@ const CONCURRENT_STICKY_SESSION_PENALTY = 120
 // timestamp. Treat that observation as authoritative briefly, then admit one
 // half-open probe rather than permanently stranding the source.
 const UNKNOWN_RESET_QUOTA_RECHECK_MS = 30_000
+export const DEFAULT_SCHEDULER_WAIT_MS = 5_000
+export const MAX_SCHEDULER_WAIT_MS = 30_000
+export const MAX_STICKY_SESSION_ID_LENGTH = 256
+export const MAX_STICKY_POOL_ID_LENGTH = 256
+export const MAX_STICKY_TTL_MINUTES = 1_440
+const DEFAULT_MAX_STICKY_ENTRIES = 10_000
+const DEFAULT_MAX_STICKY_ENTRIES_PER_POOL = 2_000
+const DEFAULT_MAX_PENDING_ACQUISITIONS = 1_024
+const DEFAULT_MAX_PENDING_ACQUISITIONS_PER_POOL = 256
 
 export class NoEligibleAccountError extends Error {
   constructor(
@@ -165,6 +212,22 @@ export class ModelNotExposedError extends Error {
     super(message)
     this.name = 'ModelNotExposedError'
   }
+}
+
+export class UnsupportedPoolStrategyError extends Error {
+  constructor(readonly strategy: unknown) {
+    super(`Unsupported pool strategy: ${String(strategy)}`)
+    this.name = 'UnsupportedPoolStrategyError'
+  }
+}
+
+export function isSupportedPoolStrategy(value: unknown): value is PoolStrategy {
+  return value === 'priority'
+    || value === 'balanced'
+    || value === 'autobalanced'
+    || value === 'round-robin'
+    || value === 'weighted-round-robin'
+    || value === 'weighted-random'
 }
 
 export function accountAllowsModel(account: Account, model: string): boolean {
@@ -189,6 +252,9 @@ export class PoolScheduler {
   /** One-shot per-session avoidance after its assigned account actually failed. */
   private readonly stickyFailureAvoidance = new Map<string, StickyFailureAvoidance>()
   private readonly stickyFailureExpiry: StickyExpiryEntry[] = []
+  /** Shared LRU bounds assignments and failure avoidances as one cache. */
+  private readonly stickyLru = new Map<string, StickyLruEntry>()
+  private readonly stickyLruByPool = new Map<string, Map<string, StickyLruEntry['kind']>>()
   private readonly activeStickySessions = new Map<string, Map<string, number>>()
   private readonly activeStickySessionCounts = new Map<string, number>()
   private aggregatePoolIndexes = new WeakMap<Pool, AggregatePoolIndex>()
@@ -204,11 +270,34 @@ export class PoolScheduler {
   private readonly performanceResetAt = new Map<string, number>()
   /** Last reset-less quota observation for which a half-open probe was admitted. */
   private readonly quotaHalfOpenObservations = new Map<string, number>()
+  /** Capacity waiters are FIFO and receive a released slot one at a time. */
+  private readonly capacityWaiters = new Map<number, CapacityWaiter>()
+  private readonly capacityWaiterCountsByPool = new Map<string, number>()
+  private nextCapacityWaiterId = 1
+  private readonly maxStickyEntries: number
+  private readonly maxStickyEntriesPerPool: number
+  private readonly maxPendingAcquisitions: number
+  private readonly maxPendingAcquisitionsPerPool: number
 
   constructor(
     private readonly now: () => number = () => Date.now(),
-    private readonly random: () => number = () => Math.random()
-  ) {}
+    private readonly random: () => number = () => Math.random(),
+    options: PoolSchedulerOptions = {},
+  ) {
+    this.maxStickyEntries = positiveBound(options.maxStickyEntries, DEFAULT_MAX_STICKY_ENTRIES)
+    this.maxStickyEntriesPerPool = Math.min(
+      this.maxStickyEntries,
+      positiveBound(options.maxStickyEntriesPerPool, DEFAULT_MAX_STICKY_ENTRIES_PER_POOL),
+    )
+    this.maxPendingAcquisitions = positiveBound(
+      options.maxPendingAcquisitions,
+      DEFAULT_MAX_PENDING_ACQUISITIONS,
+    )
+    this.maxPendingAcquisitionsPerPool = Math.min(
+      this.maxPendingAcquisitions,
+      positiveBound(options.maxPendingAcquisitionsPerPool, DEFAULT_MAX_PENDING_ACQUISITIONS_PER_POOL),
+    )
+  }
 
   hydrate(accounts: readonly Account[], pools?: readonly Pool[]): void {
     // updateConfig/hydrate is the explicit configuration-version boundary.
@@ -312,11 +401,54 @@ export class PoolScheduler {
     }
   }
 
-  selectAndAcquire(input: SchedulerSelectionInput): ScheduledAccount & {
-    healthRevision: number
-    resetEpoch: number
-  } {
+  /**
+   * Waits only for accounts that are otherwise runnable but currently at their
+   * concurrency limit. Disabled, cooling, quota-blocked and model-incompatible
+   * sources still fail immediately. A released permit is handed to one FIFO
+   * waiter synchronously, avoiding polling and thundering-herd retries.
+   */
+  async selectAndAcquireWhenAvailable(
+    input: SchedulerSelectionInput,
+    signal?: AbortSignal,
+    deadlineAt?: number,
+    maxWaitMs = DEFAULT_SCHEDULER_WAIT_MS,
+  ): Promise<ScheduledSelection> {
+    throwIfAborted(signal)
+    try {
+      return this.selectAndAcquire(input)
+    } catch (error) {
+      if (!(error instanceof NoEligibleAccountError)) throw error
+      const waitableAccountIds = this.capacityBlockedAccountIds(input)
+      if (waitableAccountIds.length === 0) throw error
+      const boundedWaitMs = Math.min(
+        MAX_SCHEDULER_WAIT_MS,
+        Math.max(0, Number.isFinite(maxWaitMs) ? Math.floor(maxWaitMs) : DEFAULT_SCHEDULER_WAIT_MS),
+      )
+      const waitDeadlineAt = Math.min(
+        deadlineAt === undefined || !Number.isFinite(deadlineAt) ? Number.POSITIVE_INFINITY : deadlineAt,
+        this.now() + boundedWaitMs,
+      )
+      if (boundedWaitMs === 0 || waitDeadlineAt <= this.now()) throw error
+      return this.enqueueCapacityWaiter(input, waitableAccountIds, waitDeadlineAt, signal, error)
+    }
+  }
+
+  /** Reserves one additional physical upstream slot, used by a same-account hedge. */
+  tryAcquireAccount(account: Account, pool: Pool): (() => void) | undefined {
+    this.assertSupportedStrategy(pool.strategy)
+    if (!this.isEligible(account, pool, pool.strategy === 'autobalanced', this.now())) return undefined
+    this.acquireAccountSlot(account.id)
+    let released = false
+    return () => {
+      if (released) return
+      released = true
+      this.releaseAccountSlot(account.id)
+    }
+  }
+
+  selectAndAcquire(input: SchedulerSelectionInput): ScheduledSelection {
     const { pool, accounts, model, sessionId } = input
+    this.assertSupportedStrategy(pool.strategy)
     const now = this.now()
     this.cleanupExpiredSticky(now)
     const excludedAccountIds = input.excludedAccountIds?.length
@@ -360,13 +492,14 @@ export class PoolScheduler {
       ])
     }
 
-    const stickyKey = pool.stickySessions && sessionId ? `${pool.id}:${sessionId}` : undefined
+    const stickyKey = pool.stickySessions ? boundedStickyKey(pool.id, sessionId) : undefined
     let selected: Account | undefined
     let escapedStickyAccountId: string | undefined
     let failedStickyAccountId: string | undefined
     if (pool.stickySessions && stickyKey) {
       const avoidance = this.stickyFailureAvoidance.get(stickyKey)
       if (avoidance && avoidance.expiresAt > now) {
+        this.touchStickyLru(stickyKey, avoidance.poolId, 'avoidance')
         // Prefer another account after a proven failure, but do not turn a
         // single-account pool into a hard outage once that account is eligible.
         if (candidates.some((account) => account.id !== avoidance.accountId)) {
@@ -377,6 +510,7 @@ export class PoolScheduler {
       }
       const assignment = this.sticky.get(stickyKey)
       if (assignment && assignment.expiresAt > now) {
+        this.touchStickyLru(stickyKey, assignment.poolId, 'assignment')
         selected = candidates.find((account) => (
           account.id === assignment.accountId && account.id !== failedStickyAccountId
         ))
@@ -408,14 +542,15 @@ export class PoolScheduler {
       accounts,
       stickyKey
     )
-    this.active.set(selected.id, (this.active.get(selected.id) ?? 0) + 1)
+    this.acquireAccountSlot(selected.id)
     if (stickyKey) this.acquireActiveStickySession(stickyKey, selected.id)
 
     if (pool.stickySessions && stickyKey) {
       this.deleteStickyFailureAvoidance(stickyKey)
       this.setSticky(stickyKey, {
+        poolId: pool.id,
         accountId: selected.id,
-        expiresAt: now + Math.max(1, pool.stickyTtlMinutes) * 60_000
+        expiresAt: now + boundedStickyTtlMs(pool.stickyTtlMinutes),
       })
     }
 
@@ -430,12 +565,152 @@ export class PoolScheduler {
       release: () => {
         if (released) return
         released = true
-        const remaining = Math.max(0, (this.active.get(selected.id) ?? 0) - 1)
-        if (remaining === 0) this.active.delete(selected.id)
-        else this.active.set(selected.id, remaining)
         if (stickyKey) this.releaseActiveStickySession(stickyKey, selected.id)
+        this.releaseAccountSlot(selected.id)
       }
     }
+  }
+
+  private assertSupportedStrategy(strategy: unknown): asserts strategy is PoolStrategy {
+    if (!isSupportedPoolStrategy(strategy)) throw new UnsupportedPoolStrategyError(strategy)
+  }
+
+  private acquireAccountSlot(accountId: string): void {
+    this.active.set(accountId, (this.active.get(accountId) ?? 0) + 1)
+  }
+
+  private releaseAccountSlot(accountId: string): void {
+    const remaining = Math.max(0, (this.active.get(accountId) ?? 0) - 1)
+    if (remaining === 0) this.active.delete(accountId)
+    else this.active.set(accountId, remaining)
+    this.fulfillOneCapacityWaiter(accountId)
+  }
+
+  private capacityBlockedAccountIds(input: SchedulerSelectionInput): string[] {
+    const excluded = input.excludedAccountIds?.length ? new Set(input.excludedAccountIds) : undefined
+    const eligibility = evaluateSourceEligibility({
+      accounts: input.accounts,
+      providers: input.providers ?? [],
+      model: input.model,
+      poolModelPolicy: input.pool.modelPolicy,
+      poolModelAllowlist: input.pool.modelAllowlist,
+      requiredCapabilities: input.requiredCapabilities,
+      requireProvider: input.providers !== undefined,
+    })
+    const available = (account: Account): boolean => (
+      !excluded?.has(account.id) && this.isAvailable(account, input.pool, this.now())
+    )
+    const verified = eligibility.verified.filter(available)
+    const tier = verified.length > 0 ? verified : eligibility.unknown.filter(available)
+    const adaptive = input.pool.strategy === 'autobalanced'
+    return tier
+      .filter((account) => !hasRouteAccountCapacity(
+        account,
+        this.inFlight(account),
+        this.concurrencyLimit(account, adaptive),
+      ))
+      .map((account) => account.id)
+  }
+
+  private enqueueCapacityWaiter(
+    input: SchedulerSelectionInput,
+    accountIds: readonly string[],
+    deadlineAt: number,
+    signal: AbortSignal | undefined,
+    originalError: NoEligibleAccountError,
+  ): Promise<ScheduledSelection> {
+    const poolCount = this.capacityWaiterCountsByPool.get(input.pool.id) ?? 0
+    if (
+      this.capacityWaiters.size >= this.maxPendingAcquisitions
+      || poolCount >= this.maxPendingAcquisitionsPerPool
+    ) {
+      throw new NoEligibleAccountError(
+        originalError.accountIds,
+        'The scheduler capacity wait queue is full',
+      )
+    }
+
+    return new Promise<ScheduledSelection>((resolve, reject) => {
+      const id = this.nextCapacityWaiterId++
+      const timeoutMs = Math.max(1, deadlineAt - this.now())
+      const waiter: CapacityWaiter = {
+        id,
+        input,
+        accountIds: new Set(accountIds),
+        poolId: input.pool.id,
+        deadlineAt,
+        signal,
+        timer: setTimeout(() => {
+          this.rejectCapacityWaiter(waiter, new NoEligibleAccountError(
+            originalError.accountIds,
+            'No account capacity became available before the scheduler wait deadline',
+          ))
+        }, timeoutMs),
+        resolve,
+        reject,
+      }
+      if (signal) {
+        waiter.abortListener = () => this.rejectCapacityWaiter(waiter, abortReason(signal))
+        signal.addEventListener('abort', waiter.abortListener, { once: true })
+      }
+      this.capacityWaiters.set(id, waiter)
+      this.capacityWaiterCountsByPool.set(input.pool.id, poolCount + 1)
+      // Closing the race between the initial failed selection and queue
+      // registration does not poll: it performs one synchronous handoff check.
+      for (const accountId of accountIds) {
+        if (this.fulfillOneCapacityWaiter(accountId)) break
+      }
+    })
+  }
+
+  private fulfillOneCapacityWaiter(accountId: string): boolean {
+    for (const waiter of this.capacityWaiters.values()) {
+      if (!waiter.accountIds.has(accountId)) continue
+      if (waiter.signal?.aborted) {
+        this.rejectCapacityWaiter(waiter, abortReason(waiter.signal))
+        continue
+      }
+      if (waiter.deadlineAt <= this.now()) {
+        this.rejectCapacityWaiter(waiter, new NoEligibleAccountError(
+          [...waiter.accountIds],
+          'No account capacity became available before the scheduler wait deadline',
+        ))
+        continue
+      }
+      try {
+        const selection = this.selectAndAcquire(waiter.input)
+        this.removeCapacityWaiter(waiter)
+        waiter.resolve(selection)
+        return true
+      } catch (error) {
+        if (error instanceof NoEligibleAccountError) {
+          const accountIds = this.capacityBlockedAccountIds(waiter.input)
+          if (accountIds.length > 0) {
+            waiter.accountIds = new Set(accountIds)
+            continue
+          }
+        }
+        this.rejectCapacityWaiter(waiter, error)
+      }
+    }
+    return false
+  }
+
+  private rejectCapacityWaiter(waiter: CapacityWaiter, error: unknown): void {
+    if (!this.capacityWaiters.has(waiter.id)) return
+    this.removeCapacityWaiter(waiter)
+    waiter.reject(error)
+  }
+
+  private removeCapacityWaiter(waiter: CapacityWaiter): void {
+    if (!this.capacityWaiters.delete(waiter.id)) return
+    clearTimeout(waiter.timer)
+    if (waiter.signal && waiter.abortListener) {
+      waiter.signal.removeEventListener('abort', waiter.abortListener)
+    }
+    const remaining = Math.max(0, (this.capacityWaiterCountsByPool.get(waiter.poolId) ?? 0) - 1)
+    if (remaining === 0) this.capacityWaiterCountsByPool.delete(waiter.poolId)
+    else this.capacityWaiterCountsByPool.set(waiter.poolId, remaining)
   }
 
   /**
@@ -474,15 +749,16 @@ export class PoolScheduler {
    * assignment created by another concurrent request for the same session.
    */
   recordStickyFailure(poolId: string, sessionId: string | undefined, accountId: string): boolean {
-    if (!sessionId) return false
+    const stickyKey = boundedStickyKey(poolId, sessionId)
+    if (!stickyKey) return false
     const now = this.now()
     this.cleanupExpiredSticky(now)
-    const stickyKey = `${poolId}:${sessionId}`
     const assignment = this.sticky.get(stickyKey)
     if (!assignment || assignment.accountId !== accountId) return false
     this.deleteSticky(stickyKey)
     if (assignment.expiresAt > now) {
       this.setStickyFailureAvoidance(stickyKey, {
+        poolId: assignment.poolId,
         accountId,
         expiresAt: assignment.expiresAt
       })
@@ -561,6 +837,7 @@ export class PoolScheduler {
       this.deleteSticky(stickyKey)
       if (assignment.expiresAt > now) {
         this.setStickyFailureAvoidance(stickyKey, {
+          poolId: assignment.poolId,
           accountId,
           expiresAt: assignment.expiresAt
         })
@@ -826,6 +1103,12 @@ export class PoolScheduler {
   }
 
   clear(): void {
+    for (const waiter of [...this.capacityWaiters.values()]) {
+      this.rejectCapacityWaiter(waiter, new NoEligibleAccountError(
+        [...waiter.accountIds],
+        'The scheduler was reset while waiting for account capacity',
+      ))
+    }
     const invalidatedAccountIds = new Set([
       ...this.active.keys(),
       ...this.health.keys(),
@@ -840,6 +1123,8 @@ export class PoolScheduler {
     this.stickyKeysByAccount.clear()
     this.stickyFailureAvoidance.clear()
     this.stickyFailureExpiry.length = 0
+    this.stickyLru.clear()
+    this.stickyLruByPool.clear()
     this.activeStickySessions.clear()
     this.activeStickySessionCounts.clear()
     this.aggregatePoolIndexes = new WeakMap()
@@ -886,7 +1171,11 @@ export class PoolScheduler {
 
   private isEligible(account: Account, pool: Pool, adaptiveConcurrency: boolean, now = this.now()): boolean {
     if (!this.isAvailable(account, pool, now)) return false
-    return this.inFlight(account) < this.concurrencyLimit(account, adaptiveConcurrency)
+    return hasRouteAccountCapacity(
+      account,
+      this.inFlight(account),
+      this.concurrencyLimit(account, adaptiveConcurrency),
+    )
   }
 
   private isAvailable(account: Account, pool?: Pool, now = this.now()): boolean {
@@ -913,8 +1202,7 @@ export class PoolScheduler {
       }
     }
     const cooldownUntil = Math.max(account.cooldownUntil ?? 0, health?.cooldownUntil ?? 0)
-    if (account.status === 'disabled' || account.status === 'expired' || account.status === 'checking') return false
-    if (account.status === 'cooldown' && account.cooldownUntil === undefined) return false
+    if (!isRouteAccountRuntimeAvailable(account, now)) return false
     if (quotaExhausted(account, now)) return false
     if (quotaProtectionBlocks(account.codexQuota, account.quotaProtection, now)) return false
     if (quotaProtectionBlocks(account.codexQuota, pool?.quotaProtection, now)) return false
@@ -960,6 +1248,8 @@ export class PoolScheduler {
         }
         return candidates[candidates.length - 1]
       }
+      default:
+        throw new UnsupportedPoolStrategyError(pool.strategy)
     }
   }
 
@@ -1166,11 +1456,15 @@ export class PoolScheduler {
   }
 
   private setSticky(stickyKey: string, assignment: StickyAssignment): void {
+    this.cleanupExpiredSticky(this.now())
     this.deleteSticky(stickyKey)
+    this.deleteStickyFailureAvoidance(stickyKey)
+    this.enforceStickyCapacity(assignment.poolId)
     this.sticky.set(stickyKey, assignment)
     const keys = this.stickyKeysByAccount.get(assignment.accountId) ?? new Set<string>()
     keys.add(stickyKey)
     this.stickyKeysByAccount.set(assignment.accountId, keys)
+    this.touchStickyLru(stickyKey, assignment.poolId, 'assignment')
     pushExpiry(this.stickyExpiry, { key: stickyKey, expiresAt: assignment.expiresAt })
     compactExpiryHeap(this.stickyExpiry, this.sticky)
   }
@@ -1179,6 +1473,7 @@ export class PoolScheduler {
     const assignment = this.sticky.get(stickyKey)
     if (!assignment) return undefined
     this.sticky.delete(stickyKey)
+    this.deleteStickyLru(stickyKey, 'assignment')
     const keys = this.stickyKeysByAccount.get(assignment.accountId)
     keys?.delete(stickyKey)
     if (keys?.size === 0) this.stickyKeysByAccount.delete(assignment.accountId)
@@ -1186,13 +1481,57 @@ export class PoolScheduler {
   }
 
   private setStickyFailureAvoidance(stickyKey: string, avoidance: StickyFailureAvoidance): void {
+    this.cleanupExpiredSticky(this.now())
+    this.deleteSticky(stickyKey)
+    this.deleteStickyFailureAvoidance(stickyKey)
+    this.enforceStickyCapacity(avoidance.poolId)
     this.stickyFailureAvoidance.set(stickyKey, avoidance)
+    this.touchStickyLru(stickyKey, avoidance.poolId, 'avoidance')
     pushExpiry(this.stickyFailureExpiry, { key: stickyKey, expiresAt: avoidance.expiresAt })
     compactExpiryHeap(this.stickyFailureExpiry, this.stickyFailureAvoidance)
   }
 
   private deleteStickyFailureAvoidance(stickyKey: string): void {
-    this.stickyFailureAvoidance.delete(stickyKey)
+    if (!this.stickyFailureAvoidance.delete(stickyKey)) return
+    this.deleteStickyLru(stickyKey, 'avoidance')
+  }
+
+  private touchStickyLru(stickyKey: string, poolId: string, kind: StickyLruEntry['kind']): void {
+    this.deleteStickyLru(stickyKey)
+    const entry = { poolId, kind }
+    this.stickyLru.set(stickyKey, entry)
+    const poolLru = this.stickyLruByPool.get(poolId) ?? new Map<string, StickyLruEntry['kind']>()
+    poolLru.set(stickyKey, kind)
+    this.stickyLruByPool.set(poolId, poolLru)
+  }
+
+  private deleteStickyLru(stickyKey: string, expectedKind?: StickyLruEntry['kind']): void {
+    const entry = this.stickyLru.get(stickyKey)
+    if (!entry || (expectedKind && entry.kind !== expectedKind)) return
+    this.stickyLru.delete(stickyKey)
+    const poolLru = this.stickyLruByPool.get(entry.poolId)
+    poolLru?.delete(stickyKey)
+    if (poolLru?.size === 0) this.stickyLruByPool.delete(entry.poolId)
+  }
+
+  private enforceStickyCapacity(poolId: string): void {
+    while ((this.stickyLruByPool.get(poolId)?.size ?? 0) >= this.maxStickyEntriesPerPool) {
+      const oldest = this.stickyLruByPool.get(poolId)?.entries().next().value as
+        | [string, StickyLruEntry['kind']]
+        | undefined
+      if (!oldest) break
+      this.evictStickyEntry(oldest[0], oldest[1])
+    }
+    while (this.stickyLru.size >= this.maxStickyEntries) {
+      const oldest = this.stickyLru.entries().next().value as [string, StickyLruEntry] | undefined
+      if (!oldest) break
+      this.evictStickyEntry(oldest[0], oldest[1].kind)
+    }
+  }
+
+  private evictStickyEntry(stickyKey: string, kind: StickyLruEntry['kind']): void {
+    if (kind === 'assignment') this.deleteSticky(stickyKey)
+    else this.deleteStickyFailureAvoidance(stickyKey)
   }
 
   /**
@@ -1290,10 +1629,11 @@ export class PoolScheduler {
   }
 
   private concurrencyLimit(account: Account, adaptive: boolean): number {
-    if (!adaptive) return Math.max(1, account.maxConcurrency)
+    const configured = routeAccountConcurrencyLimit(account.maxConcurrency)
+    if (!adaptive) return configured
     return Math.max(1, Math.min(
-      Math.max(1, account.maxConcurrency),
-      this.performance.get(account.id)?.dynamicConcurrency ?? Math.max(1, account.maxConcurrency)
+      configured,
+      routeAccountConcurrencyLimit(this.performance.get(account.id)?.dynamicConcurrency ?? configured),
     ))
   }
 }
@@ -1668,6 +2008,48 @@ function compactExpiryHeap<T extends { expiresAt: number }>(
   if (heap.length <= current.size * 4 + 64) return
   heap.length = 0
   for (const [key, value] of current) pushExpiry(heap, { key, expiresAt: value.expiresAt })
+}
+
+function positiveBound(value: number | undefined, fallback: number): number {
+  return Number.isFinite(value) && value! > 0 ? Math.max(1, Math.floor(value!)) : fallback
+}
+
+function boundedStickyKey(poolId: string, sessionId: string | undefined): string | undefined {
+  if (
+    typeof sessionId !== 'string'
+    || sessionId.length === 0
+    || sessionId.length > MAX_STICKY_SESSION_ID_LENGTH
+    || poolId.length === 0
+    || poolId.length > MAX_STICKY_POOL_ID_LENGTH
+    || containsControlCharacter(sessionId)
+    || containsControlCharacter(poolId)
+  ) return undefined
+  // Length-prefixing avoids collisions between pool/session ids containing ':'
+  // without retaining an additional attacker-controlled composite object.
+  return `${poolId.length}:${poolId}${sessionId}`
+}
+
+function boundedStickyTtlMs(value: number): number {
+  const minutes = Number.isFinite(value)
+    ? Math.max(1, Math.min(MAX_STICKY_TTL_MINUTES, Math.floor(value)))
+    : 1
+  return minutes * 60_000
+}
+
+function containsControlCharacter(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index)
+    if (code <= 0x1f || code === 0x7f) return true
+  }
+  return false
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) throw abortReason(signal)
+}
+
+function abortReason(signal: AbortSignal): unknown {
+  return signal.reason ?? new DOMException('The scheduler wait was aborted', 'AbortError')
 }
 
 function finiteNumber(value: number | undefined, fallback: number): number {

@@ -37,6 +37,7 @@ export function inferUpstreamCapabilities(input: {
   checkedAt?: number
 }): UpstreamCapabilityProfile {
   const responses = input.protocol === 'openai-responses'
+  const kiroClaude = input.protocol === 'kiro-claude'
   const officialResponses = responses && input.sourceType === 'official-api' && input.kind === 'openai'
   const compact = responses
     ? officialResponses
@@ -50,9 +51,11 @@ export function inferUpstreamCapabilities(input: {
     origin: input.origin ?? 'inferred',
     ...(input.checkedAt === undefined ? {} : { checkedAt: input.checkedAt }),
     streaming: input.streaming ?? true,
+    // Kiro's upstream wire is always an event stream, but the gateway can
+    // collect it into a buffered Anthropic response for non-streaming clients.
     nonStreaming: true,
-    toolCalls: input.toolCalls ?? true,
-    modelDiscovery: input.modelDiscovery,
+    toolCalls: input.toolCalls ?? !kiroClaude,
+    modelDiscovery: input.modelDiscovery ?? (kiroClaude ? false : undefined),
     compact,
     // These are protocol-level guarantees only for the official Responses API.
     // Compatible relays remain "unknown" until they explicitly declare them.

@@ -12,6 +12,7 @@ export {
   convertRequest,
   convertResponse,
   getRequestModel,
+  InvalidProtocolResponseError,
   InvalidToolBridgeError,
   UnsupportedProtocolConversionError
 } from './protocol'

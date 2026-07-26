@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { execFile, spawn, type ChildProcess } from 'node:child_process'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, join } from 'node:path'
 import type { BuiltInProxyPlatformCapabilities } from '@shared/types'
 import type {
   NormalizedSystemProxyLeaseTarget,
@@ -1151,7 +1151,8 @@ export interface TemporaryElevationProcessRunner {
 }
 
 export interface TemporaryElevatedProcessRecoveryRequest extends TemporaryElevatedProcessRequest {
-  pid: number
+  /** Absent only for a pre-launch journal; recovery then finds the exact image+command match. */
+  pid?: number
 }
 
 export interface SingBoxTemporaryTunAdapterOptions {
@@ -1316,7 +1317,7 @@ export class NativeTemporaryElevationProcessRunner implements TemporaryElevation
       exit,
       stop: async () => {
         try {
-          await this.stopUnixElevatedProcess(unixLauncher, child, pid)
+          await this.stopUnixElevatedProcess(unixLauncher, child, pid, request)
         } finally {
           await askpass?.cleanup()
         }
@@ -1327,37 +1328,125 @@ export class NativeTemporaryElevationProcessRunner implements TemporaryElevation
   public async recover(
     request: TemporaryElevatedProcessRecoveryRequest
   ): Promise<TemporaryElevatedProcessHandle | undefined> {
-    if (!Number.isInteger(request.pid) || request.pid <= 0) return undefined
-    const matches = await this.recoveredProcessMatches(request)
+    const pid = Number.isInteger(request.pid) && (request.pid ?? 0) > 0
+      ? request.pid!
+      : await this.findPendingProcess(request)
+    if (!pid) return undefined
+    const ownedRequest: TemporaryElevatedProcessRecoveryRequest & { pid: number } = { ...request, pid }
+    const matches = await this.recoveredProcessMatches(ownedRequest)
     if (!matches) return undefined
-    const exit = observeProcessIdExit(request.pid)
+    const processGroupId = request.launcher === 'windows-uac'
+      ? pid
+      : await this.readProcessGroupId(pid, request.launcher)
+    const exit = observeProcessIdExit(pid)
     return {
-      id: `recovered-${request.launcher}-${request.pid}`,
-      pid: request.pid,
+      id: `recovered-${request.launcher}-${pid}`,
+      pid,
       exit,
       stop: request.launcher === 'windows-uac'
-        ? () => this.stopRecoveredWindowsUac(request)
+        ? () => this.stopRecoveredWindowsUac(ownedRequest)
         : async () => {
-            const launcher = request.launcher === 'macos-sudo' ? 'macos-sudo' : 'linux-pkexec'
-            for (const signal of ['TERM', 'KILL'] as const) {
-              if (launcher === 'macos-sudo') {
-                await this.runMacOsSudo(['/bin/kill', `-${signal}`, '--', `-${request.pid}`], `tun.recover.macos-${signal.toLowerCase()}`)
+          const launcher = request.launcher === 'macos-sudo' ? 'macos-sudo' : 'linux-pkexec'
+          const stillOwned = await this.recoveredProcessMatches(ownedRequest)
+          if (!stillOwned) {
+            if (isProcessGroupRunning(processGroupId)) {
+              throw new Error(`Recovered elevated TUN process group ${processGroupId} is alive but its image/command ownership changed.`)
+            }
+            return
+          }
+          for (const signal of ['TERM', 'KILL'] as const) {
+            if (launcher === 'macos-sudo') {
+                await this.runMacOsSudo(['/bin/kill', `-${signal}`, '--', `-${processGroupId}`], `tun.recover.macos-${signal.toLowerCase()}`)
               } else {
                 await runChecked(this.commandRunner, {
                   file: 'pkexec',
-                  args: ['/bin/kill', `-${signal}`, '--', `-${request.pid}`],
+                  args: ['/bin/kill', `-${signal}`, '--', `-${processGroupId}`],
                   timeoutMs: 120_000,
                   operation: `tun.recover.linux-${signal.toLowerCase()}`
                 })
               }
-              if (!isProcessRunning(request.pid)) return
+              if (!isProcessGroupRunning(processGroupId)) return
             }
-            throw new Error(`Recovered elevated TUN process ${request.pid} did not exit.`)
+            throw new Error(`Recovered elevated TUN process group ${processGroupId} did not exit.`)
           }
     }
   }
 
-  private async recoveredProcessMatches(request: TemporaryElevatedProcessRecoveryRequest): Promise<boolean> {
+  private async findPendingProcess(request: TemporaryElevatedProcessRecoveryRequest): Promise<number | undefined> {
+    const expectedConfig = request.args.at(-1)
+    if (!expectedConfig) return undefined
+    let candidates: number[] = []
+    if (request.launcher === 'windows-uac') {
+      const script = String.raw`
+$ErrorActionPreference = 'Stop'
+$p = [Console]::In.ReadToEnd() | ConvertFrom-Json
+$ids = @(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object {
+  $_.ExecutablePath -and
+  [string]::Equals([IO.Path]::GetFullPath([string]$_.ExecutablePath), [IO.Path]::GetFullPath([string]$p.executablePath), [StringComparison]::OrdinalIgnoreCase) -and
+  ([string]$_.CommandLine).IndexOf([string]$p.configPath, [StringComparison]::OrdinalIgnoreCase) -ge 0
+} | ForEach-Object { [int]$_.ProcessId })
+[Console]::Out.Write(($ids -join [Environment]::NewLine))
+`.trim()
+      const result = await runChecked(this.commandRunner, {
+        file: 'powershell.exe',
+        args: ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script],
+        input: JSON.stringify({ executablePath: request.executablePath, configPath: expectedConfig }),
+        timeoutMs: 10_000,
+        operation: 'tun.windows-uac.recover-pending-identify',
+      })
+      candidates = result.stdout.split(/\r?\n/).map(Number).filter((value) => Number.isInteger(value) && value > 0)
+    } else {
+      const result = await runChecked(this.commandRunner, {
+        file: '/bin/ps',
+        args: ['-axo', 'pid=,command='],
+        timeoutMs: 10_000,
+        operation: `tun.${request.launcher}.recover-pending-identify`,
+      })
+      candidates = result.stdout.split(/\r?\n/).flatMap((line) => {
+        const match = /^\s*(\d+)\s+(.+)$/.exec(line)
+        if (!match || !match[2].includes(request.executablePath) || !match[2].includes(expectedConfig)) return []
+        return [Number(match[1])]
+      })
+    }
+    const exact: number[] = []
+    for (const pid of candidates) {
+      if (await this.recoveredProcessMatches({ ...request, pid })) exact.push(pid)
+    }
+    if (exact.length > 1 && request.launcher !== 'windows-uac') {
+      const groups = new Map<number, number[]>()
+      for (const pid of exact) {
+        const groupId = await this.readProcessGroupId(pid, request.launcher)
+        groups.set(groupId, [...(groups.get(groupId) ?? []), pid])
+      }
+      if (groups.size === 1) {
+        const [groupId, members] = [...groups.entries()][0]
+        return members.includes(groupId) ? groupId : members[0]
+      }
+    }
+    if (exact.length > 1) throw new Error('Multiple elevated TUN process groups match one pending Stone+ ownership journal.')
+    return exact[0]
+  }
+
+  private async readProcessGroupId(
+    pid: number,
+    launcher: Exclude<TemporaryElevationLauncher, 'windows-uac'>,
+  ): Promise<number> {
+    const result = await runChecked(this.commandRunner, {
+      file: '/bin/ps',
+      args: ['-p', String(pid), '-o', 'pgid='],
+      timeoutMs: 10_000,
+      operation: `tun.${launcher}.recover-identify-group`,
+    })
+    const groupId = Number(result.stdout.trim())
+    if (!Number.isInteger(groupId) || groupId <= 0) {
+      throw new Error(`Could not identify the process group for recovered TUN PID ${pid}.`)
+    }
+    return groupId
+  }
+
+  private async recoveredProcessMatches(
+    request: TemporaryElevatedProcessRecoveryRequest & { pid: number }
+  ): Promise<boolean> {
     const expectedConfig = request.args.at(-1)
     if (!expectedConfig) return false
     if (request.launcher === 'windows-uac') {
@@ -1380,7 +1469,14 @@ $commandMatches = ([string]$process.CommandLine).IndexOf([string]$p.configPath, 
       return result.stdout.trim() === 'match'
     }
     let result: PlatformCommandResult
+    let image: PlatformCommandResult
     try {
+      image = await runChecked(this.commandRunner, {
+        file: '/bin/ps',
+        args: ['-p', String(request.pid), '-o', 'comm='],
+        timeoutMs: 10_000,
+        operation: `tun.${request.launcher}.recover-identify-image`
+      })
       result = await runChecked(this.commandRunner, {
         file: '/bin/ps',
         args: ['-p', String(request.pid), '-o', 'command='],
@@ -1392,7 +1488,14 @@ $commandMatches = ([string]$process.CommandLine).IndexOf([string]$p.configPath, 
       throw error
     }
     const command = result.stdout.trim()
-    return command.includes(request.executablePath) && command.includes(expectedConfig)
+    const imageName = basename(image.stdout.trim())
+    const expectedImages = new Set([
+      basename(request.executablePath),
+      request.launcher === 'macos-sudo' ? 'sudo' : 'pkexec',
+    ])
+    return expectedImages.has(imageName)
+      && command.includes(request.executablePath)
+      && command.includes(expectedConfig)
   }
 
   private async startWindowsUac(
@@ -1435,15 +1538,57 @@ $child = Start-Process @options
       id: `windows-uac-${pid}-${randomUUID()}`,
       pid,
       exit,
-      stop: () => this.stopWindowsUac(pid)
+      stop: () => this.stopWindowsUac({ ...request, pid })
     }
   }
 
-  private async stopWindowsUac(pid: number): Promise<void> {
+  private async stopWindowsUac(
+    request: TemporaryElevatedProcessRecoveryRequest & { pid: number }
+  ): Promise<void> {
+    const configPath = request.args.at(-1)
+    if (!configPath) throw new Error('The elevated TUN process has no owned configuration argument.')
+    const identity = Buffer.from(JSON.stringify({
+      pid: request.pid,
+      executablePath: request.executablePath,
+      configPath,
+    }), 'utf8').toString('base64')
     const inner = String.raw`
 $taskkill = Join-Path $env:SystemRoot 'System32\taskkill.exe'
-& $taskkill /PID ${pid} /T /F 2>$null
-if ($LASTEXITCODE -ne 0) { Stop-Process -Id ${pid} -Force -ErrorAction SilentlyContinue }
+$p = ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${identity}'))) | ConvertFrom-Json
+$target = Get-CimInstance Win32_Process -Filter ('ProcessId = ' + [int]$p.pid) -ErrorAction SilentlyContinue
+if ($null -eq $target) { exit 0 }
+$exeMatches = [string]::Equals([IO.Path]::GetFullPath([string]$target.ExecutablePath), [IO.Path]::GetFullPath([string]$p.executablePath), [StringComparison]::OrdinalIgnoreCase)
+$commandMatches = ([string]$target.CommandLine).IndexOf([string]$p.configPath, [StringComparison]::OrdinalIgnoreCase) -ge 0
+if (-not ($exeMatches -and $commandMatches)) { throw 'Elevated TUN PID no longer belongs to Stone+.' }
+$all = @(Get-CimInstance Win32_Process -ErrorAction Stop)
+$queue = [Collections.Generic.Queue[int]]::new()
+$queue.Enqueue([int]$p.pid)
+$owned = @()
+while ($queue.Count -gt 0) {
+  $parent = $queue.Dequeue()
+  $process = $all | Where-Object { [int]$_.ProcessId -eq $parent } | Select-Object -First 1
+  if ($null -ne $process) {
+    $owned += [pscustomobject]@{ pid = [int]$process.ProcessId; executablePath = [string]$process.ExecutablePath; commandLine = [string]$process.CommandLine }
+  }
+  @($all | Where-Object { [int]$_.ParentProcessId -eq $parent }) | ForEach-Object { $queue.Enqueue([int]$_.ProcessId) }
+}
+& $taskkill /PID ([int]$p.pid) /T /F 2>$null
+if ($LASTEXITCODE -ne 0) { Stop-Process -Id ([int]$p.pid) -Force -ErrorAction Stop }
+$deadline = [DateTime]::UtcNow.AddSeconds(5)
+do {
+  $survivors = @()
+  foreach ($entry in $owned) {
+    $remaining = Get-CimInstance Win32_Process -Filter ('ProcessId = ' + [int]$entry.pid) -ErrorAction SilentlyContinue
+    if ($null -eq $remaining) { continue }
+    $sameExe = [string]::Equals([string]$remaining.ExecutablePath, [string]$entry.executablePath, [StringComparison]::OrdinalIgnoreCase)
+    $sameCommand = [string]::Equals([string]$remaining.CommandLine, [string]$entry.commandLine, [StringComparison]::Ordinal)
+    if ($sameExe -and $sameCommand) { $survivors += $entry }
+  }
+  if ($survivors.Count -eq 0) { exit 0 }
+  Start-Sleep -Milliseconds 100
+} while ([DateTime]::UtcNow -lt $deadline)
+$details = ($survivors | ForEach-Object { [string]$_.pid + ':' + [string]$_.executablePath + ':' + [string]$_.commandLine }) -join '; '
+throw ('Elevated TUN process tree is still alive after forced termination. ' + $details)
 `.trim()
     const encodedInner = Buffer.from(inner, 'utf16le').toString('base64')
     const script = String.raw`
@@ -1464,52 +1609,27 @@ if ($process.ExitCode -ne 0) { throw "Elevated TUN stop failed with exit code $(
     }
   }
 
-  private async stopRecoveredWindowsUac(request: TemporaryElevatedProcessRecoveryRequest): Promise<void> {
-    const configPath = request.args.at(-1)!
-    const identity = Buffer.from(JSON.stringify({
-      pid: request.pid,
-      executablePath: request.executablePath,
-      configPath
-    }), 'utf8').toString('base64')
-    const inner = String.raw`
-$ErrorActionPreference = 'Stop'
-$p = ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${identity}'))) | ConvertFrom-Json
-$target = Get-CimInstance Win32_Process -Filter ("ProcessId = " + [int]$p.pid) -ErrorAction SilentlyContinue
-if ($null -eq $target) { exit 0 }
-$exeMatches = [string]::Equals([IO.Path]::GetFullPath([string]$target.ExecutablePath), [IO.Path]::GetFullPath([string]$p.executablePath), [StringComparison]::OrdinalIgnoreCase)
-$commandMatches = ([string]$target.CommandLine).IndexOf([string]$p.configPath, [StringComparison]::OrdinalIgnoreCase) -ge 0
-if (-not ($exeMatches -and $commandMatches)) { throw 'Recovered TUN PID no longer belongs to Stone+.' }
-$taskkill = Join-Path $env:SystemRoot 'System32\taskkill.exe'
-& $taskkill /PID ([int]$p.pid) /T /F 2>$null
-if ($LASTEXITCODE -ne 0) { Stop-Process -Id ([int]$p.pid) -Force -ErrorAction Stop }
-`.trim()
-    const encodedInner = Buffer.from(inner, 'utf16le').toString('base64')
-    const script = String.raw`
-$ErrorActionPreference = 'Stop'
-$process = Start-Process -FilePath 'powershell.exe' -ArgumentList '-NoProfile -NonInteractive -EncodedCommand ${encodedInner}' -Verb RunAs -PassThru -Wait -WindowStyle Hidden
-if ($process.ExitCode -ne 0) { throw "Recovered elevated TUN stop failed with exit code $($process.ExitCode)." }
-`.trim()
-    try {
-      await runChecked(this.commandRunner, {
-        file: 'powershell.exe',
-        args: ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script],
-        timeoutMs: 120_000,
-        operation: 'tun.windows-uac.recover-stop'
-      })
-    } catch (error) {
-      if (isCommandElevationDenial(error)) throw new TunElevationDeniedError(undefined, { cause: error })
-      throw error
-    }
+  private async stopRecoveredWindowsUac(
+    request: TemporaryElevatedProcessRecoveryRequest & { pid: number }
+  ): Promise<void> {
+    await this.stopWindowsUac(request)
   }
 
   private async stopUnixElevatedProcess(
     launcher: 'macos-sudo' | 'linux-pkexec',
     child: ChildProcess,
-    pid: number | undefined
+    pid: number | undefined,
+    request?: TemporaryElevatedProcessRequest,
   ): Promise<void> {
-    if (child.exitCode !== null) return
-    child.kill('SIGTERM')
-    if (await waitForChildExit(child, this.stopTimeoutMs)) return
+    const rootAlreadyExited = child.exitCode !== null || child.signalCode !== null
+    if (rootAlreadyExited && (!pid || !isProcessGroupRunning(pid))) return
+    if (!rootAlreadyExited && pid && request) {
+      const owned = await this.recoveredProcessMatches({ ...request, pid })
+      if (!owned) throw new Error(`Refusing to stop elevated TUN PID ${pid}: image or command identity changed.`)
+    }
+    if (!rootAlreadyExited) child.kill('SIGTERM')
+    const rootExited = rootAlreadyExited || await waitForChildExit(child, this.stopTimeoutMs)
+    if (rootExited && (!pid || !isProcessGroupRunning(pid))) return
     if (!pid) throw new Error('The elevated TUN process did not expose a PID for forced cleanup.')
     for (const signal of ['TERM', 'KILL'] as const) {
       if (launcher === 'macos-sudo') {
@@ -1525,7 +1645,8 @@ if ($process.ExitCode -ne 0) { throw "Recovered elevated TUN stop failed with ex
           operation: `tun.linux-pkexec.stop-${signal.toLowerCase()}`
         })
       }
-      if (await waitForChildExit(child, this.stopTimeoutMs)) return
+      await waitForChildExit(child, this.stopTimeoutMs)
+      if (!isProcessGroupRunning(pid)) return
     }
     throw new Error(`Elevated TUN process tree ${pid} did not exit after TERM/KILL cleanup.`)
   }
@@ -2215,9 +2336,9 @@ function observeProcessIdExit(
   })
 }
 
-function isProcessRunning(pid: number): boolean {
+function isProcessGroupRunning(pid: number): boolean {
   try {
-    process.kill(pid, 0)
+    process.kill(-pid, 0)
     return true
   } catch (error) {
     return (error as NodeJS.ErrnoException).code === 'EPERM'

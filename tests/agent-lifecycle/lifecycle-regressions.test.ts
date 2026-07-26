@@ -10,13 +10,22 @@ import {
   type AgentLifecycleAdapterPort,
 } from '../../src/main/agent-lifecycle/service'
 import { agentActionBlockReason } from '../../src/renderer/src/agent-lifecycle-control'
-import type {
-  AgentCapabilities,
-  AgentLifecycleState,
-  AgentTarget,
+import {
+  AGENT_CAPABILITIES,
+  type AgentCapabilities,
+  type AgentLifecycleState,
+  type AgentTarget,
 } from '../../src/shared/agent-lifecycle'
 
-const targets: AgentTarget[] = ['codex-desktop', 'codex-cli', 'claude-code', 'gemini-cli', 'grok-build']
+const targets: AgentTarget[] = [
+  'codex-desktop',
+  'codex-cli',
+  'claude-code',
+  'claude-code-desktop',
+  'claude-code-vsc',
+  'gemini-cli',
+  'grok-build',
+]
 
 describe('Agent lifecycle regressions', () => {
   it('explains the Codex Desktop conflict before a Codex CLI start is dispatched', () => {
@@ -164,7 +173,7 @@ describe('Agent lifecycle regressions', () => {
 
     const [firstResult, secondResult] = await Promise.all([first, second])
     expect(firstResult.operationId).toBe(secondResult.operationId)
-    expect(firstResult.results).toHaveLength(5)
+    expect(firstResult.results).toHaveLength(7)
     expect(restore).toHaveBeenCalledTimes(3)
   })
 
@@ -271,7 +280,9 @@ function state(target: AgentTarget, overrides: Partial<AgentLifecycleState> = {}
     compatibility: 'native',
     running: false,
     managedInstanceCount: 0,
-    processControl: target === 'codex-desktop' ? 'full' : 'managed-only',
+    processControl: AGENT_CAPABILITIES[target].canCloseKnownProcess
+      ? target === 'codex-desktop' ? 'full' : 'managed-only'
+      : 'unavailable',
     attention: 'normal',
     pendingNewSession: false,
     needsRestart: false,
@@ -280,15 +291,5 @@ function state(target: AgentTarget, overrides: Partial<AgentLifecycleState> = {}
 }
 
 function capabilities(target: AgentTarget): AgentCapabilities {
-  return {
-    canInstall: true,
-    canDetectInstallation: true,
-    canDetectRunning: true,
-    canCloseKnownProcess: true,
-    canRestoreConnection: true,
-    canRepairSessions: target.startsWith('codex'),
-    canRepairWorkspaceIndex: target.startsWith('codex'),
-    canRestart: true,
-    ...(target.startsWith('codex') ? { sharedStateGroup: 'codex-home' as const } : {}),
-  }
+  return AGENT_CAPABILITIES[target]
 }

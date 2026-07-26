@@ -168,4 +168,62 @@ describe('Grok OAuth account import', () => {
     expect(fetchImplementation).toHaveBeenCalledOnce()
     expect(persistRotated).toHaveBeenCalledOnce()
   })
+
+  it('does not join a refresh flight created from a different source credential', async () => {
+    const firstBundle = {
+      ...parseGrokOAuthImport(exportJson()).accounts[0].bundle,
+      accessToken: jwt({ iss: 'https://auth.x.ai', sub: 'subject-1', nonce: 'first' }),
+      refreshToken: 'refresh-first',
+      expiresAt: Date.now() - 1,
+    }
+    const secondBundle = {
+      ...firstBundle,
+      accessToken: jwt({ iss: 'https://auth.x.ai', sub: 'subject-1', nonce: 'second' }),
+      refreshToken: 'refresh-second',
+    }
+    const pending: Array<(response: Response) => void> = []
+    const fetchImplementation = vi.fn(() => new Promise<Response>((resolve) => pending.push(resolve)))
+    const persistRotated = vi.fn(async () => undefined)
+    const options = { refreshKey: 'same-local-account' }
+
+    const first = resolveGrokOAuthCredential(
+      serializeGrokOAuthCredential(firstBundle), persistRotated,
+      fetchImplementation as typeof fetch, Date.now(), options,
+    )
+    const second = resolveGrokOAuthCredential(
+      serializeGrokOAuthCredential(secondBundle), persistRotated,
+      fetchImplementation as typeof fetch, Date.now(), options,
+    )
+
+    await vi.waitFor(() => expect(fetchImplementation).toHaveBeenCalledTimes(2))
+    pending[0](new Response(JSON.stringify({
+      access_token: jwt({ iss: 'https://auth.x.ai', sub: 'subject-1', nonce: 'first-result' }),
+      expires_in: 3600,
+    }), { status: 200 }))
+    pending[1](new Response(JSON.stringify({
+      access_token: jwt({ iss: 'https://auth.x.ai', sub: 'subject-1', nonce: 'second-result' }),
+      expires_in: 3600,
+    }), { status: 200 }))
+
+    const [firstResult, secondResult] = await Promise.all([first, second])
+    expect(firstResult.bundle.accessToken).not.toBe(secondResult.bundle.accessToken)
+    expect(persistRotated).toHaveBeenCalledTimes(2)
+  })
+
+  it('cancels an oversized chunked token response before buffering the full body', async () => {
+    const current = parseGrokOAuthImport(exportJson()).accounts[0].bundle
+    let cancelled = false
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        controller.enqueue(new Uint8Array(16 * 1024))
+      },
+      cancel() { cancelled = true },
+    })
+
+    await expect(refreshGrokOAuthCredential(
+      current,
+      vi.fn(async () => new Response(body, { status: 200 })) as typeof fetch,
+    )).rejects.toThrow(/too large/i)
+    expect(cancelled).toBe(true)
+  })
 })

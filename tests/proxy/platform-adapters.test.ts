@@ -637,6 +637,15 @@ describe('temporary sing-box TUN elevation adapters', () => {
       const spawnMock = vi.fn(() => child as unknown as ReturnType<typeof spawn>)
       const runner = new NativeTemporaryElevationProcessRunner({
         spawnImplementation: spawnMock as unknown as typeof spawn,
+        commandRunner: async (request) => {
+          if (request.operation?.endsWith('recover-identify-image')) {
+            return ok(launcher === 'macos-sudo' ? '/usr/bin/sudo\n' : '/usr/bin/pkexec\n')
+          }
+          if (request.operation?.endsWith('recover-identify')) {
+            return ok(`${launcher === 'macos-sudo' ? '/usr/bin/sudo' : '/usr/bin/pkexec'} ${executable} run -c /tmp/tun.json\n`)
+          }
+          return ok()
+        },
         startupObservationMs: 0
       })
       const handle = await runner.start({ launcher, executablePath: executable, args: ['run', '-c', '/tmp/tun.json'] })

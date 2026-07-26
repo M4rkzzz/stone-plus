@@ -55,7 +55,8 @@ describe('sing-box binary manifest', () => {
     const result = await verifyBundledSingBoxRuntime({
       runtimeRoot: root,
       platform: 'win32',
-      architecture: 'x64'
+      architecture: 'x64',
+      trustedManifestSha256: await runtimeManifestDigest(root)
     })
     expect(result).toMatchObject({
       version: SING_BOX_VERSION,
@@ -70,7 +71,8 @@ describe('sing-box binary manifest', () => {
     await expect(verifyBundledSingBoxRuntime({
       runtimeRoot: root,
       platform: 'win32',
-      architecture: 'x64'
+      architecture: 'x64',
+      trustedManifestSha256: await runtimeManifestDigest(root)
     })).rejects.toMatchObject({ code: 'runtime_incomplete' })
   })
 
@@ -88,8 +90,26 @@ describe('sing-box binary manifest', () => {
     await expect(verifyBundledSingBoxRuntime({
       runtimeRoot: root,
       platform: 'win32',
-      architecture: 'x64'
+      architecture: 'x64',
+      trustedManifestSha256: await runtimeManifestDigest(root)
     })).rejects.toEqual(expect.objectContaining<SingBoxManifestError>({ code: 'runtime_untrusted' }))
+  })
+
+  it('rejects a jointly replaced runtime and external manifest without the compiled trust anchor', async () => {
+    const root = await temporaryDirectory()
+    const runtime = join(root, 'win-x64')
+    await mkdir(runtime, { recursive: true })
+    const executable = Buffer.from('attacker executable')
+    const cronet = Buffer.from('attacker cronet')
+    await writeFile(join(runtime, 'sing-box.exe'), executable)
+    await writeFile(join(runtime, 'libcronet.dll'), cronet)
+    await writeManifest(root, executable, cronet)
+
+    await expect(verifyBundledSingBoxRuntime({
+      runtimeRoot: root,
+      platform: 'win32',
+      architecture: 'x64'
+    })).rejects.toMatchObject({ code: 'runtime_untrusted' })
   })
 })
 
@@ -123,7 +143,9 @@ describe('SingBoxService', () => {
       pid: 4_242
     })
     expect(states).toContain('starting')
-    expect(harness.execute.mock.calls.map((call) => call[1])).toEqual([
+    expect(harness.execute.mock.calls.map((call) => call[1]).filter((args) => (
+      args[0] === 'version' || args[0] === 'check'
+    ))).toEqual([
       ['version'],
       ['check', '-c', join(directory, 'built-in-proxy', 'sing-box.runtime.json')]
     ])
@@ -499,7 +521,8 @@ describe('SingBoxService', () => {
     const harness = createHarness(directory, { restartDelaysMs: [0] })
     const events: SingBoxRuntimeEvent[] = []
     harness.service.onEvent((event) => events.push(event))
-    await harness.service.start({ config: {}, mixedPort: 20_841, controllerPort: 20_842 })
+    const first = await harness.service.start({ config: {}, mixedPort: 20_841, controllerPort: 20_842 })
+    harness.service.retainGeneration(first.generation)
 
     harness.children[0].finish(7, null)
     expect(harness.service.getState()).toMatchObject({
@@ -512,12 +535,48 @@ describe('SingBoxService', () => {
     await vi.waitFor(() => expect(harness.spawnProcess).toHaveBeenCalledTimes(2))
     await vi.waitFor(() => expect(harness.service.getState().status).toBe('ready'))
     expect(harness.service.getState()).toMatchObject({ generation: 2, restartAttempt: 1 })
+    harness.service.retainGeneration(2)
 
     harness.children[1].finish(8, null)
     await new Promise((resolve) => setTimeout(resolve, 10))
     expect(harness.spawnProcess).toHaveBeenCalledTimes(2)
     expect(harness.service.getState()).toMatchObject({ status: 'error', restartAttempt: 1 })
     await harness.service.stop()
+  })
+
+  it('does not service-restart a healthy candidate that was never route-owned', async () => {
+    const directory = await temporaryDirectory()
+    const harness = createHarness(directory, { restartDelaysMs: [0] })
+    await harness.service.start({ config: {}, mixedPort: 20_849, controllerPort: 20_850 })
+
+    harness.children[0].finish(7, null)
+    await new Promise((resolve) => setTimeout(resolve, 10))
+
+    expect(harness.spawnProcess).toHaveBeenCalledTimes(1)
+    expect(harness.service.getState()).toMatchObject({ status: 'error', generation: 1 })
+  })
+
+  it('cleans only strict stale config generations and preserves unrelated files', async () => {
+    const directory = await temporaryDirectory()
+    const runtimeDirectory = join(directory, 'built-in-proxy')
+    await mkdir(runtimeDirectory, { recursive: true })
+    const stale = [
+      'sing-box.runtime.json',
+      'sing-box.runtime.json.120.1',
+      'sing-box.runtime.json.120.999999.tmp',
+      'sing-box.runtime.json.120.1.120.999999.tmp',
+    ]
+    for (const name of stale) await writeFile(join(runtimeDirectory, name), 'secret')
+    const unrelated = join(runtimeDirectory, 'sing-box.runtime.json.user-backup')
+    await writeFile(unrelated, 'keep')
+    const harness = createHarness(directory)
+
+    await harness.service.cleanupStaleRuntimeConfigs()
+
+    for (const name of stale) {
+      await expect(readFile(join(runtimeDirectory, name), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
+    }
+    await expect(readFile(unrelated, 'utf8')).resolves.toBe('keep')
   })
 
   it('exposes authenticated traffic, connections, close, refresh, and latency control calls', async () => {
@@ -668,6 +727,46 @@ describe('sing-box process cleanup', () => {
     await terminateProcessTree(child as unknown as ChildProcess, 'win32', execute)
     expect(execute).toHaveBeenCalledWith('taskkill.exe', ['/pid', '7777', '/t', '/f'], { timeoutMs: 5_000 })
   })
+
+  it('reports a stop failure when the child remains alive after tree termination', async () => {
+    const child = new FakeChild(7_778)
+    const execute = vi.fn(async () => ({ stdout: '', stderr: '' }))
+
+    await expect(terminateProcessTree(
+      child as unknown as ChildProcess,
+      'win32',
+      execute,
+      5,
+    )).rejects.toThrow(/still alive|final verification/i)
+    expect(child.exitCode).toBeNull()
+  })
+
+  it('refuses to terminate a reused PID whose image or command identity changed', async () => {
+    const child = new FakeChild(7_779) as FakeChild & { spawnfile: string; spawnargs: string[] }
+    child.spawnfile = 'C:\\Stone\\sing-box.exe'
+    child.spawnargs = [child.spawnfile, 'run', '-c', 'C:\\Stone\\owned.json']
+    const execute = vi.fn(async (file: string) => {
+      if (file === 'powershell.exe') {
+        return {
+          stdout: JSON.stringify({
+            imagePath: 'C:\\Other\\sing-box.exe',
+            commandLine: 'C:\\Other\\sing-box.exe run -c C:\\Other\\config.json',
+          }),
+          stderr: '',
+        }
+      }
+      throw new Error('taskkill must not be reached')
+    })
+
+    await expect(terminateProcessTree(
+      child as unknown as ChildProcess,
+      'win32',
+      execute,
+      5,
+    )).rejects.toThrow(/refusing to terminate/i)
+    expect(execute).toHaveBeenCalledTimes(1)
+    expect(child.exitCode).toBeNull()
+  })
 })
 
 class FakeChild extends EventEmitter {
@@ -817,6 +916,10 @@ async function writeManifest(root: string, executable: Buffer, cronet: Buffer): 
 
 function sha256(value: Buffer): string {
   return createHash('sha256').update(value).digest('hex')
+}
+
+async function runtimeManifestDigest(root: string): Promise<string> {
+  return sha256(await readFile(join(root, 'runtime-manifest.json')))
 }
 
 function jsonResponse(value: unknown): Response {

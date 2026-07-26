@@ -24,7 +24,6 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  NODE_VERSION: "24"
   RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
 
 jobs:
@@ -89,14 +88,20 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: ${{ env.NODE_VERSION }}
+          node-version-file: .nvmrc
           cache: npm
+
+      - name: Verify pinned toolchain
+        run: node scripts/verify-toolchain.mjs
 
       - name: Install dependencies
         run: npm ci
 
       - name: Validate release tag
         run: npm run release:check -- "$RELEASE_TAG"
+
+      - name: Verify pinned frpc runtime
+        run: npm run frp:verify
 
       - name: Validate source-available license boundary
         shell: bash
@@ -184,6 +189,7 @@ jobs:
             os: windows-latest
             runtime_targets: win-x64
             packaged_runtime_checks: win-x64=release/win-unpacked/resources/sing-box
+            packaged_electron_paths: release/win-unpacked/Stone+.exe
             builder_args: --win nsis portable --x64
             artifact_path: |
               release/StonePlus-*-windows-x64-setup.exe
@@ -196,6 +202,7 @@ jobs:
             os: ubuntu-latest
             runtime_targets: linux-x64
             packaged_runtime_checks: linux-x64=release/linux-unpacked/resources/sing-box
+            packaged_electron_paths: release/linux-unpacked/stone-plus
             builder_args: --linux AppImage deb --x64
             artifact_path: |
               release/StonePlus-*-linux-x86_64.AppImage
@@ -206,6 +213,7 @@ jobs:
             os: ubuntu-24.04-arm
             runtime_targets: linux-arm64
             packaged_runtime_checks: linux-arm64=release/linux-arm64-unpacked/resources/sing-box
+            packaged_electron_paths: release/linux-arm64-unpacked/stone-plus
             builder_args: --linux AppImage deb --arm64
             artifact_path: |
               release/StonePlus-*-linux-arm64.AppImage
@@ -216,6 +224,7 @@ jobs:
             os: macos-15
             runtime_targets: mac-x64 mac-arm64
             packaged_runtime_checks: mac-x64=release/mac/Stone+.app/Contents/Resources/sing-box mac-arm64=release/mac-arm64/Stone+.app/Contents/Resources/sing-box
+            packaged_electron_paths: release/mac/Stone+.app/Contents/MacOS/Stone+ release/mac-arm64/Stone+.app/Contents/MacOS/Stone+
             builder_args: --mac dmg zip --x64 --arm64 --config.mac.identity=- --config.mac.hardenedRuntime=false
             artifact_path: |
               release/StonePlus-*-macos-x64.dmg
@@ -239,8 +248,11 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: ${{ env.NODE_VERSION }}
+          node-version-file: .nvmrc
           cache: npm
+
+      - name: Verify pinned toolchain
+        run: node scripts/verify-toolchain.mjs
 
       - name: Install dependencies
         run: npm ci
@@ -263,9 +275,8 @@ jobs:
         env:
           WIN_CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
           WIN_CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
-          WIN_SIGNING_CERT_SHA1: ${{ vars.WIN_SIGNING_CERT_SHA1 }}
         run: |
-          foreach ($required in @('WIN_CSC_LINK', 'WIN_CSC_KEY_PASSWORD', 'WIN_SIGNING_CERT_SHA1')) {
+          foreach ($required in @('WIN_CSC_LINK', 'WIN_CSC_KEY_PASSWORD')) {
             if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($required))) {
               throw "Required Windows signing setting is missing: $required"
             }
@@ -307,13 +318,45 @@ jobs:
             }
           }
 
+      - name: Verify packaged frpc runtime
+        if: matrix.id == 'windows-x64'
+        shell: pwsh
+        run: node scripts/verify-frpc-runtime.mjs --runtime-root release/win-unpacked/resources/frp
+
+      - name: Verify packaged Electron fuse policy
+        shell: pwsh
+        run: |
+          $expected = @(
+            'RunAsNode is Disabled',
+            'EnableNodeOptionsEnvironmentVariable is Disabled',
+            'EnableNodeCliInspectArguments is Disabled',
+            'EnableEmbeddedAsarIntegrityValidation is Enabled',
+            'OnlyLoadAppFromAsar is Enabled'
+          )
+          $paths = '${{ matrix.packaged_electron_paths }}'.Split(' ', [StringSplitOptions]::RemoveEmptyEntries)
+          foreach ($path in $paths) {
+            $output = (& node node_modules/@electron/fuses/dist/bin.js read --app $path 2>&1) -join "`n"
+            if ($LASTEXITCODE -ne 0) {
+              throw "Could not read Electron fuses from ${path}: $output"
+            }
+            foreach ($line in $expected) {
+              if (-not $output.Contains($line)) {
+                throw "Packaged Electron fuse policy is incomplete for ${path}: missing '$line'.`n$output"
+              }
+            }
+          }
+
       - name: Verify Windows signatures
         if: matrix.id == 'windows-x64'
         shell: pwsh
-        env:
-          WIN_SIGNING_CERT_SHA1: ${{ vars.WIN_SIGNING_CERT_SHA1 }}
         run: |
-          $expectedThumbprint = $env:WIN_SIGNING_CERT_SHA1.Replace(' ', '').ToUpperInvariant()
+          $identity = Get-Content -LiteralPath PROJECT_IDENTITY.json -Raw | ConvertFrom-Json
+          $expectedThumbprint = $identity.signing.windowsAuthenticode.sha1Thumbprint.Replace(' ', '').ToUpperInvariant()
+          $certificatePath = $identity.signing.windowsAuthenticode.certificateFile
+          $certificate = Get-PfxCertificate -FilePath $certificatePath
+          if ($certificate.Thumbprint.ToUpperInvariant() -ne $expectedThumbprint) {
+            throw "The repository certificate does not match PROJECT_IDENTITY.json: $certificatePath"
+          }
           $signedFiles = @(
             'release/win-unpacked/Stone+.exe',
             (Get-ChildItem release/StonePlus-*-windows-x64-setup.exe -File -ErrorAction Stop).FullName,
@@ -327,8 +370,11 @@ jobs:
             if ($signature.SignerCertificate.Thumbprint.ToUpperInvariant() -ne $expectedThumbprint) {
               throw "Unexpected Authenticode signer: $file"
             }
-            if ($signature.Status -in @('NotSigned', 'HashMismatch')) {
+            if ($signature.Status -notin @('Valid', 'UnknownError')) {
               throw "Invalid Authenticode signature for ${file}: $($signature.Status)"
+            }
+            if (-not $signature.TimeStamperCertificate) {
+              throw "RFC3161 timestamp is missing from Authenticode signature: $file"
             }
           }
           Copy-Item -LiteralPath build/signing/StonePlus-CodeSigning.cer -Destination release/StonePlus-CodeSigning.cer
@@ -337,7 +383,20 @@ jobs:
         if: matrix.id == 'windows-x64'
         shell: pwsh
         run: |
-          $env:STONE_ELECTRON_PATH = (Resolve-Path 'release/win-unpacked/Stone+.exe').Path
+          $originalExe = (Resolve-Path 'release/win-unpacked/Stone+.exe').Path
+          $originalHash = (Get-FileHash -LiteralPath $originalExe -Algorithm SHA256).Hash
+          $smokeRoot = Join-Path $env:RUNNER_TEMP ("stone-packaged-smoke-" + [guid]::NewGuid().ToString('N'))
+          Copy-Item -LiteralPath (Split-Path $originalExe -Parent) -Destination $smokeRoot -Recurse -Force
+          $smokeExe = Join-Path $smokeRoot 'Stone+.exe'
+
+          # Playwright's Electron driver requires --inspect. Keep the signed release
+          # binary hardened and enable that fuse only on an isolated test copy.
+          node node_modules/@electron/fuses/dist/bin.js write --app $smokeExe EnableNodeCliInspectArguments=on
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not enable the inspect fuse on the isolated packaged smoke copy."
+          }
+
+          $env:STONE_ELECTRON_PATH = $smokeExe
           try {
             npm run smoke:electron
             if ($LASTEXITCODE -ne 0) {
@@ -345,6 +404,15 @@ jobs:
             }
           } finally {
             Remove-Item Env:\STONE_ELECTRON_PATH -ErrorAction SilentlyContinue
+          }
+
+          $afterHash = (Get-FileHash -LiteralPath $originalExe -Algorithm SHA256).Hash
+          if ($afterHash -ne $originalHash) {
+            throw "The signed packaged executable changed during smoke testing."
+          }
+          $originalFuses = (& node node_modules/@electron/fuses/dist/bin.js read --app $originalExe 2>&1) -join "`n"
+          if ($LASTEXITCODE -ne 0 -or -not $originalFuses.Contains('EnableNodeCliInspectArguments is Disabled')) {
+            throw "The signed packaged executable no longer has the inspect fuse disabled.`n$originalFuses"
           }
 
       - name: Upload build artifacts
@@ -403,6 +471,7 @@ jobs:
           grep -Fxq "StonePlus-${version}-source/.github/CODEOWNERS" "$source_list"
           grep -Fxq "StonePlus-${version}-source/REUSE.toml" "$source_list"
           grep -Fxq "StonePlus-${version}-source/LICENSES/LicenseRef-StonePlus-Source-Available-1.0.txt" "$source_list"
+          grep -Fxq "StonePlus-${version}-source/LICENSES/npm/lazy-val-1.0.5-MIT.txt" "$source_list"
           grep -Fxq "StonePlus-${version}-source/LICENSES/Apache-2.0.txt" "$source_list"
           grep -Fxq "StonePlus-${version}-source/LICENSES/AGPL-3.0-or-later.txt" "$source_list"
 
@@ -445,7 +514,6 @@ jobs:
     permissions:
       contents: write
     env:
-      GH_TOKEN: ${{ github.token }}
       PRERELEASE_INPUT: ${{ inputs.prerelease || false }}
     steps:
       - name: Check out source
@@ -453,12 +521,16 @@ jobs:
         with:
           ref: ${{ env.RELEASE_TAG }}
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: ${{ env.NODE_VERSION }}
+          node-version-file: .nvmrc
           cache: npm
+
+      - name: Verify pinned toolchain
+        run: node scripts/verify-toolchain.mjs
 
       - name: Install metadata validation dependencies
         run: npm ci
@@ -578,6 +650,8 @@ jobs:
 
       - name: Create draft, upload assets, and publish GitHub Release
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           assets=(release-assets/*)
           release_state="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null || true)"

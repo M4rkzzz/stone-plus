@@ -24,8 +24,10 @@ provenance 与线上发布基线来自 `v0.9.6` 已实际跑通并完成线上�
 
 | 项目 | 当前值 |
 | --- | --- |
-| Node.js | 24 |
+| Node.js | 22.20.0（与 `.nvmrc`、`package.json#engines` 一致） |
+| npm | 10.9.3（与 `packageManager`、`package.json#engines` 一致） |
 | sing-box | v1.13.14 |
+| frpc | v0.69.0（Windows x64，固定归档与运行文件 SHA-256） |
 | StonePlus 自有材料 | StonePlus Source Available License 1.0（`SEE LICENSE IN LICENSE`） |
 | 上游 Stone | Apache-2.0，完整原文保留在 `LICENSES/Apache-2.0.txt` |
 | 历史授权边界 | v0.9.5 及更早版本保留随附的 Apache-2.0；迁移前以 AGPL 首次发布的修订保留当时条款 |
@@ -105,8 +107,8 @@ if (-not $commitObject.commit.verification.verified) { throw 'Release commit is 
 if ($commitObject.author.login -ne 'M4rkzzz') { throw 'Unexpected release maintainer' }
 ```
 
-证书轮换时必须同时更新 CER、`PROJECT_IDENTITY.json`、`build/signing/README.md`、工作流变量、
-GitHub Secrets 和本文基线；发布一个 prerelease 完成签名、时间戳、下载后校验和与 provenance 验证后，
+证书轮换时必须同时更新 CER、`PROJECT_IDENTITY.json`、`build/signing/README.md`、
+GitHub Secrets 和本文基线；工作流只接受身份文件登记的指纹。发布一个 prerelease 完成签名、时间戳、下载后校验和与 provenance 验证后，
 才能把新证书用于正式版。旧 Release 保留原证书、原指纹和原校验和，不得覆盖。
 
 ### 2.3 受保护源码身份门与许可证分布检查
@@ -216,6 +218,7 @@ foreach ($file in $agentFiles) {
 - `THIRD_PARTY_NOTICES.md`、`SOURCE_ACCESS.md`、`TRADEMARKS.md`；
 - `AI_USAGE_POLICY.md`、`PROJECT_IDENTITY.json`；
 - Source Available、Apache、AGPL、GPL、sing-box 和 libcronet 的许可证材料；
+- `lazy-val@1.0.5` npm 包缺失的完整 MIT notice；
 - `SOURCE_OFFER-sing-box.md` 及随包第三方组件需要的声明。
 
 不能以“仓库里有”为理由跳过安装包验收。Windows unpacked resources 检查见本文 4.4；其他平台由
@@ -264,7 +267,6 @@ GitHub Actions 必须配置以下内容：
 | --- | --- | --- |
 | Secret | `WIN_CSC_LINK` | Windows 签名 PFX 的 Base64 内容 |
 | Secret | `WIN_CSC_KEY_PASSWORD` | PFX 密码 |
-| Variable | `WIN_SIGNING_CERT_SHA1` | 预期签名证书 SHA-1 指纹 |
 
 正式发布维护者还必须配置 Git 提交/标签签名。推荐使用上传到 GitHub 账号的独立 SSH signing key，
 并保证本机 `user.email` 是 `PROJECT_IDENTITY.json` 中登记的签名邮箱：
@@ -301,11 +303,10 @@ gh ssh-key add "$signingKey.pub" --type signing --title 'StonePlus release signi
 
 ```powershell
 gh secret list -R M4rkzzz/stone-plus
-gh variable list -R M4rkzzz/stone-plus
 ```
 
 证书轮换至少提前 60 天处理：生成或取得新的持续证书，替换公开 CER 和指纹文档，
-更新两个 Secret 与 `WIN_SIGNING_CERT_SHA1`，先发布 prerelease 验证，再用于下一个正式版。
+更新两个 Secret、公开 CER、`PROJECT_IDENTITY.json` 的 SHA-1/SHA-256 与本文基线，先发布 prerelease 验证，再用于下一个正式版。
 旧 Release 保留原证书和原校验值，不做覆盖。
 
 ## 4. 发布前准备
@@ -450,14 +451,17 @@ $required = @(
   'AI_USAGE_POLICY.md', 'licenses/LicenseRef-StonePlus-Source-Available-1.0.txt',
   'licenses/Apache-2.0.txt',
   'licenses/AGPL-3.0-or-later.txt',
-  'licenses/GPL-3.0-or-later.txt', 'SOURCE_OFFER-sing-box.md'
+  'licenses/GPL-3.0-or-later.txt', 'SOURCE_OFFER-sing-box.md',
+  'licenses/npm/lazy-val-1.0.5-MIT.txt'
 )
 $missing = $required | Where-Object { -not (Test-Path -LiteralPath (Join-Path $resources $_)) }
 if ($missing) { throw "Packaged legal files are missing: $($missing -join ', ')" }
 ```
 
-Windows 发布维护者还应至少完成一次本机签名打包与 packaged core smoke。CI 会在对应
-原生 runner 上为所有五个运行时目标重新执行：
+Windows 发布维护者还应至少完成一次本机签名打包与 packaged core smoke。正式 EXE 的
+`EnableNodeCliInspectArguments` 必须保持禁用；Playwright 依赖该调试参数，因此 CI 只在
+隔离复制件上临时开启此 Fuse 并执行完整烟测，同时以 SHA-256 和 Fuse 复检保证原签名 EXE
+未被修改。CI 还会在对应原生 runner 上为所有五个运行时目标重新执行：
 
 - manifest 字节一致性；
 - 完整文件集合、size 和 SHA-256；
@@ -712,13 +716,14 @@ gh run watch $releaseRunId -R M4rkzzz/stone-plus --interval 10 --exit-status
 
 1. `Quality gate`
    - 官方身份文件、GitHub Verified 发布提交、签名附注标签、标签/版本一致性、人工 Release Note
-     结构、lint、TypeScript、全量测试和生产构建。
+     结构、固定 frpc 输入、lint、TypeScript、全量测试和生产构建。
 2. `Package Windows x64`
-   - Setup、Portable、签名、公钥证书、updater metadata、packaged sing-box smoke。
+   - Setup、Portable、签名、公钥证书、updater metadata、packaged sing-box smoke、frpc 固定摘要，
+     以及实际主程序中的 ASAR 完整性、only-load-ASAR、禁用 RunAsNode/NODE_OPTIONS/inspect fuse。
 3. `Package Linux x64` 与 `Package Linux arm64`
-   - AppImage、deb、updater metadata、packaged sing-box smoke。
+   - AppImage、deb、updater metadata、packaged sing-box smoke 与实际主程序 fuse 检查。
 4. `Package macOS Intel and Apple Silicon`
-   - x64/arm64 的 dmg、zip、blockmap、updater metadata、原始 sing-box 哈希和 smoke。
+   - x64/arm64 的 dmg、zip、blockmap、updater metadata、原始 sing-box 哈希、smoke 与实际主程序 fuse 检查。
 5. `Prepare corresponding source`
    - 当前 StonePlus Tag 的完整源码归档，以及固定提交的 sing-box、cronet-go、NaiveProxy、vendor 依赖和集成构建材料。
 6. `Attest release artifacts`
@@ -773,7 +778,7 @@ gh api "repos/M4rkzzz/stone-plus/actions/jobs/$releaseJobId/logs"
 - source job 在 `setup-go` 失败：确认仍为 `cache: false`，并检查 Go 版本可用性。
 - StonePlus 源码归档缺文件：不得手工上传临时压缩包；修复 `git archive` 输入或追踪文件后，
   直接推送新的 `main` 提交并启动新运行。
-- Windows 签名失败：检查 Secret/Variable 名称、证书有效期、指纹、时间戳网络；不要降级成未签名发布。
+- Windows 签名失败：检查 Secret、身份文件、证书有效期、指纹和时间戳网络；不要降级成未签名发布。
 - 资产上传前失败：通常没有公开 Release。修复并直接推送 `main` 后启动一条新 workflow run。
 - 已存在草稿 Release：工作流可以核对并覆盖草稿资产后发布；先确认草稿标签和目标 SHA 正确。
 - 已存在公开 Release：工作流会拒绝覆盖。发布新补丁版本，不删除并重建同一稳定版本。
@@ -858,9 +863,9 @@ Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $verifyRoot 'StonePlus-Co
 
 两份 EXE 都必须满足：
 
-- `SignerCertificate.Thumbprint` 等于仓库变量；
+- `SignerCertificate.Thumbprint` 等于 `PROJECT_IDENTITY.json` 登记指纹；
 - `TimeStamperCertificate` 非空；
-- 状态不是 `NotSigned` 或 `HashMismatch`；
+- 状态只能是 `Valid`，或因项目自签名根未进入系统信任链而出现的 `UnknownError`；
 - 发布 CER 的 SHA-256 与 `build/signing/README.md` 一致。
 
 ### 9.4 源码、许可证与品牌文件
@@ -874,6 +879,7 @@ foreach ($required in @(
   'PROJECT_IDENTITY.json', 'AI_USAGE_POLICY.md', 'AGENTS.md',
   '.github/CODEOWNERS', 'REUSE.toml',
   'LICENSES/LicenseRef-StonePlus-Source-Available-1.0.txt',
+  'LICENSES/npm/lazy-val-1.0.5-MIT.txt',
   'TRADEMARKS.md', 'LICENSES/Apache-2.0.txt',
   'LICENSES/AGPL-3.0-or-later.txt', '.github/workflows/release.yml'
 )) {

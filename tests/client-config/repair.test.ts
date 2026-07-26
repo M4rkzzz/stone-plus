@@ -86,6 +86,7 @@ describe('client configuration repair planning', () => {
     expect(settings.env).toEqual({
       ANTHROPIC_BASE_URL: 'http://127.0.0.1:15721',
       ANTHROPIC_AUTH_TOKEN: target.token,
+      CLAUDE_CODE_ATTRIBUTION_HEADER: '0',
     })
   })
 
@@ -114,6 +115,7 @@ describe('client configuration repair planning', () => {
       KEEP_ME: 'yes',
       ANTHROPIC_BASE_URL: 'http://127.0.0.1:15721',
       ANTHROPIC_AUTH_TOKEN: target.token,
+      CLAUDE_CODE_ATTRIBUTION_HEADER: '0',
     })
   })
 

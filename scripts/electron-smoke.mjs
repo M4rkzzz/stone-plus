@@ -1,4 +1,5 @@
 import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { createRequire } from 'node:module'
 import { createServer } from 'node:net'
 import { isAbsolute, join, relative, resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
@@ -30,7 +31,8 @@ const originalClaudeSettings = `${JSON.stringify({
   custom: { marker: privateConfigMarker },
   env: { STONE_SMOKE_KEEP: 'yes' }
 }, null, 2)}\n`
-const executablePath = process.env.STONE_ELECTRON_PATH ?? defaultElectronPath(projectRoot)
+const packagedExecutablePath = process.env.STONE_ELECTRON_PATH
+const executablePath = packagedExecutablePath ?? defaultElectronPath(projectRoot)
 
 await rm(artifacts, { recursive: true, force: true })
 await mkdir(claudeDirectory, { recursive: true })
@@ -45,7 +47,7 @@ try {
   const gatewayPort = await findAvailablePort()
   electronApp = await electron.launch({
     executablePath,
-    args: ['.'],
+    args: packagedExecutablePath ? [] : ['.'],
     cwd: projectRoot,
     env: {
       ...process.env,
@@ -215,15 +217,40 @@ try {
   const proxy = withProxy.proxies.find((candidate) => candidate.name === 'Smoke SOCKS5 Proxy')
   const chatGptExpiry = new Date(Date.now() + 60 * 60 * 1000).toISOString()
   const k12Tag = initial.accountTags.find((tag) => tag.name === 'K12')
-  const chatGptImport = await window.evaluate(({ tagId, expired }) => window.stone.importChatGptAccounts({
-    tagId,
-    poolId: null,
-    content: JSON.stringify({ access_token: 'smoke-oauth-private', account_id: 'acct-smoke-team', email: 'smoke@example.test', expired })
-  }), { tagId: k12Tag?.id ?? null, expired: chatGptExpiry })
-  const oauthProxySnapshot = await window.evaluate(async ({ accountId, proxyId }) => {
+  if (!proxy) throw new Error('The isolated smoke proxy was not created.')
+  const beforeRejectedImport = await window.evaluate(() => window.stone.getSnapshot())
+  const credentialRowsBeforeRejectedImport = sqliteCredentialRowCount(databasePath)
+  let rejectedChatGptImportError = ''
+  try {
+    await window.evaluate(({ tagId, expired, proxyId }) => window.stone.importChatGptAccounts({
+      tagId,
+      poolId: null,
+      proxyMode: 'proxy',
+      proxyId,
+      content: JSON.stringify({ access_token: 'smoke-oauth-private', account_id: 'acct-smoke-team', email: 'smoke@example.test', expired })
+    }), { tagId: k12Tag?.id ?? null, expired: chatGptExpiry, proxyId: proxy.id })
+  } catch (error) {
+    rejectedChatGptImportError = error instanceof Error ? error.message : String(error)
+  }
+  const afterRejectedImport = await window.evaluate(() => window.stone.getSnapshot())
+  const credentialRowsAfterRejectedImport = sqliteCredentialRowCount(databasePath)
+  const rejectedImportAccountIdsUnchanged = JSON.stringify(beforeRejectedImport.accounts.map(({ id }) => id).sort())
+    === JSON.stringify(afterRejectedImport.accounts.map(({ id }) => id).sort())
+  const rejectedImportProviderIdsUnchanged = JSON.stringify(beforeRejectedImport.providers.map(({ id }) => id).sort())
+    === JSON.stringify(afterRejectedImport.providers.map(({ id }) => id).sort())
+
+  const officialSnapshot = await window.evaluate(() => window.stone.saveApiSource({
+    name: 'Smoke OpenAI Official', sourceType: 'official-api', kind: 'openai',
+    baseUrl: 'https://ignored.example/v1', protocol: 'openai-responses', credential: 'official-private',
+    models: ['gpt-smoke'], defaultModel: 'gpt-smoke', priority: 1, weight: 10, maxConcurrency: 2
+  }))
+  const officialProvider = officialSnapshot.providers.find((provider) => provider.name === 'Smoke OpenAI Official')
+  const officialAccount = officialSnapshot.accounts.find((account) => account.providerId === officialProvider?.id)
+  if (!officialProvider || !officialAccount) throw new Error('The official smoke API account was not created atomically.')
+  const apiProxySnapshot = await window.evaluate(async ({ accountId, proxyId }) => {
     const snapshot = await window.stone.getSnapshot()
     const account = snapshot.accounts.find((candidate) => candidate.id === accountId)
-    if (!account) throw new Error('Imported OAuth account was not found during proxy binding.')
+    if (!account) throw new Error('Official API account was not found during proxy binding.')
     return window.stone.saveAccount({
       id: account.id,
       providerId: account.providerId,
@@ -234,9 +261,9 @@ try {
       modelAllowlist: account.modelAllowlist,
       proxyId
     })
-  }, { accountId: chatGptImport.importedAccountIds[0], proxyId: proxy?.id })
-  const oauthPoolSnapshot = await window.evaluate((accountId) => window.stone.savePool({
-    name: 'Smoke OAuth Pool',
+  }, { accountId: officialAccount.id, proxyId: proxy.id })
+  const apiPoolSnapshot = await window.evaluate((accountId) => window.stone.savePool({
+    name: 'Smoke Official API Pool',
     kind: 'standard',
     protocol: 'openai-responses',
     strategy: 'balanced',
@@ -246,8 +273,8 @@ try {
     stickySessions: true,
     stickyTtlMinutes: 60,
     maxRetries: 0
-  }), chatGptImport.importedAccountIds[0])
-  const oauthPool = oauthPoolSnapshot.pools.find((pool) => pool.name === 'Smoke OAuth Pool')
+  }), officialAccount.id)
+  const apiPool = apiPoolSnapshot.pools.find((pool) => pool.name === 'Smoke Official API Pool')
 
   const relayOneSnapshot = await window.evaluate(({ port }) => window.stone.saveApiSource({
     name: 'Smoke Relay One', sourceType: 'relay', kind: 'openai-compatible',
@@ -266,11 +293,6 @@ try {
   if (!relayOneProvider || !relayOneAccount || !relayTwoProvider || !relayTwoAccount) {
     throw new Error('Smoke API sources were not created atomically.')
   }
-  const officialSnapshot = await window.evaluate(() => window.stone.saveApiSource({
-    name: 'Smoke OpenAI Official', sourceType: 'official-api', kind: 'openai',
-    baseUrl: 'https://ignored.example/v1', protocol: 'openai-responses', credential: 'official-private',
-    models: ['gpt-smoke'], defaultModel: 'gpt-smoke', priority: 1, weight: 10, maxConcurrency: 2
-  }))
   const relayProbe = await window.evaluate(({ id, port }) => window.stone.probeApiSource({
     id, name: 'Smoke Relay One', sourceType: 'relay', kind: 'openai-compatible',
     baseUrl: `http://127.0.0.1:${port}/v1`, protocol: 'openai-responses', model: 'gpt-smoke'
@@ -303,7 +325,7 @@ try {
 
   await window.locator('.nav-item').filter({ hasText: '账号与中转' }).click()
   await window.getByRole('heading', { name: '账号与中转' }).waitFor()
-  await window.getByRole('button', { name: '添加 Codex 账号' }).click()
+  await window.getByRole('button', { name: '添加 Codex 账号' }).first().click()
   const accountAddDialog = window.getByRole('dialog', { name: '添加 Codex 账号' })
   const oauthAddTab = accountAddDialog.getByRole('tab', { name: /OAuth 授权/ })
   const tokenJsonAddTab = accountAddDialog.getByRole('tab', { name: /Token \/ JSON/ })
@@ -324,10 +346,8 @@ try {
     && tokenJsonProxyOptions.some((label) => label.includes('沿用文件配置'))
   await accountAddDialog.getByRole('button', { name: '取消', exact: true }).click()
   await accountAddDialog.waitFor({ state: 'hidden' })
-  const k12Filter = window.locator('.account-tag-filter button').filter({ hasText: 'K12' })
-  await k12Filter.click()
-  const tagFilterWorks = await k12Filter.evaluate((element) => element.classList.contains('active'))
-    && await window.locator('.accounts-table tbody tr').count() === 1
+  const rejectedImportAbsentFromUi = await window.locator('.accounts-table tbody tr').count() === 0
+    && await window.getByText('smoke@example.test', { exact: true }).count() === 0
   await window.getByRole('tab', { name: /官方 API/ }).click()
   const officialSourceVisible = await window.locator('.provider-card').filter({ hasText: 'Smoke OpenAI Official' }).isVisible()
   await window.getByRole('tab', { name: /中转站/ }).click()
@@ -372,28 +392,28 @@ try {
   const routeSourceSaveWorks = routeSourceSnapshot.routes.some((route) => route.client === 'codex' && route.poolId === relayOneProvider.id)
 
   await window.locator('.nav-item').filter({ hasText: '号池' }).click()
-  const oauthPoolCard = window.locator('.pool-card').filter({ hasText: 'Smoke OAuth Pool' })
+  const apiPoolCard = window.locator('.pool-card').filter({ hasText: 'Smoke Official API Pool' })
   const aggregatePoolCard = window.locator('.pool-card').filter({ hasText: 'Smoke Aggregate Relay' })
   const relayPoolCard = window.locator('.pool-card--relay-source').filter({ hasText: 'Smoke Relay One' })
-  const oauthFastSwitch = oauthPoolCard.getByRole('switch', { name: '号池 Smoke OAuth Pool FAST' })
+  const apiFastSwitch = apiPoolCard.getByRole('switch', { name: '号池 Smoke Official API Pool FAST' })
   const aggregateFastSwitch = aggregatePoolCard.getByRole('switch', { name: '号池 Smoke Aggregate Relay FAST' })
   const relayFastSwitch = relayPoolCard.getByRole('switch', { name: '中转站 Smoke Relay One FAST' })
-  const poolFastSurfaceTogglesVisible = await oauthFastSwitch.isVisible()
+  const poolFastSurfaceTogglesVisible = await apiFastSwitch.isVisible()
     && await aggregateFastSwitch.isVisible()
     && await relayFastSwitch.isVisible()
   const relayReadOnlyPoolCardVisible = await relayPoolCard.isVisible()
     && await relayPoolCard.getByText('只读', { exact: true }).isVisible()
     && await relayPoolCard.getByText('配置只读', { exact: true }).isVisible()
 
-  await oauthFastSwitch.click()
+  await apiFastSwitch.click()
   await aggregateFastSwitch.click()
   await relayFastSwitch.click()
-  await window.waitForFunction(({ oauthPoolId, aggregatePoolId, relayId }) => window.stone.getSnapshot().then((snapshot) => (
-    snapshot.pools.find((pool) => pool.id === oauthPoolId)?.forceFastMode === true
+  await window.waitForFunction(({ apiPoolId, aggregatePoolId, relayId }) => window.stone.getSnapshot().then((snapshot) => (
+    snapshot.pools.find((pool) => pool.id === apiPoolId)?.forceFastMode === true
       && snapshot.pools.find((pool) => pool.id === aggregatePoolId)?.forceFastMode === true
       && snapshot.providers.find((provider) => provider.id === relayId)?.forceFastMode === true
   )), {
-    oauthPoolId: oauthPool?.id,
+    apiPoolId: apiPool?.id,
     aggregatePoolId: aggregateRelay?.id,
     relayId: relayOneProvider.id,
   })
@@ -401,8 +421,8 @@ try {
 
   await window.locator('.nav-item').filter({ hasText: '路由' }).click()
   await window.locator('.nav-item').filter({ hasText: '号池' }).click()
-  const fastModeTogglePersisted = await window.locator('.pool-card').filter({ hasText: 'Smoke OAuth Pool' })
-    .getByRole('switch', { name: '号池 Smoke OAuth Pool FAST' }).getAttribute('aria-checked') === 'true'
+  const fastModeTogglePersisted = await window.locator('.pool-card').filter({ hasText: 'Smoke Official API Pool' })
+    .getByRole('switch', { name: '号池 Smoke Official API Pool FAST' }).getAttribute('aria-checked') === 'true'
     && await window.locator('.pool-card').filter({ hasText: 'Smoke Aggregate Relay' })
       .getByRole('switch', { name: '号池 Smoke Aggregate Relay FAST' }).getAttribute('aria-checked') === 'true'
     && await window.locator('.pool-card--relay-source').filter({ hasText: 'Smoke Relay One' })
@@ -436,9 +456,9 @@ try {
   const directRelayFastServiceTier = directRelayFastResponseStatus === 200
     && directRelayFastRequest?.body?.service_tier === 'priority'
 
-  await oauthPoolCard.getByRole('button', { name: '编辑配置' }).click()
+  await apiPoolCard.getByRole('button', { name: '编辑配置' }).click()
   const poolK12Quick = window.locator('.pool-tag-quick-select button').filter({ hasText: 'K12' })
-  const poolTagQuickWorks = await poolK12Quick.isVisible() && await poolK12Quick.evaluate((element) => element.classList.contains('active'))
+  const poolEditorWorks = await poolK12Quick.isVisible() && !await poolK12Quick.evaluate((element) => element.classList.contains('active'))
   await window.getByRole('button', { name: '取消' }).click()
 
   await window.evaluate(({ sessionId }) => window.stone.saveSetupWizardProgress({
@@ -464,7 +484,7 @@ try {
   await window.waitForFunction((tagId) => window.stone.getSetupWizardState().then((state) => state?.tagId === tagId), k12Tag.id)
   const setupOauthUiWorks = await setupOauthTab.getAttribute('aria-selected') === 'true'
     && await window.getByRole('tabpanel', { name: 'OAuth 授权添加账号' }).isVisible()
-    && (await setupPoolSelect.locator('option').allTextContents()).some((label) => label.includes('Smoke OAuth Pool'))
+    && (await setupPoolSelect.locator('option').allTextContents()).some((label) => label.includes('Smoke Official API Pool'))
     && (await setupProxySelect.locator('option').allTextContents()).some((label) => label.includes('Smoke SOCKS5 Proxy'))
     && await window.getByText('截图中的“备注”已适配为 Stone+ Tag，授权和导入使用相同设置。').isVisible()
   await setupTokenJsonTab.click()
@@ -855,26 +875,19 @@ try {
       && !Object.hasOwn(proxy, 'credentialId')
       && !Object.hasOwn(proxy, 'password')
       && !JSON.stringify(withProxy).includes(proxyPasswordMarker),
-    chatGptAccountImported: chatGptImport.importedAccountIds.length === 1
-      && chatGptImport.createdAccountIds.length === 1
-      && chatGptImport.createdAccountIds[0] === chatGptImport.importedAccountIds[0]
-      && chatGptImport.updatedAccountIds.length === 0
-      && chatGptImport.snapshot.accounts.some((account) => account.id === chatGptImport.importedAccountIds[0]
-        && account.credentialType === 'chatgpt-oauth'
-        && !Object.hasOwn(account, 'credentialId'))
-      && !JSON.stringify(chatGptImport).includes('smoke-oauth-private')
-      && !JSON.stringify(chatGptImport).includes('acct-smoke-team'),
-    tagImportApplied: Boolean(k12Tag)
-      && chatGptImport.assignmentSummary.tagId === k12Tag.id
-      && chatGptImport.assignmentSummary.tagUpdatedAccountCount === 1
-      && chatGptImport.snapshot.accounts.some((account) => account.id === chatGptImport.importedAccountIds[0] && account.tagId === k12Tag.id),
-    oauthPoolCreated: Boolean(oauthPool?.members.some((member) => member.accountId === chatGptImport.importedAccountIds[0])),
+    rejectedChatGptImportRolledBack: Boolean(k12Tag)
+      && /未通过远程校验|failed remote validation/i.test(rejectedChatGptImportError)
+      && rejectedImportAccountIdsUnchanged
+      && rejectedImportProviderIdsUnchanged
+      && credentialRowsAfterRejectedImport === credentialRowsBeforeRejectedImport
+      && !afterRejectedImport.accounts.some((account) => account.name === 'smoke@example.test'),
+    apiPoolCreated: Boolean(apiPool?.members.some((member) => member.accountId === officialAccount.id)),
     oauthAccountAddUiWorks,
     tokenJsonAccountAddUiWorks,
     setupOauthUiWorks,
     setupTokenJsonUiWorks,
-    tagFilterWorks,
-    poolTagQuickWorks,
+    rejectedImportAbsentFromUi,
+    poolEditorWorks,
     apiSourcesCreated: Boolean(relayOneProvider && relayTwoProvider)
       && officialSnapshot.providers.some((provider) => provider.name === 'Smoke OpenAI Official' && provider.baseUrl === 'https://api.openai.com/v1')
       && officialSourceVisible
@@ -898,13 +911,11 @@ try {
       && completedWizard?.completed
       && completedWizard.step === 'complete'
       && setupSuccessVisible),
-    oauthProxyBound: Boolean(proxy)
-      && oauthProxySnapshot.accounts.some((account) => account.id === chatGptImport.importedAccountIds[0]
-        && account.credentialType === 'chatgpt-oauth'
+    apiAccountProxyBound: apiProxySnapshot.accounts.some((account) => account.id === officialAccount.id
+        && account.credentialType === 'api-key'
         && account.proxyId === proxy.id)
-      && !JSON.stringify(oauthProxySnapshot).includes(proxyPasswordMarker)
-      && !JSON.stringify(oauthProxySnapshot).includes('smoke-oauth-private')
-      && !JSON.stringify(oauthProxySnapshot).includes('acct-smoke-team'),
+      && !JSON.stringify(apiProxySnapshot).includes(proxyPasswordMarker)
+      && !JSON.stringify(apiProxySnapshot).includes('official-private'),
     profilePortable: profileBundle.format === 'stone-client-profile' && profileBundle.version === 1,
     diagnosticsSafe: diagnostics.version === expectedAppVersion
       && !JSON.stringify(diagnostics).includes('localToken')
@@ -1026,15 +1037,14 @@ try {
     !result.builtInProxyFirstRunSafe ||
     !result.builtInProxyDisabledCleanly ||
     !result.proxySnapshotSafe ||
-    !result.chatGptAccountImported ||
-    !result.tagImportApplied ||
-    !result.oauthPoolCreated ||
+    !result.rejectedChatGptImportRolledBack ||
+    !result.apiPoolCreated ||
     !result.oauthAccountAddUiWorks ||
     !result.tokenJsonAccountAddUiWorks ||
     !result.setupOauthUiWorks ||
     !result.setupTokenJsonUiWorks ||
-    !result.tagFilterWorks ||
-    !result.poolTagQuickWorks ||
+    !result.rejectedImportAbsentFromUi ||
+    !result.poolEditorWorks ||
     !result.apiSourcesCreated ||
     !result.sourceProbePassed ||
     !result.aggregateCreated ||
@@ -1047,7 +1057,7 @@ try {
     !result.fastModeTogglePersisted ||
     !result.directRelayFastServiceTier ||
     !result.setupWizardCompleted ||
-    !result.oauthProxyBound ||
+    !result.apiAccountProxyBound ||
     !result.profilePortable ||
     !result.diagnosticsSafe ||
     !result.sqliteProxyPasswordEncrypted ||
@@ -1189,11 +1199,12 @@ function isPathInside(root, candidate) {
 }
 
 function defaultElectronPath(root) {
-  if (process.platform === 'win32') return join(root, 'node_modules', 'electron', 'dist', 'electron.exe')
-  if (process.platform === 'darwin') {
-    return join(root, 'node_modules', 'electron', 'dist', 'Electron.app', 'Contents', 'MacOS', 'Electron')
+  const projectRequire = createRequire(join(root, 'package.json'))
+  const executable = projectRequire('electron')
+  if (typeof executable !== 'string' || !isAbsolute(executable)) {
+    throw new Error('The installed Electron package did not resolve to an executable path.')
   }
-  return join(root, 'node_modules', 'electron', 'dist', 'electron')
+  return executable
 }
 
 async function missing(path) {
@@ -1212,6 +1223,16 @@ async function readFileIfExists(path) {
   } catch (error) {
     if (error?.code === 'ENOENT') return undefined
     throw error
+  }
+}
+
+function sqliteCredentialRowCount(path) {
+  const database = new DatabaseSync(path, { readOnly: true })
+  try {
+    const row = database.prepare('SELECT COUNT(*) AS count FROM credentials').get()
+    return Number(row?.count ?? 0)
+  } finally {
+    database.close()
   }
 }
 

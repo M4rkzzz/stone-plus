@@ -16,13 +16,15 @@ import {
   useRef,
   useState,
 } from 'react'
-import type {
-  AgentLifecycleBusyAction,
-  AgentLifecycleError,
-  AgentLifecycleOperationResult,
-  AgentLifecycleState,
-  AgentTarget,
-  AgentTargetLifecycleResult,
+import {
+  AGENT_CAPABILITIES,
+  type AgentCapabilities,
+  type AgentLifecycleBusyAction,
+  type AgentLifecycleError,
+  type AgentLifecycleOperationResult,
+  type AgentLifecycleState,
+  type AgentTarget,
+  type AgentTargetLifecycleResult,
 } from '@shared/agent-lifecycle'
 import { clientBrandMeta } from './brand-icons'
 import { useI18n } from './i18n'
@@ -63,7 +65,9 @@ interface AgentDisplayMeta {
 const targetMeta: Record<AgentTarget, AgentDisplayMeta> = {
   'codex-desktop': { name: 'Codex Desktop', icon: clientBrandMeta.codex.icon },
   'codex-cli': { name: 'Codex CLI', icon: clientBrandMeta.codex.icon },
-  'claude-code': { name: 'Claude Code', icon: clientBrandMeta.claude.icon },
+  'claude-code': { name: 'Claude Code CLI', icon: clientBrandMeta.claude.icon },
+  'claude-code-desktop': { name: 'Claude Code Desktop', icon: clientBrandMeta.claude.icon },
+  'claude-code-vsc': { name: 'Claude Code VSC', icon: clientBrandMeta.claude.icon },
   'gemini-cli': { name: 'Gemini CLI', icon: clientBrandMeta.gemini.icon },
   'grok-build': { name: 'Grok Build', icon: clientBrandMeta.grokbuild.icon },
 }
@@ -72,6 +76,8 @@ const targetOrder: readonly AgentTarget[] = [
   'codex-desktop',
   'codex-cli',
   'claude-code',
+  'claude-code-desktop',
+  'claude-code-vsc',
   'gemini-cli',
   'grok-build',
 ]
@@ -108,12 +114,14 @@ export function primaryAgentActionFor(agent: AgentLifecycleState): AgentLifecycl
     && agent.processControl !== 'unavailable'
   const canRestore = agent.installed && agent.enabled
     && (agent.capabilities.canRestoreConnection || agent.capabilities.canRepairSessions)
-  const canStart = agent.installed && agent.enabled && agent.configured
-    && agent.compatibility !== 'unsupported' && agent.capabilities.canRestart
+  const canStart = agent.installed && agent.enabled
+    && (isLaunchOnly(agent) || agent.configured)
+    && agent.compatibility !== 'unsupported' && canLaunchAgent(agent.capabilities)
   const needsRepair = agent.attention === 'repair' || agent.error?.phase === 'restore-connection'
     || agent.error?.phase === 'repair-sessions' || agent.error?.phase === 'repair-workspace-index'
     || agent.error?.phase === 'validate'
   if (needsRepair && canRestore) return 'restore'
+  if (!agent.capabilities.canDetectRunning) return canStart ? 'start' : canRestore ? 'restore' : undefined
   if (agent.running) {
     if ((agent.needsRestart || agent.attention === 'restart') && canStart) return 'restart'
     return canClose ? 'close' : undefined
@@ -128,6 +136,7 @@ export function primaryAgentActionFor(agent: AgentLifecycleState): AgentLifecycl
  * the main process owns its close/repair/start phases.
  */
 export function agentRowActionsFor(agent: AgentLifecycleState): readonly AgentLifecycleControlAction[] {
+  if (!agent.capabilities.canDetectRunning) return ['start']
   return agent.running ? ['close', 'restart'] : ['start']
 }
 
@@ -202,7 +211,7 @@ export function AgentLifecycleControl({
         aria-expanded={open}
         aria-controls={open ? panelId : undefined}
         aria-label={t('Agent 控制', 'Agent controls')}
-        title={t('管理 Codex、Claude Code、Gemini CLI 和 Grok Build', 'Manage Codex, Claude Code, Gemini CLI, and Grok Build')}
+        title={t('管理 Codex、Claude Code CLI、Desktop、VSC、Gemini CLI 和 Grok Build', 'Manage Codex, Claude Code CLI, Desktop, VSC, Gemini CLI, and Grok Build')}
         disabled={disabled}
         onClick={() => setOpen((current) => !current)}
       >
@@ -311,7 +320,7 @@ function AgentRow({
         <div className="agent-lifecycle__agent-title">
           <strong>{meta.name}</strong>
           <span className={`agent-lifecycle__state agent-lifecycle__state--${displayState}`}>
-            {agent.busyAction ? actionProgressLabel(agent.busyAction, t) : agentStateLabel(agent, t)}
+            {agent.busyAction ? actionProgressLabel(agent.busyAction, t, agent) : agentStateLabel(agent, t)}
           </span>
         </div>
         <span
@@ -324,7 +333,7 @@ function AgentRow({
       <div className="agent-lifecycle__agent-actions" aria-label={t(`${meta.name} 操作`, `${meta.name} actions`)}>
         {actions.map((action) => {
           const blockedReason = agentActionBlockReasonFor(agent, agents, action, t)
-          const label = agentActionLabel(action, t)
+          const label = agentActionLabel(agent, action, t)
           const title = blockedReason ?? agentActionDescription(agent, action, t)
           const actionBusy = busy && agent.busyAction === action
           return (
@@ -348,7 +357,7 @@ function AgentRow({
               {actionBusy
                 ? <RefreshCw className="spin" size={12} />
                 : agentActionIcon(action)}
-              <span>{actionBusy ? actionProgressLabel(agent.busyAction!, t) : label}</span>
+              <span>{actionBusy ? actionProgressLabel(agent.busyAction!, t, agent) : label}</span>
             </button>
           )
         })}
@@ -363,10 +372,16 @@ function agentActionIcon(action: AgentLifecycleControlAction) {
   return <Play size={12} />
 }
 
-function agentActionLabel(action: AgentLifecycleControlAction, t: Translator): string {
+export function agentActionLabel(agent: AgentLifecycleState, action: AgentLifecycleControlAction, t: Translator): string {
   if (action === 'close') return t('关闭', 'Close')
   if (action === 'restart') return t('重启', 'Restart')
   if (action === 'restore') return t('修复', 'Repair')
+  if (agent.target === 'claude-code-desktop') {
+    return agent.configured
+      ? t('打开 Code', 'Open Code')
+      : t('配置并打开 Code', 'Configure and open Code')
+  }
+  if (isLaunchOnly(agent)) return t('打开', 'Open')
   return t('开启', 'Start')
 }
 
@@ -382,6 +397,12 @@ export function agentActionDescription(
   }
   if (action === 'close') return t('关闭客户端', 'Close client')
   if (action === 'restore') return t('修复客户端连接', 'Repair client connection')
+  if (action === 'start' && agent.target === 'claude-code-desktop') {
+    return agent.configured
+      ? t('打开 Code；配置影响整个 Claude Desktop，Stone+ 不会结束宿主进程', 'Open Code. The settings affect all of Claude Desktop; Stone+ does not close the host app')
+      : t('写入整个 Claude Desktop 的第三方推理配置并打开 Code；Stone+ 不会结束宿主进程', 'Write the third-party inference settings for all of Claude Desktop and open Code; Stone+ does not close the host app')
+  }
+  if (isLaunchOnly(agent)) return t('打开客户端', 'Open client')
   return t('开启客户端', 'Start client')
 }
 
@@ -409,23 +430,49 @@ function summaryLabel(state: AgentLifecycleDisplayState, t: Translator): string 
 
 function agentStateLabel(agent: AgentLifecycleState, t: Translator): string {
   if (!agent.installed) return t('未安装', 'Not installed')
+  if (agent.target === 'claude-code-desktop' && agent.enabled) {
+    return agent.configured
+      ? t('已写入 · 需重开', 'Written · reopen required')
+      : t('打开时自动写入', 'Configures when opened')
+  }
+  if (agent.target === 'claude-code-vsc' && agent.enabled && !agent.configured) {
+    return t('打开时配置', 'Configures when opened')
+  }
   if (!agent.enabled || !agent.configured) return t('未接入', 'Not connected')
+  if (isLaunchOnly(agent)) return t('可打开', 'Ready to open')
   if (agent.running) return t('运行中', 'Running')
   return summaryLabel(displayStateForAgent(agent), t)
 }
 
-function actionProgressLabel(action: AgentLifecycleBusyAction, t: Translator): string {
+function actionProgressLabel(action: AgentLifecycleBusyAction, t: Translator, agent?: AgentLifecycleState): string {
   if (action === 'close') return t('正在关闭', 'Closing')
   if (action === 'restore') return t('正在修复', 'Repairing')
   if (action === 'restart') return t('正在重启', 'Restarting')
   if (action === 'install') return t('正在打开安装指引', 'Opening installation guide')
   if (action === 'smart-repair') return t('正在智能修复', 'Smart repair in progress')
-  return t('正在启动', 'Starting')
+  if (agent?.target === 'claude-code-desktop') {
+    return agent.configured
+      ? t('正在打开 Code', 'Opening Code')
+      : t('正在配置并打开 Code', 'Configuring and opening Code')
+  }
+  return agent && isLaunchOnly(agent) ? t('正在打开', 'Opening') : t('正在启动', 'Starting')
 }
 
 function defaultAgentDetail(agent: AgentLifecycleState, t: Translator): string {
   if (agent.error) return localizedLifecycleError(agent.error, t)
   if (!agent.installed) return t('可在客户端配置中打开官方安装指引', 'Open the official installation guide from Client Configuration')
+  if (agent.target === 'claude-code-desktop') {
+    if (!agent.enabled) return t('请先启用兼容的 Claude 路由', 'Enable a compatible Claude route first')
+    if (!agent.configured) {
+      return t('打开时自动写入全局配置；影响 Chat、Cowork 和 Code，Stone+ 不会结束宿主进程', 'Opening writes the global settings automatically. They affect Chat, Cowork, and Code; Stone+ does not close the host app')
+    }
+    return t('已写入；完整退出并重开 Claude Desktop 后生效。Stone+ 不会结束宿主进程', 'Written; fully quit and reopen Claude Desktop to apply. Stone+ does not close the host app')
+  }
+  if (agent.target === 'claude-code-vsc') {
+    if (!agent.enabled) return t('请先启用兼容的 Claude 路由', 'Enable a compatible Claude route first')
+    if (!agent.configured) return t('打开时自动写入 VS Code 连接配置', 'Stone+ writes the VS Code connection settings when opened')
+    return t('Stone+ 只打开 Claude Code 扩展，不接管或关闭 VS Code', 'Stone+ opens the Claude Code extension without controlling or closing VS Code')
+  }
   if (!agent.enabled || !agent.configured) return t('尚未连接 Stone+', 'Not connected to Stone+')
   if (agent.processControl === 'managed-only') {
     return agent.managedInstanceCount > 0
@@ -456,6 +503,15 @@ export function agentOutcomeLabel(
     if (action === 'close') return outcome.runningAfter
       ? t('关闭未完成，客户端仍在运行', 'Close did not complete; the client is still running')
       : t('已关闭', 'Closed')
+    if (action === 'start' && outcome.target === 'claude-code-desktop') {
+      return t(
+        '配置已确认并已打开 Code；完整退出并重开 Claude Desktop 后生效',
+        'Settings verified and Code opened; fully quit and reopen Claude Desktop to apply',
+      )
+    }
+    if (action === 'start' && !AGENT_CAPABILITIES[outcome.target].canDetectRunning) {
+      return t('已打开', 'Opened')
+    }
     if (action === 'start') return outcome.runningAfter
       ? t('已启动', 'Started')
       : t('启动未完成，客户端仍未运行', 'Start did not complete; the client is still stopped')
@@ -517,7 +573,7 @@ export function agentActionBlockReasonFor(
   }
 
   if (action === 'start' || action === 'restart' || action === 'restore') {
-    if (!agent.enabled || !agent.configured) {
+    if (!agent.enabled || (!isLaunchOnly(agent) && !agent.configured)) {
       return t('该客户端尚未接入 Stone+。请先在“客户端配置”中完成配置。', 'This client is not connected to Stone+. Finish its setup in Client Configuration first.')
     }
     if (agent.compatibility === 'unsupported') {
@@ -526,8 +582,11 @@ export function agentActionBlockReasonFor(
     if (action === 'restore' && !agent.capabilities.canRestoreConnection) {
       return t('该客户端不支持自动修复。', 'This client does not support automatic repair.')
     }
-    if ((action === 'start' || action === 'restart') && !agent.capabilities.canRestart) {
+    if (action === 'start' && !canLaunchAgent(agent.capabilities)) {
       return t('该客户端不支持由 Stone+ 开启。', 'This client cannot be started by Stone+.')
+    }
+    if (action === 'restart' && !agent.capabilities.canRestart) {
+      return t('该客户端不支持由 Stone+ 重启。', 'This client cannot be restarted by Stone+.')
     }
   }
 
@@ -546,6 +605,14 @@ export function agentActionBlockReasonFor(
   }
 
   return undefined
+}
+
+function canLaunchAgent(capabilities: AgentCapabilities): boolean {
+  return capabilities.canLaunch ?? capabilities.canRestart
+}
+
+function isLaunchOnly(agent: AgentLifecycleState): boolean {
+  return !agent.capabilities.canDetectRunning && canLaunchAgent(agent.capabilities)
 }
 
 export function localizedLifecycleError(error: AgentLifecycleError, t: Translator): string {

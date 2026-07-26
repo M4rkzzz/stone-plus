@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.9.9
+
+- 新增 Kiro Claude 专用中转协议与原生兼容桥：Claude Code CLI、Desktop 和 VSC 继续使用
+  Anthropic Messages 入站，Stone+ 直接转换为 Kiro conversation state 与 AWS Event Stream，
+  完整保持并行 `tool_use` / `tool_result` 的 ID、顺序、停止原因和结构化结果。
+- 扩展 Claude Code 客户端管理，加入 Desktop 与 VS Code 表面、官方模式恢复、配置事务回滚、
+  启动就绪确认和更可靠的关闭/重启/会话修复；清理残留模型覆盖并补充权限模式新会话提示。
+- 新增系统/浅色/深色主题与原生窗口 chrome 同步，优化账号分页、后台轮询、请求记录和高并发
+  渲染，降低窗口聚焦时的桌面卡顿并修复标题栏、阴影和紧凑布局问题。
+- 加固 Gateway、路由和号池边界：完善 Kiro/Grok/Anthropic 工具流与终态校验、缓冲响应故障切换、
+  WebSocket 背压、粘滞会话和精确协议拓扑，阻止跨协议成员及 OAuth 系统来源篡改。
+- 强化 SQLite、备份与凭据生命周期：加入敏感页物理清除、数据库替换 journal、导入持久回滚、
+  浏览器缓存 safeStorage 加密、Grok 刷新令牌单飞轮换和有界认证响应。
+- 强化 sing-box/TUN/系统代理/FRP 生命周期与 Windows PowerShell、ACL、进程身份和自签名校验；
+  固定 Node/npm 工具链、frpc 包体清单与 Electron fuses，并升级 PostCSS 修复路径穿越告警。
+
 ## 0.9.8
 
 - 新增 Grok OAuth、xAI API Key 与 xAI-compatible 中转支持，引入独立 Grok 号池协议与

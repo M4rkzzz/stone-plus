@@ -1184,6 +1184,7 @@ export function createMockApi(): GatewayApi {
 
   return {
     async setUiLanguage() {},
+    async setUiTheme() {},
     async getSnapshot() {
       await pause(280)
       return localizeMockSnapshot(snapshot)
@@ -2447,6 +2448,7 @@ export function createMockApi(): GatewayApi {
     async smartRepairAgent(target) { return mockAgentOperation('smart-repair', target ? [target] : [...AGENT_TARGETS], true) },
     async repairAllAffectedAgents() { return mockAgentOperation('repair-all-affected', [...AGENT_TARGETS], true) },
     async closeAllManagedAgents() { return mockAgentOperation('close-all-managed', [...AGENT_TARGETS], false) },
+    async restoreClaudeDesktopOfficialMode() { return { changed: false } },
     onAgentLifecycleChanged(listener) {
       agentLifecycleListeners.add(listener)
       return () => agentLifecycleListeners.delete(listener)
@@ -2499,11 +2501,11 @@ export function createMockApi(): GatewayApi {
         error: undefined,
         progress: undefined,
         release: {
-          version: '0.9.1',
-          tagName: 'v0.9.1',
-          title: mockText('Stone+ 0.9.1 · 更顺滑的应用更新体验', 'Stone+ 0.9.1 · A smoother update experience'),
+          version: '9.9.9',
+          tagName: 'v9.9.9',
+          title: mockText('Stone+ 更新流程预览', 'Stone+ update flow preview'),
           publishedAt: new Date().toISOString(),
-          url: 'https://github.com/M4rkzzz/stone-plus/releases/tag/v0.9.1',
+          url: 'https://github.com/M4rkzzz/stone-plus/releases/latest',
           notes: mockUsesChinese() ? [
             '- 品牌标识旁新增绿色“更新”提醒，不再打断当前操作。',
             '- 点击提醒即可查看本次 Release 的核心亮点。',

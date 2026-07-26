@@ -51,7 +51,7 @@
   flex: 0 0 auto;
   place-items: center;
   border-radius: 8px;
-  background: #fff;
+  background: var(--surface);
   color: var(--accent);
 }
 
@@ -62,10 +62,10 @@
 .built-in-policy__footnote { color: var(--muted); font-size: 9px; line-height: 1.5; }
 .built-in-policy__pending {
   padding: 9px 10px;
-  border: 1px solid #ead8b8;
+  border: 1px solid var(--warn-border);
   border-radius: 6px;
   background: var(--amber-soft);
-  color: #79501d;
+  color: var(--warn-text);
   font-size: 9px;
   line-height: 1.5;
 }

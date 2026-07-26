@@ -18,6 +18,7 @@ const MAX_MODEL_DISCOVERY_PAGE_BYTES = 2 * 1024 * 1024
 const MAX_DISCOVERED_MODEL_IDS = 10_000
 const MAX_MODEL_ID_LENGTH = 256
 const MAX_PAGINATION_TOKEN_LENGTH = 2_048
+const MAX_CLAUDE_CODE_SESSION_ID_LENGTH = 256
 
 export function createProviderAdapter(definition: ProviderAdapterDefinition): ProviderAdapter {
   const adapter: ProviderAdapter = {
@@ -44,6 +45,12 @@ export function createProviderAdapter(definition: ProviderAdapterDefinition): Pr
       if (definition.forwardUserAgent !== false) {
         const userAgent = readSourceHeader(input.sourceHeaders, 'user-agent')
         if (userAgent) headers.set('user-agent', userAgent)
+      }
+      if (input.protocol === 'anthropic-messages') {
+        const sessionId = safeClaudeCodeSessionId(
+          readSourceHeader(input.sourceHeaders, 'x-claude-code-session-id')
+        )
+        if (sessionId) headers.set('x-claude-code-session-id', sessionId)
       }
       definition.applyAuthentication(headers, input)
     },
@@ -233,9 +240,11 @@ async function fetchProbe(
     method: 'GET',
     headers,
     signal,
-    ...((adapter.kind === 'xai' || adapter.kind === 'xai-compatible')
-      ? { redirect: 'error' as const }
-      : {}),
+    // Fetch forwards sensitive authentication headers across redirects in
+    // several otherwise standards-compliant cases. Provider discovery and
+    // health checks never need redirect compatibility, so fail closed before a
+    // credential can be replayed to a different origin.
+    redirect: 'error',
   })
 }
 
@@ -298,6 +307,12 @@ function isSafeDiscoveredModelId(candidate: string): boolean {
   const model = candidate.trim()
   if (!model) return true
   return model.length <= MAX_MODEL_ID_LENGTH && !hasControlCharacters(model)
+}
+
+function safeClaudeCodeSessionId(value: string | undefined): string | undefined {
+  const sessionId = value?.trim()
+  if (!sessionId || sessionId.length > MAX_CLAUDE_CODE_SESSION_ID_LENGTH) return undefined
+  return hasControlCharacters(sessionId) ? undefined : sessionId
 }
 
 function hasControlCharacters(value: string): boolean {

@@ -1,8 +1,9 @@
 import { randomUUID } from 'node:crypto'
 import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process'
+import type { AgentTarget } from '../../shared/agent-lifecycle'
 import { terminateProcessTree } from '../proxy/built-in/process-utils'
 
-export type AgentInstallTarget = 'codex-desktop' | 'codex-cli' | 'claude-code' | 'gemini-cli' | 'grok-build'
+export type AgentInstallTarget = AgentTarget
 export type AgentInstallChannel = 'recommended' | 'preview'
 export type AgentInstallStage =
   | 'queued'
@@ -79,6 +80,8 @@ export const CODEX_DESKTOP_DOWNLOAD_URL = 'https://chatgpt.com/download/'
 export const AGENT_INSTALL_GUIDE_URLS = Object.freeze({
   'codex-cli': 'https://learn.chatgpt.com/docs/codex/cli',
   'claude-code': 'https://code.claude.com/docs/en/getting-started',
+  'claude-code-desktop': 'https://claude.com/download',
+  'claude-code-vsc': 'https://marketplace.visualstudio.com/items?itemName=anthropic.claude-code',
   'gemini-cli': 'https://github.com/google-gemini/gemini-cli',
   'grok-build': 'https://x.ai/cli',
 } satisfies Readonly<Record<Exclude<AgentInstallTarget, 'codex-desktop'>, string>>)
@@ -294,12 +297,15 @@ export class NativeAgentInstallerProcessPort implements AgentInstallerProcessPor
 
 export function isAgentInstallTarget(value: unknown): value is AgentInstallTarget {
   return value === 'codex-desktop' || value === 'codex-cli' || value === 'claude-code'
+    || value === 'claude-code-desktop' || value === 'claude-code-vsc'
     || value === 'gemini-cli' || value === 'grok-build'
 }
 
 function displayName(target: Exclude<AgentInstallTarget, 'codex-desktop'>): string {
   if (target === 'codex-cli') return 'Codex CLI'
-  if (target === 'claude-code') return 'Claude Code'
+  if (target === 'claude-code') return 'Claude Code CLI'
+  if (target === 'claude-code-desktop') return 'Claude Code Desktop'
+  if (target === 'claude-code-vsc') return 'Claude Code VSC'
   return target === 'gemini-cli' ? 'Gemini CLI' : 'Grok Build'
 }
 

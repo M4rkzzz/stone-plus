@@ -309,7 +309,7 @@ Stone+ 保留上游 Stone 的本地网关、协议转换、号池、路由和客
 
 ## 从源码运行
 
-需要 Node.js 24：
+需要 Node.js 22.20.0 与 npm 10.9.3；仓库会在安装依赖前自动校验该工具链：
 
 ```bash
 git clone https://github.com/M4rkzzz/stone-plus.git

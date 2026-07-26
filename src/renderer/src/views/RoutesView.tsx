@@ -2,6 +2,7 @@
 import { useEffect, useRef, useState } from 'react'
 import {
   Check,
+  CircleAlert,
   Clipboard,
   Copy,
   Eye,
@@ -18,19 +19,27 @@ import {
 import { clientNativeProtocols } from '@shared/types'
 import {
   enumerateRouteSourceModels,
+  analyzeRouteSourceCompatibility,
   isGrokRouteSource,
   isNativeGrokRouteSource,
-  listRouteSources,
+  listRouteSourcesForClient,
   resolveRouteSource,
+  routeSourceUsesKiroClaude,
   type RouteSourceKind,
 } from '@shared/route-sources'
+import { normalizeRouteModelMap, validateRouteModelMapping } from '@shared/route-models'
 import type { AppSnapshot, GatewayApi, Route, RouteClient, RoutePreviewIssue, RoutePreviewResult } from '@shared/types'
 import type { ActionRunner } from '../App'
 import { clientBrandMeta as clientMeta } from '../brand-icons'
-import { ExclusiveAsyncOperation } from '../async-operation'
+import { BoundAsyncOperation, ExclusiveAsyncOperation } from '../async-operation'
+import { localizeBackendError } from '../backend-message'
 import { useI18n } from '../i18n'
 import { Badge, EmptyState, FieldError, gatewayBaseUrl, PageHeader, protocolLabels, Toggle } from '../ui'
 import { setupPoolDisplayName } from '../system-generated-text'
+import {
+  CLAUDE_TOOLCHAIN_UNVERIFIED_COPY,
+  routeSourceNeedsClaudeToolchainWarning,
+} from '../claude-toolchain-ui'
 
 type MappingRow = { id: string; source: string; target: string }
 export const DEFAULT_ROUTE_MODEL_KEY = '*'
@@ -52,22 +61,57 @@ export type RouteMappingValidation = {
   modelMap: Record<string, string>
 } | {
   valid: false
-  reason: 'incomplete' | 'duplicate-source' | 'reserved-source'
+  reason: 'incomplete' | 'duplicate-source' | 'reserved-source' | 'unsafe-source' | 'unsafe-target'
 }
 
 /** Validate without silently dropping rows the user can still see in the editor. */
 export function validateRouteMappings(rows: readonly Pick<MappingRow, 'source' | 'target'>[], defaultUpstreamModel = ''): RouteMappingValidation {
-  const modelMap: Record<string, string> = {}
+  const entries: Array<[string, string]> = []
+  const sources = new Set<string>()
   for (const row of rows) {
     const source = row.source.trim()
     const target = row.target.trim()
     if (!source || !target) return { valid: false, reason: 'incomplete' }
     if (source === DEFAULT_ROUTE_MODEL_KEY) return { valid: false, reason: 'reserved-source' }
-    if (Object.hasOwn(modelMap, source)) return { valid: false, reason: 'duplicate-source' }
-    modelMap[source] = target
+    const sharedValidation = validateRouteModelMapping(source, target)
+    if (!sharedValidation.valid) {
+      return { valid: false, reason: sharedValidation.reason === 'invalid-source' ? 'unsafe-source' : 'unsafe-target' }
+    }
+    if (sources.has(source)) return { valid: false, reason: 'duplicate-source' }
+    sources.add(source)
+    entries.push([source, target])
   }
-  if (defaultUpstreamModel.trim()) modelMap[DEFAULT_ROUTE_MODEL_KEY] = defaultUpstreamModel.trim()
-  return { valid: true, modelMap }
+  const normalizedDefault = defaultUpstreamModel.trim()
+  if (normalizedDefault) {
+    if (!validateRouteModelMapping(DEFAULT_ROUTE_MODEL_KEY, normalizedDefault).valid) {
+      return { valid: false, reason: 'unsafe-target' }
+    }
+    entries.push([DEFAULT_ROUTE_MODEL_KEY, normalizedDefault])
+  }
+  return { valid: true, modelMap: { ...normalizeRouteModelMap(Object.fromEntries(entries)) } }
+}
+
+/** Every field sent to previewRoute participates in the result identity. */
+export function routePreviewBinding(
+  draft: Route,
+  mappings: readonly Pick<MappingRow, 'source' | 'target'>[],
+  defaultUpstreamModel: string,
+  requestedModel: string,
+): string {
+  return JSON.stringify({
+    route: {
+      id: draft.id,
+      client: draft.client,
+      enabled: draft.enabled,
+      highConcurrencyMode: draft.highConcurrencyMode === true,
+      poolId: draft.poolId,
+      inboundProtocol: draft.inboundProtocol,
+      localToken: draft.localToken,
+    },
+    mappings: mappings.map(({ source, target }) => ({ source, target })),
+    defaultUpstreamModel,
+    requestedModel,
+  })
 }
 
 export function routeSourceModelOptions(
@@ -204,7 +248,7 @@ function RouteEditor({
   runAction: ActionRunner
   busy: boolean
 }) {
-  const { t } = useI18n()
+  const { t, language } = useI18n()
   const [draft, setDraft] = useState(route)
   const [mappings, setMappings] = useState<MappingRow[]>(() => splitRouteModelMap(route.modelMap).exactMappings
     .map(({ source, target }) => ({ id: crypto.randomUUID(), source, target })))
@@ -212,13 +256,15 @@ function RouteEditor({
   const [showToken, setShowToken] = useState(false)
   const [copied, setCopied] = useState<string | null>(null)
   const [previewModel, setPreviewModel] = useState('')
-  const [preview, setPreview] = useState<RoutePreviewResult | null>(null)
+  const [preview, setPreview] = useState<{ binding: string; value: RoutePreviewResult } | null>(null)
+  const [previewError, setPreviewError] = useState('')
   const [previewBusy, setPreviewBusy] = useState(false)
   const [mappingValidationAttempted, setMappingValidationAttempted] = useState(false)
   const syncedRouteSignature = useRef('')
   const pendingToggle = useRef<{ token: symbol; signature: string } | undefined>(undefined)
   const persistedRoute = useRef(route)
   const mutation = useRef(new ExclusiveAsyncOperation())
+  const previewOperation = useRef(new BoundAsyncOperation())
   const [localMutation, setLocalMutation] = useState<'save' | 'toggle' | null>(null)
   persistedRoute.current = route
   const meta = clientMeta[route.client]
@@ -247,11 +293,13 @@ function RouteEditor({
   const source = resolveRouteSource(draft.poolId, snapshot)
   const grokCompatibility = routeSourceUsesGrok(draft.poolId, snapshot)
   const nativeGrokSource = routeSourceUsesNativeGrok(draft.poolId, snapshot)
-  const routeSources = listRouteSources(snapshot)
-    .filter((item) => draft.client !== 'grokbuild'
-      || isNativeGrokRouteSource(resolveRouteSource(item.id, snapshot), snapshot))
+  const kiroClaudeSource = routeSourceUsesKiroClaude(source, snapshot)
+  const claudeToolchainUnverified = draft.client === 'claude'
+    && routeSourceNeedsClaudeToolchainWarning(source, snapshot.providers)
+  const sourceCompatibility = analyzeRouteSourceCompatibility(draft.client, source, snapshot)
+  const routeSources = listRouteSourcesForClient(draft.client, snapshot)
   const selectedSourceAvailable = routeSources.some((item) => item.id === draft.poolId)
-  const sourceAllowed = draft.client !== 'grokbuild' || nativeGrokSource
+  const sourceAllowed = sourceCompatibility.eligible
   const sourceGroups: Array<{ kind: RouteSourceKind; label: string }> = [
     { kind: 'standard', label: t('普通号池', 'Standard pools') },
     { kind: 'relay-aggregate', label: t('聚合中转', 'Aggregate relays') },
@@ -260,6 +308,17 @@ function RouteEditor({
   ]
   const baseUrl = gatewayBaseUrl(snapshot.gateway.host, snapshot.gateway.port)
   const endpoint = `${baseUrl}${routePath(draft)}`
+  const previewBinding = routePreviewBinding(draft, mappings, defaultUpstreamModel, previewModel.trim())
+  const previewBindingRef = useRef(previewBinding)
+  previewBindingRef.current = previewBinding
+  const visiblePreview = preview?.binding === previewBinding ? preview.value : null
+
+  useEffect(() => {
+    previewOperation.current.invalidate()
+    setPreview(null)
+    setPreviewError('')
+    setPreviewBusy(false)
+  }, [previewBinding])
 
   const copyText = async (key: string, value: string) => {
     await navigator.clipboard.writeText(value)
@@ -295,19 +354,29 @@ function RouteEditor({
       setMappingValidationAttempted(true)
       return
     }
+    const binding = previewBinding
     setPreviewBusy(true)
-    try {
-      setPreview(await api.previewRoute({
+    setPreview(null)
+    setPreviewError('')
+    const result = await previewOperation.current.run(
+      binding,
+      () => previewBindingRef.current,
+      () => api.previewRoute({
         route: { ...draft, modelMap: validation.modelMap },
         requestedModel: previewModel.trim() || undefined,
-      }))
-    } finally {
+      }),
+    )
+    if (result.status === 'applied') setPreview({ binding, value: result.value })
+    else if (result.status === 'failed') {
+      setPreviewError(localizeBackendError(result.error, language, t('路由预演失败，请重试。', 'Route preview failed. Try again.')))
+    }
+    if (previewOperation.current.isLatest(result.token) && previewBindingRef.current === binding) {
       setPreviewBusy(false)
     }
   }
 
   const toggleEnabled = async (enabled: boolean) => {
-    if (enabled && draft.client === 'grokbuild' && (!draft.poolId || !sourceAllowed)) return
+    if (enabled && (!draft.poolId || !sourceAllowed)) return
     await mutation.current.run(async () => {
       const requestToken = Symbol('route-toggle')
       const previousEnabled = draft.enabled
@@ -347,7 +416,7 @@ function RouteEditor({
       <header className="route-editor__header">
         <span className="client-logo route-client-brand"><img src={meta.icon} alt="" /></span>
         <div><h2>{meta.name}</h2><span>{draft.client === 'grokbuild' ? t('Grok 原生 · Responses', 'Grok native · Responses') : protocolLabels[draft.inboundProtocol]}</span></div>
-        <div className="route-editor__state"><span>{draft.enabled ? t('已启用', 'Enabled') : t('已停用', 'Disabled')}</span><Toggle checked={draft.enabled} disabled={busy || localMutation !== null || (!draft.enabled && draft.client === 'grokbuild' && (!draft.poolId || !sourceAllowed))} onChange={(value) => void toggleEnabled(value)} label={draft.enabled ? t(`停用 ${meta.name} 路由`, `Disable ${meta.name} route`) : t(`启用 ${meta.name} 路由`, `Enable ${meta.name} route`)} /></div>
+        <div className="route-editor__state"><span>{draft.enabled ? t('已启用', 'Enabled') : t('已停用', 'Disabled')}</span><Toggle checked={draft.enabled} disabled={busy || localMutation !== null || (!draft.enabled && (!draft.poolId || !sourceAllowed))} onChange={(value) => void toggleEnabled(value)} label={draft.enabled ? t(`停用 ${meta.name} 路由`, `Disable ${meta.name} route`) : t(`启用 ${meta.name} 路由`, `Enable ${meta.name} route`)} /></div>
       </header>
 
       <div className="route-editor__body">
@@ -362,12 +431,14 @@ function RouteEditor({
               {sourceGroups.map((group) => {
                 const options = routeSources.filter((item) => item.kind === group.kind)
                 return options.length ? <optgroup key={group.kind} label={group.label}>
-                  {options.map((item) => <option key={item.id} value={item.id}>{setupPoolDisplayName(item.name, t)} · {protocolLabels[item.protocol]}</option>)}
+                  {options.map((item) => <option key={item.id} value={item.id}>{setupPoolDisplayName(item.name, t)} · {protocolLabels[item.protocol]}{draft.client === 'claude' && routeSourceNeedsClaudeToolchainWarning(resolveRouteSource(item.id, snapshot), snapshot.providers) ? ` · ${t(CLAUDE_TOOLCHAIN_UNVERIFIED_COPY.zh, CLAUDE_TOOLCHAIN_UNVERIFIED_COPY.en)}` : ''}</option>)}
                 </optgroup> : null
               })}
             </select>
             {draft.client === 'grokbuild' && <small>{t('仅显示 Grok 原生 Responses 号池或中转站；Chat 兼容来源不会出现在这里。', 'Only Responses-native Grok pools or relays are shown; Chat compatibility sources are hidden.')}</small>}
             {draft.client === 'grokbuild' && draft.poolId && !sourceAllowed && <FieldError>{t('当前来源不是 Grok 原生 Responses 来源，请重新选择。', 'The current source is not a Responses-native Grok source. Select a different source.')}</FieldError>}
+            {draft.client !== 'claude' && kiroClaudeSource && <FieldError>{t('Kiro Claude 来源只能由 Claude Code 系列客户端使用。', 'Kiro Claude sources are available only to Claude Code clients.')}</FieldError>}
+            {draft.client === 'claude' && kiroClaudeSource && draft.poolId && !sourceAllowed && <FieldError>{t('该来源尚未通过 Kiro Claude 两轮工具链测试，不能绑定。', 'This source has not passed the Kiro Claude two-round tool test and cannot be bound.')}</FieldError>}
           </label>
           <label className="field">
             <span>{t('入站协议', 'Inbound protocol')}</span>
@@ -377,11 +448,25 @@ function RouteEditor({
           </label>
         </div>
 
-        {draft.client === 'grokbuild' && source && nativeGrokSource ? (
+        {claudeToolchainUnverified && <div className="claude-toolchain-warning"><CircleAlert size={15} /><span>{t(CLAUDE_TOOLCHAIN_UNVERIFIED_COPY.zh, CLAUDE_TOOLCHAIN_UNVERIFIED_COPY.en)}</span></div>}
+
+        {kiroClaudeSource && draft.client === 'claude' ? (
+          <div className="conversion-line conversion-line--kiro"><RefreshCw size={14} /><span>Anthropic Messages</span><span className="conversion-arrow">→</span><span>Kiro Claude</span><Badge tone="warning">{t('方言兼容已启用', 'Dialect bridge enabled')}</Badge></div>
+        ) : draft.client === 'grokbuild' && source && nativeGrokSource ? (
           <div className="conversion-line conversion-line--native"><Check size={14} /><span>Grok Build</span><span className="conversion-arrow">→</span><span>{t('Grok 原生 Responses', 'Grok native Responses')}</span><Badge tone="success">{t('原生直通', 'Native passthrough')}</Badge></div>
         ) : draft.client !== 'grokbuild' && source && source.summary.protocol !== draft.inboundProtocol ? (
           <div className="conversion-line"><RefreshCw size={14} /><span>{protocolLabels[draft.inboundProtocol]}</span><span className="conversion-arrow">→</span><span>{protocolLabels[source.summary.protocol]}</span><Badge tone="warning">{grokCompatibility ? t('Grok 兼容转换', 'Grok compatibility conversion') : t('协议转换', 'Protocol conversion')}</Badge></div>
         ) : null}
+
+        {kiroClaudeSource && draft.client === 'claude' && <div className="kiro-compatibility-panel" role="status">
+          <div><Check size={16} /><strong>{t('Kiro Claude 结构化兼容', 'Kiro Claude structured compatibility')}</strong><Badge tone="success">{t('强制开启', 'Always on')}</Badge></div>
+          <code>Anthropic Messages → Kiro Claude → AWS Event Stream → Anthropic SSE</code>
+          <ul>
+            <li>{t('完整保持 tool_use / tool_result 的 ID、顺序与并行关系', 'Preserves tool_use / tool_result IDs, ordering, and parallel batches')}</li>
+            <li>{t('不会把工具结果转换为 Continue 或占位文本', 'Never converts tool results into Continue or placeholder text')}</li>
+            <li>{t('Manual 切换 Auto 后请新建会话；旧待确认调用不会自动重放', 'Start a new conversation after switching Manual to Auto; old pending calls are not replayed')}</li>
+          </ul>
+        </div>}
 
         <div className={`route-performance-option ${draft.highConcurrencyMode ? 'route-performance-option--active' : ''}`}>
           <Gauge size={17} />
@@ -440,14 +525,19 @@ function RouteEditor({
             ? t('同一个请求模型只能设置一条映射。', 'Each requested model can have only one mapping.')
             : mappingValidation.reason === 'reserved-source'
               ? t('* 已保留给默认上游模型，请使用上方选择器。', '* is reserved for the default upstream model; use the selector above.')
+              : mappingValidation.reason === 'unsafe-source'
+                ? t('请求模型名称无效：不能使用保留对象键、控制字符或超过 256 个字符。', 'The requested model name is invalid: reserved object keys, control characters, and names over 256 characters are not allowed.')
+                : mappingValidation.reason === 'unsafe-target'
+                  ? t('上游模型名称无效：不能包含控制字符或超过 256 个字符。', 'The upstream model name is invalid: control characters and names over 256 characters are not allowed.')
             : t('请填写完整的请求模型和上游模型，或删除未完成的规则。', 'Complete both model fields or remove the unfinished rule.')}</FieldError>}
         </div>
 
         <details className="client-config route-preview">
           <summary><RouteIcon size={15} />{t('静态路由预演', 'Static route preview')}</summary>
           <div className="route-preview__body">
-            <div className="route-preview__controls"><input className="mono" value={previewModel} onChange={(event) => { setPreviewModel(event.target.value); setPreview(null) }} placeholder={t('请求模型（可选）', 'Requested model (optional)')} /><button className="button button--secondary" type="button" disabled={previewBusy} onClick={() => void runPreview()}>{previewBusy ? <LoaderCircle size={15} className="spin" /> : <Eye size={15} />}{t('预演', 'Preview')}</button></div>
-            {preview && <div className="route-preview__result"><Badge tone={preview.status === 'ready' ? 'success' : preview.status === 'blocked' ? 'danger' : 'warning'}>{preview.status === 'ready' ? t('可路由', 'Ready') : preview.status === 'blocked' ? t('已阻止', 'Blocked') : t('需注意', 'Attention')}</Badge><span>{t(`${preview.eligibleAccountCount} 个可用成员`, `${preview.eligibleAccountCount} eligible account(s)`)}</span>{preview.upstreamModel && <code>{preview.requestedModel && preview.requestedModel !== preview.upstreamModel ? `${preview.requestedModel} → ${preview.upstreamModel}` : preview.upstreamModel}</code>}{routePreviewIssuesForDisplay(draft, preview.issues, nativeGrokSource).map((item) => <small key={`${item.code}-${item.capability ?? ''}`}>{item.severity === 'error' ? '✕' : item.severity === 'warning' ? '!' : '·'} {previewIssueText(item, preview, t)}</small>)}</div>}
+            <div className="route-preview__controls"><input className="mono" value={previewModel} onChange={(event) => setPreviewModel(event.target.value)} placeholder={t('请求模型（可选）', 'Requested model (optional)')} /><button className="button button--secondary" type="button" disabled={previewBusy} onClick={() => void runPreview()}>{previewBusy ? <LoaderCircle size={15} className="spin" /> : <Eye size={15} />}{t('预演', 'Preview')}</button></div>
+            {previewError && <FieldError>{previewError}</FieldError>}
+            {visiblePreview && <div className="route-preview__result"><Badge tone={visiblePreview.status === 'ready' ? 'success' : visiblePreview.status === 'blocked' ? 'danger' : 'warning'}>{visiblePreview.status === 'ready' ? t('可路由', 'Ready') : visiblePreview.status === 'blocked' ? t('已阻止', 'Blocked') : t('需注意', 'Attention')}</Badge><span>{t(`${visiblePreview.eligibleAccountCount} 个可用成员`, `${visiblePreview.eligibleAccountCount} eligible account(s)`)}</span>{visiblePreview.upstreamModel && <code>{visiblePreview.requestedModel && visiblePreview.requestedModel !== visiblePreview.upstreamModel ? `${visiblePreview.requestedModel} → ${visiblePreview.upstreamModel}` : visiblePreview.upstreamModel}</code>}{routePreviewIssuesForDisplay(draft, visiblePreview.issues, nativeGrokSource).map((item) => <small key={`${item.code}-${item.capability ?? ''}`}>{item.severity === 'error' ? '✕' : item.severity === 'warning' ? '!' : '·'} {previewIssueText(item, visiblePreview, t)}</small>)}</div>}
           </div>
         </details>
 

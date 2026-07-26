@@ -1,5 +1,35 @@
 import type { PublicAccount } from '@shared/types'
 
+/** Keep high-churn account rows within a predictable reconciliation budget. */
+export const ACCOUNT_RENDER_PAGE_SIZE = 100
+
+export interface AccountPage<T> {
+  items: T[]
+  page: number
+  pageCount: number
+  start: number
+  end: number
+  total: number
+}
+
+export function paginateAccounts<T>(items: readonly T[], requestedPage: number): AccountPage<T> {
+  const total = items.length
+  const pageCount = Math.max(1, Math.ceil(total / ACCOUNT_RENDER_PAGE_SIZE))
+  const normalizedPage = Number.isFinite(requestedPage) ? Math.trunc(requestedPage) : 0
+  const page = Math.max(0, Math.min(pageCount - 1, normalizedPage))
+  const offset = page * ACCOUNT_RENDER_PAGE_SIZE
+  const pageItems = items.slice(offset, offset + ACCOUNT_RENDER_PAGE_SIZE)
+
+  return {
+    items: pageItems,
+    page,
+    pageCount,
+    start: total === 0 ? 0 : offset + 1,
+    end: offset + pageItems.length,
+    total,
+  }
+}
+
 export function accountDisplayNames(accounts: readonly Pick<PublicAccount, 'id' | 'name'>[]): Map<string, string> {
   const counts = new Map<string, number>()
   for (const account of accounts) counts.set(account.name, (counts.get(account.name) ?? 0) + 1)

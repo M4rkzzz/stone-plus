@@ -82,6 +82,54 @@ describe('CodexLifecycleAdapter', () => {
     expect(desktop.relaunch).toHaveBeenCalledWith(state)
   })
 
+  it('repairs the desktop connection before relaunch and restores a previously running client on failure', async () => {
+    const state = { wasRunning: true, launchTarget: 'Codex.exe' }
+    const desktop: ChatGptDesktopController = {
+      shutdownForRepair: vi.fn(async () => state),
+      relaunch: vi.fn(async () => undefined),
+    }
+    const prepareConnection = vi.fn()
+      .mockRejectedValueOnce(new Error('config drift remained'))
+      .mockResolvedValueOnce(undefined)
+    const adapter = new CodexLifecycleAdapter({
+      target: 'codex-desktop',
+      desktop,
+      desktopProbe: makeDesktopProbe({ installed: true, running: true }),
+      deepRepair: { run: vi.fn() },
+      prepareConnection,
+    })
+
+    await expect(adapter.start()).rejects.toMatchObject({ phase: 'restore-connection' })
+    expect(desktop.shutdownForRepair).toHaveBeenCalledOnce()
+    expect(desktop.relaunch).toHaveBeenCalledWith(state)
+
+    await adapter.start()
+    expect(desktop.shutdownForRepair).toHaveBeenCalledTimes(2)
+    expect(desktop.relaunch).toHaveBeenCalledTimes(2)
+  })
+
+  it('repairs and validates the selected CLI profile before launching it', async () => {
+    const cli = makeCli({ externalSessionDetected: false })
+    vi.mocked(cli.inspect).mockResolvedValue({
+      installation: { installed: true },
+      configured: false,
+      managedInstances: [],
+      externalSessionDetected: false,
+    })
+    const adapter = new CodexLifecycleAdapter({
+      target: 'codex-cli',
+      desktop: makeDesktop(),
+      desktopProbe: makeDesktopProbe({ installed: true, running: false }),
+      deepRepair: { run: vi.fn() },
+      cli,
+    })
+
+    await adapter.start({ profileId: 'profile-a' })
+
+    expect(cli.prepareStart).toHaveBeenCalledWith({ profileId: 'profile-a' })
+    expect(cli.startNew).toHaveBeenCalledWith({ profileId: 'profile-a' })
+  })
+
   it('restores CLI connection, restarts only managed instances, and leaves external sessions pending', async () => {
     const cli = makeCli({ externalSessionDetected: true })
     const adapter = new CodexLifecycleAdapter({
@@ -222,6 +270,34 @@ describe('CodexLifecycleAdapter', () => {
     expect(cli.restartManaged).toHaveBeenCalledWith('codex-b')
     expect(result.restartedManagedInstanceIds).toEqual(['codex-a', 'codex-b'])
   })
+
+  it('passes every running custom CODEX_HOME to deep session repair', async () => {
+    const cli = makeCli({ externalSessionDetected: false })
+    vi.mocked(cli.inspect).mockResolvedValue({
+      installation: { installed: true },
+      configured: true,
+      managedInstances: [
+        { id: 'codex-a', running: true, configDirectory: '/profiles/codex-a' },
+        { id: 'codex-b', running: false, configDirectory: '/profiles/codex-b' },
+      ],
+      externalSessionDetected: false,
+    })
+    const deepRepair = { run: vi.fn(async () => undefined) }
+    const adapter = new CodexLifecycleAdapter({
+      target: 'codex-cli',
+      desktop: makeDesktop(),
+      desktopProbe: makeDesktopProbe({ installed: true, running: false }),
+      deepRepair,
+      cli,
+    })
+
+    await adapter.restore({ repairSessions: true, repairWorkspaceIndex: false })
+
+    expect(deepRepair.run).toHaveBeenCalledWith(
+      { preserveRunningState: true },
+      ['/profiles/codex-a', '/profiles/codex-b'],
+    )
+  })
 })
 
 function makeDesktop(): ChatGptDesktopController {
@@ -254,5 +330,6 @@ function makeCli(options: { externalSessionDetected: boolean }): CodexCliPort {
     startNew: vi.fn(async () => undefined),
     restoreConnection: vi.fn(async () => undefined),
     validateConnection: vi.fn(async () => undefined),
+    prepareStart: vi.fn(async () => undefined),
   }
 }

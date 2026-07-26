@@ -117,10 +117,12 @@ describe('ChatGPT OAuth PKCE flow', () => {
     const started = await manager.start()
     const state = new URL(started.authorizationUrl).searchParams.get('state') ?? ''
 
-    expect(() => manager.submitCallback(
-      started.sessionId,
-      `${started.redirectUri}?code=code&state=wrong-state`,
-    )).toThrow('state 校验失败')
+    for (const mismatchedState of ['', 'x', 'wrong-state', 'x'.repeat(state.length + 256)]) {
+      expect(() => manager.submitCallback(
+        started.sessionId,
+        `${started.redirectUri}?code=code&state=${encodeURIComponent(mismatchedState)}`,
+      )).toThrow('state 校验失败')
+    }
 
     const exchange = successfulExchange(now)
     manager.submitCallback(

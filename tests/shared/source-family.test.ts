@@ -12,6 +12,7 @@ describe('provider source family', () => {
   it('keeps the remaining provider families stable', () => {
     expect(providerSourceFamily('anthropic')).toBe('anthropic')
     expect(providerSourceFamily('anthropic-compatible')).toBe('anthropic')
+    expect(providerSourceFamily('kiro-compatible')).toBe('kiro')
     expect(providerSourceFamily('google')).toBe('google')
     expect(providerSourceFamily('custom')).toBe('custom')
   })

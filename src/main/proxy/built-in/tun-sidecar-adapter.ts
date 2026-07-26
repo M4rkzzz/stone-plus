@@ -1,5 +1,6 @@
 import { randomBytes, randomUUID } from 'node:crypto'
 import { lookup } from 'node:dns/promises'
+import { existsSync } from 'node:fs'
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
 import { isIP } from 'node:net'
@@ -32,10 +33,23 @@ import {
   type TunPlatformSession,
   type TunPlatformStartRequest
 } from './tun-controller'
+import {
+  createWindowsPowerShellCommandArgs,
+  WINDOWS_POWERSHELL_SECURITY_MODULE_IMPORT,
+} from './process-utils'
+import {
+  STONEPLUS_RELEASE_CERTIFICATE_SHA1,
+  validateStonePlusWindowsUpdateSignature,
+  type AuthenticodeResult,
+} from '../../update/windows-signature'
 
 const DIRECT_OUTBOUND = 'stone-tun-direct'
 const MIXED_OUTBOUND = 'stone-tun-upstream-mixed'
 const TUN_INBOUND = 'stone-tun-in'
+export const STONE_WINDOWS_SIGNER_THUMBPRINT = STONEPLUS_RELEASE_CERTIFICATE_SHA1
+export const STONE_WINDOWS_SIGNER_SUBJECT = 'CN=StonePlus Open Source Release, O=StonePlus Contributors'
+const WINDOWS_HOST_PATH_ENV = 'STONE_BUILT_IN_PROXY_HOST_PATH'
+const WINDOWS_TUN_ACL_TARGET_ENV = 'STONE_BUILT_IN_PROXY_TUN_ACL_TARGET'
 const DEFAULT_TUN_ADDRESSES = Object.freeze([
   '172.30.255.1/30',
   'fdfe:dcba:9876::1/126'
@@ -106,6 +120,41 @@ export interface BuildElevatedTunSidecarConfigOptions {
   controllerSecret?: string
 }
 
+export interface ElectronPackagingProcessIdentity {
+  versions: { electron?: string }
+  defaultApp?: boolean
+  resourcesPath?: string
+}
+
+export function isPackagedElectronApplication(
+  identity: ElectronPackagingProcessIdentity,
+  fileExists: (path: string) => boolean = existsSync,
+): boolean {
+  if (!identity.versions.electron || identity.defaultApp || !identity.resourcesPath) return false
+  return fileExists(join(identity.resourcesPath, 'app.asar'))
+}
+
+/**
+ * Applies the same pinned-certificate policy used for Windows updates to the
+ * packaged host that is about to request TUN elevation. The Stone+ continuity
+ * certificate is self-signed, so clean Windows installations report a valid
+ * signature as UnknownError with an untrusted-root status message. All other
+ * UnknownError results remain fail-closed.
+ */
+export function validatePackagedStoneHostSignature(
+  executablePath: string,
+  result: AuthenticodeResult,
+): string | null {
+  if (typeof result.Path !== 'string' || !result.Path.trim()) {
+    return 'Windows host signature verification did not return the inspected file path.'
+  }
+  return validateStonePlusWindowsUpdateSignature(
+    [STONE_WINDOWS_SIGNER_SUBJECT],
+    executablePath,
+    result,
+  )
+}
+
 interface ActiveTunSidecar {
   handle: TemporaryElevatedProcessHandle
   configPath: string
@@ -114,9 +163,10 @@ interface ActiveTunSidecar {
 }
 
 interface TunSidecarRecoveryRecord {
-  version: 1
+  version: 1 | 2
+  phase: 'pending' | 'active'
   id: string
-  pid: number
+  pid?: number
   launcher: TemporaryElevationLauncher
   executablePath: string
   args: string[]
@@ -151,6 +201,7 @@ export class ElevatedSingBoxTunAdapter implements TunPlatformAdapter {
   private readonly healthIntervalMs: number
   private readonly configDirectory: string
   private readonly recoveryPath: string
+  private readonly pendingRecoveryPath: string
   private readonly sessions = new Map<string, ActiveTunSidecar>()
   private readonly pendingCleanup = new Set<ActiveTunSidecar>()
 
@@ -176,13 +227,18 @@ export class ElevatedSingBoxTunAdapter implements TunPlatformAdapter {
     this.healthIntervalMs = Math.max(10, options.healthIntervalMs ?? 100)
     this.configDirectory = join(options.userDataPath, 'built-in-proxy', 'tun-sidecar')
     this.recoveryPath = join(this.configDirectory, 'active-sidecar.json')
+    this.pendingRecoveryPath = join(this.configDirectory, 'pending-sidecar.json')
     elevationLauncher(this.platform)
   }
 
   public async startTemporaryElevated(
     request: TunPlatformStartRequest
   ): Promise<TunPlatformSession> {
-    if (this.sessions.size === 0) await this.recoverStaleSidecar()
+    if (this.sessions.size > 0) {
+      throw new ElevatedSingBoxTunError('tun_start_failed', 'A temporary TUN sidecar is already active.')
+    }
+    await this.recoverStaleSidecar()
+    await this.verifyPackagedWindowsHost()
     let runtime: VerifiedSingBoxRuntime
     try {
       runtime = await this.verifyRuntime({
@@ -212,6 +268,15 @@ export class ElevatedSingBoxTunAdapter implements TunPlatformAdapter {
 
     const id = validateRandomId(this.randomId())
     const configPath = join(this.configDirectory, `sidecar-${id}.json`)
+    try {
+      await this.protectConfigDirectory()
+    } catch (error) {
+      throw new ElevatedSingBoxTunError(
+        'tun_config_invalid',
+        'Could not create a private TUN configuration directory.',
+        { cause: error }
+      )
+    }
     let controllerLease: LoopbackPortLease
     try {
       controllerLease = await this.reservePort(0, '127.0.0.1')
@@ -272,17 +337,47 @@ export class ElevatedSingBoxTunAdapter implements TunPlatformAdapter {
       )
     }
 
-    let handle: TemporaryElevatedProcessHandle
+    const launchRequest: TemporaryElevatedProcessRecoveryRequest = {
+      launcher: elevationLauncher(this.platform),
+      executablePath: runtime.executablePath,
+      args: ['run', '-c', configPath],
+      cwd: runtime.runtimePath,
+      env: environment
+    }
     try {
-      handle = await this.processRunner.start({
-        launcher: elevationLauncher(this.platform),
-        executablePath: runtime.executablePath,
-        args: ['run', '-c', configPath],
-        cwd: runtime.runtimePath,
-        env: environment
+      await this.saveRecoveryRecord({
+        version: 2,
+        phase: 'pending',
+        id,
+        launcher: launchRequest.launcher,
+        executablePath: launchRequest.executablePath,
+        args: [...launchRequest.args],
+        cwd: launchRequest.cwd!,
+        configPath,
+        createdAt: Date.now()
       })
     } catch (error) {
-      await this.removeConfiguration(configPath)
+      await this.removeConfiguration(configPath).catch(() => undefined)
+      throw new ElevatedSingBoxTunError(
+        'tun_cleanup_failed',
+        'Could not persist pending TUN ownership before elevation.',
+        { cause: error }
+      )
+    }
+
+    let handle: TemporaryElevatedProcessHandle
+    try {
+      handle = await this.processRunner.start(launchRequest)
+    } catch (error) {
+      try {
+        await this.recoverStaleSidecar()
+      } catch (cleanupError) {
+        throw new ElevatedSingBoxTunError(
+          'tun_cleanup_failed',
+          'TUN elevation failed and pending ownership could not be safely recovered.',
+          { cause: cleanupError }
+        )
+      }
       if (isElevationDenied(error)) throw error
       throw new ElevatedSingBoxTunError(
         'tun_start_failed',
@@ -302,7 +397,8 @@ export class ElevatedSingBoxTunAdapter implements TunPlatformAdapter {
     }
     try {
       await this.saveRecoveryRecord({
-        version: 1,
+        version: 2,
+        phase: 'active',
         id: handle.id,
         pid: handle.pid,
         launcher: elevationLauncher(this.platform),
@@ -313,7 +409,16 @@ export class ElevatedSingBoxTunAdapter implements TunPlatformAdapter {
         createdAt: Date.now()
       })
     } catch (error) {
-      await this.cleanupSidecar(active).catch(() => undefined)
+      try {
+        await this.cleanupSidecar(active)
+      } catch (cleanupError) {
+        this.pendingCleanup.add(active)
+        throw new ElevatedSingBoxTunError(
+          'tun_cleanup_failed',
+          'Could not persist active TUN ownership or stop the sidecar; recovery was retained.',
+          { cause: cleanupError }
+        )
+      }
       throw new ElevatedSingBoxTunError(
         'tun_cleanup_failed',
         'Could not persist TUN crash-recovery ownership; the sidecar was stopped.',
@@ -407,9 +512,89 @@ export class ElevatedSingBoxTunAdapter implements TunPlatformAdapter {
     return isElevationDenied(error)
   }
 
+  private async verifyPackagedWindowsHost(): Promise<void> {
+    const isPackagedApplication = isPackagedElectronApplication(
+      process as unknown as ElectronPackagingProcessIdentity,
+    )
+    // electron-vite/dev and Vitest use the same fixed repository manifest and
+    // runtime hashes, but intentionally have no release Authenticode identity.
+    if (this.platform !== 'win32' || !isPackagedApplication) return
+    const script = String.raw`
+$ErrorActionPreference = 'Stop'
+${WINDOWS_POWERSHELL_SECURITY_MODULE_IMPORT}
+$Target = [Environment]::GetEnvironmentVariable('${WINDOWS_HOST_PATH_ENV}', 'Process')
+if ([string]::IsNullOrWhiteSpace($Target)) { throw 'The Stone+ host path was not provided.' }
+$signature = Get-AuthenticodeSignature -LiteralPath $Target
+$certificate = $signature.SignerCertificate
+[ordered]@{
+  Status = [int]$signature.Status
+  StatusMessage = [string]$signature.StatusMessage
+  Path = [string]$signature.Path
+  Subject = if ($null -eq $certificate) { '' } else { [string]$certificate.Subject }
+  Thumbprint = if ($null -eq $certificate) { '' } else { [string]$certificate.Thumbprint }
+} | ConvertTo-Json -Compress
+`.trim()
+    try {
+      const result = await runChecked(this.commandRunner, {
+        file: 'powershell.exe',
+        args: createWindowsPowerShellCommandArgs(script),
+        env: {
+          [WINDOWS_HOST_PATH_ENV]: process.execPath,
+        },
+        timeoutMs: 10_000,
+        operation: 'tun.windows.verify-host-signature',
+      })
+      const parsed: unknown = JSON.parse(result.stdout)
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        throw new Error('Windows host signature verification returned invalid PowerShell data.')
+      }
+      const validationError = validatePackagedStoneHostSignature(
+        process.execPath,
+        parsed as AuthenticodeResult,
+      )
+      if (validationError) throw new Error(validationError)
+    } catch (error) {
+      throw new ElevatedSingBoxTunError(
+        'tun_runtime_invalid',
+        'Stone+ cannot elevate TUN because the packaged application signature is not trusted.',
+        { cause: error },
+      )
+    }
+  }
+
+  private async protectConfigDirectory(): Promise<void> {
+    await this.fileSystem.mkdir(this.configDirectory, { recursive: true, mode: 0o700 })
+    if (this.platform !== 'win32') return
+    const script = String.raw`
+$ErrorActionPreference = 'Stop'
+${WINDOWS_POWERSHELL_SECURITY_MODULE_IMPORT}
+$Target = [Environment]::GetEnvironmentVariable('${WINDOWS_TUN_ACL_TARGET_ENV}', 'Process')
+if ([string]::IsNullOrWhiteSpace($Target)) { throw 'The TUN ACL target was not provided.' }
+$sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+$acl = New-Object Security.AccessControl.DirectorySecurity
+$acl.SetAccessRuleProtection($true, $false)
+$acl.SetOwner($sid)
+$rights = [Security.AccessControl.FileSystemRights]::FullControl
+$inheritance = [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+$rule = New-Object Security.AccessControl.FileSystemAccessRule($sid, $rights, $inheritance, [Security.AccessControl.PropagationFlags]::None, [Security.AccessControl.AccessControlType]::Allow)
+$acl.SetAccessRule($rule)
+Set-Acl -LiteralPath $Target -AclObject $acl
+`.trim()
+    await runChecked(this.commandRunner, {
+      file: 'powershell.exe',
+      args: createWindowsPowerShellCommandArgs(script),
+      env: { [WINDOWS_TUN_ACL_TARGET_ENV]: this.configDirectory },
+      timeoutMs: 10_000,
+      operation: 'tun.windows.protect-config-directory',
+    })
+  }
+
   private observeExit(active: ActiveTunSidecar): void {
     if (!active.exit) return
-    void active.exit.then(() => { active.processStopped = true })
+    // Root exit is a failure signal, not proof that its detached/elevated
+    // process group drained. cleanupSidecar still calls the identity-aware
+    // stop handle before deleting either recovery journal.
+    void active.exit.then(() => undefined)
   }
 
   private async cleanupSidecar(active: ActiveTunSidecar): Promise<void> {
@@ -419,13 +604,23 @@ export class ElevatedSingBoxTunAdapter implements TunPlatformAdapter {
     }
     await this.fileSystem.rm(active.configPath, { force: true })
     await rm(this.recoveryPath, { force: true })
+    await rm(this.pendingRecoveryPath, { force: true })
   }
 
   private async recoverStaleSidecar(): Promise<void> {
     if (this.sessions.size > 0) return
     let record: TunSidecarRecoveryRecord | undefined
     try {
-      const parsed: unknown = JSON.parse(await readFile(this.recoveryPath, 'utf8'))
+      let journalPath = this.recoveryPath
+      let serialized: string
+      try {
+        serialized = await readFile(journalPath, 'utf8')
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+        journalPath = this.pendingRecoveryPath
+        serialized = await readFile(journalPath, 'utf8')
+      }
+      const parsed: unknown = JSON.parse(serialized)
       record = parseRecoveryRecord(parsed, this.configDirectory, elevationLauncher(this.platform))
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
@@ -436,7 +631,7 @@ export class ElevatedSingBoxTunAdapter implements TunPlatformAdapter {
       executablePath: record.executablePath,
       args: record.args,
       cwd: record.cwd,
-      pid: record.pid
+      ...(record.pid !== undefined ? { pid: record.pid } : {})
     }
     let handle: TemporaryElevatedProcessHandle | undefined
     try {
@@ -450,15 +645,17 @@ export class ElevatedSingBoxTunAdapter implements TunPlatformAdapter {
     }
     await this.fileSystem.rm(record.configPath, { force: true })
     await rm(this.recoveryPath, { force: true })
+    await rm(this.pendingRecoveryPath, { force: true })
   }
 
   private async saveRecoveryRecord(record: TunSidecarRecoveryRecord): Promise<void> {
     await mkdir(this.configDirectory, { recursive: true, mode: 0o700 })
-    const temporaryPath = `${this.recoveryPath}.${process.pid}.${Date.now()}.tmp`
+    const destination = record.phase === 'pending' ? this.pendingRecoveryPath : this.recoveryPath
+    const temporaryPath = `${destination}.${process.pid}.${Date.now()}.tmp`
     await writeFile(temporaryPath, `${JSON.stringify(record)}\n`, { encoding: 'utf8', flag: 'wx', mode: 0o600 })
-    await rm(this.recoveryPath, { force: true })
+    await rm(destination, { force: true })
     try {
-      await rename(temporaryPath, this.recoveryPath)
+      await rename(temporaryPath, destination)
     } catch (error) {
       await rm(temporaryPath, { force: true }).catch(() => undefined)
       throw error
@@ -719,12 +916,16 @@ function parseRecoveryRecord(
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     throw new Error('Invalid TUN recovery record.')
   }
-  const record = value as Partial<TunSidecarRecoveryRecord>
+  const raw = value as Partial<TunSidecarRecoveryRecord>
+  const record: Partial<TunSidecarRecoveryRecord> = raw.version === 1
+    ? { ...raw, phase: 'active' }
+    : raw
   if (
-    record.version !== 1
+    (record.version !== 1 && record.version !== 2)
+    || (record.phase !== 'pending' && record.phase !== 'active')
     || typeof record.id !== 'string'
-    || !Number.isInteger(record.pid)
-    || (record.pid ?? 0) <= 0
+    || (record.phase === 'active' && (!Number.isInteger(record.pid) || (record.pid ?? 0) <= 0))
+    || (record.phase === 'pending' && record.pid !== undefined)
     || record.launcher !== expectedLauncher
     || typeof record.executablePath !== 'string'
     || typeof record.cwd !== 'string'

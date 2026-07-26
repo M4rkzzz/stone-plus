@@ -1,4 +1,5 @@
-import { cloneElement, isValidElement, useEffect, useMemo, useRef, useState, type ReactElement, type ReactNode } from 'react'
+import { cloneElement, isValidElement, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactElement, type ReactNode } from 'react'
+import { createPortal } from 'react-dom'
 import {
   Activity,
   AlertCircle,
@@ -394,7 +395,7 @@ const helpEnglish = new Map<string, string>([
   ['加权', 'Weighted'], ['账号额度或性能差异明确', 'Accounts with known quota or performance differences'], ['权重越大，被选中的机会越高；仍会受可用性与并发限制。', 'Higher weight increases selection frequency, subject to health and concurrency limits.'],
   ['粘性会话、对冲和首包超时', 'Sticky sessions, hedging, and first-byte timeout'], ['高级功能，先理解再开启', 'Advanced controls; understand them before enabling'],
   ['粘性会话', 'Sticky sessions'], ['让同一会话在一段时间内尽量使用同一账号，适合依赖上游会话上下文的调用。', ' keep a conversation on the same account for a period, which helps calls that depend on upstream session context.'],
-  ['对冲请求', 'Hedged requests'], ['在首个请求迟迟不返回时并行尝试另一个成员，可能降低尾延迟，也可能增加调用量。', ' try another member in parallel when the first is slow. This may reduce tail latency but can increase usage.'],
+  ['对冲请求', 'Hedged requests'], ['在首个请求迟迟不返回时，向同一上游并行发起备用传输请求；可能降低尾延迟，也可能额外占用一个账号并发与额度。', ' sends a backup transport request to the same upstream when the first is slow. This may reduce tail latency while consuming additional account concurrency and quota.'],
   ['首包超时', 'First-byte timeout'], ['只控制多久没收到响应体时触发处理，不等于整个请求的总超时。', ' controls how long to wait for response data; it is not the total request timeout.'],
   ['管理号池', 'Manage pools'],
 
@@ -633,15 +634,6 @@ export function HelpView({ snapshot, api, navigate }: HelpViewProps) {
     return () => window.removeEventListener('keydown', handleShortcut)
   }, [])
 
-  useEffect(() => {
-    if (!lightbox) return
-    const close = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') setLightbox(null)
-    }
-    window.addEventListener('keydown', close)
-    return () => window.removeEventListener('keydown', close)
-  }, [lightbox])
-
   const readiness = useMemo(
     () => evaluateHelpReadiness(snapshot, clientConfigs, t),
     [clientConfigs, snapshot, t],
@@ -739,13 +731,7 @@ export function HelpView({ snapshot, api, navigate }: HelpViewProps) {
         </div>
       </section>
 
-      {lightbox && <div className="help-lightbox" role="dialog" aria-modal="true" aria-label={lightbox.alt} onMouseDown={(event) => {
-        if (event.target === event.currentTarget) setLightbox(null)
-      }}>
-        <button type="button" className="help-lightbox__close" aria-label={t('关闭图片', 'Close image')} onClick={() => setLightbox(null)}><X size={20} /></button>
-        <img src={lightbox.src} alt={lightbox.alt} />
-        <span>{lightbox.alt}</span>
-      </div>}
+      {lightbox && <HelpLightbox image={lightbox} onClose={() => setLightbox(null)} />}
     </div>
   )
 }
@@ -888,6 +874,96 @@ function Callout({ tone = 'info', title, children }: { tone?: 'info' | 'success'
 
 function OpenPageButton({ page, children, navigate }: { page: PageId; children: ReactNode; navigate: (page: PageId) => void }) {
   return <button className="help-inline-action" type="button" onClick={() => navigate(page)}>{children}<ArrowRight size={14} /></button>
+}
+
+type LightboxBackgroundSnapshot = { element: Element; inert: string | null; ariaHidden: string | null }
+
+function isolateLightboxBackground(lightbox: HTMLElement): LightboxBackgroundSnapshot[] {
+  const snapshots: LightboxBackgroundSnapshot[] = []
+  for (const element of Array.from(lightbox.ownerDocument.body.children)) {
+    if (element === lightbox || element.contains(lightbox)) continue
+    snapshots.push({
+      element,
+      inert: element.getAttribute('inert'),
+      ariaHidden: element.getAttribute('aria-hidden'),
+    })
+    element.setAttribute('inert', '')
+    element.setAttribute('aria-hidden', 'true')
+  }
+  return snapshots
+}
+
+function restoreLightboxBackground(snapshots: readonly LightboxBackgroundSnapshot[]): void {
+  for (const snapshot of snapshots) {
+    if (snapshot.inert === null) snapshot.element.removeAttribute('inert')
+    else snapshot.element.setAttribute('inert', snapshot.inert)
+    if (snapshot.ariaHidden === null) snapshot.element.removeAttribute('aria-hidden')
+    else snapshot.element.setAttribute('aria-hidden', snapshot.ariaHidden)
+  }
+}
+
+function focusLightboxElement(element: HTMLElement | null): void {
+  if (!element) return
+  try {
+    element.focus({ preventScroll: true })
+  } catch {
+    element.focus()
+  }
+}
+
+function restoreLightboxFocus(opener: HTMLElement | null): void {
+  if (opener?.isConnected) focusLightboxElement(opener)
+}
+
+function HelpLightbox({ image, onClose }: { image: { src: string; alt: string }; onClose: () => void }) {
+  const { t } = useI18n()
+  const lightboxRef = useRef<HTMLDivElement>(null)
+  const closeRef = useRef<HTMLButtonElement>(null)
+  const openerRef = useRef<HTMLElement | null>(null)
+  const openerCaptured = useRef(false)
+  const onCloseRef = useRef(onClose)
+  onCloseRef.current = onClose
+  if (!openerCaptured.current && typeof document !== 'undefined') {
+    openerCaptured.current = true
+    openerRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null
+  }
+
+  useLayoutEffect(() => {
+    const lightbox = lightboxRef.current
+    if (!lightbox) return
+    const isolated = isolateLightboxBackground(lightbox)
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        event.stopPropagation()
+        onCloseRef.current()
+        return
+      }
+      if (event.key !== 'Tab') return
+      const focusable = Array.from(lightbox.querySelectorAll<HTMLElement>('button:not([disabled]), [href], [tabindex]:not([tabindex="-1"])'))
+      const currentIndex = focusable.findIndex((element) => element === lightbox.ownerDocument.activeElement)
+      if (focusable.length <= 1 || currentIndex < 0 || (event.shiftKey ? currentIndex === 0 : currentIndex === focusable.length - 1)) {
+        event.preventDefault()
+        focusLightboxElement(event.shiftKey ? focusable[focusable.length - 1] ?? closeRef.current : focusable[0] ?? closeRef.current)
+      }
+    }
+    lightbox.ownerDocument.addEventListener('keydown', handleKeyDown)
+    focusLightboxElement(closeRef.current)
+    return () => {
+      lightbox.ownerDocument.removeEventListener('keydown', handleKeyDown)
+      restoreLightboxBackground(isolated)
+      restoreLightboxFocus(openerRef.current)
+    }
+  }, [])
+
+  const content = <div ref={lightboxRef} className="help-lightbox" role="dialog" aria-modal="true" aria-label={image.alt} tabIndex={-1} onMouseDown={(event) => {
+    if (event.target === event.currentTarget) onCloseRef.current()
+  }}>
+    <button ref={closeRef} type="button" className="help-lightbox__close" aria-label={t('关闭图片', 'Close image')} onClick={() => onCloseRef.current()}><X size={20} /></button>
+    <img src={image.src} alt={image.alt} />
+    <span>{image.alt}</span>
+  </div>
+  return typeof document !== 'undefined' && document.body ? createPortal(content, document.body) : content
 }
 
 function ScreenshotFigure({ src, alt, caption, onImage }: { src: string; alt: string; caption: string; onImage: (image: { src: string; alt: string }) => void }) {
@@ -1062,7 +1138,7 @@ function PoolsDoc({ navigate, onImage }: { navigate: (page: PageId) => void; onI
       <tr><td>加权</td><td>账号额度或性能差异明确</td><td>权重越大，被选中的机会越高；仍会受可用性与并发限制。</td></tr>
     </tbody></table></div>
     <Guide title="粘性会话、对冲和首包超时" summary="高级功能，先理解再开启">
-      <ul><li><strong>粘性会话</strong>让同一会话在一段时间内尽量使用同一账号，适合依赖上游会话上下文的调用。</li><li><strong>对冲请求</strong>在首个请求迟迟不返回时并行尝试另一个成员，可能降低尾延迟，也可能增加调用量。</li><li><strong>首包超时</strong>只控制多久没收到响应体时触发处理，不等于整个请求的总超时。</li></ul>
+      <ul><li><strong>粘性会话</strong>让同一会话在一段时间内尽量使用同一账号，适合依赖上游会话上下文的调用。</li><li><strong>对冲请求</strong>在首个请求迟迟不返回时，向同一上游并行发起备用传输请求；可能降低尾延迟，也可能额外占用一个账号并发与额度。</li><li><strong>首包超时</strong>只控制多久没收到响应体时触发处理，不等于整个请求的总超时。</li></ul>
     </Guide>
     <OpenPageButton page="pools" navigate={navigate}>管理号池</OpenPageButton>
   </></LocalizedDoc>

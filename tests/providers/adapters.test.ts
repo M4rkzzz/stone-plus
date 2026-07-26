@@ -5,6 +5,9 @@ import {
   customAdapter,
   getProviderAdapter,
   googleAdapter,
+  kiroClaudeAdapter,
+  KIRO_CLAUDE_AMZ_TARGET,
+  KIRO_CLAUDE_REQUEST_CONTENT_TYPE,
   openAIAdapter,
   openAICompatibleAdapter,
   xAIAdapter,
@@ -114,6 +117,32 @@ describe('provider adapter endpoints', () => {
     })).toBe('https://api.x.ai/v1/chat/completions')
   })
 
+  it('keeps the configured Kiro Claude GenerateAssistantResponse endpoint exact', () => {
+    expect(getProviderAdapter('kiro-compatible')).toBe(kiroClaudeAdapter)
+    expect(kiroClaudeAdapter.buildEndpoint({
+      baseUrl: 'https://kiro-relay.example.test/custom/generateAssistantResponse/',
+      protocol: 'kiro-claude',
+      operation: 'generate',
+      model: 'claude-sonnet-4.5',
+      stream: true,
+    })).toBe('https://kiro-relay.example.test/custom/generateAssistantResponse/')
+    expect(() => kiroClaudeAdapter.buildEndpoint({
+      baseUrl: 'https://kiro-relay.example.test/custom/generateAssistantResponse',
+      protocol: 'kiro-claude',
+      operation: 'models',
+    })).toThrow(/exact GenerateAssistantResponse endpoint/)
+    expect(() => kiroClaudeAdapter.buildEndpoint({
+      baseUrl: 'https://kiro-relay.example.test/custom/generateAssistantResponse?token=secret',
+      protocol: 'kiro-claude',
+      operation: 'generate',
+    })).toThrow(/query string or fragment/)
+    expect(() => kiroClaudeAdapter.buildEndpoint({
+      baseUrl: 'http://kiro-relay.example.test/generateAssistantResponse',
+      protocol: 'kiro-claude',
+      operation: 'generate',
+    })).toThrow(/HTTPS unless it is local/)
+  })
+
   it('rejects credentials embedded in provider URLs', () => {
     expect(() => openAIAdapter.buildEndpoint({
       baseUrl: 'https://user:secret@example.test/v1',
@@ -181,14 +210,80 @@ describe('provider adapter authentication', () => {
       protocol: 'anthropic-messages',
       credential: 'anthropic-secret',
       sourceHeaders: {
+        authorization: 'Bearer local-gateway-token',
+        'x-api-key': 'local-gateway-key',
         'anthropic-version': '2025-01-01',
-        'anthropic-beta': 'tools-test'
+        'anthropic-beta': 'tools-test',
+        'x-claude-code-session-id': '  claude-session-42  '
       }
     })
     expect(headers.get('x-api-key')).toBe('anthropic-secret')
     expect(headers.get('anthropic-version')).toBe('2025-01-01')
     expect(headers.get('anthropic-beta')).toBe('tools-test')
+    expect(headers.get('x-claude-code-session-id')).toBe('claude-session-42')
     expect(headers.has('authorization')).toBe(false)
+    expect(headers.get('x-api-key')).not.toContain('local-gateway-key')
+  })
+
+  it.each([
+    ['empty', '   '],
+    ['too long', 's'.repeat(257)],
+    ['control character', 'session\u007fvalue'],
+  ])('does not forward an invalid Claude Code session id: %s', (_label, sessionId) => {
+    const headers = new Headers()
+    anthropicAdapter.applyRequestHeaders(headers, {
+      protocol: 'anthropic-messages',
+      credential: 'anthropic-secret',
+      sourceHeaders: {
+        authorization: 'Bearer local-gateway-token',
+        'x-api-key': 'local-gateway-key',
+        'x-claude-code-session-id': sessionId,
+      },
+    })
+
+    expect(headers.has('x-claude-code-session-id')).toBe(false)
+    expect(headers.has('authorization')).toBe(false)
+    expect(headers.get('x-api-key')).toBe('anthropic-secret')
+  })
+
+  it('applies only the Kiro Claude bearer and AWS protocol headers', () => {
+    const headers = new Headers({
+      authorization: 'Bearer downstream-token',
+      'x-api-key': 'downstream-key',
+      'anthropic-version': '2023-06-01',
+      'openai-organization': 'downstream-org',
+      'user-agent': 'downstream-client',
+      'x-amzn-codewhisperer-optout': 'true',
+      'amz-sdk-invocation-id': 'downstream-id',
+      'amz-sdk-request': 'attempt=99; max=99',
+    })
+    kiroClaudeAdapter.applyRequestHeaders(headers, {
+      protocol: 'kiro-claude',
+      credential: '  kiro-relay-secret  ',
+      stream: true,
+      sourceHeaders: {
+        authorization: 'Bearer ignored',
+        'user-agent': 'also-ignored',
+      },
+    })
+
+    expect(Object.fromEntries(headers)).toMatchObject({
+      accept: '*/*',
+      'amz-sdk-request': 'attempt=1; max=1',
+      authorization: 'Bearer kiro-relay-secret',
+      'content-type': KIRO_CLAUDE_REQUEST_CONTENT_TYPE,
+      'x-amz-target': KIRO_CLAUDE_AMZ_TARGET,
+      'x-amzn-codewhisperer-optout': 'false',
+    })
+    expect(headers.get('amz-sdk-invocation-id')).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    )
+    const firstInvocationId = headers.get('amz-sdk-invocation-id')
+    kiroClaudeAdapter.applyRequestHeaders(headers, {
+      protocol: 'kiro-claude',
+      credential: 'kiro-relay-secret',
+    })
+    expect(headers.get('amz-sdk-invocation-id')).not.toBe(firstInvocationId)
   })
 
   it('applies Google API keys as headers rather than query parameters', () => {
@@ -213,14 +308,49 @@ describe('provider adapter authentication', () => {
     })
     expect(googleAdapter.capabilities.protocols.gemini?.modelInPath).toBe(true)
     expect(anthropicAdapter.capabilities.authentication).toBe('x-api-key')
+    expect(kiroClaudeAdapter.capabilities).toMatchObject({
+      modelDiscovery: false,
+      healthProbe: false,
+      authentication: 'bearer',
+      protocols: {
+        'kiro-claude': { streaming: true, toolCalls: false, modelInPath: false },
+      },
+    })
   })
 })
 
 describe('provider discovery and health probes', () => {
+  it('does not perform REST model discovery or a misleading GET health probe for Kiro Claude', async () => {
+    const fetchImplementation = vi.fn()
+    const discovery = await kiroClaudeAdapter.discoverModels({
+      baseUrl: 'https://kiro-relay.example.test/generateAssistantResponse',
+      protocol: 'kiro-claude',
+      credential: 'kiro-secret',
+      fetchImplementation: fetchImplementation as typeof fetch,
+      now: () => 123,
+    })
+    const health = await kiroClaudeAdapter.probeHealth({
+      baseUrl: 'https://kiro-relay.example.test/generateAssistantResponse',
+      protocol: 'kiro-claude',
+      credential: 'kiro-secret',
+      fetchImplementation: fetchImplementation as typeof fetch,
+      now: () => 456,
+    })
+
+    expect(discovery).toEqual({ ok: true, models: [], checkedAt: 123, latencyMs: 0 })
+    expect(health).toMatchObject({
+      ok: false,
+      checkedAt: 456,
+      failure: { category: 'invalid_request', retryable: false },
+    })
+    expect(fetchImplementation).not.toHaveBeenCalled()
+  })
+
   it('discovers OpenAI models without exposing credentials in the result', async () => {
     const fetchImplementation = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
       expect(String(url)).toBe('https://api.openai.com/v1/models')
       expect(new Headers(init?.headers).get('authorization')).toBe('Bearer discovery-secret')
+      expect(init?.redirect).toBe('error')
       return new Response(JSON.stringify({
         data: [{ id: 'gpt-5' }, { id: 'gpt-5-mini' }, { id: 'gpt-5' }]
       }), { status: 200, headers: { 'content-type': 'application/json' } })

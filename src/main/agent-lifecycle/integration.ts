@@ -1,14 +1,19 @@
 import { execFile } from 'node:child_process'
+import { resolve as resolvePath } from 'node:path'
 import type { AgentRestoreOptions, AgentStartOptions, AgentTarget } from '@shared/agent-lifecycle'
 import { agentRouteClient } from '@shared/agent-lifecycle'
 import { clientNativeProtocols, type ManagedClientInstance, type RouteClient } from '@shared/types'
 import { enumerateRouteSourceModels, listRouteSources, resolveRouteSource } from '@shared/route-sources'
-import type { ChatGptDesktopController, CodexRepairAndRestartOptions, CodexRepairAndRestartService } from '../codex'
+import {
+  CodexSessionRepairService,
+  type ChatGptDesktopController,
+  type CodexRepairAndRestartOptions,
+  type CodexRepairAndRestartService,
+} from '../codex'
 import { findBlockingWindowsCodexPids } from '../codex/windows-codex-processes'
 import type { ClientConfigService } from '../client-config'
 import type { ClientConnectionTarget } from '../client-config'
-import { isClaudeClientModelName } from '../client-config/claude-environment'
-import type { ClientInstanceManager } from '../client-instances'
+import { sanitizeManagedClientLaunchArgs, type ClientInstanceManager } from '../client-instances'
 import type { AppStore } from '../store/app-store'
 import type { AgentInstallationService } from '../agent-installation'
 import {
@@ -20,6 +25,10 @@ import {
   type CliRuntimePort,
 } from './cli-connection-adapter'
 import { ClientConfigConnectionPort } from './client-config-connection-port'
+import { resolveClaudeDesktopInferenceModels } from './claude-desktop-models'
+import type { ClaudeDesktopOperationCoordinatorPort } from './claude-desktop-operation-coordinator'
+import { ClaudeSurfaceLifecycleAdapter } from './claude-surface-adapter'
+import { ClaudeVscodeConfig } from './claude-vscode-config'
 import {
   CodexLifecycleAdapter,
   type CodexCliPort,
@@ -40,6 +49,8 @@ export interface CreateAgentLifecycleServiceOptions {
   codexRepair: CodexRepairAndRestartService
   codexDesktop: ChatGptDesktopController
   installer: AgentInstallationService
+  openExternal(url: string): Promise<unknown>
+  claudeDesktopCoordinator: ClaudeDesktopOperationCoordinatorPort
 }
 
 export function createAgentLifecycleService(options: CreateAgentLifecycleServiceOptions): AgentLifecycleService {
@@ -48,15 +59,72 @@ export function createAgentLifecycleService(options: CreateAgentLifecycleService
   const installation = new DiscoveryInstallationPort()
   const desktopProbe = new DefaultCodexDesktopProbe()
   const cliRuntime = new ManagedCliRuntimePort(options.instances, options.clientConfig, options.store)
+  const surfaceInstallation = {
+    inspect: (target: 'claude-code-desktop' | 'claude-code-vsc') => discoverAgentExecutable(target),
+  }
 
+  // `paths` is present on the production ClientConfigService. Keeping this
+  // fallback also preserves narrow structural test doubles and integrations
+  // that only expose the transactional methods.
+  const configuredDefaultCodexHome = options.clientConfig.paths?.codex?.directory
+  const defaultCodexHome = configuredDefaultCodexHome
+    ? resolvePath(configuredDefaultCodexHome)
+    : undefined
+  const prepareDefaultCodexConnection = () => repairAndValidateConnection(
+    configPort,
+    'codex',
+    connection('codex'),
+  )
   const codexDeepRepair = {
-    run: (repairOptions: CodexRepairAndRestartOptions = {}) => options.codexRepair.run({
-      ...repairOptions,
-      beforeRepair: async () => {
-        await options.clientConfig.repair('codex', connection('codex'))
+    run: async (
+      repairOptions: CodexRepairAndRestartOptions = {},
+      configDirectories: readonly string[] = [],
+    ) => {
+      const homes = configDirectories.length > 0
+        ? uniqueFilesystemPaths(configDirectories)
+        : defaultCodexHome ? [defaultCodexHome] : []
+      if (homes.length === 0) {
+        return options.codexRepair.run({
+          ...repairOptions,
+          beforeRepair: async () => {
+            await prepareDefaultCodexConnection()
+            await repairOptions.beforeRepair?.()
+          },
+        })
+      }
+      const results: unknown[] = []
+      for (const codexHome of homes) {
+        if (defaultCodexHome && sameFilesystemPath(codexHome, defaultCodexHome)) {
+          results.push(await options.codexRepair.run({
+            ...repairOptions,
+            beforeRepair: async () => {
+              await prepareDefaultCodexConnection()
+              await repairOptions.beforeRepair?.()
+            },
+          }))
+          continue
+        }
+        // Managed CLI instances can own an isolated CODEX_HOME. They have
+        // already been stopped by CodexLifecycleAdapter, so repair that exact
+        // home directly instead of silently rewriting ~/.codex.
         await repairOptions.beforeRepair?.()
-      },
-    }),
+        const operationOptions = repairOptions.signal || repairOptions.onProgress
+          ? { signal: repairOptions.signal, onProgress: repairOptions.onProgress }
+          : undefined
+        const scopedRepair = new CodexSessionRepairService({ codexHome })
+        results.push(operationOptions
+          ? await scopedRepair.analyzeAndRepair(
+              repairOptions.targetProvider,
+              repairOptions.expectedRevision,
+              operationOptions,
+            )
+          : await scopedRepair.analyzeAndRepair(
+              repairOptions.targetProvider,
+              repairOptions.expectedRevision,
+            ))
+      }
+      return results.length === 1 ? results[0] : results
+    },
   }
   const codexCli = new ManagedCodexCliPort(
     options.instances,
@@ -70,6 +138,7 @@ export function createAgentLifecycleService(options: CreateAgentLifecycleService
     desktop: options.codexDesktop,
     desktopProbe,
     deepRepair: codexDeepRepair,
+    prepareConnection: prepareDefaultCodexConnection,
   })
   const codexCliAdapter = new CodexLifecycleAdapter({
     target: 'codex-cli',
@@ -82,6 +151,25 @@ export function createAgentLifecycleService(options: CreateAgentLifecycleService
     installation,
     runtime: cliRuntime,
     config: configPort,
+  })
+  const claudeDesktopAdapter = new ClaudeSurfaceLifecycleAdapter({
+    target: 'claude-code-desktop',
+    installation: surfaceInstallation,
+    openExternal: options.openExternal,
+    connection: () => connection('claude'),
+    prepareRoute: () => ensureSingleModelRouteDefault(options.store, 'claude'),
+    sharedConfig: configPort,
+    desktopCoordinator: options.claudeDesktopCoordinator,
+    desktopModels: () => resolveClaudeDesktopInferenceModels(options.store),
+  })
+  const claudeVscAdapter = new ClaudeSurfaceLifecycleAdapter({
+    target: 'claude-code-vsc',
+    installation: surfaceInstallation,
+    openExternal: options.openExternal,
+    connection: () => connection('claude'),
+    prepareRoute: () => ensureSingleModelRouteDefault(options.store, 'claude'),
+    sharedConfig: configPort,
+    vscodeConfig: new ClaudeVscodeConfig(),
   })
   const geminiAdapter = new GeminiCliLifecycleAdapter({
     installation,
@@ -100,9 +188,9 @@ export function createAgentLifecycleService(options: CreateAgentLifecycleService
       inspect: async () => {
         const [state, configured] = await Promise.all([
           codexDesktopAdapter.getSnapshot(),
-          configPort.inspect('codex'),
+          isConnectionConfigured(configPort, 'codex', () => connection('codex')),
         ])
-        return adapterSnapshot(state, configured.configured)
+        return adapterSnapshot(state, configured)
       },
       close: () => codexDesktopAdapter.close(),
       restore: (restoreOptions) => codexDesktopAdapter.restore(restoreOptions),
@@ -120,6 +208,8 @@ export function createAgentLifecycleService(options: CreateAgentLifecycleService
       () => connection('claude'),
       () => ensureSingleModelRouteDefault(options.store, 'claude'),
     ),
+    'claude-code-desktop': launchSurfacePort(claudeDesktopAdapter),
+    'claude-code-vsc': launchSurfacePort(claudeVscAdapter),
     'gemini-cli': connectionOnlyPort(geminiAdapter, () => connection('gemini')),
     'grok-build': connectionOnlyPort(grokBuildAdapter, () => connection('grokbuild')),
   }
@@ -129,6 +219,16 @@ export function createAgentLifecycleService(options: CreateAgentLifecycleService
     installer: options.installer,
     resolveRoute: (target) => resolveRouteState(options.store, target),
   })
+}
+
+function launchSurfacePort(adapter: ClaudeSurfaceLifecycleAdapter): AgentLifecycleAdapterPort {
+  return {
+    target: adapter.target,
+    inspect: async () => adapterSnapshot(await adapter.getSnapshot()),
+    close: () => adapter.close(),
+    restore: (restoreOptions) => adapter.restore(restoreOptions),
+    start: (startOptions) => adapter.start(startOptions),
+  }
 }
 
 function connectionOnlyPort(
@@ -172,6 +272,39 @@ function adapterSnapshot(
     managedInstanceCount: state.managedInstanceCount,
     processControl: state.processControl,
     pendingNewSession: state.externalSessionDetected === true,
+  }
+}
+
+async function isConnectionConfigured(
+  config: ClientConfigConnectionPort,
+  client: RouteClient,
+  connection: () => ClientConnectionTarget,
+  configDirectory?: string,
+): Promise<boolean> {
+  try {
+    await config.validate(client, connection(), configDirectory)
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function repairAndValidateConnection(
+  config: ClientConfigConnectionPort,
+  client: RouteClient,
+  target: ClientConnectionTarget,
+  configDirectory?: string,
+): Promise<void> {
+  const repair = await config.repair(client, target, configDirectory ? { configDirectory } : {})
+  try {
+    await config.validate(client, target, configDirectory)
+  } catch (cause) {
+    try {
+      await config.rollback(client, repair)
+    } catch (rollbackCause) {
+      throw new Error(`Connection validation failed and rollback also failed: ${messageOf(cause)}; rollback: ${messageOf(rollbackCause)}`)
+    }
+    throw cause
   }
 }
 
@@ -271,23 +404,7 @@ function agentTargetForClient(client: RouteClient): Exclude<AgentTarget, 'codex-
   return 'codex-cli'
 }
 
-/** Old relay launchers sometimes persisted their upstream GPT model in
- * Claude's --model flag. Keep native Claude selections and every unrelated
- * argument, while moving non-Claude upstream selection back to the route. */
-export function sanitizeManagedClientLaunchArgs(client: RouteClient, args: readonly string[]): string[] {
-  if (client !== 'claude') return [...args]
-  const sanitized: string[] = []
-  for (let index = 0; index < args.length; index += 1) {
-    const argument = args[index]
-    if (argument === '--model' && index + 1 < args.length && !isClaudeClientModelName(args[index + 1])) {
-      index += 1
-      continue
-    }
-    if (argument.startsWith('--model=') && !isClaudeClientModelName(argument.slice('--model='.length))) continue
-    sanitized.push(argument)
-  }
-  return sanitized
-}
+export { sanitizeManagedClientLaunchArgs } from '../client-instances'
 
 class ManagedCodexCliPort implements CodexCliPort {
   private repairResults: Array<{
@@ -307,17 +424,20 @@ class ManagedCodexCliPort implements CodexCliPort {
   }
 
   async inspect() {
-    const [installation, configured, runtime] = await Promise.all([
+    const [installation, runtime] = await Promise.all([
       this.installation.inspectAny('codex-cli'),
-      this.config.inspect('codex'),
       this.runtime.snapshot('codex'),
     ])
+    const runningDirectories = uniqueRuntimeConfigDirectories(
+      runtime.managedInstances.filter((instance) => instance.running),
+    )
+    const configured = await this.validateConfiguredScopes(runningDirectories)
     return {
       installation: {
         installed: installation.installed,
         ...(installation.executablePath ? { executablePath: installation.executablePath } : {}),
       },
-      configured: configured.configured,
+      configured,
       managedInstances: runtime.managedInstances,
       externalSessionDetected: runtime.externalSessionDetected,
     }
@@ -326,6 +446,13 @@ class ManagedCodexCliPort implements CodexCliPort {
   closeManaged(instanceId: string): Promise<void> { return this.runtime.closeManaged(instanceId) }
   restartManaged(instanceId: string): Promise<void> { return this.runtime.startManaged(instanceId) }
   startNew(options?: AgentStartOptions): Promise<void> { return this.runtime.startNew('codex', options) }
+
+  async prepareStart(options?: AgentStartOptions): Promise<void> {
+    const configDirectory = this.resolveStartConfigDirectory(options)
+    const scopes = configDirectory ? [configDirectory] : []
+    await this.restoreConnection(scopes)
+    await this.validateConnection(scopes)
+  }
 
   async restoreConnection(configDirectories: readonly string[] = []): Promise<void> {
     this.repairResults = []
@@ -362,6 +489,29 @@ class ManagedCodexCliPort implements CodexCliPort {
     }
     if (failures.length > 0) throw new Error(`Codex profile rollback failed: ${failures.join('; ')}`)
   }
+
+  private resolveStartConfigDirectory(options?: AgentStartOptions): string | undefined {
+    const existing = selectInstance(this.instances.list(), 'codex', options?.profileId)
+    if (existing) return existing.configDirectory
+    const snapshot = this.store.getSnapshot()
+    const profile = options?.profileId
+      ? snapshot.clientProfiles.find((candidate) => candidate.id === options.profileId && candidate.client === 'codex')
+      : snapshot.clientProfiles.find((candidate) => candidate.client === 'codex' && candidate.isDefault)
+    if (options?.profileId && !profile) throw new Error('Client configuration profile not found.')
+    return profile?.directory ?? this.clientConfig.paths.codex.directory
+  }
+
+  private async validateConfiguredScopes(configDirectories: readonly string[]): Promise<boolean> {
+    let target: ClientConnectionTarget
+    try { target = resolveConnection(this.store, 'codex') } catch { return false }
+    const scopes: Array<string | undefined> = configDirectories.length > 0 ? [...new Set(configDirectories)] : [undefined]
+    try {
+      for (const configDirectory of scopes) await this.config.validate('codex', target, configDirectory)
+      return true
+    } catch {
+      return false
+    }
+  }
 }
 
 class DefaultCodexDesktopProbe implements CodexDesktopProbe {
@@ -379,6 +529,34 @@ class DefaultCodexDesktopProbe implements CodexDesktopProbe {
       running,
     }
   }
+}
+
+function uniqueRuntimeConfigDirectories(
+  instances: ReadonlyArray<{ configDirectory?: string }>,
+): string[] {
+  return [...new Set(instances
+    .map((instance) => instance.configDirectory)
+    .filter((value): value is string => Boolean(value)))]
+}
+
+function uniqueFilesystemPaths(paths: readonly string[]): string[] {
+  const resolved = new Map<string, string>()
+  for (const path of paths) {
+    const absolute = resolvePath(path)
+    const key = process.platform === 'win32' ? absolute.toLowerCase() : absolute
+    if (!resolved.has(key)) resolved.set(key, absolute)
+  }
+  return [...resolved.values()]
+}
+
+function sameFilesystemPath(left: string, right: string): boolean {
+  return process.platform === 'win32'
+    ? resolvePath(left).toLowerCase() === resolvePath(right).toLowerCase()
+    : resolvePath(left) === resolvePath(right)
+}
+
+function messageOf(cause: unknown): string {
+  return cause instanceof Error ? cause.message : String(cause)
 }
 
 function resolveRouteState(store: AppStore, target: AgentTarget): AgentRouteState {
@@ -445,7 +623,9 @@ function isRunning(instance: ManagedClientInstance): boolean {
 
 function displayName(target: Exclude<AgentTarget, 'codex-desktop'>): string {
   if (target === 'codex-cli') return 'Codex CLI'
-  if (target === 'claude-code') return 'Claude Code'
+  if (target === 'claude-code') return 'Claude Code CLI'
+  if (target === 'claude-code-desktop') return 'Claude Code Desktop'
+  if (target === 'claude-code-vsc') return 'Claude Code VSC'
   return target === 'gemini-cli' ? 'Gemini CLI' : 'Grok Build'
 }
 

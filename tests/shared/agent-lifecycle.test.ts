@@ -8,9 +8,20 @@ import {
   agentRouteClient,
 } from '../../src/shared/agent-lifecycle'
 
+const expectedTargets = [
+  'codex-desktop',
+  'codex-cli',
+  'claude-code',
+  'claude-code-desktop',
+  'claude-code-vsc',
+  'gemini-cli',
+  'grok-build',
+] as const
+
 describe('agent lifecycle contract', () => {
   it('defines every supported target exactly once with a route and capabilities', () => {
-    expect(new Set(AGENT_TARGETS).size).toBe(5)
+    expect(AGENT_TARGETS).toEqual(expectedTargets)
+    expect(new Set(AGENT_TARGETS).size).toBe(expectedTargets.length)
     expect(Object.keys(AGENT_CAPABILITIES).sort()).toEqual([...AGENT_TARGETS].sort())
     expect(Object.keys(AGENT_ROUTE_CLIENT).sort()).toEqual([...AGENT_TARGETS].sort())
 
@@ -39,12 +50,50 @@ describe('agent lifecycle contract', () => {
   })
 
   it('does not advertise conversation or workspace repair for Claude and Gemini', () => {
-    for (const target of ['claude-code', 'gemini-cli', 'grok-build'] as const) {
+    for (const target of [
+      'claude-code',
+      'claude-code-desktop',
+      'claude-code-vsc',
+      'gemini-cli',
+      'grok-build',
+    ] as const) {
       expect(AGENT_CAPABILITIES[target]).toMatchObject({
-        canRestoreConnection: true,
         canRepairSessions: false,
         canRepairWorkspaceIndex: false,
       })
+    }
+  })
+
+  it('keeps the legacy Claude CLI id and models Desktop and VSC as launch-only surfaces', () => {
+    expect(AGENT_ROUTE_CLIENT['claude-code']).toBe('claude')
+    expect(AGENT_ROUTE_CLIENT['claude-code-desktop']).toBe('claude')
+    expect(AGENT_ROUTE_CLIENT['claude-code-vsc']).toBe('claude')
+
+    expect(AGENT_CAPABILITIES['claude-code']).toMatchObject({
+      canDetectRunning: true,
+      canCloseKnownProcess: true,
+      canRestart: true,
+      sharedStateGroup: 'claude-home',
+    })
+    for (const target of ['claude-code-desktop', 'claude-code-vsc'] as const) {
+      expect(AGENT_CAPABILITIES[target]).toMatchObject({
+        canDetectRunning: false,
+        canCloseKnownProcess: false,
+        canLaunch: true,
+        canRestoreConnection: true,
+        canRestart: false,
+        sharedStateGroup: 'claude-home',
+      })
+      expect(AGENT_CAPABILITIES[target].aggregateRestoreGroup).toBeUndefined()
+    }
+  })
+
+  it('aliases only Codex aggregate restore while serializing all Claude configuration writes', () => {
+    expect(AGENT_CAPABILITIES['codex-desktop'].aggregateRestoreGroup).toBe('codex-home')
+    expect(AGENT_CAPABILITIES['codex-cli'].aggregateRestoreGroup).toBe('codex-home')
+    for (const target of ['claude-code', 'claude-code-desktop', 'claude-code-vsc'] as const) {
+      expect(AGENT_CAPABILITIES[target].sharedStateGroup).toBe('claude-home')
+      expect(AGENT_CAPABILITIES[target].aggregateRestoreGroup).toBeUndefined()
     }
   })
 

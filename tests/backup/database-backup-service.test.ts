@@ -93,6 +93,26 @@ describe('DatabaseBackupService', () => {
     expect(snapshot.accounts).toHaveLength(1)
   })
 
+  it('rebuilds raw backups so deleted legacy plaintext is absent from every copied page', async () => {
+    const marker = 'legacy-webdav-password-raw-page-marker'
+    const legacyValue = `${marker}-${'x'.repeat(8_192)}`
+    const livePath = join(directory, SQLITE_DATABASE_FILENAME)
+    const database = new DatabaseSync(livePath)
+    database.exec('PRAGMA secure_delete = OFF')
+    database.prepare('INSERT INTO app_metadata (key, value) VALUES (?, ?)')
+      .run('legacy_plaintext_for_backup_test', legacyValue)
+    database.exec('PRAGMA wal_checkpoint(TRUNCATE)')
+    database.prepare('DELETE FROM app_metadata WHERE key = ?').run('legacy_plaintext_for_backup_test')
+    database.exec('PRAGMA wal_checkpoint(TRUNCATE)')
+    database.close()
+    expect((await readFile(livePath)).includes(Buffer.from(marker))).toBe(true)
+
+    const created = await service.createBackup()
+    const bytes = await readFile(join(service.directory, created.id))
+
+    expect(bytes.includes(Buffer.from(marker))).toBe(false)
+  })
+
   it('rewraps portable credentials for a different destination vault', async () => {
     const created = await store.saveAccount({
       providerId: 'provider-openai',
@@ -326,7 +346,7 @@ describe('DatabaseBackupService', () => {
     expect(store.getSnapshot().gateway.port).toBe(16556)
   })
 
-  it('reports failures after the restore commit without claiming the restore rolled back', async () => {
+  it('returns a committed restart result when safety verification fails after replacement', async () => {
     await store.updateGateway(gatewaySettings(16001))
     const backup = await service.createBackup()
     await store.updateGateway(gatewaySettings(16002))
@@ -344,8 +364,28 @@ describe('DatabaseBackupService', () => {
     })
     await service.initialize()
 
-    await expect(service.restoreBackup(backup.id)).rejects.toThrow(/was restored.*post-restore/i)
+    await expect(service.restoreBackup(backup.id)).resolves.toMatchObject({
+      committed: true,
+      restartRequired: true,
+      postRestoreStatus: 'cleanup-pending',
+      safetyBackup: { valid: false },
+    })
     expect(store.getSnapshot().gateway.port).toBe(16001)
+  })
+
+  it('returns a committed restart result when post-restore pruning fails', async () => {
+    const backup = await service.createBackup()
+    const internals = service as unknown as {
+      pruneKind: (kind: string, retention: number, preserveId?: string) => Promise<void>
+    }
+    vi.spyOn(internals, 'pruneKind').mockRejectedValueOnce(new Error('injected prune failure'))
+
+    await expect(service.restoreBackup(backup.id)).resolves.toMatchObject({
+      committed: true,
+      restartRequired: true,
+      postRestoreStatus: 'cleanup-pending',
+      postRestoreError: expect.stringMatching(/preparation or cleanup is pending/i),
+    })
   })
 
   it('resumes automatic backups when source verification rejects before staging', async () => {
@@ -430,9 +470,13 @@ describe('DatabaseBackupService', () => {
     await service.startAutomaticBackups()
     await service.runAutomaticBackupIfDue()
 
-    const error = await service.restoreBackup(source.id).catch((cause: unknown) => cause)
-    expect(String(error)).toMatch(/was restored.*post-restore/i)
-    expect(String(error)).not.toContain('legacy-secret')
+    const result = await service.restoreBackup(source.id)
+    expect(result).toMatchObject({
+      committed: true,
+      restartRequired: true,
+      postRestoreStatus: 'cleanup-pending',
+    })
+    expect(result.postRestoreError).not.toContain('legacy-secret')
     expect(service.automaticBackupsRunning).toBe(false)
     expect(service.backupBlockReason).toMatch(/backups are blocked/i)
 

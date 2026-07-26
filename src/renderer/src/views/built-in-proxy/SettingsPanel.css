@@ -91,10 +91,10 @@
   align-items: flex-start;
   gap: 9px;
   padding: 10px 11px;
-  border: 1px solid #edcccc;
+  border: 1px solid var(--danger-tint-border);
   border-radius: var(--radius);
   background: var(--red-soft);
-  color: #873434;
+  color: var(--danger-text-strong);
 }
 
 .built-in-proxy-settings-workspace__error > svg { flex: 0 0 auto; margin-top: 1px; }
@@ -146,12 +146,12 @@
 }
 
 .built-in-proxy-settings-workspace__mode.is-selected {
-  border-color: #9fc5b8;
-  background: #f3f9f7;
+  border-color: var(--border-accent);
+  background: var(--surface-active);
   box-shadow: inset 3px 0 0 var(--accent);
 }
 
-.built-in-proxy-settings-workspace__mode.is-applying { border-color: #a9bfd8; }
+.built-in-proxy-settings-workspace__mode.is-applying { border-color: var(--blue); }
 .built-in-proxy-settings-workspace__mode:has(input:focus-visible) { outline: 2px solid var(--accent); outline-offset: 2px; }
 .built-in-proxy-settings-workspace__mode:has(input:disabled) { cursor: not-allowed; }
 .built-in-proxy-settings-workspace__mode.is-unavailable { opacity: .68; }
@@ -268,7 +268,7 @@
   height: 14px;
   border-radius: 50%;
   background: var(--surface);
-  box-shadow: 0 1px 3px rgb(20 33 28 / 20%);
+  box-shadow: var(--shadow-sm);
   content: '';
   transition: transform 140ms ease;
 }
@@ -287,9 +287,9 @@
   align-items: flex-start;
   gap: 10px;
   padding: 11px 12px;
-  border: 1px solid #cddfd8;
+  border: 1px solid var(--border-accent);
   border-radius: var(--radius);
-  background: #f4f9f7;
+  background: var(--surface-active);
 }
 
 .built-in-proxy-settings-workspace__safety > div:first-child {

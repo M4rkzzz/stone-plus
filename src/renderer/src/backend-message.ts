@@ -222,6 +222,12 @@ const probeFallbacks: Record<ApiSourceProbeStage['id'], Record<ApiSourceProbeSta
     error: 'The real generation request failed.',
     skipped: 'The real generation request was skipped.',
   },
+  'tool-roundtrip': {
+    success: 'The Kiro Claude two-round tool test succeeded.',
+    warning: 'The Kiro Claude tool test returned a warning.',
+    error: 'The Kiro Claude two-round tool test failed.',
+    skipped: 'The Kiro Claude tool test was skipped.',
+  },
 }
 
 const probeStageLabels: Record<ApiSourceProbeStage['id'], readonly [string, string]> = {
@@ -229,6 +235,7 @@ const probeStageLabels: Record<ApiSourceProbeStage['id'], readonly [string, stri
   authentication: ['认证', 'Authentication'],
   models: ['模型', 'Models'],
   generation: ['生成', 'Generation'],
+  'tool-roundtrip': ['工具链', 'Tool round trip'],
 }
 
 const probeStatusLabels: Record<ApiSourceProbeStage['status'], readonly [string, string]> = {

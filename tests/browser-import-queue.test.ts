@@ -1,10 +1,19 @@
 import { EventEmitter } from 'node:events'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { Session } from 'electron'
 import { BrowserImportQueue } from '../src/main/browser-import-queue'
+
+vi.mock('electron', () => ({
+  safeStorage: {
+    isEncryptionAvailable: () => true,
+    getSelectedStorageBackend: () => 'dpapi',
+    encryptString: (value: string) => Buffer.from(`vault:${Buffer.from(value).toString('base64')}`),
+    decryptString: (value: Buffer) => Buffer.from(value.toString().slice('vault:'.length), 'base64').toString('utf8'),
+  },
+}))
 
 const temporaryDirectories: string[] = []
 
@@ -13,7 +22,7 @@ afterEach(async () => {
 })
 
 describe('BrowserImportQueue', () => {
-  it('keeps a downloaded JSON in memory and in the persistent save-as cache', async () => {
+  it('keeps a downloaded JSON in memory while encrypting the persistent save-as cache', async () => {
     const root = await mkdtemp(join(tmpdir(), 'stone-browser-import-'))
     temporaryDirectories.push(root)
     const browserSession = new EventEmitter()
@@ -35,6 +44,10 @@ describe('BrowserImportQueue', () => {
     expect(queue.getReadyItems(queue.getState().items.map((item) => item.id))[0].content).toContain('test-token')
     const cached = queue.getCacheState().items[0]
     expect(cached).toMatchObject({ fileName: 'accounts.json', sizeBytes: expect.any(Number) })
+    const cacheFiles = await readdir(cacheDirectory)
+    expect(cacheFiles).toHaveLength(1)
+    const cacheBytes = await readFile(join(cacheDirectory, cacheFiles[0]))
+    expect(cacheBytes.includes(Buffer.from('test-token'))).toBe(false)
     const savedPath = join(root, 'saved.json')
     await queue.saveCachedItem(cached.id, savedPath)
     expect(await readFile(savedPath, 'utf8')).toContain('test-token')
@@ -43,6 +56,9 @@ describe('BrowserImportQueue', () => {
     const restarted = new BrowserImportQueue(join(root, 'staging-restarted'), cacheDirectory)
     expect(restarted.getState().readyCount).toBe(0)
     expect(restarted.getCacheState().items).toEqual([expect.objectContaining({ fileName: 'accounts.json' })])
+    await restarted.removeImported([cached.id])
+    expect(restarted.getCacheState().items).toEqual([])
+    expect(await readdir(cacheDirectory)).toEqual([])
     await restarted.close()
   })
 

@@ -107,6 +107,9 @@ export function extractProtocolUsage(protocol: Protocol, payload: unknown): Norm
       return extractAnthropicUsage(root)
     case 'gemini':
       return extractGeminiUsage(root)
+    case 'kiro-claude':
+      // Kiro usage is decoded from AWS event-stream frames by its dedicated parser.
+      return undefined
   }
 }
 
@@ -190,10 +193,17 @@ export function codexQuotaCooldownUntil(
 ): number | undefined {
   if (!codexQuotaIsExhausted(quota, now) || !quota) return undefined
   const windows = codexQuotaWindows(quota)
-  const exhaustedResets = windows
-    .filter((window) => window.usedPercent >= 100 && window.resetAt !== undefined && window.resetAt > now)
+  const activeExhaustedWindows = windows
+    .filter((window) => window.usedPercent >= 100
+      && (window.resetAt === undefined || window.resetAt > now))
+  if (activeExhaustedWindows.some((window) => window.resetAt === undefined)) return undefined
+  const exhaustedResets = activeExhaustedWindows
     .map((window) => window.resetAt!)
   if (exhaustedResets.length > 0) return Math.max(...exhaustedResets)
+  // Once the first known boundary in a top-level-only exhaustion snapshot has
+  // passed, that snapshot is stale. Recheck soon instead of promoting the
+  // cooldown to an unrelated, non-exhausted longer window.
+  if (windows.some((window) => window.resetAt !== undefined && window.resetAt <= now)) return undefined
   const futureResets = windows
     .filter((window) => window.resetAt !== undefined && window.resetAt > now)
     .map((window) => window.resetAt!)
@@ -322,6 +332,13 @@ function mergeCodexQuota(
   earlier: AccountCodexQuotaSnapshot | undefined,
   later: AccountCodexQuotaSnapshot
 ): AccountCodexQuotaSnapshot {
+  if (later.source === 'usage-endpoint') {
+    return {
+      ...later,
+      ...(later.fiveHour ? { fiveHour: { ...later.fiveHour } } : {}),
+      ...(later.sevenDay ? { sevenDay: { ...later.sevenDay } } : {})
+    }
+  }
   return {
     observedAt: later.observedAt,
     source: later.source,

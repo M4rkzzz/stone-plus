@@ -72,12 +72,16 @@ export function planClaudeConfig(
     for (const key of CLAUDE_RELAY_MODEL_ENV_KEYS) delete environment[key]
     environment.ANTHROPIC_BASE_URL = desired.gatewayBaseUrl
     environment.ANTHROPIC_AUTH_TOKEN = desired.token
+    // Claude Code documents this as the gateway-friendly mode: omit the
+    // changing attribution prefix so Stone+ upstream prompt caches stay stable.
+    environment.CLAUDE_CODE_ATTRIBUTION_HEADER = '0'
   })
   return {
     client: 'claude',
     files: [mutation(paths.settings, source, settings, [
       'env.ANTHROPIC_BASE_URL',
       'env.ANTHROPIC_AUTH_TOKEN',
+      'env.CLAUDE_CODE_ATTRIBUTION_HEADER',
       'model (only non-Claude relay values)',
       ...CLAUDE_RELAY_MODEL_ENV_KEYS.map((key) => `env.${key}`),
     ])],

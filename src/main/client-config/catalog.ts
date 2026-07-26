@@ -30,6 +30,8 @@ interface FieldDefinition {
   min?: number
   max?: number
   step?: number
+  /** Presents wire values through a safer editor value without rewriting an untouched field. */
+  normalizeValue?: (value: unknown) => ClientConfigFieldValue
 }
 
 function option(
@@ -118,6 +120,16 @@ const fields: readonly FieldDefinition[] = Object.freeze([
     label: '自动更新通道', description: '选择稳定更新或尽早获取最新版。', control: 'select',
     options: [option('stable', '稳定版', '优先稳定性', true), option('latest', '最新版', '更早获得新功能')],
     defaultValue: null, recommendedValue: 'stable', advanced: true,
+  },
+  {
+    id: 'claude.disableNonessentialTraffic', client: 'claude', role: 'claude-settings',
+    path: ['env', 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC'], section: '更新与通知',
+    label: '减少非必要联网',
+    description: '关闭 Claude Code 的自动更新、遥测、错误报告、反馈、发行说明和部分网关能力检查；仅建议受限网络或隐私场景使用。',
+    control: 'select', options: [option('1', '开启', '减少非必要网络请求')],
+    defaultValue: null, recommendedValue: null, advanced: true,
+    // Claude Code treats every non-empty value (including "0") as enabled.
+    normalizeValue: (value) => typeof value === 'string' && value.length > 0 ? '1' : null,
   },
 
   // Codex
@@ -438,7 +450,11 @@ export function clientConfigEditorFields(
         : parseJsonObject(source, definition.role)
       documents.set(definition.role, root)
     }
-    return editorField(definition, normalizedValue(valueAt(root, definition.path), definition.control))
+    const rawValue = valueAt(root, definition.path)
+    return editorField(
+      definition,
+      definition.normalizeValue ? definition.normalizeValue(rawValue) : normalizedValue(rawValue, definition.control),
+    )
   })
   if (client !== 'codex') return catalogFields
   const root = documents.get('codex-config') ?? parseCodexToml(existing['codex-config'] ?? '')

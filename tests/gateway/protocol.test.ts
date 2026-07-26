@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { analyzeProtocolConversion, convertRequest, convertResponse, getRequestModel } from '../../src/main/gateway'
 import {
+  InvalidProtocolResponseError,
   InvalidToolArgumentsError,
   InvalidToolChoiceError,
   ResponsesResponseFailedError
@@ -574,6 +575,31 @@ describe('gateway protocol conversion', () => {
       .toMatchObject({ stop_reason: 'refusal' })
     expect(convertResponse('gemini', 'openai-responses', blocked, 'fallback-model'))
       .toMatchObject({ status: 'incomplete', incomplete_details: { reason: 'content_filter' } })
+  })
+
+  it.each(['cancelled', 'queued', 'in_progress'] as const)(
+    'rejects a non-terminal Responses %s result during cross-protocol response conversion',
+    (status) => {
+      const body = { id: 'resp_nonterminal', status, output: [] }
+      expect(() => convertResponse('openai-responses', 'anthropic-messages', body, 'claude'))
+        .toThrow(InvalidProtocolResponseError)
+      expect(() => convertResponse('openai-responses', 'openai-chat', body, 'chat'))
+        .toThrow(InvalidProtocolResponseError)
+      expect(convertResponse('openai-responses', 'openai-responses', body, 'gpt')).toBe(body)
+    }
+  )
+
+  it('rejects Anthropic pause_turn instead of converting it to a successful stop', () => {
+    const body = {
+      id: 'msg_pause', model: 'claude', content: [{ type: 'text', text: 'paused' }],
+      stop_reason: 'pause_turn', usage: { input_tokens: 1, output_tokens: 1 },
+    }
+
+    for (const target of ['openai-chat', 'openai-responses', 'gemini'] as const) {
+      expect(() => convertResponse('anthropic-messages', target, body, 'fallback'))
+        .toThrow(InvalidProtocolResponseError)
+    }
+    expect(convertResponse('anthropic-messages', 'anthropic-messages', body, 'claude')).toBe(body)
   })
 
   it('uses the injected clock for generated response identifiers and timestamps', () => {

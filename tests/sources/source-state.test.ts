@@ -124,6 +124,108 @@ describe('API source state changes', () => {
     }), encrypt, NOW)).toThrow(/does not support/)
   })
 
+  it('persists Kiro Claude only as an exact-endpoint relay with manual models and unverified tools', () => {
+    const state = emptyState()
+    const encrypt = (value: string) => `encrypted:${value}`
+    const saved = saveApiSourceDraft(state, kiroRelayInput({
+      credential: 'kiro-relay-key',
+      baseUrl: 'https://kiro.example.test/custom/generateAssistantResponse/',
+    }), encrypt, NOW)
+
+    expect(state.providers[0]).toMatchObject({
+      id: saved.providerId,
+      sourceType: 'relay',
+      kind: 'kiro-compatible',
+      protocol: 'kiro-claude',
+      baseUrl: 'https://kiro.example.test/custom/generateAssistantResponse/',
+      models: ['claude-sonnet-4.5'],
+      forceFastMode: false,
+      capabilityProfile: {
+        origin: 'inferred',
+        modelDiscovery: false,
+        toolCalls: false,
+      },
+    })
+    expect(state.providers[0]).not.toHaveProperty('responsesCompactMode')
+    expect(() => setRouteSourceFastModeDraft(
+      state,
+      { sourceId: saved.sourceId, enabled: true },
+      NOW + 1,
+    )).toThrow(/FAST is supported only/)
+
+    expect(() => saveApiSourceDraft(emptyState(), kiroRelayInput({
+      credential: 'kiro-key',
+      sourceType: 'official-api',
+    }), encrypt, NOW)).toThrow(/Official API sources support/)
+    expect(() => saveApiSourceDraft(emptyState(), kiroRelayInput({
+      credential: 'kiro-key',
+      kind: 'custom',
+    }), encrypt, NOW)).toThrow(/does not support/)
+    expect(() => saveApiSourceDraft(emptyState(), kiroRelayInput({
+      credential: 'kiro-key',
+      models: [],
+      defaultModel: undefined,
+    }), encrypt, NOW)).toThrow(/manually configured model/)
+    expect(() => saveApiSourceDraft(
+      emptyState(),
+      withResponsesCompactMode(kiroRelayInput({ credential: 'kiro-key' }), 'native'),
+      encrypt,
+      NOW,
+    )).toThrow(/only for OpenAI Responses relay/)
+  })
+
+  it('clears Kiro tool evidence and disables direct and aggregate bindings after model edits', () => {
+    const state = emptyState()
+    const encrypt = (value: string) => `encrypted:${value}`
+    const first = saveApiSourceDraft(state, verifiedKiroRelayInput({
+      name: 'Kiro one',
+      credential: 'kiro-one',
+    }), encrypt, NOW)
+    const second = saveApiSourceDraft(state, verifiedKiroRelayInput({
+      name: 'Kiro two',
+      credential: 'kiro-two',
+      baseUrl: 'https://kiro-two.example.test/generateAssistantResponse',
+    }), encrypt, NOW + 1)
+    const aggregate = saveAggregateRelayDraft(state, {
+      ...aggregateInput([
+        { accountId: first.accountId, order: 0, weight: 10 },
+        { accountId: second.accountId, order: 1, weight: 10 },
+      ]),
+      protocol: 'kiro-claude',
+    }, NOW + 2)
+    state.routes.push({
+      id: 'kiro-direct', client: 'claude', enabled: true, poolId: first.sourceId,
+      inboundProtocol: 'anthropic-messages', modelMap: {}, localToken: 'direct-token',
+      createdAt: NOW, updatedAt: NOW,
+    }, {
+      id: 'kiro-aggregate', client: 'claude', enabled: true, poolId: aggregate.poolId,
+      inboundProtocol: 'anthropic-messages', modelMap: {}, localToken: 'aggregate-token',
+      createdAt: NOW, updatedAt: NOW,
+    })
+
+    const changed = saveApiSourceDraft(state, kiroRelayInput({
+      id: first.sourceId,
+      name: 'Kiro one',
+      credential: '',
+      models: ['claude-opus-4.5'],
+      defaultModel: 'claude-opus-4.5',
+    }), encrypt, NOW + 3)
+
+    expect(changed.connectionChanged).toBe(true)
+    expect(state.providers.find((provider) => provider.id === first.sourceId)?.capabilityProfile)
+      .toMatchObject({ origin: 'inferred', toolCalls: false, modelDiscovery: false })
+    expect(state.providers.find((provider) => provider.id === first.sourceId)?.capabilityProfile?.checkedAt)
+      .toBeUndefined()
+    expect(state.pools.find((pool) => pool.id === aggregate.poolId)?.members).toEqual([
+      expect.objectContaining({ accountId: first.accountId, enabled: false }),
+      expect.objectContaining({ accountId: second.accountId, enabled: true }),
+    ])
+    expect(state.routes).toEqual([
+      expect.objectContaining({ id: 'kiro-direct', enabled: false, poolId: first.sourceId, updatedAt: NOW + 3 }),
+      expect.objectContaining({ id: 'kiro-aggregate', enabled: false, poolId: aggregate.poolId, updatedAt: NOW + 3 }),
+    ])
+  })
+
   it('locks official xAI credentials to the native Responses endpoint', () => {
     const state = emptyState()
     const saved = saveApiSourceDraft(state, sourceInput({
@@ -522,6 +624,151 @@ describe('API source state changes', () => {
 })
 
 describe('aggregate relay state changes', () => {
+  it('requires verified Kiro Claude members and forces sticky sessions', () => {
+    const state = emptyState()
+    const encrypt = (value: string) => `encrypted:${value}`
+    const unverified = saveApiSourceDraft(state, kiroRelayInput({
+      name: 'Unverified Kiro', credential: 'unverified-key',
+    }), encrypt, NOW)
+    const verified = saveApiSourceDraft(state, verifiedKiroRelayInput({
+      name: 'Verified Kiro', credential: 'verified-key',
+      baseUrl: 'https://verified.example.test/generateAssistantResponse',
+    }), encrypt, NOW + 1)
+
+    expect(() => saveAggregateRelayDraft(state, {
+      ...aggregateInput([
+        { accountId: unverified.accountId, order: 0, weight: 10 },
+        { accountId: verified.accountId, order: 1, weight: 10 },
+      ]),
+      protocol: 'kiro-claude',
+      stickySessions: false,
+    }, NOW + 2)).toThrow(/two-turn tool probe/)
+    expect(state.pools).toHaveLength(0)
+
+    const second = saveApiSourceDraft(state, verifiedKiroRelayInput({
+      name: 'Second verified Kiro', credential: 'second-key',
+      baseUrl: 'https://second.example.test/generateAssistantResponse',
+    }), encrypt, NOW + 2)
+    const saved = saveAggregateRelayDraft(state, {
+      ...aggregateInput([
+        { accountId: verified.accountId, order: 0, weight: 10 },
+        { accountId: second.accountId, order: 1, weight: 10 },
+      ]),
+      protocol: 'kiro-claude',
+      stickySessions: false,
+    }, NOW + 3)
+
+    expect(state.pools.find((pool) => pool.id === saved.poolId)).toMatchObject({
+      protocol: 'kiro-claude',
+      stickySessions: true,
+      forceFastMode: false,
+    })
+  })
+
+  it('keeps the binding id but disables routes when a Kiro aggregate changes protocol', () => {
+    const state = emptyState()
+    const encrypt = (value: string) => `encrypted:${value}`
+    const firstKiro = saveApiSourceDraft(state, verifiedKiroRelayInput({
+      name: 'Kiro one', credential: 'kiro-one',
+    }), encrypt, NOW)
+    const secondKiro = saveApiSourceDraft(state, verifiedKiroRelayInput({
+      name: 'Kiro two', credential: 'kiro-two',
+      baseUrl: 'https://kiro-two.example.test/generateAssistantResponse',
+    }), encrypt, NOW + 1)
+    const firstOpenAi = saveApiSourceDraft(state, relayInput({
+      name: 'OpenAI one', credential: 'openai-one',
+    }), encrypt, NOW + 2)
+    const secondOpenAi = saveApiSourceDraft(state, relayInput({
+      name: 'OpenAI two', credential: 'openai-two',
+    }), encrypt, NOW + 3)
+    const aggregate = saveAggregateRelayDraft(state, {
+      ...aggregateInput([
+        { accountId: firstKiro.accountId, order: 0, weight: 10 },
+        { accountId: secondKiro.accountId, order: 1, weight: 10 },
+      ]),
+      protocol: 'kiro-claude',
+    }, NOW + 4)
+    state.routes.push({
+      id: 'kiro-route', client: 'claude', enabled: true, poolId: aggregate.poolId,
+      inboundProtocol: 'anthropic-messages', modelMap: {}, localToken: 'preserved-token',
+      createdAt: NOW, updatedAt: NOW,
+    })
+
+    const edited = saveAggregateRelayDraft(state, {
+      ...aggregateInput([
+        { accountId: firstOpenAi.accountId, order: 0, weight: 10 },
+        { accountId: secondOpenAi.accountId, order: 1, weight: 10 },
+      ]),
+      id: aggregate.poolId,
+      protocol: 'openai-responses',
+    }, NOW + 5)
+
+    expect(edited).toEqual({ poolId: aggregate.poolId, created: false })
+    expect(state.pools.find((pool) => pool.id === aggregate.poolId)).toMatchObject({
+      id: aggregate.poolId,
+      protocol: 'openai-responses',
+    })
+    expect(state.routes[0]).toMatchObject({
+      id: 'kiro-route',
+      enabled: false,
+      poolId: aggregate.poolId,
+      localToken: 'preserved-token',
+      updatedAt: NOW + 5,
+    })
+  })
+
+  it('disables a bound Kiro aggregate only when member identity changes', () => {
+    const state = emptyState()
+    const encrypt = (value: string) => `encrypted:${value}`
+    const first = saveApiSourceDraft(state, verifiedKiroRelayInput({
+      name: 'Kiro one', credential: 'kiro-one',
+    }), encrypt, NOW)
+    const second = saveApiSourceDraft(state, verifiedKiroRelayInput({
+      name: 'Kiro two', credential: 'kiro-two',
+      baseUrl: 'https://kiro-two.example.test/generateAssistantResponse',
+    }), encrypt, NOW + 1)
+    const third = saveApiSourceDraft(state, verifiedKiroRelayInput({
+      name: 'Kiro three', credential: 'kiro-three',
+      baseUrl: 'https://kiro-three.example.test/generateAssistantResponse',
+    }), encrypt, NOW + 2)
+    const aggregate = saveAggregateRelayDraft(state, {
+      ...aggregateInput([
+        { accountId: first.accountId, order: 0, weight: 10 },
+        { accountId: second.accountId, order: 1, weight: 10 },
+      ]),
+      protocol: 'kiro-claude',
+    }, NOW + 3)
+    state.routes.push({
+      id: 'kiro-route', client: 'claude', enabled: true, poolId: aggregate.poolId,
+      inboundProtocol: 'anthropic-messages', modelMap: {}, localToken: 'route-token',
+      createdAt: NOW, updatedAt: NOW,
+    })
+
+    saveAggregateRelayDraft(state, {
+      ...aggregateInput([
+        { accountId: second.accountId, order: 0, weight: 50 },
+        { accountId: first.accountId, order: 1, weight: 5 },
+      ]),
+      id: aggregate.poolId,
+      protocol: 'kiro-claude',
+    }, NOW + 4)
+    expect(state.routes[0]).toMatchObject({ enabled: true, updatedAt: NOW })
+
+    saveAggregateRelayDraft(state, {
+      ...aggregateInput([
+        { accountId: first.accountId, order: 0, weight: 10 },
+        { accountId: third.accountId, order: 1, weight: 10 },
+      ]),
+      id: aggregate.poolId,
+      protocol: 'kiro-claude',
+    }, NOW + 5)
+    expect(state.routes[0]).toMatchObject({
+      enabled: false,
+      poolId: aggregate.poolId,
+      updatedAt: NOW + 5,
+    })
+  })
+
   it.each(['priority', 'round-robin', 'weighted-round-robin'] as const)(
     'persists ordered, independently weighted members for %s',
     (strategy) => {
@@ -753,6 +1000,38 @@ function relayInput(overrides: Partial<ApiSourceInput> = {}): ApiSourceInput {
     baseUrl: 'https://relay.example/v1',
     protocol: 'openai-responses',
     ...overrides
+  })
+}
+
+function kiroRelayInput(overrides: Partial<ApiSourceInput> = {}): ApiSourceInput {
+  return relayInput({
+    name: 'Kiro Claude relay',
+    kind: 'kiro-compatible',
+    baseUrl: 'https://kiro.example.test/generateAssistantResponse/',
+    protocol: 'kiro-claude',
+    models: ['claude-sonnet-4.5'],
+    defaultModel: 'claude-sonnet-4.5',
+    ...overrides,
+  })
+}
+
+function verifiedKiroRelayInput(overrides: Partial<ApiSourceInput> = {}): ApiSourceInput {
+  return kiroRelayInput({
+    toolRoundtripVerified: true,
+    capabilityProfile: {
+      version: 1,
+      origin: 'probed',
+      checkedAt: NOW - 1,
+      streaming: true,
+      nonStreaming: true,
+      toolCalls: true,
+      modelDiscovery: false,
+    },
+    modelCatalog: [{
+      id: 'claude-sonnet-4.5',
+      capabilities: { streaming: true, nonStreaming: true, toolCalls: true, modelDiscovery: false },
+    }],
+    ...overrides,
   })
 }
 

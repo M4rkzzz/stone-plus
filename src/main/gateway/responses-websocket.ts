@@ -10,6 +10,7 @@ const MAX_QUEUED_TURNS = 32
 const MAX_QUEUED_PAYLOAD_BYTES = 128 * 1024 * 1024
 const MAX_BUFFERED_SEND_BYTES = 8 * 1024 * 1024
 const RESUME_BUFFERED_SEND_BYTES = 2 * 1024 * 1024
+const DEFAULT_BACKPRESSURE_NO_PROGRESS_TIMEOUT_MS = 30_000
 // A Responses event is normally small even when the overall response is large.
 // Bound only the event currently being assembled so long, valid streams remain
 // unlimited while a broken/malicious upstream cannot grow one unterminated SSE
@@ -40,6 +41,7 @@ export interface ResponsesWebSocketAdapterOptions {
   authenticate: (request: IncomingMessage) => ResponsesWebSocketAuthentication
   dispatch: (input: ResponsesWebSocketDispatchInput) => Promise<Response>
   maxPayloadBytes?: number
+  backpressureNoProgressTimeoutMs?: number
 }
 
 /**
@@ -52,11 +54,16 @@ export class ResponsesWebSocketAdapter {
   private readonly wss: WebSocketServer
   private readonly server: Server
   private readonly options: ResponsesWebSocketAdapterOptions
+  private readonly backpressureNoProgressTimeoutMs: number
   private readonly upgradeListener: (request: IncomingMessage, socket: Duplex, head: Buffer) => void
   private closed = false
 
   constructor(options: ResponsesWebSocketAdapterOptions) {
     this.options = options
+    this.backpressureNoProgressTimeoutMs = positiveTimeout(
+      options.backpressureNoProgressTimeoutMs,
+      DEFAULT_BACKPRESSURE_NO_PROGRESS_TIMEOUT_MS,
+    )
     this.server = options.server
     this.wss = new WebSocketServer({
       noServer: true,
@@ -101,6 +108,24 @@ export class ResponsesWebSocketAdapter {
     let inFlight: AbortController | undefined
     let closed = false
 
+    const closeSlowConsumer = (
+      error: ResponsesWebSocketBackpressureTimeoutError,
+      controller = inFlight,
+    ): void => {
+      closed = true
+      queued.length = 0
+      queuedPayloadBytes = 0
+      if (controller && !controller.signal.aborted) controller.abort(error)
+      if (webSocket.readyState !== WebSocket.CLOSED) webSocket.terminate()
+    }
+
+    const sendBestEffort = (payload: JsonObject): void => {
+      void sendJson(webSocket, payload, undefined, this.backpressureNoProgressTimeoutMs)
+        .catch((error: unknown) => {
+          if (error instanceof ResponsesWebSocketBackpressureTimeoutError) closeSlowConsumer(error)
+        })
+    }
+
     const dispatchNext = (): void => {
       if (closed || inFlight || queued.length === 0) return
       const queuedTurn = queued.shift()!
@@ -111,18 +136,38 @@ export class ResponsesWebSocketAdapter {
       void this.options.dispatch({ body, headers: dispatchHeaders, signal: controller.signal })
         .then(async (response) => {
           if (!response.ok) {
-            await sendJson(webSocket, await responseErrorEvent(response), controller.signal)
+            await sendJson(
+              webSocket,
+              await responseErrorEvent(response),
+              controller.signal,
+              this.backpressureNoProgressTimeoutMs,
+            )
             return
           }
           await forwardResponsesSse(response, async (event) => {
-            if (!await sendJson(webSocket, event, controller.signal)) {
+            if (!await sendJson(webSocket, event, controller.signal, this.backpressureNoProgressTimeoutMs)) {
               throw new DOMException('WebSocket disconnected', 'AbortError')
             }
           }, controller.signal)
         })
         .catch(async (error: unknown) => {
+          if (error instanceof ResponsesWebSocketBackpressureTimeoutError) {
+            closeSlowConsumer(error, controller)
+            return
+          }
           if (controller.signal.aborted || closed) return
-          await sendJson(webSocket, dispatchErrorEvent(error), controller.signal)
+          try {
+            await sendJson(
+              webSocket,
+              dispatchErrorEvent(error),
+              controller.signal,
+              this.backpressureNoProgressTimeoutMs,
+            )
+          } catch (sendError) {
+            if (sendError instanceof ResponsesWebSocketBackpressureTimeoutError) {
+              closeSlowConsumer(sendError, controller)
+            }
+          }
         })
         .finally(() => {
           if (inFlight === controller) inFlight = undefined
@@ -132,28 +177,28 @@ export class ResponsesWebSocketAdapter {
 
     webSocket.on('message', (raw, isBinary) => {
       if (isBinary) {
-        void sendJson(webSocket, errorEvent(400, 'invalid_message', 'Binary messages are not supported.'))
+        sendBestEffort(errorEvent(400, 'invalid_message', 'Binary messages are not supported.'))
         return
       }
       const parsed = parseClientEvent(raw)
       if (!parsed.ok) {
-        void sendJson(webSocket, errorEvent(400, 'invalid_message', parsed.message))
+        sendBestEffort(errorEvent(400, 'invalid_message', parsed.message))
         return
       }
       if (parsed.kind === 'cancel') {
         if (inFlight && !inFlight.signal.aborted) inFlight.abort(new DOMException('Client cancelled response', 'AbortError'))
         queued.length = 0
         queuedPayloadBytes = 0
-        void sendJson(webSocket, { type: 'response.cancelled' })
+        sendBestEffort({ type: 'response.cancelled' })
         return
       }
       const byteLength = rawDataByteLength(raw)
       if (queued.length >= MAX_QUEUED_TURNS) {
-        void sendJson(webSocket, errorEvent(429, 'websocket_queue_full', 'Too many response.create events are queued.'))
+        sendBestEffort(errorEvent(429, 'websocket_queue_full', 'Too many response.create events are queued.'))
         return
       }
       if (queuedPayloadBytes + byteLength > MAX_QUEUED_PAYLOAD_BYTES) {
-        void sendJson(webSocket, errorEvent(429, 'websocket_queue_full', 'The queued response.create payload budget is full.'))
+        sendBestEffort(errorEvent(429, 'websocket_queue_full', 'The queued response.create payload budget is full.'))
         return
       }
       queued.push({ body: parsed.body, byteLength })
@@ -274,6 +319,13 @@ class ResponsesSseFrameTooLargeError extends Error {
   }
 }
 
+class ResponsesWebSocketBackpressureTimeoutError extends Error {
+  public constructor(public readonly timeoutMs: number) {
+    super(`The WebSocket send buffer made no progress for ${timeoutMs}ms.`)
+    this.name = 'ResponsesWebSocketBackpressureTimeoutError'
+  }
+}
+
 function findSseDelimiter(buffer: Uint8Array, start: number): { index: number; length: number } | undefined {
   const source = Buffer.from(buffer.buffer, buffer.byteOffset, buffer.byteLength)
   let best: { index: number; length: number } | undefined
@@ -371,12 +423,17 @@ function dispatchErrorEvent(error: unknown): JsonObject {
   return errorEvent(502, 'websocket_dispatch_error', safeErrorMessage(error))
 }
 
-async function sendJson(webSocket: WebSocket, payload: JsonObject, signal?: AbortSignal): Promise<boolean> {
+async function sendJson(
+  webSocket: WebSocket,
+  payload: JsonObject,
+  signal?: AbortSignal,
+  noProgressTimeoutMs = DEFAULT_BACKPRESSURE_NO_PROGRESS_TIMEOUT_MS,
+): Promise<boolean> {
   if (webSocket.readyState !== WebSocket.OPEN || signal?.aborted) return false
   const encoded = JSON.stringify(payload)
   if (webSocket.bufferedAmount > MAX_BUFFERED_SEND_BYTES
     || webSocket.bufferedAmount + Buffer.byteLength(encoded, 'utf8') > MAX_BUFFERED_SEND_BYTES) {
-    const writable = await waitForWebSocketCapacity(webSocket, signal)
+    const writable = await waitForWebSocketCapacity(webSocket, signal, noProgressTimeoutMs)
     if (!writable) return false
   }
   try {
@@ -387,9 +444,22 @@ async function sendJson(webSocket: WebSocket, payload: JsonObject, signal?: Abor
   }
 }
 
-async function waitForWebSocketCapacity(webSocket: WebSocket, signal?: AbortSignal): Promise<boolean> {
+async function waitForWebSocketCapacity(
+  webSocket: WebSocket,
+  signal: AbortSignal | undefined,
+  noProgressTimeoutMs: number,
+): Promise<boolean> {
+  let previousBufferedAmount = webSocket.bufferedAmount
+  let deadline = Date.now() + noProgressTimeoutMs
   while (webSocket.readyState === WebSocket.OPEN && !signal?.aborted) {
-    if (webSocket.bufferedAmount <= RESUME_BUFFERED_SEND_BYTES) return true
+    const bufferedAmount = webSocket.bufferedAmount
+    if (bufferedAmount <= RESUME_BUFFERED_SEND_BYTES) return true
+    if (bufferedAmount < previousBufferedAmount) {
+      deadline = Date.now() + noProgressTimeoutMs
+    } else if (Date.now() >= deadline) {
+      throw new ResponsesWebSocketBackpressureTimeoutError(noProgressTimeoutMs)
+    }
+    previousBufferedAmount = bufferedAmount
     await new Promise<void>((resolve) => {
       const timer = setTimeout(resolve, 4)
       timer.unref?.()
@@ -446,6 +516,12 @@ function safeErrorMessage(error: unknown): string {
 function firstHeader(value: string | string[] | undefined): string | undefined {
   const first = Array.isArray(value) ? value[0] : value
   return typeof first === 'string' && first.trim() ? first.trim() : undefined
+}
+
+function positiveTimeout(value: number | undefined, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0
+    ? Math.max(1, Math.floor(value))
+    : fallback
 }
 
 function isJsonObject(value: unknown): value is JsonObject {

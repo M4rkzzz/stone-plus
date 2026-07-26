@@ -155,6 +155,31 @@ describe('ClientInstanceManager', () => {
     await manager.stop(instance.id)
   })
 
+  it('sanitizes stale non-Claude model arguments at the managed process boundary', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'stone-client-instance-claude-args-'))
+    directories.push(root)
+    const executable = join(root, 'claude.exe')
+    await writeFile(executable, '')
+    const spawn = vi.fn(() => new FakeProcess())
+    const manager = new ClientInstanceManager({
+      store: new MemoryMetadata(),
+      processAdapter: { spawn },
+    })
+    manager.initialize()
+    const [instance] = await manager.save({
+      name: 'Claude',
+      client: 'claude',
+      configDirectory: root,
+      executablePath: executable,
+      launchArgs: ['--verbose', '--model', 'gpt-5.5', '--model=sonnet'],
+    })
+
+    expect(instance.launchArgs).toEqual(['--verbose', '--model=sonnet'])
+    await manager.start(instance.id)
+    expect(spawn).toHaveBeenCalledWith(executable, ['--verbose', '--model=sonnet'], expect.any(Object))
+    await manager.stop(instance.id)
+  })
+
   it('forces a bounded stop when a child never emits exit', async () => {
     const root = await mkdtemp(join(tmpdir(), 'stone-client-instance-stuck-'))
     directories.push(root)
@@ -215,6 +240,94 @@ describe('ClientInstanceManager', () => {
     await manager.stop('recover-me')
     expect(terminatePidTree).toHaveBeenCalledWith(7777)
     expect(manager.list()[0]).toMatchObject({ status: 'stopped', processAlive: false })
+  })
+
+  it('does not allow an active recovered process definition to be edited or deleted', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'stone-client-instance-recovered-edit-'))
+    directories.push(root)
+    const executable = join(root, 'codex.exe')
+    const identity = { executablePath: executable, commandLine: `"${executable}"`, startedAt: 1234 }
+    const metadata = new MemoryMetadata()
+    metadata.values.set('managed_client_instances_v1', JSON.stringify([{
+      id: 'recover-me', name: 'Recovered Codex', client: 'codex', configDirectory: root,
+      executablePath: executable, launchArgs: [], launchMode: 'background', status: 'running',
+      createdAt: 1, updatedAt: 1,
+      processJournal: { instanceId: 'recover-me', pid: 7777, ...identity },
+    }]))
+    let alive = true
+    const manager = new ClientInstanceManager({
+      store: metadata,
+      processAdapter: { spawn: () => new FakeProcess() },
+      inspectProcess: async () => alive ? identity : undefined,
+      terminatePidTree: async () => { alive = false },
+    })
+    manager.initialize()
+    await manager.recoverOrphanedProcesses()
+
+    await expect(manager.save({
+      id: 'recover-me', name: 'Renamed', client: 'codex', configDirectory: root,
+      executablePath: executable,
+    })).rejects.toThrow('Stop the client instance before editing it')
+    await expect(manager.delete('recover-me')).rejects.toThrow('Stop the client instance before deleting it')
+    expect(manager.list()).toEqual([expect.objectContaining({ id: 'recover-me', processAlive: true })])
+
+    await manager.stop('recover-me')
+    await manager.delete('recover-me')
+    expect(manager.list()).toEqual([])
+  })
+
+  it('retries process identity inspection and persists a recovery journal before reporting running', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'stone-client-instance-journal-retry-'))
+    directories.push(root)
+    const executable = join(root, 'codex.exe')
+    await writeFile(executable, '')
+    const identity = { executablePath: executable, commandLine: `"${executable}"`, startedAt: 5678 }
+    const metadata = new MemoryMetadata()
+    const child = new FakeProcess()
+    const inspectProcess = vi.fn()
+      .mockRejectedValueOnce(new Error('CIM warming up'))
+      .mockResolvedValueOnce(undefined)
+      .mockResolvedValue(identity)
+    const manager = new ClientInstanceManager({
+      store: metadata,
+      processAdapter: { spawn: () => child },
+      inspectProcess,
+      processIdentityAttempts: 3,
+    })
+    manager.initialize()
+    const [instance] = await manager.save({
+      name: 'Journalled', client: 'codex', configDirectory: root, executablePath: executable,
+    })
+
+    await manager.start(instance.id)
+
+    expect(inspectProcess).toHaveBeenCalledTimes(3)
+    expect(JSON.parse(metadata.values.get('managed_client_instances_v1')!)[0].processJournal)
+      .toMatchObject({ instanceId: instance.id, pid: child.pid, ...identity })
+    await manager.stop(instance.id)
+  })
+
+  it('terminates a launch that cannot establish the required recovery journal', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'stone-client-instance-journal-failure-'))
+    directories.push(root)
+    const executable = join(root, 'codex.exe')
+    await writeFile(executable, '')
+    const child = new FakeProcess()
+    const manager = new ClientInstanceManager({
+      store: new MemoryMetadata(),
+      processAdapter: { spawn: () => child },
+      inspectProcess: async () => undefined,
+      requireProcessJournal: true,
+      processIdentityAttempts: 1,
+    })
+    manager.initialize()
+    const [instance] = await manager.save({
+      name: 'Unverified', client: 'codex', configDirectory: root, executablePath: executable,
+    })
+
+    await expect(manager.start(instance.id)).rejects.toThrow('could not verify its identity')
+    expect(child.killed).toBe(true)
+    expect(manager.list()[0]).toMatchObject({ status: 'failed', processAlive: false })
   })
 
   it('keeps a recovered process journal when forced tree termination does not remove the exact process', async () => {

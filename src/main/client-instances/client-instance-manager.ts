@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto'
 import { mkdir, stat } from 'node:fs/promises'
 import { extname, isAbsolute, resolve } from 'node:path'
 import type { ManagedClientInstance, ManagedClientInstanceInput, ManagedClientLaunchMode, RouteClient } from '@shared/types'
-import { withoutClaudeRelayModelEnvironment } from '../client-config/claude-environment'
+import { isClaudeClientModelName, withoutClaudeRelayModelEnvironment } from '../client-config/claude-environment'
 
 const METADATA_KEY = 'managed_client_instances_v1'
 const SHUTDOWN_PERSIST_TIMEOUT_MS = 250
@@ -63,6 +63,9 @@ export interface ClientInstanceManagerOptions {
   stopTimeoutMs?: number
   inspectProcess?: (pid: number) => Promise<ClientInstanceProcessIdentity | undefined>
   terminatePidTree?: (pid: number) => Promise<void>
+  /** Production launches must be journalled before being reported as running. */
+  requireProcessJournal?: boolean
+  processIdentityAttempts?: number
 }
 
 export interface ClientInstanceProcessIdentity {
@@ -110,6 +113,8 @@ export class ClientInstanceManager {
   private readonly platform: NodeJS.Platform
   private readonly inspectProcess: NonNullable<ClientInstanceManagerOptions['inspectProcess']>
   private readonly terminatePidTree: NonNullable<ClientInstanceManagerOptions['terminatePidTree']>
+  private readonly requireProcessJournal: boolean
+  private readonly processIdentityAttempts: number
   private readonly shutdown = createShutdownSignal()
   private nextGeneration = 0
   private persistenceTail: Promise<void> = Promise.resolve()
@@ -121,6 +126,11 @@ export class ClientInstanceManager {
     this.platform = options.platform ?? process.platform
     this.inspectProcess = options.inspectProcess ?? ((pid) => inspectClientProcess(pid, this.platform))
     this.terminatePidTree = options.terminatePidTree ?? ((pid) => terminateClientPidTree(pid, this.platform))
+    // An injected process adapter is commonly a deterministic unit-test fake.
+    // Native production launches, plus callers that explicitly supply process
+    // inspection, must establish a durable identity before success is exposed.
+    this.requireProcessJournal = options.requireProcessJournal ?? !options.processAdapter
+    this.processIdentityAttempts = Math.max(1, Math.min(10, options.processIdentityAttempts ?? 4))
   }
 
   public initialize(): ManagedClientInstance[] {
@@ -194,8 +204,11 @@ export class ClientInstanceManager {
     if (existing && (this.startFlights.has(existing.id) || this.stopFlights.has(existing.id))) {
       throw new Error('Wait for the client instance lifecycle operation to finish before editing it.')
     }
-    if (existing && this.running.has(existing.id)) throw new Error('Stop the client instance before editing it.')
+    if (existing && (this.running.has(existing.id) || this.recovered.has(existing.id))) {
+      throw new Error('Stop the client instance before editing it.')
+    }
     const timestamp = this.now()
+    const client = supportedClient(input.client)
     const resolvedLaunchMode = launchMode(input.launchMode ?? existing?.launchMode ?? defaultLaunchMode(this.platform))
     // Preserve an old explicit terminal definition so startup migrations and
     // unrelated edits remain possible, but never allow a new unsupported mode
@@ -204,11 +217,11 @@ export class ClientInstanceManager {
     const definition: ManagedClientInstance = {
       id: existing?.id ?? randomUUID(),
       name: requiredName(input.name),
-      client: supportedClient(input.client),
+      client,
       configDirectory: requiredAbsolutePath(input.configDirectory, 'Configuration directory'),
       workingDirectory: optionalAbsolutePath(input.workingDirectory, 'Working directory'),
       executablePath: optionalAbsolutePath(input.executablePath, 'Executable path'),
-      launchArgs: normalizeArgs(input.launchArgs),
+      launchArgs: sanitizeManagedClientLaunchArgs(client, normalizeArgs(input.launchArgs)),
       // A packaged POSIX desktop process normally has no controlling TTY. Do
       // not make the default instance unlaunchable there until an external
       // terminal adapter is available; Windows keeps the visible-console
@@ -234,7 +247,7 @@ export class ClientInstanceManager {
     if (this.startFlights.has(id) || this.stopFlights.has(id)) {
       throw new Error('Wait for the client instance lifecycle operation to finish before deleting it.')
     }
-    if (this.running.has(id)) throw new Error('Stop the client instance before deleting it.')
+    if (this.running.has(id) || this.recovered.has(id)) throw new Error('Stop the client instance before deleting it.')
     if (!this.definitions.some((candidate) => candidate.id === id)) throw new Error('Managed client instance not found.')
     // Only the Stone+ definition is removed. External config/work directories
     // are intentionally never touched.
@@ -273,7 +286,9 @@ export class ClientInstanceManager {
     const plan: ClientInstanceLaunchPlan = Object.freeze({
       instanceId: instance.id,
       executable: launchExecutable,
-      args: Object.freeze([...instance.launchArgs]),
+      // Apply the sanitizer again at the final launch boundary so legacy
+      // metadata and direct IPC starts cannot revive stale relay model flags.
+      args: Object.freeze(sanitizeManagedClientLaunchArgs(instance.client, instance.launchArgs)),
       ...(instance.workingDirectory ? { cwd: instance.workingDirectory } : {}),
       env: Object.freeze({
         ...clientBaseEnvironment(instance.client, this.options.baseEnvironment ?? process.env),
@@ -302,7 +317,12 @@ export class ClientInstanceManager {
       if (this.processAdapter.waitForReady) {
         await this.awaitStartStep(this.processAdapter.waitForReady(child))
       }
-      const identity = child.pid ? await this.inspectProcess(child.pid).catch(() => undefined) : undefined
+      const identity = child.pid
+        ? await this.inspectLaunchedProcess(child.pid, this.requireProcessJournal)
+        : undefined
+      if (this.requireProcessJournal && (!child.pid || !identity)) {
+        throw new Error('The client process started, but Stone+ could not verify its identity for safe recovery.')
+      }
       // A defensive adapter may synchronously report a launch failure while
       // the listeners are installed. Never resurrect that completed
       // generation as running.
@@ -350,6 +370,28 @@ export class ClientInstanceManager {
       await this.persistForLifecycle().catch(() => undefined)
       throw error
     }
+  }
+
+  private async inspectLaunchedProcess(
+    pid: number,
+    required: boolean,
+  ): Promise<ClientInstanceProcessIdentity | undefined> {
+    let lastError: unknown
+    for (let attempt = 0; attempt < this.processIdentityAttempts; attempt += 1) {
+      try {
+        const identity = await this.inspectProcess(pid)
+        if (identity) return identity
+      } catch (error) {
+        lastError = error
+      }
+      if (attempt + 1 < this.processIdentityAttempts) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 50))
+      }
+    }
+    if (required && lastError) {
+      throw new Error(`The client process started, but Stone+ could not inspect it for safe recovery: ${errorMessage(lastError)}`)
+    }
+    return undefined
   }
 
   public stop(id: string): Promise<ManagedClientInstance[]> {
@@ -1055,6 +1097,25 @@ function normalizeArgs(value: readonly string[] | undefined): string[] {
   })
 }
 
+/** Old relay launchers sometimes persisted their upstream GPT/Grok model in
+ * Claude's native --model flag. This guard lives at the process boundary so
+ * every caller (lifecycle service, managed-instances UI and direct IPC) gets
+ * identical cleanup while valid Claude aliases remain untouched. */
+export function sanitizeManagedClientLaunchArgs(client: RouteClient, args: readonly string[]): string[] {
+  if (client !== 'claude') return [...args]
+  const sanitized: string[] = []
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index]
+    if (argument === '--model' && index + 1 < args.length && !isClaudeClientModelName(args[index + 1])) {
+      index += 1
+      continue
+    }
+    if (argument.startsWith('--model=') && !isClaudeClientModelName(argument.slice('--model='.length))) continue
+    sanitized.push(argument)
+  }
+  return sanitized
+}
+
 function optionalIdentifier(value: string | undefined): string | undefined {
   const id = value?.trim()
   return id ? id.slice(0, 200) : undefined
@@ -1101,7 +1162,7 @@ function inspectClientProcess(pid: number, platform: NodeJS.Platform): Promise<C
     return executeProcessInspection('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script]).then((stdout) => {
       if (!stdout.trim()) return undefined
       const value = JSON.parse(stdout) as { ExecutablePath?: unknown; CommandLine?: unknown; CreationDate?: unknown }
-      const startedAt = typeof value.CreationDate === 'string' ? Date.parse(value.CreationDate) : NaN
+      const startedAt = parseWindowsProcessStartedAt(value.CreationDate)
       return typeof value.ExecutablePath === 'string' && typeof value.CommandLine === 'string' && Number.isFinite(startedAt)
         ? { executablePath: value.ExecutablePath, commandLine: value.CommandLine, startedAt }
         : undefined
@@ -1113,6 +1174,15 @@ function inspectClientProcess(pid: number, platform: NodeJS.Platform): Promise<C
     const startedAt = Date.parse(match[1])
     return Number.isFinite(startedAt) ? { executablePath: match[2], commandLine: match[3], startedAt } : undefined
   })
+}
+
+function parseWindowsProcessStartedAt(value: unknown): number {
+  if (typeof value !== 'string') return NaN
+  // Windows PowerShell's ConvertTo-Json serializes CIM DateTime values as
+  // /Date(1700000000000)/, while newer PowerShell versions may emit ISO text.
+  const dotNetDate = /^\/Date\((-?\d+)(?:[+-]\d+)?\)\/$/.exec(value)
+  if (dotNetDate) return Number(dotNetDate[1])
+  return Date.parse(value)
 }
 
 function executeProcessInspection(file: string, args: string[]): Promise<string> {

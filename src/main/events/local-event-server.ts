@@ -266,15 +266,13 @@ export class LocalEventServer {
   private authorized(request: IncomingMessage): boolean {
     const authorization = request.headers.authorization
     const bearer = authorization?.match(/^Bearer\s+(.+)$/i)?.[1]
-    let queryToken: string | undefined
     try {
       const url = new URL(request.url ?? '/', `http://${this.host}`)
       if (url.pathname !== '/events') return false
-      queryToken = url.searchParams.get('token') ?? undefined
     } catch {
-      queryToken = undefined
+      return false
     }
-    return secureEqual(bearer ?? queryToken ?? '', this.token)
+    return secureEqual(bearer ?? '', this.token)
   }
 
   private async persistInfo(info: LocalEventServerInfo): Promise<void> {

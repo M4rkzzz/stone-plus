@@ -480,9 +480,12 @@ function sendHtml(
 }
 
 function safeEqual(left: string, right: string): boolean {
-  const a = Buffer.from(left)
-  const b = Buffer.from(right)
-  return a.length === b.length && timingSafeEqual(a, b)
+  // Hash both values to the same fixed-width representation before comparing.
+  // Besides satisfying timingSafeEqual's equal-length requirement, this avoids
+  // branching on attacker-controlled callback-state length.
+  const a = createHash('sha256').update(left, 'utf8').digest()
+  const b = createHash('sha256').update(right, 'utf8').digest()
+  return timingSafeEqual(a, b)
 }
 
 function oauthCallbackErrorMessage(code: string): string {

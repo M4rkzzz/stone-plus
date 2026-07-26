@@ -158,6 +158,19 @@ describe('ChatGPT Codex provider path', () => {
     expect(JSON.stringify(refreshed)).not.toContain('refresh-private')
   })
 
+  it('cancels an oversized chunked OAuth refresh response before buffering it', async () => {
+    let cancelled = false
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) { controller.enqueue(new Uint8Array(64 * 1024)) },
+      cancel() { cancelled = true },
+    })
+    const fetchMock = vi.fn(async () => new Response(body, { status: 200 }))
+
+    await expect(refreshChatGptCredential(bundle, fetchMock as typeof fetch))
+      .rejects.toThrow('ChatGPT token refresh response is too large.')
+    expect(cancelled).toBe(true)
+  })
+
   it('singleflights concurrent refreshes and persists refresh-token rotation once', async () => {
     const now = Date.now()
     const expiring = { ...bundle, accountId: 'acct-singleflight', expiresAt: now - 1 }

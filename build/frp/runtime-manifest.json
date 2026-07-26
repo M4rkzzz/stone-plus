@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "component": "frpc",
+  "version": "0.69.0",
+  "target": "windows-amd64",
+  "upstream": {
+    "repository": "https://github.com/fatedier/frp",
+    "release": "https://github.com/fatedier/frp/releases/tag/v0.69.0",
+    "archive": {
+      "name": "frp_0.69.0_windows_amd64.zip",
+      "url": "https://github.com/fatedier/frp/releases/download/v0.69.0/frp_0.69.0_windows_amd64.zip",
+      "size": 14182750,
+      "sha256": "0e38f6dbe7761d648ca5c6ee323b7309544f48c01e9476f553902f3bc0949089"
+    }
+  },
+  "files": [
+    {
+      "path": "frpc.exe",
+      "size": 16921088,
+      "sha256": "f8467a4f8d57cde5ba808a764b528147acd81db0955e51bee80fde0fea0e5243"
+    },
+    {
+      "path": "LICENSE.frp.txt",
+      "size": 11358,
+      "sha256": "c6596eb7be8581c18be736c846fb9173b69eccf6ef94c5135893ec56bd92ba08"
+    }
+  ]
+}

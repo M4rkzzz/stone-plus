@@ -1,6 +1,6 @@
 import { randomBytes } from 'node:crypto'
 import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process'
-import { mkdir, rename, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, readdir, rename, rm, writeFile } from 'node:fs/promises'
 import { createServer, connect, type Server } from 'node:net'
 import { delimiter, dirname, join } from 'node:path'
 import type { Readable } from 'node:stream'
@@ -15,10 +15,12 @@ import {
   type VerifiedSingBoxRuntime
 } from './binary-manifest'
 import {
+  createWindowsPowerShellCommandArgs,
   executeFile,
   exitDescription,
   terminateProcessTree,
   waitForProcessSpawn,
+  WINDOWS_POWERSHELL_SECURITY_MODULE_IMPORT,
   type ExecuteFile,
   type TerminateProcessTree
 } from './process-utils'
@@ -36,6 +38,7 @@ const MAX_EVENT_LOG_LENGTH = 2_000
 const MAX_TRACKED_CONNECTION_IDS = 50_000
 const DEFAULT_LATENCY_TEST_URL = 'http://www.gstatic.com/generate_204'
 const LATENCY_SAMPLE_COUNT = 3
+const WINDOWS_RUNTIME_ACL_TARGET_ENV = 'STONE_BUILT_IN_PROXY_RUNTIME_ACL_TARGET'
 
 export type SingBoxRuntimeStatus = 'idle' | 'starting' | 'ready' | 'stopping' | 'error'
 
@@ -236,6 +239,7 @@ export class SingBoxService {
   private closed = false
   private closing = false
   private closeFlight?: Promise<void>
+  private runtimeStoragePrepared = false
 
   public constructor(private readonly options: SingBoxServiceOptions) {
     this.platform = options.platform ?? process.platform
@@ -277,6 +281,7 @@ export class SingBoxService {
   public start(request: SingBoxStartRequest): Promise<SingBoxRuntimeState> {
     return this.enqueue(async () => {
       this.assertOpen()
+      await this.prepareRuntimeStorage()
       const normalized = normalizeStartRequest(request)
       if (this.state.status === 'ready' && this.lastRequest?.key === normalized.key) return this.getState()
 
@@ -285,6 +290,14 @@ export class SingBoxService {
       this.setDesiredEnabled(true)
       this.setState({ restartAttempt: 0, error: undefined })
       return this.startAttempt(normalized)
+    })
+  }
+
+  /** Removes only Stone+-named plaintext configs left by a previous hard crash. */
+  public cleanupStaleRuntimeConfigs(): Promise<void> {
+    return this.enqueue(async () => {
+      this.assertOpen()
+      await this.prepareRuntimeStorage()
     })
   }
 
@@ -828,6 +841,7 @@ export class SingBoxService {
     signal: NodeJS.Signals | null
   ): void {
     const wasActive = this.childContext === context
+    const wasPublished = (this.generationReferences.get(context.generation) ?? 0) > 0
     if (wasActive) this.childContext = undefined
     if (this.startingContext === context) this.startingContext = undefined
     this.childContexts.delete(context)
@@ -857,7 +871,66 @@ export class SingBoxService {
           error: runtimeError(error),
         }
     this.emit({ type: 'crash', state, generation: context.generation, exit })
-    if (wasActive) this.scheduleRestart()
+    // A healthy candidate is not route-owned until retainGeneration() commits
+    // it. Service-level restart of an unowned candidate could create a core
+    // that no Chromium/OS-access transaction owns.
+    if (wasActive && wasPublished) this.scheduleRestart()
+  }
+
+  private async prepareRuntimeStorage(): Promise<void> {
+    if (this.runtimeStoragePrepared) return
+    const directory = dirname(this.runtimeConfigPath)
+    try {
+      await mkdir(directory, { recursive: true, mode: 0o700 })
+      if (this.platform === 'win32') {
+        await this.protectWindowsRuntimeDirectory(directory)
+      } else {
+        await chmod(directory, 0o700)
+      }
+      const entries = await readdir(directory, { withFileTypes: true })
+      const base = 'sing-box.runtime.json'
+      const staleName = new RegExp(
+        `^(?:${escapeRegExp(base)}|${escapeRegExp(base)}\\.\\d+\\.\\d+|${escapeRegExp(base)}\\.\\d+\\.\\d+\\.tmp|${escapeRegExp(base)}\\.\\d+\\.\\d+\\.\\d+\\.\\d+\\.tmp)$`,
+      )
+      for (const entry of entries) {
+        if (!entry.isFile() || !staleName.test(entry.name)) continue
+        await rm(join(directory, entry.name), { force: true })
+      }
+      this.runtimeStoragePrepared = true
+    } catch (error) {
+      throw new SingBoxServiceError(
+        'config_invalid',
+        'Could not clean or protect the built-in proxy runtime configuration directory.',
+        { cause: error },
+      )
+    }
+  }
+
+  private async protectWindowsRuntimeDirectory(directory: string): Promise<void> {
+    const script = String.raw`
+$ErrorActionPreference = 'Stop'
+${WINDOWS_POWERSHELL_SECURITY_MODULE_IMPORT}
+$Target = [Environment]::GetEnvironmentVariable('${WINDOWS_RUNTIME_ACL_TARGET_ENV}', 'Process')
+if ([string]::IsNullOrWhiteSpace($Target)) { throw 'The runtime ACL target was not provided.' }
+$sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+$acl = New-Object Security.AccessControl.DirectorySecurity
+$acl.SetAccessRuleProtection($true, $false)
+$acl.SetOwner($sid)
+$rights = [Security.AccessControl.FileSystemRights]::FullControl
+$inheritance = [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+$propagation = [Security.AccessControl.PropagationFlags]::None
+$allow = [Security.AccessControl.AccessControlType]::Allow
+$acl.SetAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($sid, $rights, $inheritance, $propagation, $allow)))
+Set-Acl -LiteralPath $Target -AclObject $acl
+`.trim()
+    await this.execute(
+      'powershell.exe',
+      createWindowsPowerShellCommandArgs(script),
+      {
+        env: { ...this.environment, [WINDOWS_RUNTIME_ACL_TARGET_ENV]: directory },
+        timeoutMs: 10_000,
+      },
+    )
   }
 
   private scheduleRestart(): void {
@@ -1161,16 +1234,26 @@ function cloneConfiguration(value: Record<string, unknown>): Record<string, unkn
 }
 
 async function writeRuntimeConfig(path: string, config: Record<string, unknown>): Promise<void> {
-  await mkdir(dirname(path), { recursive: true })
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 })
+  await chmod(dirname(path), 0o700)
   const temporaryPath = `${path}.${process.pid}.${Date.now()}.tmp`
-  await writeFile(temporaryPath, `${JSON.stringify(config, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 })
+  await writeFile(temporaryPath, `${JSON.stringify(config, null, 2)}\n`, {
+    encoding: 'utf8',
+    flag: 'wx',
+    mode: 0o600,
+  })
   await rm(path, { force: true })
   try {
     await rename(temporaryPath, path)
+    await chmod(path, 0o600)
   } catch (error) {
     await rm(temporaryPath, { force: true }).catch(() => undefined)
     throw error
   }
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
 function mapRuntimeError(error: unknown): SingBoxServiceError {

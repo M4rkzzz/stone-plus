@@ -8,11 +8,12 @@ import {
 } from '@shared/source-capabilities'
 import { providerSourceFamily, type ProviderSourceFamily } from '@shared/source-family'
 import { accountMatchesPoolProtocol } from '@shared/pool-protocol'
-import { isNativeGrokRouteSource, resolveRouteSource } from '@shared/route-sources'
+import { hasVerifiedKiroToolBridge, isNativeGrokRouteSource, resolveRouteSource } from '@shared/route-sources'
 import type {
   Account,
   AggregateRelayInput,
   ApiSourceInput,
+  ApiSourceProbeResult,
   Pool,
   PoolProtocol,
   Protocol,
@@ -85,8 +86,39 @@ const RELAY_PROTOCOLS: Readonly<Partial<Record<ProviderKind, readonly Protocol[]
   'openai-compatible': ['openai-responses', 'openai-chat'],
   'xai-compatible': ['openai-responses', 'openai-chat'],
   'anthropic-compatible': ['anthropic-messages'],
+  'kiro-compatible': ['kiro-claude'],
   custom: ['anthropic-messages', 'openai-responses', 'openai-chat', 'gemini']
 })
+
+export function requiresApiSourceToolRoundtripEvidence(source: Pick<
+  ProviderDefinition,
+  'sourceType' | 'kind' | 'protocol'
+>): boolean {
+  return source.protocol === 'kiro-claude'
+    || (source.sourceType === 'relay'
+      && source.kind === 'anthropic-compatible'
+      && source.protocol === 'anthropic-messages')
+}
+
+export function hasSuccessfulApiSourceToolRoundtrip(
+  result: Pick<ApiSourceProbeResult, 'ok' | 'capabilityProfile' | 'toolRoundtrip'>,
+): boolean {
+  const profile = result.capabilityProfile
+  const diagnostics = result.toolRoundtrip
+  return result.ok
+    && profile.origin === 'probed'
+    && typeof profile.checkedAt === 'number'
+    && Number.isFinite(profile.checkedAt)
+    && profile.checkedAt > 0
+    && profile.toolCalls === true
+    && diagnostics !== undefined
+    && diagnostics.firstTurn.toolsCount === 1
+    && diagnostics.firstTurn.toolUseCount === 1
+    && diagnostics.firstTurn.stopReason === 'tool_use'
+    && diagnostics.secondTurn.toolResultCount === 1
+    && diagnostics.secondTurn.toolUseCount === 0
+    && diagnostics.secondTurn.stopReason === 'end_turn'
+}
 
 /** Mutates a transactional PersistedState draft after validating the complete change. */
 export function saveApiSourceDraft(
@@ -101,6 +133,9 @@ export function saveApiSourceDraft(
   const models = normalizeModels(input.models)
   const defaultModel = normalizeOptionalModel(input.defaultModel)
   if (defaultModel && !models.includes(defaultModel)) models.unshift(defaultModel)
+  if (sourceConfiguration.protocol === 'kiro-claude' && models.length === 0) {
+    throw new Error('Kiro Claude relay sources require a manually configured model.')
+  }
   const proxyId = optionalProxyId(input.proxyId, state)
 
   const existingProvider = input.id
@@ -178,6 +213,16 @@ export function saveApiSourceDraft(
   const credentialId = existingAccount?.credentialId ?? randomUUID()
 
   const credentialChanged = suppliedCredential !== undefined
+  const requiresToolRoundtripEvidence = requiresApiSourceToolRoundtripEvidence({
+    sourceType: input.sourceType,
+    kind: sourceConfiguration.kind,
+    protocol: sourceConfiguration.protocol,
+  })
+  const toolRoundtripModelChanged = requiresToolRoundtripEvidence
+    && existingProvider !== undefined
+    && (!sameStrings(existingProvider.models, models)
+      || existingAccount?.modelPolicy !== (defaultModel ? 'selected' : 'all')
+      || !sameStrings(existingAccount?.modelAllowlist ?? [], defaultModel ? [defaultModel] : []))
   const connectionChanged = !existingProvider
     || !existingAccount
     || existingProvider.sourceType !== input.sourceType
@@ -186,6 +231,7 @@ export function saveApiSourceDraft(
     || existingProvider.protocol !== sourceConfiguration.protocol
     || existingAccount.proxyId !== proxyId
     || credentialChanged
+    || toolRoundtripModelChanged
   const capabilityConfigurationChanged = connectionChanged
     || existingProvider?.responsesCompactMode !== responsesCompactMode
 
@@ -194,6 +240,12 @@ export function saveApiSourceDraft(
     kind: sourceConfiguration.kind,
     sourceType: input.sourceType,
     responsesCompactMode,
+    ...(requiresToolRoundtripEvidence
+      ? {
+          ...(sourceConfiguration.protocol === 'kiro-claude' ? { modelDiscovery: false } : {}),
+          toolCalls: false,
+        }
+      : {}),
   })
   // A newly created source may carry the successful probe performed against
   // the exact unsaved draft. Connection edits still discard renderer-supplied
@@ -202,17 +254,32 @@ export function saveApiSourceDraft(
     && !existingAccount
     && input.capabilityProfile?.origin === 'probed'
     && typeof input.capabilityProfile.checkedAt === 'number'
-  const capabilityProfile = normalizeCapabilityProfile(
+  let capabilityProfile = normalizeCapabilityProfile(
     capabilityConfigurationChanged && !acceptsInitialProbe
       ? undefined
       : input.capabilityProfile ?? existingProvider?.capabilityProfile,
     inferredCapabilities,
   )
-  const modelCatalog = (acceptsInitialProbe || !capabilityConfigurationChanged) && input.modelCatalog
+  const toolRoundtripVerified = requiresToolRoundtripEvidence && (
+    (acceptsInitialProbe
+      && input.toolRoundtripVerified === true
+      && input.capabilityProfile?.toolCalls === true)
+    || (!capabilityConfigurationChanged && existingProvider?.toolRoundtripVerified === true)
+  )
+  if (requiresToolRoundtripEvidence) {
+    capabilityProfile = { ...capabilityProfile, toolCalls: toolRoundtripVerified }
+  }
+  let modelCatalog = (acceptsInitialProbe || !capabilityConfigurationChanged) && input.modelCatalog
     ? normalizeModelCatalog(input.modelCatalog, models, capabilityProfile)
     : capabilityConfigurationChanged
       ? buildModelCatalog(models, capabilityProfile)
       : normalizeModelCatalog(existingProvider?.modelCatalog, models, capabilityProfile)
+  if (requiresToolRoundtripEvidence) {
+    modelCatalog = modelCatalog.map((model) => ({
+      ...model,
+      capabilities: { ...model.capabilities, toolCalls: toolRoundtripVerified },
+    }))
+  }
 
   const provider: ProviderDefinition = {
     id: providerId,
@@ -229,6 +296,7 @@ export function saveApiSourceDraft(
       && existingProvider?.forceFastMode === true,
     ...(responsesCompactMode ? { responsesCompactMode } : {}),
     capabilityProfile,
+    ...(requiresToolRoundtripEvidence ? { toolRoundtripVerified } : {}),
     modelCatalog,
     createdAt: existingProvider?.createdAt ?? timestamp,
     updatedAt: timestamp
@@ -252,6 +320,9 @@ export function saveApiSourceDraft(
   if (existingAccount) replaceById(state.accounts, account)
   else state.accounts.push(account)
   if (encryptedCredential !== undefined) state.credentials[credentialId] = encryptedCredential
+  if (existingAccount && sourceConfiguration.protocol === 'kiro-claude' && connectionChanged) {
+    disableKiroSourceBindingsDraft(state, providerId, timestamp)
+  }
   assertBoundGrokBuildSource(state, providerId)
 
   return {
@@ -421,7 +492,7 @@ export function saveAggregateRelayDraft(
     members: normalizedMembers,
     modelPolicy: 'all',
     modelAllowlist: [],
-    stickySessions: Boolean(input.stickySessions),
+    stickySessions: input.protocol === 'kiro-claude' || Boolean(input.stickySessions),
     stickyTtlMinutes,
     maxRetries,
     forceFastMode: supportsFastServiceTier(input.protocol) && existing?.forceFastMode === true,
@@ -432,6 +503,11 @@ export function saveAggregateRelayDraft(
   }
   if (existing) replaceById(state.pools, pool)
   else state.pools.push(pool)
+  if (existing && aggregateEditInvalidatesKiroRoute(existing, pool)) {
+    state.routes = state.routes.map((route) => route.enabled && route.poolId === pool.id
+      ? { ...route, enabled: false, updatedAt: timestamp }
+      : route)
+  }
   assertBoundGrokBuildSource(state, pool.id)
   return { poolId: pool.id, created: !existing }
 }
@@ -528,7 +604,13 @@ function normalizeSourceConfiguration(input: ApiSourceInput): {
   if (!protocols.includes(input.protocol)) {
     throw new Error(`${input.kind} does not support the ${input.protocol} protocol.`)
   }
-  return { kind: input.kind, protocol: input.protocol, baseUrl: normalizeUrl(input.baseUrl) }
+  return {
+    kind: input.kind,
+    protocol: input.protocol,
+    baseUrl: input.protocol === 'kiro-claude'
+      ? normalizeExactEndpoint(input.baseUrl)
+      : normalizeUrl(input.baseUrl)
+  }
 }
 
 function buildApiSourceAccount(input: {
@@ -601,6 +683,9 @@ function normalizeAggregateMembers(input: AggregateRelayInput, state: PersistedS
     if (provider.protocol !== input.protocol) {
       throw new Error('Every aggregate relay member must use the aggregate protocol.')
     }
+    if (input.protocol === 'kiro-claude' && !hasVerifiedKiroToolBridge(provider)) {
+      throw new Error('Every enabled Kiro Claude aggregate member must pass the two-turn tool probe.')
+    }
     const family = providerSourceFamily(provider.kind)
     if (aggregateFamily !== undefined && aggregateFamily !== family) {
       throw new Error('Every aggregate relay member must use the same source family.')
@@ -616,6 +701,43 @@ function normalizeAggregateMembers(input: AggregateRelayInput, state: PersistedS
   return indexed
     .sort((left, right) => left.order - right.order || left.index - right.index)
     .map((member, order) => ({ accountId: member.accountId, enabled: true, order, weight: member.weight }))
+}
+
+function aggregateEditInvalidatesKiroRoute(existing: Pool, replacement: Pool): boolean {
+  if (existing.protocol !== 'kiro-claude') return false
+  if (replacement.protocol !== 'kiro-claude') return true
+  const existingAccountIds = existing.members.map((member) => member.accountId).sort()
+  const replacementAccountIds = replacement.members.map((member) => member.accountId).sort()
+  return !sameStrings(existingAccountIds, replacementAccountIds)
+}
+
+/** Fail-closed binding invalidation shared by connection edits and failed
+ * persistent Kiro capability probes. Source and pool ids remain intact so the
+ * renderer can explain the disabled selection and the user can retry it. */
+export function disableKiroSourceBindingsDraft(
+  state: PersistedState,
+  providerId: string,
+  timestamp: number,
+): void {
+  const accountIds = new Set(state.accounts
+    .filter((account) => account.providerId === providerId)
+    .map((account) => account.id))
+  const invalidatedSourceIds = new Set([providerId])
+  state.pools = state.pools.map((pool) => {
+    if (pool.kind !== 'relay-aggregate'
+      || pool.protocol !== 'kiro-claude'
+      || !pool.members.some((member) => accountIds.has(member.accountId))) return pool
+    invalidatedSourceIds.add(pool.id)
+    const members = pool.members.map((member) => accountIds.has(member.accountId)
+      ? { ...member, enabled: false }
+      : member)
+    return members.some((member, index) => member.enabled !== pool.members[index]?.enabled)
+      ? { ...pool, members, updatedAt: timestamp }
+      : pool
+  })
+  state.routes = state.routes.map((route) => route.enabled && invalidatedSourceIds.has(route.poolId)
+    ? { ...route, enabled: false, updatedAt: timestamp }
+    : route)
 }
 
 /**
@@ -657,6 +779,14 @@ function trimPoolModelAllowlist(
 }
 
 function normalizeUrl(value: string): string {
+  return validatedSourceUrl(value).toString().replace(/\/$/, '')
+}
+
+function normalizeExactEndpoint(value: string): string {
+  return validatedSourceUrl(value).toString()
+}
+
+function validatedSourceUrl(value: string): URL {
   const url = new URL(value.trim())
   if (url.protocol !== 'https:' && url.protocol !== 'http:') {
     throw new Error('Source URLs must use HTTP or HTTPS.')
@@ -667,7 +797,7 @@ function normalizeUrl(value: string): string {
   }
   if (url.username || url.password) throw new Error('Credentials cannot be embedded in the source URL.')
   if (url.search || url.hash) throw new Error('Source base URLs cannot contain a query string or fragment.')
-  return url.toString().replace(/\/$/, '')
+  return url
 }
 
 function optionalProxyId(value: string | undefined, state: PersistedState): string | undefined {
@@ -736,6 +866,10 @@ function hasControlCharacters(value: string): boolean {
     const code = character.charCodeAt(0)
     return code < 32 || code === 127
   })
+}
+
+function sameStrings(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index])
 }
 
 function memberOrder(left: Pool['members'][number], right: Pool['members'][number]): number {

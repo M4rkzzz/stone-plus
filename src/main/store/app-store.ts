@@ -19,14 +19,19 @@ import {
 } from '@shared/openai-pricing'
 import {
   appendRuntimeRouteSourcePools,
+  analyzeRouteSourceCompatibility,
+  hasVerifiedKiroToolBridge,
   hasRouteSourceIdCollision,
   isNativeGrokRouteSource,
   isAvailableRouteAccount,
+  isRouteSourcePoolTopologyValid,
+  routeSourceUsesKiroClaude,
   resolveRouteSource,
 } from '@shared/route-sources'
 import { normalizeRouteModelMap } from '@shared/route-models'
 import { providerSourceFamily } from '@shared/source-family'
 import {
+  buildModelCatalog,
   inferUpstreamCapabilities,
   normalizeCapabilityProfile,
   normalizeModelCatalog,
@@ -118,6 +123,9 @@ import { SetupWizardRepository } from '../setup/setup-state'
 import { PersistentTaskRunner } from '../tasks'
 import {
   deleteApiSourceDraft,
+  disableKiroSourceBindingsDraft,
+  hasSuccessfulApiSourceToolRoundtrip,
+  requiresApiSourceToolRoundtripEvidence,
   saveAggregateRelayDraft,
   saveApiSourceDraft,
   setRouteSourceFastModeDraft,
@@ -138,6 +146,24 @@ const DEFAULT_GATEWAY: GatewaySettings = {
   backupRetention: 10,
   outboundNetworkMode: 'direct'
 }
+
+const SUPPORTED_POOL_STRATEGIES = new Set<Pool['strategy']>([
+  'balanced',
+  'autobalanced',
+  'priority',
+  'round-robin',
+  'weighted-random',
+  'weighted-round-robin',
+])
+
+const SUPPORTED_POOL_PROTOCOLS = new Set<PoolProtocol>([
+  'anthropic-messages',
+  'openai-responses',
+  'openai-chat',
+  'gemini',
+  'kiro-claude',
+  'grok',
+])
 
 const DEFAULT_BUILT_IN_PROXY_SETTINGS: Omit<BuiltInProxySettings, 'updatedAt'> = {
   desiredEnabled: false,
@@ -167,6 +193,7 @@ const MAX_CLEARED_REQUEST_LOG_TOMBSTONES = MAX_PERSISTED_REQUEST_LOGS * 2
 const FITNESS_HISTORY_WINDOW_MS = 30 * 24 * 60 * 60_000
 const FITNESS_HISTORY_ROWS_PER_ACCOUNT = 400
 const IGNORED_UPDATE_VERSION_KEY = 'ignored_update_version'
+const CREDENTIAL_IMPORT_JOURNAL_KEY = 'credential_import_rollback_v1'
 const OBSERVABILITY_CACHE_TTL_MS = 1_000
 const OBSERVABILITY_IDLE_CACHE_TTL_MS = 60_000
 const DEFAULT_ACCOUNT_TAGS: ReadonlyArray<Pick<AccountTagDefinition, 'id' | 'name'>> = [
@@ -189,6 +216,35 @@ type AccountCheckPatch = Partial<Pick<Account,
   'codexQuota' |
   'grokQuota'
 >>
+
+const CREDENTIAL_IMPORT_SECTIONS = [
+  'providers',
+  'accounts',
+  'accountTags',
+  'pools',
+  'routes',
+  'credentials',
+] as const satisfies readonly SqliteStateSection[]
+
+type CredentialImportRollbackState = Pick<
+  PersistedState,
+  (typeof CREDENTIAL_IMPORT_SECTIONS)[number]
+>
+
+interface CredentialImportJournal {
+  version: 1
+  id: string
+  createdAt: number
+  phase: 'ready'
+  rollback: CredentialImportRollbackState
+}
+
+interface CredentialImportCaptureMarker {
+  version: 1
+  id: string
+  createdAt: number
+  phase: 'capturing'
+}
 
 export class AppStore {
   private readonly store: SqliteStateStore<PersistedState>
@@ -229,6 +285,7 @@ export class AppStore {
   private readonly vaultAvailable: boolean
   private readonly vaultBackend: string
   private readonly decryptedCredentialCache = new Map<string, string>()
+  private activeCredentialImportId: string | undefined
 
   public constructor(userDataPath: string) {
     const vault = inspectCredentialVault()
@@ -246,6 +303,7 @@ export class AppStore {
 
   public async initialize(): Promise<void> {
     await this.store.initialize()
+    await this.recoverInterruptedCredentialImport()
     await this.persistentTasks.recover()
     await this.persistentTasks.pruneTerminalTasks()
     if (this.store.select((state) => state.requestLogs.some((log) => log.status === 'streaming'))) {
@@ -266,6 +324,7 @@ export class AppStore {
   public async sanitizePersistedData(): Promise<void> {
     await this.sanitizePersistedMessages()
     await this.store.pruneCodexQuotaHistory(Date.now() - 14 * 24 * 60 * 60 * 1000)
+    await this.store.scrubDeletedContentOnce()
   }
 
   public async close(): Promise<void> {
@@ -301,6 +360,98 @@ export class AppStore {
 
   public getStateRepository(): SqliteStateStore<PersistedState> {
     return this.store
+  }
+
+  /**
+   * Starts a durable rollback scope for credential imports that require a
+   * network probe before they may replace existing OAuth material.
+   */
+  public async beginCredentialImport(): Promise<string> {
+    if (this.activeCredentialImportId || this.store.readAppMetadata(CREDENTIAL_IMPORT_JOURNAL_KEY)) {
+      throw new Error('Another credential import is already being validated.')
+    }
+    const id = randomUUID()
+    this.activeCredentialImportId = id
+    const createdAt = Date.now()
+    try {
+      // Queue a capture marker first. Its durable write also drains older state
+      // mutations, so the rollback snapshot cannot predate an already-queued
+      // credential/account update. A crash at this phase is safe to discard:
+      // no import mutation is allowed until beginCredentialImport returns.
+      const marker: CredentialImportCaptureMarker = {
+        version: 1,
+        id,
+        createdAt,
+        phase: 'capturing',
+      }
+      await this.store.writeAppMetadata(CREDENTIAL_IMPORT_JOURNAL_KEY, JSON.stringify(marker))
+      const current = this.store.read()
+      const journal: CredentialImportJournal = {
+        version: 1,
+        id,
+        createdAt,
+        phase: 'ready',
+        rollback: Object.fromEntries(CREDENTIAL_IMPORT_SECTIONS.map((section) => (
+          [section, structuredClone(current[section])]
+        ))) as CredentialImportRollbackState,
+      }
+      // The undo record reaches durable storage before any imported credential
+      // can overwrite the currently working refresh token.
+      await this.store.writeAppMetadata(CREDENTIAL_IMPORT_JOURNAL_KEY, JSON.stringify(journal))
+      return id
+    } catch (error) {
+      if (this.activeCredentialImportId === id) this.activeCredentialImportId = undefined
+      throw error
+    }
+  }
+
+  public async commitCredentialImport(id: string): Promise<void> {
+    const journal = this.requireCredentialImportJournal(id)
+    await this.store.removeAppMetadata(CREDENTIAL_IMPORT_JOURNAL_KEY)
+    if (this.activeCredentialImportId === journal.id) this.activeCredentialImportId = undefined
+    this.pruneCredentialCache()
+  }
+
+  public async rollbackCredentialImport(id: string): Promise<void> {
+    const journal = this.requireCredentialImportJournal(id)
+    await this.restoreCredentialImportJournal(journal)
+    await this.store.removeAppMetadata(CREDENTIAL_IMPORT_JOURNAL_KEY)
+    if (this.activeCredentialImportId === journal.id) this.activeCredentialImportId = undefined
+    this.invalidateCredentialCache()
+  }
+
+  private async recoverInterruptedCredentialImport(): Promise<void> {
+    const serialized = this.store.readAppMetadata(CREDENTIAL_IMPORT_JOURNAL_KEY)
+    if (!serialized) return
+    if (isCredentialImportCaptureMarker(serialized)) {
+      await this.store.removeAppMetadata(CREDENTIAL_IMPORT_JOURNAL_KEY)
+      this.activeCredentialImportId = undefined
+      return
+    }
+    const journal = parseCredentialImportJournal(serialized)
+    await this.restoreCredentialImportJournal(journal)
+    await this.store.removeAppMetadata(CREDENTIAL_IMPORT_JOURNAL_KEY)
+    this.activeCredentialImportId = undefined
+    this.invalidateCredentialCache()
+  }
+
+  private requireCredentialImportJournal(id: string): CredentialImportJournal {
+    if (!id || this.activeCredentialImportId !== id) {
+      throw new Error('Credential import validation scope is no longer active.')
+    }
+    const serialized = this.store.readAppMetadata(CREDENTIAL_IMPORT_JOURNAL_KEY)
+    if (!serialized) throw new Error('Credential import rollback journal is missing.')
+    const journal = parseCredentialImportJournal(serialized)
+    if (journal.id !== id) throw new Error('Credential import rollback journal does not match this import.')
+    return journal
+  }
+
+  private async restoreCredentialImportJournal(journal: CredentialImportJournal): Promise<void> {
+    await this.store.mutate((state) => {
+      for (const section of CREDENTIAL_IMPORT_SECTIONS) {
+        ;(state[section] as PersistedState[typeof section]) = structuredClone(journal.rollback[section])
+      }
+    }, CREDENTIAL_IMPORT_SECTIONS)
   }
 
   /** Restore/lifecycle hook: discard every plaintext derived from old state. */
@@ -491,7 +642,16 @@ export class AppStore {
     const timestamp = Date.now()
     await this.store.mutate((state) => {
       const existing = input.id ? state.providers.find((provider) => provider.id === input.id) : undefined
+      if (input.kind === 'kiro-compatible'
+        || input.protocol === 'kiro-claude'
+        || existing?.kind === 'kiro-compatible'
+        || existing?.protocol === 'kiro-claude') {
+        throw new Error('Kiro Claude relays must be managed through the API source editor.')
+      }
       const sourceType = input.sourceType ?? existing?.sourceType ?? inferProviderSourceType(input.kind, input.baseUrl)
+      if (existing?.sourceType === 'oauth-system' || sourceType === 'oauth-system') {
+        throw new Error('System OAuth sources must be managed through the OAuth import flow.')
+      }
       if (input.kind === 'xai-compatible' && sourceType !== 'relay') {
         throw new Error('xAI-compatible providers are supported only as relay sources.')
       }
@@ -579,6 +739,10 @@ export class AppStore {
 
   public async deleteProvider(id: string): Promise<AppSnapshot> {
     await this.store.mutate((state) => {
+      const provider = state.providers.find((candidate) => candidate.id === id)
+      if (provider?.sourceType === 'oauth-system') {
+        throw new Error('System OAuth sources must be managed through the OAuth account flow.')
+      }
       if (state.accounts.some((account) => account.providerId === id)) {
         throw new Error('Delete the accounts under this provider first.')
       }
@@ -596,9 +760,15 @@ export class AppStore {
     options: { acceptInitialProbeEvidence?: boolean } = {},
   ): Promise<{ snapshot: AppSnapshot; source: SavedApiSourceDraft }> {
     const { probeEvidenceToken: _probeEvidenceToken, ...sourceInput } = input
-    const authorizedInput: ApiSourceInput = !sourceInput.id && !options.acceptInitialProbeEvidence
-      ? { ...sourceInput, capabilityProfile: undefined, modelCatalog: undefined }
-      : sourceInput
+    const trustsInitialProbeEvidence = !sourceInput.id && options.acceptInitialProbeEvidence === true
+    const authorizedInput: ApiSourceInput = trustsInitialProbeEvidence
+      ? sourceInput
+      : {
+          ...sourceInput,
+          capabilityProfile: undefined,
+          toolRoundtripVerified: undefined,
+          modelCatalog: undefined,
+        }
     let saved: SavedApiSourceDraft | undefined
     await this.store.mutate((state) => {
       saved = saveApiSourceDraft(state, authorizedInput, (credential) => this.encrypt(credential))
@@ -610,7 +780,7 @@ export class AppStore {
 
   public async saveApiSourceCapabilityProbe(
     sourceId: string,
-    result: Pick<ApiSourceProbeResult, 'capabilityProfile' | 'modelCatalog' | 'models'>,
+    result: Pick<ApiSourceProbeResult, 'ok' | 'capabilityProfile' | 'modelCatalog' | 'models' | 'toolRoundtrip'>,
     expectedConnectionFingerprint: string,
   ): Promise<AppSnapshot | undefined> {
     const timestamp = Date.now()
@@ -620,25 +790,54 @@ export class AppStore {
       if (!provider || provider.sourceType === 'oauth-system') throw new Error('API source not found.')
       if (apiSourceConnectionFingerprint(state, sourceId, (encrypted) => this.decrypt(encrypted))
         !== expectedConnectionFingerprint) return
+      const isKiro = provider.kind === 'kiro-compatible' || provider.protocol === 'kiro-claude'
+      const requiresToolRoundtripEvidence = requiresApiSourceToolRoundtripEvidence(provider)
+      if (!result.ok && !requiresToolRoundtripEvidence) return
       const fallback = inferUpstreamCapabilities({
         protocol: provider.protocol,
         kind: provider.kind,
         sourceType: provider.sourceType,
         responsesCompactMode: provider.responsesCompactMode,
+        ...(requiresToolRoundtripEvidence ? {
+          ...(isKiro ? { modelDiscovery: false } : {}),
+          toolCalls: false,
+        } : {}),
       })
-      const capabilityProfile = normalizeCapabilityProfile(result.capabilityProfile, fallback)
-      const models = result.models.length ? normalizeModels(result.models) : provider.models
+      const toolRoundtripVerified = requiresToolRoundtripEvidence
+        && hasSuccessfulApiSourceToolRoundtrip(result)
+      const normalizedProfile = requiresToolRoundtripEvidence && !toolRoundtripVerified
+        ? fallback
+        : normalizeCapabilityProfile(result.capabilityProfile, fallback)
+      const capabilityProfile = requiresToolRoundtripEvidence
+        ? { ...normalizedProfile, toolCalls: toolRoundtripVerified }
+        : normalizedProfile
+      const models = !result.ok && requiresToolRoundtripEvidence
+        ? provider.models
+        : result.models.length ? normalizeModels(result.models) : provider.models
+      const probeUpdatedAt = Math.max(timestamp, provider.updatedAt + 1)
+      const normalizedCatalog = !result.ok && requiresToolRoundtripEvidence
+        ? buildModelCatalog(models, capabilityProfile)
+        : normalizeModelCatalog(result.modelCatalog, models, capabilityProfile)
       replaceById(state.providers, {
         ...provider,
         models,
         capabilityProfile,
-        modelCatalog: normalizeModelCatalog(result.modelCatalog, models, capabilityProfile),
+        ...(requiresToolRoundtripEvidence ? { toolRoundtripVerified } : {}),
+        modelCatalog: requiresToolRoundtripEvidence
+          ? normalizedCatalog.map((model) => ({
+              ...model,
+              capabilities: { ...model.capabilities, toolCalls: toolRoundtripVerified },
+            }))
+          : normalizedCatalog,
         // `updatedAt` also acts as the optimistic probe revision below. Keep it
         // monotonic even when two probes finish within the same millisecond.
-        updatedAt: Math.max(timestamp, provider.updatedAt + 1),
+        updatedAt: probeUpdatedAt,
       })
+      if (isKiro && !toolRoundtripVerified) {
+        disableKiroSourceBindingsDraft(state, sourceId, probeUpdatedAt)
+      }
       persisted = true
-    }, ['providers'])
+    }, ['providers', 'pools', 'routes'])
     return persisted ? this.getSnapshot() : undefined
   }
 
@@ -732,10 +931,20 @@ export class AppStore {
     const name = requiredName(input.name, 'Account name')
     const timestamp = Date.now()
     await this.store.mutate((state) => {
-      if (!state.providers.some((provider) => provider.id === input.providerId)) {
+      const selectedProvider = state.providers.find((provider) => provider.id === input.providerId)
+      if (!selectedProvider) {
         throw new Error('Choose an existing provider before saving an account.')
       }
+      if (selectedProvider.kind === 'kiro-compatible' || selectedProvider.protocol === 'kiro-claude') {
+        throw new Error('Kiro Claude relay credentials must be managed through the API source editor.')
+      }
       const existing = input.id ? state.accounts.find((account) => account.id === input.id) : undefined
+      if (selectedProvider.sourceType === 'oauth-system'
+        && existing?.credentialType !== 'chatgpt-oauth'
+        && existing?.credentialType !== 'chatgpt-agent-identity'
+        && existing?.credentialType !== 'grok-oauth') {
+        throw new Error('System OAuth accounts must be created through the OAuth import flow.')
+      }
       if ((existing?.credentialType === 'chatgpt-oauth' || existing?.credentialType === 'chatgpt-agent-identity' || existing?.credentialType === 'grok-oauth') && (
         existing.providerId !== input.providerId || input.credential?.trim()
       )) {
@@ -1801,6 +2010,22 @@ export class AppStore {
 
   public async savePool(input: PoolInput): Promise<AppSnapshot> {
     const name = requiredName(input.name, 'Pool name')
+    const protocol = requirePoolProtocol(input.protocol)
+    const strategy = requirePoolStrategy(input.strategy)
+    const stickyTtlMinutes = requireBoundedInteger(input.stickyTtlMinutes, 1, 1_440, 'Sticky TTL')
+    const maxRetries = requireBoundedInteger(input.maxRetries, 0, 10, 'Pool retries')
+    if (input.kind !== undefined && input.kind !== 'standard') {
+      throw new Error('Aggregate relays must be managed from the relay editor.')
+    }
+    if (typeof input.stickySessions !== 'boolean') {
+      throw new Error('Sticky sessions must be enabled or disabled explicitly.')
+    }
+    if (!Array.isArray(input.accountIds)
+      || input.accountIds.length < 1
+      || input.accountIds.length > 500
+      || input.accountIds.some((id) => typeof id !== 'string' || !id.trim())) {
+      throw new Error('A standard pool must contain between 1 and 500 account ids.')
+    }
     const timestamp = Date.now()
     await this.store.mutate((state) => {
       const existing = input.id ? state.pools.find((pool) => pool.id === input.id) : undefined
@@ -1821,7 +2046,7 @@ export class AppStore {
       const incompatible = accountIds.some((accountId) => {
         const account = state.accounts.find((candidate) => candidate.id === accountId)
         const provider = state.providers.find((candidate) => candidate.id === account?.providerId)
-        return !account || !accountMatchesPoolProtocol(input.protocol, account, provider)
+        return !account || !accountMatchesPoolProtocol(protocol, account, provider)
       })
       if (incompatible) {
         throw new Error('Every account in a pool must use the pool protocol.')
@@ -1836,11 +2061,11 @@ export class AppStore {
       }
       const requestedModelAllowlist = normalizeModels(input.modelAllowlist ?? existing?.modelAllowlist ?? [])
       const modelPolicy = resolvePoolInputModelPolicy(input.modelPolicy, input.modelAllowlist !== undefined, existing)
-      const members = mergeStandardPoolMembers(existing?.members ?? [], accountIds, input.protocol, state.accounts, state.providers)
+      const members = mergeStandardPoolMembers(existing?.members ?? [], accountIds, protocol, state.accounts, state.providers)
       const finalFamilies = new Set(members.map((member) => {
         const account = state.accounts.find((candidate) => candidate.id === member.accountId)
         const provider = state.providers.find((candidate) => candidate.id === account?.providerId)
-        if (!account || !provider || !accountMatchesPoolProtocol(input.protocol, account, provider)) return undefined
+        if (!account || !provider || !accountMatchesPoolProtocol(protocol, account, provider)) return undefined
         return providerSourceFamily(provider.kind)
       }))
       if (finalFamilies.has(undefined) || finalFamilies.size !== 1) {
@@ -1850,20 +2075,20 @@ export class AppStore {
         id: existing?.id ?? createId(),
         name,
         kind: 'standard',
-        protocol: input.protocol,
-        strategy: input.strategy,
+        protocol,
+        strategy,
         members,
         modelPolicy,
         modelAllowlist: modelPolicy === 'selected' ? requestedModelAllowlist : [],
         stickySessions: input.stickySessions,
-        stickyTtlMinutes: positiveInteger(input.stickyTtlMinutes, 60),
-        maxRetries: nonNegativeInteger(input.maxRetries),
-        forceFastMode: supportsPoolFastServiceTier(input.protocol)
+        stickyTtlMinutes,
+        maxRetries,
+        forceFastMode: supportsPoolFastServiceTier(protocol)
           && (input.forceFastMode ?? existing?.forceFastMode) === true,
         quotaProtection: input.quotaProtection === undefined
           ? existing?.quotaProtection
           : normalizeQuotaProtection(input.quotaProtection),
-        hedgedRequests: input.protocol === 'openai-responses'
+        hedgedRequests: protocol === 'openai-responses'
           && (input.hedgedRequests ?? existing?.hedgedRequests) === true,
         hedgeDelayMs: Math.max(250, Math.min(15_000, positiveInteger(input.hedgeDelayMs ?? existing?.hedgeDelayMs ?? 2_500, 2_500))),
         firstBodyTimeoutMs: Math.max(1_000, Math.min(12_000, positiveInteger(input.firstBodyTimeoutMs ?? existing?.firstBodyTimeoutMs ?? 8_000, 8_000))),
@@ -1908,6 +2133,12 @@ export class AppStore {
   public async updateRoute(route: Route): Promise<AppSnapshot> {
     const timestamp = Date.now()
     await this.store.mutate((state) => {
+      const existing = state.routes.find((candidate) => candidate.id === route.id)
+      if (!existing) throw new Error('A client route must keep its existing route id.')
+      if (existing.client !== route.client) throw new Error('A route client cannot change after creation.')
+      if (state.routes.some((candidate) => candidate.id !== route.id && candidate.client === route.client)) {
+        throw new Error(`The ${route.client} client already has one route.`)
+      }
       if (route.inboundProtocol !== clientNativeProtocols[route.client]) {
         throw new Error(`The ${route.client} route must use its native inbound protocol.`)
       }
@@ -1915,13 +2146,18 @@ export class AppStore {
         throw new Error('The selected source id conflicts with an existing pool id.')
       }
       const routeSource = resolveRouteSource(route.poolId, state)
-      if (route.enabled && !routeSource) {
+      const sourceSelectionChanged = existing.poolId !== route.poolId
+      if ((route.enabled || (sourceSelectionChanged && route.poolId.trim())) && !routeSource) {
         throw new Error('Choose an existing pool or API source for the route.')
       }
-      if (route.client === 'grokbuild'
-        && route.poolId.trim()
-        && !isNativeGrokRouteSource(routeSource, state)) {
-        throw new Error('Grok Build routes can only use a Responses-native Grok account pool or relay source.')
+      if (route.poolId.trim() && routeSource && (route.enabled || sourceSelectionChanged)) {
+        assertRouteSourceEligible(route.client, routeSource, state)
+      }
+      if (route.enabled
+        && routeSource
+        && routeSourceUsesKiroClaude(routeSource, state)
+        && !routeSource.accounts.some(isAvailableRouteAccount)) {
+        throw new Error('The selected Kiro Claude source has no available verified relay member.')
       }
       if (route.enabled && routeSource?.provider && !routeSource.accounts.some(isAvailableRouteAccount)) {
         throw new Error('The selected API source has no available account.')
@@ -1936,7 +2172,6 @@ export class AppStore {
       ))) {
         throw new Error('Enabled client routes must use different local tokens.')
       }
-      const existing = state.routes.find((candidate) => candidate.id === route.id)
       const cleanRoute: Route = {
         ...route,
         // The field was introduced after Route's public IPC shape. Callers
@@ -1951,11 +2186,7 @@ export class AppStore {
         createdAt: route.createdAt || timestamp,
         updatedAt: timestamp
       }
-      if (existing) {
-        replaceById(state.routes, cleanRoute)
-      } else {
-        state.routes.push({ ...cleanRoute, id: cleanRoute.id || createId() })
-      }
+      replaceById(state.routes, cleanRoute)
     }, ['routes'])
     return this.getSnapshot()
   }
@@ -1973,13 +2204,14 @@ export class AppStore {
     await this.store.mutate((state) => {
       const route = state.routes.find((candidate) => candidate.client === client)
       if (!route) throw new Error(`The ${client} client route does not exist.`)
-      if (client === 'grokbuild') {
-        const source = resolveRouteSource(cleanSourceId, state)
-        if (!source) throw new Error('Choose an existing Grok account pool or Grok relay source.')
-        if (!isNativeGrokRouteSource(source, state)) {
-          throw new Error('Grok Build routes can only use a Responses-native Grok account pool or relay source.')
-        }
+      if (hasRouteSourceIdCollision(cleanSourceId, state)) {
+        throw new Error('The selected source id conflicts with an existing pool id.')
       }
+      const source = resolveRouteSource(cleanSourceId, state)
+      if (!source) throw new Error(client === 'grokbuild'
+        ? 'Choose an existing Grok account pool or Grok relay source.'
+        : 'Choose an existing pool or API source for the route.')
+      assertRouteSourceEligible(client, source, state)
       replaceById(state.routes, {
         ...route,
         poolId: cleanSourceId,
@@ -3130,10 +3362,15 @@ function normalizePersistedState(
       ? provider.sourceType
       : inferProviderSourceType(provider.kind, provider.baseUrl)
     const grokOAuthProvider = provider.kind === 'xai' && persistedSourceType === 'oauth-system'
-    const sourceType = provider.kind === 'xai-compatible'
+    const persistedKiroShapeIsValid = provider.kind === 'kiro-compatible'
+      && persistedSourceType === 'relay'
+      && provider.protocol === 'kiro-claude'
+    const sourceType = provider.kind === 'xai-compatible' || provider.kind === 'kiro-compatible'
       ? 'relay'
       : provider.kind === 'xai' && !grokOAuthProvider ? 'official-api' : persistedSourceType
-    const protocol = provider.kind === 'xai' ? 'openai-responses' : provider.protocol
+    const protocol = provider.kind === 'xai'
+      ? 'openai-responses'
+      : provider.kind === 'kiro-compatible' ? 'kiro-claude' : provider.protocol
     const responsesCompactMode = normalizePersistedResponsesCompactMode(
       provider.responsesCompactMode,
       sourceType,
@@ -3144,7 +3381,9 @@ function normalizePersistedState(
     // unknown values before it can enter the runtime gateway configuration.
     const { responsesCompactMode: _discardedCompactMode, ...baseProvider } = provider
     const capabilityProfile = normalizeCapabilityProfile(
-      provider.capabilityProfile,
+      provider.kind === 'kiro-compatible' && !persistedKiroShapeIsValid
+        ? undefined
+        : provider.capabilityProfile,
       inferUpstreamCapabilities({
         protocol,
         kind: provider.kind,
@@ -3152,7 +3391,7 @@ function normalizePersistedState(
         responsesCompactMode,
       }),
     )
-    return {
+    const normalizedProvider: ProviderDefinition = {
       ...baseProvider,
       sourceType,
       baseUrl: provider.kind === 'xai' ? (grokOAuthProvider ? GROK_OAUTH_BASE_URL : 'https://api.x.ai/v1') : baseProvider.baseUrl,
@@ -3163,6 +3402,23 @@ function normalizePersistedState(
       ...(responsesCompactMode ? { responsesCompactMode } : {}),
       capabilityProfile,
       modelCatalog: normalizeModelCatalog(provider.modelCatalog, provider.models, capabilityProfile),
+    }
+    if (provider.kind !== 'kiro-compatible') return normalizedProvider
+
+    const toolRoundtripVerified = hasVerifiedKiroToolBridge(normalizedProvider)
+    const verifiedCapabilityProfile = { ...capabilityProfile, toolCalls: toolRoundtripVerified }
+    return {
+      ...normalizedProvider,
+      toolRoundtripVerified,
+      capabilityProfile: verifiedCapabilityProfile,
+      modelCatalog: normalizeModelCatalog(
+        provider.modelCatalog,
+        provider.models,
+        verifiedCapabilityProfile,
+      ).map((model) => ({
+        ...model,
+        capabilities: { ...model.capabilities, toolCalls: toolRoundtripVerified },
+      })),
     }
   })
   let accounts: Account[] = state.accounts.map((account) => {
@@ -3211,16 +3467,23 @@ function normalizePersistedState(
     }
   })
   ;({ providers, accounts } = migrateSourceTopology(providers, accounts, timestamp))
+  const accountsById = new Map(accounts.map((account) => [account.id, account]))
+  const providersById = new Map(providers.map((provider) => [provider.id, provider]))
   const normalizedPools: Pool[] = state.pools.map((pool): Pool => {
     const persistedAllowlist = normalizeModels(pool.modelAllowlist)
     const modelPolicy = normalizePersistedModelPolicy(pool.modelPolicy, persistedAllowlist)
     return {
       ...pool,
       kind: pool.kind === 'relay-aggregate' ? 'relay-aggregate' : 'standard',
+      strategy: normalizePersistedPoolStrategy(pool.strategy),
+      stickySessions: pool.stickySessions === true,
+      stickyTtlMinutes: boundedInteger(pool.stickyTtlMinutes, 1, 1_440, 60),
+      maxRetries: boundedInteger(pool.maxRetries, 0, 10, 0),
       forceFastMode: supportsPoolFastServiceTier(pool.protocol) && pool.forceFastMode === true,
       members: pool.members.map((member, index) => ({
         accountId: member.accountId,
-        enabled: member.enabled,
+        enabled: member.enabled === true && (pool.protocol !== 'kiro-claude'
+          || hasVerifiedKiroToolBridge(providersById.get(accountsById.get(member.accountId)?.providerId ?? ''))),
         ...(positiveOptionalNumber(member.weight) !== undefined ? { weight: positiveOptionalNumber(member.weight) } : {}),
         ...(nonNegativeOptionalInteger(member.order) !== undefined
           ? { order: nonNegativeOptionalInteger(member.order) }
@@ -3247,7 +3510,7 @@ function normalizePersistedState(
     proxyProfiles,
     accounts,
     pools,
-    routes: normalizePersistedRoutes(state.routes, timestamp),
+    routes: normalizePersistedRoutes(state.routes, timestamp, { providers, accounts, pools }),
     gateway: {
       ...DEFAULT_GATEWAY,
       ...state.gateway,
@@ -3323,28 +3586,39 @@ function createDefaultRoutes(timestamp: number): Route[] {
   }))
 }
 
-function normalizePersistedRoutes(routes: readonly Route[] | undefined, timestamp: number): Route[] {
+function normalizePersistedRoutes(
+  routes: readonly Route[] | undefined,
+  timestamp: number,
+  collections: Pick<PersistedState, 'providers' | 'accounts' | 'pools'>,
+): Route[] {
   const persisted = Array.isArray(routes) ? routes : []
-  const consumed = new Set<Route>()
-  const defaults = createDefaultRoutes(timestamp).map((fallback) => {
-    const existing = persisted.find((route) => route.client === fallback.client)
-      ?? persisted.find((route) => route.id === fallback.id)
-    if (!existing) return fallback
-    consumed.add(existing)
+  const normalizeRoute = (route: Route): Route => {
+    const source = resolveRouteSource(route.poolId, collections)
+    const sourceEligible = Boolean(source)
+      && isRouteSourcePoolTopologyValid(source!.pool, collections)
+      && analyzeRouteSourceCompatibility(route.client, source, collections).eligible
     return {
-      ...existing,
-      highConcurrencyMode: existing.highConcurrencyMode === true,
-      modelMap: normalizeRouteModelMap(existing.modelMap),
-    }
-  })
-  return [
-    ...defaults,
-    ...persisted.filter((route) => !consumed.has(route)).map((route) => ({
       ...route,
+      enabled: route.enabled === true && sourceEligible,
+      inboundProtocol: clientNativeProtocols[route.client] ?? route.inboundProtocol,
       highConcurrencyMode: route.highConcurrencyMode === true,
       modelMap: normalizeRouteModelMap(route.modelMap),
-    })),
-  ]
+    }
+  }
+  const defaults = createDefaultRoutes(timestamp).map((fallback) => {
+    const matching = persisted.filter((route) => route.client === fallback.client)
+    const existing = matching.find((route) => route.id === fallback.id) ?? matching[0]
+    if (!existing) return fallback
+    return normalizeRoute(existing)
+  })
+  const enabledTokens = new Set<string>()
+  return defaults.map((route) => {
+    const token = route.localToken.trim()
+    if (!route.enabled) return route
+    if (!token || enabledTokens.has(token)) return { ...route, enabled: false }
+    enabledTokens.add(token)
+    return route
+  })
 }
 
 function createDefaultClientProfiles(timestamp: number): ClientConfigProfile[] {
@@ -3674,6 +3948,13 @@ function mergeAccountCodexQuota(
   earlier: AccountCodexQuotaSnapshot | undefined,
   later: AccountCodexQuotaSnapshot
 ): AccountCodexQuotaSnapshot {
+  if (later.source === 'usage-endpoint') {
+    return {
+      ...later,
+      ...(later.fiveHour ? { fiveHour: { ...later.fiveHour } } : {}),
+      ...(later.sevenDay ? { sevenDay: { ...later.sevenDay } } : {})
+    }
+  }
   return {
     observedAt: later.observedAt,
     source: later.source,
@@ -4293,6 +4574,23 @@ function migrateGrokPoolProtocols(
   })
 }
 
+function assertRouteSourceEligible(
+  client: RouteClient,
+  source: NonNullable<ReturnType<typeof resolveRouteSource>>,
+  collections: Pick<PersistedState, 'accounts' | 'providers'>,
+): void {
+  if (!isRouteSourcePoolTopologyValid(source.pool, collections)) {
+    throw new Error('Every route source member must use one valid pool protocol and source family.')
+  }
+  if (client === 'grokbuild' && !isNativeGrokRouteSource(source, collections)) {
+    throw new Error('Grok Build routes can only use a Responses-native Grok account pool or relay source.')
+  }
+  const compatibility = analyzeRouteSourceCompatibility(client, source, collections)
+  if (!compatibility.eligible) {
+    throw new Error(compatibility.reason ?? 'The selected source is not compatible with this client.')
+  }
+}
+
 /**
  * Guard write paths that can change the effective family of an already-bound
  * source. Route selection validates the same boundary, but provider, account,
@@ -4469,6 +4767,53 @@ function requiredName(value: string, label: string): string {
   return name
 }
 
+function parseCredentialImportJournal(serialized: string): CredentialImportJournal {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(serialized)
+  } catch {
+    throw new Error('Credential import rollback journal is invalid.')
+  }
+  if (!parsed || typeof parsed !== 'object') {
+    throw new Error('Credential import rollback journal is invalid.')
+  }
+  const candidate = parsed as Partial<CredentialImportJournal>
+  const rollback = candidate.rollback as Partial<CredentialImportRollbackState> | undefined
+  if (candidate.version !== 1
+    || typeof candidate.id !== 'string'
+    || !candidate.id
+    || (candidate.phase !== undefined && candidate.phase !== 'ready')
+    || typeof candidate.createdAt !== 'number'
+    || !Number.isFinite(candidate.createdAt)
+    || !rollback
+    || !Array.isArray(rollback.providers)
+    || !Array.isArray(rollback.accounts)
+    || !Array.isArray(rollback.accountTags)
+    || !Array.isArray(rollback.pools)
+    || !Array.isArray(rollback.routes)
+    || !rollback.credentials
+    || typeof rollback.credentials !== 'object'
+    || Array.isArray(rollback.credentials)
+    || Object.values(rollback.credentials).some((value) => typeof value !== 'string')) {
+    throw new Error('Credential import rollback journal is invalid.')
+  }
+  return parsed as CredentialImportJournal
+}
+
+function isCredentialImportCaptureMarker(serialized: string): boolean {
+  try {
+    const parsed = JSON.parse(serialized) as Partial<CredentialImportCaptureMarker>
+    return parsed?.version === 1
+      && typeof parsed.id === 'string'
+      && parsed.id.length > 0
+      && typeof parsed.createdAt === 'number'
+      && Number.isFinite(parsed.createdAt)
+      && parsed.phase === 'capturing'
+  } catch {
+    return false
+  }
+}
+
 function inspectCredentialVault(): { available: boolean; backend: string } {
   try {
     if (!safeStorage.isEncryptionAvailable()) {
@@ -4494,8 +4839,39 @@ function positiveInteger(value: number, fallback: number): number {
   return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback
 }
 
-function nonNegativeInteger(value: number): number {
-  return Number.isFinite(value) && value >= 0 ? Math.floor(value) : 0
+function requirePoolStrategy(value: unknown): Pool['strategy'] {
+  if (typeof value !== 'string' || !SUPPORTED_POOL_STRATEGIES.has(value as Pool['strategy'])) {
+    throw new Error('Pool strategy is unsupported.')
+  }
+  return value as Pool['strategy']
+}
+
+function requirePoolProtocol(value: unknown): PoolProtocol {
+  if (typeof value !== 'string' || !SUPPORTED_POOL_PROTOCOLS.has(value as PoolProtocol)) {
+    throw new Error('Pool protocol is unsupported.')
+  }
+  return value as PoolProtocol
+}
+
+function normalizePersistedPoolStrategy(value: unknown): Pool['strategy'] {
+  return typeof value === 'string' && SUPPORTED_POOL_STRATEGIES.has(value as Pool['strategy'])
+    ? value as Pool['strategy']
+    : 'priority'
+}
+
+function requireBoundedInteger(
+  value: unknown,
+  minimum: number,
+  maximum: number,
+  label: string,
+): number {
+  if (typeof value !== 'number'
+    || !Number.isInteger(value)
+    || value < minimum
+    || value > maximum) {
+    throw new Error(`${label} must be an integer from ${minimum} to ${maximum}.`)
+  }
+  return value
 }
 
 function boundedInteger(value: number, minimum: number, maximum: number, fallback: number): number {

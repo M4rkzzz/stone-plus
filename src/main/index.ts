@@ -1,4 +1,4 @@
-import { app, BrowserWindow, Menu, nativeImage, net, powerMonitor, safeStorage, session, shell, Tray } from 'electron'
+import { app, BrowserWindow, Menu, nativeImage, nativeTheme, net, powerMonitor, safeStorage, session, shell, Tray } from 'electron'
 import electronUpdater from 'electron-updater'
 import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -6,6 +6,7 @@ import { GatewayServer, type GatewayConfig, type ResolvedGatewayCredential } fro
 import { ClientConfigService } from './client-config'
 import { rebuildGatewayConnections, registerGatewayApi, warmGatewayConnections } from './ipc/gateway-api'
 import { registerUpdateApi } from './ipc/update-api'
+import { TITLE_BAR_HEIGHT, windowChromePalette } from './window-chrome'
 import { AppStore } from './store/app-store'
 import { DatabaseBackupService, WebDavBackupService } from './backup'
 import { resolveChatGptCredential } from './providers'
@@ -17,7 +18,7 @@ import {
   type OutboundReloadCoordinator,
 } from './proxy'
 import { UpdateService } from './update'
-import { FrpTunnelService } from './tunnel'
+import { FrpTunnelService, verifyFrpcBinaryIntegrity } from './tunnel'
 import { registerTunnelApi } from './ipc/tunnel-api'
 import {
   CodexConversationTitleResolver,
@@ -33,7 +34,10 @@ import { registerCodexSessionRepairApi } from './ipc/session-repair-api'
 import { ClientInstanceManager } from './client-instances'
 import { registerClientInstanceApi } from './ipc/client-instance-api'
 import { registerAgentLifecycleApi } from './ipc/agent-lifecycle-api'
+import { registerClaudeDesktopApi } from './ipc/claude-desktop-api'
 import { createAgentLifecycleService } from './agent-lifecycle/integration'
+import { ClaudeDesktopConfig } from './agent-lifecycle/claude-desktop-config'
+import { ClaudeDesktopOperationCoordinator } from './agent-lifecycle/claude-desktop-operation-coordinator'
 import type { AgentLifecycleService } from './agent-lifecycle/service'
 import { AgentInstallationService } from './agent-installation'
 import { registerCodexSessionManagerApi } from './ipc/session-manager-api'
@@ -73,6 +77,8 @@ let codexSessionIndexCleanup: CodexSessionIndexCleanupService
 let codexRepairAndRestart: CodexRepairAndRestartService
 let codexSessionManager: CodexSessionManager
 let clientInstanceManager: ClientInstanceManager
+let claudeDesktopConfig: ClaudeDesktopConfig
+let claudeDesktopCoordinator: ClaudeDesktopOperationCoordinator
 let agentLifecycle: AgentLifecycleService
 let agentInstaller: AgentInstallationService
 let browserImportQueue: BrowserImportQueue
@@ -86,9 +92,14 @@ let flushGatewayApiState: (() => Promise<void>) | undefined
 let disposeBuiltInProxyApi: (() => Promise<void>) | undefined
 let disposeClientInstanceApi: (() => Promise<void>) | undefined
 let disposeAgentLifecycleApi: (() => Promise<void>) | undefined
+let disposeClaudeDesktopApi: (() => Promise<void>) | undefined
 let focusMainWindowOnReady = false
+let mainWindowReadyToShow = false
+let rendererThemeReady = false
+let rendererThemeReadyTimeout: ReturnType<typeof setTimeout> | undefined
 let builtInChromiumGeneration = 0
 const LOGIN_STARTUP_ARGUMENT = '--hidden'
+const RENDERER_THEME_READY_TIMEOUT_MS = 1_000
 let startedHidden = app.isPackaged && process.argv.includes(LOGIN_STARTUP_ARGUMENT)
 
 if (process.env.STONE_USER_DATA_DIR) {
@@ -340,6 +351,11 @@ async function bootstrap(): Promise<void> {
     platform: process.platform,
     ...(grokBuildHome ? { overrides: { grokbuildDirectory: resolve(grokBuildHome) } } : {}),
   })
+  // Claude Desktop lifecycle setup and its dedicated recovery IPC must share
+  // one serialized configuration owner so repair/rollback operations cannot
+  // race through separate in-memory queues.
+  claudeDesktopConfig = new ClaudeDesktopConfig()
+  claudeDesktopCoordinator = new ClaudeDesktopOperationCoordinator(claudeDesktopConfig)
   clientInstanceManager = new ClientInstanceManager({
     store: store.getStateRepository(),
     validateLaunchPlan: async () => {
@@ -391,6 +407,8 @@ async function bootstrap(): Promise<void> {
     codexRepair: codexRepairAndRestart,
     codexDesktop,
     installer: agentInstaller,
+    openExternal: (url) => shell.openExternal(url),
+    claudeDesktopCoordinator,
   })
   clientInstanceManager.initialize()
   const initializedInstances = await clientInstanceManager.recoverOrphanedProcesses()
@@ -438,7 +456,8 @@ async function bootstrap(): Promise<void> {
     userDataPath: app.getPath('userData'),
     binaryPath: app.isPackaged
       ? join(process.resourcesPath, 'frp', 'frpc.exe')
-      : resolve('build/frp/frpc.exe')
+      : resolve('build/frp/frpc.exe'),
+    verifyBinaryIntegrity: verifyFrpcBinaryIntegrity,
   })
   await tunnelService.initialize()
   if (bootstrapShouldStop()) return
@@ -466,7 +485,14 @@ async function bootstrap(): Promise<void> {
 
   flushGatewayApiState = registerGatewayApi(
     store, gateway, clientConfig, outboundTransport, backups,
-    updateTrayMenu, browserImportQueue, undefined, localEventServer, outboundReloadCoordinator, webDavBackups
+    updateTrayMenu, browserImportQueue, undefined, localEventServer, outboundReloadCoordinator, webDavBackups,
+    (_theme, preference) => {
+      nativeTheme.themeSource = preference
+      rendererThemeReady = true
+      if (rendererThemeReadyTimeout) clearTimeout(rendererThemeReadyTimeout)
+      rendererThemeReadyTimeout = undefined
+      revealMainWindowIfReady()
+    }
   )
   disposeBuiltInProxyApi = registerBuiltInProxyApi(builtInProxy, builtInProxy)
   systemLifecycle = new SystemLifecycleCoordinator({
@@ -479,6 +505,7 @@ async function bootstrap(): Promise<void> {
   }, codexSessionIndexCleanup)
   disposeClientInstanceApi = registerClientInstanceApi(clientInstanceManager, store)
   disposeAgentLifecycleApi = registerAgentLifecycleApi(agentLifecycle)
+  disposeClaudeDesktopApi = registerClaudeDesktopApi(claudeDesktopCoordinator)
   registerCodexSessionManagerApi(codexSessionManager)
   registerPersistentTaskApi(store.getPersistentTaskRunner())
   registerUpdateApi(updateService)
@@ -524,24 +551,28 @@ function bootstrapShouldStop(): boolean {
 
 function createWindow(): void {
   const iconPath = stoneIconPath()
+  mainWindowReadyToShow = false
+  rendererThemeReady = false
+  if (rendererThemeReadyTimeout) clearTimeout(rendererThemeReadyTimeout)
+  rendererThemeReadyTimeout = undefined
+  // Seed the hidden window from the OS, then wait for the renderer's persisted
+  // preference handshake before showing it. The timeout below remains a
+  // fail-safe if the renderer cannot initialize.
+  const initialChrome = windowChromePalette(nativeTheme.shouldUseDarkColors ? 'dark' : 'light')
   mainWindow = new BrowserWindow({
     width: 1360,
     height: 900,
     minWidth: 1040,
     minHeight: 680,
     show: false,
-    backgroundColor: '#f9fbfa',
+    backgroundColor: initialChrome.background,
     icon: iconPath,
     titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'hidden',
     ...(process.platform === 'darwin' ? {} : {
       titleBarOverlay: {
-        // Keep the native Windows overlay opaque. A transparent overlay makes
-        // DWM blend the continuously updating renderer behind the caption
-        // buttons, which can stall desktop composition under request bursts.
-        // This is visually identical to the app chrome behind it.
-        color: '#f9fbfa',
-        symbolColor: '#3d4a45',
-        height: 38
+        color: initialChrome.titleBar,
+        symbolColor: initialChrome.titleBarSymbol,
+        height: TITLE_BAR_HEIGHT
       }
     }),
     webPreferences: {
@@ -588,14 +619,27 @@ function createWindow(): void {
     if (!allowed) event.preventDefault()
   })
   mainWindow.once('ready-to-show', () => {
-    if (!startedHidden || focusMainWindowOnReady) mainWindow?.show()
-    if (focusMainWindowOnReady) showMainWindow()
+    mainWindowReadyToShow = true
+    if (!rendererThemeReady) {
+      rendererThemeReadyTimeout = setTimeout(() => {
+        rendererThemeReadyTimeout = undefined
+        rendererThemeReady = true
+        revealMainWindowIfReady()
+      }, RENDERER_THEME_READY_TIMEOUT_MS)
+    }
+    revealMainWindowIfReady()
   })
   mainWindow.on('close', (event) => {
     if (!isQuitting && tray) {
       event.preventDefault()
       mainWindow?.hide()
     }
+  })
+  mainWindow.on('closed', () => {
+    mainWindowReadyToShow = false
+    rendererThemeReady = false
+    if (rendererThemeReadyTimeout) clearTimeout(rendererThemeReadyTimeout)
+    rendererThemeReadyTimeout = undefined
   })
 
   if (trustedDevelopmentRendererUrl()) {
@@ -637,8 +681,17 @@ function createTray(): void {
   })
 }
 
+function revealMainWindowIfReady(): void {
+  if (!mainWindowReadyToShow || !rendererThemeReady) return
+  if (!startedHidden || focusMainWindowOnReady) showMainWindow()
+}
+
 function showMainWindow(): void {
   if (!mainWindow || mainWindow.isDestroyed()) return
+  if (!mainWindowReadyToShow || !rendererThemeReady) {
+    focusMainWindowOnReady = true
+    return
+  }
   focusMainWindowOnReady = false
   if (mainWindow.isMinimized()) mainWindow.restore()
   mainWindow.show()
@@ -813,9 +866,11 @@ function shutdownServices(): Promise<void> {
     await shutdownStep('managed client instances', async () => {
       await Promise.all([
         disposeAgentLifecycleApi?.(),
+        disposeClaudeDesktopApi?.(),
         disposeClientInstanceApi?.(),
       ])
       disposeAgentLifecycleApi = undefined
+      disposeClaudeDesktopApi = undefined
       disposeClientInstanceApi = undefined
       if (agentLifecycle) await agentLifecycle.dispose()
       if (clientInstanceManager) {

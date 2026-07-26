@@ -129,6 +129,8 @@ export interface ApplyClientConfigResult {
   backups: BackupRecord[]
   removedBackups: string[]
   retentionWarning?: string
+  /** A Manual-to-Auto Claude permission change applies only to new conversations. */
+  requiresNewConversation?: boolean
 }
 
 /**

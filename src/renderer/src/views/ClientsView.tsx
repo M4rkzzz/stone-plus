@@ -5,6 +5,7 @@ import {
   ChevronDown,
   CheckCircle2,
   Clipboard,
+  Code2,
   Download,
   Eye,
   ExternalLink,
@@ -13,6 +14,7 @@ import {
   History,
   LoaderCircle,
   LogIn,
+  Monitor,
   Pencil,
   Plus,
   Play,
@@ -22,6 +24,7 @@ import {
   Search,
   ShieldCheck,
   SlidersHorizontal,
+  Terminal,
   Trash2,
   Undo2,
   Upload,
@@ -43,7 +46,7 @@ import type {
 } from '@shared/types'
 import type { AgentLifecycleSnapshot, AgentTarget } from '@shared/agent-lifecycle'
 import { clientNativeProtocols } from '@shared/types'
-import { enumerateRouteSourceModels, isNativeGrokRouteSource, listRouteSources, resolveRouteSource } from '@shared/route-sources'
+import { enumerateRouteSourceModels, listRouteSourcesForClient, resolveRouteSource } from '@shared/route-sources'
 import {
   buildClientConfigWorkbenchPreview,
   clientRouteSelectionDisabled,
@@ -66,9 +69,9 @@ import { setupPoolDisplayName } from '../system-generated-text'
 import { Badge, ConfirmDialog, EmptyState, formatDateTime, InfoTip, Modal, Toggle } from '../ui'
 import '../clients-view.css'
 import { ManagedClientInstancesPanel } from '../managed-client-instances'
-import { PersistentTaskCenter } from '../persistent-task-center'
 import { agentActionBlockReason, localizedLifecycleError } from '../agent-lifecycle-control'
 import { ExclusiveAsyncOperation } from '../async-operation'
+import { agentLifecycleRenderKey } from '../app-render-state'
 import { shouldAcceptSnapshotRevision } from '../runtime-delta'
 
 const clientOrder: RouteClient[] = ['claude', 'codex', 'gemini', 'grokbuild']
@@ -76,46 +79,85 @@ const clientOrder: RouteClient[] = ['claude', 'codex', 'gemini', 'grokbuild']
 interface AgentInstallMeta {
   name: string
   client: RouteClient
+  surface: 'desktop' | 'terminal' | 'extension'
+  launchOnly?: boolean
   channel: readonly [chinese: string, english: string]
   detection: readonly [chinese: string, english: string]
+  configuration: readonly [chinese: string, english: string]
+  installAction: readonly [chinese: string, english: string]
 }
 
 const agentInstallMeta: Record<AgentTarget, AgentInstallMeta> = {
   'codex-desktop': {
     name: 'ChatGPT Desktop',
     client: 'codex',
+    surface: 'desktop',
     channel: ['OpenAI 官方获取页面', 'Official OpenAI download page'],
     detection: ['自动检测 Windows 应用安装与运行状态', 'Automatically checks Windows app installation and running state'],
+    configuration: ['Stone+ 自动维护 Codex 连接配置。', 'Stone+ manages the Codex connection automatically.'],
+    installAction: ['打开官方下载', 'Open download page'],
   },
   'codex-cli': {
     name: 'Codex CLI',
     client: 'codex',
+    surface: 'terminal',
     channel: ['官方安装指引', 'Official installation guide'],
     detection: ['自动检查标准安装位置与 PATH', 'Automatically checks standard install locations and PATH'],
+    configuration: ['Stone+ 自动维护 CLI 连接配置。', 'Stone+ manages the CLI connection automatically.'],
+    installAction: ['打开官方指引', 'Open official guide'],
   },
   'claude-code': {
-    name: 'Claude Code',
+    name: 'Claude Code CLI',
     client: 'claude',
+    surface: 'terminal',
     channel: ['官方安装指引', 'Official installation guide'],
     detection: ['自动检查标准安装位置与 PATH', 'Automatically checks standard install locations and PATH'],
+    configuration: ['Stone+ 自动维护共享的 Claude Code CLI 连接配置。', 'Stone+ manages the shared Claude Code CLI connection automatically.'],
+    installAction: ['打开官方指引', 'Open official guide'],
+  },
+  'claude-code-desktop': {
+    name: 'Claude Code Desktop',
+    client: 'claude',
+    surface: 'desktop',
+    launchOnly: true,
+    channel: ['Claude 官方下载页', 'Official Claude download page'],
+    detection: ['自动检测 Claude Desktop 安装；不接管桌面应用进程', 'Detects Claude Desktop without taking control of its process'],
+    configuration: ['接管时自动允许 Cowork 访问任意网络主机并隐藏官方模式选择器；该配置影响 Chat、Cowork 和 Code，完整退出并重开 Claude Desktop 后生效。Stone+ 不会结束宿主进程。', 'When taking over, Stone+ automatically allows Cowork to access any network host and hides the official mode chooser. The settings affect Chat, Cowork, and Code and take effect after fully quitting and reopening Claude Desktop. Stone+ does not close the host app.'],
+    installAction: ['打开官方下载页', 'Open official download page'],
+  },
+  'claude-code-vsc': {
+    name: 'Claude Code VSC',
+    client: 'claude',
+    surface: 'extension',
+    launchOnly: true,
+    channel: ['Visual Studio Marketplace', 'Visual Studio Marketplace'],
+    detection: ['自动检测官方 anthropic.claude-code 扩展', 'Detects the official anthropic.claude-code extension'],
+    configuration: ['打开时自动写入扩展连接配置；Stone+ 不会关闭或重启 VS Code。', 'Writes the extension connection automatically when opened; Stone+ never closes or restarts VS Code.'],
+    installAction: ['打开扩展市场', 'Open extension marketplace'],
   },
   'gemini-cli': {
     name: 'Gemini CLI',
     client: 'gemini',
+    surface: 'terminal',
     channel: ['官方安装指引', 'Official installation guide'],
     detection: ['自动检查标准安装位置与 PATH', 'Automatically checks standard install locations and PATH'],
+    configuration: ['Stone+ 自动维护 CLI 连接配置。', 'Stone+ manages the CLI connection automatically.'],
+    installAction: ['打开官方指引', 'Open official guide'],
   },
   'grok-build': {
     name: 'Grok Build',
     client: 'grokbuild',
+    surface: 'terminal',
     channel: ['xAI 官方安装指引', 'Official xAI installation guide'],
     detection: ['自动检查 ~/.grok/bin、标准安装位置与 PATH', 'Automatically checks ~/.grok/bin, standard install locations, and PATH'],
+    configuration: ['Stone+ 自动维护 Grok Build 连接配置。', 'Stone+ manages the Grok Build connection automatically.'],
+    installAction: ['打开官方指引', 'Open official guide'],
   },
 }
 
 const clientAgentTargets: Record<RouteClient, readonly AgentTarget[]> = {
   codex: ['codex-desktop', 'codex-cli'],
-  claude: ['claude-code'],
+  claude: ['claude-code', 'claude-code-desktop', 'claude-code-vsc'],
   gemini: ['gemini-cli'],
   grokbuild: ['grok-build'],
 }
@@ -132,6 +174,12 @@ const roleLabels: Record<ClientConfigFileRole, readonly [chinese: string, englis
 
 function roleLabel(role: ClientConfigFileRole, language: UiLanguage): string {
   return roleLabels[role][language === 'zh-CN' ? 0 : 1]
+}
+
+function agentSurfaceIcon(surface: AgentInstallMeta['surface']) {
+  if (surface === 'desktop') return <Monitor size={11} aria-hidden="true" />
+  if (surface === 'extension') return <Code2 size={11} aria-hidden="true" />
+  return <Terminal size={11} aria-hidden="true" />
 }
 
 function newLocalToken(client: RouteClient): string {
@@ -170,6 +218,8 @@ export function ClientsView({
   const [advancedOpen, setAdvancedOpen] = useState(false)
   const [restoreTarget, setRestoreTarget] = useState<ClientBackupGroup | null>(null)
   const [officialLoginConfirm, setOfficialLoginConfirm] = useState(false)
+  const [claudeDesktopOfficialRestoreConfirm, setClaudeDesktopOfficialRestoreConfirm] = useState(false)
+  const [claudeDesktopOfficialRestoreBusy, setClaudeDesktopOfficialRestoreBusy] = useState(false)
   const [codexRestartConfirm, setCodexRestartConfirm] = useState<'editor' | 'agent-limit' | null>(null)
   const [deleteProfileTarget, setDeleteProfileTarget] = useState<ClientConfigProfile | null>(null)
   const [pendingSwitch, setPendingSwitch] = useState<PendingSwitch | null>(null)
@@ -200,13 +250,31 @@ export function ClientsView({
   })
   const requestSequence = useRef(0)
   const agentLifecycleRevision = useRef(-1)
+  const agentLifecycleRenderState = useRef<string | undefined>(undefined)
   const operationGate = useRef(new ExclusiveAsyncOperation())
+  const claudeDesktopOfficialRestoreInFlight = useRef(false)
 
   const activeProfileId = activeProfiles[activeClient]
+  const claudeDesktopOfficialRestoreBlockedByLifecycle = Boolean(agentLifecycle?.busy)
+  const claudeDesktopOfficialRestoreDisabled = claudeDesktopOfficialRestoreBusy
+    || claudeDesktopOfficialRestoreBlockedByLifecycle
+  const claudeDesktopOfficialRestoreLabel = claudeDesktopOfficialRestoreBusy
+    ? t('正在恢复 Claude Desktop 官方模式', 'Restoring Claude Desktop official mode')
+    : claudeDesktopOfficialRestoreBlockedByLifecycle
+      ? t('客户端操作进行中，完成后可恢复 Claude Desktop 官方模式', 'A client operation is in progress. Restore Claude Desktop official mode after it finishes.')
+      : t('恢复 Claude Desktop 官方模式', 'Restore Claude Desktop official mode')
+  const claudeDesktopOfficialRestoreTitle = claudeDesktopOfficialRestoreBusy
+    ? t('正在恢复官方模式，请稍候。', 'Official mode is being restored. Please wait.')
+    : claudeDesktopOfficialRestoreBlockedByLifecycle
+      ? t('另一项客户端接管、修复或启动操作正在进行；完成后可恢复官方模式。', 'Another client takeover, repair, or launch operation is in progress. Restore official mode after it finishes.')
+      : t('移除 Stone+ 写入的第三方推理配置并恢复 Claude Desktop 官方模式。', 'Remove the third-party inference settings written by Stone+ and restore Claude Desktop official mode.')
 
   const acceptAgentLifecycle = useCallback((next: AgentLifecycleSnapshot) => {
     if (!shouldAcceptSnapshotRevision(agentLifecycleRevision.current, next.revision)) return
     agentLifecycleRevision.current = next.revision
+    const renderState = agentLifecycleRenderKey(next)
+    if (agentLifecycleRenderState.current === renderState) return
+    agentLifecycleRenderState.current = renderState
     setAgentLifecycle(next)
   }, [])
 
@@ -372,9 +440,10 @@ export function ClientsView({
   const route = snapshot.routes.find((candidate) => candidate.client === activeClient)
   const routeSelection = routeSelections[activeClient] ?? route?.poolId ?? ''
   const resolvedRouteSource = route?.poolId ? resolveRouteSource(route.poolId, snapshot) : undefined
-  const availableRouteSources = useMemo(() => listRouteSources(snapshot)
-    .filter((source) => activeClient !== 'grokbuild'
-      || isNativeGrokRouteSource(resolveRouteSource(source.id, snapshot), snapshot)), [activeClient, snapshot])
+  const availableRouteSources = useMemo(
+    () => listRouteSourcesForClient(activeClient, snapshot),
+    [activeClient, snapshot],
+  )
   const routeSources = useMemo(() => {
     if (!resolvedRouteSource || availableRouteSources.some((source) => source.id === resolvedRouteSource.summary.id)) return availableRouteSources
     return [resolvedRouteSource.summary, ...availableRouteSources]
@@ -490,10 +559,13 @@ export function ClientsView({
     })
     if (!result) return
     setCodexRestartConfirm(null)
+    const newConversationNotice = result.requiresNewConversation
+      ? t('；权限模式已切换为 Auto，请新建会话后使用。旧会话中待确认的工具调用不会自动重放', '; permission mode changed to Auto. Start a new conversation before continuing; pending tool calls from the old conversation are not replayed')
+      : ''
     setNotice(result.changedFiles.length
       ? t(
-        `${clientMeta[editor.client].name} 已保存 ${result.changedFiles.length} 个文件，并自动创建备份${restartCodex ? '；已完成关闭、修复会话和重新开启' : ''}`,
-        `${clientMeta[editor.client].name} saved ${result.changedFiles.length} ${result.changedFiles.length === 1 ? 'file' : 'files'} and created a backup automatically${restartCodex ? '; Codex was closed, its sessions repaired, and reopened' : ''}`,
+        `${clientMeta[editor.client].name} 已保存 ${result.changedFiles.length} 个文件，并自动创建备份${restartCodex ? '；已完成关闭、修复会话和重新开启' : ''}${newConversationNotice}`,
+        `${clientMeta[editor.client].name} saved ${result.changedFiles.length} ${result.changedFiles.length === 1 ? 'file' : 'files'} and created a backup automatically${restartCodex ? '; Codex was closed, its sessions repaired, and reopened' : ''}${newConversationNotice}`,
       )
       : t(
         `${clientMeta[editor.client].name} 配置无需更改`,
@@ -593,7 +665,54 @@ export function ClientsView({
       return operation
     })
     if (!result) return
-    setNotice(t(`${agentInstallMeta[target].name} 已启动`, `${agentInstallMeta[target].name} started`))
+    const itemMeta = agentInstallMeta[target]
+    if (target === 'claude-code-desktop') {
+      setNotice(!agent?.configured
+        ? t(
+          'Claude Desktop 配置已写入并已打开 Code；完整退出并重开 Claude Desktop 后生效。Stone+ 不会结束宿主进程。',
+          'Claude Desktop settings were written and Code was opened. Fully quit and reopen Claude Desktop to apply them. Stone+ does not close the host app.',
+        )
+        : t(
+          'Claude Desktop Code 已打开；配置影响 Chat、Cowork 和 Code，Stone+ 不会结束宿主进程。',
+          'Claude Desktop Code was opened. The settings affect Chat, Cowork, and Code; Stone+ does not close the host app.',
+        ))
+      return
+    }
+    setNotice(itemMeta.launchOnly
+      ? t(`${itemMeta.name} 已打开`, `${itemMeta.name} opened`)
+      : t(`${itemMeta.name} 已启动`, `${itemMeta.name} started`))
+  }
+
+  const restoreClaudeDesktopOfficialMode = async () => {
+    if (claudeDesktopOfficialRestoreInFlight.current || agentLifecycle?.busy) return
+    claudeDesktopOfficialRestoreInFlight.current = true
+    setClaudeDesktopOfficialRestoreBusy(true)
+    setError(null)
+    setNotice(null)
+    try {
+      const result = await api.restoreClaudeDesktopOfficialMode()
+      setClaudeDesktopOfficialRestoreConfirm(false)
+      setNotice(result.changed
+        ? t(
+          '已仅移除 Stone+ 写入的 Claude Desktop 配置并恢复官方 1P 模式。请完整退出并重开 Claude Desktop 后使用官方模式。',
+          'Only the Claude Desktop settings written by Stone+ were removed, and official 1P mode was restored. Fully quit and reopen Claude Desktop before using official mode.',
+        )
+        : t(
+          '未发现 Stone+ 写入的 Claude Desktop 配置，当前已是官方 1P 模式。若应用正在运行，请完整退出并重开以刷新界面。',
+          'No Claude Desktop settings written by Stone+ were found; official 1P mode is already active. If the app is running, fully quit and reopen it to refresh the interface.',
+        ))
+      void refreshAgents()
+    } catch (cause) {
+      setClaudeDesktopOfficialRestoreConfirm(false)
+      setError(errorMessage(
+        cause,
+        t('Claude Desktop 官方模式恢复失败', 'Could not restore Claude Desktop official mode'),
+        language,
+      ))
+    } finally {
+      claudeDesktopOfficialRestoreInFlight.current = false
+      setClaudeDesktopOfficialRestoreBusy(false)
+    }
   }
 
   const repairedRouteDraft = (): Route | undefined => {
@@ -934,26 +1053,61 @@ export function ClientsView({
       {error && <div className="error-banner client-config-message" role="alert"><div><AlertTriangle size={16} /><span>{error}</span></div></div>}
       {notice && <div className="client-easy-toast" role="status"><CheckCircle2 size={16} /><span>{notice}</span></div>}
 
-      {clientAgentTargets[activeClient].length > 0 && <div className={`client-install-list ${clientAgentTargets[activeClient].length > 1 ? 'is-pair' : ''}`} aria-label={t('安装与启动', 'Install and launch')}>
+      {clientAgentTargets[activeClient].length > 0 && <div className={`client-install-list ${clientAgentTargets[activeClient].length > 1 ? 'is-multi' : ''} ${activeClient === 'claude' ? 'is-claude-surfaces' : ''}`} aria-label={t('安装与启动', 'Install and launch')}>
         {clientAgentTargets[activeClient].map((target) => {
           const item = agentLifecycle?.agents[target]
           const itemMeta = agentInstallMeta[target]
           const installing = busy === `install-${target}` || item?.busyAction === 'install'
           const starting = busy === `start-${target}` || item?.busyAction === 'start'
           const isDesktopDownload = target === 'codex-desktop'
+          const isClaudeDesktop = target === 'claude-code-desktop'
+          const launchOnly = itemMeta.launchOnly === true
           const itemError = item?.error ? localizedLifecycleError(item.error, t) : agentCheckError
           const statusLabel = !item
             ? t('正在检测', 'Checking')
             : item.installed
-              ? item.running
-                ? t('运行中', 'Running')
-                : t('已安装', 'Installed')
+              ? isClaudeDesktop
+                ? item.configured
+                  ? t('已写入；重开后生效', 'Written; reopen to apply')
+                  : t('打开时自动写入', 'Configures when opened')
+                : !launchOnly && item.running
+                  ? t('运行中', 'Running')
+                  : t('已安装', 'Installed')
               : t('未安装', 'Not installed')
+          const description = !item?.installed
+            ? isClaudeDesktop
+              ? t('将打开 Claude 官方下载页；Stone+ 不会静默安装，完成安装后请返回重新检测。', 'Opens the official Claude download page. Stone+ does not install it silently; return and check again after installation.')
+              : isDesktopDownload
+                ? t('ChatGPT Desktop 内含 Codex；从官方页面获取后 Stone+ 会自动识别。', 'ChatGPT Desktop includes Codex; Stone+ detects it automatically after installation.')
+                : t('打开官方安装指引；完成安装后返回此处重新检测。', 'Open the official installation guide, then return here and check again after installation.')
+            : isClaudeDesktop
+              ? item.configured
+                ? t('已写入；接管时会允许 Cowork 访问任意网络主机并隐藏官方模式选择器。完整退出并重开 Claude Desktop 后生效；Stone+ 不会结束宿主进程。', 'Written. Takeover allows Cowork to access any network host and hides the official mode chooser. Fully quit and reopen Claude Desktop to apply; Stone+ does not close the host app.')
+                : t('打开时自动写入 Claude Desktop 全局第三方推理配置并打开 Code，同时允许 Cowork 访问任意网络主机并隐藏官方模式选择器。完整退出并重开后生效；Stone+ 不会结束宿主进程。', 'Opening writes the global Claude Desktop third-party inference settings and opens Code, while allowing Cowork to access any network host and hiding the official mode chooser. Fully quit and reopen to apply; Stone+ does not close the host app.')
+              : launchOnly
+                ? t(...itemMeta.configuration)
+                : item.running
+                  ? t('客户端已就绪，无需额外设置。', 'The client is ready with no additional setup required.')
+                  : t('检测完成，可以直接启动。', 'Detection complete. The client is ready to launch.')
+          const installedActionLabel = isClaudeDesktop
+            ? item?.configured
+              ? t('打开 Code', 'Open Code')
+              : t('配置并打开 Code', 'Configure and open Code')
+            : launchOnly
+              ? t('打开', 'Open')
+              : t('启动', 'Launch')
+          const startProgressLabel = isClaudeDesktop
+            ? item?.configured
+              ? t('正在打开 Code…', 'Opening Code…')
+              : t('正在配置并打开 Code…', 'Configuring and opening Code…')
+            : launchOnly
+              ? t('正在打开客户端…', 'Opening client…')
+              : t('正在启动客户端…', 'Launching client…')
           return (
             <section className="client-install" key={target} data-testid={`client-install-${target}`}>
               <div className="client-install__main">
                 <div className="client-install__identity">
-                  <span className="client-install__icon"><img src={clientMeta[itemMeta.client].icon} alt="" /></span>
+                  <span className="client-install__icon"><img src={clientMeta[itemMeta.client].icon} alt="" /><span className="client-install__surface-icon">{agentSurfaceIcon(itemMeta.surface)}</span></span>
                   <div className="client-install__copy">
                     <div className="client-install__title">
                       <strong>{itemMeta.name}</strong>
@@ -962,13 +1116,7 @@ export function ClientsView({
                         {statusLabel}{item?.version ? ` · v${item.version.replace(/^v/i, '')}` : ''}
                       </span>
                     </div>
-                    <span className="client-install__description">{item?.installed
-                      ? item.running
-                        ? t('客户端已就绪，无需额外设置。', 'The client is ready with no additional setup required.')
-                        : t('检测完成，可以直接启动。', 'Detection complete. The client is ready to launch.')
-                      : isDesktopDownload
-                        ? t('ChatGPT Desktop 内含 Codex；从官方页面获取后 Stone+ 会自动识别。', 'ChatGPT Desktop includes Codex; Stone+ detects it automatically after installation.')
-                        : t('打开官方安装指引；完成安装后返回此处重新检测。', 'Open the official installation guide, then return here and check again after installation.')}</span>
+                    {!isClaudeDesktop && <span className="client-install__description">{description}</span>}
                   </div>
                 </div>
                 <div className="client-install__actions">
@@ -982,6 +1130,20 @@ export function ClientsView({
                   >
                     <RefreshCw size={15} />
                   </button>
+                  {isClaudeDesktop && (
+                    <button
+                      className="button button--secondary client-install__restore-official"
+                      type="button"
+                      aria-label={claudeDesktopOfficialRestoreLabel}
+                      aria-busy={claudeDesktopOfficialRestoreBusy || undefined}
+                      title={claudeDesktopOfficialRestoreTitle}
+                      disabled={claudeDesktopOfficialRestoreDisabled}
+                      onClick={() => setClaudeDesktopOfficialRestoreConfirm(true)}
+                    >
+                      {claudeDesktopOfficialRestoreBusy ? <LoaderCircle size={16} className="spin" /> : <Undo2 size={16} />}
+                      {t('恢复官方模式', 'Restore official mode')}
+                    </button>
+                  )}
                   {!item?.installed ? (
                     <button
                       className="button button--primary client-install__primary"
@@ -990,22 +1152,22 @@ export function ClientsView({
                       onClick={() => void installAgent(target)}
                     >
                       {installing ? <LoaderCircle size={16} className="spin" /> : <ExternalLink size={16} />}
-                      {t('打开官方指引', 'Open official guide')}
+                      {t(...itemMeta.installAction)}
                     </button>
                   ) : (
                     <button
                       className="button button--primary client-install__primary"
                       type="button"
-                      disabled={Boolean(busy) || agentLifecycle?.busy || starting || item.running}
+                      disabled={Boolean(busy) || agentLifecycle?.busy || starting || (!launchOnly && item.running)}
                       onClick={() => void startInstalledAgent(target)}
                     >
-                      {starting ? <LoaderCircle size={16} className="spin" /> : item.running ? <CheckCircle2 size={16} /> : <Play size={16} />}
-                      {item.running ? t('正在运行', 'Running') : t('启动', 'Launch')}
+                      {starting ? <LoaderCircle size={16} className="spin" /> : !launchOnly && item.running ? <CheckCircle2 size={16} /> : <Play size={16} />}
+                      {!launchOnly && item.running ? t('正在运行', 'Running') : installedActionLabel}
                     </button>
                   )}
                 </div>
               </div>
-              {(installing || starting) && <div className="client-install__progress" role="status"><LoaderCircle size={15} className="spin" /><span>{installing ? t('正在打开官方安装指引…', 'Opening the official installation guide…') : t('正在启动客户端…', 'Launching client…')}</span></div>}
+              {(installing || starting) && <div className="client-install__progress" role="status"><LoaderCircle size={15} className="spin" /><span>{installing ? t('正在打开官方安装指引…', 'Opening the official installation guide…') : startProgressLabel}</span></div>}
               {itemError && <div className="client-install__error" role="alert"><AlertTriangle size={15} /><span>{itemError}</span></div>}
               <details className="client-install__advanced">
                 <summary className="client-install__advanced-toggle"><span><SlidersHorizontal size={15} />{t('安装详情', 'Installation details')}</span><ChevronDown size={15} /></summary>
@@ -1014,7 +1176,7 @@ export function ClientsView({
                     <label className="client-install__field"><span>{t('默认渠道', 'Default channel')}</span><input value={itemMeta.channel[language === 'zh-CN' ? 0 : 1]} readOnly /></label>
                     <label className="client-install__field"><span>{t('检测方式', 'Detection')}</span><input value={itemMeta.detection[language === 'zh-CN' ? 0 : 1]} readOnly /></label>
                   </div>
-                  <p className="client-install__hint">{t('Stone+ 会自动使用推荐设置；无需手动填写安装地址或可执行文件路径。', 'Stone+ uses the recommended settings automatically; no install URL or executable path is required.')}</p>
+                  <p className="client-install__hint">{t(...itemMeta.configuration)}</p>
                 </div>
               </details>
             </section>
@@ -1069,6 +1231,7 @@ export function ClientsView({
               ))}
             </select>
             {activeClient === 'grokbuild' && <small>{t('Grok Build 仅显示原生 Responses 的 Grok 号池或 Grok 中转站；Chat 兼容来源不会出现在这里。', 'Grok Build lists only Responses-native Grok pools or relays; Chat compatibility sources are hidden.')}</small>}
+            {activeClient === 'claude' && routeSources.find((source) => source.id === routeSelection)?.protocol === 'kiro-claude' && <small>{t('Kiro Claude 兼容桥已强制开启。Manual 切换 Auto 后请新建会话，旧待确认调用不会自动重放。', 'The Kiro Claude bridge is always enabled. Start a new conversation after switching Manual to Auto; old pending calls are not replayed.')}</small>}
           </label>
 
           <div className="client-easy-route__arrow" aria-hidden="true"><span>→</span></div>
@@ -1265,7 +1428,6 @@ export function ClientsView({
       </section>
 
       <ManagedClientInstancesPanel snapshot={snapshot} api={api} />
-      <PersistentTaskCenter api={api} />
 
       <section className={`client-advanced ${advancedOpen ? 'is-open' : ''}`}>
         <button
@@ -1452,6 +1614,19 @@ export function ClientsView({
           </div>
         )}
       </section>
+
+      <ConfirmDialog
+        open={claudeDesktopOfficialRestoreConfirm}
+        title={t('恢复 Claude Desktop 官方模式？', 'Restore Claude Desktop official mode?')}
+        message={t(
+          '此操作只会移除 Stone+ 写入的 Claude Desktop 第三方推理配置，并恢复官方 1P 模式；不会删除 Claude 账号、会话或其他应用设置。完成后必须完整退出并重开 Claude Desktop，官方模式选择器才会恢复并生效。继续吗？',
+          'This only removes the Claude Desktop third-party inference settings written by Stone+ and restores official 1P mode. It does not delete your Claude account, conversations, or other app settings. You must fully quit and reopen Claude Desktop for the official mode chooser to return and take effect. Continue?',
+        )}
+        confirmLabel={t('恢复官方模式', 'Restore official mode')}
+        busy={claudeDesktopOfficialRestoreBusy}
+        onCancel={() => setClaudeDesktopOfficialRestoreConfirm(false)}
+        onConfirm={() => void restoreClaudeDesktopOfficialMode()}
+      />
 
       <ConfirmDialog
         open={Boolean(codexRestartConfirm)}

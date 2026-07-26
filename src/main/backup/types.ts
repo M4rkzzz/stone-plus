@@ -15,9 +15,15 @@ export interface DatabaseBackupVerification extends DatabaseBackupInfo {
 }
 
 export interface DatabaseRestoreResult<T> {
+  /** `restoreFrom` crossed the irreversible live-database replacement boundary. */
+  committed: true
+  restartRequired: true
   restoredBackup: DatabaseBackupInfo
   safetyBackup: DatabaseBackupInfo
   state: T
+  postRestoreStatus: 'ready' | 'cleanup-pending'
+  /** Sanitized diagnostic only; callers must still relaunch for either status. */
+  postRestoreError?: string
 }
 
 export interface DatabaseBackupStore<T> {

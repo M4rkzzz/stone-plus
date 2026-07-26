@@ -26,6 +26,8 @@ const DEFAULT_AUTOMATIC_RETENTION = 7
 const DEFAULT_PRE_RESTORE_RETENTION = 3
 const RAW_BACKUP_SAFETY_ERROR_MESSAGE =
   'Database backups are blocked until legacy WebDAV credentials can be removed safely'
+const POST_RESTORE_PENDING_MESSAGE =
+  'Database was restored, but post-restore preparation or cleanup is pending.'
 const BACKUP_PATTERN = /^stone-backup-(\d{13,16})-(manual|automatic|pre-restore)-([0-9a-f-]{8,})\.sqlite3$/
 const REQUIRED_SCHEMA_ONE_TABLES = [
   'accounts',
@@ -220,6 +222,12 @@ export class DatabaseBackupService<T> {
     this.stopAutomaticBackups()
     let stagedPath: string | undefined
     let restoreCommitted = false
+    let committedState: T | undefined
+    let committedRestoredBackup: DatabaseBackupInfo | undefined
+    let committedSafetyBackup: DatabaseBackupInfo | undefined
+    let safetyPath: string | undefined
+    let safetyId: string | undefined
+    let safetyCreatedAt: number | undefined
     let safeToResumeAutomaticBackups = false
     try {
       // restoreFrom creates its own raw pre-restore safety copy. It must not run
@@ -233,9 +241,9 @@ export class DatabaseBackupService<T> {
       }
 
       stagedPath = join(this.backupDirectory, `.${id}.${this.randomId()}.restore`)
-      const safetyCreatedAt = this.now()
-      const safetyId = createBackupId(safetyCreatedAt, 'pre-restore', this.randomId())
-      const safetyPath = this.pathForId(safetyId)
+      safetyCreatedAt = this.now()
+      safetyId = createBackupId(safetyCreatedAt, 'pre-restore', this.randomId())
+      safetyPath = this.pathForId(safetyId)
       await copyFile(sourcePath, stagedPath)
       if (process.platform !== 'win32') await chmod(stagedPath, 0o600)
       const stagedVerification = await this.verifyPath(stagedPath, id)
@@ -247,31 +255,63 @@ export class DatabaseBackupService<T> {
       // completed its cache invalidation/sanitization/migration barrier.
       safeToResumeAutomaticBackups = false
       const commitRestore = async (): Promise<DatabaseRestoreResult<T>> => {
-        const state = await this.store.restoreFrom(stagedPath!, safetyPath)
+        const state = await this.store.restoreFrom(stagedPath!, safetyPath!)
         restoreCommitted = true
+        committedState = state
+        const restoredBackup = withoutIntegrityRows(sourceVerification)
+        committedRestoredBackup = restoredBackup
         this.pendingRestoredState = state
         this.hasPendingRestoredState = true
-        await this.prepareForRawBackup()
-        safeToResumeAutomaticBackups = true
-        const safetyVerification = await this.verifyPath(safetyPath, safetyId)
-        if (!safetyVerification.valid) {
-          throw new Error(`Pre-restore backup verification failed: ${safetyVerification.issue ?? 'integrity check failed'}`)
-        }
-        await this.pruneKind('pre-restore', this.preRestoreRetention, safetyId)
-        return {
-          restoredBackup: withoutIntegrityRows(sourceVerification),
-          safetyBackup: withoutIntegrityRows(safetyVerification),
-          state
+        try {
+          await this.prepareForRawBackup()
+          safeToResumeAutomaticBackups = true
+          const safetyVerification = await this.verifyPath(safetyPath!, safetyId!)
+          committedSafetyBackup = withoutIntegrityRows(safetyVerification)
+          if (!safetyVerification.valid) {
+            throw new Error(`Pre-restore backup verification failed: ${safetyVerification.issue ?? 'integrity check failed'}`)
+          }
+          await this.pruneKind('pre-restore', this.preRestoreRetention, safetyId!)
+          return {
+            committed: true,
+            restartRequired: true,
+            restoredBackup,
+            safetyBackup: committedSafetyBackup,
+            state,
+            postRestoreStatus: 'ready',
+          }
+        } catch {
+          committedSafetyBackup ??= await backupInfoAfterCommittedRestore(
+            safetyPath!, safetyId!, safetyCreatedAt!,
+          )
+          return {
+            committed: true,
+            restartRequired: true,
+            restoredBackup,
+            safetyBackup: committedSafetyBackup,
+            state,
+            postRestoreStatus: 'cleanup-pending',
+            postRestoreError: POST_RESTORE_PENDING_MESSAGE,
+          }
         }
       }
       return this.store.runInRestoreMaintenance
         ? await this.store.runInRestoreMaintenance(commitRestore)
         : await commitRestore()
     } catch (error) {
-      if (restoreCommitted) {
-        throw new Error(
-          `Database backup was restored, but post-restore verification or cleanup failed: ${messageOf(error)}`,
+      if (restoreCommitted && committedRestoredBackup
+        && safetyPath && safetyId && safetyCreatedAt !== undefined) {
+        committedSafetyBackup ??= await backupInfoAfterCommittedRestore(
+          safetyPath, safetyId, safetyCreatedAt,
         )
+        return {
+          committed: true,
+          restartRequired: true,
+          restoredBackup: committedRestoredBackup,
+          safetyBackup: committedSafetyBackup,
+          state: committedState as T,
+          postRestoreStatus: 'cleanup-pending',
+          postRestoreError: POST_RESTORE_PENDING_MESSAGE,
+        }
       }
       throw new Error(`Unable to restore database backup: ${messageOf(error)}`)
     } finally {
@@ -546,6 +586,22 @@ function readPragmaNumber(database: DatabaseSync, name: 'user_version'): number 
 function withoutIntegrityRows(verification: DatabaseBackupVerification): DatabaseBackupInfo {
   const { integrityCheck: _integrityCheck, ...info } = verification
   return info
+}
+
+async function backupInfoAfterCommittedRestore(
+  path: string,
+  id: string,
+  createdAt: number,
+): Promise<DatabaseBackupInfo> {
+  const sizeBytes = await stat(path).then((entry) => entry.size, () => 0)
+  return {
+    id,
+    kind: 'pre-restore',
+    createdAt,
+    sizeBytes,
+    valid: false,
+    issue: POST_RESTORE_PENDING_MESSAGE,
+  }
 }
 
 function decodeCredentialCiphertext(value: string): Buffer {

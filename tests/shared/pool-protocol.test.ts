@@ -40,4 +40,10 @@ describe('logical pool protocol', () => {
     expect(accountMatchesPoolProtocol('grok', account('chatgpt-oauth'), xaiOauth)).toBe(false)
     expect(accountMatchesPoolProtocol('grok', account('grok-oauth'), xaiOfficial)).toBe(false)
   })
+
+  it('keeps Kiro Claude as a concrete relay wire protocol but out of standard pools', () => {
+    const kiro = provider('kiro-compatible', 'kiro-claude', 'relay')
+    expect(accountPoolProtocol(account('api-key'), kiro)).toBe('kiro-claude')
+    expect(accountMatchesPoolProtocol('kiro-claude', account('api-key'), kiro)).toBe(false)
+  })
 })

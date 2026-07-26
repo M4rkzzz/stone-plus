@@ -15,6 +15,7 @@ import {
 } from 'lucide-react'
 import type { AppSnapshot, GatewayApi, RequestLog, RequestReplayResult, RequestReplayTemplate, RouteClient } from '@shared/types'
 import type { ActionRunner } from '../App'
+import { BoundAsyncOperation } from '../async-operation'
 import { requestLogSourceLabel } from '../account-source-label'
 import {
   Badge,
@@ -206,6 +207,9 @@ export function RequestsView({
   const [replayResult, setReplayResult] = useState<RequestReplayResult | null>(null)
   const [replayError, setReplayError] = useState('')
   const selectedId = selected?.id
+  const selectedIdRef = useRef(selectedId ?? '')
+  selectedIdRef.current = selectedId ?? ''
+  const replayOperation = useRef(new BoundAsyncOperation())
   const [confirmClear, setConfirmClear] = useState(false)
   const [showConversationNames, setShowConversationNames] = useState(false)
   const [columnWidths, setColumnWidths] = useState<RequestColumnWidths>(loadRequestColumnWidths)
@@ -261,7 +265,19 @@ export function RequestsView({
     [accountCredentialTypes, client, query, snapshot.requestLogs, status, t],
   )
   const visibleLogPage = useMemo(() => paginateRequestLogs(filtered, logPage), [filtered, logPage])
-  const selectLog = useCallback((log: RequestLog) => setSelected(log), [])
+  const selectLog = useCallback((log: RequestLog) => {
+    replayOperation.current.invalidate()
+    setReplayLoading(false)
+    setReplayResult(null)
+    setReplayError('')
+    setSelected(log)
+  }, [])
+
+  const closeSelected = useCallback(() => {
+    replayOperation.current.invalidate()
+    setReplayLoading(false)
+    setSelected(null)
+  }, [])
 
   useEffect(() => {
     setLogPage(0)
@@ -286,6 +302,8 @@ export function RequestsView({
 
   useEffect(() => {
     let active = true
+    replayOperation.current.invalidate()
+    setReplayLoading(false)
     setReplayTemplate(null)
     setReplayResult(null)
     setReplayError('')
@@ -298,14 +316,20 @@ export function RequestsView({
 
   const replaySelected = async () => {
     if (!selected) return
+    const binding = selected.id
     setReplayLoading(true)
     setReplayResult(null)
     setReplayError('')
-    try {
-      setReplayResult(await api.replayRequest(selected.id))
-    } catch (cause) {
-      setReplayError(localizeReplayError(cause, language, t('请求回放失败', 'Request replay failed')))
-    } finally {
+    const result = await replayOperation.current.run(
+      binding,
+      () => selectedIdRef.current,
+      () => api.replayRequest(binding),
+    )
+    if (result.status === 'applied') setReplayResult(result.value)
+    else if (result.status === 'failed') {
+      setReplayError(localizeReplayError(result.error, language, t('请求回放失败', 'Request replay failed')))
+    }
+    if (replayOperation.current.isLatest(result.token) && selectedIdRef.current === binding) {
       setReplayLoading(false)
     }
   }
@@ -436,7 +460,7 @@ export function RequestsView({
         )}
       </section>
 
-      <Modal open={Boolean(selected)} title={t('请求详情', 'Request Details')} description={selected ? formatDateTime(requestStartedAt(selected), locale) : undefined} onClose={() => setSelected(null)} width="medium">
+      <Modal open={Boolean(selected)} title={t('请求详情', 'Request Details')} description={selected ? formatDateTime(requestStartedAt(selected), locale) : undefined} onClose={closeSelected} width="medium">
         {selected && (
           <div className="request-detail">
             <div className="request-detail__status"><RequestStatusBadge status={selected.status} statusCode={selected.statusCode} requestKind={selected.requestKind} /><span>{selected.statusCode ?? '—'}</span><strong>{durationLabel(liveElapsedMs(selected, liveNow))}</strong></div>
@@ -467,6 +491,11 @@ export function RequestsView({
               <DetailItem label={t('缓存输入 Token', 'Cached Input Tokens')}>{selected.cachedInputTokens?.toLocaleString(locale) ?? '—'}</DetailItem>
               <DetailItem label={t('推理 Token', 'Reasoning Tokens')}>{selected.reasoningTokens?.toLocaleString(locale) ?? '—'}</DetailItem>
               <DetailItem label={t('输出 Token', 'Output Tokens')}>{selected.outputTokens?.toLocaleString(locale) ?? '—'}</DetailItem>
+              {selected.toolsCount !== undefined && <DetailItem label={t('声明工具数', 'Declared Tools')}>{selected.toolsCount.toLocaleString(locale)}</DetailItem>}
+              {selected.toolResultCount !== undefined && <DetailItem label={t('工具结果数', 'Tool Results')}>{selected.toolResultCount.toLocaleString(locale)}</DetailItem>}
+              {selected.toolUseCount !== undefined && <DetailItem label={t('工具调用数', 'Tool Uses')}>{selected.toolUseCount.toLocaleString(locale)}</DetailItem>}
+              {selected.stopReason !== undefined && <DetailItem label={t('终止原因', 'Stop Reason')} mono>{selected.stopReason}</DetailItem>}
+              {selected.kiroStructuralRecoveryCount !== undefined && <DetailItem label={t('Kiro 结构恢复', 'Kiro Structural Recoveries')}>{selected.kiroStructuralRecoveryCount.toLocaleString(locale)}</DetailItem>}
               {selected.status === 'streaming' && <DetailItem label={t('已接收流数据', 'Stream Data Received')}>{formatTransferBytes(selected.streamedBytes ?? 0)}</DetailItem>}
             </div>
             {selected.error && <div className="request-error"><TriangleAlert size={17} /><div><strong>{t('请求失败', 'Request Failed')}</strong><p>{language === 'en' && /[\u3400-\u9fff]/u.test(selected.error) ? 'The upstream request failed.' : selected.error}</p></div></div>}

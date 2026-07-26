@@ -1,5 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { EventEmitter } from 'node:events'
+import { mkdtemp, rm, truncate, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import type { Account, AppRuntimeDelta, AppSnapshot, PersistentTask, ProviderDefinition, PublicProxyDefinition, RequestLog, RouteClient } from '../../src/shared/types'
 import type { GatewayController } from '../../src/main/ipc/gateway-api'
 import type { GatewayAccountState, GatewayRuntimeStateUpdate } from '../../src/main/gateway'
@@ -205,6 +208,56 @@ describe('refresh provider models IPC', () => {
     )
   })
 
+  it('persists failed Kiro probes and refreshes runtime safety state for existing sources', async () => {
+    const failedProbe = {
+      ok: false,
+      stages: [
+        { id: 'tool-roundtrip' as const, status: 'error' as const, message: 'tool roundtrip failed' },
+      ],
+      models: [],
+      warnings: [],
+      error: 'tool roundtrip failed',
+      capabilityProfile: {
+        version: 1 as const,
+        origin: 'inferred' as const,
+        modelDiscovery: false,
+        toolCalls: false,
+      },
+      modelCatalog: [],
+    }
+    apiSourceProbe.run.mockResolvedValue(failedProbe)
+    const harness = createHarness([apiKeyAccount()], {}, vi.fn())
+    const snapshot = harness.store.getSnapshot()
+    snapshot.providers[0] = {
+      ...snapshot.providers[0],
+      sourceType: 'relay',
+      kind: 'kiro-compatible',
+      protocol: 'kiro-claude',
+      baseUrl: 'https://kiro.example/generateAssistantResponse',
+      models: ['claude-sonnet-4-5'],
+    }
+    const probe = electron.handlers.get('stone:probe-api-source')
+    if (!probe) throw new Error('API source probe handler was not registered')
+
+    await expect(probe(rendererEvent(108), {
+      id: provider.id,
+      name: 'Existing Kiro',
+      sourceType: 'relay',
+      kind: 'kiro-compatible',
+      baseUrl: 'https://kiro.example/generateAssistantResponse',
+      protocol: 'kiro-claude',
+      model: 'claude-sonnet-4-5',
+      persistCapabilities: true,
+    })).resolves.toMatchObject({ ok: false })
+
+    expect(harness.store.saveApiSourceCapabilityProbe).toHaveBeenCalledWith(
+      provider.id,
+      failedProbe,
+      'connection-fingerprint',
+    )
+    expect(harness.gateway.updateConfig).toHaveBeenCalled()
+  })
+
   it('discards unsaved probe evidence after any connection field changes but still saves', async () => {
     apiSourceProbe.run.mockResolvedValue(successfulApiSourceProbe())
     const harness = createHarness([apiKeyAccount()], {}, vi.fn())
@@ -394,6 +447,33 @@ describe('refresh provider models IPC', () => {
     })
     expect(harness.store.getSnapshot).toHaveBeenCalled()
     expect(harness.store.importChatGptAccounts).not.toHaveBeenCalled()
+  })
+
+  it('rejects an oversized file batch from metadata before reading or starting an import transaction', async () => {
+    electron.getLocale.mockReturnValue('en-US')
+    const directory = await mkdtemp(join(tmpdir(), 'stone-ipc-import-limit-'))
+    try {
+      const filePaths = Array.from({ length: 9 }, (_, index) => join(directory, `account-${index}.json`))
+      await Promise.all(filePaths.map(async (path) => {
+        await writeFile(path, '')
+        await truncate(path, 4 * 1024 * 1024)
+      }))
+      electron.showOpenDialog.mockResolvedValue({ canceled: false, filePaths })
+      const harness = createHarness([oauthAccount()], {}, vi.fn())
+      const handler = electron.handlers.get('stone:import-chatgpt-account-files')
+      if (!handler) throw new Error('import-chatgpt-account-files handler was not registered')
+
+      await expect(handler(rendererEvent(109), {
+        tagId: null,
+        poolId: null,
+        proxyMode: 'direct',
+      })).rejects.toThrow(/total no more than 32 MB/i)
+
+      expect(harness.store.beginCredentialImport).not.toHaveBeenCalled()
+      expect(harness.store.importChatGptAccounts).not.toHaveBeenCalled()
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+    }
   })
 
   it('uses the renderer language override for native dialogs', async () => {
@@ -769,6 +849,8 @@ describe('refresh provider models IPC', () => {
         backupRetention: 3,
       })
       return {
+        committed: true,
+        restartRequired: true,
         restoredBackup: {
           id: 'stone-backup-1800000000000-manual-12345678.sqlite3',
           kind: 'manual', createdAt: 1_800_000_000_000, sizeBytes: 1024, valid: true,
@@ -778,6 +860,7 @@ describe('refresh provider models IPC', () => {
           kind: 'pre-restore', createdAt: 1_800_000_000_001, sizeBytes: 1024, valid: true,
         },
         state: {} as PersistedState,
+        postRestoreStatus: 'ready',
       }
     })
     const handler = electron.handlers.get('stone:restore-state-backup')
@@ -791,6 +874,43 @@ describe('refresh provider models IPC', () => {
     expect(backupHarness.setAutomaticRetention).toHaveBeenCalledWith(3)
     expect(harness.transport.configureOutboundNetwork).toHaveBeenCalledWith('system', 16661)
     await new Promise<void>((resolve) => setImmediate(resolve))
+    expect(electron.relaunch).toHaveBeenCalledOnce()
+    expect(electron.quit).toHaveBeenCalledOnce()
+  })
+
+  it('forces relaunch and never restarts the old gateway when restored-state publication fails', async () => {
+    const backupHarness = createBackupServiceHarness()
+    const harness = createHarness(
+      [oauthAccount()], {}, vi.fn(), undefined, undefined, undefined, undefined, backupHarness.services,
+    )
+    harness.store.getSnapshot().gatewayStatus.running = true
+    backupHarness.restoreBackup.mockResolvedValueOnce({
+      committed: true,
+      restartRequired: true,
+      restoredBackup: {
+        id: 'stone-backup-1800000000000-manual-12345678.sqlite3',
+        kind: 'manual', createdAt: 1_800_000_000_000, sizeBytes: 1024, valid: true,
+      },
+      safetyBackup: {
+        id: 'stone-backup-1800000000001-pre-restore-12345679.sqlite3',
+        kind: 'pre-restore', createdAt: 1_800_000_000_001, sizeBytes: 1024, valid: true,
+      },
+      state: {} as PersistedState,
+      postRestoreStatus: 'cleanup-pending',
+      postRestoreError: 'Database was restored, but cleanup is pending.',
+    })
+    harness.runtimeChanged.mockImplementationOnce(() => { throw new Error('injected publish failure') })
+    const handler = electron.handlers.get('stone:restore-state-backup')
+    if (!handler) throw new Error('restore-state-backup handler was not registered')
+
+    await expect(handler(
+      rendererEvent(110),
+      'C:\\Stone\\backups\\stone-backup-1800000000000-manual-12345678.sqlite3',
+    )).rejects.toThrow(/publish failure/)
+    await new Promise<void>((resolve) => setImmediate(resolve))
+
+    expect(harness.gateway.stop).toHaveBeenCalledWith({ force: true })
+    expect(harness.gateway.start).not.toHaveBeenCalled()
     expect(electron.relaunch).toHaveBeenCalledOnce()
     expect(electron.quit).toHaveBeenCalledOnce()
   })
@@ -982,6 +1102,40 @@ describe('refresh provider models IPC', () => {
     })
   })
 
+  it('rejects forged and existing system OAuth sources at the legacy save-provider IPC boundary', () => {
+    const harness = createHarness([oauthAccount()], {}, vi.fn())
+    const handler = electron.handlers.get('stone:save-provider')
+    if (!handler) throw new Error('save-provider handler was not registered')
+    const mainFrame = { url: 'http://127.0.0.1:5173/index.html' }
+    const event = { senderFrame: mainFrame, sender: { mainFrame } }
+
+    expect(() => handler(event, {
+      name: 'Forged hidden OAuth source',
+      sourceType: 'oauth-system',
+      kind: 'openai',
+      baseUrl: 'https://credential-capture.example/v1',
+      protocol: 'openai-responses',
+      models: [],
+    })).toThrow(/OAuth import flow/)
+
+    harness.store.getSnapshot().providers[0] = {
+      ...harness.store.getSnapshot().providers[0],
+      sourceType: 'oauth-system',
+      baseUrl: 'https://api.openai.com/v1',
+    }
+    expect(() => handler(event, {
+      id: provider.id,
+      name: 'Captured OAuth source',
+      kind: 'openai',
+      baseUrl: 'https://credential-capture.example/v1',
+      protocol: 'openai-responses',
+      models: [],
+    })).toThrow(/OAuth import flow/)
+
+    expect(harness.store.saveProvider).not.toHaveBeenCalled()
+    expect(harness.gateway.updateConfig).not.toHaveBeenCalled()
+  })
+
   it('forwards an explicit Responses compact capability through the current API-source IPC', async () => {
     const account = apiKeyAccount()
     const harness = createHarness([account], {}, vi.fn())
@@ -1164,6 +1318,30 @@ describe('refresh provider models IPC', () => {
         expect.objectContaining({ progressId: 'paste-import-progress', phase: 'complete', percent: 100 })
       ]))
     expect(progressEvents.every((progress) => !/[\u3400-\u9fff]/u.test(progress.message))).toBe(true)
+  })
+
+  it('rolls back a pasted credential replacement when remote validation fails', async () => {
+    electron.getLocale.mockReturnValue('en-US')
+    const oauth = oauthAccount()
+    const upstreamFetch = vi.fn(async () => new Response(
+      JSON.stringify({ error: 'invalid imported credential' }),
+      { status: 401, headers: { 'content-type': 'application/json' } },
+    ))
+    const harness = createHarness([oauth], { [oauth.credentialId]: oauthCredential() }, upstreamFetch)
+    const handler = electron.handlers.get('stone:import-chatgpt-accounts')
+    if (!handler) throw new Error('import-chatgpt-accounts handler was not registered')
+    const event = rendererEvent(108)
+
+    await expect(handler(event, {
+      content: '{"access_token":"rejected-import"}',
+      tagId: null,
+      poolId: null,
+      proxyMode: 'direct',
+    })).rejects.toThrow(/failed remote validation.*previous credentials were restored/i)
+
+    expect(harness.store.beginCredentialImport).toHaveBeenCalledOnce()
+    expect(harness.store.rollbackCredentialImport).toHaveBeenCalledWith('credential-import-transaction')
+    expect(harness.store.commitCredentialImport).not.toHaveBeenCalled()
   })
 
   it('exchanges OAuth through the selected proxy and only returns the sanitized import result', async () => {
@@ -2180,6 +2358,65 @@ describe('refresh provider models IPC', () => {
     expect(oauth.cooldownUntil).toBeLessThanOrEqual(Date.now() + resetAfterSeconds * 1_000)
   })
 
+  it('automatically retries an ambiguous five-hour reset boundary instead of sleeping until seven days', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-07-25T10:36:52.000Z'))
+    const boundary = Date.now()
+    const oauth = {
+      ...oauthAccount(),
+      status: 'cooldown' as const,
+      circuitState: 'open' as const,
+      cooldownReason: 'quota' as const,
+      cooldownUntil: boundary,
+      codexQuota: {
+        allowed: false,
+        limitReached: true,
+        fiveHour: { usedPercent: 100, resetAt: boundary },
+        sevenDay: { usedPercent: 16, resetAt: boundary + 7 * 24 * 60 * 60_000 },
+        observedAt: boundary,
+        source: 'usage-endpoint' as const
+      }
+    }
+    let attempt = 0
+    const upstreamFetch = vi.fn(async () => {
+      attempt += 1
+      return new Response(JSON.stringify({
+        rate_limit: attempt === 1 ? {
+          allowed: false,
+          limit_reached: true,
+          primary_window: { used_percent: 100, limit_window_seconds: 18_000, reset_after_seconds: 0 },
+          secondary_window: { used_percent: 16, limit_window_seconds: 604_800, reset_after_seconds: 604_800 }
+        } : {
+          allowed: true,
+          limit_reached: false,
+          primary_window: { used_percent: 0, limit_window_seconds: 18_000, reset_after_seconds: 18_000 },
+          secondary_window: { used_percent: 16, limit_window_seconds: 604_800, reset_after_seconds: 604_800 }
+        }
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    })
+    const harness = createHarness([oauth], { [oauth.credentialId]: oauthCredential() }, upstreamFetch)
+
+    try {
+      await vi.advanceTimersByTimeAsync(1_000)
+      expect(upstreamFetch).toHaveBeenCalledTimes(1)
+      expect(oauth).toMatchObject({
+        status: 'cooldown',
+        cooldownReason: 'quota',
+        cooldownUntil: boundary + 61_000
+      })
+
+      await vi.advanceTimersByTimeAsync(61_000)
+      expect(upstreamFetch).toHaveBeenCalledTimes(2)
+      expect(oauth).toMatchObject({ status: 'active', circuitState: 'closed' })
+      expect(oauth.cooldownReason).toBeUndefined()
+      expect(oauth.cooldownUntil).toBeUndefined()
+      expect(harness.gateway.resetAccountHealth).toHaveBeenCalledWith(oauth.id)
+    } finally {
+      await harness.dispose()
+      vi.useRealTimers()
+    }
+  })
+
   it('runs bulk account checks as a durable credential-free task', async () => {
     const oauth = oauthAccount()
     const upstreamFetch = vi.fn(async () => new Response(JSON.stringify({
@@ -2905,6 +3142,9 @@ function createHarness(
         : candidate)
       return snapshot
     }),
+    beginCredentialImport: vi.fn(async () => 'credential-import-transaction'),
+    commitCredentialImport: vi.fn(async () => undefined),
+    rollbackCredentialImport: vi.fn(async () => undefined),
     validateChatGptImportAssignments: vi.fn(),
     addDetectedChatGptAccountsToPool: vi.fn(async (poolId: string | null | undefined, accountIds: string[]) => ({
       added: poolId ? accountIds.length : 0,
@@ -2927,6 +3167,17 @@ function createHarness(
         createdAccountIds: [],
         updatedAccountIds: [imported.id],
         warnings: []
+      }
+    }),
+    importGrokAccounts: vi.fn(async () => {
+      const imported = accounts[0]
+      if (!imported) throw new Error('No mock account available for import')
+      return {
+        snapshot,
+        importedAccountIds: [imported.id],
+        createdAccountIds: [],
+        updatedAccountIds: [imported.id],
+        warnings: [],
       }
     }),
     setAccountCheckResult,
@@ -2989,6 +3240,7 @@ function createHarness(
       }
     }),
     getRuntimeProvider: vi.fn((id: string) => snapshot.providers.find((candidate) => candidate.id === id)),
+    getApiSourceCredential: vi.fn(() => 'stored-api-source-key'),
     getApiSourceProbeConnectionFingerprint: vi.fn(() => 'connection-fingerprint'),
     saveApiSourceCapabilityProbe: vi.fn(async () => snapshot),
     appendHealthEvent: vi.fn(async () => snapshot)

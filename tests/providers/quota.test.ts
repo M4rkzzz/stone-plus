@@ -37,6 +37,21 @@ describe('Codex quota cooldown', () => {
       sevenDay: { usedPercent: 75, resetAt: now + 3 * 60 * 60_000 }
     }
     expect(codexQuotaCooldownUntil(quota, now)).toBe(now + 20 * 60_000)
+    expect(codexQuotaCooldownUntil(quota, now + 20 * 60_000)).toBeUndefined()
+  })
+
+  it('rechecks soon instead of promoting an expired five-hour exhaustion to seven days', () => {
+    const quota = {
+      observedAt: now,
+      source: 'usage-endpoint' as const,
+      allowed: false,
+      limitReached: true,
+      fiveHour: { usedPercent: 100, resetAt: now },
+      sevenDay: { usedPercent: 16, resetAt: now + 7 * 24 * 60 * 60_000 }
+    }
+
+    expect(codexQuotaIsExhausted(quota, now)).toBe(true)
+    expect(codexQuotaCooldownUntil(quota, now)).toBeUndefined()
   })
 })
 
@@ -451,7 +466,7 @@ describe('quota signal merge precedence', () => {
     })
   })
 
-  it('merges a partial usage-endpoint Codex snapshot over response-header observations', () => {
+  it('replaces response-header observations with an authoritative usage-endpoint snapshot', () => {
     const earlier: NormalizedQuotaSignals = {
       codexQuota: {
         fiveHour: { usedPercent: 10, windowSeconds: 18_000, resetAt: now + 60_000 },
@@ -473,9 +488,7 @@ describe('quota signal merge precedence', () => {
 
     expect(mergeQuotaSignals(earlier, later)).toEqual({
       codexQuota: {
-        fiveHour: { usedPercent: 12, windowSeconds: 18_000, resetAt: now + 60_000 },
-        sevenDay: { usedPercent: 30, windowSeconds: 604_800, resetAt: now + 600_000 },
-        allowed: true,
+        fiveHour: { usedPercent: 12 },
         limitReached: true,
         observedAt: now + 1_000,
         source: 'usage-endpoint'

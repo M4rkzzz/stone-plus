@@ -5,6 +5,7 @@ import {
   routeEditorHasChanges,
   routeEnabledPayload,
   routePreviewIssuesForDisplay,
+  routePreviewBinding,
   routeSourceUsesGrok,
   routeSourceUsesNativeGrok,
   routeToggleAcknowledgementSignature,
@@ -54,6 +55,29 @@ describe('route editor state boundaries', () => {
       .toEqual({ valid: false, reason: 'reserved-source' })
     expect(validateRouteMappings([{ source: 'alias', target: 'gpt-5' }], ' grok-4 '))
       .toEqual({ valid: true, modelMap: { alias: 'gpt-5', '*': 'grok-4' } })
+  })
+
+  it('reuses persistence-safe model-map validation instead of accepting unsafe visible values', () => {
+    expect(validateRouteMappings([{ source: '__proto__', target: 'gpt-5' }]))
+      .toEqual({ valid: false, reason: 'unsafe-source' })
+    expect(validateRouteMappings([{ source: 'alias\u0000', target: 'gpt-5' }]))
+      .toEqual({ valid: false, reason: 'unsafe-source' })
+    expect(validateRouteMappings([{ source: 'alias', target: `gpt-${'x'.repeat(256)}` }]))
+      .toEqual({ valid: false, reason: 'unsafe-target' })
+    expect(validateRouteMappings([], `gpt-${'x'.repeat(256)}`))
+      .toEqual({ valid: false, reason: 'unsafe-target' })
+  })
+
+  it('invalidates a static preview when any request-relevant editor field changes', () => {
+    const rows = [{ source: 'alias', target: 'gpt-saved' }]
+    const base = routePreviewBinding(route, rows, '', 'alias')
+
+    expect(routePreviewBinding({ ...route, poolId: 'other' }, rows, '', 'alias')).not.toBe(base)
+    expect(routePreviewBinding({ ...route, highConcurrencyMode: true }, rows, '', 'alias')).not.toBe(base)
+    expect(routePreviewBinding({ ...route, localToken: 'stone_other' }, rows, '', 'alias')).not.toBe(base)
+    expect(routePreviewBinding(route, [{ source: 'alias', target: 'gpt-other' }], '', 'alias')).not.toBe(base)
+    expect(routePreviewBinding(route, rows, 'gpt-default', 'alias')).not.toBe(base)
+    expect(routePreviewBinding(route, rows, '', 'other')).not.toBe(base)
   })
 
   it('keeps the reserved default mapping out of exact editor rows', () => {

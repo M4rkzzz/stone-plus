@@ -1,8 +1,11 @@
 import { evaluateSourceEligibility } from './source-eligibility'
 import { resolveRouteModel } from './route-models'
-import { isAvailableRouteAccount, isNativeGrokRouteSource, resolveRouteSource } from './route-sources'
-import { accountMatchesPoolProtocol, accountPoolProtocol } from './pool-protocol'
-import { providerSourceFamily } from './source-family'
+import {
+  analyzeRouteSourceCompatibility,
+  isCurrentlySchedulableRouteAccount,
+  isRouteSourcePoolTopologyValid,
+  resolveRouteSource,
+} from './route-sources'
 import { clientNativeProtocols } from './types'
 import type {
   AppSnapshot,
@@ -31,16 +34,23 @@ export function previewRoute(
     issues.push(issue('source-missing', 'error', '目标来源不存在或配置不完整。'))
     return result(route.poolId, route.inboundProtocol, requestedModel, upstreamModel, 0, issues)
   }
-  const clientSourceCompatible = route.client !== 'grokbuild' || isNativeGrokRouteSource(source, snapshot)
-  const topologyValid = clientSourceCompatible && routeSourceTopologyValid(source.pool, snapshot)
-  const eligibleAccounts = topologyValid ? source.accounts.filter(isAvailableRouteAccount) : []
+  const topologyValid = isRouteSourcePoolTopologyValid(source.pool, snapshot)
+  const sourceCompatibility = analyzeRouteSourceCompatibility(route.client, source, snapshot)
+  const clientSourceCompatible = sourceCompatibility.eligible
+  const eligibleAccounts = topologyValid && clientSourceCompatible ? source.accounts.filter((account) => (
+    isCurrentlySchedulableRouteAccount(account)
+  )) : []
   if (!eligibleAccounts.length) {
     issues.push(issue(
       'source-unavailable',
       'error',
-      !clientSourceCompatible
-        ? 'Grok Build 只能使用原生 OpenAI Responses 协议的 Grok 号池或 Grok 中转站。'
-        : topologyValid ? '来源没有可参与调度的账号。' : '来源成员与号池协议或来源类型不一致。',
+      !topologyValid
+        ? '来源成员与号池协议或来源类型不一致。'
+        : !clientSourceCompatible
+          ? route.client === 'grokbuild'
+            ? 'Grok Build 只能使用原生 OpenAI Responses 协议的 Grok 号池或 Grok 中转站。'
+            : sourceCompatibility.reason ?? '来源与当前客户端不兼容。'
+          : '来源没有可参与调度的账号。',
     ))
   }
   const sourceWireProtocols = routeSourceWireProtocols(source.accounts, snapshot.providers)
@@ -121,38 +131,6 @@ function routeSourceWireProtocols(
     const protocol = providersById.get(account.providerId)?.protocol
     return protocol ? [protocol] : []
   }))
-}
-
-function routeSourceTopologyValid(
-  pool: AppSnapshot['pools'][number],
-  snapshot: Pick<AppSnapshot, 'providers' | 'accounts'>,
-): boolean {
-  const accounts = new Map(snapshot.accounts.map((account) => [account.id, account]))
-  const providers = new Map(snapshot.providers.map((provider) => [provider.id, provider]))
-  const members = pool.members.map((member) => {
-    const account = accounts.get(member.accountId)
-    return { account, provider: account ? providers.get(account.providerId) : undefined }
-  })
-  if (members.some(({ account, provider }) => !account || !provider)) return false
-  if (pool.kind === 'relay-aggregate') {
-    const families = new Set(members.map(({ provider }) => providerSourceFamily(provider!.kind)))
-    return families.size === 1 && members.every(({ provider }) => (
-      provider!.sourceType === 'relay' && provider!.protocol === pool.protocol
-    ))
-  }
-  if (pool.protocol === 'grok') {
-    return members.every(({ account, provider }) => provider!.sourceType === 'relay'
-      ? account!.credentialType === 'api-key'
-        && providerSourceFamily(provider!.kind) === 'grok'
-        && accountPoolProtocol(account!, provider!) === 'grok'
-      : accountMatchesPoolProtocol('grok', account!, provider!))
-  }
-  const families = new Set(members.map(({ provider }) => providerSourceFamily(provider!.kind)))
-  return families.size === 1 && members.every(({ account, provider }) => (
-    provider!.sourceType === 'relay'
-      ? account!.credentialType !== 'grok-oauth'
-      : accountMatchesPoolProtocol(pool.protocol, account!, provider!)
-  ))
 }
 
 function uniqueCapabilities(value: readonly UpstreamCapabilityRequirement[] | undefined): UpstreamCapabilityRequirement[] {

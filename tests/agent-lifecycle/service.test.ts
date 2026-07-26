@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import type { AgentTarget } from '../../src/shared/agent-lifecycle'
+import type { AgentLifecycleChangedEvent, AgentTarget } from '../../src/shared/agent-lifecycle'
 import {
   AgentLifecycleService,
   type AgentAdapterSnapshot,
@@ -7,7 +7,17 @@ import {
   type AgentLifecycleAdapterPort,
 } from '../../src/main/agent-lifecycle/service'
 
-const targets: AgentTarget[] = ['codex-desktop', 'codex-cli', 'claude-code', 'gemini-cli', 'grok-build']
+const targets: AgentTarget[] = [
+  'codex-desktop',
+  'codex-cli',
+  'claude-code',
+  'claude-code-desktop',
+  'claude-code-vsc',
+  'gemini-cli',
+  'grok-build',
+]
+const runningTargets = ['codex-desktop', 'codex-cli', 'claude-code', 'gemini-cli', 'grok-build'] as const
+const launchOnlyTargets = ['claude-code-desktop', 'claude-code-vsc'] as const
 
 describe('AgentLifecycleService', () => {
   it('isolates an inspection failure to the affected Agent', async () => {
@@ -20,6 +30,65 @@ describe('AgentLifecycleService', () => {
     expect(snapshot.agents['claude-code'].attention).toBe('failed')
     expect(snapshot.agents['claude-code'].error?.message).toContain('broken config')
     expect(snapshot.agents['codex-desktop'].attention).toBe('normal')
+  })
+
+  it('clears a transient inspection error after the next successful inspection', async () => {
+    const inspect = vi.fn()
+      .mockRejectedValueOnce(new Error('temporary discovery failure'))
+      .mockResolvedValue(healthySnapshot())
+    const service = createService(adaptersWith({ 'claude-code': { inspect } }), {
+      snapshotCacheTtlMs: 0,
+    })
+
+    expect((await service.getSnapshot()).agents['claude-code'].attention).toBe('failed')
+    const recovered = await service.getSnapshot()
+
+    expect(recovered.agents['claude-code'].attention).toBe('normal')
+    expect(recovered.agents['claude-code'].error).toBeUndefined()
+  })
+
+  it('coalesces and briefly caches renderer snapshot probes', async () => {
+    let now = 10_000
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const inspect = vi.fn(async () => { await gate; return healthySnapshot() })
+    const service = createService(adaptersWith({ 'claude-code': { inspect } }), {
+      now: () => now,
+      snapshotCacheTtlMs: 4_000,
+    })
+
+    const first = service.getSnapshot()
+    const second = service.getSnapshot()
+    release()
+    await Promise.all([first, second])
+    await service.getSnapshot()
+    expect(inspect).toHaveBeenCalledTimes(1)
+
+    now += 4_001
+    await service.getSnapshot()
+    expect(inspect).toHaveBeenCalledTimes(2)
+  })
+
+  it('does not publish an older polling flight after a lifecycle transition begins', async () => {
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const inspect = vi.fn()
+      .mockImplementationOnce(async () => { await gate; return healthySnapshot() })
+      .mockImplementation(async () => healthySnapshot())
+    const restore = vi.fn(async () => ({ changed: true }))
+    const service = createService(adaptersWith({ 'claude-code': { inspect, restore } }))
+    const events: AgentLifecycleChangedEvent[] = []
+    service.onChange((event) => events.push(event))
+
+    const polling = service.getSnapshot()
+    await vi.waitFor(() => expect(inspect).toHaveBeenCalledOnce())
+    const operation = service.restore('claude-code')
+    release()
+    await Promise.all([polling, operation])
+
+    expect(events.some((event) => event.snapshot.busy
+      && event.snapshot.agents['claude-code'].busyAction === 'restore')).toBe(true)
+    expect(restore).toHaveBeenCalledOnce()
   })
 
   it('serializes Codex desktop and CLI operations through their shared state group', async () => {
@@ -66,8 +135,41 @@ describe('AgentLifecycleService', () => {
     await Promise.all(operations)
   })
 
+  it('serializes all Claude surfaces through one config lock without treating them as aliases', async () => {
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const cliRestore = vi.fn(async () => { await gate; return { changed: true } })
+    const desktopRestore = vi.fn(async () => ({ changed: true }))
+    const vscRestore = vi.fn(async () => ({ changed: true }))
+    const stoppedSurface = vi.fn(async () => ({
+      ...healthySnapshot(),
+      running: false,
+      managedInstanceCount: 0,
+      processControl: 'unavailable' as const,
+    }))
+    const service = createService(adaptersWith({
+      'claude-code': { restore: cliRestore },
+      'claude-code-desktop': { inspect: stoppedSurface, restore: desktopRestore },
+      'claude-code-vsc': { inspect: stoppedSurface, restore: vscRestore },
+    }))
+
+    const cli = service.restore('claude-code')
+    await vi.waitFor(() => expect(cliRestore).toHaveBeenCalledOnce())
+    const desktop = service.restore('claude-code-desktop')
+    const vsc = service.restore('claude-code-vsc')
+    await Promise.resolve()
+    expect(desktopRestore).not.toHaveBeenCalled()
+    expect(vscRestore).not.toHaveBeenCalled()
+
+    release()
+    await Promise.all([cli, desktop, vsc])
+    expect(desktopRestore).toHaveBeenCalledOnce()
+    expect(vscRestore).toHaveBeenCalledOnce()
+  })
+
   it('returns partial aggregate results without hiding the failing Agent', async () => {
     const adapters = adaptersWith({
+      'codex-cli': { inspect: vi.fn(async () => stoppedSnapshot()) },
       'gemini-cli': { restore: vi.fn(async () => { throw new Error('cannot validate') }) },
     })
     const service = createService(adapters)
@@ -75,9 +177,9 @@ describe('AgentLifecycleService', () => {
     const result = await service.repairAllAffected()
 
     expect(result.status).toBe('partial')
-    expect(result.results).toHaveLength(5)
+    expect(result.results).toHaveLength(7)
     expect(result.results.find((entry) => entry.target === 'gemini-cli')?.error?.message).toContain('cannot validate')
-    expect(result.results.filter((entry) => entry.status === 'succeeded')).toHaveLength(3)
+    expect(result.results.filter((entry) => entry.status === 'succeeded')).toHaveLength(5)
     expect(result.results.find((entry) => entry.target === 'codex-cli')?.status).toBe('skipped')
   })
 
@@ -86,7 +188,7 @@ describe('AgentLifecycleService', () => {
     const cliRestore = vi.fn(async () => ({ changed: true }))
     const service = createService(adaptersWith({
       'codex-desktop': { restore: desktopRestore },
-      'codex-cli': { restore: cliRestore },
+      'codex-cli': { inspect: vi.fn(async () => stoppedSnapshot()), restore: cliRestore },
     }))
 
     const result = await service.smartRepair()
@@ -103,12 +205,57 @@ describe('AgentLifecycleService', () => {
     expect(result.results.find((entry) => entry.target === 'codex-cli')?.status).toBe('skipped')
   })
 
+  it('uses the running Codex member as aggregate representative and never starts its stopped sibling', async () => {
+    let desktopRunning = false
+    const cliRunning = true
+    const desktopStart = vi.fn(async () => { desktopRunning = true })
+    const desktopRestore = vi.fn(async () => ({ changed: true }))
+    const cliRestore = vi.fn(async () => ({ changed: true }))
+    const service = createService(adaptersWith({
+      'codex-desktop': {
+        inspect: vi.fn(async () => ({ ...healthySnapshot(), running: desktopRunning, managedInstanceCount: Number(desktopRunning) })),
+        start: desktopStart,
+        restore: desktopRestore,
+      },
+      'codex-cli': {
+        inspect: vi.fn(async () => ({ ...healthySnapshot(), running: cliRunning, managedInstanceCount: Number(cliRunning) })),
+        restore: cliRestore,
+      },
+    }))
+
+    const result = await service.repairAllAffected()
+
+    expect(cliRestore).toHaveBeenCalledOnce()
+    expect(desktopRestore).not.toHaveBeenCalled()
+    expect(desktopStart).not.toHaveBeenCalled()
+    expect(result.results.find((entry) => entry.target === 'codex-cli')?.status).toBe('succeeded')
+    expect(result.results.find((entry) => entry.target === 'codex-desktop')?.status).toBe('skipped')
+  })
+
+  it('fails closed when both shared Codex surfaces already report running', async () => {
+    const desktopRestore = vi.fn(async () => ({ changed: true }))
+    const cliRestore = vi.fn(async () => ({ changed: true }))
+    const service = createService(adaptersWith({
+      'codex-desktop': { restore: desktopRestore },
+      'codex-cli': { restore: cliRestore },
+    }))
+
+    const result = await service.repairAllAffected()
+
+    expect(desktopRestore).not.toHaveBeenCalled()
+    expect(cliRestore).not.toHaveBeenCalled()
+    expect(result.results.filter((entry) => entry.target.startsWith('codex-'))).toEqual(expect.arrayContaining([
+      expect.objectContaining({ target: 'codex-desktop', status: 'failed', error: expect.objectContaining({ code: 'operation-conflict' }) }),
+      expect.objectContaining({ target: 'codex-cli', status: 'failed', error: expect.objectContaining({ code: 'operation-conflict' }) }),
+    ]))
+  })
+
   it('uses the installed Codex member as the shared-home repair representative', async () => {
     const desktopRestore = vi.fn(async () => ({ changed: true }))
     const cliRestore = vi.fn(async () => ({ changed: true }))
     const adapters = adaptersWith({
       'codex-desktop': {
-        inspect: vi.fn(async () => ({ ...healthySnapshot(), installed: false })),
+        inspect: vi.fn(async () => ({ ...stoppedSnapshot(), installed: false })),
         restore: desktopRestore,
       },
       'codex-cli': { restore: cliRestore },
@@ -121,12 +268,33 @@ describe('AgentLifecycleService', () => {
     expect(cliRestore).toHaveBeenCalledOnce()
   })
 
+  it('does not collapse Claude CLI, Desktop, and VSC during aggregate restore', async () => {
+    const cliRestore = vi.fn(async () => ({ changed: true }))
+    const desktopRestore = vi.fn(async () => ({ changed: true }))
+    const vscRestore = vi.fn(async () => ({ changed: true }))
+    const service = createService(adaptersWith({
+      'claude-code': { restore: cliRestore },
+      'claude-code-desktop': { restore: desktopRestore },
+      'claude-code-vsc': { restore: vscRestore },
+    }))
+
+    const result = await service.repairAllAffected()
+
+    expect(cliRestore).toHaveBeenCalledOnce()
+    expect(desktopRestore).toHaveBeenCalledOnce()
+    expect(vscRestore).toHaveBeenCalledOnce()
+    for (const target of ['claude-code', 'claude-code-desktop', 'claude-code-vsc'] as const) {
+      expect(result.results.find((entry) => entry.target === target)?.status).toBe('succeeded')
+    }
+  })
+
   it('coalesces concurrent smart repair and repair-all requests', async () => {
     let release!: () => void
     const gate = new Promise<void>((resolve) => { release = resolve })
     const desktopRestore = vi.fn(async () => { await gate; return { changed: true } })
     const service = createService(adaptersWith({
       'codex-desktop': { restore: desktopRestore },
+      'codex-cli': { inspect: vi.fn(async () => stoppedSnapshot()) },
     }))
 
     const smartRepair = service.smartRepair()
@@ -163,7 +331,7 @@ describe('AgentLifecycleService', () => {
     await service.smartRepair()
 
     expect(completed).toHaveBeenCalledOnce()
-    expect(completed.mock.calls[0][0].results).toHaveLength(5)
+    expect(completed.mock.calls[0][0].results).toHaveLength(7)
   })
 
   it('soft-times out a stuck target without releasing its shared-state lock', async () => {
@@ -177,7 +345,7 @@ describe('AgentLifecycleService', () => {
     const cliRestore = vi.fn(async () => ({ changed: true }))
     const adapters = adaptersWith({
       'codex-desktop': { restore: desktopRestore },
-      'codex-cli': { restore: cliRestore },
+      'codex-cli': { inspect: vi.fn(async () => stoppedSnapshot()), restore: cliRestore },
     })
     const service = createService(adapters, { operationTimeoutMs: 10 })
 
@@ -266,7 +434,7 @@ describe('AgentLifecycleService', () => {
     })
   })
 
-  it('does not start an unavailable or unconfigured Agent', async () => {
+  it('does not start an unavailable Agent', async () => {
     const start = vi.fn(async () => undefined)
     const adapters = adaptersWith({
       'claude-code': {
@@ -281,6 +449,24 @@ describe('AgentLifecycleService', () => {
     expect(result.status).toBe('failed')
     expect(result.results[0].error?.code).toBe('not-installed')
     expect(start).not.toHaveBeenCalled()
+  })
+
+  it('lets an installed but drifted Agent repair its connection during start', async () => {
+    let repaired = false
+    const start = vi.fn(async () => { repaired = true })
+    const inspect = vi.fn(async () => ({
+      ...healthySnapshot(),
+      configured: repaired,
+      running: repaired,
+      managedInstanceCount: Number(repaired),
+    }))
+    const service = createService(adaptersWith({ 'claude-code': { inspect, start } }))
+
+    const result = await service.start('claude-code')
+
+    expect(result.status).toBe('succeeded')
+    expect(start).toHaveBeenCalledOnce()
+    expect(result.snapshot.agents['claude-code']).toMatchObject({ configured: true, running: true })
   })
 
   it('tags adapter start failures as process-start-failed for the top-right control', async () => {
@@ -303,7 +489,7 @@ describe('AgentLifecycleService', () => {
     expect(result.snapshot.agents['claude-code'].error?.code).toBe('process-start-failed')
   })
 
-  it.each(targets)('treats start as idempotent for an already-running %s target', async (target) => {
+  it.each(runningTargets)('treats start as idempotent for an already-running %s target', async (target) => {
     const start = vi.fn(async () => undefined)
     const service = createService(adaptersWith({ [target]: { start } }))
 
@@ -318,7 +504,7 @@ describe('AgentLifecycleService', () => {
     expect(start).not.toHaveBeenCalled()
   })
 
-  it.each(targets)('starts a previously stopped %s target after repair', async (target) => {
+  it.each(runningTargets)('starts a previously stopped %s target after repair', async (target) => {
     let running = false
     const start = vi.fn(async () => { running = true })
     const inspect = vi.fn(async () => ({
@@ -334,6 +520,55 @@ describe('AgentLifecycleService', () => {
     expect(result.results[0]).toMatchObject({ runningAfter: true })
     expect(result.results[0].phases).toContain('start')
     expect(start).toHaveBeenCalledOnce()
+  })
+
+  it.each(launchOnlyTargets)('opens launch-only %s without requiring a running postcondition', async (target) => {
+    const start = vi.fn(async () => undefined)
+    const inspect = vi.fn(async () => ({
+      ...healthySnapshot(),
+      configured: false,
+      running: false,
+      managedInstanceCount: 0,
+      processControl: 'unavailable' as const,
+    }))
+    const service = createService(adaptersWith({ [target]: { inspect, start } }))
+
+    const result = await service.start(target)
+
+    expect(result.status).toBe('succeeded')
+    expect(result.results[0]).toMatchObject({
+      target,
+      phases: ['inspect', 'start'],
+      changed: true,
+      runningAfter: false,
+    })
+    expect(start).toHaveBeenCalledOnce()
+  })
+
+  it.each(launchOnlyTargets)('does not expose close or restart behavior for launch-only %s', async (target) => {
+    const close = vi.fn(async () => ({ wasRunning: false }))
+    const restore = vi.fn(async () => ({ changed: true }))
+    const start = vi.fn(async () => undefined)
+    const inspect = vi.fn(async () => ({
+      ...healthySnapshot(),
+      running: false,
+      managedInstanceCount: 0,
+      processControl: 'unavailable' as const,
+    }))
+    const service = createService(adaptersWith({ [target]: { inspect, close, restore, start } }))
+
+    const closeResult = await service.close(target)
+    const restartResult = await service.restart(target)
+
+    expect(closeResult.status).toBe('no-op')
+    expect(close).not.toHaveBeenCalled()
+    expect(restartResult.status).toBe('failed')
+    expect(restartResult.results[0].error).toMatchObject({
+      code: 'process-start-failed',
+      phase: 'start',
+    })
+    expect(restore).not.toHaveBeenCalled()
+    expect(start).not.toHaveBeenCalled()
   })
 
   it('keeps a previously stopped target stopped when ensureRunning is not requested', async () => {
@@ -518,7 +753,12 @@ describe('AgentLifecycleService', () => {
 
 function createService(
   adapters: Record<AgentTarget, AgentLifecycleAdapterPort>,
-  options: { operationTimeoutMs?: number; installer?: AgentInstallationPort } = {},
+  options: {
+    operationTimeoutMs?: number
+    snapshotCacheTtlMs?: number
+    installer?: AgentInstallationPort
+    now?: () => number
+  } = {},
 ) {
   const installer = options.installer ?? {
     install: vi.fn(async (target, channel = 'recommended') => ({
@@ -530,7 +770,9 @@ function createService(
     installer,
     resolveRoute: () => ({ enabled: true, compatibility: 'native', sourceId: 'pool-1' }),
     id: (() => { let id = 0; return () => `operation-${++id}` })(),
+    ...(options.now ? { now: options.now } : {}),
     ...(options.operationTimeoutMs === undefined ? {} : { operationTimeoutMs: options.operationTimeoutMs }),
+    ...(options.snapshotCacheTtlMs === undefined ? {} : { snapshotCacheTtlMs: options.snapshotCacheTtlMs }),
   })
 }
 
@@ -556,5 +798,13 @@ function healthySnapshot(): AgentAdapterSnapshot {
     running: true,
     managedInstanceCount: 1,
     processControl: 'managed-only',
+  }
+}
+
+function stoppedSnapshot(): AgentAdapterSnapshot {
+  return {
+    ...healthySnapshot(),
+    running: false,
+    managedInstanceCount: 0,
   }
 }

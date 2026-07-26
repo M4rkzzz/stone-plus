@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { readBoundedResponseText } from './bounded-response'
 
 export const GROK_OAUTH_BASE_URL = 'https://cli-chat-proxy.grok.com/v1'
 export const GROK_OAUTH_TOKEN_URL = 'https://auth.x.ai/oauth2/token'
@@ -180,7 +181,7 @@ export async function resolveGrokOAuthCredential(
     if (options.forceRefresh) throw new Error('Grok OAuth account has no refresh token.')
     throw new Error('Grok OAuth access token expired and has no refresh token.')
   }
-  let flight = refreshFlights.get(refreshKey)
+  let flight = refreshFlights.get(sourceKey)
   if (!flight) {
     flight = (async () => {
       // A caller signal only controls that caller's wait. The shared refresh owns its
@@ -194,9 +195,9 @@ export async function resolveGrokOAuthCredential(
       rememberRefreshedCredential(sourceKey, current.accessToken, access)
       return access
     })()
-    refreshFlights.set(refreshKey, flight)
+    refreshFlights.set(sourceKey, flight)
     void flight.finally(() => {
-      if (refreshFlights.get(refreshKey) === flight) refreshFlights.delete(refreshKey)
+      if (refreshFlights.get(sourceKey) === flight) refreshFlights.delete(sourceKey)
     }).catch(() => undefined)
   }
   return await waitForRefresh(flight, options.signal)
@@ -230,10 +231,12 @@ export async function refreshGrokOAuthCredential(
     }
     throw new Error('Grok OAuth token refresh failed.')
   }
-  const declaredLength = Number(response.headers.get('content-length') ?? 0)
-  if (Number.isFinite(declaredLength) && declaredLength > 64 * 1024) throw new Error('Grok OAuth token refresh response is too large.')
-  const responseText = await response.text()
-  if (Buffer.byteLength(responseText, 'utf8') > 64 * 1024) throw new Error('Grok OAuth token refresh response is too large.')
+  const responseText = await readBoundedResponseText(
+    response,
+    64 * 1024,
+    'Grok OAuth token refresh response is too large.',
+    signal,
+  )
   let payload: Record<string, unknown> | undefined
   try { payload = record(JSON.parse(responseText)) } catch { throw new Error('Grok OAuth token refresh returned invalid JSON.') }
   const accessToken = text(payload?.access_token)

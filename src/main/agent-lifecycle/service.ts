@@ -59,6 +59,8 @@ export interface AgentLifecycleServiceOptions {
   now?: () => number
   id?: () => string
   operationTimeoutMs?: number
+  /** Bounds expensive renderer polling while lifecycle operations still force fresh snapshots. */
+  snapshotCacheTtlMs?: number
 }
 
 export interface AgentInstallationPort {
@@ -67,7 +69,9 @@ export interface AgentInstallationPort {
 
 interface AggregateExecution {
   target: AgentTarget
+  snapshot?: AgentAdapterSnapshot
   aliases: Array<{ target: AgentTarget; snapshot?: AgentAdapterSnapshot }>
+  conflict?: AgentLifecycleError
 }
 
 interface TargetOperationCompletion {
@@ -90,16 +94,21 @@ export class AgentLifecycleService {
   private readonly now: () => number
   private readonly id: () => string
   private readonly operationTimeoutMs: number
+  private readonly snapshotCacheTtlMs: number
   private readonly groupTails = new Map<string, Promise<void>>()
   /** A soft-timed-out physical operation keeps its state group reserved until it really settles. */
   private readonly groupReservations = new Map<string, symbol>()
   private readonly busy = new Map<AgentTarget, AgentLifecycleBusyAction>()
   private readonly errors = new Map<AgentTarget, AgentLifecycleError>()
+  private readonly inspectionErrors = new Map<AgentTarget, AgentLifecycleError>()
   private readonly listeners = new Set<(event: AgentLifecycleChangedEvent) => void>()
   private revision = 0
   private closing = false
   private inFlight = new Set<Promise<unknown>>()
   private aggregateRepairInFlight: Promise<AgentLifecycleOperationResult> | undefined
+  private snapshotCache: { expiresAt: number; snapshot: AgentLifecycleSnapshot } | undefined
+  private snapshotFlight: Promise<AgentLifecycleSnapshot> | undefined
+  private snapshotFlightRevision: number | undefined
 
   constructor(options: AgentLifecycleServiceOptions) {
     this.adapters = options.adapters
@@ -108,6 +117,7 @@ export class AgentLifecycleService {
     this.now = options.now ?? (() => Date.now())
     this.id = options.id ?? randomUUID
     this.operationTimeoutMs = options.operationTimeoutMs ?? 90_000
+    this.snapshotCacheTtlMs = Math.max(0, Math.min(30_000, options.snapshotCacheTtlMs ?? 4_000))
   }
 
   onChange(listener: (event: AgentLifecycleChangedEvent) => void): () => void {
@@ -115,24 +125,58 @@ export class AgentLifecycleService {
     return () => this.listeners.delete(listener)
   }
 
-  async getSnapshot(): Promise<AgentLifecycleSnapshot> {
+  getSnapshot(): Promise<AgentLifecycleSnapshot> {
+    return this.loadSnapshot(false)
+  }
+
+  private loadSnapshot(forceFresh: boolean): Promise<AgentLifecycleSnapshot> {
+    if (!forceFresh && this.snapshotCache && this.now() < this.snapshotCache.expiresAt) {
+      return Promise.resolve(this.snapshotCache.snapshot)
+    }
+    if (this.snapshotFlight) {
+      if (!forceFresh || this.snapshotFlightRevision === this.revision) return this.snapshotFlight
+      // A lifecycle transition invalidated the state while an older renderer
+      // poll was still probing. Wait for that probe to settle, then coalesce a
+      // fresh collection at the new revision instead of publishing stale busy
+      // or error state.
+      return this.snapshotFlight.then(() => this.loadSnapshot(true))
+    }
+    const flightRevision = this.revision
+    const flight = this.collectSnapshot().then((snapshot) => {
+      this.snapshotCache = { expiresAt: this.now() + this.snapshotCacheTtlMs, snapshot }
+      return snapshot
+    }).finally(() => {
+      if (this.snapshotFlight === flight) {
+        this.snapshotFlight = undefined
+        this.snapshotFlightRevision = undefined
+      }
+    })
+    this.snapshotFlight = flight
+    this.snapshotFlightRevision = flightRevision
+    return flight
+  }
+
+  private async collectSnapshot(): Promise<AgentLifecycleSnapshot> {
     const entries = await Promise.all(AGENT_TARGETS.map(async (target) => {
       try {
         const [adapter, route] = await Promise.all([
           this.adapters[target].inspect(),
           Promise.resolve(this.resolveRoute(target)),
         ])
+        this.inspectionErrors.delete(target)
         return [target, this.toState(target, adapter, route)] as const
       } catch (cause) {
         const route = safeRoute(() => this.resolveRoute(target))
         const error = lifecycleError(cause, 'inspect')
-        this.errors.set(target, error)
+        this.inspectionErrors.set(target, error)
         return [target, this.toState(target, {
           installed: false,
           configured: false,
           running: false,
           managedInstanceCount: 0,
-          processControl: target === 'codex-desktop' ? 'full' : 'managed-only',
+          processControl: AGENT_CAPABILITIES[target].canCloseKnownProcess
+            ? target === 'codex-desktop' ? 'full' : 'managed-only'
+            : 'unavailable',
         }, route, error)] as const
       }
     }))
@@ -143,6 +187,10 @@ export class AgentLifecycleService {
       agents,
       busy: this.busy.size > 0,
     }
+  }
+
+  private invalidateSnapshotCache(): void {
+    this.snapshotCache = undefined
   }
 
   close(target: AgentTarget): Promise<AgentLifecycleOperationResult> {
@@ -198,6 +246,9 @@ export class AgentLifecycleService {
   restart(target: AgentTarget): Promise<AgentLifecycleOperationResult> {
     return this.runSingle('restart', target, 'restart', async (adapter) => {
       const before = await adapter.inspect()
+      if (!AGENT_CAPABILITIES[target].canRestart) {
+        throw taggedError('process-start-failed', `${target} cannot be restarted safely; open it instead.`, 'start')
+      }
       await this.assertStartable(target, before, true)
       if (!before.running) {
         await adapter.start()
@@ -236,11 +287,17 @@ export class AgentLifecycleService {
     return this.runSingle('start', target, 'start', async (adapter) => {
       const before = await adapter.inspect()
       await this.assertStartable(target, before, !before.running)
-      if (before.running) {
+      const detectsRunning = AGENT_CAPABILITIES[target].canDetectRunning
+      if (detectsRunning && before.running && before.configured) {
         return { before, phases: ['inspect'], changed: false, expectedRunningAfter: true }
       }
       await adapter.start(options)
-      return { before, phases: ['inspect', 'start'], changed: !before.running, expectedRunningAfter: true }
+      return {
+        before,
+        phases: ['inspect', 'start'],
+        changed: true,
+        ...(detectsRunning ? { expectedRunningAfter: true } : {}),
+      }
     })
   }
 
@@ -264,7 +321,7 @@ export class AgentLifecycleService {
   }
 
   private async affectedTargets(): Promise<AgentTarget[]> {
-    const snapshot = await this.getSnapshot()
+    const snapshot = await this.loadSnapshot(true)
     return AGENT_TARGETS.filter((target) => {
       const state = snapshot.agents[target]
       return state.enabled && (state.configured || state.running)
@@ -276,9 +333,18 @@ export class AgentLifecycleService {
     snapshot: AgentAdapterSnapshot,
     checkCodexConflict: boolean,
   ): Promise<void> {
+    const capabilities = AGENT_CAPABILITIES[target]
     const route = this.resolveRoute(target)
     if (!snapshot.installed) throw taggedError('not-installed', 'Agent is not installed.')
-    if (!route.enabled || !snapshot.configured) throw taggedError('not-enabled', 'Agent is not configured for Stone+.')
+    if (!(capabilities.canLaunch ?? capabilities.canRestart)) {
+      throw taggedError('process-start-failed', 'This Agent cannot be opened by Stone+.', 'start')
+    }
+    // Launch-only surfaces repair their surface-specific settings as part of
+    // opening, or deliberately hand off a documented manual setup flow. They
+    // cannot claim a reliable running state before that handoff completes.
+    if (!route.enabled) {
+      throw taggedError('not-enabled', 'Agent is not configured for Stone+.')
+    }
     if (route.compatibility === 'unsupported') {
       throw taggedError('unsupported-source', 'The selected source is not compatible with this Agent.')
     }
@@ -323,7 +389,15 @@ export class AgentLifecycleService {
     const executions = mode === 'restore'
       ? await this.collapseSharedRestoreTargets(targets)
       : targets.map((target): AggregateExecution => ({ target, aliases: [] }))
-    const settledGroups = await Promise.all(executions.map(async ({ target, aliases }) => {
+    const settledGroups = await Promise.all(executions.map(async ({ target, snapshot, aliases, conflict }) => {
+      if (conflict) {
+        return [
+          failedTargetResult(target, conflict, snapshot),
+          ...aliases.map(({ target: alias, snapshot: aliasSnapshot }) => (
+            failedTargetResult(alias, conflict, aliasSnapshot)
+          )),
+        ]
+      }
       const result = await this.runTarget(target, mode, mode === 'restore' ? 'smart-repair' : 'close', {
         preserveRunningState: true,
         ensureRunning: true,
@@ -348,7 +422,11 @@ export class AgentLifecycleService {
   private async collapseSharedRestoreTargets(targets: AgentTarget[]): Promise<AggregateExecution[]> {
     const grouped = new Map<string, AgentTarget[]>()
     for (const target of targets) {
-      const group = AGENT_CAPABILITIES[target].sharedStateGroup ?? target
+      // A shared-state lock prevents concurrent writes. Aggregate aliasing is
+      // a separate promise: it is safe for Codex Desktop/CLI today, but not for
+      // Claude CLI, Desktop and VS Code because each surface has distinct
+      // relaunch and configuration work.
+      const group = AGENT_CAPABILITIES[target].aggregateRestoreGroup ?? target
       grouped.set(group, [...(grouped.get(group) ?? []), target])
     }
     return Promise.all([...grouped.values()].map(async (members) => {
@@ -357,9 +435,25 @@ export class AgentLifecycleService {
         target,
         snapshot: await this.adapters[target].inspect().catch(() => undefined),
       })))
-      const selected = snapshots.find(({ snapshot }) => snapshot?.installed)?.target ?? members[0]
+      const running = snapshots.filter(({ snapshot }) => snapshot?.running)
+      const selectedEntry = running.length === 1
+        ? running[0]
+        : snapshots.find(({ snapshot }) => snapshot?.installed) ?? snapshots[0]
+      const selected = selectedEntry.target
+      const conflict = running.length > 1
+        ? lifecycleError(
+            taggedError(
+              'operation-conflict',
+              `Multiple ${AGENT_CAPABILITIES[selected].aggregateRestoreGroup ?? 'shared-state'} clients are running. Close all but one before repair.`,
+              undefined,
+              false,
+            ),
+          )
+        : undefined
       return {
         target: selected,
+        ...(selectedEntry.snapshot ? { snapshot: selectedEntry.snapshot } : {}),
+        ...(conflict ? { conflict } : {}),
         aliases: snapshots
           .filter(({ target }) => target !== selected)
           .map(({ target, snapshot }) => ({ target, ...(snapshot ? { snapshot } : {}) })),
@@ -537,7 +631,7 @@ export class AgentLifecycleService {
       startedAt,
       completedAt: this.now(),
       results,
-      snapshot: await this.getSnapshot(),
+      snapshot: await this.loadSnapshot(true),
     }
     const event = { snapshot: operation.snapshot, operation }
     for (const listener of this.listeners) listener(event)
@@ -545,8 +639,9 @@ export class AgentLifecycleService {
   }
 
   private async broadcastSnapshot(): Promise<void> {
+    this.invalidateSnapshotCache()
     if (this.listeners.size === 0) return
-    const event = { snapshot: await this.getSnapshot() }
+    const event = { snapshot: await this.loadSnapshot(true) }
     for (const listener of this.listeners) listener(event)
   }
 
@@ -567,7 +662,7 @@ export class AgentLifecycleService {
     route: AgentRouteState,
     inspectionError?: AgentLifecycleError,
   ): AgentLifecycleState {
-    const error = inspectionError ?? this.errors.get(target)
+    const error = inspectionError ?? this.errors.get(target) ?? this.inspectionErrors.get(target)
     const busyAction = this.busy.get(target)
     return {
       target,

@@ -4,7 +4,7 @@ import type { AppSnapshot, GatewayApi, ManagedClientInstance, ManagedClientInsta
 import { clientBrandMeta } from './brand-icons'
 import { useI18n } from './i18n'
 import { Modal } from './ui'
-import { ExclusiveAsyncOperation, StartOrderedAsyncValue } from './async-operation'
+import { ExclusiveAsyncOperation, SingleFlightAsyncOperation, StartOrderedAsyncValue } from './async-operation'
 
 const defaultManagedLaunchMode = typeof window === 'undefined' || !window.stone || window.stonePlatform === 'win32' ? 'terminal' : 'background'
 
@@ -27,6 +27,12 @@ function managedInstanceError(cause: unknown, t: Translator): string {
   return message || t('客户端实例操作失败，请重试。', 'The client instance operation failed. Try again.')
 }
 
+function sameManagedClientInstances(current: readonly ManagedClientInstance[], next: readonly ManagedClientInstance[]): boolean {
+  if (current === next) return true
+  if (current.length !== next.length) return false
+  return current.every((instance, index) => JSON.stringify(instance) === JSON.stringify(next[index]))
+}
+
 export function ManagedClientInstancesPanel({ snapshot, api }: { snapshot: AppSnapshot; api: GatewayApi }) {
   const { t } = useI18n()
   const [instances, setInstances] = useState<ManagedClientInstance[]>([])
@@ -37,22 +43,52 @@ export function ManagedClientInstancesPanel({ snapshot, api }: { snapshot: AppSn
   const [notice, setNotice] = useState<string | null>(null)
   const instanceUpdates = useRef<StartOrderedAsyncValue<ManagedClientInstance[]> | null>(null)
   const instanceMutation = useRef(new ExclusiveAsyncOperation())
+  const instanceRefresh = useRef(new SingleFlightAsyncOperation())
   if (!instanceUpdates.current) {
-    instanceUpdates.current = new StartOrderedAsyncValue<ManagedClientInstance[]>((next) => setInstances(next))
+    instanceUpdates.current = new StartOrderedAsyncValue<ManagedClientInstance[]>((next) => {
+      setInstances((current) => sameManagedClientInstances(current, next) ? current : next)
+    })
   }
   const load = useCallback(() => {
-    if (instanceMutation.current.busy) return
-    void instanceUpdates.current?.run(() => api.listManagedClientInstances())
+    if (instanceMutation.current.busy) return Promise.resolve()
+    return instanceRefresh.current.run(() => instanceUpdates.current!.run(() => api.listManagedClientInstances()))
       .then(() => setLoadError(null))
       .catch((cause) => setLoadError(managedInstanceError(cause, t)))
   }, [api, t])
   useEffect(() => {
-    load()
+    let active = true
+    let timer: number | undefined
+    const schedule = () => {
+      if (!active || document.visibilityState === 'hidden') return
+      if (timer !== undefined) window.clearTimeout(timer)
+      timer = window.setTimeout(() => void poll(), 10_000)
+    }
+    const poll = async () => {
+      if (!active || document.visibilityState === 'hidden') return
+      await load()
+      schedule()
+    }
+    const refreshWhenVisible = () => {
+      if (document.visibilityState === 'hidden') {
+        if (timer !== undefined) window.clearTimeout(timer)
+        timer = undefined
+        return
+      }
+      if (timer !== undefined) window.clearTimeout(timer)
+      timer = undefined
+      void poll()
+    }
+    void poll()
     const unsubscribe = api.onManagedClientInstancesChanged((next) => {
       instanceUpdates.current?.push(next)
     })
-    const timer = setInterval(load, 2_000)
-    return () => { unsubscribe(); clearInterval(timer) }
+    document.addEventListener('visibilitychange', refreshWhenVisible)
+    return () => {
+      active = false
+      unsubscribe()
+      document.removeEventListener('visibilitychange', refreshWhenVisible)
+      if (timer !== undefined) window.clearTimeout(timer)
+    }
   }, [api, load])
 
   useEffect(() => {

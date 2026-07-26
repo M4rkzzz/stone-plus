@@ -2,6 +2,7 @@ import type { ProviderKind } from '../../shared/types'
 import { anthropicAdapter, anthropicCompatibleAdapter } from './anthropic'
 import { customAdapter } from './custom'
 import { googleAdapter } from './google'
+import { kiroClaudeAdapter } from './kiro-claude'
 import { openAIAdapter, openAICompatibleAdapter } from './openai'
 import type { ProviderAdapter } from './types'
 import { xAIAdapter, xAICompatibleAdapter } from './xai'
@@ -14,6 +15,7 @@ const adapters: Readonly<Record<ProviderKind, ProviderAdapter>> = Object.freeze(
   'openai-compatible': openAICompatibleAdapter,
   'xai-compatible': xAICompatibleAdapter,
   'anthropic-compatible': anthropicCompatibleAdapter,
+  'kiro-compatible': kiroClaudeAdapter,
   custom: customAdapter
 })
 
@@ -26,11 +28,17 @@ export {
   anthropicCompatibleAdapter,
   customAdapter,
   googleAdapter,
+  kiroClaudeAdapter,
   openAIAdapter,
   openAICompatibleAdapter,
   xAIAdapter,
   xAICompatibleAdapter
 }
+export {
+  KIRO_CLAUDE_AMZ_TARGET,
+  KIRO_CLAUDE_REQUEST_CONTENT_TYPE,
+  KIRO_CLAUDE_RESPONSE_CONTENT_TYPE,
+} from './kiro-claude'
 export { classifyProviderFailure, parseRetryAfter } from './failure'
 export {
   applyGrokBuildHeaders,

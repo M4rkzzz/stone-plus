@@ -1,6 +1,7 @@
 import type { ApiSourceInput, Protocol, ProviderKind } from '@shared/types'
 
 export const XAI_COMPATIBLE_KIND: ProviderKind = 'xai-compatible'
+export const KIRO_COMPATIBLE_KIND: ProviderKind = 'kiro-compatible'
 
 export const providerKindLabelsZh: Readonly<Record<ProviderKind, string>> = Object.freeze({
   anthropic: 'Anthropic',
@@ -10,6 +11,7 @@ export const providerKindLabelsZh: Readonly<Record<ProviderKind, string>> = Obje
   'openai-compatible': 'OpenAI 兼容',
   'xai-compatible': 'Grok / xAI 兼容中转',
   'anthropic-compatible': 'Anthropic 兼容',
+  'kiro-compatible': 'Kiro Claude 中转',
   custom: '自定义',
 })
 
@@ -21,6 +23,7 @@ export const providerKindLabelsEn: Readonly<Record<ProviderKind, string>> = Obje
   'openai-compatible': 'OpenAI compatible',
   'xai-compatible': 'Grok / xAI compatible relay',
   'anthropic-compatible': 'Anthropic compatible',
+  'kiro-compatible': 'Kiro Claude relay',
   custom: 'Custom',
 })
 
@@ -32,6 +35,7 @@ export const protocolsByProviderKind: Readonly<Record<ProviderKind, readonly Pro
   'openai-compatible': ['openai-responses', 'openai-chat'],
   'xai-compatible': ['openai-responses', 'openai-chat'],
   'anthropic-compatible': ['anthropic-messages'],
+  'kiro-compatible': ['kiro-claude'],
   custom: ['anthropic-messages', 'openai-responses', 'openai-chat', 'gemini'],
 })
 
@@ -57,8 +61,13 @@ export function protocolAfterProviderKindChange(
   currentProtocol: Protocol,
 ): Protocol {
   if (kind === XAI_COMPATIBLE_KIND) return 'openai-responses'
+  if (kind === KIRO_COMPATIBLE_KIND) return 'kiro-claude'
   const supported = protocolsByProviderKind[kind]
   return supported.includes(currentProtocol) ? currentProtocol : supported[0]
+}
+
+export function relayProtocolSelectLocked(kind: ProviderKind): boolean {
+  return kind === KIRO_COMPATIBLE_KIND
 }
 
 export function protocolOptionLabel(
@@ -67,6 +76,7 @@ export function protocolOptionLabel(
   labels: Readonly<Record<Protocol, string>>,
   t: (zh: string, en: string) => string,
 ): string {
+  if (kind === KIRO_COMPATIBLE_KIND) return t('Kiro Claude', 'Kiro Claude')
   if (kind !== XAI_COMPATIBLE_KIND) return labels[protocol]
   if (protocol === 'openai-responses') {
     return t('OpenAI Responses（推荐）', 'OpenAI Responses (recommended)')

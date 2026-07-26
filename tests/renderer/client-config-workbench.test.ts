@@ -355,7 +355,7 @@ describe('client configuration workbench preview', () => {
 
   it('provides descriptions, paths and defaults for representative client fields', () => {
     const ids = [
-      'claude.model', 'claude.effort', 'claude.permissionMode', 'claude.permissionsAllow', 'claude.permissionsAsk', 'claude.permissionsDeny',
+      'claude.model', 'claude.effort', 'claude.permissionMode', 'claude.permissionsAllow', 'claude.permissionsAsk', 'claude.permissionsDeny', 'claude.disableNonessentialTraffic',
       'codex.model', 'codex.reasoningEffort', 'codex.approvalPolicy', 'codex.sandboxMode', 'codex.webSearch', 'codex.personality',
       'gemini.model', 'gemini.approvalMode', 'gemini.allowedTools', 'gemini.excludedTools', 'gemini.theme',
     ]

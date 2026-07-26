@@ -397,7 +397,7 @@ function mergeRepairResults(
 }
 
 function displayName(target: ConnectionOnlyAgentTarget): string {
-  if (target === 'claude-code') return 'Claude Code'
+  if (target === 'claude-code') return 'Claude Code CLI'
   return target === 'gemini-cli' ? 'Gemini CLI' : 'Grok Build'
 }
 

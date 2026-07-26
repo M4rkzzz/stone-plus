@@ -279,17 +279,70 @@ describe('credential lifecycle resolver', () => {
       .rejects.toMatchObject({ code: 'rotation_persistence_failed' })
     expect(refresh).toHaveBeenCalledTimes(2)
   })
+
+  it('rejects a rotated refresh token when no durable rotation handler exists', async () => {
+    const resolver = new CredentialLifecycleResolver({
+      secretReader: secretReader({ 'refresh-ref': 'refresh-old-private' }),
+      refreshAdapters: {
+        'oauth-adapter': {
+          refresh: async () => ({
+            accessToken: 'access-new',
+            refreshToken: 'refresh-rotated-without-store',
+            expiresInSeconds: 600,
+          }),
+        },
+      },
+      now: () => now,
+    })
+
+    await expect(resolver.resolve(bearerRecord({ expiresAt: now - 1 })))
+      .rejects.toMatchObject({ code: 'rotation_persistence_failed' })
+  })
+
+  it('finishes durable rotation after the final waiter cancels once refresh has returned', async () => {
+    const persistenceGate = deferred<void>()
+    const persistenceStarted = deferred<void>()
+    const persisted: string[] = []
+    const controller = new AbortController()
+    const resolver = new CredentialLifecycleResolver({
+      secretReader: secretReader({ 'refresh-ref': 'refresh-old-private' }),
+      refreshAdapters: {
+        'oauth-adapter': {
+          refresh: async () => ({
+            accessToken: 'access-new',
+            refreshToken: 'refresh-must-persist',
+            expiresInSeconds: 600,
+          }),
+        },
+      },
+      onRefreshTokenRotation: async ({ refreshToken }, signal) => {
+        persistenceStarted.resolve()
+        await persistenceGate.promise
+        expect(signal.aborted).toBe(false)
+        persisted.push(refreshToken)
+      },
+      now: () => now,
+    })
+
+    const resolution = resolver.resolve(bearerRecord({ expiresAt: now - 1 }), { signal: controller.signal })
+    await persistenceStarted.promise
+    controller.abort()
+    persistenceGate.resolve()
+
+    await expect(resolution).rejects.toMatchObject({ code: 'cancelled' })
+    await vi.waitFor(() => expect(persisted).toEqual(['refresh-must-persist']))
+  })
 })
 
 function deferred<T>(): {
   promise: Promise<T>
-  resolve(value: T): void
+  resolve(value?: T): void
 } {
   let resolve!: (value: T) => void
   const promise = new Promise<T>((innerResolve) => {
     resolve = innerResolve
   })
-  return { promise, resolve }
+  return { promise, resolve: resolve as (value?: T) => void }
 }
 
 function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {

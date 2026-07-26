@@ -4,6 +4,16 @@ import {
   type AgentLifecycleIpcService,
 } from '../../src/main/ipc/agent-lifecycle-api'
 
+const expectedTargets = [
+  'codex-desktop',
+  'codex-cli',
+  'claude-code',
+  'claude-code-desktop',
+  'claude-code-vsc',
+  'gemini-cli',
+  'grok-build',
+] as const
+
 type InvokeHandler = (event: unknown, ...args: unknown[]) => unknown
 
 const electron = vi.hoisted(() => ({
@@ -82,15 +92,18 @@ describe('Agent lifecycle IPC', () => {
     expect(service.closeAllManaged).toHaveBeenCalledOnce()
   })
 
-  it('accepts every declared Agent target', async () => {
+  it('accepts every fixed Agent target while preserving the legacy Claude CLI id', async () => {
     const service = createService()
     registerAgentLifecycleApi(service)
 
-    for (const target of ['codex-desktop', 'codex-cli', 'claude-code', 'gemini-cli', 'grok-build']) {
+    for (const target of expectedTargets) {
       await invoke('stone:close-agent', trustedEvent(), target)
     }
 
-    expect(service.close).toHaveBeenCalledTimes(5)
+    expect(service.close).toHaveBeenCalledTimes(expectedTargets.length)
+    expect(service.close).toHaveBeenCalledWith('claude-code')
+    expect(service.close).toHaveBeenCalledWith('claude-code-desktop')
+    expect(service.close).toHaveBeenCalledWith('claude-code-vsc')
   })
 
   it('rejects unsupported targets and malformed start options before invoking the service', async () => {

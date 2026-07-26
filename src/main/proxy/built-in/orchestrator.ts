@@ -75,6 +75,7 @@ export type BuiltInProxyPersistence = Pick<
 export type BuiltInProxyCore = Pick<
   SingBoxService,
   | 'getState'
+  | 'cleanupStaleRuntimeConfigs'
   | 'start'
   | 'retry'
   | 'stop'
@@ -161,6 +162,14 @@ interface PreparedConfiguration {
   built: BuildSingBoxConfigResult
 }
 
+interface LatencyBatch {
+  token: number
+  controller: AbortController
+  profileId?: string
+  readonly nodeIds: Set<string>
+  writeTail: Promise<void>
+}
+
 type HealthyCoreState = SingBoxRuntimeState & {
   status: 'ready'
   pid: number
@@ -222,8 +231,15 @@ export class BuiltInProxyOrchestrator implements BuiltInProxyStoreFacade, BuiltI
   private accessEpoch = 0
   private readonly blockedCoreGenerations = new Set<number>()
   private crashRecoveryPending = false
+  // A successful stale-lease restore can still leave Chromium holding its
+  // previous system-proxy snapshot when forceReloadProxyConfig fails. Keep the
+  // reload obligation in memory so Retry performs the missing proof instead
+  // of treating the already-removed recovery journal as success.
+  private startupExternalReloadPending = false
   private crashEpoch = 0
-  private latencyAbort?: AbortController
+  private latencyBatch?: LatencyBatch
+  private latencyBatchSequence = 0
+  private latencyCleanup: Promise<void> = Promise.resolve()
   private closing = false
   private closeFlight?: Promise<void>
   private closed = false
@@ -296,40 +312,17 @@ export class BuiltInProxyOrchestrator implements BuiltInProxyStoreFacade, BuiltI
       this.assertOpen()
       const persisted = this.store.getBuiltInProxySettings()
       try {
-        // TUN sidecars are independently elevated processes. Recover any
-        // ownership journal left by a hard main-process crash before ordinary
-        // networking or a replacement sidecar can start.
-        await this.tunController.recoverStale()
+        await this.recoverStartupArtifacts()
       } catch (error) {
-        const failure = classifyError(error, 'tun-elevation')
-        this.transitionError = failure
-        if (persisted.desiredEnabled && persisted.hasEverActivated) this.routes.failClosed(failure)
-        else this.routes.reportError(failure)
-        this.emit()
-        throw new BuiltInProxyOperationError(failure.category, failure.message, true, error)
-      }
-      try {
-        const recovery = await this.systemProxyLease.recoverStaleLease()
-        // If an earlier bootstrap repair was transiently unable to restore the
-        // journal, Chromium may still hold the stale mixed snapshot. Refresh
-        // it before any external-system request can start.
-        if (
-          recovery.status !== 'none'
-          && this.externalNetworkMode() === 'system'
-          && this.reloadExternalSystemProxy
-        ) {
-          await this.reloadExternalSystemProxy()
-        }
-      } catch (error) {
-        const failure = classifyError(error, 'system-proxy')
-        this.transitionError = failure
-        if (persisted.desiredEnabled && persisted.hasEverActivated) this.routes.failClosed(failure)
-        else this.routes.reportError(failure)
-        this.emit()
-        throw new BuiltInProxyOperationError(failure.category, failure.message, true, error)
+        throw this.publishStartupRecoveryFailure(persisted, error)
       }
       const settings = this.store.getBuiltInProxySettings()
       if (!settings.desiredEnabled) {
+        this.transitionStatus = undefined
+        this.transitionError = undefined
+        // Also clears an earlier in-process maintenance error when initialize
+        // is retried after the underlying filesystem/platform issue is fixed.
+        this.routes.completeDisable()
         this.emit()
         return
       }
@@ -339,8 +332,9 @@ export class BuiltInProxyOrchestrator implements BuiltInProxyStoreFacade, BuiltI
         // that intent must become a normal disabled/external route, not an
         // artificial fail-closed error requiring a retry.
         await this.store.setBuiltInProxyDesiredEnabled(false)
+        this.transitionStatus = undefined
         this.transitionError = undefined
-        if (this.routes.isIntercepting()) this.routes.completeDisable()
+        this.routes.completeDisable()
         this.emit()
         return
       }
@@ -354,10 +348,111 @@ export class BuiltInProxyOrchestrator implements BuiltInProxyStoreFacade, BuiltI
     })
   }
 
+  /**
+   * Repairs process-owned artifacts that can outlive an unclean shutdown.
+   * This is shared by bootstrap and the disabled/external maintenance Retry
+   * path so a visible recovery error cannot be dismissed without re-running
+   * the cleanup that originally failed.
+   */
+  private async recoverStartupArtifacts(): Promise<void> {
+    try {
+      await this.core.cleanupStaleRuntimeConfigs()
+      // TUN sidecars are independently elevated processes. Recover any
+      // ownership journal left by a hard main-process crash before ordinary
+      // networking or a replacement sidecar can start.
+      await this.tunController.recoverStale()
+    } catch (error) {
+      const failure = classifyError(error, 'tun-elevation')
+      throw new BuiltInProxyOperationError(failure.category, failure.message, true, error)
+    }
+
+    try {
+      const recovery = await this.systemProxyLease.recoverStaleLease()
+      // If an earlier bootstrap repair was transiently unable to restore the
+      // journal, Chromium may still hold the stale mixed snapshot. Refresh it
+      // before any external-system request can start. Keep the obligation when
+      // the reload itself fails because the recovery journal is already gone.
+      if (recovery.status !== 'none' && this.externalNetworkMode() === 'system') {
+        this.startupExternalReloadPending = true
+      }
+      if (this.externalNetworkMode() !== 'system') {
+        this.startupExternalReloadPending = false
+      } else if (this.startupExternalReloadPending && this.reloadExternalSystemProxy) {
+        await this.reloadExternalSystemProxy()
+        this.startupExternalReloadPending = false
+      }
+    } catch (error) {
+      const failure = classifyError(error, 'system-proxy')
+      throw new BuiltInProxyOperationError(failure.category, failure.message, true, error)
+    }
+  }
+
+  private publishStartupRecoveryFailure(
+    settings: BuiltInProxySettings,
+    error: unknown,
+    maintenanceWasDisabled = !settings.desiredEnabled,
+  ): BuiltInProxyOperationError {
+    const failure = classifyError(error)
+    this.transitionStatus = undefined
+    this.transitionError = failure
+    if (maintenanceWasDisabled) {
+      // Maintenance failed while the built-in route was off. Keep the actual
+      // external route and desired switch off; Renderer presents this as a
+      // repairable maintenance error rather than a false active takeover.
+      this.routes.disableFailed(failure)
+    } else if (settings.hasEverActivated) {
+      this.routes.failClosed(failure)
+    } else {
+      this.routes.reportError(failure)
+    }
+    this.emit()
+    return error instanceof BuiltInProxyOperationError
+      ? error
+      : new BuiltInProxyOperationError(failure.category, failure.message, true, error)
+  }
+
+  private isDisabledExternalMaintenanceError(): boolean {
+    const route = this.routes.getSnapshot()
+    return !route.desiredEnabled
+      && route.status === 'error'
+      && route.effectiveRoute.kind === 'external'
+  }
+
+  private async repairDisabledExternalMaintenance(settings: BuiltInProxySettings): Promise<void> {
+    try {
+      await this.recoverStartupArtifacts()
+    } catch (error) {
+      throw this.publishStartupRecoveryFailure(settings, error, true)
+    }
+
+    const requiresShutdownRetry = this.routes.isIntercepting()
+      || this.core.getState().status !== 'idle'
+      || this.systemProxyLease.getState().status !== 'idle'
+      || this.tunController.getState().status !== 'stopped'
+    if (requiresShutdownRetry) {
+      this.transitionError = undefined
+      await this.disableExclusive()
+      return
+    }
+
+    this.transitionStatus = undefined
+    this.transitionError = undefined
+    this.routes.completeDisable()
+    this.emit()
+  }
+
   public setEnabled(enabled: boolean): Promise<void> {
     this.cancelLatencyTests()
     return this.enqueue(async () => {
       this.assertOpen()
+      const before = this.store.getBuiltInProxySettings()
+      // An external-route maintenance error must be repaired before changing
+      // desired state. Renderer controls are not a security boundary: direct
+      // IPC callers must not bypass stale config/TUN/system-proxy recovery.
+      if (this.isDisabledExternalMaintenanceError()) {
+        await this.repairDisabledExternalMaintenance(before)
+        if (!enabled) return
+      }
       await this.store.setBuiltInProxyDesiredEnabled(enabled)
       this.transitionError = undefined
       if (enabled) {
@@ -376,16 +471,23 @@ export class BuiltInProxyOrchestrator implements BuiltInProxyStoreFacade, BuiltI
     this.cancelLatencyTests()
     return this.enqueue(async () => {
       this.assertOpen()
-      this.transitionError = undefined
-      if (this.store.getBuiltInProxySettings().desiredEnabled) {
+      const settings = this.store.getBuiltInProxySettings()
+      if (settings.desiredEnabled) {
+        this.transitionError = undefined
         if (!this.resolveActiveProfile()) {
-          this.handleMissingProfile(this.store.getBuiltInProxySettings())
+          this.handleMissingProfile(settings)
           return
         }
         await this.enableExclusive(true)
-      } else {
-        await this.disableExclusive()
+        return
       }
+
+      if (!this.isDisabledExternalMaintenanceError()) {
+        this.transitionError = undefined
+        await this.disableExclusive()
+        return
+      }
+      await this.repairDisabledExternalMaintenance(settings)
     })
   }
 
@@ -530,11 +632,22 @@ export class BuiltInProxyOrchestrator implements BuiltInProxyStoreFacade, BuiltI
   public testLatency(profileId?: string, nodeIds?: string[]): Promise<BuiltInProxyNodeSummary[]> {
     this.cancelLatencyTests()
     const controller = new AbortController()
-    this.latencyAbort = controller
+    const pendingCleanup = this.latencyCleanup
+    const pendingOperations = this.operationTail
+    const batch: LatencyBatch = {
+      token: ++this.latencyBatchSequence,
+      controller,
+      nodeIds: new Set<string>(),
+      writeTail: Promise.resolve(),
+    }
+    this.latencyBatch = batch
     const flight = (async () => {
+      await Promise.all([pendingCleanup, pendingOperations.catch(() => undefined)])
       this.assertOpen()
+      this.assertLatencyBatch(batch)
       const profile = profileId ? this.requireProfile(profileId) : this.resolveActiveProfile()
       if (!profile) throw new BuiltInProxyOperationError('configuration-invalid', 'No active proxy profile is available.', false)
+      batch.profileId = profile.id
       const activeProfileId = this.store.getBuiltInProxySettings().activeProfileId
       if (profile.id !== activeProfileId || this.core.getState().status !== 'ready') {
         throw new BuiltInProxyOperationError(
@@ -547,7 +660,8 @@ export class BuiltInProxyOrchestrator implements BuiltInProxyStoreFacade, BuiltI
       const nodes = profile.nodes.filter((node) => !selectedIds || selectedIds.has(node.id))
       for (const node of nodes) {
         throwIfAborted(controller.signal)
-        await this.store.setBuiltInProxyNodeLatency(profile.id, node.id, { latencyStatus: 'testing' })
+        batch.nodeIds.add(node.id)
+        await this.writeLatency(batch, node.id, { latencyStatus: 'testing' })
       }
       await forEachWithConcurrency(nodes, LATENCY_TEST_CONCURRENCY, async (node) => {
         throwIfAborted(controller.signal)
@@ -557,14 +671,14 @@ export class BuiltInProxyOrchestrator implements BuiltInProxyStoreFacade, BuiltI
             controller.signal,
           )
           throwIfAborted(controller.signal)
-          await this.store.setBuiltInProxyNodeLatency(profile.id, node.id, {
+          await this.writeLatency(batch, node.id, {
             latencyStatus: 'available',
             latencyMs: result.delayMs,
             lastTestedAt: result.testedAt,
           })
         } catch (error) {
           if (controller.signal.aborted) throw latencyCancelledError()
-          await this.store.setBuiltInProxyNodeLatency(profile.id, node.id, {
+          await this.writeLatency(batch, node.id, {
             latencyStatus: isTimeoutError(error) ? 'timeout' : 'error',
             lastTestedAt: this.now(),
           })
@@ -572,9 +686,12 @@ export class BuiltInProxyOrchestrator implements BuiltInProxyStoreFacade, BuiltI
       }, controller.signal)
       throwIfAborted(controller.signal)
       return this.requireProfile(profile.id).nodes
-    })()
+    })().catch((error) => {
+      if (this.latencyBatch === batch) this.cancelLatencyTests()
+      throw error
+    })
     void flight.finally(() => {
-      if (this.latencyAbort === controller) this.latencyAbort = undefined
+      if (this.latencyBatch === batch) this.latencyBatch = undefined
     }).catch(() => undefined)
     return flight
   }
@@ -612,6 +729,7 @@ export class BuiltInProxyOrchestrator implements BuiltInProxyStoreFacade, BuiltI
     this.closing = true
     this.cancelLatencyTests()
     const flight = (async () => {
+      await this.latencyCleanup
       await this.operationTail.catch(() => undefined)
       try {
         // Never tear down the core while the operating system may still point
@@ -627,7 +745,7 @@ export class BuiltInProxyOrchestrator implements BuiltInProxyStoreFacade, BuiltI
         throw error
       }
       if (this.routes.isIntercepting()) this.routes.completeDisable()
-      await this.routes.drainRetired()
+      await this.routes.drainRetired({ force: true })
       await this.core.close()
       this.blockedCoreGenerations.clear()
       this.closed = true
@@ -649,9 +767,17 @@ export class BuiltInProxyOrchestrator implements BuiltInProxyStoreFacade, BuiltI
 
   private async reconcileExclusive(reason: BuiltInProxyReconcileReason): Promise<void> {
     this.assertOpen()
-    if (reason === 'auto-start-changed' || !this.store.getBuiltInProxySettings().desiredEnabled) {
+    const settings = this.store.getBuiltInProxySettings()
+    if (reason === 'auto-start-changed' || !settings.desiredEnabled) {
       this.emit()
       return
+    }
+    // First-profile import can set desiredEnabled as part of the same store
+    // transaction. The route coordinator still records that maintenance
+    // failed while disabled, so repair it before reconciliation may start a
+    // core or apply operating-system access.
+    if (this.isDisabledExternalMaintenanceError()) {
+      await this.repairDisabledExternalMaintenance(settings)
     }
     await this.enableExclusive(false, reason === 'access-mode-changed')
     if (this.detectBuiltInTargets) {
@@ -1667,14 +1793,64 @@ export class BuiltInProxyOrchestrator implements BuiltInProxyStoreFacade, BuiltI
         true,
       ))
     }
-    const result = this.operationTail.then(operation, operation)
+    const invoke = async (): Promise<T> => {
+      await this.latencyCleanup
+      return operation()
+    }
+    const result = this.operationTail.then(invoke, invoke)
     this.operationTail = result.then(() => undefined, () => undefined)
     return result
   }
 
   private cancelLatencyTests(): void {
-    this.latencyAbort?.abort()
-    this.latencyAbort = undefined
+    const batch = this.latencyBatch
+    if (!batch) return
+    batch.controller.abort()
+    this.latencyBatch = undefined
+    this.latencyBatchSequence += 1
+    const cleanup = async (): Promise<void> => {
+      await batch.writeTail.catch(() => undefined)
+      if (!batch.profileId) return
+      const profile = this.store.getBuiltInProxyProfile(batch.profileId)
+      if (!profile) return
+      for (const nodeId of batch.nodeIds) {
+        const node = profile.nodes.find((candidate) => candidate.id === nodeId)
+        if (node?.latencyStatus !== 'testing') continue
+        try {
+          await this.store.setBuiltInProxyNodeLatency(batch.profileId, nodeId, {
+            latencyStatus: 'untested',
+            latencyMs: undefined,
+            lastTestedAt: undefined,
+          })
+        } catch (error) {
+          this.logger.warn('[built-in-proxy] Could not roll back a cancelled latency marker', error)
+        }
+      }
+    }
+    this.latencyCleanup = this.latencyCleanup.then(cleanup, cleanup).catch((error) => {
+      this.logger.warn('[built-in-proxy] Could not finish cancelled latency cleanup', error)
+    })
+  }
+
+  private assertLatencyBatch(batch: LatencyBatch): void {
+    if (
+      this.latencyBatch !== batch
+      || this.latencyBatchSequence !== batch.token
+      || batch.controller.signal.aborted
+    ) throw latencyCancelledError()
+  }
+
+  private async writeLatency(
+    batch: LatencyBatch,
+    nodeId: string,
+    patch: Pick<BuiltInProxyNodeSummary, 'latencyStatus'>
+      & Partial<Pick<BuiltInProxyNodeSummary, 'latencyMs' | 'lastTestedAt'>>,
+  ): Promise<void> {
+    batch.writeTail = batch.writeTail.then(async () => {
+      this.assertLatencyBatch(batch)
+      await this.store.setBuiltInProxyNodeLatency(batch.profileId!, nodeId, patch)
+    })
+    await batch.writeTail
   }
 
   private assertOpen(): void {
@@ -1839,7 +2015,7 @@ function mapErrorCategory(code: string, fallback: BuiltInProxyErrorCategory): Bu
   const normalized = code.toLowerCase().replaceAll('_', '-')
   if (normalized === 'core-missing') return 'core-missing'
   if (['core-untrusted', 'core-integrity', 'core-version'].includes(normalized)) return 'core-integrity'
-  if (['config-invalid', 'check-failed', 'invalid-profile', 'no-active-node', 'invalid-input', 'invalid-config', 'unsupported-format', 'no-supported-nodes'].includes(normalized)) return 'configuration-invalid'
+  if (['configuration-invalid', 'config-invalid', 'check-failed', 'invalid-profile', 'no-active-node', 'invalid-input', 'invalid-config', 'unsupported-format', 'no-supported-nodes'].includes(normalized)) return 'configuration-invalid'
   if (['node-handshake', 'controller-request', 'not-ready'].includes(normalized)) return 'node-handshake'
   if (['mixed-port', 'controller-port'].includes(normalized)) return 'mixed-port'
   if (['tun-invalid-bypass', 'tun-config-invalid'].includes(normalized)) return 'configuration-invalid'

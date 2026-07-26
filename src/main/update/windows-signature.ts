@@ -17,6 +17,16 @@ export type AuthenticodeResult = {
   Thumbprint?: string
 }
 
+// Pin the inbox Windows PowerShell 5.1 security module instead of relying on
+// PSModulePath auto-loading. A parent launched from PowerShell 7 can put its
+// incompatible module directory first, which otherwise makes the signature
+// check fail before it can inspect the update. The verification result remains
+// fail-closed; this only makes the trusted Windows API deterministic.
+const WINDOWS_POWERSHELL_SECURITY_MODULE_IMPORT = [
+  "$stoneSecurityModule = Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell\\v1.0\\Modules\\Microsoft.PowerShell.Security\\Microsoft.PowerShell.Security.psd1'",
+  'Import-Module -Name $stoneSecurityModule -Force -ErrorAction Stop',
+]
+
 /**
  * Verifies a Windows update with the same Authenticode API electron-updater
  * uses, while allowing the published Stone+ continuity certificate when its
@@ -40,6 +50,7 @@ export async function verifyStonePlusWindowsUpdateSignature(
         '-Command',
         [
           "$ErrorActionPreference = 'Stop'",
+          ...WINDOWS_POWERSHELL_SECURITY_MODULE_IMPORT,
           '$signature = Get-AuthenticodeSignature -LiteralPath $env:STONEPLUS_UPDATE_PATH',
           '$certificate = $signature.SignerCertificate',
           '$subject = if ($null -eq $certificate) { \'\' } else { [string]$certificate.Subject }',
@@ -51,7 +62,7 @@ export async function verifyStonePlusWindowsUpdateSignature(
           '  Subject = $subject',
           '  Thumbprint = $thumbprint',
           '} | ConvertTo-Json -Compress',
-        ].join('; '),
+        ].join('\n'),
       ],
       {
         windowsHide: true,

@@ -1,7 +1,8 @@
 import { mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { parse } from 'smol-toml'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { FrpTunnelService, parseTunnelEndpoint } from '../../src/main/tunnel'
 
 const temporaryDirectories: string[] = []
@@ -87,6 +88,85 @@ remotePort = 15721
     }
   })
 
+  it('recursively redacts inline tables, array tables, mixed-case keys, and restores every placeholder structurally', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'stone-frp-structured-secret-'))
+    temporaryDirectories.push(directory)
+    const service = new FrpTunnelService({ userDataPath: directory, binaryPath: join(directory, 'frpc'), platform: 'linux' })
+    await service.initialize()
+    const original = `serverAddr = "example.com"
+auth = { ToKeN = "inline-token", oidc = { ClientSECRET = "inline-client-secret" } }
+displayName = "[REDACTED]"
+[[proxies]]
+name = "stone"
+type = "tcp"
+remotePort = 15721
+secretKey = "array-secret"
+PassWord = "array-password"
+credentialFile = "credential-value"
+AUTHORIZATIONHeader = "Bearer authorization-value"
+`
+    await service.saveConfig(original)
+
+    const masked = (await service.getState()).config
+    for (const secret of [
+      'inline-token', 'inline-client-secret', 'array-secret', 'array-password',
+      'credential-value', 'authorization-value',
+    ]) expect(masked).not.toContain(secret)
+    expect(masked).toContain('displayName = "[REDACTED]"')
+
+    await service.saveConfig(masked)
+    const restored = parse(await readFile(join(directory, 'frp', 'frpc.toml'), 'utf8')) as Record<string, unknown>
+    expect(restored).toMatchObject({
+      auth: { ToKeN: 'inline-token', oidc: { ClientSECRET: 'inline-client-secret' } },
+      displayName: '[REDACTED]',
+      proxies: [{
+        secretKey: 'array-secret',
+        PassWord: 'array-password',
+        credentialFile: 'credential-value',
+        AUTHORIZATIONHeader: 'Bearer authorization-value',
+      }],
+    })
+  })
+
+  it('fails closed when a masked secret has no corresponding persisted value', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'stone-frp-orphan-mask-'))
+    temporaryDirectories.push(directory)
+    const service = new FrpTunnelService({ userDataPath: directory, binaryPath: join(directory, 'frpc'), platform: 'linux' })
+    await service.initialize()
+    await service.saveConfig('serverAddr = "example.com"\n[[proxies]]\ntype = "tcp"\nremotePort = 15721\n')
+
+    await expect(service.saveConfig(
+      'serverAddr = "example.com"\nauth.token = "[REDACTED]"\n[[proxies]]\ntype = "tcp"\nremotePort = 15721\n',
+    )).rejects.toThrow(/stored secret|redacted/i)
+  })
+
+  it('requires a binary integrity verifier before configuration validation or spawn and redacts verifier errors', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'stone-frp-integrity-'))
+    temporaryDirectories.push(directory)
+    const binaryPath = join(directory, 'frpc.exe')
+    await writeFile(binaryPath, 'not-a-real-binary')
+    const verifyBinaryIntegrity = vi.fn(async () => {
+      throw new Error('clientSecret = "verifier-secret" password: verifier-password Authorization: Basic verifier-token {"apiToken":"json-token"}')
+    })
+    const service = new FrpTunnelService({
+      userDataPath: directory,
+      binaryPath,
+      binaryExists: async () => true,
+      verifyBinaryIntegrity,
+    })
+    await service.initialize()
+    await service.saveConfig('serverAddr = "example.com"\n[[proxies]]\ntype = "tcp"\nremotePort = 15721\n')
+
+    await expect(service.start()).rejects.toThrow(/integrity/i)
+    expect(verifyBinaryIntegrity).toHaveBeenCalledWith(binaryPath)
+    const serializedState = JSON.stringify(await service.getState())
+    expect(serializedState).not.toContain('verifier-secret')
+    expect(serializedState).not.toContain('verifier-password')
+    expect(serializedState).not.toContain('verifier-token')
+    expect(serializedState).not.toContain('json-token')
+    expect(serializedState).toContain('[REDACTED]')
+  })
+
   it('adopts a verified frpc process marker after Stone+ restarts and terminates its tree', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'stone-frp-recovery-'))
     temporaryDirectories.push(directory)
@@ -99,10 +179,12 @@ remotePort = 15721
       version: 1, pid: 4242, executablePath: await realpath(binaryPath), configPath, startedAt: 123,
     }))
     const terminated: number[] = []
+    const verifyBinaryIntegrity = vi.fn(async () => undefined)
     const service = new FrpTunnelService({
       userDataPath: directory,
       binaryPath,
       platform: 'win32',
+      verifyBinaryIntegrity,
       inspectProcess: async () => ({ executablePath: await realpath(binaryPath), commandLine: `"${binaryPath}" -c "${configPath}"` }),
       terminateProcessTree: async (pid) => { terminated.push(pid) },
     })
@@ -111,9 +193,50 @@ remotePort = 15721
     const recovered = await service.getState()
     expect(recovered.lastError).toBeUndefined()
     expect(recovered).toMatchObject({ running: true, pid: 4242, startedAt: 123 })
+    expect(verifyBinaryIntegrity).toHaveBeenCalledWith(await realpath(binaryPath))
     await service.stop()
     expect(terminated).toEqual([4242])
     await expect(readFile(join(directory, 'frp', 'frpc-process.json'), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  it('discards a recovery marker when the marked frpc binary fails integrity without touching the process', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'stone-frp-recovery-integrity-'))
+    temporaryDirectories.push(directory)
+    const binaryPath = join(directory, 'frpc.exe')
+    const configPath = join(directory, 'frp', 'frpc.toml')
+    const markerPath = join(directory, 'frp', 'frpc-process.json')
+    await mkdir(join(directory, 'frp'), { recursive: true })
+    await writeFile(binaryPath, 'tampered')
+    await writeFile(configPath, 'serverAddr = "example.com"\n[[proxies]]\ntype = "tcp"\nremotePort = 15721\n')
+    await writeFile(markerPath, JSON.stringify({
+      version: 1, pid: 4343, executablePath: await realpath(binaryPath), configPath, startedAt: 456,
+    }))
+    const inspectProcess = vi.fn(async () => ({
+      executablePath: await realpath(binaryPath),
+      commandLine: `"${binaryPath}" -c "${configPath}"`,
+    }))
+    const terminateProcessTree = vi.fn(async () => undefined)
+    const verifyBinaryIntegrity = vi.fn(async () => {
+      throw new Error('checksum mismatch')
+    })
+    const service = new FrpTunnelService({
+      userDataPath: directory,
+      binaryPath,
+      platform: 'win32',
+      verifyBinaryIntegrity,
+      inspectProcess,
+      terminateProcessTree,
+    })
+
+    await service.initialize()
+
+    expect(await service.getState()).toMatchObject({ running: false })
+    expect((await service.getState()).lastError).toMatch(/integrity/i)
+    expect(verifyBinaryIntegrity).toHaveBeenCalledWith(await realpath(binaryPath))
+    expect(inspectProcess).not.toHaveBeenCalled()
+    await service.stop()
+    expect(terminateProcessTree).not.toHaveBeenCalled()
+    await expect(readFile(markerPath, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
   it('rejects a stale or PID-reused marker instead of adopting an unrelated process', async () => {
@@ -130,6 +253,7 @@ remotePort = 15721
       userDataPath: directory,
       binaryPath,
       platform: 'win32',
+      verifyBinaryIntegrity: async () => undefined,
       inspectProcess: async () => ({ executablePath: 'C:\\Windows\\System32\\notepad.exe', commandLine: 'notepad.exe' }),
     })
 

@@ -11,6 +11,11 @@ export type SourceAccount = Pick<
   'id' | 'providerId' | 'modelPolicy' | 'modelAllowlist' | 'availableModels' | 'modelsRefreshedAt'
 >
 
+export type RouteAvailabilityAccount = Pick<
+  Account | PublicAccount,
+  'status' | 'cooldownUntil' | 'inFlight' | 'maxConcurrency'
+>
+
 export type CapabilityEligibility = 'verified' | 'unknown' | 'unsupported'
 
 export interface SourceEligibilityResult<T extends SourceAccount> {
@@ -19,6 +24,50 @@ export interface SourceEligibilityResult<T extends SourceAccount> {
   unknown: T[]
   unsupported: T[]
   schedulable: T[]
+}
+
+/** Long-lived route binding excludes only accounts requiring user repair. */
+export function isRouteAccountBindable(
+  account: Pick<Account | PublicAccount, 'status'>,
+): boolean {
+  return account.status !== 'disabled' && account.status !== 'expired'
+}
+
+/** Runtime health gate shared by route diagnostics and the scheduler. */
+export function isRouteAccountRuntimeAvailable(
+  account: Pick<Account | PublicAccount, 'status' | 'cooldownUntil'>,
+  now = Date.now(),
+): boolean {
+  if (!isRouteAccountBindable(account) || account.status === 'checking') return false
+  if (account.status === 'cooldown' && account.cooldownUntil === undefined) return false
+  return (account.cooldownUntil ?? 0) <= now
+}
+
+/** Capacity calculation accepts scheduler-owned live counts/limits as overrides. */
+export function hasRouteAccountCapacity(
+  account: Pick<Account | PublicAccount, 'inFlight' | 'maxConcurrency'>,
+  inFlight = account.inFlight,
+  concurrencyLimit = account.maxConcurrency,
+): boolean {
+  const active = routeAccountInFlight(inFlight)
+  const limit = routeAccountConcurrencyLimit(concurrencyLimit)
+  return active < limit
+}
+
+export function routeAccountInFlight(value: number): number {
+  return Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0
+}
+
+export function routeAccountConcurrencyLimit(value: number): number {
+  return Number.isFinite(value) ? Math.max(1, Math.floor(value)) : 1
+}
+
+/** Snapshot-level readiness; quota/circuit overlays remain scheduler-owned. */
+export function isRouteAccountCurrentlySchedulable(
+  account: RouteAvailabilityAccount,
+  now = Date.now(),
+): boolean {
+  return isRouteAccountRuntimeAvailable(account, now) && hasRouteAccountCapacity(account)
 }
 
 /**

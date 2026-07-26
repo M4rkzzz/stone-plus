@@ -49,6 +49,7 @@ export interface CodexCliPort {
   startNew(options?: AgentStartOptions): Promise<void>
   restoreConnection(configDirectories?: readonly string[]): Promise<void>
   validateConnection(configDirectories?: readonly string[]): Promise<void>
+  prepareStart(options?: AgentStartOptions): Promise<void>
 }
 
 /**
@@ -57,7 +58,7 @@ export interface CodexCliPort {
  * session or workspace-index repair.
  */
 export interface CodexDeepRepairPort {
-  run(options?: CodexRepairAndRestartOptions): Promise<unknown>
+  run(options?: CodexRepairAndRestartOptions, configDirectories?: readonly string[]): Promise<unknown>
 }
 
 export interface CodexLifecycleAdapterOptions {
@@ -66,6 +67,8 @@ export interface CodexLifecycleAdapterOptions {
   desktopProbe: CodexDesktopProbe
   deepRepair: CodexDeepRepairPort
   cli?: CodexCliPort
+  /** Repairs and validates the default desktop CODEX_HOME transactionally. */
+  prepareConnection?: () => Promise<void>
 }
 
 export interface CodexLifecycleSnapshot {
@@ -122,6 +125,7 @@ export class CodexLifecycleAdapter {
   private readonly desktopProbe: CodexDesktopProbe
   private readonly deepRepair: CodexDeepRepairPort
   private readonly cli?: CodexCliPort
+  private readonly prepareConnection?: () => Promise<void>
   private closedDesktopState?: ChatGptDesktopRestartState
   private operationTail: Promise<void> = Promise.resolve()
 
@@ -135,6 +139,7 @@ export class CodexLifecycleAdapter {
     this.desktopProbe = options.desktopProbe
     this.deepRepair = options.deepRepair
     this.cli = options.cli
+    this.prepareConnection = options.prepareConnection
   }
 
   async getSnapshot(): Promise<CodexLifecycleSnapshot> {
@@ -256,7 +261,10 @@ export class CodexLifecycleAdapter {
     const cli = this.cli!
     const before = await cli.inspect()
     const runningIds = before.managedInstances.filter((instance) => instance.running).map((instance) => instance.id)
-    const configDirectories = uniqueConfigDirectories(before.managedInstances.filter((instance) => instance.running))
+    // Every managed definition owns its own CODEX_HOME, even while stopped.
+    // A repair-all operation must not silently repair only ~/.codex and leave
+    // a stopped custom profile stale for its next launch.
+    const configDirectories = uniqueConfigDirectories(before.managedInstances)
     const closed: string[] = []
     let connectionRestored = false
     try {
@@ -270,7 +278,7 @@ export class CodexLifecycleAdapter {
       const repairWorkspaceIndex = options.repairWorkspaceIndex === true
       if (repairSessions || repairWorkspaceIndex) {
         try {
-          await this.deepRepair.run({ preserveRunningState: true })
+          await this.deepRepair.run({ preserveRunningState: true }, configDirectories)
         } catch (cause) {
           throw new CodexLifecycleOperationError(
             this.target,
@@ -330,16 +338,42 @@ export class CodexLifecycleAdapter {
     if (this.target === 'codex-cli') {
       const snapshot = await this.cli!.inspect()
       if (!snapshot.installation.installed) throw new Error('Codex CLI is not installed.')
-      if (!snapshot.configured) throw new Error('Codex CLI is not configured for Stone+.')
+      await this.cli!.prepareStart(options)
       await this.cli!.startNew(options)
       return
     }
 
     const snapshot = await this.desktopProbe.inspect()
     if (!snapshot.installed) throw new Error('Codex desktop is not installed.')
-    if (!snapshot.configured) throw new Error('Codex desktop is not configured for Stone+.')
-    if (snapshot.running) return
+    // Capture/stop first when already running so a repaired config is never
+    // reported as active while the old desktop process still owns its stale
+    // environment and cached connection state.
     const state = this.closedDesktopState ?? await this.desktop.shutdownForRepair()
+    this.closedDesktopState = state
+    try {
+      await this.prepareConnection?.()
+    } catch (cause) {
+      const recoveryErrors: string[] = []
+      // Transactional connection preparation restores the previous files on
+      // validation failure. If this call interrupted an already-running
+      // desktop, restore that captured process state instead of stranding the
+      // user with a stopped client.
+      if (state.wasRunning) {
+        try {
+          await this.desktop.relaunch(state)
+          this.closedDesktopState = undefined
+        } catch (relaunchCause) {
+          recoveryErrors.push(`desktop relaunch: ${messageOf(relaunchCause)}`)
+        }
+      }
+      throw new CodexLifecycleOperationError(
+        this.target,
+        'restore-connection',
+        `Unable to prepare the Codex desktop connection: ${messageOf(cause)}`,
+        recoveryErrors,
+        { cause },
+      )
+    }
     try {
       await this.desktop.relaunch(state)
       this.closedDesktopState = undefined

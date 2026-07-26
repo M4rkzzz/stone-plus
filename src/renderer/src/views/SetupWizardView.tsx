@@ -47,7 +47,13 @@ import type {
 } from '@shared/types'
 import { providerSourceFamily } from '@shared/source-family'
 import { DEFAULT_ACCOUNT_MAX_CONCURRENCY } from '@shared/types'
-import { isAvailableRouteAccount, isNativeGrokRouteSource, resolveRouteSource } from '@shared/route-sources'
+import {
+  isAvailableRouteAccount,
+  isKiroClaudeRouteSource,
+  isNativeGrokRouteSource,
+  resolveRouteSource,
+  routeSourceUsesKiroClaude,
+} from '@shared/route-sources'
 import { Badge, ConfirmDialog, InfoTip, protocolLabels } from '../ui'
 import { ExclusiveAsyncOperation, SerializedAsyncOperation } from '../async-operation'
 import { BUILT_IN_PROXY_BINDING_NOTICE, useBuiltInProxyInterlock } from '../built-in-proxy-interlocks'
@@ -74,6 +80,8 @@ import {
   protocolsByProviderKind,
   providerKindLabelsEn,
   providerKindLabelsZh,
+  relayProtocolSelectLocked,
+  KIRO_COMPATIBLE_KIND,
   XAI_COMPATIBLE_KIND,
 } from '../grok-relay-ui'
 import { setupPoolDisplayName } from '../system-generated-text'
@@ -189,6 +197,11 @@ export function SetupWizardView({
 
   const providerById = useMemo(() => new Map(snapshot.providers.map((provider) => [provider.id, provider])), [snapshot.providers])
   const availableAccounts = useMemo(() => snapshot.accounts.filter(isAvailableRouteAccount), [snapshot.accounts])
+  const setupEligibleAccounts = useMemo(() => availableAccounts.filter((account) => {
+    const provider = providerById.get(account.providerId)
+    if (!provider || provider.kind !== KIRO_COMPATIBLE_KIND && provider.protocol !== 'kiro-claude') return true
+    return isKiroClaudeRouteSource(resolveRouteSource(provider.id, snapshot), snapshot)
+  }), [availableAccounts, providerById, snapshot])
   const selectedAccount = oauthImportedSnapshot?.accounts.find((account) => account.id === selectedAccountId)
     ?? snapshot.accounts.find((account) => account.id === selectedAccountId)
   const selectedProvider = selectedAccount
@@ -200,6 +213,8 @@ export function SetupWizardView({
     : selectedProvider !== undefined
       && selectedProvider.protocol === 'openai-responses'
       && providerSourceFamily(selectedProvider.kind) === 'grok'
+  const selectedRouteSource = resolveRouteSource(aggregatePoolId || selectedProvider?.id || '', snapshot)
+  const selectedSourceIsKiroClaude = routeSourceUsesKiroClaude(selectedRouteSource, snapshot)
   const compatiblePools = snapshot.pools.filter((pool) => pool.kind === 'standard'
     && pool.protocol === 'openai-responses'
     && pool.members.every((member) => {
@@ -209,7 +224,9 @@ export function SetupWizardView({
     }))
   const aggregatePools = snapshot.pools.filter((pool) => pool.kind === 'relay-aggregate'
     && pool.members.some((member) => member.enabled
-      && availableAccounts.some((account) => account.id === member.accountId)))
+      && setupEligibleAccounts.some((account) => account.id === member.accountId))
+    && (!routeSourceUsesKiroClaude(resolveRouteSource(pool.id, snapshot), snapshot)
+      || isKiroClaudeRouteSource(resolveRouteSource(pool.id, snapshot), snapshot)))
   const currentStep = wizard?.step ?? 'scan'
   const currentIndex = Math.max(0, steps.findIndex((step) => step.id === currentStep))
   const oauthActive = oauthStage === 'starting' || oauthStage === 'waiting' || oauthStage === 'submitting' || oauthStage === 'exchanging' || oauthStage === 'cancelling'
@@ -382,13 +399,13 @@ export function SetupWizardView({
     const pool = snapshot.pools.find((candidate) => candidate.id === aggregatePoolId && candidate.kind === 'relay-aggregate')
     if (!pool) return setError(t('请选择一个聚合中转。', 'Choose an aggregate relay.'))
     const first = pool.members.find((member) => member.enabled
-      && availableAccounts.some((account) => account.id === member.accountId))
+      && setupEligibleAccounts.some((account) => account.id === member.accountId))
     if (!first) return setError(t('聚合中转没有启用成员。', 'The aggregate relay has no enabled members.'))
     setSelectedAccountId(first.accountId)
     setPoolId(pool.id)
     const nextProxyId = pool.proxyId ?? ''
     setProxyId(nextProxyId)
-    const account = availableAccounts.find((candidate) => candidate.id === first.accountId)
+    const account = setupEligibleAccounts.find((candidate) => candidate.id === first.accountId)
     const provider = account ? providerById.get(account.providerId) : undefined
     const nextModel = pool.modelAllowlist[0] || account?.availableModels[0] || provider?.models[0] || ''
     setModel(nextModel)
@@ -683,6 +700,9 @@ export function SetupWizardView({
     if (!draft.name.trim() || !draft.baseUrl.trim() || !draft.credential?.trim()) {
       return setError(t('请填写名称、Base URL 和 API Key。', 'Enter a name, Base URL, and API key.'))
     }
+    if (draft.kind === KIRO_COMPATIBLE_KIND && !(selectedModel || draft.defaultModel)?.trim()) {
+      return setError(t('Kiro Claude 不提供模型发现，请手动填写测试模型。', 'Kiro Claude does not use model discovery. Enter the test model manually.'))
+    }
     setProbe(null)
     setProbeBinding(null)
     const requestBinding = captureSetupSourceProbeBinding(draft, selectedProxyId, selectedModel)
@@ -729,6 +749,7 @@ export function SetupWizardView({
         .sort((left, right) => right.updatedAt - left.updatedAt)[0]
     const account = provider ? result.accounts.find((candidate) => candidate.providerId === provider.id) : undefined
     if (!account) return setError(t('来源已保存，但未找到对应凭据账号。', 'The source was saved, but its credential account could not be found.'))
+    setOauthImportedSnapshot(result)
     setSelectedAccountId(account.id)
     await move('network', { sourceId: account.id, sourceType: sourceDraft.sourceType, proxyId: account.proxyId })
   }
@@ -754,6 +775,30 @@ export function SetupWizardView({
 
   const verifyExistingSource = async () => {
     if (!selectedAccountId) return setError(t('来源账号不存在。', 'The source account does not exist.'))
+    if (selectedProvider?.protocol === 'kiro-claude') {
+      if (!model) return setError(t('Kiro Claude 必须手动填写测试模型。', 'Enter a test model for Kiro Claude.'))
+      const checked = currentProbe?.ok
+        ? currentProbe
+        : await run('upstream', () => api.probeApiSource({
+            id: selectedProvider.id,
+            name: selectedProvider.name,
+            sourceType: 'relay',
+            kind: KIRO_COMPATIBLE_KIND,
+            baseUrl: selectedProvider.baseUrl,
+            protocol: 'kiro-claude',
+            model,
+            proxyId: selectedAccount?.proxyId,
+            persistCapabilities: true,
+          }))
+      if (!checked) return
+      if (!checked.ok) return setError(checked.error
+        ? localizedProbeMessage('tool-roundtrip', 'error', checked.error, t)
+        : t('Kiro Claude 两轮工具链测试未通过。', 'The Kiro Claude two-round tool test failed.'))
+      setClient('claude')
+      setNotice(t(`Kiro Claude 两轮工具链测试通过，耗时 ${checked.latencyMs ?? 0} ms。`, `The Kiro Claude two-round tool test passed in ${checked.latencyMs ?? 0} ms.`))
+      await move('client', { sourceId: selectedAccountId, model: checked.testedModel ?? model, client: 'claude' })
+      return
+    }
     const checked = await run('upstream', async () => {
       await api.checkAccount(selectedAccountId)
       if (!model) {
@@ -777,6 +822,7 @@ export function SetupWizardView({
   const createRouting = async () => {
     if (!wizard?.sessionId || !selectedAccountId || !model) return setError(t('缺少来源、模型或向导会话。', 'The source, model, or wizard session is missing.'))
     if (client === 'grokbuild' && !selectedSourceIsGrok) return setError(t('Grok Build 仅可连接原生 Responses 的 Grok 号池或中转站。', 'Grok Build can connect only to Responses-native Grok pools or relays.'))
+    if (selectedSourceIsKiroClaude && client !== 'claude') return setError(t('Kiro Claude 中转只能绑定 Claude Code 客户端。', 'Kiro Claude relays can be bound only to Claude Code clients.'))
     const result = await run('routing', () => api.applySetupRouting({
       sessionId: wizard.sessionId,
       sourceId: selectedAccountId,
@@ -897,7 +943,7 @@ export function SetupWizardView({
               <Choice icon={<ShieldCheck />} title="Codex OAuth / Sub2API CPA" description={t('浏览器 OAuth 授权，或使用 Token / JSON 兼容导入', 'Authorize with OAuth in your browser, or import a compatible Token / JSON file')} onClick={() => chooseMode('oauth-import')} disabled={Boolean(busy)} />
               <Choice icon={<Cloud />} title={t('官方 API', 'Official API')} description={t('OpenAI、Anthropic 或 Google Gemini', 'OpenAI, Anthropic, or Google Gemini')} onClick={() => chooseMode('official-api')} disabled={Boolean(busy)} />
               <Choice icon={<Server />} title={t('中转站', 'Relay')} description={t('配置兼容 Base URL 与单把 Key', 'Configure a compatible Base URL and one API key')} onClick={() => chooseMode('relay')} disabled={Boolean(busy)} />
-              <Choice icon={<KeyRound />} title={t('已有来源', 'Existing source')} description={t(`${availableAccounts.length} 个可调度凭据`, `${availableAccounts.length} schedulable credential(s)`)} onClick={() => chooseMode('existing')} disabled={Boolean(busy) || !availableAccounts.length} />
+              <Choice icon={<KeyRound />} title={t('已有来源', 'Existing source')} description={t(`${setupEligibleAccounts.length} 个可绑定凭据`, `${setupEligibleAccounts.length} bindable credential(s)`)} onClick={() => chooseMode('existing')} disabled={Boolean(busy) || !setupEligibleAccounts.length} />
               <Choice icon={<Network />} title={t('已有聚合中转', 'Existing aggregate relay')} description={t(`${aggregatePools.length} 个聚合配置`, `${aggregatePools.length} aggregate configuration(s)`)} onClick={() => chooseMode('aggregate')} disabled={Boolean(busy) || !aggregatePools.length} />
             </div>
           </WizardSection>}
@@ -905,7 +951,7 @@ export function SetupWizardView({
           {currentStep === 'source-config' && sourceMode === 'existing' && <WizardSection icon={<KeyRound />} title={t('选择已有来源', 'Choose an existing source')} description={t('向导会重新检查账号状态和模型。', 'The wizard will check the account status and models again.')}>
             <select className="setup-select" value={selectedAccountId} disabled={Boolean(busy)} onChange={(event) => { setSelectedAccountId(event.target.value); setModel('') }}>
               <option value="">{t('选择来源', 'Choose a source')}</option>
-              {availableAccounts.map((account) => <option value={account.id} key={account.id}>{account.name} · {providerById.get(account.providerId)?.name}</option>)}
+              {setupEligibleAccounts.map((account) => <option value={account.id} key={account.id}>{account.name} · {providerById.get(account.providerId)?.name}</option>)}
             </select>
             <PrimaryAction disabled={Boolean(busy) || !selectedAccountId} busy={false} onClick={() => void selectExisting()} label={t('使用此来源', 'Use this source')} />
           </WizardSection>}
@@ -959,7 +1005,7 @@ export function SetupWizardView({
             </section>}
           </WizardSection>}
 
-          {currentStep === 'source-config' && (sourceMode === 'official-api' || sourceMode === 'relay') && <WizardSection icon={<Server />} title={sourceMode === 'official-api' ? t('配置官方 API', 'Configure official API') : t('配置中转站', 'Configure relay')} description={t('先完成真实请求测试，再保存到本机安全存储。', 'Run a real request test before saving the source to secure local storage.')}>
+          {currentStep === 'source-config' && (sourceMode === 'official-api' || sourceMode === 'relay') && <WizardSection icon={<Server />} title={sourceDraft.kind === KIRO_COMPATIBLE_KIND ? t('配置 Kiro Claude 中转', 'Configure Kiro Claude relay') : sourceMode === 'official-api' ? t('配置官方 API', 'Configure official API') : t('配置中转站', 'Configure relay')} description={sourceDraft.kind === KIRO_COMPATIBLE_KIND ? t('填写完整端点、Key 和模型，并完成真实两轮工具链测试。', 'Enter the full endpoint, key, and model, then run the real two-round tool test.') : t('先完成真实请求测试，再保存到本机安全存储。', 'Run a real request test before saving the source to secure local storage.')}>
             <ApiSourceForm
               draft={sourceDraft}
               proxyId={proxyId}
@@ -978,7 +1024,7 @@ export function SetupWizardView({
             />
             {currentProbe && <ProbeResult result={currentProbe} />}
             {probe && !currentProbe && <div className="setup-message setup-message--error"><CircleAlert size={17} /><span>{t('来源配置已变更，原测试结果已失效。', 'The source changed, so the previous test result is no longer valid.')}</span></div>}
-            <div className="setup-actions"><button className="button button--secondary" type="button" disabled={Boolean(busy)} onClick={() => void probeDraft()}>{busy === 'probe' ? <LoaderCircle size={16} className="spin" /> : <ShieldCheck size={16} />}{t('测试连接', 'Test connection')}</button><PrimaryAction disabled={Boolean(busy) || !currentProbe?.ok} busy={busy === 'save-source'} onClick={() => void saveDraft()} label={t('保存并继续', 'Save and continue')} /></div>
+            <div className="setup-actions"><button className="button button--secondary" type="button" disabled={Boolean(busy)} onClick={() => void probeDraft()}>{busy === 'probe' ? <LoaderCircle size={16} className="spin" /> : <ShieldCheck size={16} />}{sourceDraft.kind === KIRO_COMPATIBLE_KIND ? t('测试 Kiro 工具链', 'Test Kiro tool chain') : t('测试连接', 'Test connection')}</button><PrimaryAction disabled={Boolean(busy) || !currentProbe?.ok} busy={busy === 'save-source'} onClick={() => void saveDraft()} label={t('保存并继续', 'Save and continue')} /></div>
           </WizardSection>}
 
           {currentStep === 'network' && <WizardSection icon={<Router />} title={t('检查网络出口', 'Check the network exit')} description={t('使用来源配置的实际出口运行网络诊断。', 'Run network diagnostics through the actual exit configured for this source.')}>
@@ -992,9 +1038,10 @@ export function SetupWizardView({
           </WizardSection>}
 
           {currentStep === 'client' && <WizardSection icon={<Settings2 />} title={t('选择主客户端', 'Choose your primary client')} description={t('向导一次配置一个客户端，完成后可以继续配置其他客户端。', 'The wizard configures one client at a time. You can add more after this setup.')}>
-            <div className="setup-choice-grid setup-choice-grid--clients">{(['codex', 'claude', 'gemini', 'grokbuild'] as RouteClient[]).map((item) => <Choice key={item} title={clientLabels[item]} description={item === 'codex' ? t('推荐用于 OAuth / Responses 来源', 'Recommended for OAuth / Responses sources') : item === 'grokbuild' ? t('仅连接原生 Responses 的 Grok 号池或中转站', 'Connects only to Responses-native Grok pools or relays') : t(`通过 Stone+ 协议转换接入 ${clientLabels[item]}`, `Connect ${clientLabels[item]} through Stone+ protocol conversion`)} selected={client === item} onClick={() => setClient(item)} disabled={Boolean(busy) || (item === 'grokbuild' && !selectedSourceIsGrok)} />)}</div>
+            <div className="setup-choice-grid setup-choice-grid--clients">{(['codex', 'claude', 'gemini', 'grokbuild'] as RouteClient[]).map((item) => <Choice key={item} title={clientLabels[item]} description={item === 'codex' ? t('推荐用于 OAuth / Responses 来源', 'Recommended for OAuth / Responses sources') : item === 'grokbuild' ? t('仅连接原生 Responses 的 Grok 号池或中转站', 'Connects only to Responses-native Grok pools or relays') : t(`通过 Stone+ 协议转换接入 ${clientLabels[item]}`, `Connect ${clientLabels[item]} through Stone+ protocol conversion`)} selected={client === item} onClick={() => setClient(item)} disabled={Boolean(busy) || (item === 'grokbuild' && !selectedSourceIsGrok) || (selectedSourceIsKiroClaude && item !== 'claude')} />)}</div>
             {!selectedSourceIsGrok && <small>{t('当前来源不是 Grok 原生 Responses 来源，因此不能选择 Grok Build。', 'The current source is not a Responses-native Grok source, so Grok Build is unavailable.')}</small>}
-            <PrimaryAction busy={false} disabled={Boolean(busy) || (client === 'grokbuild' && !selectedSourceIsGrok)} onClick={() => void move('routing', { client, model })} label={t('继续配置路由', 'Continue to routing')} />
+            {selectedSourceIsKiroClaude && <small>{t('Kiro Claude 使用 Anthropic Messages 入站并直转 AWS Event Stream，仅支持 Claude Code CLI、Desktop 与 VSC。', 'Kiro Claude accepts Anthropic Messages and translates directly to AWS Event Stream. It is available only to Claude Code CLI, Desktop, and VSC.')}</small>}
+            <PrimaryAction busy={false} disabled={Boolean(busy) || (client === 'grokbuild' && !selectedSourceIsGrok) || (selectedSourceIsKiroClaude && client !== 'claude')} onClick={() => void move('routing', { client, model })} label={t('继续配置路由', 'Continue to routing')} />
           </WizardSection>}
 
           {currentStep === 'routing' && <WizardSection icon={<Waypoints />} title={t('创建号池与路由', 'Create the pool and route')} description={t('Stone+ 会原子创建或复用号池，并启用对应客户端路由。', 'Stone+ atomically creates or reuses a pool and enables the matching client route.')}>
@@ -1064,7 +1111,7 @@ function ScanSummary({ snapshot }: { snapshot: AppSnapshot }) {
 
 function ApiSourceForm({ draft, proxies, proxyId, proxyInterlocked, official, onChange, onProxyChange, onVendor }: { draft: ApiSourceInput; proxies: AppSnapshot['proxies']; proxyId: string; proxyInterlocked: boolean; official: boolean; onChange: (value: ApiSourceInput) => void; onProxyChange: (value: string) => void; onVendor: (kind: ProviderKind) => void }) {
   const { t } = useI18n()
-  const compatibleKinds: ProviderKind[] = [XAI_COMPATIBLE_KIND, 'openai-compatible', 'anthropic-compatible', 'custom']
+  const compatibleKinds: ProviderKind[] = [XAI_COMPATIBLE_KIND, KIRO_COMPATIBLE_KIND, 'openai-compatible', 'anthropic-compatible', 'custom']
   const protocols = official && draft.kind === 'xai'
     ? ['openai-responses'] as const
     : protocolsByProviderKind[draft.kind]
@@ -1085,8 +1132,8 @@ function ApiSourceForm({ draft, proxies, proxyId, proxyInterlocked, official, on
       })
     }}>{compatibleKinds.map((kind) => <option value={kind} key={kind}>{t(providerKindLabelsZh[kind], providerKindLabelsEn[kind])}</option>)}</select></label>}
     <label><span>{t('显示名称', 'Display name')}</span><input value={draft.name} onChange={(event) => onChange({ ...draft, name: event.target.value })} /></label>
-    <label className="full"><span>Base URL</span><input className="mono" disabled={official} value={draft.baseUrl} onChange={(event) => onChange({ ...draft, baseUrl: event.target.value })} /></label>
-    <label><span>{t('协议', 'Protocol')}</span><select value={draft.protocol} disabled={official && draft.kind === 'xai'} onChange={(event) => {
+    <label className="full"><span>{draft.kind === KIRO_COMPATIBLE_KIND ? t('完整 GenerateAssistantResponse 端点', 'Full GenerateAssistantResponse endpoint') : 'Base URL'}</span><input className="mono" disabled={official} value={draft.baseUrl} onChange={(event) => onChange({ ...draft, baseUrl: event.target.value })} />{draft.kind === KIRO_COMPATIBLE_KIND && <small>{t('按原样请求此完整端点，不会拼接 /v1/messages 或 /models。', 'This exact endpoint is requested as entered; Stone+ does not append /v1/messages or /models.')}</small>}</label>
+    <label><span>{t('协议', 'Protocol')}</span><select value={draft.protocol} disabled={(official && draft.kind === 'xai') || relayProtocolSelectLocked(draft.kind)} onChange={(event) => {
       const protocol = event.target.value as Protocol
       onChange({
         ...draft,
@@ -1095,10 +1142,10 @@ function ApiSourceForm({ draft, proxies, proxyId, proxyInterlocked, official, on
           ? effectiveResponsesCompactMode(draft.responsesCompactMode)
           : undefined,
       })
-    }}>{protocols.map((protocol) => <option value={protocol} key={protocol}>{protocolOptionLabel(draft.kind, protocol, protocolLabels, t)}</option>)}</select>{draft.kind === XAI_COMPATIBLE_KIND && <small>{t('默认使用官方当前主路径 Responses；仅当中转明确只兼容 Chat Completions 时选择高级兼容模式。', 'Responses is the current primary API path. Choose advanced Chat compatibility only when the relay explicitly requires Chat Completions.')}</small>}</label>
+    }}>{protocols.map((protocol) => <option value={protocol} key={protocol}>{protocolOptionLabel(draft.kind, protocol, protocolLabels, t)}</option>)}</select>{draft.kind === XAI_COMPATIBLE_KIND && <small>{t('默认使用官方当前主路径 Responses；仅当中转明确只兼容 Chat Completions 时选择高级兼容模式。', 'Responses is the current primary API path. Choose advanced Chat compatibility only when the relay explicitly requires Chat Completions.')}</small>}{draft.kind === KIRO_COMPATIBLE_KIND && <small>{t('协议固定为 Kiro Claude；保存前必须通过两轮结构化工具测试。', 'The protocol is fixed to Kiro Claude. A two-round structured tool test is required before binding.')}</small>}</label>
     {relayCanConfigureResponsesCompact(draft.sourceType, draft.protocol) && <label className="full"><span className="field-label-with-help">{t('Responses Compact 能力', 'Responses compact capability')}<InfoTip text={t(compactCopy.helpZh, compactCopy.helpEn)} /></span><select value={compactMode} onChange={(event) => onChange({ ...draft, responsesCompactMode: event.target.value as ResponsesCompactMode })}>{responsesCompactModes.map((mode) => <option value={mode} key={mode}>{t(responsesCompactModeCopy[mode].labelZh, responsesCompactModeCopy[mode].labelEn)}</option>)}</select></label>}
     {officialOpenAiUsesNativeCompact(draft.sourceType, draft.kind, draft.protocol) && <label className="full"><span className="field-label-with-help"><ShieldCheck size={13} />{t('Responses Compact 能力', 'Responses compact capability')}<InfoTip text={t('官方 OpenAI 按 Responses 协议自动使用完整原生 Compact，无需手动配置。', 'Official OpenAI automatically uses full native compact through the Responses protocol. No manual setting is needed.')} /></span><input disabled value={t('自动：完整原生 Compact', 'Automatic: full native compact')} /></label>}
-    <label><span>{t('测试/默认模型', 'Test/default model')}</span><input value={draft.defaultModel ?? ''} onChange={(event) => onChange({ ...draft, defaultModel: event.target.value })} placeholder={t('例如 gpt-5.4', 'For example, gpt-5.4')} /></label>
+    <label><span>{t('测试/默认模型', 'Test/default model')}</span><input value={draft.defaultModel ?? ''} onChange={(event) => onChange({ ...draft, defaultModel: event.target.value })} placeholder={draft.kind === KIRO_COMPATIBLE_KIND ? t('手动填写 Kiro 模型', 'Enter the Kiro model manually') : t('例如 gpt-5.4', 'For example, gpt-5.4')} />{draft.kind === KIRO_COMPATIBLE_KIND && <small>{t('Kiro Claude 不进行模型发现。', 'Kiro Claude does not use model discovery.')}</small>}</label>
     <label className="full"><span>API Key</span><input type="password" value={draft.credential ?? ''} onChange={(event) => onChange({ ...draft, credential: event.target.value })} /></label>
     <label><span>{t('最大并发', 'Max concurrency')}</span><input type="number" min={1} max={100} value={draft.maxConcurrency} onChange={(event) => onChange({ ...draft, maxConcurrency: Number(event.target.value) })} /></label>
     <label><span>{t('代理', 'Proxy')}</span><select value={proxyId} disabled={proxyInterlocked} onChange={(event) => onProxyChange(event.target.value)}><option value="">{t('直连', 'Direct')}</option>{proxies.map((proxy) => <option value={proxy.id} key={proxy.id}>{proxy.name}</option>)}</select>{proxyInterlocked && <small>{t(BUILT_IN_PROXY_BINDING_NOTICE.zh, BUILT_IN_PROXY_BINDING_NOTICE.en)}</small>}</label>
@@ -1132,6 +1179,7 @@ function stageLabel(id: string, t: Translate): string {
   if (id === 'network') return t('网络', 'Network')
   if (id === 'authentication') return t('认证', 'Authentication')
   if (id === 'models') return t('模型发现', 'Model discovery')
+  if (id === 'tool-roundtrip') return t('两轮工具链', 'Two-round tool test')
   return t('真实生成', 'Real generation')
 }
 

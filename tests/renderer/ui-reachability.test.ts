@@ -35,6 +35,37 @@ describe('renderer reachability regressions', () => {
     expect(source).toContain('(error || loadError)')
   })
 
+  it('keeps managed-client fallback polling single-flight and dormant while hidden', () => {
+    const source = readFileSync(new URL('../../src/renderer/src/managed-client-instances.tsx', import.meta.url), 'utf8')
+    expect(source).toContain('new SingleFlightAsyncOperation()')
+    expect(source).toContain("document.visibilityState === 'hidden'")
+    expect(source).toContain("document.addEventListener('visibilitychange'")
+    expect(source).not.toContain('setInterval(load, 2_000)')
+  })
+
+  it('does not mount the retired background-task panel in client management', () => {
+    const source = readFileSync(new URL('../../src/renderer/src/views/ClientsView.tsx', import.meta.url), 'utf8')
+    expect(source).not.toContain("import { PersistentTaskCenter }")
+    expect(source).not.toContain('<PersistentTaskCenter')
+  })
+
+  it('ignores lifecycle transport-only changes and serializes tunnel polling', () => {
+    const clients = readFileSync(new URL('../../src/renderer/src/views/ClientsView.tsx', import.meta.url), 'utf8')
+    const tunnel = readFileSync(new URL('../../src/renderer/src/views/TunnelView.tsx', import.meta.url), 'utf8')
+
+    expect(clients).toContain('agentLifecycleRenderKey(next)')
+    expect(tunnel).toContain('new SingleFlightAsyncOperation()')
+    expect(tunnel).toContain("document.visibilityState === 'hidden'")
+    expect(tunnel).not.toContain('setInterval(() => void load(false), 1_500)')
+  })
+
+  it('isolates the one-second OAuth countdown from the large account workspace', () => {
+    const source = readFileSync(new URL('../../src/renderer/src/views/ProvidersView.tsx', import.meta.url), 'utf8')
+    expect(source).toContain('function OAuthExpiryCountdown')
+    expect(source).toContain('<OAuthExpiryCountdown expiresAt={oauthSession.expiresAt} />')
+    expect(source).not.toContain('setOauthNow')
+  })
+
   it('keeps browser navigation and reload controls visible at narrow widths', () => {
     const css = readFileSync(new URL('../../src/renderer/src/styles.css', import.meta.url), 'utf8')
     const narrowBrowserRules = css.slice(css.indexOf('@media (max-width: 780px)'), css.indexOf('@media (max-width: 560px)'))

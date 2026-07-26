@@ -205,7 +205,7 @@
 
 .telemetry-workspace__search:focus-within {
   border-color: var(--accent);
-  box-shadow: 0 0 0 3px rgb(23 107 82 / 10%);
+  box-shadow: 0 0 0 3px var(--focus-ring);
 }
 
 .telemetry-workspace__search input {
@@ -464,7 +464,7 @@
 .telemetry-workspace__table-mask {
   position: absolute;
   inset: 31px 0 0;
-  background: linear-gradient(180deg, rgb(248 250 249 / 78%), rgb(255 255 255 / 96%));
+  background: linear-gradient(180deg, var(--surface-subtle), var(--surface));
   pointer-events: none;
 }
 

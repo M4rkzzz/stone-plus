@@ -6,7 +6,11 @@ import type { VerifiedSingBoxRuntime } from '../../src/main/proxy/built-in/binar
 import {
   ElevatedSingBoxTunAdapter,
   ElevatedSingBoxTunError,
+  STONE_WINDOWS_SIGNER_SUBJECT,
+  STONE_WINDOWS_SIGNER_THUMBPRINT,
   buildElevatedTunSidecarConfig,
+  isPackagedElectronApplication,
+  validatePackagedStoneHostSignature,
   type TunSidecarFileSystem
 } from '../../src/main/proxy/built-in/tun-sidecar-adapter'
 import {
@@ -30,6 +34,75 @@ afterEach(async () => {
 })
 
 describe('elevated sing-box TUN sidecar configuration', () => {
+  it('keeps the elevation signer trust anchor synchronized with project identity', async () => {
+    const identity = JSON.parse(await readFile(join(process.cwd(), 'PROJECT_IDENTITY.json'), 'utf8'))
+    expect(STONE_WINDOWS_SIGNER_THUMBPRINT).toBe(identity.signing.windowsAuthenticode.sha1Thumbprint)
+  })
+
+  it('accepts the exact self-signed packaged host only for an untrusted-root UnknownError', () => {
+    const executablePath = 'C:\\Users\\test user\\AppData\\Local\\Programs\\stone-desktop\\Stone+.exe'
+    const untrustedRoot = {
+      Status: 1,
+      StatusMessage: 'A certificate chain processed, but terminated in a root certificate which is not trusted by the trust provider',
+      Path: executablePath,
+      Subject: STONE_WINDOWS_SIGNER_SUBJECT,
+      Thumbprint: STONE_WINDOWS_SIGNER_THUMBPRINT,
+    }
+
+    expect(validatePackagedStoneHostSignature(executablePath, untrustedRoot)).toBeNull()
+    expect(validatePackagedStoneHostSignature(executablePath, {
+      ...untrustedRoot,
+      StatusMessage: 'An unknown signature verification error occurred.',
+    })).toContain('verification failed')
+    expect(validatePackagedStoneHostSignature(executablePath, {
+      ...untrustedRoot,
+      Status: 4,
+      StatusMessage: 'Not trusted.',
+    })).toContain('verification failed')
+  })
+
+  it('rejects the self-signed host when its exact path, subject, or thumbprint differs', () => {
+    const executablePath = 'C:\\Program Files\\Stone+\\Stone+.exe'
+    const signature = {
+      Status: 0,
+      Path: executablePath,
+      Subject: STONE_WINDOWS_SIGNER_SUBJECT,
+      Thumbprint: STONE_WINDOWS_SIGNER_THUMBPRINT,
+    }
+
+    expect(validatePackagedStoneHostSignature(executablePath, { ...signature, Path: '' }))
+      .toContain('did not return the inspected file path')
+    expect(validatePackagedStoneHostSignature(executablePath, { ...signature, Path: 'C:\\Temp\\Stone+.exe' }))
+      .toContain('different file path')
+    expect(validatePackagedStoneHostSignature(executablePath, {
+      ...signature,
+      Subject: 'CN=StonePlus Open Source Release, O=Unrelated Publisher',
+    })).toContain('verification failed')
+    expect(validatePackagedStoneHostSignature(executablePath, {
+      ...signature,
+      Thumbprint: '0000000000000000000000000000000000000000',
+    })).toContain('verification failed')
+  })
+
+  it('distinguishes plain Node, Electron dev/defaultApp, and an asar packaged application', () => {
+    expect(isPackagedElectronApplication({ versions: {}, resourcesPath: 'C:\\Stone\\resources' }, () => true)).toBe(false)
+    expect(isPackagedElectronApplication({
+      versions: { electron: '39.0.0' },
+      defaultApp: true,
+      resourcesPath: 'C:\\Stone\\resources',
+    }, () => true)).toBe(false)
+    expect(isPackagedElectronApplication({
+      versions: { electron: '39.0.0' },
+      defaultApp: false,
+      resourcesPath: 'C:\\Stone\\resources',
+    }, (path) => path.endsWith('app.asar'))).toBe(true)
+    expect(isPackagedElectronApplication({
+      versions: { electron: '39.0.0' },
+      defaultApp: false,
+      resourcesPath: 'C:\\Stone\\resources',
+    }, () => false)).toBe(false)
+  })
+
   it('routes default traffic through loopback mixed while directly excluding every self-routing edge', () => {
     const bypass = sidecarBypass()
     const config = buildElevatedTunSidecarConfig({
@@ -95,6 +168,39 @@ describe('elevated sing-box TUN sidecar configuration', () => {
 })
 
 describe('ElevatedSingBoxTunAdapter lifecycle', () => {
+  it('writes a pending ownership journal before starting the elevated process', async () => {
+    const directory = await temporaryDirectory()
+    const recoveryPath = join(directory, 'built-in-proxy', 'tun-sidecar', 'active-sidecar.json')
+    const pendingRecoveryPath = join(directory, 'built-in-proxy', 'tun-sidecar', 'pending-sidecar.json')
+    const stop = vi.fn(async () => undefined)
+    const start = vi.fn(async () => {
+      const pending = JSON.parse(await readFile(pendingRecoveryPath, 'utf8'))
+      expect(pending).toMatchObject({ version: 2, phase: 'pending' })
+      expect(pending).not.toHaveProperty('pid')
+      return { id: 'journal-first', pid: 9301, stop }
+    })
+    const adapter = new ElevatedSingBoxTunAdapter({
+      userDataPath: directory,
+      runtimeRoot: join(directory, 'runtime'),
+      platform: 'win32',
+      verifyRuntime: async () => verifiedRuntime(directory, 'win32'),
+      commandRunner: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
+      processRunner: { start, recover: vi.fn(async () => undefined) },
+      randomId: () => 'journal-first-session',
+      resolveHost: resolveTestHost,
+      fetchImplementation: healthyTunFetch
+    })
+
+    const session = await adapter.startTemporaryElevated({ bypass: sidecarBypass() })
+    expect(JSON.parse(await readFile(recoveryPath, 'utf8'))).toMatchObject({
+      version: 2,
+      phase: 'active',
+      pid: 9301
+    })
+    await adapter.stopTemporary(session)
+    expect(stop).toHaveBeenCalledOnce()
+  })
+
   it('recovers and stops an authenticated sidecar journal left by a prior main process', async () => {
     const directory = await temporaryDirectory()
     const runner = new FakeProcessRunner()
@@ -168,12 +274,22 @@ describe('ElevatedSingBoxTunAdapter lifecycle', () => {
       architecture: 'x64'
     })
     expect(writes).toEqual([{ path: `${configPath}.tmp`, mode: 0o600, flag: 'wx' }])
-    expect(commands).toEqual([expect.objectContaining({
+    expect(commands.filter((command) => command.operation === 'tun.sidecar.check')).toEqual([expect.objectContaining({
       file: runtime.executablePath,
       args: ['check', '-c', configPath],
       cwd: runtime.runtimePath,
       operation: 'tun.sidecar.check'
     })])
+    const protectConfigCommand = commands.find((command) => (
+      command.operation === 'tun.windows.protect-config-directory'
+    ))
+    expect(protectConfigCommand).toMatchObject({
+      file: 'powershell.exe',
+      env: {
+        STONE_BUILT_IN_PROXY_TUN_ACL_TARGET: join(directory, 'built-in-proxy', 'tun-sidecar'),
+      },
+    })
+    expect(protectConfigCommand?.args).not.toContain(join(directory, 'built-in-proxy', 'tun-sidecar'))
     expect(processRunner.requests).toEqual([expect.objectContaining({
       launcher: 'windows-uac',
       executablePath: runtime.executablePath,
@@ -240,9 +356,13 @@ describe('ElevatedSingBoxTunAdapter lifecycle', () => {
     })
     const session = await adapter.startTemporaryElevated({ bypass: sidecarBypass() })
     const configPath = join(directory, 'built-in-proxy', 'tun-sidecar', 'sidecar-retry-stop-session.json')
+    const activeJournal = join(directory, 'built-in-proxy', 'tun-sidecar', 'active-sidecar.json')
+    const pendingJournal = join(directory, 'built-in-proxy', 'tun-sidecar', 'pending-sidecar.json')
 
     await expect(adapter.stopTemporary(session)).rejects.toMatchObject({ code: 'tun_cleanup_failed' })
     await expect(readFile(configPath, 'utf8')).resolves.toContain('stone-tun-in')
+    await expect(readFile(activeJournal, 'utf8')).resolves.toContain('"phase":"active"')
+    await expect(readFile(pendingJournal, 'utf8')).resolves.toContain('"phase":"pending"')
     await expect(adapter.stopTemporary(session)).resolves.toBeUndefined()
     expect(processRunner.stop).toHaveBeenCalledTimes(2)
     await expect(readFile(configPath, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
@@ -275,7 +395,7 @@ describe('ElevatedSingBoxTunAdapter lifecycle', () => {
 
     await expect(adapter.startTemporaryElevated({ bypass: sidecarBypass() }))
       .rejects.toMatchObject({ code: 'tun_start_failed' })
-    expect(stop).not.toHaveBeenCalled()
+    expect(stop).toHaveBeenCalledOnce()
     await expect(readFile(configPath, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
@@ -310,7 +430,7 @@ describe('ElevatedSingBoxTunAdapter lifecycle', () => {
 
     await expect(adapter.startTemporaryElevated({ bypass: sidecarBypass() }))
       .rejects.toBeInstanceOf(TunElevationDeniedError)
-    expect(stop).not.toHaveBeenCalled()
+    expect(stop).toHaveBeenCalledOnce()
     await expect(readFile(configPath, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
   })
 

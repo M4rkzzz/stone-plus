@@ -7,6 +7,7 @@ import {
   isCurrentBuiltInRuntimeRequest,
   parseBuiltInProxyNodePanelPreferences,
   resolveBuiltInProxyGroupFilter,
+  resolveBuiltInProxySurfacePresentation,
   resolveBuiltInProxyTakeoverPresentation,
   runtimeErrorMessage,
   shouldAcceptBuiltInRuntimeResponse,
@@ -168,6 +169,64 @@ describe('built-in proxy takeover presentation truth', () => {
       status: 'stopping',
       effectiveRoute: { generation: 13, kind: 'built-in-mixed', mixedPort: 3198 },
     }))).toMatchObject({ phase: 'restoring', accessApplied: false })
+  })
+})
+
+describe('built-in proxy master surface truth', () => {
+  it('distinguishes desired intent, published routes, disabling, and external maintenance errors', () => {
+    const state = (
+      desiredEnabled: boolean,
+      status: BuiltInProxyRuntimeState['status'],
+      kind: BuiltInProxyRuntimeState['effectiveRoute']['kind'],
+    ): BuiltInProxyRuntimeState => {
+      const effectiveRoute: BuiltInProxyRuntimeState['effectiveRoute'] = kind === 'external'
+        ? { generation: 1, kind, externalMode: 'direct' }
+        : kind === 'blocked'
+          ? { generation: 1, kind }
+          : { generation: 1, kind, mixedPort: 3198 }
+      const runtime = runtimeState({ status, effectiveRoute })
+      runtime.desiredEnabled = desiredEnabled
+      runtime.settings.desiredEnabled = desiredEnabled
+      return runtime
+    }
+
+    expect(resolveBuiltInProxySurfacePresentation(state(false, 'disabled', 'external'))).toEqual({
+      showBuiltIn: false,
+      masterChecked: false,
+      disabledExternalMaintenanceError: false,
+    })
+    expect(resolveBuiltInProxySurfacePresentation(state(false, 'error', 'external'))).toEqual({
+      showBuiltIn: false,
+      masterChecked: false,
+      disabledExternalMaintenanceError: true,
+    })
+    expect(resolveBuiltInProxySurfacePresentation(state(true, 'disabled', 'external'))).toMatchObject({
+      showBuiltIn: true,
+      masterChecked: true,
+      disabledExternalMaintenanceError: false,
+    })
+    expect(resolveBuiltInProxySurfacePresentation(state(false, 'stopping', 'external'))).toMatchObject({
+      showBuiltIn: true,
+      masterChecked: true,
+    })
+    expect(resolveBuiltInProxySurfacePresentation(state(false, 'stopping', 'built-in-mixed'))).toMatchObject({
+      showBuiltIn: true,
+      masterChecked: true,
+    })
+    expect(resolveBuiltInProxySurfacePresentation(state(false, 'error', 'built-in-mixed'))).toMatchObject({
+      showBuiltIn: true,
+      masterChecked: true,
+      disabledExternalMaintenanceError: false,
+    })
+    expect(resolveBuiltInProxySurfacePresentation(state(false, 'error', 'blocked'))).toMatchObject({
+      showBuiltIn: true,
+      masterChecked: true,
+    })
+    expect(resolveBuiltInProxySurfacePresentation(state(true, 'error', 'external'))).toMatchObject({
+      showBuiltIn: true,
+      masterChecked: true,
+      disabledExternalMaintenanceError: false,
+    })
   })
 })
 

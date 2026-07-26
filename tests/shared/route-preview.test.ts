@@ -189,6 +189,46 @@ describe('static route preview', () => {
     expect(result.eligibleAccountCount).toBe(0)
   })
 
+  it('fails closed when a disabled legacy relay member uses a different wire protocol', () => {
+    const crossWire = {
+      providers: [
+        {
+          ...snapshot.providers[0],
+          id: 'responses-relay',
+          sourceType: 'relay' as const,
+          kind: 'openai-compatible' as const,
+          protocol: 'openai-responses' as const,
+        },
+        {
+          ...snapshot.providers[0],
+          id: 'chat-relay',
+          sourceType: 'relay' as const,
+          kind: 'openai-compatible' as const,
+          protocol: 'openai-chat' as const,
+        },
+      ],
+      accounts: [
+        { ...snapshot.accounts[0], id: 'responses-account', providerId: 'responses-relay' },
+        { ...snapshot.accounts[0], id: 'chat-account', providerId: 'chat-relay' },
+      ],
+      pools: [{
+        id: 'legacy-cross-wire', name: 'Legacy cross wire', kind: 'standard' as const,
+        protocol: 'openai-responses' as const, strategy: 'balanced' as const,
+        members: [
+          { accountId: 'responses-account', enabled: true },
+          { accountId: 'chat-account', enabled: false },
+        ],
+        modelPolicy: 'all' as const, modelAllowlist: [], stickySessions: false,
+        stickyTtlMinutes: 30, maxRetries: 0, createdAt: 1, updatedAt: 1,
+      }],
+    } as Pick<AppSnapshot, 'providers' | 'accounts' | 'pools'>
+
+    const result = previewRoute({ route: { ...route, poolId: 'legacy-cross-wire' } }, crossWire)
+    expect(result.status).toBe('blocked')
+    expect(result.eligibleAccountCount).toBe(0)
+    expect(result.issues).toContainEqual(expect.objectContaining({ code: 'source-unavailable' }))
+  })
+
   it('blocks explicitly unsupported required capabilities', () => {
     const result = previewRoute({ route, requestedModel: 'alias', requiredCapabilities: ['imageInput'] }, snapshot)
     expect(result.status).toBe('blocked')
@@ -315,5 +355,34 @@ describe('static route preview', () => {
     const result = previewRoute({ route, requestedModel: 'alias' }, selected)
     expect(result.status).toBe('blocked')
     expect(result.issues).toContainEqual(expect.objectContaining({ code: 'model-unavailable' }))
+  })
+
+  it('does not report checking, cooling or saturated accounts as currently eligible', () => {
+    const now = Date.now()
+    const variants = [
+      { status: 'checking' as const },
+      { status: 'cooldown' as const, cooldownUntil: now + 60_000 },
+      { status: 'active' as const, inFlight: 4, maxConcurrency: 4 },
+    ]
+    for (const patch of variants) {
+      const unavailable = {
+        ...snapshot,
+        accounts: snapshot.accounts.map((account) => ({ ...account, ...patch })),
+      } as Pick<AppSnapshot, 'providers' | 'accounts' | 'pools'>
+      const result = previewRoute({ route, requestedModel: 'alias' }, unavailable)
+      expect(result.status).toBe('blocked')
+      expect(result.eligibleAccountCount).toBe(0)
+      expect(result.issues).toContainEqual(expect.objectContaining({ code: 'source-unavailable' }))
+    }
+
+    const recovered = {
+      ...snapshot,
+      accounts: snapshot.accounts.map((account) => ({
+        ...account,
+        status: 'cooldown' as const,
+        cooldownUntil: now - 1,
+      })),
+    } as Pick<AppSnapshot, 'providers' | 'accounts' | 'pools'>
+    expect(previewRoute({ route, requestedModel: 'alias' }, recovered).eligibleAccountCount).toBe(1)
   })
 })

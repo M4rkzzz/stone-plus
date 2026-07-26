@@ -1,4 +1,4 @@
-import { useEffect, useId, useLayoutEffect, useRef, useState, type CSSProperties, type PropsWithChildren, type ReactNode } from 'react'
+import { Children, Fragment, cloneElement, isValidElement, useEffect, useId, useLayoutEffect, useRef, useState, type ButtonHTMLAttributes, type CSSProperties, type PropsWithChildren, type ReactElement, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import { AlertCircle, Check, LoaderCircle, MoreHorizontal, X } from 'lucide-react'
 import type { AccountCircuitState, AccountImportProgress, AccountStatus, PoolProtocol, ProviderKind, RequestLog } from '@shared/types'
@@ -9,6 +9,7 @@ export const protocolLabels: Record<PoolProtocol, string> = {
   'anthropic-messages': 'Anthropic Messages',
   'openai-responses': 'OpenAI Responses',
   'openai-chat': 'OpenAI Chat',
+  'kiro-claude': 'Kiro Claude',
   gemini: 'Gemini',
   grok: 'Grok',
 }
@@ -210,7 +211,8 @@ function focusInitialModalElement(dialog: HTMLElement): void {
   focusElement(target)
 }
 
-function focusElement(element: HTMLElement): void {
+function focusElement(element: HTMLElement | undefined): void {
+  if (!element) return
   try {
     element.focus({ preventScroll: true })
   } catch {
@@ -480,7 +482,9 @@ export function OverflowMenu({
 }>) {
   const triggerRef = useRef<HTMLButtonElement>(null)
   const menuRef = useRef<HTMLDivElement>(null)
+  const initialFocusRef = useRef<'first' | 'last'>('first')
   const [position, setPosition] = useState<CSSProperties>({ visibility: 'hidden' })
+  const menuId = useId()
 
   useLayoutEffect(() => {
     if (!open) return
@@ -501,6 +505,9 @@ export function OverflowMenu({
       setPosition({ top, left, visibility: 'visible' })
     }
     updatePosition()
+    const items = overflowMenuItems(menuRef.current)
+    focusOverflowMenuItem(items, initialFocusRef.current === 'last' ? items[items.length - 1] : items[0])
+    initialFocusRef.current = 'first'
     window.addEventListener('resize', updatePosition)
     window.addEventListener('scroll', updatePosition, true)
     return () => {
@@ -529,6 +536,48 @@ export function OverflowMenu({
     }
   }, [onOpenChange, open])
 
+  const requestOpen = (initialFocus: 'first' | 'last' = 'first') => {
+    initialFocusRef.current = initialFocus
+    onOpenChange(true)
+  }
+
+  const handleTriggerKeyDown = (event: React.KeyboardEvent<HTMLButtonElement>) => {
+    if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return
+    event.preventDefault()
+    if (open) {
+      const items = overflowMenuItems(menuRef.current)
+      focusOverflowMenuItem(items, event.key === 'ArrowUp' ? items[items.length - 1] : items[0])
+      return
+    }
+    requestOpen(event.key === 'ArrowUp' ? 'last' : 'first')
+  }
+
+  const handleMenuKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    const items = overflowMenuItems(menuRef.current)
+    if (!items.length) return
+    const currentIndex = items.findIndex((item) => item === document.activeElement)
+    let target: HTMLElement | undefined
+    if (event.key === 'ArrowDown') target = items[(currentIndex + 1 + items.length) % items.length]
+    else if (event.key === 'ArrowUp') target = items[(currentIndex - 1 + items.length) % items.length]
+    else if (event.key === 'Home') target = items[0]
+    else if (event.key === 'End') target = items[items.length - 1]
+    else if (event.key === 'Tab') {
+      const trigger = triggerRef.current
+      if (!trigger) return
+      const pageItems = focusableElements(document.body).filter((item) => !menuRef.current?.contains(item))
+      const triggerIndex = pageItems.indexOf(trigger)
+      const adjacent = pageItems[triggerIndex + (event.shiftKey ? -1 : 1)] ?? trigger
+      event.preventDefault()
+      onOpenChange(false)
+      queueMicrotask(() => focusElement(adjacent))
+      return
+    } else return
+    event.preventDefault()
+    focusOverflowMenuItem(items, target)
+  }
+
+  const menuChildren = decorateOverflowMenuItems(children)
+
   return <div className="menu-wrap">
     <button
       ref={triggerRef}
@@ -538,15 +587,58 @@ export function OverflowMenu({
       aria-label={label}
       aria-haspopup="menu"
       aria-expanded={open}
-      onClick={() => onOpenChange(!open)}
+      aria-controls={open ? menuId : undefined}
+      onKeyDown={handleTriggerKeyDown}
+      onClick={() => open ? onOpenChange(false) : requestOpen()}
     >
       <MoreHorizontal size={18} />
     </button>
     {open && createPortal(
-      <div ref={menuRef} className="context-menu context-menu--portal" role="menu" style={position}>{children}</div>,
+      <div
+        ref={menuRef}
+        id={menuId}
+        className="context-menu context-menu--portal"
+        role="menu"
+        aria-label={label}
+        style={position}
+        onKeyDown={handleMenuKeyDown}
+        onClickCapture={(event) => {
+          const item = (event.target as Element).closest<HTMLElement>('[role="menuitem"]')
+          if (item && !item.matches(':disabled')) {
+            focusElement(triggerRef.current ?? undefined)
+            onOpenChange(false)
+          }
+        }}
+      >{menuChildren}</div>,
       document.body,
     )}
   </div>
+}
+
+function decorateOverflowMenuItems(children: ReactNode): ReactNode {
+  return Children.map(children, (child) => {
+    if (!isValidElement(child)) return child
+    if (child.type === Fragment) {
+      const fragment = child as ReactElement<{ children?: ReactNode }>
+      return cloneElement(fragment, undefined, decorateOverflowMenuItems(fragment.props.children))
+    }
+    if (child.type !== 'button') return child
+    return cloneElement(child as ReactElement<ButtonHTMLAttributes<HTMLButtonElement>>, {
+      role: 'menuitem',
+      tabIndex: -1,
+    })
+  })
+}
+
+function overflowMenuItems(menu: HTMLElement | null): HTMLElement[] {
+  if (!menu) return []
+  return Array.from(menu.querySelectorAll<HTMLElement>('[role="menuitem"]:not([disabled])'))
+}
+
+function focusOverflowMenuItem(items: readonly HTMLElement[], target: HTMLElement | undefined): void {
+  if (!target) return
+  for (const item of items) item.tabIndex = item === target ? 0 : -1
+  focusElement(target)
 }
 
 export function ImportProgress({ progress }: { progress: AccountImportProgress }) {

@@ -441,6 +441,30 @@ describe('built-in proxy workspace server-rendered guardrails', () => {
     expect(failedHtml).not.toContain('role="tablist" aria-label="Proxy workspace"')
   })
 
+  it('keeps external proxy content visible when disabled startup maintenance needs retry', () => {
+    const maintenanceFailure = runtime({
+      desiredEnabled: false,
+      status: 'error',
+      settings: { ...runtime().settings, desiredEnabled: false },
+      effectiveRoute: { generation: 0, kind: 'external', externalMode: 'system' },
+      accessState: { mode: 'system', status: 'idle' },
+      error: {
+        category: 'configuration-invalid',
+        message: 'Could not protect the runtime directory.',
+        retryable: true,
+      },
+    })
+
+    const html = renderWorkspace(maintenanceFailure, { externalMarker: 'EXTERNAL_PROXY_CONTENT' })
+
+    expect(html).toContain('Maintenance cleanup failed')
+    expect(html).toContain('EXTERNAL_PROXY_CONTENT')
+    expect(html).toContain('aria-checked="false"')
+    expect(html).toContain('aria-label="Enable built-in proxy"')
+    expect(html).toContain('Retry reruns residual configuration, TUN, and system-proxy recovery')
+    expect(html).not.toContain('role="tablist" aria-label="Proxy workspace"')
+  })
+
   it('never renders the takeover label before the verified ready boundary', () => {
     const starting = runtime({
       status: 'starting',
@@ -743,6 +767,7 @@ interface RenderWorkspaceOptions {
   tab?: BuiltInProxyWorkspaceTab
   persistedWorkspace?: string | null
   persistedNodePanel?: string | null
+  externalMarker?: string
 }
 
 function renderWorkspace(
@@ -769,7 +794,7 @@ function renderWorkspace(
       createElement(BuiltInProxyView, {
         api: {} as GatewayApi,
         initialState: state,
-      }),
+      }, options.externalMarker),
     ))
   } finally {
     vi.unstubAllGlobals()

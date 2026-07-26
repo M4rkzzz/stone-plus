@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest'
-import { normalizeRouteModelMap, resolveRouteModel } from '../../src/shared/route-models'
+import {
+  isSafeRouteModelMapKey,
+  isSafeRouteModelMapTarget,
+  normalizeRouteModelMap,
+  resolveRouteModel,
+  validateRouteModelMapping,
+} from '../../src/shared/route-models'
 
 describe('route model mappings', () => {
   it('prefers an exact own mapping over the wildcard, then preserves the requested model', () => {
@@ -52,5 +58,22 @@ describe('route model mappings', () => {
     expect(Object.hasOwn(normalized, 'control\u0000key')).toBe(false)
     expect(Object.hasOwn(normalized, 'controlTarget')).toBe(false)
     expect(resolveRouteModel(normalized, oversized)).toBe('grok-4.20')
+  })
+
+  it('exports the exact normalized validation contract used by mapping editors', () => {
+    const maximum = 'm'.repeat(256)
+    expect(isSafeRouteModelMapKey(maximum)).toBe(true)
+    expect(isSafeRouteModelMapTarget(` ${maximum} `)).toBe(true)
+    expect(validateRouteModelMapping(' alias ', ' target ')).toEqual({
+      valid: true,
+      source: 'alias',
+      target: 'target',
+    })
+    for (const source of ['', '__proto__', 'constructor', 'prototype', 'bad\nkey', 'm'.repeat(257)]) {
+      expect(validateRouteModelMapping(source, 'target')).toEqual({ valid: false, reason: 'invalid-source' })
+    }
+    for (const target of ['', 'bad\u0000target', 'm'.repeat(257)]) {
+      expect(validateRouteModelMapping('alias', target)).toEqual({ valid: false, reason: 'invalid-target' })
+    }
   })
 })

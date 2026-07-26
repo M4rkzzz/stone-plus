@@ -9,6 +9,7 @@ const repositoryRoot = path.resolve(scriptDirectory, '..')
 const manifestRoot = path.join(repositoryRoot, 'build', 'sing-box')
 const defaultRuntimeRoot = manifestRoot
 const supportedTargets = ['win-x64', 'linux-x64', 'linux-arm64', 'mac-x64', 'mac-arm64']
+const trustedRuntimeManifestSha256 = '4882f06349e095d08862d3dbe6bd9fd8a58b32aaec77e67a5c7179def178ffb3'
 
 function assertSafeRelativePath(relativePath) {
   if (typeof relativePath !== 'string' || relativePath.length === 0 || relativePath.includes('\\')) {
@@ -67,6 +68,10 @@ export async function verifyRuntimeTarget(targetName, options = {}) {
   const canonicalManifestContents = await Promise.all(manifestNames.map((name) => (
     readFile(path.join(manifestRoot, name))
   )))
+  const canonicalRuntimeDigest = createHash('sha256').update(canonicalManifestContents[0]).digest('hex')
+  if (canonicalRuntimeDigest !== trustedRuntimeManifestSha256) {
+    throw new Error('Canonical sing-box runtime manifest differs from the compiled Stone+ trust anchor.')
+  }
   const selectedManifestContents = selectedManifestRoot === manifestRoot
     ? canonicalManifestContents
     : await Promise.all(manifestNames.map((name) => readFile(path.join(selectedManifestRoot, name))))

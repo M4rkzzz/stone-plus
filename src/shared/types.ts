@@ -8,7 +8,7 @@ import type {
   AgentTarget,
 } from './agent-lifecycle'
 
-export type Protocol = 'anthropic-messages' | 'openai-responses' | 'openai-chat' | 'gemini'
+export type Protocol = 'anthropic-messages' | 'openai-responses' | 'openai-chat' | 'gemini' | 'kiro-claude'
 /**
  * User-facing protocol exposed by a pool. `grok` is a logical dialect: the
  * provider retains its actual OpenAI Responses or Chat wire protocol. Grok
@@ -38,6 +38,7 @@ export type ProviderKind =
   | 'openai-compatible'
   | 'xai-compatible'
   | 'anthropic-compatible'
+  | 'kiro-compatible'
   | 'custom'
 
 export type UpstreamSourceType = 'oauth-system' | 'official-api' | 'relay'
@@ -513,6 +514,8 @@ export interface ClientConfigApplyResult {
   backups: ClientConfigBackup[]
   removedBackups: string[]
   retentionWarning?: string
+  /** Permission-mode changes apply only to a fresh Claude conversation. */
+  requiresNewConversation?: boolean
 }
 
 /** Result of restoring Stone+ connectivity without replacing valid user settings. */
@@ -588,6 +591,8 @@ export interface ProviderDefinition {
    */
   responsesCompactMode?: ResponsesCompactMode
   capabilityProfile?: UpstreamCapabilityProfile
+  /** Set only after the main process completes a structured two-turn tool round trip. */
+  toolRoundtripVerified?: boolean
   modelCatalog?: ModelCapabilityDefinition[]
   createdAt: number
   updatedAt: number
@@ -1031,6 +1036,16 @@ export interface RequestLog {
   cacheWriteInputTokens1h?: number
   reasoningTokens?: number
   failoverCount?: number
+  /** Number of tool definitions declared by the downstream request. */
+  toolsCount?: number
+  /** Number of structured tool results accepted from downstream history. */
+  toolResultCount?: number
+  /** Number of structured tool uses emitted by the upstream response. */
+  toolUseCount?: number
+  /** Protocol-level model stop reason after compatibility conversion. */
+  stopReason?: string
+  /** Kiro frames completed only through the narrowly allowed empty-input recovery. */
+  kiroStructuralRecoveryCount?: number
 }
 
 /** Memory-only, renderer-safe replay template. Prompt/content fields are redacted. */
@@ -1425,6 +1440,8 @@ export interface ApiSourceInput {
   proxyId?: string
   unlinkIncompatiblePools?: boolean
   capabilityProfile?: UpstreamCapabilityProfile
+  /** Main-process probe evidence; renderer-supplied values are not authoritative. */
+  toolRoundtripVerified?: boolean
   modelCatalog?: ModelCapabilityDefinition[]
   /** One-use main-process evidence binding returned by a successful unsaved-source probe. */
   probeEvidenceToken?: string
@@ -1445,7 +1462,7 @@ export interface ApiSourceProbeInput {
   persistCapabilities?: boolean
 }
 
-export type ApiSourceProbeStageId = 'network' | 'authentication' | 'models' | 'generation'
+export type ApiSourceProbeStageId = 'network' | 'authentication' | 'models' | 'generation' | 'tool-roundtrip'
 export type ApiSourceProbeStageStatus = 'success' | 'warning' | 'error' | 'skipped'
 
 export interface ApiSourceProbeStage {
@@ -1453,6 +1470,19 @@ export interface ApiSourceProbeStage {
   status: ApiSourceProbeStageStatus
   message: string
   latencyMs?: number
+}
+
+export interface ApiSourceToolRoundtripDiagnostics {
+  firstTurn: {
+    toolsCount: number
+    toolUseCount: number
+    stopReason: string
+  }
+  secondTurn: {
+    toolResultCount: number
+    toolUseCount: number
+    stopReason: string
+  }
 }
 
 export interface ApiSourceProbeResult {
@@ -1466,6 +1496,8 @@ export interface ApiSourceProbeResult {
   warnings: string[]
   capabilityProfile: UpstreamCapabilityProfile
   modelCatalog: ModelCapabilityDefinition[]
+  /** Safe Kiro probe counters only; tool ids, arguments, results and proof are never persisted. */
+  toolRoundtrip?: ApiSourceToolRoundtripDiagnostics
   /** Opaque, short-lived and one-use; never contains the connection fingerprint or credential. */
   probeEvidenceToken?: string
 }
@@ -1861,6 +1893,11 @@ export interface CodexOfficialLoginRecoveryResult extends CodexSessionRepairRest
   clientConfig: ClientConfigApplyResult
 }
 
+/** Renderer-safe outcome of restoring Claude Desktop's official inference mode. */
+export interface ClaudeDesktopOfficialModeRestoreResult {
+  readonly changed: boolean
+}
+
 export interface CodexSessionIndexCleanupCandidate {
   id: string
   threadName: string
@@ -1919,8 +1956,13 @@ export interface NetworkDiagnosticReport {
 /** Resolved renderer language used by native dialogs and main-process progress text. */
 export type UiLanguage = 'zh-CN' | 'en'
 
+/** Resolved renderer theme, mirrored onto the native window chrome. */
+export type UiTheme = 'light' | 'dark'
+export type UiThemePreference = 'system' | UiTheme
+
 export interface GatewayApi {
   setUiLanguage(language: UiLanguage): Promise<void>
+  setUiTheme(theme: UiTheme, preference: UiThemePreference): Promise<void>
   getSnapshot(): Promise<AppSnapshot>
   saveProvider(input: ProviderInput): Promise<AppSnapshot>
   refreshProviderModels(id: string): Promise<AppSnapshot>
@@ -2079,6 +2121,7 @@ export interface GatewayApi {
   smartRepairAgent(target?: AgentTarget): Promise<AgentLifecycleOperationResult>
   repairAllAffectedAgents(): Promise<AgentLifecycleOperationResult>
   closeAllManagedAgents(): Promise<AgentLifecycleOperationResult>
+  restoreClaudeDesktopOfficialMode(): Promise<ClaudeDesktopOfficialModeRestoreResult>
   previewCodexSessionIndexCleanup(): Promise<CodexSessionIndexCleanupPreview>
   cleanupCodexSessionIndexAndRestart(snapshotSha256: string, threadIds: string[]): Promise<CodexSessionIndexCleanupRestartResult>
   listCodexSessions(query?: CodexSessionQuery): Promise<CodexManagedSession[]>

@@ -1,6 +1,7 @@
 import { createHash, createPrivateKey, createPublicKey, sign, verify, type KeyObject } from 'node:crypto'
 import { createRequire } from 'node:module'
 import type * as SodiumApi from 'libsodium-wrappers-sumo'
+import { readBoundedResponseText } from './bounded-response'
 
 // The wrappers package's CommonJS entry correctly resolves its libsodium-sumo
 // dependency; some published ESM builds reference a non-existent sibling WASM
@@ -50,6 +51,8 @@ export interface AgentIdentityResolveOptions {
 
 const DEFAULT_AUTH_API_BASE_URL = 'https://auth.openai.com/api/accounts'
 const DEFAULT_REGISTRATION_TIMEOUT_MS = 30_000
+const MAX_REGISTRATION_RESPONSE_BYTES = 256 * 1024
+const MAX_JWKS_RESPONSE_BYTES = 1024 * 1024
 const MAX_REGISTRATION_ATTEMPTS = 3
 const registrationFlights = new Map<string, Promise<ChatGptAgentIdentityBundle>>()
 const JWKS_URL = 'https://chatgpt.com/backend-api/wham/agent-identities/jwks'
@@ -235,7 +238,16 @@ async function registerAgentTask(
         await retryDelay(response.headers.get('retry-after'), attempt, options.signal)
         continue
       }
-      const payload = objectValue(await response.json())
+      const responseText = await readBoundedResponseText(
+        response,
+        MAX_REGISTRATION_RESPONSE_BYTES,
+        'Agent Identity task registration response is too large.',
+        signal,
+      )
+      let payload: Record<string, unknown> | undefined
+      try { payload = objectValue(JSON.parse(responseText)) } catch {
+        throw new Error('Agent Identity task registration returned invalid JSON.')
+      }
       const taskId = firstString(payload, ['task_id'], ['taskId'])
       if (taskId) return taskId
       const encryptedTaskId = firstString(payload, ['encrypted_task_id'], ['encryptedTaskId'])
@@ -462,10 +474,11 @@ async function refreshJwks(entry: JwksCacheEntry, fetchImplementation: typeof fe
   const headers: Record<string, string> = { accept: 'application/json' }
   if (entry.etag) headers['if-none-match'] = entry.etag
   if (entry.lastModified) headers['if-modified-since'] = entry.lastModified
+  const signal = AbortSignal.timeout(DEFAULT_REGISTRATION_TIMEOUT_MS)
   const response = await fetchImplementation(JWKS_URL, {
     method: 'GET',
     headers,
-    signal: AbortSignal.timeout(DEFAULT_REGISTRATION_TIMEOUT_MS),
+    signal,
   })
   const now = Date.now()
   const ttl = jwksTtl(response.headers.get('cache-control'))
@@ -475,8 +488,12 @@ async function refreshJwks(entry: JwksCacheEntry, fetchImplementation: typeof fe
     return
   }
   if (!response.ok) throw new Error(`Agent Identity JWKS endpoint returned HTTP ${response.status}.`)
-  const text = await response.text()
-  if (Buffer.byteLength(text) > 1024 * 1024) throw new Error('Agent Identity JWKS response is too large.')
+  const text = await readBoundedResponseText(
+    response,
+    MAX_JWKS_RESPONSE_BYTES,
+    'Agent Identity JWKS response is too large.',
+    signal,
+  )
   const payload = objectValue(JSON.parse(text))
   const candidates = Array.isArray(payload?.keys) ? payload.keys.slice(0, MAX_JWKS_KEYS) : []
   const keys = new Map<string, KeyObject>()

@@ -75,7 +75,7 @@ describe('provider model probes', () => {
     const [url, init] = fetchImplementation.mock.calls[0]
     expect(String(url)).toBe(endpoint)
     expect(init?.method).toBe('POST')
-    expect(init?.redirect).toBe(adapter.kind === 'xai' ? 'error' : undefined)
+    expect(init?.redirect).toBe('error')
     const body = JSON.parse(String(init?.body)) as Record<string, unknown>
     if (protocol !== 'gemini') expect(body).toMatchObject({ model: 'test-model' })
     expect(body).not.toMatchObject({ stream: true })
@@ -169,6 +169,7 @@ describe('provider model probes', () => {
     expect(JSON.stringify(result)).not.toContain('oauth-access-private')
     const [, init] = fetchImplementation.mock.calls[0]
     expect(new Headers(init?.headers).get('authorization')).toBe('Bearer oauth-access-private')
+    expect(init?.redirect).toBe('error')
     const body = JSON.parse(String(init?.body)) as Record<string, unknown>
     expect(body).toMatchObject({ model: 'gpt-test', stream: true, store: false })
     expect(body).not.toHaveProperty('max_output_tokens')

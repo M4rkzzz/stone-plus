@@ -11,8 +11,8 @@ import type {
 type JsonObject = Record<string, unknown>
 
 export class UnsupportedProtocolConversionError extends Error {
-  constructor(from: Protocol, to: Protocol) {
-    super(`Conversion from ${from} to ${to} is not supported`)
+  constructor(from: Protocol, to: Protocol, reason?: string) {
+    super(reason ?? `Conversion from ${from} to ${to} is not supported`)
     this.name = 'UnsupportedProtocolConversionError'
   }
 }
@@ -42,6 +42,17 @@ export class InvalidToolChoiceError extends Error {
   constructor(public readonly path: string) {
     super(`Required tool choice at ${path} has no compatible function declaration.`)
     this.name = 'InvalidToolChoiceError'
+  }
+}
+
+/** Raised when an upstream response is valid for its native protocol but
+ * cannot be represented as a successful terminal response by the requested
+ * downstream protocol. Callers must surface this as a controlled upstream
+ * conversion failure instead of manufacturing an ordinary stop. */
+export class InvalidProtocolResponseError extends Error {
+  constructor(public readonly path: string, reason: string) {
+    super(`Invalid protocol response at ${path}: ${reason}`)
+    this.name = 'InvalidProtocolResponseError'
   }
 }
 
@@ -115,6 +126,16 @@ export function analyzeProtocolConversion(
     }
   }
   if (from === to) return { supported: true, issues: [] }
+  if (from === 'kiro-claude' || to === 'kiro-claude') {
+    return {
+      supported: false,
+      issues: [{
+        path: 'body',
+        capability: 'content-part',
+        reason: 'Kiro Claude conversion is available only through the dedicated Anthropic Messages gateway bridge.',
+      }],
+    }
+  }
   const issues: ProtocolConversionIssue[] = []
   const add = (path: string, capability: ProtocolConversionIssue['capability'], reason: string): void => {
     issues.push({ path, capability, reason })
@@ -190,6 +211,38 @@ export function analyzeProtocolConversion(
     }
     if (objectValue(body.reasoning) && to === 'gemini') {
       add('reasoning', 'request-option', 'Responses reasoning controls have no lossless Gemini mapping')
+    }
+  }
+  if (from === 'anthropic-messages') {
+    const thinking = objectValue(body.thinking)
+    if (thinking) {
+      if (to !== 'openai-responses') {
+        add('thinking', 'request-option', `Anthropic thinking controls have no lossless ${to} mapping`)
+      } else if (Object.hasOwn(thinking, 'budget_tokens')) {
+        add(
+          'thinking.budget_tokens',
+          'request-option',
+          'Anthropic thinking token budgets have no exact OpenAI Responses mapping'
+        )
+      }
+    }
+    for (const [index, block] of arrayOfObjects(body.system).entries()) {
+      if (Object.hasOwn(block, 'cache_control')) {
+        add(
+          `system[${index}].cache_control`,
+          'request-option',
+          `Anthropic prompt cache controls have no lossless ${to} mapping`
+        )
+      }
+    }
+    for (const [index, tool] of arrayOfObjects(body.tools).entries()) {
+      if (Object.hasOwn(tool, 'cache_control')) {
+        add(
+          `tools[${index}].cache_control`,
+          'request-option',
+          `Anthropic tool cache controls have no lossless ${to} mapping`
+        )
+      }
     }
   }
   const hasDeclaredTools = hasCompatibleFunctionDeclaration(from, body, context)
@@ -278,7 +331,21 @@ export function analyzeProtocolConversion(
             'Text after an Anthropic tool_use block has no lossless OpenAI Chat mapping'
           )
         }
+        if (Object.hasOwn(block, 'cache_control')) {
+          add(
+            `messages[${messageIndex}].content[${blockIndex}].cache_control`,
+            'request-option',
+            `Anthropic prompt cache controls have no lossless ${to} mapping`
+          )
+        }
         if (type === 'tool_result') {
+          if (block.is_error === true) {
+            add(
+              `messages[${messageIndex}].content[${blockIndex}].is_error`,
+              'content-part',
+              `Anthropic tool-result error state has no lossless ${to} mapping`
+            )
+          }
           validateToolResultContent(
             'anthropic-messages',
             to,
@@ -515,6 +582,16 @@ export function convertRequest(
       ...(context ? { conversionContext: context } : {})
     }
   }
+  if (from === 'anthropic-messages') {
+    const errorPath = anthropicToolResultErrorPath(body)
+    if (errorPath) {
+      throw new UnsupportedProtocolConversionError(
+        from,
+        to,
+        `Anthropic tool-result error state at ${errorPath} has no lossless ${to} mapping`
+      )
+    }
+  }
   const nativeXaiResponses = context?.dialect === 'xai-grok'
     && from === 'openai-responses'
     && to === 'openai-responses'
@@ -585,6 +662,22 @@ export function convertResponse(
       && context.toolBridgePlan
       ? restoreXaiResponsesToolCalls(body, context)
       : body
+  }
+  if (from === 'openai-responses') {
+    const status = stringValue(body.status).trim().toLowerCase()
+    if (status === 'cancelled' || status === 'queued' || status === 'in_progress') {
+      throw new InvalidProtocolResponseError(
+        'status',
+        `Responses status ${status} is not a successful terminal result and cannot be mapped to ${to}`
+      )
+    }
+  }
+  if (from === 'anthropic-messages'
+    && stringValue(body.stop_reason).trim().toLowerCase() === 'pause_turn') {
+    throw new InvalidProtocolResponseError(
+      'stop_reason',
+      `Anthropic pause_turn requires native continuation and cannot be mapped to ${to}`
+    )
   }
   if (to === 'openai-chat') {
     if (from === 'anthropic-messages') return anthropicResponseToChat(body, fallbackModel, now)
@@ -2374,9 +2467,9 @@ function chatResponseToAnthropic(body: JsonObject, fallbackModel: string, now: (
 function responsesResponseToChat(body: JsonObject, fallbackModel: string, now: () => number): JsonObject {
   const timestamp = now()
   const output = arrayOfObjects(body.output)
-  const messageItem = output.find((item) => stringValue(item.type) === 'message')
-  const text = messageItem ? responsesContentToText(messageItem.content, false) : ''
-  const refusal = messageItem ? responsesRefusalToText(messageItem.content) : ''
+  const messageItems = output.filter((item) => stringValue(item.type) === 'message')
+  const text = messageItems.map((item) => responsesContentToText(item.content, false)).join('')
+  const refusal = messageItems.map((item) => responsesRefusalToText(item.content)).join('')
   const toolCalls = output.filter((item) => stringValue(item.type) === 'function_call').map((item) => ({
     id: stringValue(item.call_id, stringValue(item.id)),
     type: 'function',
@@ -2488,17 +2581,29 @@ function responsesResponseToAnthropic(
 ): JsonObject {
   const output = arrayOfObjects(body.output)
   const content: JsonObject[] = []
-  const messageItem = output.find((item) => stringValue(item.type) === 'message')
-  const text = messageItem ? responsesContentToText(messageItem.content) : ''
-  if (text) content.push({ type: 'text', text })
   for (const item of output) {
-    if (stringValue(item.type) !== 'function_call') continue
-    content.push({
-      type: 'tool_use',
-      id: stringValue(item.call_id, stringValue(item.id)),
-      name: stringValue(item.name),
-      input: parseJsonObject(item.arguments, 'Responses function_call.arguments')
-    })
+    const itemType = stringValue(item.type)
+    if (itemType === 'message') {
+      for (const part of arrayOfObjects(item.content)) {
+        const partType = stringValue(part.type)
+        if (partType === 'output_text' || partType === 'text') {
+          const text = optionalString(part.text)
+          if (text) content.push({ type: 'text', text })
+        } else if (partType === 'refusal') {
+          const refusal = optionalString(part.refusal)
+          if (refusal) content.push({ type: 'text', text: refusal })
+        }
+      }
+      continue
+    }
+    if (itemType === 'function_call') {
+      content.push({
+        type: 'tool_use',
+        id: stringValue(item.call_id, stringValue(item.id)),
+        name: stringValue(item.name),
+        input: parseJsonObject(item.arguments, 'Responses function_call.arguments')
+      })
+    }
   }
   if (content.length === 0) content.push({ type: 'text', text: '' })
   const usage = objectValue(body.usage)
@@ -2605,18 +2710,23 @@ function responsesResponseToGemini(
 ): JsonObject {
   const output = arrayOfObjects(body.output)
   const parts: JsonObject[] = []
-  const messageItem = output.find((item) => stringValue(item.type) === 'message')
-  const text = messageItem ? responsesContentToText(messageItem.content) : ''
-  if (text) parts.push({ text })
   for (const item of output) {
-    if (stringValue(item.type) !== 'function_call') continue
-    parts.push({
-      functionCall: omitUndefined({
-        id: optionalString(stringValue(item.call_id, stringValue(item.id))),
-        name: stringValue(item.name),
-        args: parseJsonObject(item.arguments, 'Responses function_call.arguments')
+    const itemType = stringValue(item.type)
+    if (itemType === 'message') {
+      const text = responsesContentToText(item.content, false)
+      const refusal = responsesRefusalToText(item.content)
+      if (text || refusal) parts.push({ text: `${text}${refusal}` })
+      continue
+    }
+    if (itemType === 'function_call') {
+      parts.push({
+        functionCall: omitUndefined({
+          id: optionalString(stringValue(item.call_id, stringValue(item.id))),
+          name: stringValue(item.name),
+          args: parseJsonObject(item.arguments, 'Responses function_call.arguments')
+        })
       })
-    })
+    }
   }
   const usage = objectValue(body.usage)
   const promptTokens = numberValue(usage?.input_tokens) ?? 0
@@ -2862,6 +2972,17 @@ function anthropicAssistantMessageToChat(message: JsonObject): JsonObject {
   return converted
 }
 
+function anthropicToolResultErrorPath(body: JsonObject): string | undefined {
+  for (const [messageIndex, message] of arrayOfObjects(body.messages).entries()) {
+    for (const [blockIndex, block] of arrayOfObjects(message.content).entries()) {
+      if (stringValue(block.type) === 'tool_result' && block.is_error === true) {
+        return `messages[${messageIndex}].content[${blockIndex}].is_error`
+      }
+    }
+  }
+  return undefined
+}
+
 function anthropicUserMessageToChat(message: JsonObject): JsonObject[] {
   if (typeof message.content === 'string') return [{ role: 'user', content: message.content }]
 
@@ -2885,7 +3006,6 @@ function anthropicUserMessageToChat(message: JsonObject): JsonObject[] {
         tool_call_id: stringValue(block.tool_use_id),
         content: anthropicToolResultToChat(block.content)
       }
-      if (typeof block.is_error === 'boolean') toolMessage.is_error = block.is_error
       converted.push(toolMessage)
     } else if (stringValue(block.type) === 'text') {
       const text = stringValue(block.text)

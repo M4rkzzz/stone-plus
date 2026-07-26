@@ -1,10 +1,11 @@
 import { execFile } from 'node:child_process'
-import { stat } from 'node:fs/promises'
+import { readdir, stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { posix, win32 } from 'node:path'
 import type { AgentProcessControl, AgentTarget } from '@shared/agent-lifecycle'
 
 export type DiscoverableAgentTarget = AgentTarget
+type DiscoverableCliTarget = 'codex-cli' | 'claude-code' | 'gemini-cli' | 'grok-build'
 
 export type AgentExecutableSource =
   | 'command-path'
@@ -40,6 +41,7 @@ export interface PlatformDiscoveryOptions {
   workingDirectory?: string
   environment?: NodeJS.ProcessEnv
   fileExists?: (path: string) => Promise<boolean>
+  readDirectoryNames?: (path: string) => Promise<string[]>
   findCommand?: (name: string, platform: NodeJS.Platform) => Promise<string[]>
   runCommand?: (file: string, args: string[]) => Promise<PlatformCommandResult>
 }
@@ -60,6 +62,7 @@ export async function discoverAgentExecutable(
   const workingDirectory = options.workingDirectory ?? process.cwd()
   const environment = options.environment ?? process.env
   const fileExists = options.fileExists ?? isExistingFile
+  const readDirectoryNames = options.readDirectoryNames ?? directoryNames
   const findCommand = options.findCommand ?? findCommandOnPath
   const runCommand = options.runCommand ?? executeCommand
 
@@ -67,7 +70,18 @@ export async function discoverAgentExecutable(
     return discoverCodexDesktop({ platform, homeDir, workingDirectory, environment, fileExists, runCommand })
   }
 
-  return discoverCli(target, { platform, homeDir, workingDirectory, environment, fileExists, findCommand })
+  if (target === 'claude-code-desktop') {
+    return discoverClaudeCodeDesktop({ platform, homeDir, workingDirectory, environment, fileExists, runCommand })
+  }
+
+  if (target === 'claude-code-vsc') {
+    return discoverClaudeCodeVsc({ platform, homeDir, workingDirectory, environment, fileExists, readDirectoryNames })
+  }
+
+  if (isDiscoverableCliTarget(target)) {
+    return discoverCli(target, { platform, homeDir, workingDirectory, environment, fileExists, findCommand })
+  }
+  return unsupported(target, platform)
 }
 
 interface ResolvedDiscoveryOptions {
@@ -79,7 +93,7 @@ interface ResolvedDiscoveryOptions {
 }
 
 async function discoverCli(
-  target: Exclude<DiscoverableAgentTarget, 'codex-desktop'>,
+  target: DiscoverableCliTarget,
   options: ResolvedDiscoveryOptions & {
     findCommand: (name: string, platform: NodeJS.Platform) => Promise<string[]>
   },
@@ -112,6 +126,117 @@ async function discoverCli(
     source: 'unavailable',
     processControl: 'managed-only',
     inspectedPaths,
+  }
+}
+
+async function discoverClaudeCodeDesktop(
+  options: ResolvedDiscoveryOptions & {
+    runCommand: (file: string, args: string[]) => Promise<PlatformCommandResult>
+  },
+): Promise<AgentExecutableDiscovery> {
+  const target = 'claude-code-desktop' as const
+  const { platform, homeDir, fileExists, runCommand } = options
+  if (!isDesktopPlatform(platform)) return unsupported(target, platform)
+
+  if (platform === 'win32') {
+    const appPackage = await discoverWindowsClaudeDesktopApp(runCommand)
+    if (!appPackage) {
+      return {
+        target, platform, supported: true, installed: false,
+        source: 'unavailable', processControl: 'unavailable', inspectedPaths: [],
+      }
+    }
+    return {
+      target,
+      platform,
+      supported: true,
+      installed: true,
+      launchTarget: 'claude://code/new',
+      source: 'windows-app',
+      processControl: 'unavailable',
+      inspectedPaths: appPackage.installLocation ? [appPackage.installLocation] : [],
+    }
+  }
+
+  const candidates = platform === 'darwin'
+    ? [
+        '/Applications/Claude.app/Contents/MacOS/Claude',
+        posix.join(homeDir, 'Applications', 'Claude.app', 'Contents', 'MacOS', 'Claude'),
+      ]
+    : ['/usr/bin/claude-desktop']
+  const inspectedPaths: string[] = []
+  const match = await firstExisting(candidates, fileExists, inspectedPaths, platform)
+  if (!match) {
+    return {
+      target, platform, supported: true, installed: false,
+      source: 'unavailable', processControl: 'unavailable', inspectedPaths,
+    }
+  }
+  return {
+    target,
+    platform,
+    supported: true,
+    installed: true,
+    executablePath: match,
+    launchTarget: 'claude://code/new',
+    source: platform === 'darwin' ? 'macos-app' : 'well-known-path',
+    processControl: 'unavailable',
+    inspectedPaths,
+  }
+}
+
+async function discoverClaudeCodeVsc(
+  options: ResolvedDiscoveryOptions & {
+    readDirectoryNames: (path: string) => Promise<string[]>
+  },
+): Promise<AgentExecutableDiscovery> {
+  const target = 'claude-code-vsc' as const
+  const { platform, homeDir, readDirectoryNames } = options
+  if (!isDesktopPlatform(platform)) return unsupported(target, platform)
+  const pathApi = platform === 'win32' ? win32 : posix
+  const channels = [
+    {
+      root: pathApi.join(homeDir, '.vscode', 'extensions'),
+      launchTarget: 'vscode://anthropic.claude-code/open',
+    },
+    {
+      root: pathApi.join(homeDir, '.vscode-insiders', 'extensions'),
+      launchTarget: 'vscode-insiders://anthropic.claude-code/open',
+    },
+  ] as const
+  const inspectedPaths: string[] = []
+
+  for (const channel of channels) {
+    inspectedPaths.push(channel.root)
+    let names: string[]
+    try {
+      names = await readDirectoryNames(channel.root)
+    } catch {
+      continue
+    }
+    const extension = names
+      .filter(isOfficialClaudeCodeExtensionDirectory)
+      .sort((left, right) => right.localeCompare(left, 'en-US'))
+      .at(0)
+    if (!extension) continue
+    const extensionPath = pathApi.join(channel.root, extension)
+    inspectedPaths.push(extensionPath)
+    return {
+      target,
+      platform,
+      supported: true,
+      installed: true,
+      launchTarget: channel.launchTarget,
+      source: 'well-known-path',
+      processControl: 'unavailable',
+      inspectedPaths: uniquePaths(inspectedPaths, platform),
+    }
+  }
+
+  return {
+    target, platform, supported: true, installed: false,
+    source: 'unavailable', processControl: 'unavailable',
+    inspectedPaths: uniquePaths(inspectedPaths, platform),
   }
 }
 
@@ -153,7 +278,7 @@ async function discoverCodexDesktop(
 }
 
 export function cliWellKnownPaths(
-  target: Exclude<DiscoverableAgentTarget, 'codex-desktop'>,
+  target: DiscoverableCliTarget,
   options: Pick<ResolvedDiscoveryOptions, 'platform' | 'homeDir' | 'environment'> & { workingDirectory?: string },
 ): string[] {
   const { platform, homeDir, environment } = options
@@ -243,10 +368,44 @@ async function discoverWindowsCodexApp(
   }
 }
 
-function cliCommandName(target: Exclude<DiscoverableAgentTarget, 'codex-desktop'>): string {
+async function discoverWindowsClaudeDesktopApp(
+  runCommand: (file: string, args: string[]) => Promise<PlatformCommandResult>,
+): Promise<{ packageFamilyName: string; installLocation?: string } | undefined> {
+  const script = [
+    "$package = Get-AppxPackage -Name 'Claude' -ErrorAction SilentlyContinue | Sort-Object Version -Descending | Select-Object -First 1;",
+    'if (-not $package) { exit 0 };',
+    '[Console]::Out.WriteLine($package.PackageFamilyName);',
+    '[Console]::Out.WriteLine($package.InstallLocation);',
+  ].join(' ')
+  try {
+    const result = await runCommand('powershell.exe', [
+      '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script,
+    ])
+    const [packageFamilyName, installLocation] = result.stdout
+      .split(/\r?\n/)
+      .map((value) => value.trim())
+    if (!packageFamilyName) return undefined
+    return { packageFamilyName, ...(installLocation ? { installLocation } : {}) }
+  } catch {
+    return undefined
+  }
+}
+
+function cliCommandName(target: DiscoverableCliTarget): string {
   if (target === 'codex-cli') return 'codex'
   if (target === 'claude-code') return 'claude'
   return target === 'gemini-cli' ? 'gemini' : 'grok'
+}
+
+function isDiscoverableCliTarget(target: DiscoverableAgentTarget): target is DiscoverableCliTarget {
+  return target === 'codex-cli'
+    || target === 'claude-code'
+    || target === 'gemini-cli'
+    || target === 'grok-build'
+}
+
+function isOfficialClaudeCodeExtensionDirectory(name: string): boolean {
+  return /^anthropic\.claude-code-\d+\.\d+\.\d+(?:-[0-9a-z][0-9a-z.-]*)?$/i.test(name)
 }
 
 function isDesktopPlatform(platform: NodeJS.Platform): boolean {
@@ -349,6 +508,11 @@ async function isExistingFile(path: string): Promise<boolean> {
   } catch {
     return false
   }
+}
+
+async function directoryNames(path: string): Promise<string[]> {
+  const entries = await readdir(path, { withFileTypes: true })
+  return entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name)
 }
 
 async function findCommandOnPath(name: string, platform: NodeJS.Platform): Promise<string[]> {

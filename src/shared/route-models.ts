@@ -1,6 +1,15 @@
 const PROTOTYPE_POLLUTION_KEYS = new Set(['__proto__', 'constructor', 'prototype'])
 export const MAX_ROUTE_MODEL_NAME_LENGTH = 256
 
+export type RouteModelMappingValidation = {
+  valid: true
+  source: string
+  target: string
+} | {
+  valid: false
+  reason: 'invalid-source' | 'invalid-target'
+}
+
 /**
  * Resolves a client-facing model name without consulting inherited properties.
  * Exact aliases win over the optional wildcard; invalid mappings are ignored.
@@ -40,6 +49,25 @@ export function isSafeRouteModelMapKey(value: string): boolean {
     && !PROTOTYPE_POLLUTION_KEYS.has(value)
 }
 
+/** Shared renderer/main-process target validation after whitespace trimming. */
+export function isSafeRouteModelMapTarget(value: string): boolean {
+  const normalized = value.trim()
+  return normalized.length > 0
+    && normalized.length <= MAX_ROUTE_MODEL_NAME_LENGTH
+    && !hasControlCharacter(normalized)
+}
+
+/** Validates and normalizes one editor row without silently dropping it. */
+export function validateRouteModelMapping(sourceValue: unknown, targetValue: unknown): RouteModelMappingValidation {
+  if (typeof sourceValue !== 'string') return { valid: false, reason: 'invalid-source' }
+  const source = sourceValue.trim()
+  if (!isSafeRouteModelMapKey(source)) return { valid: false, reason: 'invalid-source' }
+  if (typeof targetValue !== 'string' || !isSafeRouteModelMapTarget(targetValue)) {
+    return { valid: false, reason: 'invalid-target' }
+  }
+  return { valid: true, source, target: targetValue.trim() }
+}
+
 function readOwnMapping(
   modelMap: Readonly<Record<string, unknown>> | null | undefined,
   source: string,
@@ -52,9 +80,7 @@ function readOwnMapping(
 function normalizeTarget(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined
   const normalized = value.trim()
-  if (!normalized
-    || normalized.length > MAX_ROUTE_MODEL_NAME_LENGTH
-    || hasControlCharacter(normalized)) return undefined
+  if (!isSafeRouteModelMapTarget(normalized)) return undefined
   return normalized
 }
 

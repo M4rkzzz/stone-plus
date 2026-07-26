@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest'
 import type { Account, Pool, ProviderDefinition, RequestLog } from '../../src/shared/types'
-import { ModelNotExposedError, NoEligibleAccountError, PoolScheduler, quotaProtectionBlocks } from '../../src/main/gateway/scheduler'
+import {
+  ModelNotExposedError,
+  NoEligibleAccountError,
+  PoolScheduler,
+  quotaProtectionBlocks,
+  UnsupportedPoolStrategyError,
+} from '../../src/main/gateway/scheduler'
 
 const timestamp = 1_700_000_000_000
 
@@ -228,6 +234,75 @@ describe('PoolScheduler', () => {
     expect(state.stickyKeysByAccount.size).toBe(0)
   })
 
+  it('bounds sticky ids, TTL and global/per-pool LRU cardinality', () => {
+    let now = timestamp
+    const scheduler = new PoolScheduler(() => now, () => 0, {
+      maxStickyEntries: 3,
+      maxStickyEntriesPerPool: 2,
+    })
+    const accounts = [account('a', { maxConcurrency: 4 }), account('b', { maxConcurrency: 4 })]
+    const firstPool = pool({ id: 'first-pool', strategy: 'round-robin', stickySessions: true, stickyTtlMinutes: 99_999 })
+    const secondPool = pool({ id: 'second-pool', strategy: 'round-robin', stickySessions: true })
+    const state = scheduler as unknown as {
+      sticky: Map<string, { poolId: string; expiresAt: number }>
+      stickyFailureAvoidance: Map<string, unknown>
+      stickyLruByPool: Map<string, Map<string, unknown>>
+    }
+    const select = (targetPool: Pool, sessionId: string) => {
+      const selected = scheduler.selectAndAcquire({
+        pool: targetPool,
+        accounts,
+        model: 'model',
+        sessionId,
+      })
+      selected.release()
+    }
+
+    select(firstPool, 'one')
+    const firstExpiry = [...state.sticky.values()][0].expiresAt
+    expect(firstExpiry).toBe(now + 1_440 * 60_000)
+    select(firstPool, 'two')
+    select(firstPool, 'one') // refresh LRU so "two" is the per-pool victim
+    select(firstPool, 'three')
+    expect([...state.sticky.keys()].some((key) => key.endsWith('two'))).toBe(false)
+    expect(state.stickyLruByPool.get(firstPool.id)?.size).toBe(2)
+
+    select(secondPool, 'four')
+    select(secondPool, 'five')
+    expect(state.sticky.size + state.stickyFailureAvoidance.size).toBe(3)
+    expect(state.stickyLruByPool.get(firstPool.id)?.size).toBe(1)
+    expect(state.stickyLruByPool.get(secondPool.id)?.size).toBe(2)
+
+    select(firstPool, 'x'.repeat(257))
+    select(firstPool, 'bad\ncontrol')
+    expect(state.sticky.size + state.stickyFailureAvoidance.size).toBe(3)
+
+    now += 1_441 * 60_000
+    const trigger = scheduler.selectAndAcquire({ pool: pool(), accounts, model: 'model' })
+    trigger.release()
+    expect(state.sticky.size).toBe(0)
+    expect(state.stickyLruByPool.size).toBe(0)
+  })
+
+  it('keeps failure avoidance inside the same sticky cache bound', () => {
+    const scheduler = new PoolScheduler(() => timestamp, () => 0, {
+      maxStickyEntries: 2,
+      maxStickyEntriesPerPool: 2,
+    })
+    const targetPool = pool({ strategy: 'priority', stickySessions: true })
+    const accounts = [account('a'), account('b')]
+    for (const sessionId of ['one', 'two', 'three']) {
+      const selected = scheduler.selectAndAcquire({ pool: targetPool, accounts, model: 'model', sessionId })
+      selected.release()
+      scheduler.recordStickyFailure(targetPool.id, sessionId, selected.account.id)
+    }
+    const state = scheduler as unknown as {
+      sticky: Map<string, unknown>
+      stickyFailureAvoidance: Map<string, unknown>
+    }
+    expect(state.sticky.size + state.stickyFailureAvoidance.size).toBe(2)
+  })
+
   it('counts a concurrent sticky session once regardless of its request count', () => {
     const scheduler = new PoolScheduler(() => timestamp, () => 0)
     const stickyPool = pool({ stickySessions: true })
@@ -351,6 +426,119 @@ describe('PoolScheduler', () => {
     scheduled.release()
     expect(scheduler.getInFlight(onlyAccount)).toBe(0)
     expect(scheduler.selectAndAcquire({ pool: pool(), accounts: [onlyAccount], model: 'model' }).account.id).toBe('a')
+  })
+
+  it('hands released capacity to one bounded FIFO waiter at a time', async () => {
+    const scheduler = new PoolScheduler()
+    const onlyAccount = account('a')
+    const targetPool = pool()
+    const held = scheduler.selectAndAcquire({ pool: targetPool, accounts: [onlyAccount], model: 'model' })
+    const resolved: string[] = []
+    const firstPending = scheduler.selectAndAcquireWhenAvailable(
+      { pool: targetPool, accounts: [onlyAccount], model: 'model' },
+      undefined,
+      undefined,
+      1_000,
+    ).then((selection) => { resolved.push('first'); return selection })
+    const secondPending = scheduler.selectAndAcquireWhenAvailable(
+      { pool: targetPool, accounts: [onlyAccount], model: 'model' },
+      undefined,
+      undefined,
+      1_000,
+    ).then((selection) => { resolved.push('second'); return selection })
+
+    held.release()
+    const first = await firstPending
+    await Promise.resolve()
+    expect(resolved).toEqual(['first'])
+    expect(scheduler.getInFlight(onlyAccount)).toBe(1)
+
+    first.release()
+    const second = await secondPending
+    expect(resolved).toEqual(['first', 'second'])
+    expect(scheduler.getInFlight(onlyAccount)).toBe(1)
+    second.release()
+  })
+
+  it('cancels and expires capacity waits without leaking queue entries', async () => {
+    const scheduler = new PoolScheduler()
+    const onlyAccount = account('a')
+    const targetPool = pool()
+    const held = scheduler.selectAndAcquire({ pool: targetPool, accounts: [onlyAccount], model: 'model' })
+    const controller = new AbortController()
+    const cancelled = scheduler.selectAndAcquireWhenAvailable(
+      { pool: targetPool, accounts: [onlyAccount], model: 'model' },
+      controller.signal,
+      undefined,
+      1_000,
+    )
+    controller.abort(new DOMException('cancelled', 'AbortError'))
+    await expect(cancelled).rejects.toMatchObject({ name: 'AbortError' })
+
+    await expect(scheduler.selectAndAcquireWhenAvailable(
+      { pool: targetPool, accounts: [onlyAccount], model: 'model' },
+      undefined,
+      undefined,
+      10,
+    )).rejects.toThrow(/wait deadline/)
+    const state = scheduler as unknown as { capacityWaiters: Map<number, unknown> }
+    expect(state.capacityWaiters.size).toBe(0)
+    held.release()
+  })
+
+  it('bounds each pool wait queue and never waits for a non-capacity blocker', async () => {
+    const scheduler = new PoolScheduler(undefined, undefined, {
+      maxPendingAcquisitions: 2,
+      maxPendingAcquisitionsPerPool: 2,
+    })
+    const onlyAccount = account('a')
+    const targetPool = pool()
+    const held = scheduler.selectAndAcquire({ pool: targetPool, accounts: [onlyAccount], model: 'model' })
+    const pending = [0, 1].map(() => scheduler.selectAndAcquireWhenAvailable(
+      { pool: targetPool, accounts: [onlyAccount], model: 'model' },
+      undefined,
+      undefined,
+      1_000,
+    ))
+    await expect(scheduler.selectAndAcquireWhenAvailable(
+      { pool: targetPool, accounts: [onlyAccount], model: 'model' },
+      undefined,
+      undefined,
+      1_000,
+    )).rejects.toThrow(/queue is full/)
+    await expect(scheduler.selectAndAcquireWhenAvailable({
+      pool: targetPool,
+      accounts: [account('checking', { status: 'checking' })],
+      model: 'model',
+    }, undefined, undefined, 1_000)).rejects.toThrow(NoEligibleAccountError)
+
+    scheduler.clear()
+    expect((await Promise.allSettled(pending)).every((result) => result.status === 'rejected')).toBe(true)
+    held.release()
+  })
+
+  it('requires a second physical permit for a same-account hedge', () => {
+    const scheduler = new PoolScheduler()
+    const targetPool = pool()
+    const onlyAccount = account('a', { maxConcurrency: 2 })
+    const primary = scheduler.selectAndAcquire({ pool: targetPool, accounts: [onlyAccount], model: 'model' })
+    const releaseHedge = scheduler.tryAcquireAccount(onlyAccount, targetPool)
+    expect(releaseHedge).toEqual(expect.any(Function))
+    expect(scheduler.tryAcquireAccount(onlyAccount, targetPool)).toBeUndefined()
+    expect(scheduler.getInFlight(onlyAccount)).toBe(2)
+    releaseHedge?.()
+    primary.release()
+    expect(scheduler.getInFlight(onlyAccount)).toBe(0)
+  })
+
+  it('fails closed on an unsupported runtime pool strategy', () => {
+    const invalidPool = { ...pool(), strategy: 'unknown-strategy' } as unknown as Pool
+    const scheduler = new PoolScheduler()
+    expect(() => scheduler.selectAndAcquire({
+      pool: invalidPool,
+      accounts: [account('a')],
+      model: 'model',
+    })).toThrow(UnsupportedPoolStrategyError)
   })
 
   it('admits 200 synchronous autobalanced selections across available account capacity without oversubscription', () => {

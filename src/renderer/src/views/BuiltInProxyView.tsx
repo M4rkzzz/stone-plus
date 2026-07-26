@@ -245,6 +245,41 @@ export interface BuiltInProxyTakeoverPresentation {
   mixedPort?: number
 }
 
+export interface BuiltInProxySurfacePresentation {
+  showBuiltIn: boolean
+  masterChecked: boolean
+  disabledExternalMaintenanceError: boolean
+}
+
+/**
+ * The persisted desired switch becomes false before an asynchronous disable
+ * transaction finishes. Keep the switch visually on while that transaction or
+ * a published/blocked built-in generation still exists, but never turn an
+ * external-route startup maintenance error into a false active takeover.
+ */
+export function resolveBuiltInProxySurfacePresentation(
+  runtime: BuiltInProxyRuntimeState | null,
+): BuiltInProxySurfacePresentation {
+  if (!runtime) {
+    return {
+      showBuiltIn: false,
+      masterChecked: false,
+      disabledExternalMaintenanceError: false,
+    }
+  }
+  const publishedBuiltIn = runtime.effectiveRoute.kind !== 'external'
+  const disabling = runtime.status === 'stopping'
+  const showBuiltIn = runtime.desiredEnabled || publishedBuiltIn || disabling
+  return {
+    showBuiltIn,
+    masterChecked: showBuiltIn,
+    disabledExternalMaintenanceError: !runtime.desiredEnabled
+      && !publishedBuiltIn
+      && !disabling
+      && runtime.status === 'error',
+  }
+}
+
 export function shouldPollBuiltInProxyTelemetry(
   routeReady: boolean,
   activeWorkspaceTab: BuiltInProxyWorkspaceTab,
@@ -483,8 +518,11 @@ export function BuiltInProxyView({
 
   const transitional = runtime?.status === 'starting' || runtime?.status === 'stopping'
   const masterBusy = pending.size > 0 || transitional
-  const showBuiltIn = Boolean(runtime && (runtime.desiredEnabled || runtime.status !== 'disabled'))
-  const masterChecked = showBuiltIn
+  const {
+    showBuiltIn,
+    masterChecked,
+    disabledExternalMaintenanceError,
+  } = resolveBuiltInProxySurfacePresentation(runtime)
   const controlsDisabled = masterBusy || runtime?.status === 'stopping'
   const activeProfile = useMemo(() => runtime?.profiles.find((profile) => (
     profile.id === runtime.settings.activeProfileId
@@ -735,7 +773,7 @@ export function BuiltInProxyView({
       <button type="button" className="icon-button" title={t('关闭', 'Close')} onClick={() => setActionError(null)}><XCircle size={16} /></button>
     </div>}
 
-    {runtime?.error && showBuiltIn && !firstRunWithoutProfile && <RuntimeError
+    {runtime?.error && (showBuiltIn || disabledExternalMaintenanceError) && !firstRunWithoutProfile && <RuntimeError
       runtime={runtime}
       busy={pending.has('retry') || transitional}
       onRetry={() => void runStateAction('retry', () => api.retryBuiltInProxy())}
@@ -1163,56 +1201,71 @@ function MasterSwitch({ runtime, checked, busy, loadError, onToggle, onReload, t
     && runtime.effectiveRoute.kind === 'external'
     && !runtime.error,
   )
+  const disabledExternalMaintenanceError = Boolean(
+    runtime
+    && !runtime.desiredEnabled
+    && runtime.effectiveRoute.kind === 'external'
+    && runtime.status === 'error',
+  )
   const takeover = runtime ? resolveBuiltInProxyTakeoverPresentation(runtime) : null
   const badgeTone = awaitingFirstProfile
     ? 'info'
-    : takeover?.phase === 'ready'
-      ? 'success'
-      : takeover?.phase === 'failed' || takeover?.phase === 'blocked' || takeover?.phase === 'inconsistent'
-        ? 'danger'
-        : takeover?.phase === 'starting' || takeover?.phase === 'restoring'
-          ? 'warning'
-          : 'neutral'
+    : disabledExternalMaintenanceError
+      ? 'danger'
+      : takeover?.phase === 'ready'
+        ? 'success'
+        : takeover?.phase === 'failed' || takeover?.phase === 'blocked' || takeover?.phase === 'inconsistent'
+          ? 'danger'
+          : takeover?.phase === 'starting' || takeover?.phase === 'restoring'
+            ? 'warning'
+            : 'neutral'
   const statusLabel = awaitingFirstProfile
     ? t('等待配置', 'Waiting for profile')
-    : takeover?.phase === 'ready'
-      ? t('已接管', 'Taken over')
-      : takeover?.phase === 'starting'
-      ? takeover.effectiveBuiltInRouteActive ? t('切换中 · 当前已接管', 'Switching · route active') : t('正在启动', 'Starting')
-      : takeover?.phase === 'restoring'
-        ? takeover.effectiveBuiltInRouteActive ? t('恢复中 · 当前已接管', 'Restoring · route active') : t('正在恢复', 'Stopping')
-        : takeover?.phase === 'blocked'
-          ? t('错误 / 已阻断', 'Error / blocked')
-          : takeover?.phase === 'failed'
-            ? takeover.effectiveBuiltInRouteActive ? t('操作失败 · 当前已接管', 'Operation failed · route active') : t('接管失败', 'Takeover failed')
-            : takeover?.phase === 'inconsistent'
-              ? t('状态未确认', 'State unconfirmed')
-          : t('已关闭', 'Off')
+    : disabledExternalMaintenanceError
+      ? t('维护清理失败', 'Maintenance cleanup failed')
+      : takeover?.phase === 'ready'
+        ? t('已接管', 'Taken over')
+        : takeover?.phase === 'starting'
+        ? takeover.effectiveBuiltInRouteActive ? t('切换中 · 当前已接管', 'Switching · route active') : t('正在启动', 'Starting')
+        : takeover?.phase === 'restoring'
+          ? takeover.effectiveBuiltInRouteActive ? t('恢复中 · 当前已接管', 'Restoring · route active') : t('正在恢复', 'Stopping')
+          : takeover?.phase === 'blocked'
+            ? t('错误 / 已阻断', 'Error / blocked')
+            : takeover?.phase === 'failed'
+              ? takeover.effectiveBuiltInRouteActive ? t('操作失败 · 当前已接管', 'Operation failed · route active') : t('接管失败', 'Takeover failed')
+              : takeover?.phase === 'inconsistent'
+                ? t('状态未确认', 'State unconfirmed')
+            : t('已关闭', 'Off')
   const description = loadError
     ? loadError
     : !runtime
     ? t('正在确认当前路由，不会在状态未知时切换请求。', 'Confirming the current route; requests are not switched while state is unknown.')
     : awaitingFirstProfile
       ? t('等待导入有效配置，当前外部路由保持不变。', 'Waiting for a valid profile; the current external route remains unchanged.')
-      : takeover?.phase === 'ready'
-        ? t('Stone+ 新请求强制经过内置代理；原账号与号池绑定已保留并暂停。', 'New Stone+ requests are forced through the built-in proxy; account and pool bindings are preserved and paused.')
-        : takeover?.phase === 'starting'
-          ? takeover.effectiveBuiltInRouteActive
-            ? t('正在准备候选代次；当前内置路由继续接管，完成后原子切换。', 'Preparing a candidate generation; the current built-in route remains active until the atomic switch.')
-            : t('核心健康后才会原子接管新请求。', 'New requests are taken over atomically only after the core is healthy.')
-          : takeover?.phase === 'restoring'
+      : disabledExternalMaintenanceError
+        ? t(
+            '内置代理保持关闭且未发布接管路由；请重试清理上次运行留下的配置或系统接入资源。',
+            'The built-in proxy remains off and no takeover route is published; retry cleanup of configuration or system-access resources left by the previous run.',
+          )
+        : takeover?.phase === 'ready'
+          ? t('Stone+ 新请求强制经过内置代理；原账号与号池绑定已保留并暂停。', 'New Stone+ requests are forced through the built-in proxy; account and pool bindings are preserved and paused.')
+          : takeover?.phase === 'starting'
             ? takeover.effectiveBuiltInRouteActive
-              ? t('正在恢复原外部路由并排空旧连接，完成前当前内置代次继续接管。', 'Restoring the previous external route and draining old connections; the current built-in generation remains active until complete.')
-              : t('正在恢复原外部路由。', 'Restoring the previous external route.')
-            : takeover?.phase === 'blocked'
-              ? t('请求保持 fail-closed，不会自动回退或直连泄漏。', 'Requests remain fail-closed; there is no automatic fallback or direct-connection leak.')
-              : takeover?.phase === 'failed'
-                ? takeover.effectiveBuiltInRouteActive
-                  ? t('操作失败，但当前已发布的内置代次仍承担 Stone+ 请求；请查看错误后重试。', 'The operation failed, but the published built-in generation still serves Stone+ requests; review the error and retry.')
-                  : t('接入方式未成功应用，Stone+ 没有把此状态显示为已接管；请查看下方错误后重试。', 'The access mode was not applied, so Stone+ does not show takeover; review the error below and retry.')
-                : takeover?.phase === 'inconsistent'
-                  ? t('运行状态与接入方式不一致，已隐藏接管标识并等待状态恢复。', 'The runtime route does not match the selected access mode; takeover is hidden until state recovers.')
-              : t('账号代理优先于号池代理，随后使用已保存的系统代理或直连。', 'Account proxies take priority over pool proxies, followed by the saved system-proxy or direct route.')
+              ? t('正在准备候选代次；当前内置路由继续接管，完成后原子切换。', 'Preparing a candidate generation; the current built-in route remains active until the atomic switch.')
+              : t('核心健康后才会原子接管新请求。', 'New requests are taken over atomically only after the core is healthy.')
+            : takeover?.phase === 'restoring'
+              ? takeover.effectiveBuiltInRouteActive
+                ? t('正在恢复原外部路由并排空旧连接，完成前当前内置代次继续接管。', 'Restoring the previous external route and draining old connections; the current built-in generation remains active until complete.')
+                : t('正在恢复原外部路由。', 'Restoring the previous external route.')
+              : takeover?.phase === 'blocked'
+                ? t('请求保持 fail-closed，不会自动回退或直连泄漏。', 'Requests remain fail-closed; there is no automatic fallback or direct-connection leak.')
+                : takeover?.phase === 'failed'
+                  ? takeover.effectiveBuiltInRouteActive
+                    ? t('操作失败，但当前已发布的内置代次仍承担 Stone+ 请求；请查看错误后重试。', 'The operation failed, but the published built-in generation still serves Stone+ requests; review the error and retry.')
+                    : t('接入方式未成功应用，Stone+ 没有把此状态显示为已接管；请查看下方错误后重试。', 'The access mode was not applied, so Stone+ does not show takeover; review the error below and retry.')
+                  : takeover?.phase === 'inconsistent'
+                    ? t('运行状态与接入方式不一致，已隐藏接管标识并等待状态恢复。', 'The runtime route does not match the selected access mode; takeover is hidden until state recovers.')
+                : t('账号代理优先于号池代理，随后使用已保存的系统代理或直连。', 'Account proxies take priority over pool proxies, followed by the saved system-proxy or direct route.')
   const visuallyFailed = takeover?.phase === 'failed'
     || takeover?.phase === 'blocked'
     || takeover?.phase === 'inconsistent'
@@ -1258,16 +1311,24 @@ function RuntimeError({ runtime, busy, onRetry, t }: {
 }) {
   if (!runtime.error) return null
   const takeover = resolveBuiltInProxyTakeoverPresentation(runtime)
+  const disabledExternalMaintenanceError = !runtime.desiredEnabled
+    && runtime.effectiveRoute.kind === 'external'
+    && runtime.status === 'error'
   return <section className="built-in-proxy-runtime-error" role="alert">
     <ShieldAlert size={22} />
     <div>
       <strong>{errorCategoryLabel(runtime.error.category, t)}</strong>
       <p>{runtimeErrorMessage(runtime.error, t)}</p>
-      <small>{takeover.phase === 'blocked'
-        ? t('Stone+ 请求保持阻断，不会自动改用原代理或直连。', 'Stone+ requests remain blocked and will not automatically use the previous proxy or a direct connection.')
-        : takeover.effectiveBuiltInRouteActive
-          ? t('操作失败，但当前已发布的内置代次仍承担 Stone+ 新请求；重试不会自动改用直连。', 'The operation failed, but the published built-in generation still serves new Stone+ requests; retrying will not fall back to direct.')
-        : t('此次接管没有成功应用；页面不会把计划中的 mixed/TUN 地址显示为已生效。', 'This takeover was not applied; the page will not show the planned mixed/TUN endpoint as active.')}</small>
+      <small>{disabledExternalMaintenanceError
+        ? t(
+            '内置代理开关仍为关闭，Stone+ 未发布 mixed/TUN 路由；重试会再次执行残留配置、TUN 与系统代理恢复。',
+            'The built-in proxy switch remains off and Stone+ has not published a mixed/TUN route; Retry reruns residual configuration, TUN, and system-proxy recovery.',
+          )
+        : takeover.phase === 'blocked'
+          ? t('Stone+ 请求保持阻断，不会自动改用原代理或直连。', 'Stone+ requests remain blocked and will not automatically use the previous proxy or a direct connection.')
+          : takeover.effectiveBuiltInRouteActive
+            ? t('操作失败，但当前已发布的内置代次仍承担 Stone+ 新请求；重试不会自动改用直连。', 'The operation failed, but the published built-in generation still serves new Stone+ requests; retrying will not fall back to direct.')
+            : t('此次接管没有成功应用；页面不会把计划中的 mixed/TUN 地址显示为已生效。', 'This takeover was not applied; the page will not show the planned mixed/TUN endpoint as active.')}</small>
     </div>
     {runtime.error.retryable && <button type="button" className="button button--secondary" disabled={busy} onClick={onRetry}>
       {busy ? <LoaderCircle size={15} className="spin" /> : <RefreshCw size={15} />}{t('重试', 'Retry')}

@@ -1,8 +1,20 @@
 import { COPYFILE_EXCL } from 'node:constants'
-import { chmod, copyFile, mkdir, open, readFile, rename, rm } from 'node:fs/promises'
+import { createReadStream } from 'node:fs'
+import {
+  chmod,
+  copyFile,
+  lstat,
+  mkdir,
+  open,
+  readFile,
+  readdir,
+  rename,
+  rm,
+  writeFile,
+} from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
-import { backup, DatabaseSync } from 'node:sqlite'
-import { randomUUID } from 'node:crypto'
+import { DatabaseSync } from 'node:sqlite'
+import { createHash, randomUUID } from 'node:crypto'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { estimateOpenAiTokenCosts, resolveModelPricing } from '@shared/openai-pricing'
 import type {
@@ -16,6 +28,10 @@ const CURRENT_SCHEMA_VERSION = 9
 const STATE_INITIALIZED_KEY = 'state_initialized'
 const LEGACY_IMPORT_KEY = 'legacy_json_import'
 const LIFETIME_TOKEN_COSTS_KEY = 'lifetime_token_costs_v1'
+const PHYSICAL_SECRET_SCRUB_KEY = 'physical_secret_scrub_v1'
+const CREDENTIAL_IMPORT_JOURNAL_KEY = 'credential_import_rollback_v1'
+const REPLACEMENT_JOURNAL_SUFFIX = '.replace-journal-v1.json'
+const MAX_REPLACEMENT_JOURNAL_BYTES = 16 * 1024
 const TOKEN_PRICING_CATALOG_REVISION = 2
 
 const TOKEN_COST_NUMBER_KEYS = [
@@ -325,6 +341,8 @@ export class SqliteStateStore<T extends SqlitePersistedShape> {
 
     let initializationBackupPath: string | undefined
     await mkdir(dirname(this.options.databasePath), { recursive: true, mode: 0o700 })
+    await recoverDatabaseReplacement(this.options.databasePath)
+    await assertNoUnjournaledReplacementWouldBeHidden(this.options.databasePath)
     await secureDatabaseFile(this.options.databasePath)
     const database = new DatabaseSync(this.options.databasePath)
     this.database = database
@@ -381,6 +399,13 @@ export class SqliteStateStore<T extends SqlitePersistedShape> {
         writeMetadata(database, LIFETIME_TOKEN_COSTS_KEY, JSON.stringify(this.lifetimeTokenCosts))
       }
 
+      // A brand-new file has no deleted pages to scrub. Existing installations
+      // leave this marker absent until AppStore has sanitized legacy messages,
+      // then scrubDeletedContentOnce rebuilds the file exactly once.
+      if (schemaVersion === 0 && readMetadata(database, PHYSICAL_SECRET_SCRUB_KEY) === undefined) {
+        writeMetadata(database, PHYSICAL_SECRET_SCRUB_KEY, '1')
+      }
+
       if (process.platform !== 'win32') {
         await chmod(this.options.databasePath, 0o600)
       }
@@ -389,6 +414,11 @@ export class SqliteStateStore<T extends SqlitePersistedShape> {
       this.telemetryDatabase = telemetryDatabase
       this.rebuildRequestLogLookup()
       this.rebuildAccountLookup()
+      if (initializationBackupPath) {
+        await rm(initializationBackupPath, { force: true })
+        initializationBackupPath = undefined
+      }
+      await removeStalePreMigrationBackups(this.options.databasePath)
       return this.read()
     } catch (error) {
       this.telemetryDatabase?.close()
@@ -398,6 +428,8 @@ export class SqliteStateStore<T extends SqlitePersistedShape> {
       if (initializationBackupPath) {
         try {
           await restorePreMigrationBackup(initializationBackupPath, this.options.databasePath)
+          await rm(initializationBackupPath, { force: true })
+          initializationBackupPath = undefined
         } catch (recoveryError) {
           throw new Error(
             `Unable to initialize SQLite state (${messageOf(error)}); `
@@ -1094,9 +1126,48 @@ export class SqliteStateStore<T extends SqlitePersistedShape> {
     return pending
   }
 
+  /**
+   * Rebuilds an upgraded database once after higher-level sanitizers have
+   * removed legacy plaintext. Future UPDATE/DELETE operations are protected by
+   * secure_delete on both writer connections.
+   */
+  public async scrubDeletedContentOnce(): Promise<void> {
+    this.assertWriteAllowed()
+    const operation = async (): Promise<void> => {
+      const database = this.requireDatabase()
+      if (readMetadata(database, PHYSICAL_SECRET_SCRUB_KEY) === '1') return
+
+      const reopenTelemetry = this.telemetryDatabase !== undefined
+      this.telemetryDatabase?.close()
+      this.telemetryDatabase = undefined
+      try {
+        checkpointDatabase(database)
+        database.exec('VACUUM')
+        writeMetadata(database, PHYSICAL_SECRET_SCRUB_KEY, '1')
+        checkpointDatabase(database)
+      } finally {
+        if (reopenTelemetry && this.database && !this.telemetryDatabase) {
+          const telemetryDatabase = new DatabaseSync(this.options.databasePath)
+          configureTelemetryDatabase(telemetryDatabase)
+          this.telemetryDatabase = telemetryDatabase
+        }
+      }
+    }
+
+    const pending = this.writeChain.then(operation, operation)
+    this.writeChain = pending.then(() => undefined, () => undefined)
+    await pending
+  }
+
   public async backupTo(destinationPath: string): Promise<number> {
     this.assertWriteAllowed()
-    const operation = async (): Promise<number> => backup(this.requireDatabase(), destinationPath)
+    const operation = async (): Promise<number> => {
+      const database = this.requireDatabase()
+      if (readMetadata(database, CREDENTIAL_IMPORT_JOURNAL_KEY) !== undefined) {
+        throw new Error('Database backup is unavailable while imported credentials are being validated.')
+      }
+      return createCompactedDatabaseCopy(database, destinationPath)
+    }
     const pending = this.writeChain.then(operation, operation)
     this.writeChain = pending.then(
       () => undefined,
@@ -1109,6 +1180,9 @@ export class SqliteStateStore<T extends SqlitePersistedShape> {
     this.assertWriteAllowed()
     const operation = async (): Promise<T> => {
       const database = this.requireDatabase()
+      if (readMetadata(database, CREDENTIAL_IMPORT_JOURNAL_KEY) !== undefined) {
+        throw new Error('Database restore is unavailable while imported credentials are being validated.')
+      }
       const rollbackTemporaryPath = join(
         dirname(rollbackDatabasePath),
         `.${basename(rollbackDatabasePath)}.${randomUUID()}.tmp`
@@ -1116,10 +1190,10 @@ export class SqliteStateStore<T extends SqlitePersistedShape> {
       let databaseClosed = false
 
       try {
-        await backup(database, rollbackTemporaryPath)
-        if (process.platform !== 'win32') await chmod(rollbackTemporaryPath, 0o600)
+        await createCompactedDatabaseCopy(database, rollbackTemporaryPath)
         assertDatabaseIntegrity(rollbackTemporaryPath)
         await rename(rollbackTemporaryPath, rollbackDatabasePath)
+        await syncDirectory(dirname(rollbackDatabasePath))
         database.exec('PRAGMA wal_checkpoint(TRUNCATE)')
         this.telemetryDatabase?.close()
         this.telemetryDatabase = undefined
@@ -1467,6 +1541,7 @@ function writeCodexQuotaSamples(
 function configureDatabase(database: DatabaseSync): void {
   database.exec('PRAGMA journal_mode = WAL')
   database.exec('PRAGMA synchronous = FULL')
+  database.exec('PRAGMA secure_delete = ON')
   database.exec('PRAGMA foreign_keys = ON')
   database.exec('PRAGMA busy_timeout = 5000')
   database.exec('PRAGMA trusted_schema = OFF')
@@ -1475,6 +1550,7 @@ function configureDatabase(database: DatabaseSync): void {
 function configureTelemetryDatabase(database: DatabaseSync): void {
   database.exec('PRAGMA journal_mode = WAL')
   database.exec('PRAGMA synchronous = NORMAL')
+  database.exec('PRAGMA secure_delete = ON')
   database.exec('PRAGMA foreign_keys = ON')
   database.exec('PRAGMA busy_timeout = 5000')
   database.exec('PRAGMA trusted_schema = OFF')
@@ -1838,6 +1914,50 @@ async function secureDatabaseFile(path: string): Promise<void> {
   if (process.platform !== 'win32') await chmod(path, 0o600)
 }
 
+async function createCompactedDatabaseCopy(database: DatabaseSync, destinationPath: string): Promise<number> {
+  checkpointDatabase(database)
+  database.prepare('VACUUM INTO ?').run(destinationPath)
+  if (process.platform !== 'win32') await chmod(destinationPath, 0o600)
+  await syncFile(destinationPath)
+  assertDatabaseIntegrity(destinationPath)
+
+  const copied = new DatabaseSync(destinationPath, { readOnly: true })
+  try {
+    const row = copied.prepare('PRAGMA page_count').get() as { page_count?: unknown } | undefined
+    return typeof row?.page_count === 'number' ? row.page_count : 0
+  } finally {
+    copied.close()
+  }
+}
+
+function checkpointDatabase(database: DatabaseSync): void {
+  const result = database.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get() as {
+    busy?: unknown
+    log?: unknown
+    checkpointed?: unknown
+  } | undefined
+  if (result?.busy !== 0) {
+    throw new Error('SQLite WAL checkpoint remained busy; refusing to copy or scrub an incomplete generation')
+  }
+}
+
+async function removeStalePreMigrationBackups(databasePath: string): Promise<void> {
+  const directory = dirname(databasePath)
+  const fileName = basename(databasePath)
+  const pattern = new RegExp(
+    `^${escapeRegExp(fileName)}\\.pre-migration-v\\d+-to-v\\d+-\\d+-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\\.bak$`,
+    'i',
+  )
+  const entries = await readdir(directory, { withFileTypes: true })
+  for (const entry of entries) {
+    if (!pattern.test(entry.name)) continue
+    if (!entry.isFile() || entry.isSymbolicLink()) {
+      throw new Error(`SQLite pre-migration cleanup encountered a non-regular artifact: ${entry.name}`)
+    }
+    await rm(join(directory, entry.name))
+  }
+}
+
 async function createPreMigrationBackup(
   database: DatabaseSync,
   databasePath: string,
@@ -1846,8 +1966,7 @@ async function createPreMigrationBackup(
 ): Promise<string> {
   const destination = `${databasePath}.pre-migration-v${sourceVersion}-to-v${targetVersion}-${Date.now()}-${randomUUID()}.bak`
   try {
-    await backup(database, destination)
-    if (process.platform !== 'win32') await chmod(destination, 0o600)
+    await createCompactedDatabaseCopy(database, destination)
     assertDatabaseIntegrity(destination)
     return destination
   } catch (error) {
@@ -1867,27 +1986,290 @@ async function restorePreMigrationBackup(backupPath: string, databasePath: strin
   }
 }
 
+interface DatabaseReplacementJournal {
+  version: 1
+  id: string
+  hadPrevious: boolean
+  candidateSha256: string
+  previousSha256?: string
+  createdAt: number
+}
+
+type DatabaseReplacementRecovery = 'none' | 'installed' | 'rolled-back'
+
 async function replaceDatabaseFile(sourcePath: string, databasePath: string): Promise<void> {
-  await Promise.all([
-    rm(`${databasePath}-wal`, { force: true }),
-    rm(`${databasePath}-shm`, { force: true })
-  ])
-  const previousPath = join(dirname(databasePath), `.${SQLITE_DATABASE_FILENAME}.${randomUUID()}.previous`)
-  let previousExists = false
+  await recoverDatabaseReplacement(databasePath)
+  await requireRegularFile(sourcePath, 'SQLite replacement source')
+  assertDatabaseIntegrity(sourcePath)
+
+  const id = randomUUID()
+  const paths = databaseReplacementPaths(databasePath, id)
+  let candidateCreated = false
+  let journalWritten = false
   try {
-    await rename(databasePath, previousPath)
-    previousExists = true
+    await copyFile(sourcePath, paths.candidatePath, COPYFILE_EXCL)
+    candidateCreated = true
+    if (process.platform !== 'win32') await chmod(paths.candidatePath, 0o600)
+    await syncFile(paths.candidatePath)
+    assertDatabaseIntegrity(paths.candidatePath)
+
+    const hadPrevious = await regularFileExists(databasePath, 'SQLite live database')
+    if (hadPrevious) {
+      const live = new DatabaseSync(databasePath)
+      try { checkpointDatabase(live) } finally { live.close() }
+    }
+    const candidateSha256 = await sha256File(paths.candidatePath)
+    const previousSha256 = hadPrevious ? await sha256File(databasePath) : undefined
+    await writeDatabaseReplacementJournal(paths.journalPath, {
+      version: 1,
+      id,
+      hadPrevious,
+      candidateSha256,
+      ...(previousSha256 ? { previousSha256 } : {}),
+      createdAt: Date.now(),
+    })
+    journalWritten = true
+    await Promise.all([
+      rm(`${databasePath}-wal`, { force: true }),
+      rm(`${databasePath}-shm`, { force: true }),
+    ])
+    await syncDirectory(dirname(databasePath))
+
+    if (hadPrevious) await rename(databasePath, paths.previousPath)
+    await rename(paths.candidatePath, databasePath)
+    if (process.platform !== 'win32') await chmod(databasePath, 0o600)
+    await syncDirectory(dirname(databasePath))
+    assertDatabaseIntegrity(databasePath)
+    await cleanupDatabaseReplacement(paths)
   } catch (error) {
-    if (!isMissingFile(error)) throw error
-  }
-  try {
-    await rename(sourcePath, databasePath)
-  } catch (error) {
-    if (previousExists) await rename(previousPath, databasePath).catch(() => undefined)
+    if (!journalWritten) {
+      if (candidateCreated) await rm(paths.candidatePath, { force: true }).catch(() => undefined)
+      throw error
+    }
+    let recovery: DatabaseReplacementRecovery
+    try {
+      recovery = await recoverDatabaseReplacement(databasePath)
+    } catch (recoveryError) {
+      throw new Error(
+        `Unable to replace SQLite database (${messageOf(error)}); `
+        + `crash-journal recovery also failed (${messageOf(recoveryError)})`,
+      )
+    }
+    if (recovery === 'installed') return
     throw error
   }
-  if (previousExists) await rm(previousPath, { force: true })
-  if (process.platform !== 'win32') await chmod(databasePath, 0o600)
+}
+
+async function recoverDatabaseReplacement(databasePath: string): Promise<DatabaseReplacementRecovery> {
+  const journalPath = `${databasePath}${REPLACEMENT_JOURNAL_SUFFIX}`
+  if (!await regularFileExists(journalPath, 'SQLite replacement journal')) return 'none'
+  const journal = parseDatabaseReplacementJournal(await readReplacementJournalFile(journalPath))
+  const paths = databaseReplacementPaths(databasePath, journal.id)
+  if (paths.journalPath !== journalPath) throw new Error('SQLite replacement journal path is invalid')
+
+  const liveExists = await regularFileExists(databasePath, 'SQLite live database')
+  const candidateExists = await regularFileExists(paths.candidatePath, 'SQLite replacement candidate')
+  const previousExists = await regularFileExists(paths.previousPath, 'SQLite replacement rollback')
+  const liveValid = liveExists && isDatabaseIntegrityValid(databasePath)
+  const candidateValid = candidateExists && isDatabaseIntegrityValid(paths.candidatePath)
+  const previousValid = previousExists && isDatabaseIntegrityValid(paths.previousPath)
+  const liveSha256 = liveValid ? await sha256File(databasePath) : undefined
+  const candidateSha256 = candidateValid ? await sha256File(paths.candidatePath) : undefined
+  const previousSha256 = previousValid ? await sha256File(paths.previousPath) : undefined
+  const liveIsCandidate = liveSha256 === journal.candidateSha256
+  const liveIsPrevious = journal.hadPrevious && liveSha256 === journal.previousSha256
+  const candidateMatches = candidateSha256 === journal.candidateSha256
+  const previousMatches = journal.hadPrevious && previousSha256 === journal.previousSha256
+
+  if (liveValid && candidateExists) {
+    // The candidate was never installed. The canonical live file is the old
+    // generation and remains authoritative.
+    if (!candidateMatches || !liveIsPrevious) {
+      throw new Error('SQLite replacement files do not match the durable journal')
+    }
+    await cleanupDatabaseReplacement(paths)
+    return 'rolled-back'
+  }
+  if (liveValid && !candidateExists) {
+    // rename(candidate, live) consumed the candidate. A valid canonical file
+    // therefore proves the new generation reached its commit point.
+    if (liveIsPrevious) {
+      await cleanupDatabaseReplacement(paths)
+      return 'rolled-back'
+    }
+    if (!liveIsCandidate) throw new Error('SQLite installed database does not match the durable journal')
+    await cleanupDatabaseReplacement(paths)
+    return 'installed'
+  }
+
+  if (journal.hadPrevious && previousValid && previousMatches) {
+    if (liveExists) await rm(databasePath)
+    await rename(paths.previousPath, databasePath)
+    await syncDirectory(dirname(databasePath))
+    assertDatabaseIntegrity(databasePath)
+    await cleanupDatabaseReplacement(paths)
+    return 'rolled-back'
+  }
+
+  if (!journal.hadPrevious && !liveExists && candidateValid && candidateMatches) {
+    await rename(paths.candidatePath, databasePath)
+    if (process.platform !== 'win32') await chmod(databasePath, 0o600)
+    await syncDirectory(dirname(databasePath))
+    assertDatabaseIntegrity(databasePath)
+    await cleanupDatabaseReplacement(paths)
+    return 'installed'
+  }
+
+  throw new Error(
+    'SQLite replacement journal cannot be recovered without discarding an unverified database generation',
+  )
+}
+
+async function assertNoUnjournaledReplacementWouldBeHidden(databasePath: string): Promise<void> {
+  const databaseExists = await regularFileExists(databasePath, 'SQLite live database')
+  const fileName = basename(databasePath)
+  const pattern = new RegExp(
+    `^\\.${escapeRegExp(fileName)}\\.[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\\.(?:candidate|previous)$`,
+    'i',
+  )
+  const unresolved = (await readdir(dirname(databasePath), { withFileTypes: true }))
+    .filter((entry) => pattern.test(entry.name))
+  if (unresolved.length === 0) return
+  if (!databaseExists || !isDatabaseIntegrityValid(databasePath)) {
+    throw new Error(
+      'SQLite live database is missing or invalid while unjournaled replacement artifacts remain; refusing to initialize an empty database',
+    )
+  }
+  console.warn('[store] Unjournaled SQLite replacement artifacts were retained for manual recovery.')
+}
+
+function databaseReplacementPaths(databasePath: string, id: string): {
+  journalPath: string
+  candidatePath: string
+  previousPath: string
+} {
+  if (!isCanonicalReplacementId(id)) throw new Error('SQLite replacement journal id is invalid')
+  const directory = dirname(databasePath)
+  const fileName = basename(databasePath)
+  return {
+    journalPath: `${databasePath}${REPLACEMENT_JOURNAL_SUFFIX}`,
+    candidatePath: join(directory, `.${fileName}.${id}.candidate`),
+    previousPath: join(directory, `.${fileName}.${id}.previous`),
+  }
+}
+
+function parseDatabaseReplacementJournal(value: string): DatabaseReplacementJournal {
+  let parsed: unknown
+  try { parsed = JSON.parse(value) as unknown } catch { throw new Error('SQLite replacement journal is invalid JSON') }
+  if (!parsed || typeof parsed !== 'object') throw new Error('SQLite replacement journal is invalid')
+  const journal = parsed as Partial<DatabaseReplacementJournal>
+  if (journal.version !== 1 || typeof journal.id !== 'string' || !isCanonicalReplacementId(journal.id)
+    || typeof journal.hadPrevious !== 'boolean' || typeof journal.createdAt !== 'number'
+    || typeof journal.candidateSha256 !== 'string' || !isSha256(journal.candidateSha256)
+    || (journal.hadPrevious
+      ? typeof journal.previousSha256 !== 'string' || !isSha256(journal.previousSha256)
+      : journal.previousSha256 !== undefined)
+    || !Number.isSafeInteger(journal.createdAt) || journal.createdAt < 0) {
+    throw new Error('SQLite replacement journal is invalid')
+  }
+  return journal as DatabaseReplacementJournal
+}
+
+async function readReplacementJournalFile(path: string): Promise<string> {
+  const handle = await open(path, 'r')
+  try {
+    const entry = await handle.stat()
+    if (!entry.isFile() || entry.size > MAX_REPLACEMENT_JOURNAL_BYTES) {
+      throw new Error('SQLite replacement journal is not a bounded regular file')
+    }
+    return await handle.readFile('utf8')
+  } finally {
+    await handle.close()
+  }
+}
+
+function isCanonicalReplacementId(id: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id)
+}
+
+function isSha256(value: string): boolean {
+  return /^[0-9a-f]{64}$/i.test(value)
+}
+
+async function writeDatabaseReplacementJournal(path: string, journal: DatabaseReplacementJournal): Promise<void> {
+  const temporaryPath = `${path}.${process.pid}.${randomUUID()}.tmp`
+  try {
+    await writeFile(temporaryPath, JSON.stringify(journal), { flag: 'wx', mode: 0o600 })
+    await syncFile(temporaryPath)
+    await rename(temporaryPath, path)
+    await syncDirectory(dirname(path))
+  } catch (error) {
+    await rm(temporaryPath, { force: true }).catch(() => undefined)
+    throw error
+  }
+}
+
+async function cleanupDatabaseReplacement(paths: {
+  journalPath: string
+  candidatePath: string
+  previousPath: string
+}): Promise<void> {
+  await rm(paths.candidatePath, { force: true })
+  await rm(paths.previousPath, { force: true })
+  await rm(paths.journalPath, { force: true })
+  await syncDirectory(dirname(paths.journalPath))
+}
+
+async function regularFileExists(path: string, label: string): Promise<boolean> {
+  try {
+    const entry = await lstat(path)
+    if (!entry.isFile() || entry.isSymbolicLink()) throw new Error(`${label} is not a regular file`)
+    return true
+  } catch (error) {
+    if (isMissingFile(error)) return false
+    throw error
+  }
+}
+
+async function requireRegularFile(path: string, label: string): Promise<void> {
+  if (!await regularFileExists(path, label)) throw new Error(`${label} does not exist`)
+}
+
+function isDatabaseIntegrityValid(path: string): boolean {
+  try {
+    assertDatabaseIntegrity(path)
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function syncFile(path: string): Promise<void> {
+  const handle = await open(path, 'r+')
+  try { await handle.sync() } finally { await handle.close() }
+}
+
+async function sha256File(path: string): Promise<string> {
+  return await new Promise<string>((resolve, reject) => {
+    const hash = createHash('sha256')
+    const input = createReadStream(path)
+    input.on('error', reject)
+    input.on('data', (chunk) => { hash.update(chunk) })
+    input.on('end', () => { resolve(hash.digest('hex')) })
+  })
+}
+
+async function syncDirectory(path: string): Promise<void> {
+  try {
+    const handle = await open(path, 'r')
+    try { await handle.sync() } finally { await handle.close() }
+  } catch (error) {
+    if (process.platform !== 'win32') throw error
+  }
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
 function parseJson(value: string, label: string): unknown {

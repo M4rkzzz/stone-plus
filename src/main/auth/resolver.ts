@@ -147,7 +147,6 @@ export class CredentialLifecycleResolver {
         scopes: record.scopes,
         signal
       })
-      throwIfAborted(signal)
     } catch (error) {
       const classified = classifyRefreshFailure(error, signal)
       if (classified.code === 'invalid_grant' || classified.code === 'revoked') {
@@ -167,21 +166,29 @@ export class CredentialLifecycleResolver {
       const rotatedRefreshToken = validSecret(result.refreshToken)
       if (!rotatedRefreshToken) throw new CredentialResolutionError('invalid_refresh_response')
       if (rotatedRefreshToken !== refreshToken) {
+        const persistRotation = this.options.onRefreshTokenRotation
+        if (!persistRotation) {
+          this.cache.delete(record.id)
+          throw new CredentialResolutionError('rotation_persistence_failed')
+        }
         try {
-          await this.options.onRefreshTokenRotation?.({
+          // OAuth providers may invalidate the source refresh token before the
+          // final caller cancels. Once a rotated response exists, persistence is
+          // a durability commit and must no longer inherit a request signal.
+          await persistRotation({
             credentialId: record.id,
             previousRefreshTokenRef: record.refreshTokenRef,
             refreshToken: rotatedRefreshToken
-          }, signal)
-          throwIfAborted(signal)
-        } catch (error) {
-          if (isAbortFailure(error, signal)) throw new CredentialResolutionError('cancelled')
+          }, new AbortController().signal)
+        } catch {
           this.cache.delete(record.id)
           throw new CredentialResolutionError('rotation_persistence_failed')
         }
         nextRefreshToken = rotatedRefreshToken
       }
     }
+
+    if (signal.aborted) throw new CredentialResolutionError('cancelled')
 
     this.cache.set(record.id, {
       fingerprint,

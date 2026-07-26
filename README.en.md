@@ -126,7 +126,7 @@ Download the package for your platform and `SHA256SUMS` from [GitHub Releases](h
 | Linux x64           | `StonePlus-*-linux-x86_64.AppImage` or `StonePlus-*-linux-amd64.deb`                                      |
 | Linux arm64         | `StonePlus-*-linux-arm64.AppImage` or `StonePlus-*-linux-arm64.deb`                                       |
 
-Windows builds are currently unsigned, and macOS builds are not Apple-notarized. Your operating system may show an unknown-publisher or first-launch warning. Verify the file against `SHA256SUMS` before approving it.
+Windows builds use the persistent StonePlus project self-signed Authenticode certificate with an RFC 3161 timestamp; because it is not rooted in Microsoft's public trust store, SmartScreen may still warn. macOS builds are ad-hoc signed and are not Apple-notarized. Verify the certificate fingerprint, `SHA256SUMS`, and GitHub build provenance before approving a download.
 
 If you are upgrading directly from `v0.7.1` or earlier, the first upgrade to `v0.8.0` or later must be installed manually because the older release does not contain the updater. After `v0.8.0` is installed, Windows setup builds and Linux AppImages can download an update in Stone+ and restart into it. Windows Portable, Linux deb, and current macOS builds open Releases for manual replacement.
 

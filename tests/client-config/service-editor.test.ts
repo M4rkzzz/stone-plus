@@ -177,9 +177,35 @@ describe('ClientConfigService editor workflow', () => {
     expect(saved.env).toEqual({
       ANTHROPIC_BASE_URL: 'http://127.0.0.1:15721',
       ANTHROPIC_AUTH_TOKEN: 'stone-target-token',
+      CLAUDE_CODE_ATTRIBUTION_HEADER: '0',
       KEEP: 'preserve-this-environment-value',
     })
     expect(JSON.stringify(saved)).not.toContain('draft-override')
+  })
+
+  it('marks a Claude Manual-to-Auto permission change as requiring a new conversation', async () => {
+    await mkdir(service.paths.claude.directory, { recursive: true })
+    await writeFile(service.paths.claude.settings.path, JSON.stringify({
+      permissions: { defaultMode: 'default' },
+    }, null, 2) + '\n')
+
+    const changed = await service.applyEditor('claude', {
+      gatewayBaseUrl: 'http://127.0.0.1:15721',
+      token: 'stone-target-token',
+    }, {
+      patches: [{ id: 'claude.permissionMode', value: 'auto' }],
+      files: [],
+    })
+    expect(changed.requiresNewConversation).toBe(true)
+
+    const unchanged = await service.applyEditor('claude', {
+      gatewayBaseUrl: 'http://127.0.0.1:15721',
+      token: 'stone-target-token',
+    }, {
+      patches: [{ id: 'claude.permissionMode', value: 'auto' }],
+      files: [],
+    })
+    expect(unchanged.requiresNewConversation).toBeUndefined()
   })
 
   it('forces the complete Stone Codex provider and authentication contract after editor changes', async () => {

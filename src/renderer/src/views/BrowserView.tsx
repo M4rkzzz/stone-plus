@@ -1,3 +1,4 @@
+/* eslint-disable react-refresh/only-export-components -- queue ordering helper is regression-tested beside the view. */
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
 import {
   ArrowLeft,
@@ -36,6 +37,7 @@ import {
   type BrowserShortcut,
 } from '../browser-defaults'
 import { BUILT_IN_PROXY_BINDING_NOTICE, useBuiltInProxyInterlock } from '../built-in-proxy-interlocks'
+import { ExclusiveAsyncOperation } from '../async-operation'
 import { translate, useI18n, type UiLanguage } from '../i18n'
 import { setupPoolDisplayName } from '../system-generated-text'
 import { Badge, ImportProgress, Modal } from '../ui'
@@ -44,6 +46,13 @@ const ZOOM_KEY = 'stone.builtin-browser.zoom.v1'
 const ZOOM_LEVELS = [50, 67, 75, 80, 90, 100, 110, 125, 150, 175, 200]
 const EMPTY_QUEUE: BrowserImportQueueState = { items: [], readyCount: 0, totalBytes: 0, revision: 0 }
 const EMPTY_CACHE: BrowserJsonCacheState = { items: [], totalBytes: 0 }
+
+export function newestBrowserQueueState(
+  current: BrowserImportQueueState,
+  candidate: BrowserImportQueueState,
+): BrowserImportQueueState {
+  return candidate.revision >= current.revision ? candidate : current
+}
 
 interface EmbeddedWebview extends HTMLElement {
   loadURL(url: string): Promise<void>
@@ -83,6 +92,8 @@ export function BrowserView({ snapshot, api }: { snapshot: AppSnapshot; api: Gat
   const [shortcutDraft, setShortcutDraft] = useState({ name: '', url: '' })
   const [shortcutError, setShortcutError] = useState('')
   const [queue, setQueue] = useState<BrowserImportQueueState>(EMPTY_QUEUE)
+  const [queueBusyId, setQueueBusyId] = useState<string | null>(null)
+  const queueMutation = useRef(new ExclusiveAsyncOperation())
   const [cache, setCache] = useState<BrowserJsonCacheState>(EMPTY_CACHE)
   const [cacheOpen, setCacheOpen] = useState(false)
   const [cacheBusyId, setCacheBusyId] = useState<string | null>(null)
@@ -103,6 +114,9 @@ export function BrowserView({ snapshot, api }: { snapshot: AppSnapshot; api: Gat
 
   const readyItems = useMemo(() => queue.items.filter((item) => item.status === 'ready'), [queue.items])
   const selectedReadyIds = useMemo(() => selectedIds.filter((id) => readyItems.some((item) => item.id === id)), [readyItems, selectedIds])
+  const acceptQueue = useCallback((next: BrowserImportQueueState) => {
+    setQueue((current) => newestBrowserQueueState(current, next))
+  }, [])
   const compatiblePools = useMemo(
     () => snapshot.pools.filter((pool) => pool.kind === 'standard'
       && pool.protocol === 'openai-responses'
@@ -119,14 +133,14 @@ export function BrowserView({ snapshot, api }: { snapshot: AppSnapshot; api: Gat
     const refreshCache = () => api.getBrowserJsonCache()
       .then((next) => { if (active) setCache(next) })
       .catch(() => undefined)
-    void api.getBrowserImportQueue().then((next) => { if (active) setQueue(next) }).catch(() => undefined)
+    void api.getBrowserImportQueue().then((next) => { if (active) acceptQueue(next) }).catch(() => undefined)
     void refreshCache()
     const unsubscribe = api.onBrowserImportQueue((next) => {
-      if (active) setQueue(next)
+      if (active) acceptQueue(next)
       void refreshCache()
     })
     return () => { active = false; unsubscribe() }
-  }, [api])
+  }, [acceptQueue, api])
 
   useEffect(() => api.onAccountImportProgress((progress) => {
     if (progress.progressId === importProgressId.current) setImportProgress(progress)
@@ -253,8 +267,33 @@ export function BrowserView({ snapshot, api }: { snapshot: AppSnapshot; api: Gat
   }
 
   const removeQueueItem = async (id: string): Promise<void> => {
-    setQueue(await api.removeBrowserImportItem(id))
-    setSelectedIds((current) => current.filter((candidate) => candidate !== id))
+    await queueMutation.current.run(async () => {
+      setQueueBusyId(id)
+      setError('')
+      try {
+        acceptQueue(await api.removeBrowserImportItem(id))
+        setSelectedIds((current) => current.filter((candidate) => candidate !== id))
+      } catch (cause) {
+        setError(localizeBackendError(cause, language, t('移除挂起 JSON 失败', 'Failed to remove queued JSON')))
+      } finally {
+        setQueueBusyId(null)
+      }
+    })
+  }
+
+  const clearQueue = async (): Promise<void> => {
+    await queueMutation.current.run(async () => {
+      setQueueBusyId('clear')
+      setError('')
+      try {
+        acceptQueue(await api.clearBrowserImportQueue())
+        setSelectedIds([])
+      } catch (cause) {
+        setError(localizeBackendError(cause, language, t('清空挂起 JSON 失败', 'Failed to clear queued JSON')))
+      } finally {
+        setQueueBusyId(null)
+      }
+    })
   }
 
   const openCache = async (): Promise<void> => {
@@ -328,7 +367,7 @@ export function BrowserView({ snapshot, api }: { snapshot: AppSnapshot; api: Gat
             <strong>{queue.readyCount ? t(`挂起 JSON ${queue.readyCount}`, `${queue.readyCount} queued JSON`) : t('挂起 JSON 0', '0 queued JSON')}</strong>
           </span>
           <button type="button" className="text-button browser-cache-button" disabled={busy} title={t('查看下载缓存', 'View download cache')} onClick={() => void openCache()}><Archive size={13} /><span>{t('缓存', 'Cache')}</span>{cache.items.length ? ` ${cache.items.length}` : ''}</button>
-          {queue.items.length > 0 && <button type="button" className="icon-button button--danger-text browser-import-inline__clear" disabled={busy} title={t('清空挂起 JSON', 'Clear queued JSON')} aria-label={t('清空挂起 JSON', 'Clear queued JSON')} onClick={() => void api.clearBrowserImportQueue().then(setQueue)}><Trash2 size={13} /></button>}
+          {queue.items.length > 0 && <button type="button" className="icon-button button--danger-text browser-import-inline__clear" disabled={busy || queueBusyId !== null} title={t('清空挂起 JSON', 'Clear queued JSON')} aria-label={t('清空挂起 JSON', 'Clear queued JSON')} onClick={() => void clearQueue()}>{queueBusyId === 'clear' ? <LoaderCircle size={13} className="spin" /> : <Trash2 size={13} />}</button>}
           <button type="button" className="button button--primary browser-import-inline__review" disabled={!queue.readyCount || busy} title={t('确认并导入挂起 JSON', 'Review and import queued JSON')} onClick={openImport}><Download size={14} /><span>{t('导入', 'Import')}</span></button>
         </div>
       </div>
@@ -444,7 +483,7 @@ export function BrowserView({ snapshot, api }: { snapshot: AppSnapshot; api: Gat
             <FileJson size={18} />
             <div><strong>{item.fileName}</strong><span>{item.sourceUrl || t('未知来源', 'Unknown source')} · {formatBytes(item.sizeBytes)}</span>{item.error && <small>{localizeBackendMessage(item.error, language, t('下载失败', 'Download failed.'))}</small>}</div>
             <Badge tone={item.status === 'ready' ? 'success' : item.status === 'failed' ? 'danger' : 'warning'}>{item.status === 'ready' ? t('待导入', 'Ready') : item.status === 'failed' ? t('失败', 'Failed') : t('下载中', 'Downloading')}</Badge>
-            <button type="button" className="icon-button button--danger-text" disabled={busy} title={t('移除', 'Remove')} onClick={() => void removeQueueItem(item.id)}><Trash2 size={15} /></button>
+            <button type="button" className="icon-button button--danger-text" disabled={busy || queueBusyId !== null} title={t('移除', 'Remove')} onClick={() => void removeQueueItem(item.id)}>{queueBusyId === item.id ? <LoaderCircle size={15} className="spin" /> : <Trash2 size={15} />}</button>
           </div>)}
         </div>
       </div>

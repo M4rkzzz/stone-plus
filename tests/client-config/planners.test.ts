@@ -27,10 +27,12 @@ describe('Claude Code planning', () => {
     expect(parsed.env.KEEP_ME).toBe('yes')
     expect(parsed.env.ANTHROPIC_BASE_URL).toBe('http://127.0.0.1:15721')
     expect(parsed.env.ANTHROPIC_AUTH_TOKEN).toBe(target.token)
+    expect(parsed.env.CLAUDE_CODE_ATTRIBUTION_HEADER).toBe('0')
     expect(JSON.stringify(parsed)).not.toContain('gpt-5.5')
     expect(plan.files[0].managedFields).toEqual([
       'env.ANTHROPIC_BASE_URL',
       'env.ANTHROPIC_AUTH_TOKEN',
+      'env.CLAUDE_CODE_ATTRIBUTION_HEADER',
       'model (only non-Claude relay values)',
       'env.ANTHROPIC_MODEL',
       'env.ANTHROPIC_DEFAULT_HAIKU_MODEL',
@@ -44,6 +46,20 @@ describe('Claude Code planning', () => {
 
     const repeated = planClaudeConfig(paths.claude, { 'claude-settings': output }, target)
     expect(repeated.files[0].changed).toBe(false)
+  })
+
+  it('preserves an explicit nonessential-traffic preference without enabling it by default', () => {
+    const preserved = JSON.parse(planClaudeConfig(paths.claude, {
+      'claude-settings': JSON.stringify({
+        env: { CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1' },
+      }),
+    }, target).files[0].content)
+    const defaulted = JSON.parse(planClaudeConfig(paths.claude, {
+      'claude-settings': JSON.stringify({ env: {} }),
+    }, target).files[0].content)
+
+    expect(preserved.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC).toBe('1')
+    expect(defaulted.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC).toBeUndefined()
   })
 
   it('removes an upstream relay model from Claude model selection while preserving native aliases', () => {

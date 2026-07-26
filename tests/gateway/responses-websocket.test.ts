@@ -1,16 +1,26 @@
 import { createServer as createNodeServer } from 'node:net'
+import { createServer as createHttpServer, type Server as HttpServer } from 'node:http'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import WebSocket from 'ws'
 import { GatewayServer } from '../../src/main/gateway'
-import { forwardResponsesSse, parseClientEvent } from '../../src/main/gateway/responses-websocket'
+import {
+  ResponsesWebSocketAdapter,
+  forwardResponsesSse,
+  parseClientEvent,
+} from '../../src/main/gateway/responses-websocket'
 import type { Account, GatewaySettings, Pool, ProviderDefinition, RequestLog, Route } from '../../src/shared/types'
 import type { GatewayConfig } from '../../src/main/gateway'
 
 const running: GatewayServer[] = []
+const runningAdapters: ResponsesWebSocketAdapter[] = []
+const runningHttpServers: HttpServer[] = []
 const timestamp = 1_700_000_000_000
 
 afterEach(async () => {
   await Promise.all(running.splice(0).map((gateway) => gateway.stop({ force: true })))
+  for (const adapter of runningAdapters.splice(0)) adapter.close()
+  await Promise.all(runningHttpServers.splice(0).map((server) => closeHttpServer(server)))
+  vi.restoreAllMocks()
 })
 
 describe('Responses WebSocket message adapter', () => {
@@ -115,6 +125,73 @@ describe('Responses WebSocket message adapter', () => {
 })
 
 describe('GatewayServer Responses WebSocket', () => {
+  it('aborts the upstream reader and closes a client whose send buffer makes no progress', async () => {
+    const originalBufferedAmount = Object.getOwnPropertyDescriptor(WebSocket.prototype, 'bufferedAmount')?.get
+    if (!originalBufferedAmount) throw new Error('ws bufferedAmount getter is unavailable')
+    vi.spyOn(WebSocket.prototype, 'bufferedAmount', 'get').mockImplementation(function (this: WebSocket) {
+      return isServerWebSocket(this)
+        ? 9 * 1024 * 1024
+        : Number(originalBufferedAmount.call(this))
+    })
+    let upstreamSignal: AbortSignal | undefined
+    let readerCancelled = false
+    const { port } = await startStandaloneAdapter(async ({ signal }) => {
+      upstreamSignal = signal
+      return new Response(new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('data: {"type":"response.output_text.delta","delta":"blocked"}\n\n'))
+        },
+        cancel() { readerCancelled = true },
+      }), { headers: { 'content-type': 'text/event-stream' } })
+    }, 40)
+    const socket = await connect(`ws://127.0.0.1:${port}/v1/responses`, 'local-secret')
+    const closed = new Promise<void>((resolve) => socket.once('close', () => resolve()))
+
+    socket.send(JSON.stringify({ type: 'response.create', model: 'gpt-test', input: 'hello' }))
+
+    await closed
+    await waitFor(() => upstreamSignal?.aborted === true)
+    await waitFor(() => readerCancelled)
+    expect(upstreamSignal?.reason).toMatchObject({ name: 'ResponsesWebSocketBackpressureTimeoutError' })
+  })
+
+  it('refreshes the backpressure deadline while the send buffer keeps draining', async () => {
+    const originalBufferedAmount = Object.getOwnPropertyDescriptor(WebSocket.prototype, 'bufferedAmount')?.get
+    if (!originalBufferedAmount) throw new Error('ws bufferedAmount getter is unavailable')
+    let serverBufferedAmount = 9 * 1024 * 1024
+    let firstBackpressureCheckAt: number | undefined
+    let progress: ReturnType<typeof setInterval> | undefined
+    vi.spyOn(WebSocket.prototype, 'bufferedAmount', 'get').mockImplementation(function (this: WebSocket) {
+      if (!isServerWebSocket(this)) return Number(originalBufferedAmount.call(this))
+      if (firstBackpressureCheckAt === undefined) {
+        firstBackpressureCheckAt = Date.now()
+        progress = setInterval(() => {
+          serverBufferedAmount = Math.max(1024 * 1024, serverBufferedAmount - 2 * 1024 * 1024)
+        }, 40)
+      }
+      return serverBufferedAmount
+    })
+    let upstreamSignal: AbortSignal | undefined
+    const { port } = await startStandaloneAdapter(async ({ signal }) => {
+      upstreamSignal = signal
+      return responsesSse([{ type: 'response.output_text.delta', delta: 'eventually writable' }])
+    }, 100)
+    const socket = await connect(`ws://127.0.0.1:${port}/v1/responses`, 'local-secret')
+    const messages = collectMessages(socket)
+
+    try {
+      socket.send(JSON.stringify({ type: 'response.create', model: 'gpt-test', input: 'hello' }))
+      await waitFor(() => messages.some((event) => event.type === 'response.output_text.delta'))
+      expect(firstBackpressureCheckAt).toBeTypeOf('number')
+      expect(Date.now() - firstBackpressureCheckAt!).toBeGreaterThan(100)
+      expect(upstreamSignal?.aborted).toBe(false)
+      expect(socket.readyState).toBe(WebSocket.OPEN)
+    } finally {
+      if (progress) clearInterval(progress)
+      socket.close()
+    }
+  })
+
   it('is disabled by default and rejects invalid handshake credentials', async () => {
     const port = await freePort()
     const gateway = makeGateway(port, {}, vi.fn())
@@ -349,4 +426,38 @@ async function freePort(): Promise<number> {
   if (!address || typeof address === 'string') throw new Error('Failed to allocate port')
   await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
   return address.port
+}
+
+async function startStandaloneAdapter(
+  dispatch: ConstructorParameters<typeof ResponsesWebSocketAdapter>[0]['dispatch'],
+  backpressureNoProgressTimeoutMs: number,
+): Promise<{ port: number }> {
+  const server = createHttpServer()
+  runningHttpServers.push(server)
+  const adapter = new ResponsesWebSocketAdapter({
+    server,
+    enabled: () => true,
+    authenticate: (request) => request.headers.authorization === 'Bearer local-secret'
+      ? { ok: true }
+      : { ok: false, statusCode: 401 },
+    dispatch,
+    backpressureNoProgressTimeoutMs,
+  })
+  runningAdapters.push(adapter)
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(0, '127.0.0.1', resolve)
+  })
+  const address = server.address()
+  if (!address || typeof address === 'string') throw new Error('Failed to allocate adapter port')
+  return { port: address.port }
+}
+
+async function closeHttpServer(server: HttpServer): Promise<void> {
+  if (!server.listening) return
+  await new Promise<void>((resolve) => server.close(() => resolve()))
+}
+
+function isServerWebSocket(socket: WebSocket): boolean {
+  return Boolean((socket as WebSocket & { _isServer?: boolean })._isServer)
 }

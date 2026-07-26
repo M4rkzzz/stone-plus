@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs'
 import {
   agentActionBlockReasonFor,
   agentActionDescription,
+  agentActionLabel,
   agentRowActionsFor,
   agentOutcomeLabel,
   agentActionBlockReason,
@@ -11,10 +12,11 @@ import {
   primaryAgentActionFor,
   summarizeAgentLifecycle,
 } from '../../src/renderer/src/agent-lifecycle-control'
-import type {
-  AgentCapabilities,
-  AgentLifecycleOperationResult,
-  AgentLifecycleState,
+import {
+  AGENT_CAPABILITIES,
+  type AgentCapabilities,
+  type AgentLifecycleOperationResult,
+  type AgentLifecycleState,
 } from '../../src/shared/agent-lifecycle'
 
 const capabilities: AgentCapabilities = {
@@ -55,6 +57,60 @@ describe('agent lifecycle control summary', () => {
     expect(source).not.toContain('agent-lifecycle__count')
     expect(styles).not.toContain('agent-lifecycle__count')
     expect(source).toContain('disabled={busy || runningCount === 0}')
+  })
+
+  it('labels the legacy Claude target as CLI and exposes Desktop and VSC as separate rows', () => {
+    const source = readFileSync(new URL('../../src/renderer/src/agent-lifecycle-control.tsx', import.meta.url), 'utf8')
+    expect(source).toContain("'claude-code': { name: 'Claude Code CLI'")
+    expect(source).toContain("'claude-code-desktop': { name: 'Claude Code Desktop'")
+    expect(source).toContain("'claude-code-vsc': { name: 'Claude Code VSC'")
+    expect(source.indexOf("'claude-code'", source.indexOf('const targetOrder')))
+      .toBeLessThan(source.indexOf("'claude-code-desktop'", source.indexOf('const targetOrder')))
+    expect(source.indexOf("'claude-code-desktop'", source.indexOf('const targetOrder')))
+      .toBeLessThan(source.indexOf("'claude-code-vsc'", source.indexOf('const targetOrder')))
+  })
+
+  it('presents Claude Desktop as automatic whole-app configuration without manual token instructions', () => {
+    const controlSource = readFileSync(new URL('../../src/renderer/src/agent-lifecycle-control.tsx', import.meta.url), 'utf8')
+    const clientsSource = readFileSync(new URL('../../src/renderer/src/views/ClientsView.tsx', import.meta.url), 'utf8')
+
+    expect(controlSource).not.toContain('需手动配置')
+    expect(controlSource).not.toContain('Configure Third-Party Inference')
+    expect(clientsSource).not.toContain('Desktop 手动网关参数')
+    expect(clientsSource).not.toContain('inferenceGatewayApiKey')
+    expect(clientsSource).toContain('接管时自动允许 Cowork 访问任意网络主机并隐藏官方模式选择器')
+    expect(clientsSource).toContain('同时允许 Cowork 访问任意网络主机并隐藏官方模式选择器')
+    expect(clientsSource).toContain('完整退出并重开 Claude Desktop 后生效')
+    expect(clientsSource).toContain('Stone+ 不会结束宿主进程')
+    expect(clientsSource).not.toContain('claudeDesktopCapabilities:')
+    expect(clientsSource).not.toContain('Cowork 全域网络放行')
+    expect(clientsSource).toContain("installAction: ['打开官方下载页', 'Open official download page']")
+  })
+
+  it('keeps Claude Desktop official-mode recovery reachable and blocks lifecycle races', () => {
+    const clientsSource = readFileSync(new URL('../../src/renderer/src/views/ClientsView.tsx', import.meta.url), 'utf8')
+    const restoreButtonStart = clientsSource.indexOf('{isClaudeDesktop && (')
+    const restoreButtonEnd = clientsSource.indexOf('{!item?.installed ? (', restoreButtonStart)
+    const restoreButtonSource = clientsSource.slice(restoreButtonStart, restoreButtonEnd)
+
+    expect(clientsSource).toContain('restoreClaudeDesktopOfficialMode()')
+    expect(clientsSource).toContain('if (claudeDesktopOfficialRestoreInFlight.current || agentLifecycle?.busy) return')
+    expect(clientsSource).toContain('const claudeDesktopOfficialRestoreDisabled = claudeDesktopOfficialRestoreBusy')
+    expect(clientsSource).toContain('|| claudeDesktopOfficialRestoreBlockedByLifecycle')
+    expect(clientsSource).toContain('disabled={claudeDesktopOfficialRestoreDisabled}')
+    expect(clientsSource).toContain('aria-label={claudeDesktopOfficialRestoreLabel}')
+    expect(clientsSource).toContain('title={claudeDesktopOfficialRestoreTitle}')
+    expect(clientsSource).toContain('客户端操作进行中，完成后可恢复 Claude Desktop 官方模式')
+    expect(clientsSource).toContain('另一项客户端接管、修复或启动操作正在进行；完成后可恢复官方模式')
+    expect(clientsSource).toContain('此操作只会移除 Stone+ 写入的 Claude Desktop 第三方推理配置')
+    expect(clientsSource).toContain('官方模式选择器才会恢复并生效')
+    expect(clientsSource).toContain('请完整退出并重开 Claude Desktop 后使用官方模式')
+    expect(restoreButtonStart).toBeGreaterThanOrEqual(0)
+    expect(restoreButtonEnd).toBeGreaterThan(restoreButtonStart)
+    expect(restoreButtonSource).not.toContain('item?.installed')
+    expect(restoreButtonSource).not.toContain('itemError')
+    expect(restoreButtonSource).not.toContain('routeSelection')
+    expect(restoreButtonSource).not.toContain('Boolean(busy)')
   })
 
   it('explicitly starts a stopped client after the user chooses repair and start', () => {
@@ -114,6 +170,39 @@ describe('agent lifecycle control summary', () => {
     }))).toEqual(['close', 'restart'])
     expect(agentRowActionsFor(agent({ running: false }))).toEqual(['start'])
     expect(agentRowActionsFor(agent({ running: false, attention: 'repair' }))).toEqual(['start'])
+  })
+
+  it.each(['claude-code-desktop', 'claude-code-vsc'] as const)(
+    'offers only one launch action for launch-only %s and never close or restart',
+    (target) => {
+      const launchOnly = agent({
+        target,
+        capabilities: AGENT_CAPABILITIES[target],
+        configured: false,
+        running: false,
+        managedInstanceCount: 0,
+        processControl: 'unavailable',
+      })
+
+      expect(primaryAgentActionFor(launchOnly)).toBe('start')
+      expect(agentRowActionsFor(launchOnly)).toEqual(['start'])
+      expect(agentActionBlockReasonFor(launchOnly, [launchOnly], 'start', zh)).toBeUndefined()
+    },
+  )
+
+  it('uses configured state to label the Claude Desktop launch action', () => {
+    const unconfigured = agent({
+      target: 'claude-code-desktop',
+      capabilities: AGENT_CAPABILITIES['claude-code-desktop'],
+      configured: false,
+      processControl: 'unavailable',
+    })
+    const configured = agent({ ...unconfigured, configured: true })
+
+    expect(agentActionLabel(unconfigured, 'start', zh)).toBe('配置并打开 Code')
+    expect(agentActionLabel(configured, 'start', zh)).toBe('打开 Code')
+    expect(agentActionDescription(unconfigured, 'start', zh)).toContain('整个 Claude Desktop')
+    expect(agentActionDescription(unconfigured, 'start', zh)).toContain('不会结束宿主进程')
   })
 
   it('describes the repair depth represented by the single restart button', () => {
@@ -196,6 +285,23 @@ describe('agent lifecycle control summary', () => {
     expect(agentOutcomeLabel({ ...repaired, wasRunning: false, runningAfter: false }, 'install', zh)).toBe('已打开官方安装指引')
   })
 
+  it.each(['claude-code-desktop', 'claude-code-vsc'] as const)(
+    'reports a successful launch-only %s handoff as opened without a running process',
+    (target) => {
+      expect(agentOutcomeLabel({
+        target,
+        status: 'succeeded',
+        phases: ['inspect', 'start'],
+        wasRunning: false,
+        runningAfter: false,
+        changed: true,
+        pendingNewSession: false,
+      }, 'start', zh)).toBe(target === 'claude-code-desktop'
+        ? '配置已确认并已打开 Code；完整退出并重开 Claude Desktop 后生效'
+        : '已打开')
+    },
+  )
+
   it('turns backend failure codes into localized actionable reasons', () => {
     expect(localizedLifecycleError({
       code: 'process-start-failed',
@@ -229,6 +335,16 @@ function operation(status: AgentLifecycleOperationResult['status']): AgentLifecy
         'codex-desktop': agent({ target: 'codex-desktop' }),
         'codex-cli': agent({ target: 'codex-cli' }),
         'claude-code': agent({ target: 'claude-code' }),
+        'claude-code-desktop': agent({
+          target: 'claude-code-desktop',
+          capabilities: AGENT_CAPABILITIES['claude-code-desktop'],
+          processControl: 'unavailable',
+        }),
+        'claude-code-vsc': agent({
+          target: 'claude-code-vsc',
+          capabilities: AGENT_CAPABILITIES['claude-code-vsc'],
+          processControl: 'unavailable',
+        }),
         'gemini-cli': agent({ target: 'gemini-cli' }),
         'grok-build': agent({ target: 'grok-build' }),
       },

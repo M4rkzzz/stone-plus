@@ -145,7 +145,18 @@ export async function refreshChatGptCredential(
     throw new Error('ChatGPT token refresh endpoint could not be reached.')
   }
   if (!response.ok) throw new Error(response.status === 400 || response.status === 401 ? 'ChatGPT refresh token was rejected.' : 'ChatGPT token refresh failed.')
-  const payload = await response.json() as Record<string, unknown>
+  const responseText = await readLimitedResponseText(
+    response,
+    256 * 1024,
+    'ChatGPT token refresh response is too large.',
+    signal,
+  )
+  let payload: Record<string, unknown>
+  try {
+    payload = JSON.parse(responseText) as Record<string, unknown>
+  } catch {
+    throw new Error('ChatGPT token refresh returned invalid JSON.')
+  }
   const accessToken = typeof payload.access_token === 'string' ? payload.access_token.trim() : ''
   const expiresIn = typeof payload.expires_in === 'number' ? payload.expires_in : 0
   if (!accessToken || !Number.isFinite(expiresIn) || expiresIn <= 0) throw new Error('ChatGPT token refresh returned an invalid response.')
@@ -441,7 +452,8 @@ export async function queryChatGptCodexModelsAuthorized(
   const text = await readLimitedResponseText(
     response,
     1024 * 1024,
-    'ChatGPT Codex model response is too large.'
+    'ChatGPT Codex model response is too large.',
+    signal,
   )
   let payload: unknown
   try {
@@ -527,7 +539,8 @@ export async function queryChatGptCodexQuotaAuthorized(
   const text = await readLimitedResponseText(
     response,
     512 * 1024,
-    'ChatGPT Codex usage response is too large.'
+    'ChatGPT Codex usage response is too large.',
+    signal,
   )
   let payload: unknown
   try {
@@ -543,15 +556,20 @@ export async function queryChatGptCodexQuotaAuthorized(
 async function readLimitedResponseText(
   response: Response,
   maximumBytes: number,
-  oversizedMessage: string
+  oversizedMessage: string,
+  signal?: AbortSignal,
 ): Promise<string> {
   const reader = response.body?.getReader()
   if (!reader) return ''
   const chunks: Buffer[] = []
   let size = 0
+  const onAbort = (): void => { void reader.cancel(signal?.reason).catch(() => undefined) }
+  signal?.addEventListener('abort', onAbort, { once: true })
   try {
+    if (signal?.aborted) throw abortReason(signal)
     for (;;) {
       const { done, value } = await reader.read()
+      if (signal?.aborted) throw abortReason(signal)
       if (done) break
       size += value.byteLength
       if (size > maximumBytes) {
@@ -561,6 +579,7 @@ async function readLimitedResponseText(
       chunks.push(Buffer.from(value))
     }
   } finally {
+    signal?.removeEventListener('abort', onAbort)
     reader.releaseLock()
   }
   return Buffer.concat(chunks).toString('utf8')

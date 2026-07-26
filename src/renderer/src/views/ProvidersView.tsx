@@ -48,13 +48,19 @@ import type {
 import { DEFAULT_ACCOUNT_MAX_CONCURRENCY } from '@shared/types'
 import { providerSourceFamily, type ProviderSourceFamily } from '@shared/source-family'
 import { accountMatchesPoolProtocol } from '@shared/pool-protocol'
+import { hasVerifiedKiroToolBridge } from '@shared/route-sources'
 import type { ActionRunner } from '../App'
 import { BoundAsyncOperation } from '../async-operation'
 import { normalizeAggregateRelayMembers, toggleAggregateRelayMember } from '../aggregate-relay-members'
 import { providerBrandIcon } from '../brand-icons'
 import { BUILT_IN_PROXY_BINDING_NOTICE, useBuiltInProxyInterlock } from '../built-in-proxy-interlocks'
 import { providerProbeDraftBinding } from '../provider-probe-binding'
-import { accountDisplayNames, accountSelectionSummary, nextTabIndex, selectMatchingAccountIds } from '../providers-view-state'
+import {
+  anthropicRelayNeedsClaudeToolchainWarning,
+  CLAUDE_TOOLCHAIN_UNVERIFIED_COPY,
+  isAnthropicCompatibleRelay,
+} from '../claude-toolchain-ui'
+import { accountDisplayNames, accountSelectionSummary, nextTabIndex, paginateAccounts, selectMatchingAccountIds } from '../providers-view-state'
 import {
   localizeBackendError,
   localizeBackendMessage,
@@ -65,12 +71,14 @@ import {
 } from '../backend-message'
 import { useI18n } from '../i18n'
 import {
+  KIRO_COMPATIBLE_KIND,
   newRelayConnectionDefaults,
   protocolAfterProviderKindChange,
   protocolOptionLabel,
   protocolsByProviderKind,
   providerKindLabelsEn,
   providerKindLabelsZh,
+  relayProtocolSelectLocked,
   XAI_COMPATIBLE_KIND,
 } from '../grok-relay-ui'
 import { setupPoolDisplayName } from '../system-generated-text'
@@ -289,13 +297,25 @@ function CooldownCountdown({ account }: { account: PublicAccount }) {
     {account.cooldownReason === 'quota' || accountQuotaIsExhausted(account, now) ? t('额度恢复', 'Quota recovery') : t('冷却恢复', 'Cooldown recovery')} {thawCountdown(until, now)}
   </span>
 }
+
+function OAuthExpiryCountdown({ expiresAt }: { expiresAt: number }) {
+  const { t } = useI18n()
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    setNow(Date.now())
+    const timer = window.setInterval(() => setNow(Date.now()), 1_000)
+    return () => window.clearInterval(timer)
+  }, [expiresAt])
+  const seconds = Math.max(0, Math.ceil((expiresAt - now) / 1_000))
+  return <strong>{seconds > 0 ? `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}` : t('即将过期', 'Expiring soon')}</strong>
+}
 import { ModelPolicyEditor } from './ModelPolicyEditor'
 import { accountModelCatalog, effectiveAccountModels, isAccountModelWildcard } from '../model-policy'
 
 type ApiSourceDraft = Omit<ApiSourceInput, 'models' | 'defaultModel'> & { modelsText: string; defaultModel: string }
 type AccountDraft = Omit<AccountInput, 'modelPolicy'> & { modelPolicy: ModelPolicy }
 type AggregateRelayDraft = AggregateRelayInput
-const aggregateProtocols: Protocol[] = ['anthropic-messages', 'openai-responses', 'openai-chat', 'gemini']
+const aggregateProtocols: Protocol[] = ['anthropic-messages', 'openai-responses', 'openai-chat', 'kiro-claude', 'gemini']
 
 const officialSourceDefaults: Record<'openai' | 'xai' | 'anthropic' | 'google', Pick<ApiSourceDraft, 'baseUrl' | 'protocol'>> = {
   openai: { baseUrl: 'https://api.openai.com/v1', protocol: 'openai-responses' },
@@ -372,7 +392,7 @@ function ApiSourceForm({
     : protocolsByProviderKind[draft.kind]
   const availableKinds: ProviderKind[] = draft.sourceType === 'official-api'
     ? draft.kind === 'xai' ? ['xai'] : ['openai', 'anthropic', 'google']
-    : [XAI_COMPATIBLE_KIND, 'openai-compatible', 'anthropic-compatible', 'custom']
+    : [XAI_COMPATIBLE_KIND, KIRO_COMPATIBLE_KIND, 'openai-compatible', 'anthropic-compatible', 'custom']
   const compactMode = effectiveResponsesCompactMode(draft.responsesCompactMode)
   const compactCopy = responsesCompactModeCopy[compactMode]
   return (
@@ -403,7 +423,7 @@ function ApiSourceForm({
       </label>
       <label className="field">
         <span>{t('上游协议', 'Upstream protocol')}</span>
-        <select value={draft.protocol} disabled={draft.sourceType === 'official-api' && draft.kind === 'xai'} onChange={(event) => {
+        <select value={draft.protocol} disabled={(draft.sourceType === 'official-api' && draft.kind === 'xai') || relayProtocolSelectLocked(draft.kind)} onChange={(event) => {
           const protocol = event.target.value as Protocol
           setDraft({
             ...draft,
@@ -416,6 +436,7 @@ function ApiSourceForm({
           {availableProtocols.map((protocol) => <option value={protocol} key={protocol}>{protocolOptionLabel(draft.kind, protocol, protocolLabels, t)}</option>)}
         </select>
         {draft.kind === XAI_COMPATIBLE_KIND && <small>{t('默认使用官方当前主路径 Responses；仅当中转明确只兼容 Chat Completions 时选择高级兼容模式。', 'Responses is the current primary API path. Choose advanced Chat compatibility only when the relay explicitly requires Chat Completions.')}</small>}
+        {draft.kind === KIRO_COMPATIBLE_KIND && <small>{t('仅供 Claude Code CLI、Desktop 与 VSC 使用；Stone+ 会强制启用结构化工具兼容。', 'Available only to Claude Code CLI, Desktop, and VSC. Stone+ always enables the structured tool bridge.')}</small>}
       </label>
       {relayCanConfigureResponsesCompact(draft.sourceType, draft.protocol) && <label className="field field--full">
         <span className="field-label-with-help">{t('Responses Compact 能力', 'Responses compact capability')}<InfoTip text={t(compactCopy.helpZh, compactCopy.helpEn)} /></span>
@@ -428,8 +449,9 @@ function ApiSourceForm({
         <span>{t('官方 OpenAI 自动使用完整原生 Compact', 'Official OpenAI automatically uses full native compact')}<InfoTip text={t('该能力由 Stone+ 按官方 Responses 协议自动管理，包括 compact 请求和后续 opaque 历史，无需手动配置。', 'Stone+ manages this automatically using the official Responses protocol, including compact requests and subsequent opaque history. No manual setting is needed.')} /></span>
       </div>}
       <label className="field field--full">
-        <span className="field-label-with-help">{t('基础地址', 'Base URL')}{draft.sourceType === 'official-api' && <InfoTip text={t('官方 API 地址由 Stone+ 锁定，避免误接到第三方中转端点。', 'Stone+ locks official API URLs to prevent accidental routing through a third-party relay.')} />}</span>
-        <input className="mono" disabled={draft.sourceType === 'official-api'} value={draft.baseUrl} onChange={(event) => setDraft({ ...draft, baseUrl: event.target.value })} placeholder="https://api.example.com/v1" />
+        <span className="field-label-with-help">{draft.kind === KIRO_COMPATIBLE_KIND ? t('完整 GenerateAssistantResponse 端点', 'Full GenerateAssistantResponse endpoint') : t('基础地址', 'Base URL')}{draft.sourceType === 'official-api' && <InfoTip text={t('官方 API 地址由 Stone+ 锁定，避免误接到第三方中转端点。', 'Stone+ locks official API URLs to prevent accidental routing through a third-party relay.')} />}</span>
+        <input className="mono" disabled={draft.sourceType === 'official-api'} value={draft.baseUrl} onChange={(event) => setDraft({ ...draft, baseUrl: event.target.value })} placeholder={draft.kind === KIRO_COMPATIBLE_KIND ? 'https://relay.example.com/generateAssistantResponse' : 'https://api.example.com/v1'} />
+        {draft.kind === KIRO_COMPATIBLE_KIND && <small>{t('该地址按原样请求，不会追加 /v1/messages 或 /models。', 'This exact URL is requested as-is; /v1/messages and /models are never appended.')}</small>}
         <FieldError>{errors.baseUrl}</FieldError>
       </label>
       <label className="field field--full">
@@ -438,12 +460,14 @@ function ApiSourceForm({
         <FieldError>{errors.credential}</FieldError>
       </label>
       <label className="field field--full">
-        <span className="field-label-with-help">{t('目录模型（兼容）', 'Catalog models (fallback)')}<InfoTip text={t('每行一个模型标识，仅在账号尚未单独刷新时作为兼容候选。', 'Enter one model identifier per line. These are fallback candidates until the account refreshes its own models.')} /></span>
+        <span className="field-label-with-help">{draft.kind === KIRO_COMPATIBLE_KIND ? t('Kiro Claude 模型', 'Kiro Claude models') : t('目录模型（兼容）', 'Catalog models (fallback)')}<InfoTip text={draft.kind === KIRO_COMPATIBLE_KIND ? t('Kiro Claude 不提供模型发现，请按中转说明每行填写一个模型标识。', 'Kiro Claude does not use model discovery. Enter one relay model identifier per line.') : t('每行一个模型标识，仅在账号尚未单独刷新时作为兼容候选。', 'Enter one model identifier per line. These are fallback candidates until the account refreshes its own models.')} /></span>
         <textarea value={draft.modelsText} onChange={(event) => setDraft({ ...draft, modelsText: event.target.value })} rows={4} placeholder={'gpt-5\ngpt-5-mini'} />
+        <FieldError>{errors.models}</FieldError>
       </label>
       <label className="field field--full">
         <span>{t('默认 / 测试模型', 'Default / test model')}</span>
         <input className="mono" value={draft.defaultModel} onChange={(event) => setDraft({ ...draft, defaultModel: event.target.value })} placeholder={t('例如：gpt-5-mini', 'e.g. gpt-5-mini')} />
+        <FieldError>{errors.defaultModel}</FieldError>
       </label>
       <label className="field"><span className="field-label-with-help">{t('优先级', 'Priority')}<InfoTip text={t('数值越小越优先，仅在优先级调度或故障转移时决定先后顺序。', 'Lower values have higher priority and determine order only for priority scheduling or failover.')} /></span><input type="number" min={1} max={999} value={draft.priority} onChange={(event) => setDraft({ ...draft, priority: Number(event.target.value) })} /></label>
       <label className="field"><span className="field-label-with-help">{t('调度权重', 'Scheduling weight')}<InfoTip text={t('数值越大，被加权策略分配到请求的比例越高。', 'Higher values receive a larger share of requests under weighted strategies.')} /></span><input type="number" min={1} max={100} value={draft.weight} onChange={(event) => setDraft({ ...draft, weight: Number(event.target.value) })} /></label>
@@ -633,16 +657,17 @@ export function ProvidersView({
   const [oauthCopied, setOauthCopied] = useState(false)
   const [oauthCommitLocked, setOauthCommitLocked] = useState(false)
   const [oauthResult, setOauthResult] = useState<ChatGptAccountImportResult | null>(null)
-  const [oauthNow, setOauthNow] = useState(Date.now())
   const oauthSessionIdRef = useRef<string | null>(null)
   const oauthAttemptRef = useRef(0)
   const [quotaAccountId, setQuotaAccountId] = useState<string | null>(null)
   const [selectedAccountIds, setSelectedAccountIds] = useState<string[]>([])
+  const [accountPage, setAccountPage] = useState(0)
   const [bulkDeleteOpen, setBulkDeleteOpen] = useState(false)
   const [exportOpen, setExportOpen] = useState(false)
   const [exportFormat, setExportFormat] = useState<'sub2api' | 'cpa'>('sub2api')
   const [exportMode, setExportMode] = useState<'merged' | 'separate'>('merged')
   const [exportAccountIds, setExportAccountIds] = useState<string[]>([])
+  const [exportAccountPage, setExportAccountPage] = useState(0)
   const [exportBusy, setExportBusy] = useState(false)
   const [exportNotice, setExportNotice] = useState('')
   const [accountColumnWidths, setAccountColumnWidths] = useState<AccountColumnWidths>(loadAccountColumnWidths)
@@ -660,10 +685,11 @@ export function ProvidersView({
   const [importTagName, setImportTagName] = useState('')
 
   const providerById = useMemo(() => new Map(snapshot.providers.map((provider) => [provider.id, provider])), [snapshot.providers])
+  const accountById = useMemo(() => new Map(snapshot.accounts.map((account) => [account.id, account])), [snapshot.accounts])
   const proxyById = useMemo(() => new Map(snapshot.proxies.map((proxy) => [proxy.id, proxy])), [snapshot.proxies])
   const accountNameById = useMemo(() => accountDisplayNames(snapshot.accounts), [snapshot.accounts])
-  const quotaAccount = quotaAccountId ? snapshot.accounts.find((account) => account.id === quotaAccountId) ?? null : null
-  const editingAccount = accountDraft.id ? snapshot.accounts.find((account) => account.id === accountDraft.id) : undefined
+  const quotaAccount = quotaAccountId ? accountById.get(quotaAccountId) ?? null : null
+  const editingAccount = accountDraft.id ? accountById.get(accountDraft.id) : undefined
   const accountModelsBusy = Boolean(accountDraft.id && busyKeys.has(`refresh-account-models-${accountDraft.id}`))
   const loginAccounts = useMemo(() => snapshot.accounts.filter((account) => {
     const provider = providerById.get(account.providerId)
@@ -695,6 +721,18 @@ export function ProvidersView({
     if (tagFilter !== 'all') return account.tagId === tagFilter
     return true
   }), [hideExhaustedAccounts, oauthAccounts, tagFilter])
+  const visibleAccountPage = useMemo(() => paginateAccounts(visibleAccounts, accountPage), [accountPage, visibleAccounts])
+  const exportAccountPageState = useMemo(() => paginateAccounts(oauthAccounts, exportAccountPage), [exportAccountPage, oauthAccounts])
+  const selectedAccountIdSet = useMemo(() => new Set(selectedAccountIds), [selectedAccountIds])
+  const exportAccountIdSet = useMemo(() => new Set(exportAccountIds), [exportAccountIds])
+  const accountTagCounts = useMemo(() => {
+    const counts = new Map<string, number>()
+    for (const account of oauthAccounts) {
+      const key = account.tagId ?? 'untagged'
+      counts.set(key, (counts.get(key) ?? 0) + 1)
+    }
+    return counts
+  }, [oauthAccounts])
   const checkingAllAccounts = busyKeys.has('check-all-accounts')
   const officialProviders = useMemo(() => snapshot.providers.filter((provider) => provider.sourceType === 'official-api' && provider.kind !== 'xai'), [snapshot.providers])
   const relayProviders = useMemo(() => snapshot.providers.filter((provider) => provider.sourceType === 'relay'), [snapshot.providers])
@@ -702,19 +740,18 @@ export function ProvidersView({
   const compatibleImportPools = useMemo(() => snapshot.pools.filter((pool) => pool.kind === 'standard'
     && pool.protocol === 'openai-responses'
     && pool.members.every((member) => {
-      const account = snapshot.accounts.find((candidate) => candidate.id === member.accountId)
+      const account = accountById.get(member.accountId)
       const provider = providerById.get(account?.providerId ?? '')
       return provider !== undefined && providerSourceFamily(provider.kind) === 'openai'
-    })), [providerById, snapshot.accounts, snapshot.pools])
+    })), [accountById, providerById, snapshot.pools])
   const compatibleGrokImportPools = useMemo(() => snapshot.pools.filter((pool) => pool.kind === 'standard'
     && pool.protocol === 'grok'
     && pool.members.every((member) => {
-      const account = snapshot.accounts.find((candidate) => candidate.id === member.accountId)
+      const account = accountById.get(member.accountId)
       return Boolean(account && accountMatchesPoolProtocol('grok', account, providerById.get(account.providerId)))
-    })), [providerById, snapshot.accounts, snapshot.pools])
+    })), [accountById, providerById, snapshot.pools])
   const oauthActive = oauthStage === 'starting' || oauthStage === 'waiting' || oauthStage === 'submitting' || oauthStage === 'exchanging' || oauthStage === 'cancelling'
   const importConfigurationLocked = fileImportBusy || oauthActive
-  const oauthExpiresInSeconds = oauthSession ? Math.max(0, Math.ceil((oauthSession.expiresAt - oauthNow) / 1000)) : 0
   const refreshModelsDisabledReason = !accountDraft.id
     ? t('请先保存账号，再拉取此账号的可用模型。', 'Save the account before fetching its available models.')
     : accountDraft.credential?.trim()
@@ -723,6 +760,8 @@ export function ProvidersView({
 
   const selectAccountFamily = (family: AccountFamilyTab) => {
     setAccountFamily(family)
+    setAccountPage(0)
+    setExportAccountPage(0)
     setSelectedAccountIds([])
     setExportAccountIds([])
     setTagFilter('all')
@@ -732,6 +771,11 @@ export function ProvidersView({
     } catch {
       // The selected family still works for this session when storage is unavailable.
     }
+  }
+
+  const selectTagFilter = (next: string) => {
+    setTagFilter(next)
+    setAccountPage(0)
   }
 
   useEffect(() => {
@@ -833,13 +877,6 @@ export function ProvidersView({
     if (progress.progressId === importProgressId.current) setImportProgress(progress)
   }), [api])
 
-  useEffect(() => {
-    if (!oauthSession || !oauthActive) return
-    setOauthNow(Date.now())
-    const timer = window.setInterval(() => setOauthNow(Date.now()), 1_000)
-    return () => window.clearInterval(timer)
-  }, [oauthActive, oauthSession])
-
   useEffect(() => () => {
     oauthAttemptRef.current += 1
     const sessionId = oauthSessionIdRef.current
@@ -863,8 +900,19 @@ export function ProvidersView({
   }, [snapshot.accounts])
 
   useEffect(() => {
-    if (tagFilter !== 'all' && tagFilter !== 'untagged' && !tagById.has(tagFilter)) setTagFilter('all')
+    if (tagFilter !== 'all' && tagFilter !== 'untagged' && !tagById.has(tagFilter)) {
+      setTagFilter('all')
+      setAccountPage(0)
+    }
   }, [tagById, tagFilter])
+
+  useEffect(() => {
+    setAccountPage((current) => current === visibleAccountPage.page ? current : visibleAccountPage.page)
+  }, [visibleAccountPage.page])
+
+  useEffect(() => {
+    setExportAccountPage((current) => current === exportAccountPageState.page ? current : exportAccountPageState.page)
+  }, [exportAccountPageState.page])
 
   const showProviderDraft = (next: ApiSourceDraft) => {
     providerModalSession.current += 1
@@ -993,10 +1041,10 @@ export function ProvidersView({
         .map((member, index) => ({
           accountId: member.accountId,
           order: member.order ?? index,
-          weight: member.weight ?? snapshot.accounts.find((account) => account.id === member.accountId)?.weight ?? 10,
+          weight: member.weight ?? accountById.get(member.accountId)?.weight ?? 10,
         }))
         .sort((a, b) => a.order - b.order),
-      stickySessions: pool.stickySessions,
+      stickySessions: pool.protocol === 'kiro-claude' ? true : pool.stickySessions,
       stickyTtlMinutes: pool.stickyTtlMinutes,
       maxRetries: pool.maxRetries,
       quotaProtection: pool.quotaProtection ? { ...pool.quotaProtection } : undefined,
@@ -1014,7 +1062,7 @@ export function ProvidersView({
   const toggleAggregateMember = (account: PublicAccount) => {
     const provider = providerById.get(account.providerId)
     const selectedMember = aggregateDraft.members
-      .map((member) => snapshot.accounts.find((candidate) => candidate.id === member.accountId))
+      .map((member) => accountById.get(member.accountId))
       .find((candidate) => candidate?.id !== account.id)
     const selectedProvider = selectedMember ? providerById.get(selectedMember.providerId) : undefined
     if (provider && selectedProvider
@@ -1037,8 +1085,16 @@ export function ProvidersView({
     const nextErrors: Record<string, string> = {}
     if (!aggregateDraft.name.trim()) nextErrors.aggregateName = t('请输入聚合中转名称', 'Enter an aggregate relay name.')
     if (aggregateDraft.members.length < 2) nextErrors.aggregateMembers = t('至少选择两个同协议 API 来源', 'Select at least two API sources with the same protocol.')
+    if (aggregateDraft.protocol === 'kiro-claude') {
+      const unverified = aggregateDraft.members.some((member) => {
+        const account = accountById.get(member.accountId)
+        const provider = providerById.get(account?.providerId ?? '')
+        return !hasVerifiedKiroToolBridge(provider)
+      })
+      if (unverified) nextErrors.aggregateMembers = t('Kiro Claude 聚合成员必须先通过两轮工具链测试。', 'Every Kiro Claude aggregate member must pass the two-turn tool-chain test first.')
+    }
     const aggregateFamilies = new Set(aggregateDraft.members.flatMap((member) => {
-      const account = snapshot.accounts.find((candidate) => candidate.id === member.accountId)
+      const account = accountById.get(member.accountId)
       const provider = providerById.get(account?.providerId ?? '')
       return provider ? [providerSourceFamily(provider.kind)] : []
     }))
@@ -1047,6 +1103,7 @@ export function ProvidersView({
     if (Object.keys(nextErrors).length) return
     const success = await runAction('save-aggregate-relay', () => api.saveAggregateRelay({
       ...aggregateDraft,
+      stickySessions: aggregateDraft.protocol === 'kiro-claude' ? true : aggregateDraft.stickySessions,
       name: aggregateDraft.name.trim(),
       proxyId: aggregateDraft.proxyId || undefined,
     }))
@@ -1103,6 +1160,11 @@ export function ProvidersView({
     try { new URL(providerDraft.baseUrl) } catch { nextErrors.baseUrl = t('请输入有效的 HTTP(S) 地址', 'Enter a valid HTTP(S) URL.') }
     if (!/^https?:\/\//.test(providerDraft.baseUrl)) nextErrors.baseUrl = t('地址必须以 http:// 或 https:// 开头', 'The URL must start with http:// or https://.')
     if (!providerDraft.id && !providerDraft.credential?.trim()) nextErrors.credential = t('首次添加需要填写 API Key', 'An API key is required when adding a source.')
+    if (providerDraft.kind === KIRO_COMPATIBLE_KIND) {
+      const models = providerDraft.modelsText.split(/[\n,]/).map((model) => model.trim()).filter(Boolean)
+      if (models.length === 0) nextErrors.models = t('Kiro Claude 不支持模型发现，请至少填写一个模型。', 'Kiro Claude does not use model discovery. Enter at least one model.')
+      if (!providerDraft.defaultModel.trim()) nextErrors.defaultModel = t('请选择用于工具链测试的默认模型。', 'Enter the default model used by the tool-chain test.')
+    }
     setErrors(nextErrors)
     if (Object.keys(nextErrors).length) return
     const sourceAccount = providerDraft.id
@@ -1124,7 +1186,7 @@ export function ProvidersView({
           : !accountMatchesPoolProtocol(pool.protocol, sourceAccount, nextProvider)
             || pool.members.some((member) => {
                 if (member.accountId === sourceAccount.id) return false
-                const memberAccount = snapshot.accounts.find((account) => account.id === member.accountId)
+                const memberAccount = accountById.get(member.accountId)
                 const memberProvider = providerById.get(memberAccount?.providerId ?? '')
                 return !memberProvider || providerSourceFamily(memberProvider.kind) !== nextFamily
               })))
@@ -1138,7 +1200,7 @@ export function ProvidersView({
       name: providerDraft.name.trim(),
       sourceType: providerDraft.sourceType,
       kind: providerDraft.kind,
-      baseUrl: providerDraft.baseUrl.replace(/\/$/, ''),
+      baseUrl: providerDraft.kind === KIRO_COMPATIBLE_KIND ? providerDraft.baseUrl.trim() : providerDraft.baseUrl.replace(/\/$/, ''),
       protocol: providerDraft.protocol,
       responsesCompactMode: responsesCompactModeForSave(
         providerDraft.sourceType,
@@ -1185,7 +1247,7 @@ export function ProvidersView({
         name: draft.name.trim() || t('未命名来源', 'Unnamed source'),
         sourceType: draft.sourceType,
         kind: draft.kind,
-        baseUrl: draft.baseUrl.replace(/\/$/, ''),
+        baseUrl: draft.kind === KIRO_COMPATIBLE_KIND ? draft.baseUrl.trim() : draft.baseUrl.replace(/\/$/, ''),
         protocol: draft.protocol,
         responsesCompactMode: draft.responsesCompactMode,
         credential: draft.credential?.trim() || undefined,
@@ -1239,7 +1301,9 @@ export function ProvidersView({
         t('未知错误', 'Unknown error'),
       )
       setImportNotice(result.ok
-        ? t(`“${provider.name}”真实生成测试通过，耗时 ${result.latencyMs ?? 0} ms。`, `“${provider.name}” passed the real generation test in ${result.latencyMs ?? 0} ms.`)
+        ? provider.protocol === 'kiro-claude'
+          ? t(`“${provider.name}”Kiro 两轮工具链测试通过，耗时 ${result.latencyMs ?? 0} ms。`, `“${provider.name}” passed the Kiro two-round tool test in ${result.latencyMs ?? 0} ms.`)
+          : t(`“${provider.name}”真实生成测试通过，耗时 ${result.latencyMs ?? 0} ms。`, `“${provider.name}” passed the real generation test in ${result.latencyMs ?? 0} ms.`)
         : t(`“${provider.name}”测试未通过：${resultError}`, `“${provider.name}” failed the test: ${resultError}`))
     } catch (cause) {
       const detail = localizeBackendError(cause, language, t('未知错误', 'Unknown error'))
@@ -1274,7 +1338,7 @@ export function ProvidersView({
     event.preventDefault()
     const nextErrors: Record<string, string> = {}
     const existingAccount = accountDraft.id
-      ? snapshot.accounts.find((account) => account.id === accountDraft.id)
+      ? accountById.get(accountDraft.id)
       : undefined
     if (!accountDraft.providerId) nextErrors.providerId = t('请选择供应商', 'Select a provider.')
     if (!accountDraft.name.trim()) nextErrors.name = t('请输入账号名称', 'Enter an account name.')
@@ -1482,7 +1546,6 @@ export function ProvidersView({
       }
       oauthSessionIdRef.current = session.sessionId
       setOauthSession(session)
-      setOauthNow(Date.now())
       setOauthStage('waiting')
       void waitForChatGptOAuth(session, attempt)
       await openOAuthInSystemBrowser(session)
@@ -1670,6 +1733,7 @@ export function ProvidersView({
     const oauthIds = new Set(oauthAccounts.map((account) => account.id))
     const alreadySelected = selectedAccountIds.filter((id) => oauthIds.has(id))
     setExportAccountIds(alreadySelected.length ? alreadySelected : [...oauthIds])
+    setExportAccountPage(0)
     setExportNotice('')
     setErrors({})
     setExportOpen(true)
@@ -1711,7 +1775,7 @@ export function ProvidersView({
     }
   }
 
-  const selectedAccounts = snapshot.accounts.filter((account) => selectedAccountIds.includes(account.id))
+  const selectedAccounts = snapshot.accounts.filter((account) => selectedAccountIdSet.has(account.id))
   const selectedVisibleIds = new Set(visibleAccounts.map((account) => account.id))
   const selectedAccountSummary = accountSelectionSummary(selectedAccounts, selectedVisibleIds)
 
@@ -1758,13 +1822,13 @@ export function ProvidersView({
             <>
               <div className="table-toolbar account-table-toolbar">
                 <div className="account-toolbar-summary">
-                  <label className="account-quota-filter"><input type="checkbox" checked={hideExhaustedAccounts} onChange={(event) => setHideExhaustedAccounts(event.target.checked)} /><span>{t('隐藏额度耗尽账号', 'Hide quota-exhausted accounts')}</span><small>{exhaustedAccountCount ? t(`${exhaustedAccountCount} 个`, `${exhaustedAccountCount}`) : t('暂无', 'None')}</small></label>
+                  <label className="account-quota-filter"><input type="checkbox" checked={hideExhaustedAccounts} onChange={(event) => { setHideExhaustedAccounts(event.target.checked); setAccountPage(0) }} /><span>{t('隐藏额度耗尽账号', 'Hide quota-exhausted accounts')}</span><small>{exhaustedAccountCount ? t(`${exhaustedAccountCount} 个`, `${exhaustedAccountCount}`) : t('暂无', 'None')}</small></label>
                   <strong>{t(`已选择 ${selectedAccountIds.length} 个`, `${selectedAccountIds.length} selected`)}</strong>
                 </div>
                 {accountFamily === 'openai' && <div className="account-tag-filter" aria-label={t('按 Tag 筛选账号', 'Filter accounts by tag')}>
-                  <button type="button" className={tagFilter === 'all' ? 'active' : ''} onClick={() => setTagFilter('all')}>{t('全部', 'All')} <span>{oauthAccounts.length}</span></button>
-                  <button type="button" className={tagFilter === 'untagged' ? 'active' : ''} onClick={() => setTagFilter(tagFilter === 'untagged' ? 'all' : 'untagged')}>{t('未标记', 'Untagged')} <span>{oauthAccounts.filter((account) => !account.tagId).length}</span></button>
-                  {snapshot.accountTags.map((tag) => <button type="button" key={tag.id} className={tagFilter === tag.id ? 'active' : ''} onClick={() => setTagFilter(tagFilter === tag.id ? 'all' : tag.id)}>{tag.name} <span>{oauthAccounts.filter((account) => account.tagId === tag.id).length}</span></button>)}
+                  <button type="button" className={tagFilter === 'all' ? 'active' : ''} onClick={() => selectTagFilter('all')}>{t('全部', 'All')} <span>{oauthAccounts.length}</span></button>
+                  <button type="button" className={tagFilter === 'untagged' ? 'active' : ''} onClick={() => selectTagFilter(tagFilter === 'untagged' ? 'all' : 'untagged')}>{t('未标记', 'Untagged')} <span>{accountTagCounts.get('untagged') ?? 0}</span></button>
+                  {snapshot.accountTags.map((tag) => <button type="button" key={tag.id} className={tagFilter === tag.id ? 'active' : ''} onClick={() => selectTagFilter(tagFilter === tag.id ? 'all' : tag.id)}>{tag.name} <span>{accountTagCounts.get(tag.id) ?? 0}</span></button>)}
                 </div>}
                 <div className="account-selection-actions" aria-label={t('按条件选择账号', 'Select accounts by condition')}>
                   <button type="button" onClick={() => selectAccounts(() => true)}>{t('全选', 'Select all')}</button>
@@ -1782,15 +1846,15 @@ export function ProvidersView({
                   <button className="button button--secondary" type="button" disabled={checkingAllAccounts || !visibleAccounts.length} onClick={() => void checkAllAccounts()}>{checkingAllAccounts ? <LoaderCircle size={16} className="spin" /> : <RefreshCw size={16} />}{checkingAllAccounts ? t('正在检测…', 'Checking…') : t('检测全部', 'Check all')}</button>
                 </div>
               </div>
-              {visibleAccounts.length ? <div className="table-wrap">
+              {visibleAccounts.length ? <><div className="table-wrap">
               <table className="data-table accounts-table" style={{ width: accountTableWidth, minWidth: '100%' }}>
                 <colgroup>{ACCOUNT_COLUMNS.map((column) => <col key={column.id} style={{ width: accountColumnWidths[column.id] }} />)}</colgroup>
                 <thead><tr>
-                  <th className="account-select-column account-column-header"><input type="checkbox" aria-label={t('选择当前显示的全部账号', 'Select all currently visible accounts')} checked={visibleAccounts.length > 0 && visibleAccounts.every((account) => selectedAccountIds.includes(account.id))} onChange={(event) => toggleVisibleAccounts(event.target.checked)} /></th>
+                  <th className="account-select-column account-column-header"><input type="checkbox" aria-label={t('选择当前筛选的全部账号', 'Select all currently filtered accounts')} checked={visibleAccounts.length > 0 && visibleAccounts.every((account) => selectedAccountIdSet.has(account.id))} onChange={(event) => toggleVisibleAccounts(event.target.checked)} /></th>
                   {ACCOUNT_COLUMNS.slice(1).map((column) => <th className="account-column-header" key={column.id} aria-label={column.id === 'actions' ? t(column.label, ACCOUNT_COLUMN_LABELS_EN[column.id]) : undefined}>{column.id === 'actions' ? null : t(column.label, ACCOUNT_COLUMN_LABELS_EN[column.id])}{accountColumnResizer(column)}</th>)}
                 </tr></thead>
                 <tbody>
-                  {visibleAccounts.map((account) => {
+                  {visibleAccountPage.items.map((account) => {
                     const provider = providerById.get(account.providerId)
                     const checking = checkingAllAccounts || busyKeys.has(`check-${account.id}`) || account.status === 'checking'
                     const refreshingModels = busyKeys.has(`refresh-account-models-${account.id}`)
@@ -1810,7 +1874,7 @@ export function ProvidersView({
                       : undefined
                     return (
                       <tr key={account.id}>
-                        <td className="account-select-column"><input type="checkbox" aria-label={t(`选择账号 ${account.name}`, `Select account ${account.name}`)} checked={selectedAccountIds.includes(account.id)} onChange={() => toggleSelectedAccount(account.id)} /></td>
+                        <td className="account-select-column"><input type="checkbox" aria-label={t(`选择账号 ${account.name}`, `Select account ${account.name}`)} checked={selectedAccountIdSet.has(account.id)} onChange={() => toggleSelectedAccount(account.id)} /></td>
                         <td><div className="provider-cell"><ProviderAvatar kind={provider?.kind} name={provider?.name} color={provider?.color} /><div><strong title={account.name}>{accountNameById.get(account.id) ?? account.name}</strong><span>{provider?.name ?? t('供应商已删除', 'Provider deleted')}{account.proxyId ? ` · ${proxyById.get(account.proxyId)?.name ?? t('代理已删除', 'Proxy deleted')}` : ''} · {modelSummary}</span></div></div></td>
                         <td>{account.tagId && tagById.has(account.tagId) ? <span className="account-tag-chip"><Tag size={12} />{tagById.get(account.tagId)?.name}</span> : <span className="muted">{t('未标记', 'Untagged')}</span>}</td>
                         <td><AccountStatusBadge status={account.status} circuitState={account.circuitState} /><CooldownCountdown account={account} />{(account.credentialType === 'chatgpt-oauth' || account.credentialType === 'chatgpt-agent-identity' || account.credentialType === 'grok-oauth') && <span className="row-note">{account.credentialType === 'chatgpt-agent-identity' ? 'Agent Identity' : account.credentialType === 'grok-oauth' ? 'Grok OAuth' : 'ChatGPT OAuth'} · {account.renewable ? t('可续期', 'Renewable') : t('会话到期即停用', 'Disabled when the session expires')}</span>}{provider?.kind === 'xai' && account.credentialType !== 'grok-oauth' && <span className="row-note">xAI API Key</span>}{Boolean(account.consecutiveFailures) && <span className="row-note">{t('连续失败', 'Consecutive failures')} {account.consecutiveFailures}</span>}{account.lastError && <span className="row-note row-note--danger" title={localizeBackendMessage(account.lastError, language, t('账号检测失败', 'Account check failed.'))}>{localizeBackendMessage(account.lastError, language, t('账号检测失败', 'Account check failed.'))}</span>}</td>
@@ -1832,7 +1896,20 @@ export function ProvidersView({
                   })}
                 </tbody>
               </table>
-              </div> : <div className="account-filter-empty"><CheckCircle2 size={22} /><strong>{t('当前筛选下没有账号', 'No accounts match the current filters')}</strong><span>{t('更换 Tag 筛选或取消“隐藏额度耗尽账号”后再试。', 'Change the tag filter or turn off “Hide quota-exhausted accounts.”')}</span></div>}
+              </div>
+              {visibleAccountPage.pageCount > 1 && <footer className="table-footer request-log-footer">
+                <span>{t(
+                  `显示 ${visibleAccountPage.start}–${visibleAccountPage.end} / ${visibleAccountPage.total} 个筛选账号`,
+                  `Showing ${visibleAccountPage.start}–${visibleAccountPage.end} of ${visibleAccountPage.total} filtered accounts`,
+                )}</span>
+                <div className="filter-group" aria-label={t('账号分页', 'Account pagination')}>
+                  <button className="text-button" type="button" disabled={visibleAccountPage.page === 0} onClick={() => setAccountPage((page) => page - 1)}>{t('上一页', 'Previous')}</button>
+                  <span>{visibleAccountPage.page + 1} / {visibleAccountPage.pageCount}</span>
+                  <button className="text-button" type="button" disabled={visibleAccountPage.page + 1 >= visibleAccountPage.pageCount} onClick={() => setAccountPage((page) => page + 1)}>{t('下一页', 'Next')}</button>
+                </div>
+                <span>{t('全选、检测与批量操作仍作用于完整筛选结果', 'Select-all, checks, and bulk actions still apply to the complete filtered result')}</span>
+              </footer>}
+              </> : <div className="account-filter-empty"><CheckCircle2 size={22} /><strong>{t('当前筛选下没有账号', 'No accounts match the current filters')}</strong><span>{t('更换 Tag 筛选或取消“隐藏额度耗尽账号”后再试。', 'Change the tag filter or turn off “Hide quota-exhausted accounts.”')}</span></div>}
             </>
           ) : (
             <EmptyState
@@ -1852,15 +1929,17 @@ export function ProvidersView({
               const sourceAccount = snapshot.accounts.find((account) => account.providerId === provider.id
                 && account.credentialType !== 'chatgpt-oauth'
                 && account.credentialType !== 'chatgpt-agent-identity')
+              const claudeToolchainUnverified = anthropicRelayNeedsClaudeToolchainWarning(provider)
               return (
                 <article className="provider-card" key={provider.id}>
                   <div className="provider-card__top">
                     <ProviderAvatar kind={provider.kind} name={provider.name} color={provider.color} large />
                     <div><h2>{provider.name}</h2><span>{t(providerKindLabelsZh[provider.kind], providerKindLabelsEn[provider.kind])}</span></div>
-                    <OverflowMenu open={menuOpen === provider.id} onOpenChange={(open) => setMenuOpen(open ? provider.id : null)} label={t('来源操作', 'Source actions')}><button type="button" disabled={testingSourceId === provider.id || !sourceAccount} onClick={() => void testSavedSource(provider, sourceAccount)}>{testingSourceId === provider.id ? <LoaderCircle size={15} className="spin" /> : <RefreshCw size={15} />}{t('测试', 'Test')}</button><button type="button" onClick={() => openProvider(provider.sourceType === 'relay' ? 'relay' : 'official-api', provider)}><Edit3 size={15} />{t('编辑', 'Edit')}</button><button type="button" onClick={() => copySourceConfiguration(provider, sourceAccount)}><Copy size={15} />{t('复制配置', 'Copy configuration')}</button><button className="danger" type="button" onClick={() => { setDeleteTarget({ kind: 'provider', id: provider.id, name: provider.name }); setMenuOpen(null) }}><Trash2 size={15} />{t('删除', 'Delete')}</button></OverflowMenu>
+                    <OverflowMenu open={menuOpen === provider.id} onOpenChange={(open) => setMenuOpen(open ? provider.id : null)} label={t('来源操作', 'Source actions')}><button type="button" disabled={testingSourceId === provider.id || !sourceAccount} onClick={() => void testSavedSource(provider, sourceAccount)}>{testingSourceId === provider.id ? <LoaderCircle size={15} className="spin" /> : <RefreshCw size={15} />}{provider.protocol === 'kiro-claude' ? t('测试 Kiro 工具链', 'Test Kiro tool chain') : isAnthropicCompatibleRelay(provider) ? t('测试 Claude 工具链', 'Test Claude tool chain') : t('测试', 'Test')}</button><button type="button" onClick={() => openProvider(provider.sourceType === 'relay' ? 'relay' : 'official-api', provider)}><Edit3 size={15} />{t('编辑', 'Edit')}</button><button type="button" onClick={() => copySourceConfiguration(provider, sourceAccount)}><Copy size={15} />{t('复制配置', 'Copy configuration')}</button><button className="danger" type="button" onClick={() => { setDeleteTarget({ kind: 'provider', id: provider.id, name: provider.name }); setMenuOpen(null) }}><Trash2 size={15} />{t('删除', 'Delete')}</button></OverflowMenu>
                   </div>
-                  <div className="provider-card__endpoint"><span>{t('基础地址', 'Base URL')}</span><code>{provider.baseUrl}</code></div>
-                  <div className="provider-card__meta"><Badge tone="info">{protocolLabels[provider.protocol]}</Badge><span><KeyRound size={14} />{sourceAccount?.maskedCredential ?? t('凭据待完善', 'Credential required')}</span><span><Boxes size={14} />{t(`${provider.models.length} 个模型`, `${provider.models.length} ${provider.models.length === 1 ? 'model' : 'models'}`)}</span>{provider.capabilityProfile?.checkedAt && <Badge tone="success">{t('能力已探测', 'Capabilities probed')}</Badge>}</div>
+                  <div className="provider-card__endpoint"><span>{provider.protocol === 'kiro-claude' ? t('完整端点', 'Full endpoint') : t('基础地址', 'Base URL')}</span><code>{provider.baseUrl}</code></div>
+                  <div className="provider-card__meta"><Badge tone="info">{protocolLabels[provider.protocol]}</Badge><span><KeyRound size={14} />{sourceAccount?.maskedCredential ?? t('凭据待完善', 'Credential required')}</span><span><Boxes size={14} />{t(`${provider.models.length} 个模型`, `${provider.models.length} ${provider.models.length === 1 ? 'model' : 'models'}`)}</span>{provider.protocol === 'kiro-claude' ? <Badge tone={hasVerifiedKiroToolBridge(provider) ? 'success' : 'warning'}>{hasVerifiedKiroToolBridge(provider) ? t('工具链已验证', 'Tool chain verified') : t('待工具验证', 'Tool verification required')}</Badge> : isAnthropicCompatibleRelay(provider) ? <Badge tone={claudeToolchainUnverified ? 'warning' : 'success'}>{claudeToolchainUnverified ? t('Claude 工具待验证', 'Claude tools unverified') : t('Claude 工具链已验证', 'Claude tool chain verified')}</Badge> : provider.capabilityProfile?.checkedAt && <Badge tone="success">{t('能力已探测', 'Capabilities probed')}</Badge>}</div>
+                  {claudeToolchainUnverified && <div className="claude-toolchain-warning"><CircleAlert size={15} /><span>{t(CLAUDE_TOOLCHAIN_UNVERIFIED_COPY.zh, CLAUDE_TOOLCHAIN_UNVERIFIED_COPY.en)}</span></div>}
                   {sourceAccount && <div className="provider-source-health"><AccountStatusBadge status={sourceAccount.status} circuitState={sourceAccount.circuitState} /><span>{t('并发', 'Concurrency')} {sourceAccount.inFlight} / {sourceAccount.maxConcurrency}</span><span>{t('权重', 'Weight')} {sourceAccount.weight}</span>{sourceAccount.latencyMs !== undefined && <span>{durationLabel(sourceAccount.latencyMs)}</span>}</div>}
                   <div className="model-tags">
                     {provider.models.slice(0, 3).map((model) => <span key={model}>{model}</span>)}
@@ -1873,8 +1952,11 @@ export function ProvidersView({
             {tab === 'relays' && aggregateRelays.map((pool) => {
               const members = pool.members
                 .filter((member) => member.enabled)
-                .map((member) => snapshot.accounts.find((account) => account.id === member.accountId))
+                .map((member) => accountById.get(member.accountId))
                 .filter((account) => account !== undefined)
+              const claudeToolchainUnverified = members.some((account) => (
+                anthropicRelayNeedsClaudeToolchainWarning(providerById.get(account.providerId))
+              ))
               return <article className="provider-card aggregate-relay-card" key={pool.id}>
                 <div className="provider-card__top">
                   <span className="provider-avatar provider-avatar--large aggregate-relay-card__icon"><Boxes size={18} /></span>
@@ -1883,6 +1965,7 @@ export function ProvidersView({
                 </div>
                 <div className="provider-card__endpoint"><span>{t('成员顺序', 'Member order')}</span><code>{members.map((account) => account.name).join(' → ') || t('暂无成员', 'No members')}</code></div>
                 <div className="provider-card__meta"><Badge tone="info">{protocolLabels[pool.protocol]}</Badge><span><KeyRound size={14} />{t(`${members.length} 个 API 来源`, `${members.length} API ${members.length === 1 ? 'source' : 'sources'}`)}</span><span>{t(`重试 ${pool.maxRetries} 次`, `${pool.maxRetries} ${pool.maxRetries === 1 ? 'retry' : 'retries'}`)}</span></div>
+                {claudeToolchainUnverified && <div className="claude-toolchain-warning"><CircleAlert size={15} /><span>{t(CLAUDE_TOOLCHAIN_UNVERIFIED_COPY.zh, CLAUDE_TOOLCHAIN_UNVERIFIED_COPY.en)}</span></div>}
                 <div className="model-tags">{members.slice(0, 4).map((account) => <span key={account.id}>{account.name} · {t('权重', 'Weight')} {pool.members.find((member) => member.accountId === account.id)?.weight ?? account.weight}</span>)}{members.length > 4 && <span>+{members.length - 4}</span>}</div>
               </article>
             })}
@@ -1918,12 +2001,24 @@ export function ProvidersView({
             <button type="button" disabled={!exportAccountIds.length} onClick={() => setExportAccountIds([])}>{t('清空', 'Clear')}</button>
           </div>
           <div className="account-export__list">
-            {oauthAccounts.map((account) => {
+            {exportAccountPageState.items.map((account) => {
               const provider = providerById.get(account.providerId)
-              const selected = exportAccountIds.includes(account.id)
+              const selected = exportAccountIdSet.has(account.id)
               return <label className={selected ? 'selected' : ''} key={account.id}><input type="checkbox" checked={selected} onChange={() => toggleExportAccount(account.id)} /><ProviderAvatar kind={provider?.kind} name={provider?.name} color={provider?.color} /><span><strong title={account.name}>{accountNameById.get(account.id) ?? account.name}</strong><small>{provider?.name ?? t('供应商已删除', 'Provider deleted')} · {accountIsCooling(account) ? t('冷却中', 'Cooling down') : t('非冷却', 'Not cooling')} · {account.renewable ? t('可续期', 'Renewable') : 'Access Token only'}</small></span><AccountStatusBadge status={account.status} circuitState={account.circuitState} /></label>
             })}
           </div>
+          {exportAccountPageState.pageCount > 1 && <footer className="table-footer request-log-footer">
+            <span>{t(
+              `显示 ${exportAccountPageState.start}–${exportAccountPageState.end} / ${exportAccountPageState.total} 个账号`,
+              `Showing ${exportAccountPageState.start}–${exportAccountPageState.end} of ${exportAccountPageState.total} accounts`,
+            )}</span>
+            <div className="filter-group" aria-label={t('导出账号分页', 'Export account pagination')}>
+              <button className="text-button" type="button" disabled={exportAccountPageState.page === 0} onClick={() => setExportAccountPage((page) => page - 1)}>{t('上一页', 'Previous')}</button>
+              <span>{exportAccountPageState.page + 1} / {exportAccountPageState.pageCount}</span>
+              <button className="text-button" type="button" disabled={exportAccountPageState.page + 1 >= exportAccountPageState.pageCount} onClick={() => setExportAccountPage((page) => page + 1)}>{t('下一页', 'Next')}</button>
+            </div>
+            <span>{t(`已选择 ${exportAccountIds.length} 个`, `${exportAccountIds.length} selected`)}</span>
+          </footer>}
           <FieldError>{errors.accountExport}</FieldError>
         </div>
       </Modal>
@@ -2021,7 +2116,7 @@ export function ProvidersView({
               <div className="oauth-account-flow__status-heading"><div><span className="oauth-pulse"><span /></span><div><h3>{oauthStage === 'exchanging' ? t('正在交换 Token 并检测账号', 'Exchanging tokens and checking the account') : oauthStage === 'submitting' ? t('正在提交回调地址', 'Submitting callback URL') : t('等待 OpenAI 授权回调', 'Waiting for the OpenAI authorization callback')}</h3><p>{oauthStage === 'exchanging' ? t('回调已接收，请保持此窗口开启。', 'Callback received. Keep this window open.') : t('请在系统浏览器完成登录与授权。', 'Complete sign-in and authorization in your system browser.')}</p></div></div><Badge tone={oauthSession.loopbackListening ? 'success' : 'warning'}>{oauthSession.loopbackListening ? t('自动回调监听中', 'Listening for automatic callback') : t('需要手动回调', 'Manual callback required')}</Badge></div>
               <div className="oauth-session-status">
                 <span><Link2 size={14} /><strong>{oauthSession.loopbackListening ? t('本机回调已就绪', 'Local callback ready') : t('本机端口不可用', 'Local port unavailable')}</strong><small>{oauthSession.redirectUri}</small></span>
-                <span><Clock3 size={14} /><strong>{oauthExpiresInSeconds > 0 ? `${Math.floor(oauthExpiresInSeconds / 60)}:${String(oauthExpiresInSeconds % 60).padStart(2, '0')}` : t('即将过期', 'Expiring soon')}</strong><small>{t('授权会话剩余时间', 'Authorization session time remaining')}</small></span>
+                <span><Clock3 size={14} /><OAuthExpiryCountdown expiresAt={oauthSession.expiresAt} /><small>{t('授权会话剩余时间', 'Authorization session time remaining')}</small></span>
               </div>
               <div className="oauth-authorization-link"><span>{t('授权链接', 'Authorization link')}</span><div><input className="mono" readOnly value={oauthSession.authorizationUrl} aria-label={t('OpenAI OAuth 授权链接', 'OpenAI OAuth authorization link')} /><button className="icon-button" type="button" aria-label={t('复制 OAuth 授权链接', 'Copy OAuth authorization link')} title={t('复制授权链接', 'Copy authorization link')} onClick={() => void copyOAuthAuthorizationUrl()}>{oauthCopied ? <CheckCircle2 size={16} /> : <Copy size={16} />}</button></div></div>
               <div className="oauth-account-flow__actions"><button className="button button--primary" type="button" disabled={oauthOpenBusy || oauthStage === 'exchanging'} onClick={() => void openOAuthInSystemBrowser()}>{oauthOpenBusy ? <LoaderCircle size={16} className="spin" /> : <ExternalLink size={16} />}{t('在系统浏览器中打开', 'Open in system browser')}</button><button className="button button--secondary" type="button" onClick={() => void copyOAuthAuthorizationUrl()}><Copy size={16} />{t('复制链接', 'Copy link')}</button></div>
@@ -2073,12 +2168,14 @@ export function ProvidersView({
 
       <Modal
         open={providerModal}
-        title={providerDraft.kind === 'xai'
+        title={providerDraft.kind === KIRO_COMPATIBLE_KIND
+          ? providerDraft.id ? t('编辑 Kiro Claude 中转', 'Edit Kiro Claude relay') : t('添加 Kiro Claude 中转', 'Add Kiro Claude relay')
+          : providerDraft.kind === 'xai'
           ? providerDraft.id ? t('编辑 Grok 凭据', 'Edit Grok credential') : t('添加 Grok 凭据', 'Add Grok credential')
           : providerDraft.id ? (providerDraft.sourceType === 'official-api' ? t('编辑官方 API', 'Edit official API') : t('编辑中转站', 'Edit relay')) : (providerDraft.sourceType === 'official-api' ? t('添加官方 API', 'Add official API') : t('添加中转站', 'Add relay'))}
         onClose={closeProvider}
         width="large"
-        footer={<><button type="button" className="button button--secondary" onClick={closeProvider}>{t('取消', 'Cancel')}</button><button type="button" className="button button--secondary" disabled={providerProbeBusy} onClick={() => void probeProvider()}>{providerProbeBusy ? <LoaderCircle size={16} className="spin" /> : <RefreshCw size={16} />}{t('测试连接', 'Test connection')}</button><button type="submit" form="provider-form" className="button button--primary" disabled={providerProbeBusy || busyKeys.has('save-api-source')}>{busyKeys.has('save-api-source') ? <LoaderCircle size={16} className="spin" /> : <CheckCircle2 size={16} />}{t('保存来源', 'Save source')}</button></>}
+        footer={<><button type="button" className="button button--secondary" onClick={closeProvider}>{t('取消', 'Cancel')}</button><button type="button" className="button button--secondary" disabled={providerProbeBusy} onClick={() => void probeProvider()}>{providerProbeBusy ? <LoaderCircle size={16} className="spin" /> : <RefreshCw size={16} />}{providerDraft.kind === KIRO_COMPATIBLE_KIND ? t('测试 Kiro 工具链', 'Test Kiro tool chain') : isAnthropicCompatibleRelay(providerDraft) ? t('测试 Claude 工具链', 'Test Claude tool chain') : t('测试连接', 'Test connection')}</button><button type="submit" form="provider-form" className="button button--primary" disabled={providerProbeBusy || busyKeys.has('save-api-source')}>{busyKeys.has('save-api-source') ? <LoaderCircle size={16} className="spin" /> : <CheckCircle2 size={16} />}{t('保存来源', 'Save source')}</button></>}
       >
         <form id="provider-form" onSubmit={(event) => void submitProvider(event)}><ApiSourceForm draft={providerDraft} setDraft={updateProviderDraft} proxies={snapshot.proxies} proxyInterlocked={builtInProxyInterlocked} errors={errors} /></form>
         {(providerProbe || errors.sourceProbe) && <div className={`source-probe-result ${providerProbe?.ok ? 'source-probe-result--ok' : 'source-probe-result--error'}`}>
@@ -2113,7 +2210,7 @@ export function ProvidersView({
       >
         <form id="aggregate-relay-form" className="form-grid" onSubmit={(event) => void submitAggregateRelay(event)}>
           <label className="field"><span>{t('显示名称', 'Display name')}</span><input autoFocus value={aggregateDraft.name} onChange={(event) => setAggregateDraft({ ...aggregateDraft, name: event.target.value })} placeholder={t('例如：Codex 多线路', 'e.g. Multi-route Codex')} /><FieldError>{errors.aggregateName}</FieldError></label>
-          <label className="field"><span>{t('对外协议', 'Public protocol')}</span><select value={aggregateDraft.protocol} onChange={(event) => { const protocol = event.target.value as Protocol; setAggregateDraft({ ...aggregateDraft, protocol, members: aggregateDraft.members.filter((member) => providerById.get(snapshot.accounts.find((account) => account.id === member.accountId)?.providerId ?? '')?.protocol === protocol) }) }}>{aggregateProtocols.map((protocol) => <option key={protocol} value={protocol}>{protocolLabels[protocol]}</option>)}</select></label>
+          <label className="field"><span>{t('对外协议', 'Public protocol')}</span><select value={aggregateDraft.protocol} onChange={(event) => { const protocol = event.target.value as Protocol; setAggregateDraft({ ...aggregateDraft, protocol, stickySessions: protocol === 'kiro-claude' ? true : aggregateDraft.stickySessions, members: aggregateDraft.members.filter((member) => providerById.get(accountById.get(member.accountId)?.providerId ?? '')?.protocol === protocol) }) }}>{aggregateProtocols.map((protocol) => <option key={protocol} value={protocol}>{protocolLabels[protocol]}</option>)}</select></label>
           <div className="field field--full"><span>{t('调度策略', 'Scheduling strategy')}</span><div className="aggregate-strategy-grid">
             {([
               ['priority', '故障转移', 'Failover', '按成员顺序使用，失败时切换下一条', 'Use members in order and switch to the next after a failure'],
@@ -2128,8 +2225,9 @@ export function ProvidersView({
                 if (account.credentialType === 'chatgpt-oauth' || account.credentialType === 'chatgpt-agent-identity' || account.credentialType === 'grok-oauth') return false
                 const provider = providerById.get(account.providerId)
                 if (!provider || (provider.sourceType !== 'official-api' && provider.sourceType !== 'relay') || provider.protocol !== aggregateDraft.protocol) return false
+                if (aggregateDraft.protocol === 'kiro-claude' && !hasVerifiedKiroToolBridge(provider)) return false
                 const selectedProviders = aggregateDraft.members.flatMap((member) => {
-                  const selectedAccount = snapshot.accounts.find((candidate) => candidate.id === member.accountId)
+                  const selectedAccount = accountById.get(member.accountId)
                   const selectedProvider = providerById.get(selectedAccount?.providerId ?? '')
                   return selectedProvider ? [selectedProvider] : []
                 })
@@ -2151,7 +2249,7 @@ export function ProvidersView({
           </div>
           <label className="field"><span>{t('失败重试次数', 'Failure retries')}</span><input type="number" min={0} max={10} value={aggregateDraft.maxRetries} onChange={(event) => setAggregateDraft({ ...aggregateDraft, maxRetries: Number(event.target.value) })} /></label>
           <label className="field"><span>{t('默认代理', 'Default proxy')}</span><select value={aggregateDraft.proxyId ?? ''} disabled={builtInProxyInterlocked} onChange={(event) => setAggregateDraft({ ...aggregateDraft, proxyId: event.target.value })}><option value="">{t('直连', 'Direct')}</option>{snapshot.proxies.map((proxy) => <option key={proxy.id} value={proxy.id}>{proxy.name}</option>)}</select>{builtInProxyInterlocked && <small>{t(BUILT_IN_PROXY_BINDING_NOTICE.zh, BUILT_IN_PROXY_BINDING_NOTICE.en)}</small>}</label>
-          <div className="field field--full inline-settings"><div><strong>{t('会话粘性', 'Session stickiness')}<InfoTip text={t('同一会话优先复用已分配来源，减少上下文和缓存命中波动。', 'Prefer the assigned source for the same session to reduce context and cache-hit variability.')} /></strong></div><button className={`toggle ${aggregateDraft.stickySessions ? 'toggle--on' : ''}`} role="switch" aria-label={t('会话粘性', 'Session stickiness')} aria-checked={aggregateDraft.stickySessions} type="button" onClick={() => setAggregateDraft({ ...aggregateDraft, stickySessions: !aggregateDraft.stickySessions })}><span /></button></div>
+          <div className="field field--full inline-settings"><div><strong>{t('会话粘性', 'Session stickiness')}<InfoTip text={aggregateDraft.protocol === 'kiro-claude' ? t('Kiro Claude 聚合强制按 Claude 会话粘滞，避免工具历史跨中转错配。', 'Kiro Claude aggregates are always sticky by Claude session to prevent tool history from crossing relays.') : t('同一会话优先复用已分配来源，减少上下文和缓存命中波动。', 'Prefer the assigned source for the same session to reduce context and cache-hit variability.')} /></strong></div><button className={`toggle ${aggregateDraft.stickySessions ? 'toggle--on' : ''}`} role="switch" aria-label={t('会话粘性', 'Session stickiness')} aria-checked={aggregateDraft.stickySessions} disabled={aggregateDraft.protocol === 'kiro-claude'} type="button" onClick={() => setAggregateDraft({ ...aggregateDraft, stickySessions: !aggregateDraft.stickySessions })}><span /></button></div>
           <div className="field field--full inline-settings"><div><strong>{t('额度保护线', 'Quota reserve guard')}</strong></div><button className={`toggle ${aggregateDraft.quotaProtection ? 'toggle--on' : ''}`} role="switch" aria-checked={Boolean(aggregateDraft.quotaProtection)} type="button" onClick={() => setAggregateDraft({ ...aggregateDraft, quotaProtection: aggregateDraft.quotaProtection ? undefined : { fiveHourRemainingPercent: 10, sevenDayRemainingPercent: 10, unavailableBehavior: 'allow', staleAfterMinutes: 15 } })}><span /></button></div>
           {aggregateDraft.quotaProtection && <><label className="field"><span>{t('5 小时最低保留（%）', '5-hour reserve (%)')}</span><input type="number" min={0} max={100} value={aggregateDraft.quotaProtection.fiveHourRemainingPercent ?? ''} onChange={(event) => setAggregateDraft({ ...aggregateDraft, quotaProtection: { ...aggregateDraft.quotaProtection!, fiveHourRemainingPercent: event.target.value === '' ? undefined : Number(event.target.value) } })} /></label><label className="field"><span>{t('周额度最低保留（%）', 'Weekly reserve (%)')}</span><input type="number" min={0} max={100} value={aggregateDraft.quotaProtection.sevenDayRemainingPercent ?? ''} onChange={(event) => setAggregateDraft({ ...aggregateDraft, quotaProtection: { ...aggregateDraft.quotaProtection!, sevenDayRemainingPercent: event.target.value === '' ? undefined : Number(event.target.value) } })} /></label><label className="field"><span>{t('额度未知或过期', 'Unknown or stale quota')}</span><select value={aggregateDraft.quotaProtection.unavailableBehavior ?? 'allow'} onChange={(event) => setAggregateDraft({ ...aggregateDraft, quotaProtection: { ...aggregateDraft.quotaProtection!, unavailableBehavior: event.target.value as 'allow' | 'block' } })}><option value="allow">{t('继续调度', 'Continue scheduling')}</option><option value="block">{t('保守停用', 'Block conservatively')}</option></select></label><label className="field"><span>{t('快照有效期（分钟）', 'Snapshot validity (minutes)')}</span><input type="number" min={1} max={10080} value={aggregateDraft.quotaProtection.staleAfterMinutes ?? ''} onChange={(event) => setAggregateDraft({ ...aggregateDraft, quotaProtection: { ...aggregateDraft.quotaProtection!, staleAfterMinutes: event.target.value === '' ? undefined : Number(event.target.value) } })} /></label></>}
           {aggregateDraft.stickySessions && <label className="field"><span>{t('粘性时长（分钟）', 'Stickiness duration (minutes)')}</span><input type="number" min={1} max={1440} value={aggregateDraft.stickyTtlMinutes} onChange={(event) => setAggregateDraft({ ...aggregateDraft, stickyTtlMinutes: Number(event.target.value) })} /></label>}
@@ -2168,7 +2266,7 @@ export function ProvidersView({
         <div className="tag-manager">
           <div className="tag-manager__create"><input autoFocus maxLength={24} value={tagDraft.name} onChange={(event) => setTagDraft({ ...tagDraft, name: event.target.value })} placeholder={tagDraft.id ? t('输入新名称', 'Enter a new name') : t('新建 Tag（最多 24 字符）', 'New tag (up to 24 characters)')} /><button className="button button--primary" type="button" disabled={!tagDraft.name.trim() || busyKeys.has('save-account-tag')} onClick={() => void saveTag()}>{tagDraft.id ? t('保存改名', 'Save rename') : t('新建 Tag', 'New tag')}</button>{tagDraft.id && <button className="button button--secondary" type="button" onClick={() => setTagDraft({ name: '' })}>{t('取消编辑', 'Cancel editing')}</button>}</div>
           <div className="tag-manager__list">
-            {snapshot.accountTags.map((tag) => <div key={tag.id}><span className="account-tag-chip"><Tag size={12} />{tag.name}</span><span>{t(`${oauthAccounts.filter((account) => account.tagId === tag.id).length} 个账号`, `${oauthAccounts.filter((account) => account.tagId === tag.id).length} accounts`)}</span><button className="icon-button" type="button" title={t('改名', 'Rename')} onClick={() => setTagDraft({ id: tag.id, name: tag.name })}><Edit3 size={15} /></button><button className="icon-button icon-button--danger" type="button" title={t('删除', 'Delete')} onClick={() => setTagDeleteTarget(tag)}><Trash2 size={15} /></button></div>)}
+            {snapshot.accountTags.map((tag) => <div key={tag.id}><span className="account-tag-chip"><Tag size={12} />{tag.name}</span><span>{t(`${accountTagCounts.get(tag.id) ?? 0} 个账号`, `${accountTagCounts.get(tag.id) ?? 0} accounts`)}</span><button className="icon-button" type="button" title={t('改名', 'Rename')} onClick={() => setTagDraft({ id: tag.id, name: tag.name })}><Edit3 size={15} /></button><button className="icon-button icon-button--danger" type="button" title={t('删除', 'Delete')} onClick={() => setTagDeleteTarget(tag)}><Trash2 size={15} /></button></div>)}
             {!snapshot.accountTags.length && <div className="muted">{t('尚未创建 Tag', 'No tags created yet')}</div>}
           </div>
         </div>
@@ -2181,7 +2279,7 @@ export function ProvidersView({
         onClose={() => setTagAssignmentOpen(false)}
         footer={<button className="button button--secondary" type="button" onClick={() => setTagAssignmentOpen(false)}>{t('取消', 'Cancel')}</button>}
       >
-        <div className="tag-assignment-grid"><button type="button" onClick={() => void assignSelectedTag(null)}><span className="muted">—</span><strong>{t('未标记', 'Untagged')}</strong><small>{t('清空已有 Tag', 'Clear existing tag')}</small></button>{snapshot.accountTags.map((tag) => <button type="button" key={tag.id} onClick={() => void assignSelectedTag(tag.id)}><Tag size={16} /><strong>{tag.name}</strong><small>{t(`${oauthAccounts.filter((account) => account.tagId === tag.id).length} 个账号`, `${oauthAccounts.filter((account) => account.tagId === tag.id).length} accounts`)}</small></button>)}</div>
+        <div className="tag-assignment-grid"><button type="button" onClick={() => void assignSelectedTag(null)}><span className="muted">—</span><strong>{t('未标记', 'Untagged')}</strong><small>{t('清空已有 Tag', 'Clear existing tag')}</small></button>{snapshot.accountTags.map((tag) => <button type="button" key={tag.id} onClick={() => void assignSelectedTag(tag.id)}><Tag size={16} /><strong>{tag.name}</strong><small>{t(`${accountTagCounts.get(tag.id) ?? 0} 个账号`, `${accountTagCounts.get(tag.id) ?? 0} accounts`)}</small></button>)}</div>
       </Modal>
 
       <CodexQuotaModal account={quotaAccount} api={api} runAction={runAction} busyKeys={busyKeys} onClose={() => setQuotaAccountId(null)} />
@@ -2189,7 +2287,7 @@ export function ProvidersView({
       <ConfirmDialog
         open={Boolean(tagDeleteTarget)}
         title={t('删除 Tag', 'Delete tag')}
-        message={t(`确定删除“${tagDeleteTarget?.name ?? ''}”吗？${tagDeleteTarget ? ` ${oauthAccounts.filter((account) => account.tagId === tagDeleteTarget.id).length} 个账号将变为未标记。` : ''}`, `Delete “${tagDeleteTarget?.name ?? ''}”?${tagDeleteTarget ? ` ${oauthAccounts.filter((account) => account.tagId === tagDeleteTarget.id).length} accounts will become untagged.` : ''}`)}
+        message={t(`确定删除“${tagDeleteTarget?.name ?? ''}”吗？${tagDeleteTarget ? ` ${accountTagCounts.get(tagDeleteTarget.id) ?? 0} 个账号将变为未标记。` : ''}`, `Delete “${tagDeleteTarget?.name ?? ''}”?${tagDeleteTarget ? ` ${accountTagCounts.get(tagDeleteTarget.id) ?? 0} accounts will become untagged.` : ''}`)}
         busy={busyKeys.has('delete-account-tag')}
         onCancel={() => setTagDeleteTarget(null)}
         onConfirm={() => void deleteTag()}

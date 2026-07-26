@@ -69,6 +69,19 @@ describe('LocalEventServer', () => {
     expect(status).toBe(401)
   })
 
+  it('rejects bearer credentials in the URL query string', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'stone-events-query-token-'))
+    const server = new LocalEventServer({ userDataPath: directory, portStart: 31_760, portEnd: 31_769, token: 'q'.repeat(48) })
+    cleanups.push(async () => { await server.close(); await rm(directory, { recursive: true, force: true }) })
+    const info = await server.start()
+    const socket = new WebSocket(`ws://${info.host}:${info.port}/events?token=${encodeURIComponent(info.token)}`)
+    socket.on('error', () => undefined)
+
+    const status = await new Promise<number>((resolve) => socket.once('unexpected-response', (_request, response) => resolve(response.statusCode ?? 0)))
+
+    expect(status).toBe(401)
+  })
+
   it('coalesces concurrent starts into one persisted listener', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'stone-events-'))
     const server = new LocalEventServer({ userDataPath: directory, portStart: 31_760, portEnd: 31_769, token: 'c'.repeat(48) })

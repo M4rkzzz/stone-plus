@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   AlertTriangle,
   Check,
@@ -14,8 +14,16 @@ import {
 } from 'lucide-react'
 import type { AppSnapshot, FrpTunnelState, GatewayApi } from '@shared/types'
 import { localizeBackendError, localizeBackendMessage } from '../backend-message'
+import { SingleFlightAsyncOperation, StartOrderedAsyncValue } from '../async-operation'
 import { useI18n } from '../i18n'
 import { Badge, PageHeader, relativeTime } from '../ui'
+
+const RUNNING_POLL_INTERVAL_MS = 1_500
+const STOPPED_POLL_INTERVAL_MS = 5_000
+
+function sameFrpTunnelState(current: FrpTunnelState | null, next: FrpTunnelState): boolean {
+  return current !== null && JSON.stringify(current) === JSON.stringify(next)
+}
 
 // eslint-disable-next-line react-refresh/only-export-components
 export function frpExampleConfig(localPort: number): string {
@@ -38,9 +46,20 @@ export function TunnelView({ snapshot, api }: { snapshot: AppSnapshot; api: Gate
   const { t, language, locale } = useI18n()
   const [state, setState] = useState<FrpTunnelState | null>(null)
   const [config, setConfig] = useState('')
-  const [busy, setBusy] = useState<'save' | 'start' | 'stop' | null>(null)
+  const [busy, setBusy] = useState<'save' | 'start' | 'stop' | 'clear' | null>(null)
   const [error, setError] = useState('')
   const [copied, setCopied] = useState<'address' | 'token' | null>(null)
+  const mounted = useRef(true)
+  const configInitialized = useRef(false)
+  const copiedResetTimer = useRef<number | undefined>(undefined)
+  const tunnelRefresh = useRef(new SingleFlightAsyncOperation())
+  const tunnelMutationInFlight = useRef(false)
+  const tunnelStateUpdates = useRef<StartOrderedAsyncValue<FrpTunnelState> | null>(null)
+  if (!tunnelStateUpdates.current) {
+    tunnelStateUpdates.current = new StartOrderedAsyncValue<FrpTunnelState>((next) => {
+      if (mounted.current) setState((current) => sameFrpTunnelState(current, next) ? current : next)
+    })
+  }
   const route = useMemo(
     () => snapshot.routes.find((candidate) => candidate.client === 'codex' && candidate.enabled)
       ?? snapshot.routes.find((candidate) => candidate.client === 'codex'),
@@ -49,55 +68,101 @@ export function TunnelView({ snapshot, api }: { snapshot: AppSnapshot; api: Gate
   const exampleConfig = useMemo(() => frpExampleConfig(snapshot.gateway.port), [snapshot.gateway.port])
 
   useEffect(() => {
+    mounted.current = true
+    return () => {
+      mounted.current = false
+      if (copiedResetTimer.current !== undefined) window.clearTimeout(copiedResetTimer.current)
+    }
+  }, [])
+
+  useEffect(() => {
     let active = true
-    const load = async (replaceConfig = false) => {
+    let timer: number | undefined
+    const load = async (initializeConfig = false): Promise<FrpTunnelState | undefined> => {
+      if (tunnelMutationInFlight.current) return undefined
       try {
-        const next = await api.getFrpTunnelState()
+        const next = await tunnelRefresh.current.run(() => tunnelStateUpdates.current!.run(() => api.getFrpTunnelState()))
         if (!active) return
-        setState(next)
-        if (replaceConfig) setConfig(next.config || exampleConfig)
+        if (initializeConfig && !configInitialized.current) {
+          configInitialized.current = true
+          setConfig(next.config || exampleConfig)
+        }
+        return next
       } catch (cause) {
         if (active) setError(localizeBackendError(cause, language, t('无法读取 frpc 状态', 'Unable to read frpc status')))
+        return undefined
       }
     }
-    void load(true)
-    const timer = window.setInterval(() => void load(false), 1_500)
-    return () => { active = false; window.clearInterval(timer) }
+    const schedule = (delay: number) => {
+      if (!active || document.visibilityState === 'hidden') return
+      if (timer !== undefined) window.clearTimeout(timer)
+      timer = window.setTimeout(() => void poll(false), delay)
+    }
+    const poll = async (initializeConfig: boolean) => {
+      if (!active || document.visibilityState === 'hidden') return
+      const next = await load(initializeConfig)
+      if (active) schedule(next?.running ? RUNNING_POLL_INTERVAL_MS : STOPPED_POLL_INTERVAL_MS)
+    }
+    const refreshWhenVisible = () => {
+      if (timer !== undefined) window.clearTimeout(timer)
+      timer = undefined
+      if (document.visibilityState !== 'hidden') void poll(!configInitialized.current)
+    }
+    void poll(true)
+    document.addEventListener('visibilitychange', refreshWhenVisible)
+    return () => {
+      active = false
+      document.removeEventListener('visibilitychange', refreshWhenVisible)
+      if (timer !== undefined) window.clearTimeout(timer)
+    }
   }, [api, exampleConfig, language, t])
 
-  const run = async (kind: 'save' | 'start' | 'stop', operation: () => Promise<FrpTunnelState>) => {
+  const run = async (kind: 'save' | 'start' | 'stop' | 'clear', operation: () => Promise<FrpTunnelState>) => {
+    if (tunnelMutationInFlight.current) return
+    tunnelMutationInFlight.current = true
     setBusy(kind)
     setError('')
     try {
-      const next = await operation()
-      setState(next)
+      const next = await tunnelStateUpdates.current!.run(operation)
       if (kind === 'save') setConfig(next.config)
     } catch (cause) {
       setError(localizeBackendError(cause, language, t('操作失败', 'Operation failed')))
     } finally {
+      tunnelMutationInFlight.current = false
       setBusy(null)
     }
   }
 
   const saveAndStart = async () => {
+    if (tunnelMutationInFlight.current) return
+    tunnelMutationInFlight.current = true
     setBusy('start')
     setError('')
     try {
-      const saved = config === state?.config ? state : await api.saveFrpTunnelConfig(config)
-      if (saved) setState(saved)
-      setState(await api.startFrpTunnel())
+      const saved = config === state?.config ? state : await tunnelStateUpdates.current!.run(() => api.saveFrpTunnelConfig(config))
+      if (saved) setConfig(saved.config)
+      await tunnelStateUpdates.current!.run(() => api.startFrpTunnel())
     } catch (cause) {
       setError(localizeBackendError(cause, language, t('frpc 启动失败', 'Failed to start frpc')))
     } finally {
+      tunnelMutationInFlight.current = false
       setBusy(null)
     }
   }
 
   const copy = async (kind: 'address' | 'token', value: string | undefined) => {
     if (!value) return
-    await navigator.clipboard.writeText(value)
-    setCopied(kind)
-    window.setTimeout(() => setCopied(null), 1_500)
+    try {
+      await navigator.clipboard.writeText(value)
+      setCopied(kind)
+      if (copiedResetTimer.current !== undefined) window.clearTimeout(copiedResetTimer.current)
+      copiedResetTimer.current = window.setTimeout(() => {
+        copiedResetTimer.current = undefined
+        setCopied(null)
+      }, 1_500)
+    } catch (cause) {
+      setError(localizeBackendError(cause, language, t('复制失败', 'Copy failed')))
+    }
   }
 
   const changed = state !== null && config !== state.config
@@ -144,7 +209,7 @@ export function TunnelView({ snapshot, api }: { snapshot: AppSnapshot; api: Gate
       <section className="panel tunnel-log-panel">
         <div className="tunnel-panel__heading">
           <div><TerminalSquare size={19} /><div><strong>{t('运行日志', 'Runtime logs')}</strong>{state?.running && state.startedAt && <span>{t('启动于', 'Started')} {relativeTime(state.startedAt, locale)} · PID {state.pid ?? '—'}</span>}</div></div>
-          <button className="icon-button" type="button" title={t('清空日志', 'Clear logs')} onClick={() => void api.clearFrpTunnelLogs().then(setState)}><Trash2 size={16} /></button>
+          <button className="icon-button" type="button" disabled={Boolean(busy)} title={t('清空日志', 'Clear logs')} onClick={() => void run('clear', () => api.clearFrpTunnelLogs())}>{busy === 'clear' ? <LoaderCircle size={16} className="spin" /> : <Trash2 size={16} />}</button>
         </div>
         <pre className="tunnel-logs">{state?.logs.length ? state.logs.join('\n') : t('暂无日志', 'No logs yet')}</pre>
       </section>

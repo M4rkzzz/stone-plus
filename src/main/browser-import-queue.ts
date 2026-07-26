@@ -1,7 +1,16 @@
-import type { DownloadItem, Session } from 'electron'
+import { safeStorage, type DownloadItem, type Session } from 'electron'
 import { randomUUID } from 'node:crypto'
-import { mkdirSync, readdirSync, rmSync, statSync } from 'node:fs'
-import { copyFile, readFile, rm, stat } from 'node:fs/promises'
+import {
+  chmodSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs'
+import { readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { dirname, extname, join, resolve } from 'node:path'
 import type {
   BrowserCachedJsonItem,
@@ -15,6 +24,8 @@ const MAX_QUEUE_BYTES = 32 * 1024 * 1024
 const MAX_QUEUE_ITEMS = 100
 const MAX_CACHE_BYTES = 256 * 1024 * 1024
 const MAX_CACHE_ITEMS = 500
+const MAX_ENCRYPTED_ITEM_BYTES = MAX_ITEM_BYTES + 64 * 1024
+const ENCRYPTED_CACHE_SUFFIX = '.safe'
 
 interface PrivateQueueItem extends BrowserPendingJsonItem {
   content?: string
@@ -49,8 +60,10 @@ export class BrowserImportQueue {
   ) {
     this.cacheDirectory = cacheDirectory
     rmSync(stagingDirectory, { recursive: true, force: true })
-    mkdirSync(stagingDirectory, { recursive: true })
-    mkdirSync(cacheDirectory, { recursive: true })
+    mkdirSync(stagingDirectory, { recursive: true, mode: 0o700 })
+    mkdirSync(cacheDirectory, { recursive: true, mode: 0o700 })
+    hardenDirectory(stagingDirectory)
+    hardenDirectory(cacheDirectory)
     this.loadCache()
   }
 
@@ -107,7 +120,8 @@ export class BrowserImportQueue {
     const item = this.cachedItems.get(id)
     if (!item) throw new Error('缓存中的 JSON 已不存在。')
     if (resolve(item.path) === resolve(destinationPath)) return
-    await copyFile(item.path, destinationPath)
+    const plaintext = this.decryptCacheFile(item.path)
+    await writeFile(destinationPath, plaintext, { encoding: 'utf8', mode: 0o600, flag: 'w' })
   }
 
   public async removeCachedItem(id: string): Promise<BrowserJsonCacheState> {
@@ -134,6 +148,24 @@ export class BrowserImportQueue {
     for (const id of new Set(ids)) changed = this.items.delete(id) || changed
     if (changed) this.emit()
     return this.getState()
+  }
+
+  /** Removes both the in-memory import and its encrypted persistent cache. */
+  public async removeImported(ids: string[]): Promise<BrowserImportQueueState> {
+    const uniqueIds = [...new Set(ids)]
+    let removalError: unknown
+    for (const id of uniqueIds) {
+      const cached = this.cachedItems.get(id)
+      if (!cached) continue
+      try {
+        await rm(cached.path, { force: true })
+        this.cachedItems.delete(id)
+      } catch (error) {
+        removalError ??= error
+      }
+    }
+    if (removalError) throw removalError
+    return this.removeMany(uniqueIds)
   }
 
   public clear(): BrowserImportQueueState {
@@ -193,7 +225,8 @@ export class BrowserImportQueue {
       return
     }
 
-    mkdirSync(this.stagingDirectory, { recursive: true })
+    mkdirSync(this.stagingDirectory, { recursive: true, mode: 0o700 })
+    hardenDirectory(this.stagingDirectory)
     const stagingPath = join(this.stagingDirectory, `${id}.json`)
     download.setSavePath(stagingPath)
     this.items.set(id, item)
@@ -223,7 +256,7 @@ export class BrowserImportQueue {
       item.status = 'ready'
       delete item.error
       try {
-        await this.cacheDownload(item, stagingPath)
+        await this.cacheDownload(item)
       } catch (error) {
         item.error = `JSON 已挂起，但写入下载缓存失败：${queueErrorMessage(error)}`
       }
@@ -246,11 +279,22 @@ export class BrowserImportQueue {
     return total
   }
 
-  private async cacheDownload(item: PrivateQueueItem, stagingPath: string): Promise<void> {
-    mkdirSync(this.cacheDirectory, { recursive: true })
+  private async cacheDownload(item: PrivateQueueItem): Promise<void> {
+    if (typeof item.content !== 'string') throw new Error('下载缓存内容不可用。')
+    requireCacheEncryption()
+    mkdirSync(this.cacheDirectory, { recursive: true, mode: 0o700 })
+    hardenDirectory(this.cacheDirectory)
     const fileName = jsonFileName(item.fileName)
-    const cachePath = join(this.cacheDirectory, `${item.receivedAt}--${item.id}--${fileName}`)
-    await copyFile(stagingPath, cachePath)
+    const cachePath = join(this.cacheDirectory, `${item.receivedAt}--${item.id}--${fileName}${ENCRYPTED_CACHE_SUFFIX}`)
+    const temporaryPath = `${cachePath}.${randomUUID()}.tmp`
+    const encrypted = safeStorage.encryptString(item.content)
+    try {
+      await writeFile(temporaryPath, encrypted, { mode: 0o600, flag: 'wx' })
+      await rename(temporaryPath, cachePath)
+    } catch (error) {
+      await rm(temporaryPath, { force: true }).catch(() => undefined)
+      throw error
+    }
     this.cachedItems.set(item.id, {
       id: item.id,
       fileName,
@@ -263,18 +307,51 @@ export class BrowserImportQueue {
 
   private loadCache(): void {
     for (const fileName of readdirSync(this.cacheDirectory)) {
-      const parsed = parseCachedFileName(fileName)
+      const encrypted = fileName.endsWith(ENCRYPTED_CACHE_SUFFIX)
+      const logicalName = encrypted ? fileName.slice(0, -ENCRYPTED_CACHE_SUFFIX.length) : fileName
+      const parsed = parseCachedFileName(logicalName)
       if (!parsed) continue
-      const path = join(this.cacheDirectory, fileName)
+      let path = join(this.cacheDirectory, fileName)
       try {
         const info = statSync(path)
-        if (!info.isFile() || info.size > MAX_ITEM_BYTES) continue
-        this.cachedItems.set(parsed.id, { ...parsed, sizeBytes: info.size, path })
+        if (!info.isFile() || info.size > (encrypted ? MAX_ENCRYPTED_ITEM_BYTES : MAX_ITEM_BYTES)) {
+          rmSync(path, { force: true })
+          continue
+        }
+        if (!encrypted) path = this.migrateLegacyCacheFile(path)
+        const plaintext = this.decryptCacheFile(path)
+        JSON.parse(plaintext)
+        const sizeBytes = Buffer.byteLength(plaintext, 'utf8')
+        if (sizeBytes > MAX_ITEM_BYTES) throw new Error('缓存 JSON 超过大小上限。')
+        this.cachedItems.set(parsed.id, { ...parsed, sizeBytes, path })
       } catch {
-        // An unreadable cache entry is ignored; other downloads remain available.
+        // Never retain unreadable or legacy plaintext credential files.
+        rmSync(path, { force: true })
       }
     }
     this.pruneCache()
+  }
+
+  private migrateLegacyCacheFile(path: string): string {
+    requireCacheEncryption()
+    const plaintext = readFileSync(path, 'utf8')
+    JSON.parse(plaintext)
+    const encryptedPath = `${path}${ENCRYPTED_CACHE_SUFFIX}`
+    const temporaryPath = `${encryptedPath}.${randomUUID()}.tmp`
+    try {
+      writeFileSync(temporaryPath, safeStorage.encryptString(plaintext), { mode: 0o600, flag: 'wx' })
+      renameSync(temporaryPath, encryptedPath)
+      rmSync(path, { force: true })
+      return encryptedPath
+    } catch (error) {
+      rmSync(temporaryPath, { force: true })
+      throw error
+    }
+  }
+
+  private decryptCacheFile(path: string): string {
+    requireCacheEncryption()
+    return safeStorage.decryptString(readFileSync(path))
   }
 
   private pruneCache(): void {
@@ -337,4 +414,21 @@ function queueErrorMessage(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error)
   if (/JSON|Unexpected token|Unexpected end/i.test(message)) return '下载内容不是有效 JSON。'
   return message.slice(0, 240)
+}
+
+function requireCacheEncryption(): void {
+  let available = false
+  try {
+    available = safeStorage.isEncryptionAvailable()
+      && (process.platform !== 'linux'
+        || !['basic_text', 'unknown'].includes(safeStorage.getSelectedStorageBackend()))
+  } catch {
+    available = false
+  }
+  if (!available) throw new Error('系统凭据保险库不可用，下载 JSON 不会持久化到磁盘。')
+}
+
+function hardenDirectory(path: string): void {
+  if (process.platform === 'win32') return
+  try { chmodSync(path, 0o700) } catch { /* best-effort; file encryption remains mandatory */ }
 }

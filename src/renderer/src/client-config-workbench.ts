@@ -134,6 +134,14 @@ export const clientConfigFieldGuides: Readonly<Record<string, ClientConfigFieldG
   'claude.permissionsAllow': guide('claude-settings', ['permissions', 'allow'], '每行一条始终允许的工具规则；适合可信且高频的操作。'),
   'claude.permissionsAsk': guide('claude-settings', ['permissions', 'ask'], '每行一条始终需要确认的工具规则。'),
   'claude.permissionsDeny': guide('claude-settings', ['permissions', 'deny'], '每行一条禁止执行的工具规则；拒绝规则应保持最小且明确。'),
+  'claude.disableNonessentialTraffic': guide(
+    'claude-settings',
+    ['env', 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC'],
+    '关闭自动更新、遥测、错误报告、反馈、发行说明和部分网关能力检查；仅建议受限网络或隐私场景使用。',
+    null,
+    '关闭（不写入）',
+    { '1': '开启后减少 Claude Code 的非必要网络请求' },
+  ),
 
   'codex.model': guide('codex-config', ['model'], '指定 Codex 默认模型；留空可避免把 Profile 锁定到某个模型。'),
   'codex.reasoningEffort': guide('codex-config', ['model_reasoning_effort'], '控制模型的推理投入。任务越复杂可选越高，但响应时间与用量也可能增加。', 'medium', '跟随模型默认推理强度', {
@@ -178,6 +186,7 @@ const englishFieldMetadata: Readonly<Record<string, EnglishFieldMetadata>> = Obj
   ['claude.permissionsDeny', 'Deny rules', 'Tool-matching rules that are always blocked, one per line. Deny rules take precedence over allow rules.'],
   ['claude.includeGitInstructions', 'Include Git guidance', 'Allows the client to include its built-in Git workflow guidance in context.'],
   ['claude.autoUpdatesChannel', 'Automatic update channel', 'Choose stable updates or receive the latest release earlier.'],
+  ['claude.disableNonessentialTraffic', 'Reduce nonessential traffic', 'Disables Claude Code auto-updates, telemetry, error reporting, feedback, release notes, and some gateway capability checks. Use only on restricted networks or for privacy-sensitive setups.'],
 
   ['codex.model', 'Default model', 'The model Codex uses for new conversations. Leave blank to follow the client recommendation.', 'Use the client-recommended model'],
   ['codex.reviewModel', 'Code review model', 'The model used specifically for /review. Leave blank to use the current conversation model.', 'Use the current model'],
@@ -292,6 +301,9 @@ const englishOptions: Readonly<Record<string, EnglishOptionMetadata>> = Object.f
   },
   'claude.autoUpdatesChannel': {
     stable: ['Stable', 'Prioritize stability'], latest: ['Latest', 'Receive new features earlier'],
+  },
+  'claude.disableNonessentialTraffic': {
+    '1': ['On', 'Reduce nonessential Claude Code network requests'],
   },
   'codex.credentialsStore': {
     file: ['File', 'Store credentials in the protected auth.json file'],

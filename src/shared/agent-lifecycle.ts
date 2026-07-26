@@ -3,6 +3,8 @@ export const AGENT_TARGETS = [
   'codex-desktop',
   'codex-cli',
   'claude-code',
+  'claude-code-desktop',
+  'claude-code-vsc',
   'gemini-cli',
   'grok-build',
 ] as const
@@ -17,12 +19,16 @@ export interface AgentCapabilities {
   readonly canDetectInstallation: boolean
   readonly canDetectRunning: boolean
   readonly canCloseKnownProcess: boolean
+  /** The target can be opened even when Stone+ cannot observe its host process. */
+  readonly canLaunch?: boolean
   readonly canRestoreConnection: boolean
   readonly canRepairSessions: boolean
   readonly canRepairWorkspaceIndex: boolean
   readonly canRestart: boolean
   /** Targets in the same group must not mutate their shared state concurrently. */
   readonly sharedStateGroup?: AgentSharedStateGroup
+  /** Targets in the same group share one aggregate restore execution. */
+  readonly aggregateRestoreGroup?: AgentSharedStateGroup
 }
 
 /**
@@ -40,6 +46,7 @@ export const AGENT_CAPABILITIES: Readonly<Record<AgentTarget, AgentCapabilities>
     canRepairWorkspaceIndex: true,
     canRestart: true,
     sharedStateGroup: 'codex-home',
+    aggregateRestoreGroup: 'codex-home',
   }),
   'codex-cli': Object.freeze({
     canInstall: true,
@@ -52,16 +59,42 @@ export const AGENT_CAPABILITIES: Readonly<Record<AgentTarget, AgentCapabilities>
     canRepairWorkspaceIndex: true,
     canRestart: true,
     sharedStateGroup: 'codex-home',
+    aggregateRestoreGroup: 'codex-home',
   }),
   'claude-code': Object.freeze({
     canInstall: true,
     canDetectInstallation: true,
     canDetectRunning: true,
     canCloseKnownProcess: true,
+    canLaunch: true,
     canRestoreConnection: true,
     canRepairSessions: false,
     canRepairWorkspaceIndex: false,
     canRestart: true,
+    sharedStateGroup: 'claude-home',
+  }),
+  'claude-code-desktop': Object.freeze({
+    canInstall: true,
+    canDetectInstallation: true,
+    canDetectRunning: false,
+    canCloseKnownProcess: false,
+    canLaunch: true,
+    canRestoreConnection: true,
+    canRepairSessions: false,
+    canRepairWorkspaceIndex: false,
+    canRestart: false,
+    sharedStateGroup: 'claude-home',
+  }),
+  'claude-code-vsc': Object.freeze({
+    canInstall: true,
+    canDetectInstallation: true,
+    canDetectRunning: false,
+    canCloseKnownProcess: false,
+    canLaunch: true,
+    canRestoreConnection: true,
+    canRepairSessions: false,
+    canRepairWorkspaceIndex: false,
+    canRestart: false,
     sharedStateGroup: 'claude-home',
   }),
   'gemini-cli': Object.freeze({
@@ -92,6 +125,8 @@ export const AGENT_ROUTE_CLIENT: Readonly<Record<AgentTarget, AgentRouteClient>>
   'codex-desktop': 'codex',
   'codex-cli': 'codex',
   'claude-code': 'claude',
+  'claude-code-desktop': 'claude',
+  'claude-code-vsc': 'claude',
   'gemini-cli': 'gemini',
   'grok-build': 'grokbuild',
 })

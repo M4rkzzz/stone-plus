@@ -60,8 +60,11 @@ those terms.
 | `ws` | 8.21.1 | MIT |
 | `zustand` | 5.0.14 | MIT |
 
-The complete license text for each npm package is retained with that package
-inside the application archive and in the installed dependency tree.
+The complete license text published with each npm package is retained with that
+package inside the application archive. The `lazy-val@1.0.5` npm artifact
+declares MIT and Vladimir Krivosheev as its author but omits a standalone
+license file; Stone+ therefore supplies the complete MIT notice separately at
+`licenses/npm/lazy-val-1.0.5-MIT.txt` in the installed application resources.
 
 ## Fonts
 

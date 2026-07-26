@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest'
-import { accountDisplayNames, accountSelectionSummary, nextTabIndex, selectMatchingAccountIds } from '../../src/renderer/src/providers-view-state'
+import {
+  ACCOUNT_RENDER_PAGE_SIZE,
+  accountDisplayNames,
+  accountSelectionSummary,
+  nextTabIndex,
+  paginateAccounts,
+  selectMatchingAccountIds,
+} from '../../src/renderer/src/providers-view-state'
 
 describe('providers view state helpers', () => {
   it('selects only accounts in the already filtered visible set', () => {
@@ -41,5 +48,25 @@ describe('providers view state helpers', () => {
     expect(nextTabIndex(1, 3, 'Home')).toBe(0)
     expect(nextTabIndex(1, 3, 'End')).toBe(2)
     expect(nextTabIndex(1, 3, 'Enter')).toBeUndefined()
+  })
+
+  it('bounds account rows while keeping every filtered account reachable', () => {
+    const accounts = Array.from({ length: 251 }, (_, index) => ({ id: `account-${index}` }))
+    const pages = Array.from({ length: 3 }, (_, page) => paginateAccounts(accounts, page))
+
+    expect(ACCOUNT_RENDER_PAGE_SIZE).toBe(100)
+    expect(pages.map((page) => page.items.length)).toEqual([100, 100, 51])
+    expect(pages.flatMap((page) => page.items)).toEqual(accounts)
+    expect(paginateAccounts(accounts, Number.POSITIVE_INFINITY).page).toBe(0)
+    expect(paginateAccounts(accounts, 999).page).toBe(2)
+  })
+
+  it('keeps bulk selection scoped to the complete filtered set instead of the current page', () => {
+    const filtered = Array.from({ length: 251 }, (_, index) => ({ id: `account-${index}`, ready: index % 2 === 0 }))
+    const firstPage = paginateAccounts(filtered, 0)
+
+    expect(firstPage.items).toHaveLength(ACCOUNT_RENDER_PAGE_SIZE)
+    expect(selectMatchingAccountIds(filtered, () => true)).toHaveLength(251)
+    expect(selectMatchingAccountIds(filtered, (account) => account.ready)).toHaveLength(126)
   })
 })

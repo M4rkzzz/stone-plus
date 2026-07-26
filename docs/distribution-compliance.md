@@ -110,6 +110,9 @@ For the Windows x64, Linux x64/arm64, and macOS x64/arm64 packages:
 - `SOURCE_ACCESS.md` identifies the exact-version StonePlus source archive and
   public repository, while `SOURCE_OFFER-sing-box.md` covers the bundled core.
 - `LICENSES/GPL-3.0-or-later.txt` contains the complete GPL version 3 text.
+- `LICENSES/npm/lazy-val-1.0.5-MIT.txt` supplies the complete MIT notice omitted
+  from the published `lazy-val@1.0.5` npm artifact and is copied into installed
+  application resources.
 - `LICENSES/sing-box-v1.13.14.txt` preserves the upstream sing-box notice.
 - `LICENSES/libcronet/` preserves cronet-go's notice and the pinned
   NaiveProxy/Chromium license metadata corpus used by libcronet.

@@ -383,6 +383,68 @@ describe('AppStore', () => {
     })).rejects.toThrow(/loopback/)
   })
 
+  it('keeps system OAuth sources behind the import flow across legacy provider and account methods', async () => {
+    const store = createStore()
+    await store.initialize()
+    const imported = await store.importChatGptAccounts({
+      content: JSON.stringify({
+        access_token: 'oauth-boundary-access',
+        account_id: 'acct-oauth-boundary',
+        email: 'oauth-boundary@example.com',
+        expired: new Date(Date.now() + 3_600_000).toISOString(),
+      }),
+      tagId: null,
+      poolId: null,
+    })
+    const oauthProvider = imported.snapshot.providers.find((provider) => provider.sourceType === 'oauth-system')!
+    const oauthAccount = imported.snapshot.accounts.find((account) => account.id === imported.importedAccountIds[0])!
+
+    const renamed = await store.saveAccount({
+      id: oauthAccount.id,
+      providerId: oauthProvider.id,
+      name: 'Renamed OAuth account',
+      priority: oauthAccount.priority,
+      weight: oauthAccount.weight,
+      maxConcurrency: oauthAccount.maxConcurrency,
+      modelAllowlist: oauthAccount.modelAllowlist,
+    })
+    expect(renamed.accounts.find((account) => account.id === oauthAccount.id)?.name).toBe('Renamed OAuth account')
+
+    await expect(store.saveProvider({
+      id: oauthProvider.id,
+      name: oauthProvider.name,
+      kind: oauthProvider.kind,
+      baseUrl: 'https://credential-capture.example/v1',
+      protocol: oauthProvider.protocol,
+      models: oauthProvider.models,
+    })).rejects.toThrow(/OAuth import flow/)
+    expect(store.getRuntimeProvider(oauthProvider.id)?.baseUrl).toBe('https://api.openai.com/v1')
+
+    await expect(store.saveProvider({
+      name: 'Forged hidden OAuth source',
+      sourceType: 'oauth-system',
+      kind: 'openai',
+      baseUrl: 'https://credential-capture.example/v1',
+      protocol: 'openai-responses',
+      models: [],
+    })).rejects.toThrow(/OAuth import flow/)
+    expect(store.getSnapshot().providers.some((provider) => provider.name === 'Forged hidden OAuth source')).toBe(false)
+
+    await expect(store.saveAccount({
+      providerId: oauthProvider.id,
+      name: 'Forged hidden key',
+      credential: 'sk-must-not-persist',
+      priority: 1,
+      weight: 1,
+      maxConcurrency: 1,
+      modelAllowlist: [],
+    })).rejects.toThrow(/OAuth import flow/)
+
+    await store.deleteAccount(oauthAccount.id)
+    await expect(store.deleteProvider(oauthProvider.id)).rejects.toThrow(/OAuth account flow/)
+    expect(store.getRuntimeProvider(oauthProvider.id)).toBeDefined()
+  })
+
   it('persists validated relay Responses compact capabilities and rejects invalid save-provider input', async () => {
     const store = createStore()
     await store.initialize()
@@ -732,6 +794,54 @@ describe('AppStore', () => {
     expect(restarted.getSnapshot().pools[0].strategy).toBe('autobalanced')
   })
 
+  it('enforces standard pool strategy, sticky TTL, and retry bounds at the write boundary', async () => {
+    const store = createStore()
+    await store.initialize()
+    const withAccount = await store.saveAccount({
+      providerId: 'provider-openai', name: 'Bounded pool key', credential: 'sk-bounded-pool',
+      priority: 1, weight: 1, maxConcurrency: 1, modelAllowlist: [],
+    })
+    const base = {
+      name: 'Bounded pool', protocol: 'openai-responses' as const, strategy: 'priority' as const,
+      accountIds: [withAccount.accounts[0].id], stickySessions: true, stickyTtlMinutes: 30, maxRetries: 1,
+    }
+
+    await expect(store.savePool({ ...base, strategy: 'unknown' as typeof base.strategy }))
+      .rejects.toThrow(/strategy/i)
+    await expect(store.savePool({ ...base, protocol: 'unknown' as typeof base.protocol }))
+      .rejects.toThrow(/protocol/i)
+    await expect(store.savePool({ ...base, stickySessions: 'yes' as unknown as boolean }))
+      .rejects.toThrow(/sticky sessions/i)
+    await expect(store.savePool({ ...base, accountIds: [] }))
+      .rejects.toThrow(/between 1 and 500/i)
+    await expect(store.savePool({ ...base, stickyTtlMinutes: 1_441 }))
+      .rejects.toThrow(/sticky.*1.*1440/i)
+    await expect(store.savePool({ ...base, stickyTtlMinutes: 0 }))
+      .rejects.toThrow(/sticky.*1.*1440/i)
+    await expect(store.savePool({ ...base, maxRetries: 11 }))
+      .rejects.toThrow(/retr.*0.*10/i)
+  })
+
+  it('normalizes unsafe restored pool controls to deterministic bounded defaults', async () => {
+    const store = createStore()
+    await store.initialize()
+    const withAccount = await store.saveAccount({
+      providerId: 'provider-openai', name: 'Restored pool key', credential: 'sk-restored-pool',
+      priority: 1, weight: 1, maxConcurrency: 1, modelAllowlist: [],
+    })
+    await store.savePool({
+      name: 'Restored pool', protocol: 'openai-responses', strategy: 'priority',
+      accountIds: [withAccount.accounts[0].id], stickySessions: true, stickyTtlMinutes: 30, maxRetries: 1,
+    })
+    await store.getStateRepository().mutate((state) => {
+      Object.assign(state.pools[0], { strategy: 'corrupt', stickyTtlMinutes: 99_999, maxRetries: 99 })
+    }, ['pools'])
+
+    expect(store.getStateRepository().read().pools[0]).toMatchObject({
+      strategy: 'priority', stickyTtlMinutes: 60, maxRetries: 0,
+    })
+  })
+
   it('requires a new credential when moving an account to another provider', async () => {
     const store = createStore()
     await store.initialize()
@@ -886,9 +996,93 @@ describe('AppStore', () => {
       .rejects.toThrow(/native inbound protocol/)
   })
 
+  it('binds verified Kiro Claude sources only to Claude routes', async () => {
+    const store = createStore()
+    await store.initialize()
+    const saved = await store.saveApiSource({
+      name: 'Verified Kiro relay',
+      sourceType: 'relay',
+      kind: 'kiro-compatible',
+      baseUrl: 'https://kiro.example/generateAssistantResponse',
+      protocol: 'kiro-claude',
+      models: ['claude-sonnet-4-5'],
+      defaultModel: 'claude-sonnet-4-5',
+      credential: 'kiro-relay-secret',
+      priority: 1,
+      weight: 1,
+      maxConcurrency: 2,
+      toolRoundtripVerified: true,
+      capabilityProfile: {
+        version: 1,
+        origin: 'probed',
+        checkedAt: Date.now(),
+        toolCalls: true,
+      },
+    }, { acceptInitialProbeEvidence: true })
+
+    await expect(store.setRouteSource('claude', saved.source.sourceId)).resolves.toBeDefined()
+    await expect(store.setRouteSource('codex', saved.source.sourceId))
+      .rejects.toThrow(/only to Claude Code/i)
+    await expect(store.setRouteSource('gemini', saved.source.sourceId))
+      .rejects.toThrow(/only to Claude Code/i)
+    await expect(store.setRouteSource('grokbuild', saved.source.sourceId))
+      .rejects.toThrow(/Grok Build routes can only/i)
+  })
+
+  it('preserves an unverified Kiro selection for display but rejects binding or enabling it', async () => {
+    const store = createStore()
+    await store.initialize()
+    const saved = await store.saveApiSource({
+      name: 'Pending Kiro relay',
+      sourceType: 'relay',
+      kind: 'kiro-compatible',
+      baseUrl: 'https://pending-kiro.example/generateAssistantResponse',
+      protocol: 'kiro-claude',
+      models: ['claude-sonnet-4-5'],
+      defaultModel: 'claude-sonnet-4-5',
+      credential: 'pending-kiro-secret',
+      priority: 1,
+      weight: 1,
+      maxConcurrency: 2,
+    })
+    const route = saved.snapshot.routes.find((candidate) => candidate.client === 'claude')!
+
+    await expect(store.setRouteSource('claude', saved.source.sourceId))
+      .rejects.toThrow(/two-round tool test/i)
+    await expect(store.updateRoute({
+      ...route,
+      poolId: saved.source.sourceId,
+      enabled: true,
+    })).rejects.toThrow(/two-round tool test/i)
+
+    await store.getStateRepository().mutate((state) => {
+      const persistedRoute = state.routes.find((candidate) => candidate.client === 'claude')!
+      persistedRoute.poolId = saved.source.sourceId
+      persistedRoute.enabled = true
+    }, ['routes'])
+    expect(store.getStateRepository().read().routes.find((candidate) => candidate.client === 'claude')).toMatchObject({
+      poolId: saved.source.sourceId,
+      enabled: false,
+    })
+    await store.close()
+
+    const restarted = createStore()
+    await restarted.initialize()
+    expect(restarted.getSnapshot().routes.find((candidate) => candidate.client === 'claude')).toMatchObject({
+      poolId: saved.source.sourceId,
+      enabled: false,
+    })
+  })
+
   it('atomically switches only the selected client route source', async () => {
     const store = createStore()
     await store.initialize()
+    const relay = await store.saveApiSource({
+      name: 'Atomic route relay', sourceType: 'relay', kind: 'openai-compatible',
+      baseUrl: 'https://atomic-route.example/v1', protocol: 'openai-chat', models: ['upstream-model'],
+      credential: 'atomic-route-secret', priority: 1, weight: 1, maxConcurrency: 1,
+    })
+    const sourceId = relay.source.sourceId
     const route = store.getSnapshot().routes.find((candidate) => candidate.client === 'codex')!
     const seeded = await store.updateRoute({
       ...route,
@@ -900,16 +1094,90 @@ describe('AppStore', () => {
     const switchedAt = before.updatedAt + 1_000
     vi.spyOn(Date, 'now').mockReturnValue(switchedAt)
 
-    const switched = await store.setRouteSource('codex', '  relay-source  ')
+    const switched = await store.setRouteSource('codex', `  ${sourceId}  `)
     const after = switched.routes.find((candidate) => candidate.client === 'codex')!
 
     expect(after).toEqual({
       ...before,
-      poolId: 'relay-source',
+      poolId: sourceId,
       updatedAt: switchedAt
     })
     expect(switched.routes.filter((candidate) => candidate.client !== 'codex'))
       .toEqual(seeded.routes.filter((candidate) => candidate.client !== 'codex'))
+  })
+
+  it('rejects duplicate or client-changing route writes', async () => {
+    const store = createStore()
+    await store.initialize()
+    const codex = store.getSnapshot().routes.find((route) => route.client === 'codex')!
+    const claude = store.getSnapshot().routes.find((route) => route.client === 'claude')!
+
+    await expect(store.updateRoute({ ...codex, id: 'second-codex-route' }))
+      .rejects.toThrow(/one route|already has a route|route id/i)
+    await expect(store.updateRoute({ ...codex, client: 'claude', inboundProtocol: claude.inboundProtocol }))
+      .rejects.toThrow(/cannot change|route client/i)
+  })
+
+  it('normalizes restored routes to one safe route per client and disables missing sources', async () => {
+    const store = createStore()
+    await store.initialize()
+    const repository = store.getStateRepository()
+    await repository.mutate((state) => {
+      const codex = state.routes.find((route) => route.client === 'codex')!
+      codex.enabled = true
+      codex.poolId = 'missing-restored-source'
+      state.routes.push({ ...codex, id: 'duplicate-restored-codex', localToken: 'duplicate-token' })
+    }, ['routes'])
+
+    const codexRoutes = repository.read().routes.filter((route) => route.client === 'codex')
+    expect(codexRoutes).toHaveLength(1)
+    expect(codexRoutes[0]).toMatchObject({ enabled: false, poolId: 'missing-restored-source' })
+  })
+
+  it('disables a restored route whose legacy standard relay pool crosses wire protocols', async () => {
+    const store = createStore()
+    await store.initialize()
+    const withAccount = await store.saveAccount({
+      providerId: 'provider-openai',
+      name: 'Legacy cross-wire account',
+      credential: 'sk-legacy-cross-wire',
+      priority: 1,
+      weight: 1,
+      maxConcurrency: 1,
+      modelAllowlist: [],
+    })
+    const accountId = withAccount.accounts.find((account) => account.name === 'Legacy cross-wire account')!.id
+    const withPool = await store.savePool({
+      name: 'Legacy cross-wire pool',
+      protocol: 'openai-responses',
+      strategy: 'priority',
+      accountIds: [accountId],
+      stickySessions: false,
+      stickyTtlMinutes: 30,
+      maxRetries: 0,
+    })
+    const targetPool = withPool.pools.find((pool) => pool.name === 'Legacy cross-wire pool')!
+    const codex = withPool.routes.find((route) => route.client === 'codex')!
+    await store.updateRoute({
+      ...codex,
+      enabled: true,
+      poolId: targetPool.id,
+      localToken: 'legacy-cross-wire-local-token',
+    })
+
+    const repository = store.getStateRepository()
+    await repository.mutate((state) => {
+      const provider = state.providers.find((candidate) => candidate.id === 'provider-openai')!
+      provider.kind = 'openai-compatible'
+      provider.sourceType = 'relay'
+      provider.protocol = 'openai-chat'
+      state.routes.find((route) => route.client === 'codex')!.enabled = true
+    }, ['providers', 'routes'])
+
+    const restoredRoute = repository.read().routes.find((route) => route.client === 'codex')!
+    expect(restoredRoute).toMatchObject({ enabled: false, poolId: targetPool.id })
+    await expect(store.updateRoute({ ...restoredRoute, enabled: true }))
+      .rejects.toThrow(/one valid pool protocol|protocol and source family/i)
   })
 
   it('normalizes route mappings without retaining prototype-pollution keys', async () => {
@@ -937,7 +1205,11 @@ describe('AppStore', () => {
     await store.initialize()
 
     await expect(store.setRouteSource('codex', '   ')).rejects.toThrow(/route source/i)
+    await expect(store.setRouteSource('codex', 'missing-route-source')).rejects.toThrow(/existing pool|API source/i)
     await expect(store.setRouteSource('missing-client' as RouteClient, 'relay-source')).rejects.toThrow(/route does not exist/i)
+    const codex = store.getSnapshot().routes.find((route) => route.client === 'codex')!
+    await expect(store.updateRoute({ ...codex, poolId: 'missing-route-source' }))
+      .rejects.toThrow(/existing pool|API source/i)
   })
 
   it('persists custom client profiles and protects the default profiles', async () => {
@@ -1047,6 +1319,7 @@ describe('AppStore', () => {
     const probeInput = { ...input, id: saved.source.sourceId, model: 'model-a' }
     const fingerprint = store.getApiSourceProbeConnectionFingerprint(probeInput)
     const probeResult = {
+      ok: true,
       capabilityProfile: { version: 1 as const, origin: 'probed' as const, streaming: true },
       modelCatalog: [],
       models: ['model-a'],
@@ -1077,6 +1350,137 @@ describe('AppStore', () => {
     expect(provider.baseUrl).toBe('https://relay-b.example/v1')
     expect(provider.models).toEqual(['model-b'])
     expect(provider.capabilityProfile?.origin).not.toBe('probed')
+  })
+
+  it('invalidates Kiro probe evidence and bindings on failure or capability rollback without auto-reenabling them', async () => {
+    const store = createStore()
+    await store.initialize()
+    const checkedAt = Date.now()
+    const verifiedProfile = {
+      version: 1 as const,
+      origin: 'probed' as const,
+      checkedAt,
+      streaming: true,
+      nonStreaming: true,
+      modelDiscovery: false,
+      toolCalls: true,
+    }
+    const firstInput = {
+      name: 'Persistent Kiro one',
+      sourceType: 'relay' as const,
+      kind: 'kiro-compatible' as const,
+      baseUrl: 'https://kiro-one.example/generateAssistantResponse',
+      protocol: 'kiro-claude' as const,
+      models: ['claude-sonnet-4-5'],
+      defaultModel: 'claude-sonnet-4-5',
+      credential: 'kiro-one-secret',
+      priority: 1,
+      weight: 1,
+      maxConcurrency: 2,
+      toolRoundtripVerified: true,
+      capabilityProfile: verifiedProfile,
+      modelCatalog: [],
+    }
+    const first = await store.saveApiSource(firstInput, { acceptInitialProbeEvidence: true })
+    const second = await store.saveApiSource({
+      ...firstInput,
+      name: 'Persistent Kiro two',
+      baseUrl: 'https://kiro-two.example/generateAssistantResponse',
+      credential: 'kiro-two-secret',
+    }, { acceptInitialProbeEvidence: true })
+    const aggregateSnapshot = await store.saveAggregateRelay({
+      name: 'Persistent Kiro aggregate',
+      protocol: 'kiro-claude',
+      strategy: 'priority',
+      members: [
+        { accountId: first.source.accountId, order: 0, weight: 1 },
+        { accountId: second.source.accountId, order: 1, weight: 1 },
+      ],
+      stickySessions: false,
+      stickyTtlMinutes: 30,
+      maxRetries: 1,
+    })
+    const aggregate = aggregateSnapshot.pools.find((pool) => pool.protocol === 'kiro-claude')!
+    const directRoute = {
+      ...aggregateSnapshot.routes.find((route) => route.client === 'claude')!,
+      enabled: true,
+      poolId: first.source.sourceId,
+      localToken: 'kiro-persistent-direct-token',
+    }
+    await store.updateRoute(directRoute)
+
+    const probeInput = {
+      ...firstInput,
+      id: first.source.sourceId,
+      credential: undefined,
+      model: 'claude-sonnet-4-5',
+      persistCapabilities: true,
+    }
+    const failedFingerprint = store.getApiSourceProbeConnectionFingerprint(probeInput)
+    await expect(store.saveApiSourceCapabilityProbe(first.source.sourceId, {
+      ok: false,
+      capabilityProfile: { version: 1, origin: 'inferred', modelDiscovery: false, toolCalls: false },
+      modelCatalog: [],
+      models: [],
+    }, failedFingerprint)).resolves.toBeDefined()
+
+    expect(store.getRuntimeProvider(first.source.sourceId)?.capabilityProfile).toMatchObject({
+      origin: 'inferred',
+      modelDiscovery: false,
+      toolCalls: false,
+    })
+    expect(store.getRuntimeProvider(first.source.sourceId)?.capabilityProfile?.checkedAt).toBeUndefined()
+    expect(store.getSnapshot().pools.find((pool) => pool.id === aggregate.id)?.members)
+      .toContainEqual(expect.objectContaining({ accountId: first.source.accountId, enabled: false }))
+    expect(store.getSnapshot().routes.find((route) => route.client === 'claude'))
+      .toMatchObject({ id: directRoute.id, enabled: false, poolId: first.source.sourceId })
+
+    const successFingerprint = store.getApiSourceProbeConnectionFingerprint(probeInput)
+    const successfulProbe = {
+      ok: true,
+      capabilityProfile: { ...verifiedProfile, checkedAt: checkedAt + 1 },
+      modelCatalog: [],
+      models: ['claude-sonnet-4-5'],
+      toolRoundtrip: {
+        firstTurn: { toolsCount: 1, toolUseCount: 1, stopReason: 'tool_use' },
+        secondTurn: { toolResultCount: 1, toolUseCount: 0, stopReason: 'end_turn' },
+      },
+    }
+    await expect(store.saveApiSourceCapabilityProbe(
+      first.source.sourceId,
+      successfulProbe,
+      successFingerprint,
+    )).resolves.toBeDefined()
+    expect(store.getRuntimeProvider(first.source.sourceId)?.capabilityProfile).toMatchObject({
+      origin: 'probed', toolCalls: true,
+    })
+    expect(store.getSnapshot().routes.find((route) => route.client === 'claude')?.enabled).toBe(false)
+    expect(store.getSnapshot().pools.find((pool) => pool.id === aggregate.id)?.members)
+      .toContainEqual(expect.objectContaining({ accountId: first.source.accountId, enabled: false }))
+
+    await store.saveAggregateRelay({
+      id: aggregate.id,
+      name: aggregate.name,
+      protocol: 'kiro-claude',
+      strategy: 'priority',
+      members: [
+        { accountId: first.source.accountId, order: 0, weight: 1 },
+        { accountId: second.source.accountId, order: 1, weight: 1 },
+      ],
+      stickySessions: true,
+      stickyTtlMinutes: 30,
+      maxRetries: 1,
+    })
+    await store.updateRoute({ ...directRoute, enabled: true })
+
+    const rollbackFingerprint = store.getApiSourceProbeConnectionFingerprint(probeInput)
+    await expect(store.saveApiSourceCapabilityProbe(first.source.sourceId, {
+      ...successfulProbe,
+      capabilityProfile: { ...verifiedProfile, checkedAt: checkedAt + 2, toolCalls: false },
+    }, rollbackFingerprint)).resolves.toBeDefined()
+    expect(store.getRuntimeProvider(first.source.sourceId)?.capabilityProfile)
+      .toMatchObject({ origin: 'inferred', toolCalls: false })
+    expect(store.getSnapshot().routes.find((route) => route.client === 'claude')?.enabled).toBe(false)
   })
 
   it('accepts initial probe evidence only when the main process explicitly authorizes it', async () => {
@@ -1718,6 +2122,66 @@ describe('AppStore', () => {
     expect(reimported.snapshot.proxies[0]).not.toHaveProperty('password')
   })
 
+  it('durably rolls back an unvalidated OAuth replacement explicitly and after restart', async () => {
+    const store = createStore()
+    await store.initialize()
+    const accountId = 'acct-import-rollback'
+    const userId = 'principal-import-rollback'
+    const expiresAtSeconds = Math.floor(Date.now() / 1000) + 3_600
+    const originalAccessToken = chatGptAccessToken(expiresAtSeconds, accountId, userId)
+    const originalRefreshToken = 'refresh-token-known-good'
+    const imported = await store.importChatGptAccounts({
+      content: JSON.stringify({
+        access_token: originalAccessToken,
+        refresh_token: originalRefreshToken,
+        account_id: accountId,
+        expired: new Date(expiresAtSeconds * 1_000).toISOString(),
+      }),
+      tagId: null,
+      poolId: null,
+    })
+    const importedId = imported.importedAccountIds[0]
+
+    const explicitScope = await store.beginCredentialImport()
+    await expect(store.getStateRepository().backupTo(join(directory, 'blocked-during-import.sqlite3')))
+      .rejects.toThrow(/credentials are being validated/i)
+    await store.importChatGptAccounts({
+      content: JSON.stringify({
+        access_token: chatGptAccessToken(expiresAtSeconds + 60, accountId, userId),
+        refresh_token: 'refresh-token-unvalidated-one',
+        account_id: accountId,
+        expired: new Date((expiresAtSeconds + 60) * 1_000).toISOString(),
+      }),
+      tagId: null,
+      poolId: null,
+    })
+    await store.rollbackCredentialImport(explicitScope)
+    expect(store.getChatGptCredential(store.getRuntimeAccount(importedId)!.credentialId)).toMatchObject({
+      accessToken: originalAccessToken,
+      refreshToken: originalRefreshToken,
+    })
+
+    await store.beginCredentialImport()
+    await store.importChatGptAccounts({
+      content: JSON.stringify({
+        access_token: chatGptAccessToken(expiresAtSeconds + 120, accountId, userId),
+        refresh_token: 'refresh-token-unvalidated-two',
+        account_id: accountId,
+        expired: new Date((expiresAtSeconds + 120) * 1_000).toISOString(),
+      }),
+      tagId: null,
+      poolId: null,
+    })
+    await store.close()
+
+    const restarted = createStore()
+    await restarted.initialize()
+    expect(restarted.getChatGptCredential(restarted.getRuntimeAccount(importedId)!.credentialId)).toMatchObject({
+      accessToken: originalAccessToken,
+      refreshToken: originalRefreshToken,
+    })
+  })
+
   it('applies preserve, batch override, and direct proxy choices to mixed account imports', async () => {
     const store = createStore()
     await store.initialize()
@@ -1891,6 +2355,47 @@ describe('AppStore', () => {
     expect(database.prepare('SELECT COUNT(*) AS count FROM account_codex_quota_samples WHERE account_id = ?').get(accountId))
       .toEqual({ count: 0 })
     database.close()
+  })
+
+  it('replaces authoritative Codex usage snapshots so stale exhaustion flags cannot survive recovery', async () => {
+    const store = createStore()
+    await store.initialize()
+    const created = await store.saveAccount({
+      providerId: 'provider-openai',
+      name: 'Recovered quota account',
+      credential: 'sk-recovered-quota',
+      priority: 1,
+      weight: 1,
+      maxConcurrency: 1,
+      modelAllowlist: []
+    })
+    const accountId = created.accounts[0].id
+    const observedAt = 1_800_000_000_000
+
+    await store.setAccountCheckResult(accountId, {
+      codexQuota: {
+        allowed: false,
+        limitReached: true,
+        fiveHour: { usedPercent: 100, resetAt: observedAt + 60_000 },
+        sevenDay: { usedPercent: 40, resetAt: observedAt + 604_800_000 },
+        observedAt,
+        source: 'usage-endpoint'
+      }
+    })
+    await store.setAccountCheckResult(accountId, {
+      codexQuota: {
+        fiveHour: { usedPercent: 0, resetAt: observedAt + 18_000_000 },
+        observedAt: observedAt + 61_000,
+        source: 'usage-endpoint'
+      }
+    })
+
+    expect(store.getSnapshot().accounts.find((account) => account.id === accountId)?.codexQuota).toEqual({
+      fiveHour: { usedPercent: 0, resetAt: observedAt + 18_000_000 },
+      observedAt: observedAt + 61_000,
+      source: 'usage-endpoint'
+    })
+    await store.close()
   })
 
   it('redacts credentials and authentication material before messages are persisted', async () => {
@@ -3568,7 +4073,7 @@ describe('AppStore', () => {
     expect((await readdir(directory)).some((name) => (
       name.startsWith(`${SQLITE_DATABASE_FILENAME}.pre-migration-v1-to-v${SQLITE_SCHEMA_VERSION}-`)
       && name.endsWith('.bak')
-    ))).toBe(true)
+    ))).toBe(false)
     const restartedAccount = restarted.getSnapshot().accounts[0]
     expect(restarted.getCredential(restarted.getRuntimeAccount(restartedAccount.id)!.credentialId)).toBe('migration-secret')
     await restarted.close()
@@ -3644,7 +4149,7 @@ describe('AppStore', () => {
     expect((await readdir(directory)).some((name) => (
       name.startsWith(`${SQLITE_DATABASE_FILENAME}.pre-migration-v1-to-v${SQLITE_SCHEMA_VERSION}-`)
       && name.endsWith('.bak')
-    ))).toBe(true)
+    ))).toBe(false)
 
     const inspected = new DatabaseSync(databasePath)
     expect(readSchemaVersion(inspected)).toBe(1)

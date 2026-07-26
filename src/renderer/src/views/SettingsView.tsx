@@ -17,6 +17,7 @@ import {
   Sparkles,
   Languages,
   LockKeyhole,
+  Palette,
   Upload,
   Radio,
   Cloud,
@@ -39,6 +40,7 @@ import { Badge, FieldError, gatewayBaseUrl, InfoTip, PageHeader, Toggle } from '
 import { StoneMark } from '../StoneMark'
 import { UpdateProgress, statusLabel, statusTone, type AppUpdateController } from '../UpdateDialog'
 import { translate, useI18n, type UiLanguage } from '../i18n'
+import { useTheme, type UiThemePreference } from '../theme'
 import {
   LatestAutosaveScheduler,
   SETTINGS_AUTOSAVE_DELAY_MS,
@@ -185,6 +187,7 @@ export function SettingsView({
   update: AppUpdateController
 }) {
   const { t, language, locale, preference, setPreference } = useI18n()
+  const { preference: themePreference, setPreference: setThemePreference } = useTheme()
   const builtInProxyInterlocked = useBuiltInProxyInterlock(snapshot, api)
   const [draft, setDraft] = useState<GatewaySettings>(snapshot.gateway)
   const [errors, setErrors] = useState<Record<string, string>>({})
@@ -707,6 +710,25 @@ export function SettingsView({
               <option value="en">英文 / English</option>
             </select>
             <small>更改后立即生效并自动保存 / Changes apply instantly and are saved automatically.</small>
+          </label>
+        </div>
+      </section>
+
+      <section className="settings-section">
+        <header><div className="settings-section__icon"><Palette size={18} /></div><div><h2>{t('外观', 'Appearance')}</h2></div></header>
+        <div className="settings-section__content">
+          <label className="field">
+            <span>{t('主题', 'Theme')}</span>
+            <select
+              aria-label={t('主题', 'Theme')}
+              value={themePreference}
+              onChange={(event) => setThemePreference(event.target.value as UiThemePreference)}
+            >
+              <option value="system">{t('跟随系统', 'Follow system')}</option>
+              <option value="light">{t('浅色', 'Light')}</option>
+              <option value="dark">{t('深色', 'Dark')}</option>
+            </select>
+            <small>{t('更改后立即生效并自动保存', 'Changes apply instantly and are saved automatically.')}</small>
           </label>
         </div>
       </section>

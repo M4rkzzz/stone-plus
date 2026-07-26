@@ -116,6 +116,43 @@ describe('BuiltInProxyRouteCoordinator', () => {
     await abandoned.body?.cancel()
   })
 
+  it('does not cut an actively consumed streaming body at the ordinary drain boundary', async () => {
+    let unblock!: () => void
+    const gate = new Promise<void>((resolve) => { unblock = resolve })
+    const dispose = vi.fn(async () => undefined)
+    const coordinator = trackCoordinator(new BuiltInProxyRouteCoordinator({
+      retirementDrainTimeoutMs: 10,
+      retirementFinalTimeoutMs: 250,
+    }))
+    const routed = coordinator.bind(fetchSpy('external'), fetchSpy('loopback'))
+    coordinator.requestEnable()
+    coordinator.activate({
+      fetchImplementation: vi.fn(async () => new Response(new ReadableStream({
+        async pull(controller) {
+          await gate
+          controller.enqueue(new TextEncoder().encode('stream-complete'))
+          controller.close()
+        },
+      }))) as unknown as typeof fetch,
+      mixedEndpoint: 'http://127.0.0.1:19120',
+      dispose,
+    })
+
+    const response = await routed('https://api.example/stream')
+    const body = response.text()
+    coordinator.activate({
+      fetchImplementation: fetchSpy('replacement'),
+      mixedEndpoint: 'http://127.0.0.1:19121',
+    })
+    await new Promise((resolve) => setTimeout(resolve, 35))
+    expect(dispose).not.toHaveBeenCalled()
+
+    unblock()
+    await expect(body).resolves.toBe('stream-complete')
+    await coordinator.drainRetired()
+    expect(dispose).toHaveBeenCalledOnce()
+  })
+
   it('bounds a generation disposer that never settles', async () => {
     const coordinator = trackCoordinator(new BuiltInProxyRouteCoordinator({ disposalTimeoutMs: 10 }))
     const dispose = vi.fn(() => new Promise<void>(() => undefined))

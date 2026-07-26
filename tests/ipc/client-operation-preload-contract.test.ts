@@ -48,6 +48,7 @@ describe('client operation preload contract', () => {
     await stone.smartRepairAgent('codex-cli')
     await stone.repairAllAffectedAgents()
     await stone.closeAllManagedAgents()
+    await stone.restoreClaudeDesktopOfficialMode()
 
     expect(electron.invoke.mock.calls).toEqual([
       ['stone:list-managed-client-instances'],
@@ -64,6 +65,7 @@ describe('client operation preload contract', () => {
       ['stone:smart-repair-agent', 'codex-cli'],
       ['stone:repair-all-affected-agents'],
       ['stone:close-all-managed-agents'],
+      ['stone:restore-claude-desktop-official-mode'],
     ])
   })
 
