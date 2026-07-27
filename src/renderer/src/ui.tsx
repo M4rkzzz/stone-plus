@@ -28,8 +28,8 @@ export const requestStatusLabels = {
   get streaming() { return localeText('传输中', 'Streaming') },
 } as Record<RequestLog['status'], string>
 
-export function Badge({ tone = 'neutral', children }: PropsWithChildren<{ tone?: 'neutral' | 'success' | 'warning' | 'danger' | 'info' }>) {
-  return <span className={`badge badge--${tone}`}>{children}</span>
+export function Badge({ tone = 'neutral', className = '', children }: PropsWithChildren<{ tone?: 'neutral' | 'success' | 'warning' | 'danger' | 'info'; className?: string }>) {
+  return <span className={`badge badge--${tone} ${className}`.trim()}>{children}</span>
 }
 
 export function ProviderAvatar({ kind, name, color = '#61736f', large = false, className = '' }: { kind?: ProviderKind; name?: string; color?: string; large?: boolean; className?: string }) {
@@ -47,11 +47,11 @@ export function ProviderAvatar({ kind, name, color = '#61736f', large = false, c
 
 export function AccountStatusBadge({ status, circuitState }: { status: AccountStatus; circuitState?: AccountCircuitState }) {
   const { t } = useI18n()
-  if (circuitState === 'half-open') return <Badge tone="warning">{t('探测中', 'Probing')}</Badge>
-  if (circuitState === 'open' && status === 'active') return <Badge tone="danger">{t('已熔断', 'Circuit open')}</Badge>
+  if (circuitState === 'half-open') return <Badge className="account-status-badge" tone="warning">{t('探测中', 'Probing')}</Badge>
+  if (circuitState === 'open' && status === 'active') return <Badge className="account-status-badge" tone="danger">{t('已熔断', 'Circuit open')}</Badge>
   const tone = status === 'active' ? 'success' : status === 'cooldown' || status === 'checking' ? 'warning' : 'danger'
   return (
-    <Badge tone={tone}>
+    <Badge className="account-status-badge" tone={tone}>
       {status === 'checking' && <LoaderCircle size={12} className="spin" />}
       {t(accountStatusLabelsZh[status], accountStatusLabelsEn[status])}
     </Badge>
@@ -602,7 +602,7 @@ export function OverflowMenu({
         aria-label={label}
         style={position}
         onKeyDown={handleMenuKeyDown}
-        onClickCapture={(event) => {
+        onClick={(event) => {
           const item = (event.target as Element).closest<HTMLElement>('[role="menuitem"]')
           if (item && !item.matches(':disabled')) {
             focusElement(triggerRef.current ?? undefined)

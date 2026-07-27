@@ -2,6 +2,8 @@ import type {
   AccountInput,
   AccountTagDefinition,
   AccountImportProgress,
+  ApiSourceInput,
+  ApiSourceProbeInput,
   AppSnapshot,
   AppUpdateState,
   BrowserImportQueueState,
@@ -22,6 +24,7 @@ import type {
   PublicProxyDefinition,
   ProviderDefinition,
   ProviderInput,
+  Protocol,
   RequestLog,
   Route,
   RouteClient,
@@ -43,6 +46,7 @@ import {
 import { summarizeOpenAiTokenCosts } from '@shared/openai-pricing'
 import { hasRouteSourceIdCollision, isAvailableRouteAccount, isNativeGrokRouteSource, resolveRouteSource } from '@shared/route-sources'
 import { patchCodexTomlPaths } from '../../main/client-config/toml-format'
+import { protocolsByProviderKind } from './grok-relay-ui'
 import { buildPoolModelCoverage, pruneModelSelection } from './model-policy'
 
 const STORAGE_KEY = 'stone.browser-mock.v2'
@@ -749,6 +753,96 @@ function localizeMockImportProgress(message: string): string {
 const makeId = (prefix: string) => `${prefix}-${crypto.randomUUID().slice(0, 8)}`
 const pause = (duration = 140) => new Promise((resolve) => window.setTimeout(resolve, duration))
 
+const defaultMockSourceModels = (kind: ProviderDefinition['kind'], protocol: Protocol): string[] => {
+  if (protocol === 'kiro-claude') return []
+  if (protocol === 'anthropic-messages') {
+    return ['claude-opus-4-1', 'claude-sonnet-4', 'claude-3-7-sonnet-latest']
+  }
+  if (protocol === 'gemini') return ['gemini-2.5-pro', 'gemini-2.5-flash']
+  if (kind === 'xai' || kind === 'xai-compatible') return ['grok-4.5']
+  return ['gpt-5', 'gpt-5-mini', 'o3']
+}
+
+function mockSourceRequiresToolRoundtrip(source: Pick<ApiSourceProbeInput, 'sourceType' | 'kind' | 'protocol'>): boolean {
+  return source.protocol === 'kiro-claude'
+    || (source.sourceType === 'relay'
+      && source.kind === 'anthropic-compatible'
+      && source.protocol === 'anthropic-messages')
+}
+
+const mockOfficialSources: Readonly<Partial<Record<ProviderDefinition['kind'], {
+  baseUrl: string
+  protocols: readonly Protocol[]
+}>>> = Object.freeze({
+  openai: { baseUrl: 'https://api.openai.com/v1', protocols: ['openai-responses', 'openai-chat'] },
+  xai: { baseUrl: 'https://api.x.ai/v1', protocols: ['openai-responses'] },
+  anthropic: { baseUrl: 'https://api.anthropic.com', protocols: ['anthropic-messages'] },
+  google: { baseUrl: 'https://generativelanguage.googleapis.com', protocols: ['gemini'] },
+})
+
+function mockMaskCredential(credential: string): string {
+  return credential.length <= 4 ? '****' : `****${credential.slice(-4)}`
+}
+
+function normalizeMockSourceUrl(value: string, exact: boolean): string {
+  const url = new URL(value.trim())
+  if (url.protocol !== 'https:' && url.protocol !== 'http:') throw new Error(mockText('来源地址必须使用 HTTP 或 HTTPS', 'Source URLs must use HTTP or HTTPS'))
+  const loopback = url.hostname === '127.0.0.1' || url.hostname === 'localhost' || url.hostname === '[::1]'
+  if (url.protocol === 'http:' && !loopback) throw new Error(mockText('非本地来源必须使用 HTTPS', 'Non-local sources must use HTTPS'))
+  if (url.username || url.password) throw new Error(mockText('来源地址不能嵌入凭据', 'Credentials cannot be embedded in the source URL'))
+  if (url.search || url.hash) throw new Error(mockText('来源地址不能包含查询参数或片段', 'Source URLs cannot contain a query string or fragment'))
+  const normalized = url.toString()
+  return exact ? normalized : normalized.replace(/\/$/, '')
+}
+
+function normalizeMockApiSourceInput(input: ApiSourceInput): ApiSourceInput & { baseUrl: string; models: string[] } {
+  const name = input.name.trim()
+  if (!name) throw new Error(mockText('请输入来源名称', 'Enter a source name'))
+  const official = input.sourceType === 'official-api' ? mockOfficialSources[input.kind] : undefined
+  if (input.sourceType === 'official-api' && !official) {
+    throw new Error(mockText('官方 API 类型无效', 'The official API type is invalid'))
+  }
+  if (official && !official.protocols.includes(input.protocol)) {
+    throw new Error(mockText('官方 API 协议不匹配', 'The official API protocol is incompatible'))
+  }
+  if (input.sourceType === 'relay' && !protocolsByProviderKind[input.kind]?.includes(input.protocol)) {
+    throw new Error(mockText('中转类型与协议不匹配', 'The relay type and protocol are incompatible'))
+  }
+  const normalizedModels = [...new Set(input.models.map((model) => model.trim()).filter(Boolean))]
+  const defaultModel = input.defaultModel?.trim()
+  if (defaultModel && !normalizedModels.includes(defaultModel)) normalizedModels.unshift(defaultModel)
+  else if (defaultModel) {
+    normalizedModels.splice(normalizedModels.indexOf(defaultModel), 1)
+    normalizedModels.unshift(defaultModel)
+  }
+  if (input.protocol === 'kiro-claude' && (!defaultModel || normalizedModels.length === 0)) {
+    throw new Error(mockText('Kiro Claude 需要手动填写模型和默认测试模型', 'Kiro Claude requires a manually entered model and default test model'))
+  }
+  for (const [label, value] of [['优先级', input.priority], ['权重', input.weight], ['最大并发', input.maxConcurrency]] as const) {
+    if (!Number.isInteger(value) || value < 1) throw new Error(mockText(`${label}必须是正整数`, `${label} must be a positive integer`))
+  }
+  return {
+    ...input,
+    name,
+    baseUrl: official?.baseUrl ?? normalizeMockSourceUrl(input.baseUrl, input.protocol === 'kiro-claude'),
+    credential: input.credential?.trim() || undefined,
+    models: normalizedModels,
+    defaultModel,
+    proxyId: input.proxyId?.trim() || undefined,
+  }
+}
+
+function mockProbeEvidenceFingerprint(input: Pick<ApiSourceProbeInput, 'sourceType' | 'kind' | 'baseUrl' | 'protocol' | 'model'>): string {
+  const officialBaseUrl = input.sourceType === 'official-api' ? mockOfficialSources[input.kind]?.baseUrl : undefined
+  return JSON.stringify({
+    sourceType: input.sourceType,
+    kind: input.kind,
+    baseUrl: officialBaseUrl ?? normalizeMockSourceUrl(input.baseUrl, input.protocol === 'kiro-claude'),
+    protocol: input.protocol,
+    model: input.model?.trim() || '',
+  })
+}
+
 function mockSessionRepairCancelled(): Error {
   const error = new Error('Session repair cancelled.')
   error.name = 'AbortError'
@@ -775,13 +869,16 @@ const mockClientFiles: Record<RouteClient, Array<{ role: ClientConfigFileRole; p
 
 const mockEditorContent: Record<RouteClient, Partial<Record<ClientConfigFileRole, string>>> = {
   claude: {
-    'claude-settings': '{\n  "model": "claude-sonnet-4-5",\n  "effortLevel": "high",\n  "permissions": {\n    "defaultMode": "default",\n    "allow": ["Read", "Grep"]\n  },\n  "env": {\n    "ANTHROPIC_AUTH_TOKEN": "__STONE_PROTECTED_VALUE__"\n  }\n}\n',
+    'claude-settings': '{\n  "model": "claude-sonnet-4-5",\n  "effortLevel": "high",\n  "permissions": {\n    "defaultMode": "default",\n    "allow": ["Read", "Grep"]\n  },\n  "env": {\n    "ANTHROPIC_AUTH_TOKEN": "stone-demo-claude-token"\n  }\n}\n',
     'claude-mcp': '{\n  "mcpServers": {\n    "filesystem": {\n      "command": "npx",\n      "args": ["-y", "@modelcontextprotocol/server-filesystem"]\n    }\n  }\n}\n',
   },
-  codex: { 'codex-config': 'model_provider = "stone"\nmodel = "gpt-5.6-sol"\nmodel_reasoning_effort = "medium"\nmodel_reasoning_summary = "auto"\nmodel_verbosity = "medium"\npersonality = "pragmatic"\napproval_policy = "on-request"\nsandbox_mode = "workspace-write"\nweb_search = "cached"\ncli_auth_credentials_store = "file"\n\n[features]\nfast_mode = true\nmulti_agent = true\n\n[agents]\nmax_threads = 6\n\n[windows]\nsandbox = "elevated"\n\n[model_providers.stone]\nname = "OpenAI"\nbase_url = "http://127.0.0.1:15720/v1"\nwire_api = "responses"\nrequires_openai_auth = true\n' },
-  gemini: { 'gemini-settings': '{\n  "model": { "name": "gemini-2.5-pro" },\n  "general": { "defaultApprovalMode": "default" },\n  "ui": { "theme": "Default" }\n}\n', 'gemini-env': 'GEMINI_API_KEY="__STONE_PROTECTED_VALUE__"\nGOOGLE_GEMINI_BASE_URL="__STONE_PROTECTED_VALUE__"\n' },
+  codex: {
+    'codex-config': 'model_provider = "stone"\nmodel = "gpt-5.6-sol"\nmodel_reasoning_effort = "medium"\nmodel_reasoning_summary = "auto"\nmodel_verbosity = "medium"\npersonality = "pragmatic"\napproval_policy = "on-request"\nsandbox_mode = "workspace-write"\nweb_search = "cached"\ncli_auth_credentials_store = "file"\n\n[features]\nfast_mode = true\nmulti_agent = true\n\n[agents]\nmax_threads = 6\n\n[windows]\nsandbox = "elevated"\n\n[model_providers.stone]\nname = "OpenAI"\nbase_url = "http://127.0.0.1:15720/v1"\nwire_api = "responses"\nrequires_openai_auth = true\n',
+    'codex-auth': '{\n  "OPENAI_API_KEY": "stone-demo-codex-token"\n}\n',
+  },
+  gemini: { 'gemini-settings': '{\n  "model": { "name": "gemini-2.5-pro" },\n  "general": { "defaultApprovalMode": "default" },\n  "ui": { "theme": "Default" }\n}\n', 'gemini-env': 'GEMINI_API_KEY="stone-demo-gemini-token"\nGOOGLE_GEMINI_BASE_URL="http://127.0.0.1:15720"\n' },
   grokbuild: {
-    'grok-config': '[auth]\npreferred_method = "api_key"\n\n[models]\ndefault = "stoneplus"\n\n[model.stoneplus]\nmodel = "grok-4.5"\nbase_url = "http://127.0.0.1:15721/grokbuild/v1"\nname = "Stone+"\napi_key = "__STONE_PROTECTED_VALUE__"\napi_backend = "responses"\ncontext_window = 500000\n',
+    'grok-config': '[auth]\npreferred_method = "api_key"\n\n[models]\ndefault = "stoneplus"\n\n[model.stoneplus]\nmodel = "grok-4.5"\nbase_url = "http://127.0.0.1:15721/grokbuild/v1"\nname = "Stone+"\napi_key = "stone-demo-grok-token"\napi_backend = "responses"\ncontext_window = 500000\n',
   },
 }
 
@@ -955,6 +1052,7 @@ export function createMockApi(): GatewayApi {
   const browserImportListeners = new Set<(value: BrowserImportQueueState) => void>()
   const agentLifecycleListeners = new Set<(value: AgentLifecycleChangedEvent) => void>()
   const sessionRepairProgressListeners = new Set<(value: CodexSessionRepairProgressEvent) => void>()
+  const apiSourceProbeEvidence = new Map<string, { fingerprint: string; expiresAt: number }>()
   const activeSessionRepairOperations = new Set<string>()
   const cancelledSessionRepairOperations = new Set<string>()
   let agentLifecycleSnapshot = mockAgentLifecycleSnapshot()
@@ -1041,7 +1139,11 @@ export function createMockApi(): GatewayApi {
   }
 
   const publish = () => {
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(snapshot))
+    try {
+      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(snapshot))
+    } catch {
+      // Browser mock state remains usable for this session when storage is unavailable.
+    }
     const value = localizeMockSnapshot(snapshot)
     listeners.forEach((listener) => listener(value))
     return value
@@ -1235,7 +1337,7 @@ export function createMockApi(): GatewayApi {
         providerId: input.providerId,
         name: input.name,
         maskedCredential: input.credential
-          ? `${input.credential.slice(0, 5)}••••••••${input.credential.slice(-4)}`
+          ? mockMaskCredential(input.credential)
           : existing?.maskedCredential ?? '••••••••',
         status: existing?.status ?? 'active',
         priority: input.priority,
@@ -1945,18 +2047,200 @@ export function createMockApi(): GatewayApi {
         : candidate)
       return changed()
     },
-    async saveApiSource() {
-      throw new Error('API source mock is not implemented yet.')
+    async saveApiSource(rawInput) {
+      const input = normalizeMockApiSourceInput(rawInput)
+      const timestamp = Date.now()
+      const existing = input.id ? snapshot.providers.find((provider) => provider.id === input.id) : undefined
+      if (input.id && !existing) throw new Error(mockText('API 来源不存在', 'The API source does not exist'))
+      if (input.proxyId && !snapshot.proxies.some((proxy) => proxy.id === input.proxyId)) {
+        throw new Error(mockText('请选择现有代理', 'Choose an existing proxy'))
+      }
+      const existingAccounts = existing
+        ? snapshot.accounts.filter((account) => account.providerId === existing.id)
+        : []
+      if (existingAccounts.some((account) => ['chatgpt-oauth', 'chatgpt-agent-identity', 'grok-oauth'].includes(account.credentialType ?? ''))) {
+        throw new Error(mockText('OAuth 账号不能转换为 API Key 来源', 'OAuth accounts cannot be converted into API-key sources'))
+      }
+      if (existingAccounts.length > 1) throw new Error(mockText('该来源包含多个账号，无法安全编辑', 'This source has multiple accounts and cannot be edited safely'))
+      const existingAccount = existingAccounts[0]
+      if (!existingAccount && !input.credential) {
+        throw new Error(mockText('首次添加需要填写 API Key', 'An API key is required when adding a source'))
+      }
+
+      const evidence = input.probeEvidenceToken ? apiSourceProbeEvidence.get(input.probeEvidenceToken) : undefined
+      if (input.probeEvidenceToken) apiSourceProbeEvidence.delete(input.probeEvidenceToken)
+      if (input.probeEvidenceToken && (!evidence
+        || evidence.expiresAt < timestamp
+        || evidence.fingerprint !== mockProbeEvidenceFingerprint({ ...input, model: input.defaultModel }))) {
+        throw new Error(mockText('来源探针凭据无效或已使用，请重新测试', 'The source probe evidence is invalid or already used; run the test again'))
+      }
+
+      const models = input.models.length ? [...input.models] : defaultMockSourceModels(input.kind, input.protocol)
+      const connectionChanged = !existing
+        || !existingAccount
+        || existing.sourceType !== input.sourceType
+        || existing.kind !== input.kind
+        || existing.baseUrl !== input.baseUrl
+        || existing.protocol !== input.protocol
+        || existing.models[0] !== models[0]
+        || existingAccount.proxyId !== input.proxyId
+        || Boolean(input.credential)
+      const providerId = existing?.id ?? makeId('provider')
+      const provider: ProviderDefinition = {
+        id: providerId,
+        name: input.name,
+        sourceType: input.sourceType,
+        kind: input.kind,
+        baseUrl: input.baseUrl,
+        protocol: input.protocol,
+        responsesCompactMode: input.responsesCompactMode,
+        models,
+        capabilityProfile: evidence ? input.capabilityProfile : connectionChanged ? undefined : existing?.capabilityProfile,
+        toolRoundtripVerified: connectionChanged ? false : existing?.toolRoundtripVerified,
+        modelCatalog: evidence ? input.modelCatalog : connectionChanged ? undefined : existing?.modelCatalog,
+        forceFastMode: existing?.forceFastMode,
+        color: existing?.color ?? '#2f7668',
+        createdAt: existing?.createdAt ?? timestamp,
+        updatedAt: timestamp,
+      }
+      const account: PublicAccount = {
+        id: existingAccount?.id ?? makeId('account'),
+        providerId,
+        name: input.name,
+        maskedCredential: input.credential ? mockMaskCredential(input.credential) : existingAccount?.maskedCredential ?? '••••••••',
+        status: connectionChanged ? 'active' : existingAccount?.status ?? 'active',
+        priority: input.priority,
+        weight: input.weight,
+        maxConcurrency: input.maxConcurrency,
+        inFlight: connectionChanged ? 0 : existingAccount?.inFlight ?? 0,
+        availableModels: models,
+        modelsRefreshedAt: timestamp,
+        modelPolicy: existingAccount?.modelPolicy ?? 'all',
+        modelAllowlist: existingAccount?.modelAllowlist ?? [],
+        proxyId: input.proxyId,
+        credentialType: existingAccount?.credentialType ?? 'api-key',
+        credentialExpiresAt: existingAccount?.credentialExpiresAt,
+        renewable: existingAccount?.renewable,
+        tagId: existingAccount?.tagId,
+        quota: connectionChanged ? undefined : existingAccount?.quota,
+        codexQuota: existingAccount?.codexQuota,
+        cooldownUntil: connectionChanged ? undefined : existingAccount?.cooldownUntil,
+        circuitState: connectionChanged ? 'closed' : existingAccount?.circuitState,
+        consecutiveFailures: connectionChanged ? 0 : existingAccount?.consecutiveFailures,
+        lastError: connectionChanged ? undefined : existingAccount?.lastError,
+        quotaRemaining: connectionChanged ? undefined : existingAccount?.quotaRemaining,
+        quotaUnit: connectionChanged ? undefined : existingAccount?.quotaUnit,
+        latencyMs: connectionChanged ? undefined : existingAccount?.latencyMs,
+        lastUsedAt: connectionChanged ? undefined : existingAccount?.lastUsedAt,
+        createdAt: existingAccount?.createdAt ?? timestamp,
+        updatedAt: timestamp,
+      }
+
+      const nextProviders = existing
+        ? snapshot.providers.map((item) => (item.id === provider.id ? provider : item))
+        : [...snapshot.providers, provider]
+      const nextAccounts = existingAccount
+        ? snapshot.accounts.map((item) => (item.id === account.id ? account : item))
+        : [...snapshot.accounts, account]
+      let nextPools = [...snapshot.pools]
+      let nextRoutes = [...snapshot.routes]
+      if (input.unlinkIncompatiblePools) {
+        const deletedPoolIds = new Set<string>()
+        nextPools = nextPools.flatMap((pool) => {
+          if (!pool.members.some((member) => member.accountId === account.id)) return [pool]
+          const compatible = pool.kind === 'relay-aggregate'
+            ? input.sourceType === 'relay' && pool.protocol === input.protocol
+            : accountMatchesPoolProtocol(pool.protocol, account, provider)
+              && pool.members.every((member) => {
+                if (member.accountId === account.id) return true
+                const memberAccount = nextAccounts.find((candidate) => candidate.id === member.accountId)
+                const memberProvider = nextProviders.find((candidate) => candidate.id === memberAccount?.providerId)
+                return Boolean(memberProvider) && providerSourceFamily(memberProvider!.kind) === providerSourceFamily(provider.kind)
+              })
+          if (compatible) return [pool]
+          const members = pool.members.filter((member) => member.accountId !== account.id)
+          if (!members.length || (pool.kind === 'relay-aggregate' && members.length < 2)) {
+            deletedPoolIds.add(pool.id)
+            return []
+          }
+          return [{ ...pool, members, updatedAt: timestamp }]
+        })
+        nextRoutes = nextRoutes.map((route) => deletedPoolIds.has(route.poolId)
+          ? { ...route, enabled: false, poolId: '', updatedAt: timestamp }
+          : route)
+      }
+
+      // Commit only after every validation and derived update has succeeded.
+      snapshot.providers = nextProviders
+      snapshot.accounts = nextAccounts
+      snapshot.pools = nextPools
+      snapshot.routes = nextRoutes
+      reconcileMockPoolModels()
+      return changed()
     },
-    async probeApiSource() {
+    async probeApiSource(input) {
+      await pause()
+      const existing = input.id ? snapshot.providers.find((provider) => provider.id === input.id) : undefined
+      const discoveredModels = defaultMockSourceModels(input.kind, input.protocol)
+      const configuredModel = input.model?.trim() || existing?.models[0] || discoveredModels[0]
+      const models = existing?.models.length
+        ? [...existing.models]
+        : configuredModel
+          ? [configuredModel, ...discoveredModels.filter((model) => model !== configuredModel)]
+          : discoveredModels
+      if (mockSourceRequiresToolRoundtrip(input)) {
+        const isKiro = input.protocol === 'kiro-claude'
+        const bridgeName = isKiro ? 'Kiro Claude' : 'Claude'
+        const result = {
+          ok: false,
+          stages: [
+            { id: 'network' as const, status: 'success' as const, message: mockText('网络可达（示例数据）', 'Network reachable (sample data)'), latencyMs: 38 },
+            { id: 'authentication' as const, status: 'warning' as const, message: mockText('浏览器 Mock 不会发送真实上游凭据', 'Browser mock never sends real upstream credentials') },
+            isKiro
+              ? { id: 'models' as const, status: 'skipped' as const, message: mockText('Kiro Claude 模型必须手动填写', 'Kiro Claude models must be entered manually') }
+              : { id: 'models' as const, status: 'success' as const, message: mockText(`使用 ${models.length} 个示例模型`, `Using ${models.length} sample model(s)`) },
+            { id: 'generation' as const, status: 'skipped' as const, message: mockText('未执行真实生成请求', 'No real generation request was made') },
+            { id: 'tool-roundtrip' as const, status: 'error' as const, message: mockText(`Mock 模式不能证明 ${bridgeName} 两轮工具链；请在桌面版完成真实测试`, `Mock mode cannot prove the ${bridgeName} two-turn tool chain; run the real test in the desktop app`) },
+          ],
+          models,
+          testedModel: configuredModel,
+          latencyMs: 38,
+          error: mockText(`${bridgeName} 工具链仍待验证`, `${bridgeName} tool-chain verification is still required`),
+          warnings: [isKiro
+            ? mockText('此来源可以保存为待验证，但不能绑定或加入聚合中转。', 'This source may be saved as pending verification, but cannot be bound or added to an aggregate relay.')
+            : mockText('此来源可以保存，但聊天可用不代表结构化工具链已验证。', 'This source may be saved, but working chat does not prove the structured tool chain.')],
+          capabilityProfile: { version: 1 as const, origin: 'inferred' as const, checkedAt: Date.now(), streaming: true, toolCalls: false, modelDiscovery: !isKiro },
+          modelCatalog: [],
+        }
+        if (input.persistCapabilities && existing) {
+          snapshot.providers = snapshot.providers.map((provider) => provider.id === existing.id
+            ? { ...provider, capabilityProfile: result.capabilityProfile, toolRoundtripVerified: false, updatedAt: Date.now() }
+            : provider)
+          publish()
+        }
+        return result
+      }
+
+      const probeEvidenceToken = makeId('probe-evidence')
+      apiSourceProbeEvidence.set(probeEvidenceToken, {
+        fingerprint: mockProbeEvidenceFingerprint({ ...input, model: configuredModel }),
+        expiresAt: Date.now() + 5 * 60_000,
+      })
       return {
-        ok: false,
-        stages: [],
-        models: [],
-        error: 'API source mock is not implemented yet.',
+        ok: true,
+        stages: [
+          { id: 'network', status: 'success', message: mockText('网络可达（示例数据）', 'Network reachable (sample data)'), latencyMs: 38 },
+          { id: 'authentication', status: 'success', message: mockText('凭据格式有效（示例数据）', 'Credential accepted (sample data)') },
+          { id: 'models', status: 'success', message: mockText(`发现 ${models.length} 个模型`, `Discovered ${models.length} model(s)`) },
+          { id: 'generation', status: 'success', message: mockText('生成测试通过（示例数据）', 'Generation test passed (sample data)'), latencyMs: 320 },
+        ],
+        models,
+        testedModel: configuredModel,
+        latencyMs: 358,
         warnings: [],
-        capabilityProfile: { version: 1, origin: 'inferred' },
+        capabilityProfile: { version: 1, origin: 'probed', checkedAt: Date.now(), streaming: true, toolCalls: true, modelDiscovery: true },
         modelCatalog: [],
+        probeEvidenceToken,
       }
     },
     async previewRoute(input) {
@@ -2393,13 +2677,14 @@ export function createMockApi(): GatewayApi {
             exists: content !== undefined || client !== 'gemini',
             editable,
             containsCredential: file.containsCredential,
-            ...(editable ? { content: content ?? (mockConfigFormat(file.role) === 'json' ? '{}\n' : '') } : {}),
+            ...(content !== undefined || editable ? { content: content ?? (mockConfigFormat(file.role) === 'json' ? '{}\n' : '') } : {}),
             revision: `mock-${client}-${file.role}`,
-            protectedValueCount: content?.match(/__STONE_PROTECTED_VALUE__/g)?.length ?? (editable ? 0 : 1),
+            protectedValueCount: 0,
           }
         }),
       }
     },
+    async openClientConfigFile() {},
     async saveClientConfigEditor(input) {
       await pause()
       const changedFiles = new Set<string>()

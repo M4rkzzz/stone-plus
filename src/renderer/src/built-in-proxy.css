@@ -111,7 +111,7 @@
   justify-content: space-between;
   gap: 7px;
   padding: 4px 5px 4px 12px;
-  border: 1px solid var(--border-strong);
+  border: 1px solid var(--control-border);
   border-radius: 20px;
   background: var(--surface-muted);
   color: var(--muted);
@@ -126,7 +126,7 @@
   height: 28px;
   flex: 0 0 auto;
   border-radius: 50%;
-  border: 1px solid var(--border-strong);
+  border: 1px solid var(--control-border);
   background: var(--surface-raised);
   box-shadow: var(--shadow-sm);
 }
@@ -326,14 +326,6 @@
 .built-in-proxy-import__footer > span svg { color: var(--accent); }
 .built-in-proxy-import--compact { margin-top: 2px; }
 
-.built-in-proxy__overview-grid,
-.built-in-proxy__settings-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  align-items: stretch;
-  gap: 12px;
-}
-
 .built-in-proxy-profiles,
 .built-in-proxy-route,
 .built-in-proxy-mode,
@@ -372,7 +364,7 @@
   height: 20px;
   flex: 0 0 auto;
   place-items: center;
-  border: 1px solid var(--border-strong);
+  border: 1px solid var(--control-border);
   border-radius: 50%;
   background: var(--surface-raised);
   color: var(--accent);
@@ -416,7 +408,7 @@
   white-space: nowrap;
 }
 
-.built-in-proxy-route__path > i { height: 1px; background: var(--rule-line); }
+.built-in-proxy-route__path > i { height: 1px; background: var(--topology-line); }
 .built-in-proxy-route__inactive {
   display: flex;
   align-items: center;
@@ -541,7 +533,7 @@
   text-align: left;
 }
 
-.built-in-proxy-choice-grid button > span { display: grid; width: 18px; height: 18px; place-items: center; border: 1px solid var(--border-strong); border-radius: 50%; color: var(--on-accent); }
+.built-in-proxy-choice-grid button > span { display: grid; width: 18px; height: 18px; place-items: center; border: 1px solid var(--control-border); border-radius: 50%; color: var(--on-accent); }
 .built-in-proxy-choice-grid button strong { font-size: 10px; }
 .built-in-proxy-choice-grid button small { color: var(--muted); font-size: 8px; line-height: 1.45; }
 .built-in-proxy-choice-grid button.is-selected { border-color: var(--border-active); background: var(--surface-raised); }
@@ -761,8 +753,6 @@
 .built-in-proxy-connection-bytes > span { display: flex; align-items: center; gap: 2px; color: var(--muted); font-size: 8px; }
 
 @media (max-width: 1080px) {
-  .built-in-proxy__overview-grid,
-  .built-in-proxy__settings-grid { grid-template-columns: minmax(0, 1fr); }
   .built-in-proxy-traffic { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .built-in-proxy-traffic__metric:nth-child(2) { border-right: 0; }
   .built-in-proxy-traffic__metric:nth-child(-n + 2) { border-bottom: 1px solid var(--border); }

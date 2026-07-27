@@ -4,8 +4,11 @@ import type {
   ClientConfigFieldValue,
   ClientConfigFileFormat,
   ClientConfigFileRole,
+  PoolProtocol,
   Route,
+  RouteClient,
 } from '@shared/types'
+import { clientNativeProtocols } from '@shared/types'
 import type { AgentLifecycleState } from '@shared/agent-lifecycle'
 import type { UiLanguage } from './i18n'
 import { mutateJsonObject, objectField, parseJsonObject, type JsonObject } from '../../main/client-config/json-format'
@@ -23,14 +26,26 @@ export function clientRouteSelectionDisabled(busy: boolean, availableSourceCount
   return busy || availableSourceCount === 0
 }
 
-/** Keep explicit user mappings; otherwise a single exposed upstream model is
- * a deterministic route-layer default for one-click connection. */
+export interface OneClickRouteModelContext {
+  client: RouteClient
+  sourceProtocol?: PoolProtocol
+}
+
+/** Preserve explicit mappings. A one-click repair may add a fallback only for
+ * a real cross-wire bridge with exactly one effective upstream model. */
 export function oneClickRouteModelMap(
   current: Readonly<Record<string, string>>,
   sourceModels: readonly string[],
+  context?: OneClickRouteModelContext,
 ): Record<string, string> {
-  if (Object.keys(current).length > 0 || sourceModels.length !== 1) return { ...current }
-  return { '*': sourceModels[0] }
+  const result = { ...current }
+  if (!context?.sourceProtocol
+    || Object.hasOwn(result, '*')
+    || context.client === 'grokbuild'
+    || context.sourceProtocol === clientNativeProtocols[context.client]) return result
+  const models = [...new Set(sourceModels.map((model) => model.trim()).filter(Boolean))]
+  if (models.length === 1) result['*'] = models[0]
+  return result
 }
 
 export function oneClickRouteNeedsUpdate(current: Route | undefined, next: Route): boolean {
@@ -502,6 +517,7 @@ export function buildClientConfigWorkbenchPreview(
         role: file.role,
         path: file.path,
         format: file.format,
+        ...(file.content !== undefined ? { content: file.content } : {}),
         exists: file.exists,
         editable: file.editable,
         protectedValueCount: file.protectedValueCount,

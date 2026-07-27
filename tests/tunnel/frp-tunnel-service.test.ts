@@ -44,7 +44,7 @@ describe('FRP tunnel service', () => {
     expect(() => parseTunnelEndpoint('serverAddr = "frps.example.com"', true)).toThrow(/TCP proxy/)
   })
 
-  it('persists configuration without exposing it through Stone diagnostics', async () => {
+  it('persists and returns the complete configuration for the explicit editor', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'stone-frp-test-'))
     temporaryDirectories.push(directory)
     const service = new FrpTunnelService({
@@ -61,24 +61,22 @@ type = "tcp"
 remotePort = 15721
 `
     const state = await service.saveConfig(content)
-    expect(state.config).not.toContain('secret-control-token')
-    expect(state.config).toContain('[REDACTED]')
+    expect(state.config).toBe(content)
     expect(state.binaryAvailable).toBe(false)
     expect(state.remoteAddress).toBe('http://frps.example.com:15721/v1')
     expect(await readFile(join(directory, 'frp', 'frpc.toml'), 'utf8')).toBe(content)
   })
 
-  it('redacts auth and OIDC secrets without overwriting them when the masked config is saved', async () => {
+  it('returns auth and OIDC values in plaintext and keeps restrictive file permissions', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'stone-frp-secret-'))
     temporaryDirectories.push(directory)
     const service = new FrpTunnelService({ userDataPath: directory, binaryPath: join(directory, 'frpc'), platform: 'linux' })
     await service.initialize()
     await service.saveConfig(`serverAddr = "example.com"\nauth.token = "control-secret#suffix" # private\n[auth.oidc]\nclientSecret = "oidc-secret"\n[[proxies]]\ntype = "tcp"\nremotePort = 15721\n`)
-    const masked = (await service.getState()).config
-    expect(masked).not.toContain('control-secret')
-    expect(masked).not.toContain('suffix')
-    expect(masked).not.toContain('oidc-secret')
-    await service.saveConfig(masked)
+    const visible = (await service.getState()).config
+    expect(visible).toContain('control-secret#suffix')
+    expect(visible).toContain('oidc-secret')
+    await service.saveConfig(visible)
     const persisted = await readFile(join(directory, 'frp', 'frpc.toml'), 'utf8')
     expect(persisted).toContain('control-secret#suffix')
     expect(persisted).toContain('oidc-secret')
@@ -88,7 +86,7 @@ remotePort = 15721
     }
   })
 
-  it('recursively redacts inline tables, array tables, mixed-case keys, and restores every placeholder structurally', async () => {
+  it('round-trips inline tables, array tables, mixed-case keys, and literal redacted text', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'stone-frp-structured-secret-'))
     temporaryDirectories.push(directory)
     const service = new FrpTunnelService({ userDataPath: directory, binaryPath: join(directory, 'frpc'), platform: 'linux' })
@@ -107,14 +105,14 @@ AUTHORIZATIONHeader = "Bearer authorization-value"
 `
     await service.saveConfig(original)
 
-    const masked = (await service.getState()).config
+    const visible = (await service.getState()).config
     for (const secret of [
       'inline-token', 'inline-client-secret', 'array-secret', 'array-password',
       'credential-value', 'authorization-value',
-    ]) expect(masked).not.toContain(secret)
-    expect(masked).toContain('displayName = "[REDACTED]"')
+    ]) expect(visible).toContain(secret)
+    expect(visible).toContain('displayName = "[REDACTED]"')
 
-    await service.saveConfig(masked)
+    await service.saveConfig(visible)
     const restored = parse(await readFile(join(directory, 'frp', 'frpc.toml'), 'utf8')) as Record<string, unknown>
     expect(restored).toMatchObject({
       auth: { ToKeN: 'inline-token', oidc: { ClientSECRET: 'inline-client-secret' } },
@@ -128,16 +126,17 @@ AUTHORIZATIONHeader = "Bearer authorization-value"
     })
   })
 
-  it('fails closed when a masked secret has no corresponding persisted value', async () => {
+  it('treats a literal redacted value as normal editable configuration content', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'stone-frp-orphan-mask-'))
     temporaryDirectories.push(directory)
     const service = new FrpTunnelService({ userDataPath: directory, binaryPath: join(directory, 'frpc'), platform: 'linux' })
     await service.initialize()
     await service.saveConfig('serverAddr = "example.com"\n[[proxies]]\ntype = "tcp"\nremotePort = 15721\n')
 
-    await expect(service.saveConfig(
+    const state = await service.saveConfig(
       'serverAddr = "example.com"\nauth.token = "[REDACTED]"\n[[proxies]]\ntype = "tcp"\nremotePort = 15721\n',
-    )).rejects.toThrow(/stored secret|redacted/i)
+    )
+    expect(state.config).toContain('auth.token = "[REDACTED]"')
   })
 
   it('requires a binary integrity verifier before configuration validation or spawn and redacts verifier errors', async () => {

@@ -42,6 +42,62 @@ export function summarizeAccountQuota(accounts: AppSnapshot['accounts']): Accoun
   }
 }
 
+/**
+ * "Is the account unusable right now" — a different question than
+ * accountRemainingPercent's "how much is left". Exhaustion honors resetAt
+ * expiry and zero-remaining windows without a limit, so neither function can
+ * be derived from the other; keep both here so the two answers stay adjacent.
+ */
+export function accountQuotaIsExhausted(account: PublicAccount, now = Date.now()): boolean {
+  if (account.quotaRemaining !== undefined && account.quotaRemaining <= 0) return true
+  if (account.codexQuota?.limitReached || account.codexQuota?.allowed === false) return true
+  if ([account.codexQuota?.fiveHour, account.codexQuota?.sevenDay].some((window) =>
+    window !== undefined && window.usedPercent >= 100 && (window.resetAt === undefined || window.resetAt > now)
+  )) return true
+  return [account.quota?.requests, account.quota?.tokens, account.quota?.inputTokens, account.quota?.outputTokens]
+    .some((window) => window?.remaining === 0 && (window.resetAt === undefined || window.resetAt > now))
+}
+
+export function accountIsCooling(account: PublicAccount, now = Date.now()): boolean {
+  return account.status === 'cooldown' || (account.cooldownUntil !== undefined && account.cooldownUntil > now)
+}
+
+export function thawCountdown(until: number, now: number): string {
+  const totalMinutes = Math.max(1, Math.ceil((until - now) / 60_000))
+  const days = Math.floor(totalMinutes / 1_440)
+  const hours = Math.floor(totalMinutes % 1_440 / 60)
+  if (days > 0) return `${days}d${hours}h`
+  const totalHours = Math.floor(totalMinutes / 60)
+  const minutes = totalMinutes % 60
+  if (totalHours > 0) return `${totalHours}h${minutes}m`
+  return `${totalMinutes}m`
+}
+
+export function accountRecoveryAt(account: PublicAccount, now: number): number | undefined {
+  const candidates: number[] = []
+  if (account.cooldownUntil !== undefined && account.cooldownUntil > now) candidates.push(account.cooldownUntil)
+
+  const quotaResets = [account.quota?.requests, account.quota?.tokens, account.quota?.inputTokens, account.quota?.outputTokens]
+    .filter((window) => window?.remaining === 0 && window.resetAt !== undefined && window.resetAt > now)
+    .map((window) => window!.resetAt!)
+  if (quotaResets.length) candidates.push(Math.max(...quotaResets))
+
+  if (accountQuotaIsExhausted(account, now) && account.codexQuota) {
+    const windows = [account.codexQuota.fiveHour, account.codexQuota.sevenDay].filter(Boolean)
+    const exhaustedResets = windows
+      .filter((window) => window!.usedPercent >= 100 && window!.resetAt !== undefined && window!.resetAt! > now)
+      .map((window) => window!.resetAt!)
+    if (exhaustedResets.length) candidates.push(Math.max(...exhaustedResets))
+    else {
+      const futureResets = windows
+        .filter((window) => window!.resetAt !== undefined && window!.resetAt! > now)
+        .map((window) => window!.resetAt!)
+      if (futureResets.length) candidates.push(Math.min(...futureResets))
+    }
+  }
+  return candidates.length ? Math.max(...candidates) : undefined
+}
+
 function windowRemainingPercent(window: QuotaWindow | undefined): number | undefined {
   if (!window || window.limit === undefined || window.remaining === undefined || window.limit <= 0) return undefined
   return clampPercent((window.remaining / window.limit) * 100)

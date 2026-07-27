@@ -9,9 +9,9 @@ describe('native window chrome theme', () => {
       titleBarSymbol: '#3d4a45',
     })
     expect(windowChromePalette('dark')).toEqual({
-      background: '#161c1a',
-      titleBar: '#161c1a',
-      titleBarSymbol: '#bcc7c2',
+      background: '#141517',
+      titleBar: '#141517',
+      titleBarSymbol: '#c5c7c8',
     })
   })
 
@@ -24,11 +24,11 @@ describe('native window chrome theme', () => {
 
     applyWindowChromeTheme(window as never, 'dark')
 
-    expect(window.setBackgroundColor).toHaveBeenCalledWith('#161c1a')
+    expect(window.setBackgroundColor).toHaveBeenCalledWith('#141517')
     if (process.platform !== 'darwin') {
       expect(window.setTitleBarOverlay).toHaveBeenCalledWith({
-        color: '#161c1a',
-        symbolColor: '#bcc7c2',
+        color: '#141517',
+        symbolColor: '#c5c7c8',
         height: TITLE_BAR_HEIGHT,
       })
     }

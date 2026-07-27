@@ -194,6 +194,7 @@ const FITNESS_HISTORY_WINDOW_MS = 30 * 24 * 60 * 60_000
 const FITNESS_HISTORY_ROWS_PER_ACCOUNT = 400
 const IGNORED_UPDATE_VERSION_KEY = 'ignored_update_version'
 const CREDENTIAL_IMPORT_JOURNAL_KEY = 'credential_import_rollback_v1'
+const CREDENTIAL_ROTATION_JOURNAL_KEY = 'credential_rotation_recovery_v1'
 const OBSERVABILITY_CACHE_TTL_MS = 1_000
 const OBSERVABILITY_IDLE_CACHE_TTL_MS = 60_000
 const DEFAULT_ACCOUNT_TAGS: ReadonlyArray<Pick<AccountTagDefinition, 'id' | 'name'>> = [
@@ -246,6 +247,23 @@ interface CredentialImportCaptureMarker {
   phase: 'capturing'
 }
 
+type RotatingCredentialType = 'chatgpt-oauth' | 'grok-oauth' | 'chatgpt-agent-identity'
+
+interface CredentialRotationRecord {
+  version: 1
+  accountId: string
+  credentialType: RotatingCredentialType
+  sourceSha256: string
+  rotatedSha256: string
+  encryptedRotated: string
+  createdAt: number
+}
+
+interface CredentialRotationJournal {
+  version: 1
+  entries: Record<string, CredentialRotationRecord>
+}
+
 export class AppStore {
   private readonly store: SqliteStateStore<PersistedState>
   private readonly setupWizard: SetupWizardRepository
@@ -286,6 +304,7 @@ export class AppStore {
   private readonly vaultBackend: string
   private readonly decryptedCredentialCache = new Map<string, string>()
   private activeCredentialImportId: string | undefined
+  private credentialRotationTail: Promise<void> = Promise.resolve()
 
   public constructor(userDataPath: string) {
     const vault = inspectCredentialVault()
@@ -304,6 +323,7 @@ export class AppStore {
   public async initialize(): Promise<void> {
     await this.store.initialize()
     await this.recoverInterruptedCredentialImport()
+    await this.recoverInterruptedCredentialRotations()
     await this.persistentTasks.recover()
     await this.persistentTasks.pruneTerminalTasks()
     if (this.store.select((state) => state.requestLogs.some((log) => log.status === 'streaming'))) {
@@ -331,6 +351,7 @@ export class AppStore {
     // Plaintext credentials are an in-memory optimization only. Drop them as
     // soon as shutdown starts, including when later persistence cleanup fails.
     this.invalidateCredentialCache()
+    await this.credentialRotationTail.catch(() => undefined)
     // A clear keeps the old live generation in memory until its SQLite delete
     // commits so it can roll back safely. Do not checkpoint that generation
     // behind the delete during shutdown, or it would resurrect cleared rows.
@@ -452,6 +473,124 @@ export class AppStore {
         ;(state[section] as PersistedState[typeof section]) = structuredClone(journal.rollback[section])
       }
     }, CREDENTIAL_IMPORT_SECTIONS)
+  }
+
+  private recoverInterruptedCredentialRotations(): Promise<void> {
+    return this.serializeCredentialRotation(async () => {
+      const serialized = this.store.readAppMetadata(CREDENTIAL_ROTATION_JOURNAL_KEY)
+      if (!serialized) return
+      const journal = parseCredentialRotationJournal(serialized)
+      if (!journal) {
+        await this.store.removeAppMetadata(CREDENTIAL_ROTATION_JOURNAL_KEY)
+        return
+      }
+      for (const [key, record] of Object.entries(journal.entries)) {
+        const rotated = this.decrypt(record.encryptedRotated)
+        const account = this.store.selectAccount<Account>(record.accountId)
+        const current = account ? this.getCredential(account.credentialId) : undefined
+        if (
+          rotated
+          && current
+          && account?.credentialType === record.credentialType
+          && credentialSha256(rotated) === record.rotatedSha256
+        ) {
+          const currentSha256 = credentialSha256(current)
+          if (currentSha256 === record.sourceSha256) {
+            await this.applyCredentialRotation(record.credentialType, record.accountId, rotated, current)
+          }
+          // If current already equals rotated, the credential write committed
+          // before the crash. If it differs from both hashes, a newer import or
+          // edit won and must never be overwritten by recovery.
+        }
+        delete journal.entries[key]
+        await this.writeCredentialRotationJournal(journal)
+      }
+    })
+  }
+
+  private persistCredentialRotation(
+    credentialType: RotatingCredentialType,
+    accountId: string,
+    serialized: string,
+    expectedSourceSerialized?: string,
+  ): Promise<void> {
+    return this.serializeCredentialRotation(async () => {
+      const account = this.store.selectAccount<Account>(accountId)
+      if (!account || account.credentialType !== credentialType) throw new Error('Rotating account not found.')
+      const source = this.getCredential(account.credentialId)
+      if (!source) throw new Error('The credential being rotated is unavailable.')
+      if (expectedSourceSerialized !== undefined && source !== expectedSourceSerialized) {
+        throw new Error('Account credential changed while it was being rotated.')
+      }
+      // Validate before journaling so startup recovery never has to interpret
+      // malformed credential material returned by an upstream.
+      assertRotatedCredential(credentialType, serialized)
+      const encryptedRotated = this.encrypt(serialized)
+      const key = credentialRotationKey(credentialType, accountId)
+      const journal = parseCredentialRotationJournal(
+        this.store.readAppMetadata(CREDENTIAL_ROTATION_JOURNAL_KEY),
+      ) ?? { version: 1, entries: {} }
+      journal.entries[key] = {
+        version: 1,
+        accountId,
+        credentialType,
+        sourceSha256: credentialSha256(source),
+        rotatedSha256: credentialSha256(serialized),
+        encryptedRotated,
+        createdAt: Date.now(),
+      }
+      try {
+        // The recovery material is encrypted with the same OS vault and is
+        // durable before the main account row is replaced.
+        await this.writeCredentialRotationJournal(journal)
+      } catch {
+        // If metadata storage alone is unavailable, still attempt the atomic
+        // account update rather than discarding a token the server just
+        // rotated. A failure here remains visible to the caller.
+        await this.applyCredentialRotation(credentialType, accountId, serialized, source)
+        return
+      }
+      await this.applyCredentialRotation(credentialType, accountId, serialized, source)
+      const latest = parseCredentialRotationJournal(
+        this.store.readAppMetadata(CREDENTIAL_ROTATION_JOURNAL_KEY),
+      ) ?? { version: 1, entries: {} }
+      delete latest.entries[key]
+      // The primary credential row is already durable. A cleanup failure must
+      // not fail the user's otherwise successful request; startup recovery
+      // recognizes the rotated hash and removes the redundant journal later.
+      await this.writeCredentialRotationJournal(latest).catch(() => undefined)
+    })
+  }
+
+  private async writeCredentialRotationJournal(journal: CredentialRotationJournal): Promise<void> {
+    if (Object.keys(journal.entries).length === 0) {
+      await this.store.removeAppMetadata(CREDENTIAL_ROTATION_JOURNAL_KEY)
+      return
+    }
+    await this.store.writeAppMetadata(CREDENTIAL_ROTATION_JOURNAL_KEY, JSON.stringify(journal))
+  }
+
+  private applyCredentialRotation(
+    credentialType: RotatingCredentialType,
+    accountId: string,
+    serialized: string,
+    expectedSourceSerialized: string,
+  ): Promise<void> {
+    if (credentialType === 'chatgpt-oauth') {
+      return this.updateChatGptCredential(accountId, serialized, expectedSourceSerialized)
+    }
+    if (credentialType === 'grok-oauth') {
+      return this.updateGrokOAuthCredential(accountId, serialized, expectedSourceSerialized)
+    }
+    return this.updateChatGptAgentIdentityCredential(accountId, serialized, expectedSourceSerialized)
+  }
+
+  private async serializeCredentialRotation<T>(operation: () => Promise<T>): Promise<T> {
+    const preceding = this.credentialRotationTail
+    let release!: () => void
+    this.credentialRotationTail = new Promise<void>((resolve) => { release = resolve })
+    await preceding.catch(() => undefined)
+    try { return await operation() } finally { release() }
   }
 
   /** Restore/lifecycle hook: discard every plaintext derived from old state. */
@@ -2841,6 +2980,14 @@ export class AppStore {
     this.decryptedCredentialCache.set(encrypted, serialized)
   }
 
+  public persistRotatedChatGptCredential(
+    accountId: string,
+    serialized: string,
+    expectedSourceSerialized?: string,
+  ): Promise<void> {
+    return this.persistCredentialRotation('chatgpt-oauth', accountId, serialized, expectedSourceSerialized)
+  }
+
   public async updateGrokOAuthCredential(
     accountId: string,
     serialized: string,
@@ -2869,6 +3016,14 @@ export class AppStore {
     this.decryptedCredentialCache.set(encrypted, serialized)
   }
 
+  public persistRotatedGrokOAuthCredential(
+    accountId: string,
+    serialized: string,
+    expectedSourceSerialized?: string,
+  ): Promise<void> {
+    return this.persistCredentialRotation('grok-oauth', accountId, serialized, expectedSourceSerialized)
+  }
+
   public async updateChatGptAgentIdentityCredential(
     accountId: string,
     serialized: string,
@@ -2893,6 +3048,14 @@ export class AppStore {
     }, previousEncrypted)
     if (previousEncrypted) this.decryptedCredentialCache.delete(previousEncrypted)
     this.decryptedCredentialCache.set(encrypted, serialized)
+  }
+
+  public persistRotatedChatGptAgentIdentityCredential(
+    accountId: string,
+    serialized: string,
+    expectedSourceSerialized?: string,
+  ): Promise<void> {
+    return this.persistCredentialRotation('chatgpt-agent-identity', accountId, serialized, expectedSourceSerialized)
   }
 
   private encrypt(credential: string): string {
@@ -4812,6 +4975,63 @@ function isCredentialImportCaptureMarker(serialized: string): boolean {
   } catch {
     return false
   }
+}
+
+function credentialSha256(serialized: string): string {
+  return createHash('sha256').update(serialized).digest('base64url')
+}
+
+function credentialRotationKey(type: RotatingCredentialType, accountId: string): string {
+  return `${type}:${accountId}`
+}
+
+function assertRotatedCredential(type: RotatingCredentialType, serialized: string): void {
+  const valid = type === 'chatgpt-oauth'
+    ? deserializeChatGptCredential(serialized)
+    : type === 'grok-oauth'
+      ? deserializeGrokOAuthCredential(serialized)
+      : deserializeChatGptAgentIdentity(serialized)
+  if (!valid) throw new Error('Rotated credential is invalid.')
+}
+
+function parseCredentialRotationJournal(serialized: string | undefined): CredentialRotationJournal | undefined {
+  if (!serialized) return undefined
+  try {
+    const parsed = JSON.parse(serialized) as Partial<CredentialRotationJournal>
+    if (parsed?.version !== 1 || !parsed.entries || typeof parsed.entries !== 'object' || Array.isArray(parsed.entries)) {
+      return undefined
+    }
+    const entries: Record<string, CredentialRotationRecord> = Object.create(null) as Record<string, CredentialRotationRecord>
+    const rawEntries = Object.entries(parsed.entries)
+    if (rawEntries.length > 10_000) return undefined
+    for (const [key, raw] of rawEntries) {
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined
+      const record = raw as Partial<CredentialRotationRecord>
+      if (
+        record.version !== 1
+        || typeof record.accountId !== 'string'
+        || record.accountId.length === 0
+        || !isRotatingCredentialType(record.credentialType)
+        || key !== credentialRotationKey(record.credentialType, record.accountId)
+        || typeof record.sourceSha256 !== 'string'
+        || !/^[A-Za-z0-9_-]{43}$/.test(record.sourceSha256)
+        || typeof record.rotatedSha256 !== 'string'
+        || !/^[A-Za-z0-9_-]{43}$/.test(record.rotatedSha256)
+        || typeof record.encryptedRotated !== 'string'
+        || record.encryptedRotated.length === 0
+        || typeof record.createdAt !== 'number'
+        || !Number.isFinite(record.createdAt)
+      ) return undefined
+      entries[key] = record as CredentialRotationRecord
+    }
+    return { version: 1, entries }
+  } catch {
+    return undefined
+  }
+}
+
+function isRotatingCredentialType(value: unknown): value is RotatingCredentialType {
+  return value === 'chatgpt-oauth' || value === 'grok-oauth' || value === 'chatgpt-agent-identity'
 }
 
 function inspectCredentialVault(): { available: boolean; backend: string } {

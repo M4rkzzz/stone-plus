@@ -46,6 +46,7 @@ const electron = vi.hoisted(() => ({
   getLocale: vi.fn(() => 'zh-CN'),
   showOpenDialog: vi.fn(),
   openExternal: vi.fn(),
+  openPath: vi.fn(async () => ''),
   relaunch: vi.fn(),
   quit: vi.fn(),
   isPackaged: false,
@@ -83,7 +84,7 @@ vi.mock('electron', () => ({
   Notification: class {
     static isSupported(): boolean { return false }
   },
-  shell: { openExternal: electron.openExternal }
+  shell: { openExternal: electron.openExternal, openPath: electron.openPath }
 }))
 
 const provider: ProviderDefinition = {
@@ -3099,6 +3100,21 @@ function createHarness(
     return snapshot
   })
 
+  const updateChatGptCredential = vi.fn(async (
+    _accountId: string,
+    _serialized: string,
+    _expectedSourceSerialized?: string,
+  ) => undefined)
+  const updateGrokOAuthCredential = vi.fn(async (
+    _accountId: string,
+    _serialized: string,
+    _expectedSourceSerialized?: string,
+  ) => undefined)
+  const updateChatGptAgentIdentityCredential = vi.fn(async (
+    _accountId: string,
+    _serialized: string,
+    _expectedSourceSerialized?: string,
+  ) => undefined)
   const store = {
     getPersistentTaskRunner: vi.fn(() => taskRunner),
     getSnapshot: vi.fn(() => snapshot),
@@ -3153,8 +3169,20 @@ function createHarness(
     getAccountModelDiscoveryFingerprint: vi.fn(() => discoveryFingerprint.current),
     getCredential: vi.fn((credentialId: string) => credentials[credentialId]),
     getProxyPassword: vi.fn(() => undefined),
-    updateChatGptCredential: vi.fn(async () => undefined),
-    updateGrokOAuthCredential: vi.fn(async () => undefined),
+    updateChatGptCredential,
+    updateGrokOAuthCredential,
+    updateChatGptAgentIdentityCredential,
+    persistRotatedChatGptCredential: vi.fn(async (...args: Parameters<typeof updateChatGptCredential>) => {
+      await updateChatGptCredential(...args)
+    }),
+    persistRotatedGrokOAuthCredential: vi.fn(async (...args: Parameters<typeof updateGrokOAuthCredential>) => {
+      await updateGrokOAuthCredential(...args)
+    }),
+    persistRotatedChatGptAgentIdentityCredential: vi.fn(async (
+      ...args: Parameters<typeof updateChatGptAgentIdentityCredential>
+    ) => {
+      await updateChatGptAgentIdentityCredential(...args)
+    }),
     importChatGptAccounts: vi.fn(async (input: { proxyMode?: string; proxyId?: string }) => {
       const imported = accounts[0]
       if (!imported) throw new Error('No mock account available for import')

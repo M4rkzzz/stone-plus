@@ -43,19 +43,34 @@ describe('one-click client route reconciliation', () => {
     createdAt: 1, updatedAt: 1,
   }
 
-  it('adds a deterministic route fallback when the source exposes one model', () => {
-    expect(oneClickRouteModelMap({}, ['claude-opus-4-8'])).toEqual({ '*': 'claude-opus-4-8' })
-    expect(oneClickRouteNeedsUpdate(route, {
-      ...route,
-      modelMap: { '*': 'claude-opus-4-8' },
-    })).toBe(true)
+  it('requires protocol context before adding a one-click route fallback', () => {
+    expect(oneClickRouteModelMap({}, ['claude-opus-4-8'])).toEqual({})
+    expect(oneClickRouteNeedsUpdate(route, { ...route })).toBe(false)
   })
 
-  it('does not replace explicit mappings or guess between multiple models', () => {
-    expect(oneClickRouteModelMap({ sonnet: 'claude-sonnet-5' }, ['claude-opus-4-8']))
-      .toEqual({ sonnet: 'claude-sonnet-5' })
-    expect(oneClickRouteModelMap({}, ['claude-opus-4-8', 'claude-opus-5'])).toEqual({})
-    expect(oneClickRouteNeedsUpdate(route, { ...route })).toBe(false)
+  it('adds one cross-protocol fallback without replacing explicit mappings', () => {
+    expect(oneClickRouteModelMap(
+      { sonnet: 'claude-sonnet-5' },
+      ['gpt-5.5'],
+      { client: 'claude', sourceProtocol: 'openai-responses' },
+    )).toEqual({ sonnet: 'claude-sonnet-5', '*': 'gpt-5.5' })
+    expect(oneClickRouteModelMap(
+      { '*': 'explicit-default' },
+      ['gpt-5.5'],
+      { client: 'claude', sourceProtocol: 'openai-responses' },
+    )).toEqual({ '*': 'explicit-default' })
+  })
+
+  it('does not guess for same-protocol, multi-model, or Grok Build routes', () => {
+    expect(oneClickRouteModelMap(
+      {}, ['claude-opus-4-8'], { client: 'claude', sourceProtocol: 'anthropic-messages' },
+    )).toEqual({})
+    expect(oneClickRouteModelMap(
+      {}, ['gpt-5.5', 'gpt-5.5-mini'], { client: 'claude', sourceProtocol: 'openai-responses' },
+    )).toEqual({})
+    expect(oneClickRouteModelMap(
+      {}, ['grok-4.5'], { client: 'grokbuild', sourceProtocol: 'grok' },
+    )).toEqual({})
   })
 
   it('restarts only controllable running clients and leaves external sessions to the user', () => {

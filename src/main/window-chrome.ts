@@ -15,7 +15,7 @@ interface WindowChromePalette {
 
 const CHROME_PALETTES: Record<UiTheme, WindowChromePalette> = {
   light: { background: '#f9fbfa', titleBar: '#f9fbfa', titleBarSymbol: '#3d4a45' },
-  dark: { background: '#161c1a', titleBar: '#161c1a', titleBarSymbol: '#bcc7c2' },
+  dark: { background: '#141517', titleBar: '#141517', titleBarSymbol: '#c5c7c8' },
 }
 
 export const TITLE_BAR_HEIGHT = 38

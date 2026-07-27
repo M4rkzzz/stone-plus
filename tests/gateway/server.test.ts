@@ -318,6 +318,25 @@ afterEach(async () => {
 })
 
 describe('GatewayServer', () => {
+  it('does not bind the local gateway until the startup network barrier succeeds', async () => {
+    const port = await freePort()
+    const beforeStart = vi.fn()
+      .mockRejectedValueOnce(new Error('stale system proxy lease'))
+      .mockResolvedValueOnce(undefined)
+    const gateway = new GatewayServer({
+      config: config(port),
+      credentialResolver: () => 'credential',
+      beforeStart,
+    })
+    runningServers.push(gateway)
+
+    await expect(gateway.start()).rejects.toThrow('stale system proxy lease')
+    expect(gateway.getStatus().running).toBe(false)
+    await expect(gateway.start()).resolves.toBeUndefined()
+    expect(gateway.getStatus().running).toBe(true)
+    expect(beforeStart).toHaveBeenCalledTimes(2)
+  })
+
   it('reports the statically matching accounts when scheduling has zero runtime candidates', async () => {
     const port = await freePort()
     const gatewayConfig = config(port)

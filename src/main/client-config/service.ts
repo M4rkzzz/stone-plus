@@ -173,10 +173,6 @@ export class ClientConfigService {
     const currentPermissionMode = client === 'claude'
       ? clientConfigEditorFields(client, existing).find((field) => field.id === 'claude.permissionMode')?.value
       : undefined
-    const requestedPermissionMode = client === 'claude'
-      ? changes.patches.find((patch) => patch.id === 'claude.permissionMode')?.value
-      : undefined
-    const requiresNewConversation = requestedPermissionMode === 'auto' && currentPermissionMode !== 'auto'
     const edited: ExistingClientConfig = { ...existing }
     const submitted = new Set<ClientConfigFilePath['role']>()
     for (const draft of changes.files) {
@@ -191,6 +187,13 @@ export class ClientConfigService {
       edited[file.role] = restoreClientConfigEditorContent(file, draft.content, source)
     }
     const patched = applyClientConfigFieldPatches(client, edited, changes.patches)
+    // Derive the effective mode from the fully restored document, not only
+    // from structured field patches. Advanced/raw editor changes must receive
+    // the same new-conversation warning as the form control.
+    const requestedPermissionMode = client === 'claude'
+      ? clientConfigEditorFields(client, patched).find((field) => field.id === 'claude.permissionMode')?.value
+      : undefined
+    const requiresNewConversation = requestedPermissionMode === 'auto' && currentPermissionMode !== 'auto'
     const connectionPlan = planClientConfig(client, this.paths, patched, target)
     const plannedRoles = new Set(connectionPlan.files.map((file) => file.role))
     const plan: ClientConfigPlan = {

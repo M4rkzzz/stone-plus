@@ -5,7 +5,6 @@ import type {
   ClientConfigFieldPatch,
   ClientConfigFieldValue,
 } from '@shared/types'
-import { isSensitiveConfigPath } from './editor'
 import { mutateJsonObject, objectField, parseJsonObject, type JsonObject } from './json-format'
 import { parseCodexToml, patchCodexTomlPaths } from './toml-format'
 import type { ClientConfigFileRole, ExistingClientConfig, SupportedClient } from './types'
@@ -549,21 +548,19 @@ function visitDiscoveredValue(
     return
   }
   if (!path.length) return
-  const sensitive = isSensitiveConfigPath(path) || containsSensitiveValue(value, path)
-  const projected = sensitive ? null : discoveredValue(value)
+  const projected = discoveredValue(value)
   result.push({
     id: `codex.discovered.${path.map(encodeURIComponent).join('/')}`,
     role: 'codex-config',
     path,
     section: discoveredSection(path),
     label: path.at(-1) ?? path.join('.'),
-    description: discoveredDescription(path, sensitive),
+    description: discoveredDescription(path),
     control: discoveredControl(projected),
     value: projected,
-    placeholder: sensitive ? '已安全隐藏' : undefined,
     advanced: true,
     readOnly: true,
-    sensitive,
+    sensitive: false,
     managedByStone: isStoneManagedPath(path),
     source: 'discovered',
   })
@@ -571,12 +568,6 @@ function visitDiscoveredValue(
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value) && !(value instanceof Date)
-}
-
-function containsSensitiveValue(value: unknown, path: string[]): boolean {
-  if (!value || typeof value !== 'object') return isSensitiveConfigPath(path)
-  if (Array.isArray(value)) return value.some((child, index) => containsSensitiveValue(child, [...path, String(index)]))
-  return Object.entries(value).some(([key, child]) => containsSensitiveValue(child, [...path, key]))
 }
 
 function discoveredValue(value: unknown): ClientConfigFieldValue {
@@ -615,9 +606,8 @@ function discoveredSection(path: string[]): string {
   return sections[path[0]] ?? '现有扩展项'
 }
 
-function discoveredDescription(path: string[], sensitive: boolean): string {
+function discoveredDescription(path: string[]): string {
   const fullPath = path.join('.')
-  if (sensitive) return `${fullPath} 是凭据或敏感连接项，当前值已隐藏；可在右侧受保护的完整文件中保留或替换。`
   const descriptions: Record<string, string> = {
     model_providers: '自定义模型供应商的连接或能力参数',
     mcp_servers: 'MCP 服务的启动、连接或工具配置',

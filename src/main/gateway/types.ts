@@ -92,6 +92,8 @@ export type ConversationTitleResolver = (conversationId: string) => Promise<stri
 export interface GatewayServerOptions {
   config: GatewayConfig
   credentialResolver: CredentialResolver
+  /** Fail-closed startup barrier for repairing OS network state before listen. */
+  beforeStart?: () => Promise<void>
   onLog?: GatewayLogHandler
   onAccountState?: GatewayAccountStateHandler
   fetchImplementation?: typeof fetch

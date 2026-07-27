@@ -303,7 +303,7 @@ describe('managed Claude launch residue', () => {
 })
 
 describe('single-model client route preparation', () => {
-  it('keeps the upstream model in the Claude route instead of the Claude client config', async () => {
+  it('does not create a wildcard mapping from a same-protocol source', async () => {
     const route = {
       id: 'route-claude', client: 'claude', enabled: true, poolId: 'kiro-provider',
       inboundProtocol: 'anthropic-messages', modelMap: {}, localToken: 'stone_claude_token',
@@ -327,10 +327,83 @@ describe('single-model client route preparation', () => {
 
     await ensureSingleModelRouteDefault(store, 'claude')
 
+    expect(updateRoute).not.toHaveBeenCalled()
+  })
+
+  it('adds a fallback for one cross-protocol upstream model and preserves exact mappings', async () => {
+    const route = {
+      id: 'route-claude', client: 'claude', enabled: true, poolId: 'openai-provider',
+      inboundProtocol: 'anthropic-messages', modelMap: { sonnet: 'gpt-explicit' },
+      localToken: 'stone_claude_token', createdAt: 1, updatedAt: 1,
+    } as const
+    const snapshot = {
+      routes: [route],
+      pools: [],
+      providers: [{
+        id: 'openai-provider', name: 'OpenAI relay', sourceType: 'relay', kind: 'openai-compatible',
+        protocol: 'openai-responses', baseUrl: 'https://example.invalid', models: ['gpt-5.5'],
+        createdAt: 1, updatedAt: 1,
+      }],
+      accounts: [{
+        id: 'openai-account', providerId: 'openai-provider', credentialType: 'api-key', status: 'active',
+        modelPolicy: 'all', modelAllowlist: [], availableModels: [], updatedAt: 1,
+      }],
+    }
+    const updateRoute = vi.fn(async () => snapshot)
+    const store = { getSnapshot: () => snapshot, updateRoute } as unknown as AppStore
+
+    await ensureSingleModelRouteDefault(store, 'claude')
+
     expect(updateRoute).toHaveBeenCalledWith({
       ...route,
-      modelMap: { '*': 'claude-opus-4-8' },
+      modelMap: { sonnet: 'gpt-explicit', '*': 'gpt-5.5' },
     })
+  })
+
+  it('does not guess between multiple cross-protocol models or rewrite Grok Build', async () => {
+    const crossRoute = {
+      id: 'route-codex', client: 'codex', enabled: true, poolId: 'claude-provider',
+      inboundProtocol: 'openai-responses', modelMap: {}, localToken: 'stone_codex_token',
+      createdAt: 1, updatedAt: 1,
+    } as const
+    const grokRoute = {
+      id: 'route-grok', client: 'grokbuild', enabled: true, poolId: 'grok-provider',
+      inboundProtocol: 'openai-responses', modelMap: {}, localToken: 'stone_grok_token',
+      createdAt: 1, updatedAt: 1,
+    } as const
+    const snapshot = {
+      routes: [crossRoute, grokRoute],
+      pools: [],
+      providers: [
+        {
+          id: 'claude-provider', name: 'Claude', sourceType: 'official-api', kind: 'anthropic',
+          protocol: 'anthropic-messages', baseUrl: 'https://example.invalid',
+          models: ['claude-opus-4-8', 'claude-sonnet-5'], createdAt: 1, updatedAt: 1,
+        },
+        {
+          id: 'grok-provider', name: 'Grok', sourceType: 'official-api', kind: 'xai',
+          protocol: 'openai-responses', baseUrl: 'https://example.invalid',
+          models: ['grok-4.5'], createdAt: 1, updatedAt: 1,
+        },
+      ],
+      accounts: [
+        {
+          id: 'claude-account', providerId: 'claude-provider', credentialType: 'api-key', status: 'active',
+          modelPolicy: 'all', modelAllowlist: [], availableModels: [], updatedAt: 1,
+        },
+        {
+          id: 'grok-account', providerId: 'grok-provider', credentialType: 'api-key', status: 'active',
+          modelPolicy: 'all', modelAllowlist: [], availableModels: [], updatedAt: 1,
+        },
+      ],
+    }
+    const updateRoute = vi.fn(async () => snapshot)
+    const store = { getSnapshot: () => snapshot, updateRoute } as unknown as AppStore
+
+    await ensureSingleModelRouteDefault(store, 'codex')
+    await ensureSingleModelRouteDefault(store, 'grokbuild')
+
+    expect(updateRoute).not.toHaveBeenCalled()
   })
 })
 

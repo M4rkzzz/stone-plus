@@ -132,7 +132,7 @@ export function saveApiSourceDraft(
   const sourceConfiguration = normalizeSourceConfiguration(input)
   const models = normalizeModels(input.models)
   const defaultModel = normalizeOptionalModel(input.defaultModel)
-  if (defaultModel && !models.includes(defaultModel)) models.unshift(defaultModel)
+  if (defaultModel) moveModelToFront(models, defaultModel)
   if (sourceConfiguration.protocol === 'kiro-claude' && models.length === 0) {
     throw new Error('Kiro Claude relay sources require a manually configured model.')
   }
@@ -220,9 +220,7 @@ export function saveApiSourceDraft(
   })
   const toolRoundtripModelChanged = requiresToolRoundtripEvidence
     && existingProvider !== undefined
-    && (!sameStrings(existingProvider.models, models)
-      || existingAccount?.modelPolicy !== (defaultModel ? 'selected' : 'all')
-      || !sameStrings(existingAccount?.modelAllowlist ?? [], defaultModel ? [defaultModel] : []))
+    && existingProvider.models[0] !== models[0]
   const connectionChanged = !existingProvider
     || !existingAccount
     || existingProvider.sourceType !== input.sourceType
@@ -311,6 +309,8 @@ export function saveApiSourceDraft(
     defaultModel,
     proxyId,
     input,
+    preserveRelayModelPolicy: existingProvider?.sourceType === 'relay'
+      && input.sourceType === 'relay',
     connectionChanged,
     timestamp
   })
@@ -623,10 +623,12 @@ function buildApiSourceAccount(input: {
   defaultModel: string | undefined
   proxyId: string | undefined
   input: ApiSourceInput
+  preserveRelayModelPolicy: boolean
   connectionChanged: boolean
   timestamp: number
 }): Account {
   const existing = input.existing
+  const preserveRelayModelPolicy = input.preserveRelayModelPolicy && existing !== undefined
   return {
     id: input.accountId,
     providerId: input.providerId,
@@ -643,8 +645,15 @@ function buildApiSourceAccount(input: {
     inFlight: input.connectionChanged ? 0 : existing?.inFlight ?? 0,
     availableModels: input.connectionChanged ? [] : existing?.availableModels ?? [],
     modelsRefreshedAt: input.connectionChanged ? undefined : existing?.modelsRefreshedAt,
-    modelPolicy: input.defaultModel ? 'selected' : 'all',
-    modelAllowlist: input.defaultModel ? [input.defaultModel] : [],
+    // The probe/default model is connection-test input, not an authorization
+    // decision. Relay catalogs stay open unless the user explicitly restricts
+    // the account later through the account model-policy editor.
+    modelPolicy: input.input.sourceType === 'relay'
+      ? preserveRelayModelPolicy ? existing.modelPolicy : 'all'
+      : input.defaultModel ? 'selected' : 'all',
+    modelAllowlist: input.input.sourceType === 'relay'
+      ? preserveRelayModelPolicy ? [...existing.modelAllowlist] : []
+      : input.defaultModel ? [input.defaultModel] : [],
     proxyId: input.proxyId,
     quotaRemaining: input.connectionChanged ? undefined : existing?.quotaRemaining,
     quotaUnit: input.connectionChanged ? undefined : existing?.quotaUnit,
@@ -819,6 +828,18 @@ function normalizeModels(value: unknown): string[] {
     result.push(model)
   }
   return result
+}
+
+/**
+ * ProviderDefinition has no separate default-model field. Keep the selected
+ * probe/default model at index zero so it survives restarts and can invalidate
+ * model-specific tool evidence without changing the persisted schema. The
+ * remaining catalog order stays stable.
+ */
+function moveModelToFront(models: string[], defaultModel: string): void {
+  const existingIndex = models.indexOf(defaultModel)
+  if (existingIndex >= 0) models.splice(existingIndex, 1)
+  models.unshift(defaultModel)
 }
 
 function normalizeOptionalModel(value: string | undefined): string | undefined {

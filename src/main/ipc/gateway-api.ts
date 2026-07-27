@@ -19,6 +19,7 @@ import type {
   AppSnapshot,
   ClientConfigEditorSaveInput,
   ClientConfigEditorState,
+  ClientConfigFileRole,
   ClientConfigPreview,
   ClientConfigStatus,
   ClientConfigProfile,
@@ -38,7 +39,7 @@ import { applyWindowChromeTheme } from '../window-chrome'
 import type { GatewayAccountState, GatewayConfig, GatewayRuntimeStateUpdate } from '../gateway'
 import { applyGrokBuildHeaders, checkChatGptAccountAuthorized, codexQuotaCooldownUntil, codexQuotaIsExhausted, getProviderAdapter, probeChatGptAccountAuthorized, probeChatGptCodexModel, probeProviderModel, queryChatGptCodexModels, queryChatGptCodexModelsAuthorized, queryChatGptCodexQuota, queryChatGptCodexQuotaAuthorized, queryGrokBuildQuota, resolveChatGptCredential, type GrokBuildQuotaResult, type GrokBuildQuotaSnapshot, type ProviderFailure } from '../providers'
 import { validateAccountImportProxySelection, type AppStore } from '../store/app-store'
-import type { ClientConfigService } from '../client-config'
+import { clientFiles, type ClientConfigService } from '../client-config'
 import { WebDavBackupService, type DatabaseBackupService } from '../backup'
 import type { PersistedState } from '../store/types'
 import { serializeDiagnostics } from './diagnostics'
@@ -2739,6 +2740,24 @@ export function registerGatewayApi(
       profileId: profile?.id ?? `default-${client}`
     } satisfies ClientConfigEditorState
   })
+  ipcMain.handle('stone:open-client-config-file', async (
+    event,
+    client: RouteClient,
+    role: ClientConfigFileRole,
+    profileId?: string,
+  ) => {
+    assertTrustedSender(event)
+    assertRouteClient(client)
+    if (typeof role !== 'string') throw new Error('A client configuration file role is required.')
+    const profile = resolveClientProfile(store, profileId, client)
+    const scoped = scopedClientConfig(clientConfig, profile)
+    const file = clientFiles(scoped.paths, client).find((candidate) => candidate.role === role)
+    if (!file) throw new Error('The selected configuration file does not belong to this client.')
+    const info = await lstat(file.path).catch(() => undefined)
+    if (!info?.isFile()) throw new Error('The selected configuration file does not exist.')
+    const failure = await shell.openPath(file.path)
+    if (failure) throw new Error('The operating system could not open the selected configuration file.')
+  })
   ipcMain.handle('stone:save-client-config-editor', (event, input: ClientConfigEditorSaveInput) => {
     assertTrustedSender(event)
     if (!input || typeof input !== 'object') throw new Error('Client configuration changes are required.')
@@ -3075,7 +3094,7 @@ async function resolveAgentIdentityForOperation(
   if (!serialized) throw new Error('This Agent Identity account has no readable credential.')
   const access = await resolveChatGptAgentIdentity(
     serialized,
-    (rotated, expectedSource) => store.updateChatGptAgentIdentityCredential(account.id, rotated, expectedSource),
+    (rotated, expectedSource) => store.persistRotatedChatGptAgentIdentityCredential(account.id, rotated, expectedSource),
     fetchImplementation,
     { signal }
   )
@@ -3119,7 +3138,7 @@ async function checkAccount(
     if (!serialized) throw new Error('This ChatGPT account has no readable credential.')
     const resolved = await resolveChatGptCredential(
       serialized,
-      (rotated, expectedSource) => store.updateChatGptCredential(account.id, rotated, expectedSource),
+      (rotated, expectedSource) => store.persistRotatedChatGptCredential(account.id, rotated, expectedSource),
       fetchImplementation,
       Date.now(),
       { refreshKey: account.id, signal }
@@ -3239,7 +3258,7 @@ export async function discoverAccountModels(
   if (!serialized) throw new Error('The selected ChatGPT account has no readable credential.')
   const resolved = await resolveChatGptCredential(
     serialized,
-    (rotated, expectedSource) => store.updateChatGptCredential(account.id, rotated, expectedSource),
+    (rotated, expectedSource) => store.persistRotatedChatGptCredential(account.id, rotated, expectedSource),
     fetchImplementation,
     Date.now(),
     { refreshKey: account.id }
@@ -3289,7 +3308,7 @@ export async function testAccountModel(
     if (!serialized) throw new Error('The selected ChatGPT account has no readable credential.')
     const resolved = await resolveChatGptCredential(
       serialized,
-      (rotated, expectedSource) => store.updateChatGptCredential(account.id, rotated, expectedSource),
+      (rotated, expectedSource) => store.persistRotatedChatGptCredential(account.id, rotated, expectedSource),
       fetchImplementation,
       Date.now(),
       { refreshKey: account.id, signal }
@@ -3337,7 +3356,7 @@ async function queryGrokOAuthAccountBilling(
   const signal = boundedAbortSignal(parentSignal, 10_000)
   let resolved = await resolveGrokOAuthCredential(
     serialized,
-    (rotated, expectedSource) => store.updateGrokOAuthCredential(account.id, rotated, expectedSource),
+    (rotated, expectedSource) => store.persistRotatedGrokOAuthCredential(account.id, rotated, expectedSource),
     fetchImplementation,
     Date.now(),
     { refreshKey: account.id, signal },
@@ -3354,7 +3373,7 @@ async function queryGrokOAuthAccountBilling(
     try {
       resolved = await resolveGrokOAuthCredential(
         resolved.serialized,
-        (rotated, expectedSource) => store.updateGrokOAuthCredential(account.id, rotated, expectedSource),
+        (rotated, expectedSource) => store.persistRotatedGrokOAuthCredential(account.id, rotated, expectedSource),
         fetchImplementation,
         Date.now(),
         { refreshKey: account.id, signal, forceRefresh: true },
@@ -3468,7 +3487,7 @@ async function refreshAccountCodexQuota(
   const fetchImplementation = accountFetchImplementation(store, outboundTransport, account)
   const resolved = await resolveChatGptCredential(
     serialized,
-    (rotated, expectedSource) => store.updateChatGptCredential(account.id, rotated, expectedSource),
+    (rotated, expectedSource) => store.persistRotatedChatGptCredential(account.id, rotated, expectedSource),
     fetchImplementation,
     Date.now(),
     { refreshKey: account.id }

@@ -1291,13 +1291,89 @@ describe('AppStore', () => {
     const snapshot = saved.snapshot
     const provider = snapshot.providers.find((candidate) => candidate.name === 'DeepSeek')!
     const account = snapshot.accounts.find((candidate) => candidate.providerId === provider.id)!
-    expect(account).toMatchObject({ name: 'DeepSeek', maskedCredential: '****cret', credentialType: 'api-key' })
+    expect(account).toMatchObject({
+      name: 'DeepSeek', maskedCredential: '****cret', credentialType: 'api-key',
+      modelPolicy: 'all', modelAllowlist: [],
+    })
     expect(store.getCredential(store.getRuntimeAccount(account.id)!.credentialId)).toBe('deepseek-secret')
     await expect(store.saveApiSource({
       name: 'Bad', sourceType: 'official-api', kind: 'openai', baseUrl: 'https://api.openai.com/v1',
       protocol: 'gemini', models: [], credential: 'secret', priority: 1, weight: 1, maxConcurrency: 1
     })).rejects.toThrow(/does not support/)
     expect(store.getSnapshot().providers).toHaveLength(before.providers.length + 1)
+  })
+
+  it('preserves explicit relay model restrictions and wildcard mappings across restart and backup restore', async () => {
+    const store = createStore()
+    await store.initialize()
+    const saved = await store.saveApiSource({
+      name: 'Restricted relay',
+      sourceType: 'relay',
+      kind: 'anthropic-compatible',
+      baseUrl: 'https://relay.example/v1',
+      protocol: 'anthropic-messages',
+      models: ['claude-fable-5', 'claude-opus-5'],
+      defaultModel: 'claude-fable-5',
+      credential: 'restricted-relay-secret',
+      priority: 10,
+      weight: 10,
+      maxConcurrency: 4,
+    })
+    const account = saved.snapshot.accounts.find((candidate) => candidate.id === saved.source.accountId)!
+    await store.saveAccount({
+      id: account.id,
+      providerId: account.providerId,
+      name: account.name,
+      priority: account.priority,
+      weight: account.weight,
+      maxConcurrency: account.maxConcurrency,
+      modelPolicy: 'selected',
+      modelAllowlist: ['claude-fable-5'],
+    })
+    const route = saved.snapshot.routes.find((candidate) => candidate.client === 'claude')!
+    await store.updateRoute({
+      ...route,
+      enabled: true,
+      poolId: saved.source.sourceId,
+      modelMap: { '*': 'claude-fable-5' },
+    })
+    const backupPath = join(directory, 'explicit-relay-settings.sqlite3')
+    await store.getStateRepository().backupTo(backupPath)
+    await store.close()
+
+    const restarted = createStore()
+    await restarted.initialize()
+    expect(restarted.getSnapshot().accounts.find((account) => account.id === saved.source.accountId))
+      .toMatchObject({ modelPolicy: 'selected', modelAllowlist: ['claude-fable-5'] })
+    expect(restarted.getSnapshot().routes.find((candidate) => candidate.client === 'claude'))
+      .toMatchObject({ modelMap: { '*': 'claude-fable-5' } })
+
+    const restartedAccount = restarted.getSnapshot().accounts
+      .find((candidate) => candidate.id === saved.source.accountId)!
+    await restarted.saveAccount({
+      id: restartedAccount.id,
+      providerId: restartedAccount.providerId,
+      name: restartedAccount.name,
+      priority: restartedAccount.priority,
+      weight: restartedAccount.weight,
+      maxConcurrency: restartedAccount.maxConcurrency,
+      modelPolicy: 'all',
+      modelAllowlist: [],
+    })
+    const restartedRoute = restarted.getSnapshot().routes
+      .find((candidate) => candidate.client === 'claude')!
+    await restarted.updateRoute({ ...restartedRoute, modelMap: {} })
+
+    await restarted.getStateRepository().runInRestoreMaintenance(async () => {
+      await restarted.getStateRepository().restoreFrom(
+        backupPath,
+        join(directory, 'explicit-relay-settings-rollback.sqlite3'),
+      )
+    })
+    expect(restarted.getSnapshot().accounts.find((candidate) => candidate.id === saved.source.accountId))
+      .toMatchObject({ modelPolicy: 'selected', modelAllowlist: ['claude-fable-5'] })
+    expect(restarted.getSnapshot().routes.find((candidate) => candidate.client === 'claude'))
+      .toMatchObject({ modelMap: { '*': 'claude-fable-5' } })
   })
 
   it('persists probed capabilities only while the source connection and probe revision still match', async () => {
@@ -2912,6 +2988,75 @@ describe('AppStore', () => {
     await expect(stale).rejects.toThrow('credential changed while it was being rotated')
     expect(store.getChatGptCredential(store.getRuntimeAccount(id)!.credentialId)).toMatchObject({
       accessToken: 'oauth-race-winner', refreshToken: 'oauth-race-rotated'
+    })
+  })
+
+  it('recovers a server-rotated OAuth credential after a crash between journal and account persistence', async () => {
+    const store = createStore()
+    await store.initialize()
+    const imported = await store.importChatGptAccounts({
+      providerId: 'provider-openai',
+      content: JSON.stringify({
+        access_token: 'oauth-journal-original', refresh_token: 'oauth-journal-refresh',
+        account_id: 'acct-oauth-journal', expired: new Date(Date.now() + 60_000).toISOString(),
+      }),
+    })
+    const id = imported.importedAccountIds[0]
+    const account = store.getRuntimeAccount(id)!
+    const source = store.getCredential(account.credentialId)!
+    const rotated = JSON.stringify({
+      accessToken: 'oauth-journal-rotated', refreshToken: 'oauth-journal-refresh-rotated',
+      accountId: 'acct-oauth-journal', expiresAt: Date.now() + 3_600_000,
+    })
+    vi.spyOn(store, 'updateChatGptCredential').mockRejectedValueOnce(new Error('simulated crash boundary'))
+
+    await expect(store.persistRotatedChatGptCredential(id, rotated, source))
+      .rejects.toThrow('simulated crash boundary')
+    await store.close()
+    stores.splice(stores.indexOf(store), 1)
+
+    const restarted = createStore()
+    await restarted.initialize()
+    expect(restarted.getChatGptCredential(restarted.getRuntimeAccount(id)!.credentialId)).toMatchObject({
+      accessToken: 'oauth-journal-rotated',
+      refreshToken: 'oauth-journal-refresh-rotated',
+    })
+    expect(restarted.getStateRepository().readAppMetadata('credential_rotation_recovery_v1')).toBeUndefined()
+  })
+
+  it('does not let credential-rotation recovery overwrite a newer user edit', async () => {
+    const store = createStore()
+    await store.initialize()
+    const imported = await store.importChatGptAccounts({
+      providerId: 'provider-openai',
+      content: JSON.stringify({
+        access_token: 'oauth-journal-source', refresh_token: 'oauth-journal-source-refresh',
+        account_id: 'acct-oauth-journal-edit', expired: new Date(Date.now() + 60_000).toISOString(),
+      }),
+    })
+    const id = imported.importedAccountIds[0]
+    const account = store.getRuntimeAccount(id)!
+    const source = store.getCredential(account.credentialId)!
+    const staleRotation = JSON.stringify({
+      accessToken: 'oauth-journal-stale', refreshToken: 'oauth-journal-stale-refresh',
+      accountId: 'acct-oauth-journal-edit', expiresAt: Date.now() + 3_600_000,
+    })
+    const failedUpdate = vi.spyOn(store, 'updateChatGptCredential').mockRejectedValueOnce(new Error('simulated persistence failure'))
+    await expect(store.persistRotatedChatGptCredential(id, staleRotation, source)).rejects.toThrow()
+    failedUpdate.mockRestore()
+    const edited = JSON.stringify({
+      accessToken: 'oauth-journal-user-edit', refreshToken: 'oauth-journal-user-refresh',
+      accountId: 'acct-oauth-journal-edit', expiresAt: Date.now() + 7_200_000,
+    })
+    await store.updateChatGptCredential(id, edited)
+    await store.close()
+    stores.splice(stores.indexOf(store), 1)
+
+    const restarted = createStore()
+    await restarted.initialize()
+    expect(restarted.getChatGptCredential(restarted.getRuntimeAccount(id)!.credentialId)).toMatchObject({
+      accessToken: 'oauth-journal-user-edit',
+      refreshToken: 'oauth-journal-user-refresh',
     })
   })
 

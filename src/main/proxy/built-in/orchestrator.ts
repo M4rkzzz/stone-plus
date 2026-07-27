@@ -23,6 +23,7 @@ import type {
   BuiltInOutboundTargetDetector,
   BuiltInRouteChangeCoordinator,
 } from '../outbound-reload-coordinator'
+import { isLoopbackHostname } from '../system-proxy'
 import {
   buildSingBoxConfig,
   outboundTagForNodeId,
@@ -1095,6 +1096,7 @@ export class BuiltInProxyOrchestrator implements BuiltInProxyStoreFacade, BuiltI
     if (!profile) throw new BuiltInProxyOperationError('configuration-invalid', 'No active proxy profile is available.', false)
     const secrets = this.requireProfileSecrets(profile.id)
     const parsed = validateParsedProfile(secrets.configuration)
+    this.assertNoOwnedEndpointNode(parsed, settings)
     const built = this.buildConfiguration({
       profile: parsed,
       activeNodeId: profile.activeNodeId,
@@ -1104,6 +1106,26 @@ export class BuiltInProxyOrchestrator implements BuiltInProxyStoreFacade, BuiltI
       dnsServers: this.dnsUpstreams.map((endpoint) => endpoint.host),
     })
     return { profile, parsed, built }
+  }
+
+  private assertNoOwnedEndpointNode(profile: ParsedBuiltInProxyProfile, settings: BuiltInProxySettings): void {
+    const currentCore = this.core.getState()
+    const ownedPorts = new Set([
+      this.localGateway.port,
+      settings.mixedPort,
+      currentCore.mixedPort,
+      currentCore.controllerPort,
+    ].filter((port): port is number => typeof port === 'number' && Number.isInteger(port) && port > 0))
+    const collision = profile.nodes.find((node) => (
+      isLoopbackHostname(node.server)
+      && ownedPorts.has(node.serverPort)
+    ))
+    if (!collision) return
+    throw new BuiltInProxyOperationError(
+      'configuration-invalid',
+      `Proxy node "${collision.name}" points back to a Stone+ local endpoint.`,
+      false,
+    )
   }
 
   private async prepareAccessTransition(

@@ -400,7 +400,11 @@ export class AgentLifecycleService {
       }
       const result = await this.runTarget(target, mode, mode === 'restore' ? 'smart-repair' : 'close', {
         preserveRunningState: true,
-        ensureRunning: true,
+        // Launch-only surfaces (Claude Desktop Code and VS Code) cannot
+        // report a reliable running state. Aggregate repair must configure
+        // them without opening a host application and then failing an
+        // impossible running-state postcondition.
+        ensureRunning: AGENT_CAPABILITIES[target].canDetectRunning,
         repairSessions: true,
         repairWorkspaceIndex: true,
       })

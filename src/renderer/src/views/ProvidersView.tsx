@@ -50,6 +50,8 @@ import { providerSourceFamily, type ProviderSourceFamily } from '@shared/source-
 import { accountMatchesPoolProtocol } from '@shared/pool-protocol'
 import { hasVerifiedKiroToolBridge } from '@shared/route-sources'
 import type { ActionRunner } from '../App'
+import { accountIsCooling, accountQuotaIsExhausted, accountRecoveryAt, thawCountdown } from '../account-quota'
+import { isOAuthManagedCredential } from '../account-source-label'
 import { BoundAsyncOperation } from '../async-operation'
 import { normalizeAggregateRelayMembers, toggleAggregateRelayMember } from '../aggregate-relay-members'
 import { providerBrandIcon } from '../brand-icons'
@@ -114,6 +116,15 @@ const ACCOUNT_TAG_FILTER_STORAGE_KEY = 'stone.providers.tag-filter'
 const ACCOUNT_COLUMN_STORAGE_KEY = 'stone:account-column-widths:v1'
 const ACCOUNT_FAMILY_STORAGE_KEY = 'stone.providers.account-family'
 
+function readRendererStorage(key: string): string | undefined {
+  if (typeof window === 'undefined') return undefined
+  try {
+    return window.localStorage.getItem(key) ?? undefined
+  } catch {
+    return undefined
+  }
+}
+
 type AccountAddMethod = 'oauth' | 'token-json'
 type AccountFamilyTab = Extract<ProviderSourceFamily, 'openai' | 'grok'>
 type OAuthUiStage = 'idle' | 'starting' | 'waiting' | 'submitting' | 'exchanging' | 'cancelling' | 'success' | 'error' | 'cancelled'
@@ -165,7 +176,7 @@ function defaultAccountColumnWidths(): AccountColumnWidths {
 function loadAccountColumnWidths(): AccountColumnWidths {
   const defaults = defaultAccountColumnWidths()
   try {
-    const stored = JSON.parse(window.localStorage.getItem(ACCOUNT_COLUMN_STORAGE_KEY) ?? '{}') as Record<string, unknown>
+    const stored = JSON.parse(readRendererStorage(ACCOUNT_COLUMN_STORAGE_KEY) ?? '{}') as Record<string, unknown>
     for (const column of ACCOUNT_COLUMNS) {
       const width = stored[column.id]
       if (typeof width === 'number' && Number.isFinite(width)) {
@@ -189,55 +200,6 @@ function proxySafeSummary(proxy: PublicProxyDefinition): string {
   return `${proxy.protocol.toUpperCase()} · ${host}:${proxy.port}`
 }
 
-function accountQuotaIsExhausted(account: PublicAccount, now = Date.now()): boolean {
-  if (account.quotaRemaining !== undefined && account.quotaRemaining <= 0) return true
-  if (account.codexQuota?.limitReached || account.codexQuota?.allowed === false) return true
-  if ([account.codexQuota?.fiveHour, account.codexQuota?.sevenDay].some((window) =>
-    window !== undefined && window.usedPercent >= 100 && (window.resetAt === undefined || window.resetAt > now)
-  )) return true
-  return [account.quota?.requests, account.quota?.tokens, account.quota?.inputTokens, account.quota?.outputTokens]
-    .some((window) => window?.remaining === 0 && (window.resetAt === undefined || window.resetAt > now))
-}
-
-function accountIsCooling(account: PublicAccount, now = Date.now()): boolean {
-  return account.status === 'cooldown' || (account.cooldownUntil !== undefined && account.cooldownUntil > now)
-}
-
-function thawCountdown(until: number, now: number): string {
-  const totalMinutes = Math.max(1, Math.ceil((until - now) / 60_000))
-  const days = Math.floor(totalMinutes / 1_440)
-  const hours = Math.floor(totalMinutes % 1_440 / 60)
-  if (days > 0) return `${days}d${hours}h`
-  const totalHours = Math.floor(totalMinutes / 60)
-  const minutes = totalMinutes % 60
-  if (totalHours > 0) return `${totalHours}h${minutes}m`
-  return `${totalMinutes}m`
-}
-
-function accountRecoveryAt(account: PublicAccount, now: number): number | undefined {
-  const candidates: number[] = []
-  if (account.cooldownUntil !== undefined && account.cooldownUntil > now) candidates.push(account.cooldownUntil)
-
-  const quotaResets = [account.quota?.requests, account.quota?.tokens, account.quota?.inputTokens, account.quota?.outputTokens]
-    .filter((window) => window?.remaining === 0 && window.resetAt !== undefined && window.resetAt > now)
-    .map((window) => window!.resetAt!)
-  if (quotaResets.length) candidates.push(Math.max(...quotaResets))
-
-  if (accountQuotaIsExhausted(account, now) && account.codexQuota) {
-    const windows = [account.codexQuota.fiveHour, account.codexQuota.sevenDay].filter(Boolean)
-    const exhaustedResets = windows
-      .filter((window) => window!.usedPercent >= 100 && window!.resetAt !== undefined && window!.resetAt! > now)
-      .map((window) => window!.resetAt!)
-    if (exhaustedResets.length) candidates.push(Math.max(...exhaustedResets))
-    else {
-      const futureResets = windows
-        .filter((window) => window!.resetAt !== undefined && window!.resetAt! > now)
-        .map((window) => window!.resetAt!)
-      if (futureResets.length) candidates.push(Math.min(...futureResets))
-    }
-  }
-  return candidates.length ? Math.max(...candidates) : undefined
-}
 
 function handleTabListKeyDown(event: React.KeyboardEvent<HTMLElement>) {
   const tabs = Array.from(event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="tab"]:not(:disabled)'))
@@ -303,7 +265,12 @@ function OAuthExpiryCountdown({ expiresAt }: { expiresAt: number }) {
   const [now, setNow] = useState(() => Date.now())
   useEffect(() => {
     setNow(Date.now())
-    const timer = window.setInterval(() => setNow(Date.now()), 1_000)
+    if (expiresAt <= Date.now()) return
+    const timer = window.setInterval(() => {
+      const current = Date.now()
+      setNow(current)
+      if (current >= expiresAt) window.clearInterval(timer)
+    }, 1_000)
     return () => window.clearInterval(timer)
   }, [expiresAt])
   const seconds = Math.max(0, Math.ceil((expiresAt - now) / 1_000))
@@ -356,6 +323,30 @@ function emptyAggregateRelay(): AggregateRelayDraft {
     proxyId: '',
     quotaProtection: undefined,
   }
+}
+
+type AggregateRelayCandidateIssue =
+  | 'oauth-account'
+  | 'relay-required'
+  | 'protocol-mismatch'
+  | 'kiro-unverified'
+  | 'source-family-mismatch'
+
+function aggregateRelayCandidateIssue(
+  account: PublicAccount,
+  provider: ProviderDefinition | undefined,
+  protocol: Protocol,
+  selectedFamilies: ReadonlySet<string>,
+): AggregateRelayCandidateIssue | undefined {
+  if (isOAuthManagedCredential(account.credentialType)) return 'oauth-account'
+  if (!provider || provider.sourceType !== 'relay') return 'relay-required'
+  if (provider.protocol !== protocol) return 'protocol-mismatch'
+  if (protocol === 'kiro-claude' && !hasVerifiedKiroToolBridge(provider)) return 'kiro-unverified'
+  const family = providerSourceFamily(provider.kind)
+  if (selectedFamilies.size > 0 && (selectedFamilies.size !== 1 || !selectedFamilies.has(family))) {
+    return 'source-family-mismatch'
+  }
+  return undefined
 }
 
 function makeAccountDraft(providerId = ''): AccountDraft {
@@ -611,7 +602,7 @@ export function ProvidersView({
   const builtInProxyInterlocked = useBuiltInProxyInterlock(snapshot, api)
   const [tab, setTab] = useState<'accounts' | 'official' | 'relays'>('accounts')
   const [accountFamily, setAccountFamily] = useState<AccountFamilyTab>(() =>
-    window.localStorage.getItem(ACCOUNT_FAMILY_STORAGE_KEY) === 'grok' ? 'grok' : 'openai'
+    readRendererStorage(ACCOUNT_FAMILY_STORAGE_KEY) === 'grok' ? 'grok' : 'openai'
   )
   const [providerModal, setProviderModal] = useState(false)
   const [accountModal, setAccountModal] = useState(false)
@@ -621,7 +612,6 @@ export function ProvidersView({
   const providerDraftRef = useRef(providerDraft)
   const providerProbeOperation = useRef(new BoundAsyncOperation())
   const providerModalSession = useRef(0)
-  providerDraftRef.current = providerDraft
   const [testingSourceId, setTestingSourceId] = useState('')
   const [aggregateModalOpen, setAggregateModalOpen] = useState(false)
   const [aggregateDraft, setAggregateDraft] = useState<AggregateRelayDraft>(emptyAggregateRelay)
@@ -673,10 +663,10 @@ export function ProvidersView({
   const [accountColumnWidths, setAccountColumnWidths] = useState<AccountColumnWidths>(loadAccountColumnWidths)
   const resizingAccountColumn = useRef<{ id: AccountColumnId; startX: number; startWidth: number } | null>(null)
   const [hideExhaustedAccounts, setHideExhaustedAccounts] = useState(() =>
-    window.localStorage.getItem(HIDE_EXHAUSTED_ACCOUNTS_STORAGE_KEY) === 'true'
+    readRendererStorage(HIDE_EXHAUSTED_ACCOUNTS_STORAGE_KEY) === 'true'
   )
   const [tagFilter, setTagFilter] = useState<'all' | 'untagged' | string>(() =>
-    accountFamily === 'grok' ? 'all' : window.localStorage.getItem(ACCOUNT_TAG_FILTER_STORAGE_KEY)?.trim() || 'all'
+    accountFamily === 'grok' ? 'all' : readRendererStorage(ACCOUNT_TAG_FILTER_STORAGE_KEY)?.trim() || 'all'
   )
   const [tagManagerOpen, setTagManagerOpen] = useState(false)
   const [tagAssignmentOpen, setTagAssignmentOpen] = useState(false)
@@ -737,6 +727,41 @@ export function ProvidersView({
   const officialProviders = useMemo(() => snapshot.providers.filter((provider) => provider.sourceType === 'official-api' && provider.kind !== 'xai'), [snapshot.providers])
   const relayProviders = useMemo(() => snapshot.providers.filter((provider) => provider.sourceType === 'relay'), [snapshot.providers])
   const aggregateRelays = useMemo(() => snapshot.pools.filter((pool) => pool.kind === 'relay-aggregate'), [snapshot.pools])
+  const aggregateMemberFamilies = useMemo(() => {
+    const families = new Set<string>()
+    for (const member of aggregateDraft.members) {
+      const provider = providerById.get(accountById.get(member.accountId)?.providerId ?? '')
+      if (provider) families.add(providerSourceFamily(provider.kind))
+    }
+    return families
+  }, [accountById, aggregateDraft.members, providerById])
+  const eligibleAggregateMembers = useMemo(() => snapshot.accounts.flatMap((account) => {
+    const provider = providerById.get(account.providerId)
+    return aggregateRelayCandidateIssue(account, provider, aggregateDraft.protocol, aggregateMemberFamilies)
+      ? []
+      : [{ account, provider: provider! }]
+  }), [aggregateDraft.protocol, aggregateMemberFamilies, providerById, snapshot.accounts])
+  const visibleAggregateMembers = useMemo(() => {
+    const eligibleAccountIds = new Set(eligibleAggregateMembers.map(({ account }) => account.id))
+    const selectedAccountIds = new Set(aggregateDraft.members.map((member) => member.accountId))
+    return snapshot.accounts.flatMap((account) => {
+      const provider = providerById.get(account.providerId)
+      if (eligibleAccountIds.has(account.id)) return [{ account, provider, issue: undefined }]
+      if (!selectedAccountIds.has(account.id)) return []
+      return [{
+        account,
+        provider,
+        issue: aggregateRelayCandidateIssue(account, provider, aggregateDraft.protocol, aggregateMemberFamilies),
+      }]
+    })
+  }, [aggregateDraft.members, aggregateDraft.protocol, aggregateMemberFamilies, eligibleAggregateMembers, providerById, snapshot.accounts])
+  const hiddenUnverifiedKiroMembers = useMemo(() => aggregateDraft.protocol === 'kiro-claude'
+    ? snapshot.accounts.filter((account) => {
+        if (aggregateDraft.members.some((member) => member.accountId === account.id)) return false
+        const provider = providerById.get(account.providerId)
+        return aggregateRelayCandidateIssue(account, provider, aggregateDraft.protocol, new Set()) === 'kiro-unverified'
+      }).length
+    : 0, [aggregateDraft.members, aggregateDraft.protocol, providerById, snapshot.accounts])
   const compatibleImportPools = useMemo(() => snapshot.pools.filter((pool) => pool.kind === 'standard'
     && pool.protocol === 'openai-responses'
     && pool.members.every((member) => {
@@ -844,33 +869,20 @@ export function ProvidersView({
     onKeyDown={(event) => resizeAccountColumnByKeyboard(event, column)}
     onMouseDown={(event) => beginAccountColumnResize(event, column)}
   />
-  const persistedAccountModelState = editingAccount ? JSON.stringify({
-    id: editingAccount.id,
-    revision: editingAccount.modelsRefreshedAt,
-    modelPolicy: editingAccount.modelPolicy,
-    modelAllowlist: editingAccount.modelAllowlist,
-  }) : ''
-
   useEffect(() => {
-    if (!accountModal || !persistedAccountModelState) return
-    const persisted = JSON.parse(persistedAccountModelState) as {
-      id: string
-      modelPolicy: ModelPolicy
-      modelAllowlist: string[]
+    try {
+      window.localStorage.setItem(HIDE_EXHAUSTED_ACCOUNTS_STORAGE_KEY, String(hideExhaustedAccounts))
+    } catch {
+      // A disabled localStorage must not break filter toggling.
     }
-    setAccountDraft((current) => current.id === persisted.id ? {
-      ...current,
-      modelPolicy: persisted.modelPolicy,
-      modelAllowlist: [...persisted.modelAllowlist],
-    } : current)
-  }, [accountModal, persistedAccountModelState])
-
-  useEffect(() => {
-    window.localStorage.setItem(HIDE_EXHAUSTED_ACCOUNTS_STORAGE_KEY, String(hideExhaustedAccounts))
   }, [hideExhaustedAccounts])
 
   useEffect(() => {
-    window.localStorage.setItem(ACCOUNT_TAG_FILTER_STORAGE_KEY, tagFilter)
+    try {
+      window.localStorage.setItem(ACCOUNT_TAG_FILTER_STORAGE_KEY, tagFilter)
+    } catch {
+      // A disabled localStorage must not break tag filtering.
+    }
   }, [tagFilter])
 
   useEffect(() => api.onAccountImportProgress((progress) => {
@@ -895,8 +907,12 @@ export function ProvidersView({
 
   useEffect(() => {
     const existingIds = new Set(snapshot.accounts.map((account) => account.id))
-    setSelectedAccountIds((current) => current.filter((id) => existingIds.has(id)))
-    setExportAccountIds((current) => current.filter((id) => existingIds.has(id)))
+    const withoutRemoved = (current: string[]) => {
+      const next = current.filter((id) => existingIds.has(id))
+      return next.length === current.length ? current : next
+    }
+    setSelectedAccountIds(withoutRemoved)
+    setExportAccountIds(withoutRemoved)
   }, [snapshot.accounts])
 
   useEffect(() => {
@@ -965,9 +981,7 @@ export function ProvidersView({
 
   const openProvider = (sourceType: 'official-api' | 'relay', provider?: ProviderDefinition) => {
     const account = provider ? snapshot.accounts.find((candidate) => candidate.providerId === provider.id
-      && candidate.credentialType !== 'chatgpt-oauth'
-      && candidate.credentialType !== 'chatgpt-agent-identity'
-      && candidate.credentialType !== 'grok-oauth') : undefined
+      && !isOAuthManagedCredential(candidate.credentialType)) : undefined
     showProviderDraft(provider ? {
       id: provider.id,
       name: provider.name,
@@ -982,7 +996,7 @@ export function ProvidersView({
       modelCatalog: provider.modelCatalog,
       credential: '',
       modelsText: provider.models.join('\n'),
-      defaultModel: account?.modelAllowlist[0] ?? provider.models[0] ?? '',
+      defaultModel: provider.models[0] ?? '',
       priority: account?.priority ?? 10,
       weight: account?.weight ?? 10,
       maxConcurrency: account?.maxConcurrency ?? DEFAULT_ACCOUNT_MAX_CONCURRENCY,
@@ -1017,7 +1031,7 @@ export function ProvidersView({
         poolId: grokImport.poolId || null,
       })
       setGrokImportOpen(false)
-      setGrokImport({ ...grokImport, content: '' })
+      setGrokImport((current) => ({ ...current, content: '' }))
       setImportNotice(t(
         `Grok OAuth 导入完成：新增 ${result.createdAccountIds.length} 个，更新 ${result.updatedAccountIds.length} 个${result.warnings.length ? `；${localizeBackendMessages(result.warnings, language, 'Import warning.').join(' ')}` : ''}`,
         `Grok OAuth import complete: ${result.createdAccountIds.length} added and ${result.updatedAccountIds.length} updated${result.warnings.length ? `; ${localizeBackendMessages(result.warnings, language, 'Import warning.').join(' ')}` : ''}`,
@@ -1060,7 +1074,26 @@ export function ProvidersView({
   }
 
   const toggleAggregateMember = (account: PublicAccount) => {
+    const memberSelected = aggregateDraft.members.some((member) => member.accountId === account.id)
+    if (memberSelected) {
+      setAggregateDraft((current) => ({
+        ...current,
+        members: toggleAggregateRelayMember(current.members, account),
+      }))
+      setErrors((current) => current.aggregateMembers ? { ...current, aggregateMembers: '' } : current)
+      return
+    }
     const provider = providerById.get(account.providerId)
+    const candidateIssue = aggregateRelayCandidateIssue(account, provider, aggregateDraft.protocol, aggregateMemberFamilies)
+    if (candidateIssue) {
+      setErrors((current) => ({
+        ...current,
+        aggregateMembers: candidateIssue === 'kiro-unverified'
+          ? t('Kiro Claude 中转必须先通过两轮工具链测试。', 'A Kiro Claude relay must pass the two-turn tool-chain test first.')
+          : t('只能选择同协议、同来源类型的中转站 API Key。', 'Choose relay API-key sources with the same protocol and source family.'),
+      }))
+      return
+    }
     const selectedMember = aggregateDraft.members
       .map((member) => accountById.get(member.accountId))
       .find((candidate) => candidate?.id !== account.id)
@@ -1085,6 +1118,13 @@ export function ProvidersView({
     const nextErrors: Record<string, string> = {}
     if (!aggregateDraft.name.trim()) nextErrors.aggregateName = t('请输入聚合中转名称', 'Enter an aggregate relay name.')
     if (aggregateDraft.members.length < 2) nextErrors.aggregateMembers = t('至少选择两个同协议 API 来源', 'Select at least two API sources with the same protocol.')
+    const invalidMember = aggregateDraft.members.some((member) => {
+      const account = accountById.get(member.accountId)
+      return !account || Boolean(aggregateRelayCandidateIssue(account, providerById.get(account.providerId), aggregateDraft.protocol, aggregateMemberFamilies))
+    })
+    if (invalidMember) {
+      nextErrors.aggregateMembers = t('聚合成员必须是同协议、同来源类型且可用的中转站 API Key。', 'Aggregate members must be eligible relay API-key sources with the same protocol and source family.')
+    }
     if (aggregateDraft.protocol === 'kiro-claude') {
       const unverified = aggregateDraft.members.some((member) => {
         const account = accountById.get(member.accountId)
@@ -1145,7 +1185,7 @@ export function ProvidersView({
     })
     const refreshedAccount = refreshedSnapshot?.accounts.find((account) => account.id === accountId)
     if (success && refreshedAccount) {
-      setAccountDraft((current) => current.id === accountId ? {
+      setAccountDraft((current) => current.id === accountId && current.providerId === refreshedAccount.providerId ? {
         ...current,
         modelPolicy: refreshedAccount.modelPolicy,
         modelAllowlist: [...refreshedAccount.modelAllowlist],
@@ -1169,9 +1209,7 @@ export function ProvidersView({
     if (Object.keys(nextErrors).length) return
     const sourceAccount = providerDraft.id
       ? snapshot.accounts.find((account) => account.providerId === providerDraft.id
-        && account.credentialType !== 'chatgpt-oauth'
-        && account.credentialType !== 'chatgpt-agent-identity'
-        && account.credentialType !== 'grok-oauth')
+        && !isOAuthManagedCredential(account.credentialType))
       : undefined
     const nextFamily = providerSourceFamily(providerDraft.kind)
     const nextProvider = {
@@ -1291,7 +1329,7 @@ export function ProvidersView({
         baseUrl: provider.baseUrl,
         protocol: provider.protocol,
         responsesCompactMode: provider.responsesCompactMode,
-        model: account?.modelAllowlist[0] ?? account?.availableModels[0] ?? provider.models[0],
+        model: account?.availableModels[0] ?? provider.models[0],
         proxyId: account?.proxyId,
         persistCapabilities: true,
       })
@@ -1325,7 +1363,7 @@ export function ProvidersView({
         ? effectiveResponsesCompactMode(provider.responsesCompactMode)
         : undefined,
       modelsText: provider.models.join('\n'),
-      defaultModel: account?.modelAllowlist[0] ?? account?.availableModels[0] ?? provider.models[0] ?? '',
+      defaultModel: account?.availableModels[0] ?? provider.models[0] ?? '',
       priority: account?.priority ?? 10,
       weight: account?.weight ?? 10,
       maxConcurrency: account?.maxConcurrency ?? DEFAULT_ACCOUNT_MAX_CONCURRENCY,
@@ -1603,7 +1641,7 @@ export function ProvidersView({
     try {
       const result = await api.importChatGptAccounts({ ...chatGptImport, progressId })
       setChatGptImportOpen(false)
-      setChatGptImport({ ...chatGptImport, content: '' })
+      setChatGptImport((current) => ({ ...current, content: '' }))
       const detected = result.detectionResults.filter((item) => item.ok).length
       const modelsRefreshed = result.detectionResults.filter((item) => item.availableModelCount !== undefined).length
       const modelFailures = result.detectionResults.length - modelsRefreshed
@@ -1877,7 +1915,7 @@ export function ProvidersView({
                         <td className="account-select-column"><input type="checkbox" aria-label={t(`选择账号 ${account.name}`, `Select account ${account.name}`)} checked={selectedAccountIdSet.has(account.id)} onChange={() => toggleSelectedAccount(account.id)} /></td>
                         <td><div className="provider-cell"><ProviderAvatar kind={provider?.kind} name={provider?.name} color={provider?.color} /><div><strong title={account.name}>{accountNameById.get(account.id) ?? account.name}</strong><span>{provider?.name ?? t('供应商已删除', 'Provider deleted')}{account.proxyId ? ` · ${proxyById.get(account.proxyId)?.name ?? t('代理已删除', 'Proxy deleted')}` : ''} · {modelSummary}</span></div></div></td>
                         <td>{account.tagId && tagById.has(account.tagId) ? <span className="account-tag-chip"><Tag size={12} />{tagById.get(account.tagId)?.name}</span> : <span className="muted">{t('未标记', 'Untagged')}</span>}</td>
-                        <td><AccountStatusBadge status={account.status} circuitState={account.circuitState} /><CooldownCountdown account={account} />{(account.credentialType === 'chatgpt-oauth' || account.credentialType === 'chatgpt-agent-identity' || account.credentialType === 'grok-oauth') && <span className="row-note">{account.credentialType === 'chatgpt-agent-identity' ? 'Agent Identity' : account.credentialType === 'grok-oauth' ? 'Grok OAuth' : 'ChatGPT OAuth'} · {account.renewable ? t('可续期', 'Renewable') : t('会话到期即停用', 'Disabled when the session expires')}</span>}{provider?.kind === 'xai' && account.credentialType !== 'grok-oauth' && <span className="row-note">xAI API Key</span>}{Boolean(account.consecutiveFailures) && <span className="row-note">{t('连续失败', 'Consecutive failures')} {account.consecutiveFailures}</span>}{account.lastError && <span className="row-note row-note--danger" title={localizeBackendMessage(account.lastError, language, t('账号检测失败', 'Account check failed.'))}>{localizeBackendMessage(account.lastError, language, t('账号检测失败', 'Account check failed.'))}</span>}</td>
+                        <td><AccountStatusBadge status={account.status} circuitState={account.circuitState} /><CooldownCountdown account={account} />{isOAuthManagedCredential(account.credentialType) && <span className="row-note">{account.credentialType === 'chatgpt-agent-identity' ? 'Agent Identity' : account.credentialType === 'grok-oauth' ? 'Grok OAuth' : 'ChatGPT OAuth'} · {account.renewable ? t('可续期', 'Renewable') : t('会话到期即停用', 'Disabled when the session expires')}</span>}{provider?.kind === 'xai' && account.credentialType !== 'grok-oauth' && <span className="row-note">xAI API Key</span>}{Boolean(account.consecutiveFailures) && <span className="row-note">{t('连续失败', 'Consecutive failures')} {account.consecutiveFailures}</span>}{account.lastError && <span className="row-note row-note--danger" title={localizeBackendMessage(account.lastError, language, t('账号检测失败', 'Account check failed.'))}>{localizeBackendMessage(account.lastError, language, t('账号检测失败', 'Account check failed.'))}</span>}</td>
                         <td><AccountFitness fitness={account.fitness} /></td>
                         <td><span className="mono masked-key">{account.maskedCredential}</span></td>
                         <td><div className="concurrency-cell"><strong>{account.inFlight} / {account.maxConcurrency}</strong><div className="mini-progress"><span style={{ width: `${Math.min(100, account.inFlight / account.maxConcurrency * 100)}%` }} /></div></div></td>
@@ -2198,7 +2236,7 @@ export function ProvidersView({
         width="xlarge"
         footer={<><button type="button" className="button button--secondary" onClick={() => setAccountModal(false)}>{t('取消', 'Cancel')}</button><button type="submit" form="account-form" className="button button--primary" disabled={busyKeys.has('save-account')}>{busyKeys.has('save-account') ? <LoaderCircle size={16} className="spin" /> : <CheckCircle2 size={16} />}{t('保存账号', 'Save account')}</button></>}
       >
-        <form id="account-form" onSubmit={(event) => void submitAccount(event)}><AccountForm draft={accountDraft} setDraft={setAccountDraft} providers={snapshot.providers} proxies={snapshot.proxies} proxyInterlocked={builtInProxyInterlocked} account={editingAccount} editing={Boolean(accountDraft.id)} oauthAccount={editingAccount?.credentialType === 'chatgpt-oauth' || editingAccount?.credentialType === 'chatgpt-agent-identity' || editingAccount?.credentialType === 'grok-oauth'} codexQuotaAccount={editingAccount?.credentialType === 'chatgpt-oauth' || editingAccount?.credentialType === 'chatgpt-agent-identity'} refreshingModels={accountModelsBusy} refreshDisabledReason={refreshModelsDisabledReason} onRefreshModels={() => void refreshEditingAccountModels()} onTestModel={accountDraft.id ? (model) => api.testAccountModel(accountDraft.id as string, model) : undefined} errors={errors} /></form>
+        <form id="account-form" onSubmit={(event) => void submitAccount(event)}><AccountForm draft={accountDraft} setDraft={setAccountDraft} providers={snapshot.providers} proxies={snapshot.proxies} proxyInterlocked={builtInProxyInterlocked} account={editingAccount} editing={Boolean(accountDraft.id)} oauthAccount={isOAuthManagedCredential(editingAccount?.credentialType)} codexQuotaAccount={editingAccount?.credentialType === 'chatgpt-oauth' || editingAccount?.credentialType === 'chatgpt-agent-identity'} refreshingModels={accountModelsBusy} refreshDisabledReason={refreshModelsDisabledReason} onRefreshModels={() => void refreshEditingAccountModels()} onTestModel={accountDraft.id ? (model) => api.testAccountModel(accountDraft.id as string, model) : undefined} errors={errors} /></form>
       </Modal>
 
       <Modal
@@ -2210,7 +2248,7 @@ export function ProvidersView({
       >
         <form id="aggregate-relay-form" className="form-grid" onSubmit={(event) => void submitAggregateRelay(event)}>
           <label className="field"><span>{t('显示名称', 'Display name')}</span><input autoFocus value={aggregateDraft.name} onChange={(event) => setAggregateDraft({ ...aggregateDraft, name: event.target.value })} placeholder={t('例如：Codex 多线路', 'e.g. Multi-route Codex')} /><FieldError>{errors.aggregateName}</FieldError></label>
-          <label className="field"><span>{t('对外协议', 'Public protocol')}</span><select value={aggregateDraft.protocol} onChange={(event) => { const protocol = event.target.value as Protocol; setAggregateDraft({ ...aggregateDraft, protocol, stickySessions: protocol === 'kiro-claude' ? true : aggregateDraft.stickySessions, members: aggregateDraft.members.filter((member) => providerById.get(accountById.get(member.accountId)?.providerId ?? '')?.protocol === protocol) }) }}>{aggregateProtocols.map((protocol) => <option key={protocol} value={protocol}>{protocolLabels[protocol]}</option>)}</select></label>
+          <label className="field"><span>{t('对外协议', 'Public protocol')}</span><select value={aggregateDraft.protocol} onChange={(event) => { const protocol = event.target.value as Protocol; setAggregateDraft({ ...aggregateDraft, protocol, stickySessions: protocol === 'kiro-claude' ? true : aggregateDraft.stickySessions, members: aggregateDraft.members.filter((member) => { const account = accountById.get(member.accountId); const provider = providerById.get(account?.providerId ?? ''); return Boolean(account && provider?.sourceType === 'relay' && provider.protocol === protocol && (protocol !== 'kiro-claude' || hasVerifiedKiroToolBridge(provider))) }) }) }}>{aggregateProtocols.map((protocol) => <option key={protocol} value={protocol}>{protocolLabels[protocol]}</option>)}</select></label>
           <div className="field field--full"><span>{t('调度策略', 'Scheduling strategy')}</span><div className="aggregate-strategy-grid">
             {([
               ['priority', '故障转移', 'Failover', '按成员顺序使用，失败时切换下一条', 'Use members in order and switch to the next after a failure'],
@@ -2221,29 +2259,18 @@ export function ProvidersView({
           <div className="field field--full">
             <span>{t('API 来源成员', 'API source members')}</span>
             <div className="aggregate-member-picker">
-              {snapshot.accounts.filter((account) => {
-                if (account.credentialType === 'chatgpt-oauth' || account.credentialType === 'chatgpt-agent-identity' || account.credentialType === 'grok-oauth') return false
-                const provider = providerById.get(account.providerId)
-                if (!provider || (provider.sourceType !== 'official-api' && provider.sourceType !== 'relay') || provider.protocol !== aggregateDraft.protocol) return false
-                if (aggregateDraft.protocol === 'kiro-claude' && !hasVerifiedKiroToolBridge(provider)) return false
-                const selectedProviders = aggregateDraft.members.flatMap((member) => {
-                  const selectedAccount = accountById.get(member.accountId)
-                  const selectedProvider = providerById.get(selectedAccount?.providerId ?? '')
-                  return selectedProvider ? [selectedProvider] : []
-                })
-                return aggregateDraft.members.some((member) => member.accountId === account.id)
-                  || selectedProviders.length === 0
-                  || selectedProviders.every((selectedProvider) => providerSourceFamily(selectedProvider.kind) === providerSourceFamily(provider.kind))
-              }).map((account) => {
-                const provider = providerById.get(account.providerId)
+              {visibleAggregateMembers.map(({ account, provider, issue }) => {
                 const memberIndex = aggregateDraft.members.findIndex((member) => member.accountId === account.id)
                 const member = memberIndex >= 0 ? aggregateDraft.members[memberIndex] : undefined
                 return <div className={member ? 'selected' : ''} key={account.id}>
-                  <button className="aggregate-member-picker__toggle" type="button" aria-pressed={Boolean(member)} aria-label={member ? t(`取消选择${provider?.name ?? account.name}`, `Deselect ${provider?.name ?? account.name}`) : t(`选择${provider?.name ?? account.name}`, `Select ${provider?.name ?? account.name}`)} onClick={() => toggleAggregateMember(account)}><span className="checkbox-mark" aria-hidden="true">{member && <CheckCircle2 size={13} />}</span><ProviderAvatar kind={provider?.kind} name={provider?.name} color={provider?.color} /><span><strong>{provider?.name}</strong><small>{account.maskedCredential} · {protocolLabels[aggregateDraft.protocol]}</small></span></button>
+                  <button className="aggregate-member-picker__toggle" type="button" aria-pressed={Boolean(member)} aria-label={member ? t(`取消选择${provider?.name ?? account.name}`, `Deselect ${provider?.name ?? account.name}`) : t(`选择${provider?.name ?? account.name}`, `Select ${provider?.name ?? account.name}`)} onClick={() => toggleAggregateMember(account)}><span className="checkbox-mark" aria-hidden="true">{member && <CheckCircle2 size={13} />}</span><ProviderAvatar kind={provider?.kind} name={provider?.name} color={provider?.color} /><span><strong>{provider?.name ?? account.name}</strong><small>{issue ? issue === 'kiro-unverified' ? t('工具链验证已失效，请取消选择后重试', 'Tool-chain verification expired; deselect this member and retest') : t('成员资格已失效，请取消选择', 'Member eligibility is no longer valid; deselect this member') : `${account.maskedCredential} · ${protocolLabels[aggregateDraft.protocol]}`}</small></span></button>
                   {member && <div className="aggregate-member-controls"><button type="button" title={t('上移', 'Move up')} disabled={memberIndex === 0} onClick={() => { const next = [...aggregateDraft.members]; [next[memberIndex - 1], next[memberIndex]] = [next[memberIndex], next[memberIndex - 1]]; updateAggregateMembers(next) }}>↑</button><button type="button" title={t('下移', 'Move down')} disabled={memberIndex === aggregateDraft.members.length - 1} onClick={() => { const next = [...aggregateDraft.members]; [next[memberIndex + 1], next[memberIndex]] = [next[memberIndex], next[memberIndex + 1]]; updateAggregateMembers(next) }}>↓</button><label>{t('权重', 'Weight')} <input type="number" min={1} max={100} value={member.weight} onChange={(event) => updateAggregateMembers(aggregateDraft.members.map((item) => item.accountId === member.accountId ? { ...item, weight: Number(event.target.value) } : item))} /></label><span>#{memberIndex + 1}</span></div>}
                 </div>
               })}
-              {!snapshot.accounts.some((account) => account.credentialType !== 'chatgpt-oauth' && account.credentialType !== 'chatgpt-agent-identity' && account.credentialType !== 'grok-oauth' && providerById.get(account.providerId)?.protocol === aggregateDraft.protocol) && <div className="aggregate-member-picker__empty">{t('没有同协议的官方 API 或中转站，请先添加来源。', 'No official API or relay uses this protocol. Add a source first.')}</div>}
+              {visibleAggregateMembers.length === 0 && <div className="aggregate-member-picker__empty">{hiddenUnverifiedKiroMembers > 0
+                ? t(`有 ${hiddenUnverifiedKiroMembers} 个 Kiro Claude 中转尚未通过两轮工具链测试，请先在中转站卡片中完成测试。`, `${hiddenUnverifiedKiroMembers} Kiro Claude relay(s) are hidden until they pass the two-turn tool-chain test.`)
+                : t('没有符合条件的同协议中转站 API Key，请先添加或调整中转来源。', 'No eligible relay API-key source uses this protocol. Add or update a relay first.')}</div>}
+              {eligibleAggregateMembers.length > 0 && hiddenUnverifiedKiroMembers > 0 && <div className="aggregate-member-picker__empty">{t(`另有 ${hiddenUnverifiedKiroMembers} 个 Kiro Claude 中转因未通过工具链测试而未显示。`, `${hiddenUnverifiedKiroMembers} additional Kiro Claude relay(s) are hidden because their tool-chain test is incomplete.`)}</div>}
             </div>
             <FieldError>{errors.aggregateMembers}</FieldError>
           </div>

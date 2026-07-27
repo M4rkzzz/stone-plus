@@ -232,7 +232,7 @@ export class CodexLifecycleAdapter {
       const repairWorkspaceIndex = options.repairWorkspaceIndex !== false
       if (repairSessions || repairWorkspaceIndex) {
         try {
-          await this.deepRepair.run({ preserveRunningState: true })
+          await this.deepRepair.run({ preserveRunningState: options.preserveRunningState !== false })
         } catch (cause) {
           throw new CodexLifecycleOperationError(
             this.target,

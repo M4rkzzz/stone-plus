@@ -17,6 +17,8 @@ import {
 import {
   SingBoxService,
   buildRuntimeConfiguration,
+  isFetchForbiddenPort,
+  reserveFetchSafeLoopbackPort,
   type LoopbackPortLease,
   type SingBoxRuntimeEvent,
   type SingBoxServiceOptions
@@ -242,7 +244,7 @@ describe('SingBoxService', () => {
 
   it('re-promotes a retained route generation after a candidate is rolled back', async () => {
     const directory = await temporaryDirectory()
-    const harness = createHarness(directory)
+    const harness = createHarness(directory, { restartDelaysMs: [0] })
     const first = await harness.service.start({ config: { route: 'first' }, mixedPort: 20_877, controllerPort: 20_878 })
     harness.service.retainGeneration(first.generation)
     const second = await harness.service.start({ config: { route: 'second' }, mixedPort: first.mixedPort, controllerPort: 20_878 })
@@ -258,7 +260,29 @@ describe('SingBoxService', () => {
       controllerPort: first.controllerPort,
     })
     expect(harness.terminateProcess).toHaveBeenCalledWith(harness.children[1], 'win32')
+
+    harness.children[0].finish(9, null)
+    await vi.waitFor(() => expect(harness.spawnProcess).toHaveBeenCalledTimes(3))
+    await vi.waitFor(() => expect(harness.service.getState().status).toBe('ready'))
+    const checkCalls = harness.execute.mock.calls.filter((call) => call[1][0] === 'check')
+    const restartedConfig = JSON.parse(await readFile(checkCalls.at(-1)![1][2] as string, 'utf8'))
+    expect(restartedConfig.route).toBe('first')
     await harness.service.close()
+  })
+
+  it('retries automatic controller allocation until Chromium Fetch accepts the port', async () => {
+    expect(isFetchForbiddenPort(10_080)).toBe(true)
+    expect(isFetchForbiddenPort(20_802)).toBe(false)
+    const released = vi.fn(async () => undefined)
+    const reserve = vi.fn()
+      .mockResolvedValueOnce({ port: 10_080, release: released })
+      .mockResolvedValueOnce({ port: 20_802, release: vi.fn(async () => undefined) })
+
+    await expect(reserveFetchSafeLoopbackPort(0, '127.0.0.1', reserve))
+      .resolves.toMatchObject({ port: 20_802 })
+    expect(released).toHaveBeenCalledOnce()
+    await expect(reserveFetchSafeLoopbackPort(10_080, '127.0.0.1', reserve))
+      .rejects.toThrow(/Fetch network policy/)
   })
 
   it('reports a retained route-owner exit even while a candidate is childContext', async () => {

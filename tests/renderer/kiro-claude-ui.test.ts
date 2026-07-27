@@ -58,6 +58,25 @@ describe('Kiro Claude renderer boundaries', () => {
     expect(setupWizardView).toContain('isKiroClaudeRouteSource(resolveRouteSource(provider.id, snapshot), snapshot)')
     expect(setupWizardView).toContain("selectedSourceIsKiroClaude && item !== 'claude'")
     expect(providersView).toContain("t('待工具验证', 'Tool verification required')")
+    expect(providersView).toContain("provider.sourceType !== 'relay'")
+    expect(providersView).toContain('eligibleAggregateMembers.map')
+    expect(providersView).toContain('visibleAggregateMembers.length === 0')
+    expect(providersView).toContain('Kiro Claude 中转尚未通过两轮工具链测试')
+  })
+
+  it('always lets an already-selected member escape after its verification becomes invalid', () => {
+    const toggleBody = providersView.slice(
+      providersView.indexOf('const toggleAggregateMember ='),
+      providersView.indexOf('const submitAggregateRelay ='),
+    )
+    const selectedBranch = toggleBody.indexOf('if (memberSelected)')
+    const eligibilityGate = toggleBody.indexOf('const candidateIssue = aggregateRelayCandidateIssue')
+
+    expect(selectedBranch).toBeGreaterThanOrEqual(0)
+    expect(eligibilityGate).toBeGreaterThan(selectedBranch)
+    expect(toggleBody.slice(selectedBranch, eligibilityGate)).toContain('toggleAggregateRelayMember(current.members, account)')
+    expect(toggleBody.slice(selectedBranch, eligibilityGate)).toContain('return')
+    expect(providersView).toContain('Tool-chain verification expired; deselect this member and retest')
   })
 
   it('shows the native Event Stream bridge and states that tool results never trigger hidden Continue turns', () => {

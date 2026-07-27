@@ -201,7 +201,7 @@ export function TunnelView({ snapshot, api }: { snapshot: AppSnapshot; api: Gate
         </article>
         <article className="panel tunnel-access-card">
           <div><KeyRound size={18} /><span>{t('共享访问令牌', 'Shared access token')}</span></div>
-          <code>{route ? t(`Codex 路由 · ••••••••••••${route.localToken.slice(-6)}`, `Codex route · ••••••••••••${route.localToken.slice(-6)}`) : t('尚未配置 Codex 路由', 'No Codex route configured')}</code>
+          <code>{route ? t(`Codex 路由 · ${route.localToken}`, `Codex route · ${route.localToken}`) : t('尚未配置 Codex 路由', 'No Codex route configured')}</code>
           <button className="button button--secondary" type="button" disabled={!route?.localToken} onClick={() => void copy('token', route?.localToken)}>{copied === 'token' ? <Check size={16} /> : <Copy size={16} />}{copied === 'token' ? t('已复制', 'Copied') : t('复制访问令牌', 'Copy access token')}</button>
         </article>
       </section>

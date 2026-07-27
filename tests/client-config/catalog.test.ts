@@ -310,7 +310,7 @@ describe('client configuration field catalog', () => {
     expect(patched).toContain('multi_agent = true # keep feature comment')
   })
 
-  it('masks sensitive discovered TOML values and rejects read-only or out-of-range patches', () => {
+  it('shows discovered TOML values as read-only plaintext and rejects invalid patches', () => {
     const editorFields = clientConfigEditorFields('codex', {
       'codex-config': [
         '[model_providers.private]',
@@ -320,8 +320,7 @@ describe('client configuration field catalog', () => {
       ].join('\n'),
     })
     const token = editorFields.find((field) => field.path.join('.') === 'model_providers.private.experimental_bearer_token')!
-    expect(token).toMatchObject({ value: null, sensitive: true, readOnly: true })
-    expect(JSON.stringify(editorFields)).not.toContain('do-not-expose')
+    expect(token).toMatchObject({ value: 'do-not-expose', sensitive: false, readOnly: true })
 
     expect(() => applyClientConfigFieldPatches('codex', {}, [
       { id: 'codex.modelProvider', value: 'other' },

@@ -128,7 +128,7 @@ describe('theme helpers', () => {
 
     expect(applyStoredThemeEarly()).toBe('dark')
     expect(dataset.theme).toBe('dark')
-    expect(setAttribute).toHaveBeenCalledWith('content', '#161c1a')
+    expect(setAttribute).toHaveBeenCalledWith('content', '#141517')
   })
 
   it('does nothing when document is unavailable', () => {

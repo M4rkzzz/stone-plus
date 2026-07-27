@@ -121,6 +121,7 @@ const stone: GatewayApi = {
   restoreClientConfigBackupSet: (groupId, client, profileId) => ipcRenderer.invoke('stone:restore-client-config-backup-set', groupId, client, profileId),
   restoreClientConfig: (backupPath, client, profileId) => ipcRenderer.invoke('stone:restore-client-config', backupPath, client, profileId),
   getClientConfigEditor: (client, profileId) => ipcRenderer.invoke('stone:get-client-config-editor', client, profileId),
+  openClientConfigFile: (client, role, profileId) => ipcRenderer.invoke('stone:open-client-config-file', client, role, profileId),
   saveClientConfigEditor: (input) => ipcRenderer.invoke('stone:save-client-config-editor', input),
   listManagedClientInstances: () => ipcRenderer.invoke('stone:list-managed-client-instances'),
   saveManagedClientInstance: (input) => ipcRenderer.invoke('stone:save-managed-client-instance', input),

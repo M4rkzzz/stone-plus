@@ -3,7 +3,6 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { ClientConfigService, ClientConfigValidationError } from '../../src/main/client-config'
-import { protectedValuePlaceholder } from '../../src/main/client-config/editor'
 import { parseCodexToml } from '../../src/main/client-config/toml-format'
 
 describe('ClientConfigService editor workflow', () => {
@@ -27,7 +26,7 @@ describe('ClientConfigService editor workflow', () => {
     await rm(homeDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 })
   })
 
-  it('returns editable Codex config without exposing the protected authentication file', async () => {
+  it('returns editable Codex config and a read-only plaintext authentication preview', async () => {
     const config = 'model = "gpt-existing"\n'
     const authSecret = 'codex-auth-secret-that-must-not-leak'
     await mkdir(service.paths.codex.directory, { recursive: true })
@@ -40,12 +39,15 @@ describe('ClientConfigService editor workflow', () => {
 
     expect(snapshot.fields.find((field) => field.id === 'codex.model')?.value).toBe('gpt-existing')
     expect(configFile).toMatchObject({ editable: true, content: config, protectedValueCount: 0 })
-    expect(authFile).toMatchObject({ editable: false, containsCredential: true, protectedValueCount: 1 })
-    expect(authFile.content).toBeUndefined()
-    expect(JSON.stringify(snapshot)).not.toContain(authSecret)
+    expect(authFile).toMatchObject({
+      editable: false,
+      containsCredential: true,
+      protectedValueCount: 0,
+      content: JSON.stringify({ OPENAI_API_KEY: authSecret }) + '\n',
+    })
   })
 
-  it('does not expose provider credentials in the editor snapshot and restores them when saving', async () => {
+  it('shows provider credentials in the editor snapshot and preserves them when saving unrelated edits', async () => {
     const bearerSecret = 'provider-bearer-secret-that-must-not-leak'
     const headerSecret = 'provider-header-secret-that-must-not-leak'
     const config = [
@@ -64,11 +66,9 @@ describe('ClientConfigService editor workflow', () => {
 
     const snapshot = await service.editor('codex')
     const file = snapshot.files.find((candidate) => candidate.role === 'codex-config')!
-    const serialized = JSON.stringify(snapshot)
-    expect(file.protectedValueCount).toBe(2)
-    expect(file.content).toContain(protectedValuePlaceholder)
-    expect(serialized).not.toContain(bearerSecret)
-    expect(serialized).not.toContain(headerSecret)
+    expect(file.protectedValueCount).toBe(0)
+    expect(file.content).toContain(bearerSecret)
+    expect(file.content).toContain(headerSecret)
 
     const draft = file.content!.replace('model = "gpt-existing"', 'model = "gpt-updated"')
     await service.applyEditor('codex', {
@@ -154,7 +154,7 @@ describe('ClientConfigService editor workflow', () => {
     advancedDraft.unknown.keep = false
     advancedDraft.env.ANTHROPIC_BASE_URL = 'https://draft-override.invalid'
     advancedDraft.env.ANTHROPIC_AUTH_TOKEN = 'draft-override-token'
-    expect(advancedDraft.env.KEEP).toBe(protectedValuePlaceholder)
+    expect(advancedDraft.env.KEEP).toBe('preserve-this-environment-value')
 
     const result = await service.applyEditor('claude', {
       gatewayBaseUrl: 'http://127.0.0.1:15721',
@@ -206,6 +206,27 @@ describe('ClientConfigService editor workflow', () => {
       files: [],
     })
     expect(unchanged.requiresNewConversation).toBeUndefined()
+  })
+
+  it('also detects a Manual-to-Auto change made through the protected raw editor', async () => {
+    await mkdir(service.paths.claude.directory, { recursive: true })
+    await writeFile(service.paths.claude.settings.path, JSON.stringify({
+      permissions: { defaultMode: 'default' },
+    }, null, 2) + '\n')
+    const snapshot = await service.editor('claude')
+    const file = snapshot.files.find((candidate) => candidate.role === 'claude-settings')!
+    const draft = JSON.parse(file.content!)
+    draft.permissions.defaultMode = 'auto'
+
+    const changed = await service.applyEditor('claude', {
+      gatewayBaseUrl: 'http://127.0.0.1:15721',
+      token: 'stone-target-token',
+    }, {
+      patches: [],
+      files: [{ ...file, content: `${JSON.stringify(draft, null, 2)}\n` }],
+    })
+
+    expect(changed.requiresNewConversation).toBe(true)
   })
 
   it('forces the complete Stone Codex provider and authentication contract after editor changes', async () => {

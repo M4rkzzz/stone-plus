@@ -4,8 +4,13 @@ import type { PoolProtocol, SetupRoutingInput, SetupRoutingResult } from '@share
 import { accountPoolProtocol } from '@shared/pool-protocol'
 import { providerSourceFamily } from '@shared/source-family'
 import { evaluateSourceEligibility } from '../../shared/source-eligibility'
-import { isSafeRouteModelMapKey, normalizeRouteModelMap } from '../../shared/route-models'
-import { isAvailableRouteAccount, isNativeGrokRouteSource, resolveRouteSource } from '../../shared/route-sources'
+import { normalizeRouteModelMap } from '../../shared/route-models'
+import {
+  enumerateRouteSourceModels,
+  isAvailableRouteAccount,
+  isNativeGrokRouteSource,
+  resolveRouteSource,
+} from '../../shared/route-sources'
 import type { PersistedState } from '../store/types'
 
 export interface ApplySetupRoutingOptions {
@@ -99,20 +104,16 @@ export function applySetupRoutingDraft(
   const inboundProtocol = clientNativeProtocols[input.client]
   const existingRoute = state.routes.find((candidate) => candidate.client === input.client)
   const routeId = existingRoute?.id ?? randomUUID()
+  // The model selected here proves that the source can answer a setup probe;
+  // it does not authorize rewriting every future client-requested model.
+  // Preserve only mappings the user had already configured on the route.
   const modelMap = normalizeRouteModelMap(existingRoute?.modelMap)
-  const codexToClaude = input.client === 'codex' && provider.protocol === 'anthropic-messages'
-  const claudeToOpenAi = input.client === 'claude'
-    && (provider.protocol === 'openai-responses' || provider.protocol === 'openai-chat')
-  if (input.client === 'grokbuild'
-    || (input.client === 'codex' && (provider.kind === 'xai' || provider.kind === 'xai-compatible'))
-    || codexToClaude
-    || claudeToOpenAi) {
-    // Cross-protocol clients normally request their own model aliases rather
-    // than the verified upstream identifier. Preserve the client config and
-    // route every otherwise-unmapped alias to the setup-tested model.
-    modelMap['*'] = model
-  } else if (isSafeRouteModelMapKey(model)) {
-    modelMap[model] = model
+  const routeSourceModels = enumerateRouteSourceModels(resolveRouteSource(pool.id, state), state)
+  if (requiresSingleModelFallback(input.client, pool.protocol)
+    && !Object.hasOwn(modelMap, '*')
+    && routeSourceModels.length === 1
+    && routeSourceModels[0] === model) {
+    modelMap['*'] = routeSourceModels[0]
   }
   const route = {
     // Preserve fields owned by other route features. The setup wizard only
@@ -133,6 +134,14 @@ export function applySetupRoutingDraft(
   else state.routes.push(route)
 
   return { poolId: pool.id, routeId, createdPool }
+}
+
+/** Cross-wire bridges need an upstream model when the client sends a model
+ * name from its own family. Same-wire routes retain the requested model, while
+ * Grok Build remains a native Grok Responses passthrough despite the logical
+ * `grok` pool protocol. */
+function requiresSingleModelFallback(client: SetupRoutingInput['client'], sourceProtocol: PoolProtocol): boolean {
+  return client !== 'grokbuild' && sourceProtocol !== clientNativeProtocols[client]
 }
 
 function healthyOAuthPeers(state: PersistedState, protocol: PoolProtocol, selectedId: string, model: string): string[] {

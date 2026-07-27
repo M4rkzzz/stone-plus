@@ -7,21 +7,7 @@ import { ClientConfigParseError, ClientConfigValidationError } from './types'
 
 export const protectedValuePlaceholder = '__STONE_PROTECTED_VALUE__'
 const dotenvAssignment = /^(\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)(?:\s*=\s*))(.*)$/
-const sensitiveKey = /(?:token|secret|password|credential|api[_-]?key|authorization|cookie)/i
-const sensitiveContainer = /^(?:env|headers?|http[_-]?headers?|env[_-]?http[_-]?headers?|request[_-]?headers?)$/i
-const knownNonSecretKeys = new Set([
-  'cli_auth_credentials_store',
-  'mcp_oauth_credentials_store',
-  'env_key',
-])
 const revisionKey = randomBytes(32)
-
-export function isSensitiveConfigPath(path: readonly string[]): boolean {
-  return path.some((part) => (
-    sensitiveContainer.test(part)
-    || (!knownNonSecretKeys.has(part) && sensitiveKey.test(part))
-  ))
-}
 
 export function createClientConfigEditorFile(
   file: ClientConfigFilePath,
@@ -36,13 +22,13 @@ export function createClientConfigEditorFile(
       exists: source !== undefined,
       editable: false,
       containsCredential: true,
+      ...(source !== undefined ? { content: source } : {}),
       revision,
-      protectedValueCount: source === undefined ? 0 : 1,
+      protectedValueCount: 0,
     }
   }
   if (file.role === 'claude-mcp') {
     const projected = projectClaudeMcp(source)
-    const protectedDocument = protectJsonDocument(projected, file.role)
     return {
       role: file.role,
       path: file.path,
@@ -50,17 +36,12 @@ export function createClientConfigEditorFile(
       exists: source !== undefined,
       editable: true,
       containsCredential: true,
-      content: protectedDocument.content,
+      content: projected,
       revision,
-      protectedValueCount: protectedDocument.count,
+      protectedValueCount: 0,
     }
   }
   const initial = source ?? defaultContent(file.format)
-  const protectedDocument = file.format === 'json'
-    ? protectJsonDocument(initial, file.role)
-    : file.format === 'dotenv'
-      ? protectDotenv(initial)
-      : protectTomlDocument(initial, file.role)
   return {
     role: file.role,
     path: file.path,
@@ -68,9 +49,9 @@ export function createClientConfigEditorFile(
     exists: source !== undefined,
     editable: true,
     containsCredential: file.containsCredential,
-    content: protectedDocument.content,
+    content: initial,
     revision,
-    protectedValueCount: protectedDocument.count,
+    protectedValueCount: 0,
   }
 }
 
@@ -115,20 +96,6 @@ function isTomlValue(value: unknown): value is TomlValue {
     || (Array.isArray(value) && value.every((item) => typeof item === 'string'))
 }
 
-function collectSensitiveTomlPaths(
-  value: unknown,
-  path: string[] = [],
-  result: string[][] = [],
-): string[][] {
-  if (isTomlValue(value)) {
-    if (path.length && isSensitiveConfigPath(path)) result.push(path)
-    return result
-  }
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return result
-  for (const [key, child] of Object.entries(value)) collectSensitiveTomlPaths(child, [...path, key], result)
-  return result
-}
-
 function collectTomlPlaceholderPaths(
   value: unknown,
   path: string[] = [],
@@ -150,26 +117,6 @@ function tomlValueAt(root: Record<string, unknown>, path: readonly string[]): un
     current = (current as Record<string, unknown>)[part]
   }
   return current
-}
-
-function protectTomlDocument(
-  content: string,
-  role: ClientConfigFilePath['role'],
-): { content: string; count: number } {
-  const root = parseTomlForRole(content, role)
-  const protectedPaths = collectSensitiveTomlPaths(root)
-  if (!protectedPaths.length) return { content, count: 0 }
-  try {
-    return {
-      content: patchCodexTomlPaths(content, protectedPaths.map((path) => ({
-        path,
-        value: protectedValuePlaceholder,
-      }))).content,
-      count: protectedPaths.length,
-    }
-  } catch (error) {
-    throw tomlRoleError(error, role)
-  }
 }
 
 function restoreTomlDocument(
@@ -238,43 +185,6 @@ function restoreClaudeMcp(draft: string, original: string): string {
   return stringifyJsonObject(root, original)
 }
 
-function protectJsonDocument(content: string, role: ClientConfigFilePath['role']): { content: string; count: number } {
-  const root = parseJsonObject(content, role)
-  const protectedDocument = protectJsonValue(root, false)
-  if (protectedDocument.count === 0) return { content, count: 0 }
-  return {
-    content: stringifyJsonObject(protectedDocument.value as JsonObject, content),
-    count: protectedDocument.count,
-  }
-}
-
-function protectJsonValue(value: unknown, protectChildren: boolean): { value: unknown; count: number } {
-  if (typeof value === 'string') {
-    return protectChildren ? { value: protectedValuePlaceholder, count: 1 } : { value, count: 0 }
-  }
-  if (Array.isArray(value)) {
-    let count = 0
-    const next = value.map((item) => {
-      const protectedItem = protectJsonValue(item, protectChildren)
-      count += protectedItem.count
-      return protectedItem.value
-    })
-    return { value: next, count }
-  }
-  if (!value || typeof value !== 'object') return { value, count: 0 }
-  let count = 0
-  const next: JsonObject = {}
-  for (const [key, child] of Object.entries(value)) {
-    const protectedChild = protectJsonValue(
-      child,
-      protectChildren || sensitiveContainer.test(key) || sensitiveKey.test(key),
-    )
-    count += protectedChild.count
-    next[key] = protectedChild.value
-  }
-  return { value: next, count }
-}
-
 function restoreJsonDocument(
   draft: string,
   original: string,
@@ -303,18 +213,6 @@ function restoreJsonValue(draft: unknown, original: unknown, role: ClientConfigF
     key,
     restoreJsonValue(value, source[key], role),
   ]))
-}
-
-function protectDotenv(content: string): { content: string; count: number } {
-  let count = 0
-  const next = content.split(/(\r?\n)/).map((part) => {
-    if (part === '\n' || part === '\r\n') return part
-    const match = dotenvAssignment.exec(part)
-    if (!match) return part
-    count += 1
-    return `${match[1]}${JSON.stringify(protectedValuePlaceholder)}`
-  }).join('')
-  return { content: next, count }
 }
 
 function restoreDotenv(draft: string, original: string): string {

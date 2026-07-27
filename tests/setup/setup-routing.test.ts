@@ -44,7 +44,7 @@ describe('setup routing transaction', () => {
     expect(result).toMatchObject({ poolId: 'import-pool', createdPool: false })
   })
 
-  it('uses a wildcard for Codex routes created from an xAI-compatible relay', () => {
+  it('maps Codex aliases to the only xAI relay model across the protocol bridge', () => {
     const draft = state()
     draft.providers[0] = {
       ...draft.providers[0],
@@ -87,7 +87,7 @@ describe('setup routing transaction', () => {
     expect(draft.routes[0]).toMatchObject({
       client: 'grokbuild',
       inboundProtocol: 'openai-responses',
-      modelMap: { '*': 'grok-4.5' },
+      modelMap: {},
     })
     expect(draft.pools[0]).toMatchObject({ protocol: 'grok' })
   })
@@ -113,7 +113,7 @@ describe('setup routing transaction', () => {
     expect(draft.pools).toEqual([])
   })
 
-  it('uses a wildcard for Codex routes backed by Claude', () => {
+  it('maps Codex aliases to the only Claude model across the protocol bridge', () => {
     const draft = state()
     draft.providers[0] = {
       ...draft.providers[0], kind: 'anthropic', protocol: 'anthropic-messages', models: ['claude-opus-4-8'],
@@ -125,12 +125,67 @@ describe('setup routing transaction', () => {
     expect(draft.routes[0].modelMap).toEqual({ '*': 'claude-opus-4-8' })
   })
 
-  it('uses a wildcard for Claude routes backed by OpenAI Responses', () => {
+  it('maps Claude aliases to the only OpenAI model across the protocol bridge', () => {
     const draft = state()
     applySetupRoutingDraft(draft, {
       sessionId: 'session', sourceId: 'one', client: 'claude', model: 'gpt-test',
     })
     expect(draft.routes[0].modelMap).toEqual({ '*': 'gpt-test' })
+  })
+
+  it('does not generate a fallback for same-protocol or ambiguous cross-protocol sources', () => {
+    const nativeDraft = state()
+    applySetupRoutingDraft(nativeDraft, {
+      sessionId: 'session', sourceId: 'one', client: 'codex', model: 'gpt-test',
+    })
+    expect(nativeDraft.routes[0].modelMap).toEqual({})
+
+    const ambiguousDraft = state()
+    ambiguousDraft.providers[0] = {
+      ...ambiguousDraft.providers[0],
+      kind: 'anthropic',
+      protocol: 'anthropic-messages',
+      models: ['claude-opus-4-8', 'claude-sonnet-5'],
+    }
+    ambiguousDraft.accounts.forEach((account) => {
+      account.availableModels = ['claude-opus-4-8', 'claude-sonnet-5']
+    })
+    applySetupRoutingDraft(ambiguousDraft, {
+      sessionId: 'session', sourceId: 'one', client: 'codex', model: 'claude-opus-4-8',
+    })
+    expect(ambiguousDraft.routes[0].modelMap).toEqual({})
+
+    const advisoryDraft = state()
+    advisoryDraft.providers[0] = {
+      ...advisoryDraft.providers[0],
+      kind: 'anthropic',
+      protocol: 'anthropic-messages',
+      models: ['claude-opus-4-8'],
+    }
+    applySetupRoutingDraft(advisoryDraft, {
+      sessionId: 'session', sourceId: 'one', client: 'codex', model: 'claude-sonnet-5',
+    })
+    expect(advisoryDraft.routes[0].modelMap).toEqual({})
+  })
+
+  it('preserves explicit mappings and never replaces an explicit wildcard', () => {
+    const draft = state()
+    draft.providers[0] = {
+      ...draft.providers[0], kind: 'anthropic', protocol: 'anthropic-messages', models: ['claude-opus-4-8'],
+    }
+    draft.accounts.forEach((account) => { account.availableModels = ['claude-opus-4-8'] })
+    draft.routes.push({
+      id: 'codex-route', client: 'codex', enabled: true, poolId: 'old-pool',
+      inboundProtocol: 'openai-responses',
+      modelMap: { exact: 'explicit-model', '*': 'explicit-default' },
+      localToken: 'stable-token', createdAt: 1, updatedAt: 1,
+    })
+
+    applySetupRoutingDraft(draft, {
+      sessionId: 'session', sourceId: 'one', client: 'codex', model: 'claude-opus-4-8',
+    })
+
+    expect(draft.routes[0].modelMap).toEqual({ exact: 'explicit-model', '*': 'explicit-default' })
   })
 
   it('mixes eligible OAuth and Agent Identity peers but excludes unsupported members', () => {

@@ -27,7 +27,7 @@ export interface ClientInstanceProcessAdapter {
     env: NodeJS.ProcessEnv
     launchMode: ManagedClientLaunchMode
   }): ClientInstanceProcess
-  terminateTree?(child: ClientInstanceProcess): Promise<void>
+  terminateTree?(child: ClientInstanceProcess, signal?: NodeJS.Signals): Promise<void>
   isAlive?(child: ClientInstanceProcess): Promise<boolean>
   waitForReady?(child: ClientInstanceProcess): Promise<void>
 }
@@ -498,7 +498,8 @@ export class ClientInstanceManager {
     }
     let graceful = false
     try {
-      active.child.kill('SIGTERM')
+      if (this.processAdapter.terminateTree) await this.processAdapter.terminateTree(active.child, 'SIGTERM')
+      else active.child.kill('SIGTERM')
       graceful = await waitForExit(active.exit, this.stopTimeoutMs)
     } catch {
       // A failed graceful signal does not prove exit; continue to tree termination.
@@ -670,7 +671,10 @@ export class ClientInstanceManager {
         ? !await this.processAdapter.isAlive(active.child).catch(() => true)
         : true
     }
-    try { active.child.kill('SIGTERM') } catch { /* Continue to the forced tree termination. */ }
+    try {
+      if (this.processAdapter.terminateTree) await this.processAdapter.terminateTree(active.child, 'SIGTERM')
+      else active.child.kill('SIGTERM')
+    } catch { /* Continue to the forced tree termination. */ }
     if (await waitForExit(active.exit, Math.min(500, this.stopTimeoutMs))) {
       await active.finalized
       return true
@@ -784,9 +788,13 @@ class NodeClientInstanceProcessAdapter implements ClientInstanceProcessAdapter {
     })
   }
 
-  async terminateTree(child: ClientInstanceProcess): Promise<void> {
-    if (process.platform !== 'win32' || !child.pid) {
-      child.kill('SIGKILL')
+  async terminateTree(child: ClientInstanceProcess, signal: NodeJS.Signals = 'SIGKILL'): Promise<void> {
+    if (!child.pid) {
+      child.kill(signal)
+      return
+    }
+    if (process.platform !== 'win32') {
+      await terminatePosixPidTree(child.pid, signal)
       return
     }
     await new Promise<void>((resolve, reject) => {
@@ -872,7 +880,10 @@ export function clientInstanceNodeSpawnOptions(
   hasControllingTerminal: boolean,
 ): ClientInstanceNodeSpawnOptions {
   if (launchMode === 'background') {
-    return { windowsHide: true, detached: false, stdio: 'ignore' }
+    // A dedicated POSIX process group lets Stone+ terminate the CLI and every
+    // child tool it spawned without depending on the wrapper process staying
+    // alive. Windows uses taskkill /T instead.
+    return { windowsHide: true, detached: platform !== 'win32', stdio: 'ignore' }
   }
   if (platform !== 'win32' && !hasControllingTerminal) {
     throw new Error('Visible terminal launch requires Stone+ to run from a controlling terminal on this platform. Choose background mode otherwise.')
@@ -1198,8 +1209,42 @@ async function terminateClientPidTree(pid: number, platform: NodeJS.Platform): P
     })
     return
   }
-  try { process.kill(pid, 'SIGKILL') } catch (error) {
+  await terminatePosixPidTree(pid, 'SIGKILL')
+}
+
+async function terminatePosixPidTree(pid: number, signal: NodeJS.Signals): Promise<void> {
+  // Background instances are process-group leaders. Group signalling is
+  // atomic and still reaches descendants after a short-lived wrapper exits.
+  try {
+    process.kill(-pid, signal)
+    return
+  } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error
+  }
+  // Legacy/recovered terminal launches may not own a process group. Enumerate
+  // their descendants and signal leaves first so no orphan survives its root.
+  let output = ''
+  try { output = await executeProcessInspection('/bin/ps', ['-eo', 'pid=', '-o', 'ppid=']) } catch { /* Fall through to root. */ }
+  const children = new Map<number, number[]>()
+  for (const line of output.split(/\r?\n/)) {
+    const match = /^\s*(\d+)\s+(\d+)\s*$/.exec(line)
+    if (!match) continue
+    const childPid = Number(match[1])
+    const parentPid = Number(match[2])
+    children.set(parentPid, [...(children.get(parentPid) ?? []), childPid])
+  }
+  const descendants: number[] = []
+  const visit = (parent: number): void => {
+    for (const child of children.get(parent) ?? []) {
+      visit(child)
+      descendants.push(child)
+    }
+  }
+  visit(pid)
+  for (const target of [...descendants, pid]) {
+    try { process.kill(target, signal) } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error
+    }
   }
 }
 

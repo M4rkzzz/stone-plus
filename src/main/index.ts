@@ -127,6 +127,9 @@ async function bootstrap(): Promise<void> {
   await store.initialize()
   if (bootstrapShouldStop()) return
   const gatewaySettings = store.getSnapshot().gateway
+  const clientConfigHome = process.env.STONE_CLIENT_CONFIG_HOME?.trim()
+  const resolvedClientConfigHome = clientConfigHome ? resolve(clientConfigHome) : app.getPath('home')
+  const defaultCodexHome = join(resolvedClientConfigHome, '.codex')
   const singBoxRuntimeRoot = app.isPackaged
     ? join(process.resourcesPath, 'sing-box')
     : resolve('build', 'sing-box')
@@ -136,13 +139,27 @@ async function bootstrap(): Promise<void> {
       join(app.getPath('userData'), 'built-in-proxy', 'system-proxy-lease.json')
     )
   })
+  let startupSystemProxyRecoveryError: unknown
   // A stale OS proxy lease must be repaired before Chromium reloads PAC/system
   // state or any background service gets a chance to issue an outbound request.
   // initialize() retries and publishes a fail-closed error if this first repair
   // attempt cannot complete.
-  await systemProxyLease.recoverStaleLease().catch((error) => {
+  try {
+    await systemProxyLease.recoverStaleLease()
+  } catch (error) {
+    startupSystemProxyRecoveryError = error
     console.error('[built-in-proxy] Could not repair the previous system-proxy lease before startup', error)
-  })
+  }
+  const ensureSystemProxyRecoveryBarrier = async (): Promise<void> => {
+    const state = systemProxyLease.getState()
+    if (state.status === 'active') {
+      startupSystemProxyRecoveryError = undefined
+      return
+    }
+    if (!startupSystemProxyRecoveryError && !state.recoveryPending && state.status !== 'error') return
+    await systemProxyLease.recoverStaleLease()
+    startupSystemProxyRecoveryError = undefined
+  }
   if (bootstrapShouldStop()) return
   singBoxService = new SingBoxService({
     userDataPath: app.getPath('userData'),
@@ -203,10 +220,10 @@ async function bootstrap(): Promise<void> {
     scheduleBuiltInRouteChange: (detector) => outboundReloadCoordinator.scheduleBuiltInRouteChange(detector),
     platformCapabilities: builtInProxyPlatformCapabilities(),
   })
-  codexConversationTitles = new CodexConversationTitleResolver(app.getPath('home'))
-  codexSessionRepair = new CodexSessionRepairService({ codexHome: join(app.getPath('home'), '.codex') })
-  codexSessionIndexCleanup = new CodexSessionIndexCleanupService({ codexHome: join(app.getPath('home'), '.codex') })
-  codexSessionManager = new CodexSessionManager({ codexHome: join(app.getPath('home'), '.codex') })
+  codexConversationTitles = new CodexConversationTitleResolver(resolvedClientConfigHome)
+  codexSessionRepair = new CodexSessionRepairService({ codexHome: defaultCodexHome })
+  codexSessionIndexCleanup = new CodexSessionIndexCleanupService({ codexHome: defaultCodexHome })
+  codexSessionManager = new CodexSessionManager({ codexHome: defaultCodexHome })
   const codexDesktop = process.platform === 'darwin'
     ? new MacChatGptDesktopController()
     : process.platform === 'win32'
@@ -262,6 +279,7 @@ async function bootstrap(): Promise<void> {
   if (bootstrapShouldStop()) return
   gateway = new GatewayServer({
     config: toGatewayConfig(store),
+    beforeStart: ensureSystemProxyRecoveryBarrier,
     credentialResolver: async (account, fetchImplementation = fetch, signal) => {
       if (account.credentialType === 'chatgpt-agent-identity') {
         const serialized = store.getCredential(account.credentialId)
@@ -273,7 +291,7 @@ async function bootstrap(): Promise<void> {
         ): Promise<ResolvedGatewayCredential> => {
           const access = await resolveChatGptAgentIdentity(
             source,
-            (rotated, expectedSource) => store.updateChatGptAgentIdentityCredential(account.id, rotated, expectedSource),
+            (rotated, expectedSource) => store.persistRotatedChatGptAgentIdentityCredential(account.id, rotated, expectedSource),
             fetchImplementation,
             { signal, forceTaskRegistration, expectedTaskId }
           )
@@ -298,7 +316,7 @@ async function bootstrap(): Promise<void> {
         if (!serialized) return undefined
         const resolved = await resolveChatGptCredential(
           serialized,
-          (rotated, expectedSource) => store.updateChatGptCredential(account.id, rotated, expectedSource),
+          (rotated, expectedSource) => store.persistRotatedChatGptCredential(account.id, rotated, expectedSource),
           fetchImplementation,
           Date.now(),
           { refreshKey: account.id, signal }
@@ -310,7 +328,7 @@ async function bootstrap(): Promise<void> {
         if (!serialized) return undefined
         const resolved = await resolveGrokOAuthCredential(
           serialized,
-          (rotated, expectedSource) => store.updateGrokOAuthCredential(account.id, rotated, expectedSource),
+          (rotated, expectedSource) => store.persistRotatedGrokOAuthCredential(account.id, rotated, expectedSource),
           fetchImplementation,
           Date.now(),
           { refreshKey: account.id, signal }
@@ -344,10 +362,9 @@ async function bootstrap(): Promise<void> {
     // filesystem failure must never prevent the gateway itself from starting.
     console.warn('Stone+ local event stream is unavailable', eventServerStart.error)
   }
-  const clientConfigHome = process.env.STONE_CLIENT_CONFIG_HOME
   const grokBuildHome = process.env.GROK_HOME?.trim()
   const clientConfig = new ClientConfigService({
-    homeDir: clientConfigHome ? resolve(clientConfigHome) : app.getPath('home'),
+    homeDir: resolvedClientConfigHome,
     platform: process.platform,
     ...(grokBuildHome ? { overrides: { grokbuildDirectory: resolve(grokBuildHome) } } : {}),
   })

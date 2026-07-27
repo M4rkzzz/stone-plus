@@ -2,7 +2,12 @@ import { execFile } from 'node:child_process'
 import { resolve as resolvePath } from 'node:path'
 import type { AgentRestoreOptions, AgentStartOptions, AgentTarget } from '@shared/agent-lifecycle'
 import { agentRouteClient } from '@shared/agent-lifecycle'
-import { clientNativeProtocols, type ManagedClientInstance, type RouteClient } from '@shared/types'
+import {
+  clientNativeProtocols,
+  type ManagedClientInstance,
+  type PoolProtocol,
+  type RouteClient,
+} from '@shared/types'
 import { enumerateRouteSourceModels, listRouteSources, resolveRouteSource } from '@shared/route-sources'
 import {
   CodexSessionRepairService,
@@ -242,13 +247,22 @@ function connectionOnlyPort(
   }
   return {
     target: adapter.target,
-    inspect: async () => adapterSnapshot(await adapter.getSnapshot()),
+    inspect: async () => {
+      const state = await adapter.getSnapshot()
+      let configured = false
+      try { configured = await adapter.isConfiguredFor(connection()) } catch { /* Missing/disabled route. */ }
+      return adapterSnapshot(state, configured)
+    },
     close: async () => {
       const before = await adapter.getSnapshot()
       const result = await adapter.close()
       return { wasRunning: before.running, pendingNewSession: result.externalSessionsUnaffected }
     },
-    restore: async (_options?: AgentRestoreOptions) => adapter.restore(await preparedConnection()),
+    restore: async (restoreOptions?: AgentRestoreOptions) => adapter.restore(
+      await preparedConnection(),
+      {},
+      restoreOptions?.preserveRunningState !== false,
+    ),
     start: async (options?: AgentStartOptions) => adapter.start(options, await preparedConnection()),
   }
 }
@@ -591,12 +605,9 @@ function enabledNativeRoute(store: AppStore, client: RouteClient) {
   return route
 }
 
-/**
- * A client-native model name and an upstream model name are separate concerns.
- * When a Claude source exposes exactly one model, persist that deterministic
- * choice as the route fallback instead of leaking it into Claude's own model
- * environment variables. Existing explicit mappings always win.
- */
+/** Keep client-native model names out of provider configuration. A route-layer
+ * wildcard is safe only when a translated source exposes one unambiguous
+ * upstream model; explicit exact/default mappings remain authoritative. */
 export async function ensureSingleModelRouteDefault(store: AppStore, client: RouteClient): Promise<void> {
   const snapshot = store.getSnapshot()
   const route = snapshot.routes.find((candidate) => (
@@ -604,11 +615,16 @@ export async function ensureSingleModelRouteDefault(store: AppStore, client: Rou
     && candidate.enabled
     && candidate.inboundProtocol === clientNativeProtocols[client]
   ))
-  if (!route || Object.keys(route.modelMap).length > 0) return
+  if (!route || Object.hasOwn(route.modelMap, '*')) return
   const source = resolveRouteSource(route.poolId, snapshot)
+  if (!source || !requiresSingleModelFallback(client, source.summary.protocol)) return
   const exposed = enumerateRouteSourceModels(source, snapshot)
   if (exposed.length !== 1) return
-  await store.updateRoute({ ...route, modelMap: { '*': exposed[0] } })
+  await store.updateRoute({ ...route, modelMap: { ...route.modelMap, '*': exposed[0] } })
+}
+
+function requiresSingleModelFallback(client: RouteClient, sourceProtocol: PoolProtocol): boolean {
+  return client !== 'grokbuild' && sourceProtocol !== clientNativeProtocols[client]
 }
 
 function selectInstance(instances: ManagedClientInstance[], client: RouteClient, profileId?: string) {

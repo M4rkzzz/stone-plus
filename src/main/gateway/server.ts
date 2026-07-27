@@ -319,6 +319,7 @@ export class GatewayServer implements GatewayController {
   private readonly loopbackFetchImplementation: typeof fetch
   private readonly outboundFetchResolver?: OutboundFetchResolver
   private readonly conversationTitleResolver?: ConversationTitleResolver
+  private readonly beforeStart?: () => Promise<void>
   private readonly scheduler: PoolScheduler
   private readonly largeRequestBodies = new WeightedByteGate(LARGE_REQUEST_BODY_BUDGET_BYTES)
   private readonly logListeners = new Set<GatewayLogHandler>()
@@ -347,6 +348,7 @@ export class GatewayServer implements GatewayController {
     this.loopbackFetchImplementation = options.loopbackFetchImplementation ?? fetch
     this.outboundFetchResolver = options.outboundFetchResolver
     this.conversationTitleResolver = options.conversationTitleResolver
+    this.beforeStart = options.beforeStart
     this.now = options.now ?? (() => Date.now())
     this.responsesProgressIdleTimeoutMs = Math.max(
       1,
@@ -369,6 +371,7 @@ export class GatewayServer implements GatewayController {
     }
     if (credentialResolver) this.credentialResolver = credentialResolver
     if (this.server) return
+    await this.beforeStart?.()
     this.scheduler.hydrate(this.config.accounts, this.config.pools)
     this.scheduler.hydratePerformance(this.config.recentRequestLogs ?? [])
 

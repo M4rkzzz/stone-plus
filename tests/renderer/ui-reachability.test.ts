@@ -97,4 +97,12 @@ describe('renderer reachability regressions', () => {
     expect(script).toContain("'内置浏览器'")
     expect(script).toContain("getByRole('tab', { name: /Grok/ })")
   })
+
+  it('runs overflow-menu actions before closing their portal', () => {
+    const source = readFileSync(new URL('../../src/renderer/src/ui.tsx', import.meta.url), 'utf8')
+    const overflowMenu = source.slice(source.indexOf('export function OverflowMenu'), source.indexOf('function decorateOverflowMenuItems'))
+
+    expect(overflowMenu).toContain('onClick={(event) => {')
+    expect(overflowMenu).not.toContain('onClickCapture=')
+  })
 })

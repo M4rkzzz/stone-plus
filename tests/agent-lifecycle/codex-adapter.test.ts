@@ -56,6 +56,20 @@ describe('CodexLifecycleAdapter', () => {
     })
   })
 
+  it('passes a requested stopped-state repair through to the desktop transaction', async () => {
+    const deepRepair = { run: vi.fn(async () => undefined) }
+    const adapter = new CodexLifecycleAdapter({
+      target: 'codex-desktop',
+      desktop: makeDesktop(),
+      desktopProbe: makeDesktopProbe({ installed: true, running: true }),
+      deepRepair,
+    })
+
+    await adapter.restore({ preserveRunningState: false })
+
+    expect(deepRepair.run).toHaveBeenCalledWith({ preserveRunningState: false })
+  })
+
   it('reuses the exact captured desktop launch state after an explicit close', async () => {
     const state = {
       wasRunning: true,

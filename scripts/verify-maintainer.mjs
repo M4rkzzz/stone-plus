@@ -2,8 +2,13 @@
 // See LICENSE and PROJECT_IDENTITY.json in the repository root.
 
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { accessSync, constants, existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { spawnSync } from "node:child_process";
+import { delimiter, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const repositoryRoot = realpathSync(fileURLToPath(new URL("../", import.meta.url)));
+const resolvedExecutables = new Map();
 
 const identity = JSON.parse(
   readFileSync(new URL("../PROJECT_IDENTITY.json", import.meta.url), "utf8"),
@@ -28,12 +33,13 @@ function isVersionAtLeast(candidate, minimum) {
 }
 
 function run(command, args) {
-  const result = spawnSync(command, args, {
+  const executable = resolveTrustedExecutable(command);
+  const result = spawnSync(executable, args, {
     encoding: "utf8",
     windowsHide: true,
   });
   if (result.error)
-    throw new Error(`${command} could not be started: ${result.error.message}`);
+    throw new Error(`${command} could not be started from ${executable}: ${result.error.message}`);
   if (result.status !== 0) {
     const detail = (result.stderr || result.stdout || "").trim();
     throw new Error(
@@ -41,6 +47,45 @@ function run(command, args) {
     );
   }
   return result.stdout.trim();
+}
+
+function resolveTrustedExecutable(command) {
+  const cached = resolvedExecutables.get(command);
+  if (cached) return cached;
+  const executableName = process.platform === "win32" ? `${command}.exe` : command;
+  const known = process.platform === "win32"
+    ? command === "git"
+      ? [
+          join(process.env.ProgramFiles || "C:\\Program Files", "Git", "cmd", executableName),
+          join(process.env.ProgramFiles || "C:\\Program Files", "Git", "bin", executableName),
+        ]
+      : command === "gh"
+        ? [join(process.env.ProgramFiles || "C:\\Program Files", "GitHub CLI", executableName)]
+        : []
+    : [];
+  const fromPath = String(process.env.PATH || "")
+    .split(delimiter)
+    .filter(Boolean)
+    .map((directory) => join(directory, executableName));
+  for (const candidate of [...known, ...fromPath]) {
+    try {
+      const absolute = resolve(candidate);
+      if (!existsSync(absolute) || !statSync(absolute).isFile()) continue;
+      accessSync(absolute, constants.X_OK);
+      const canonical = realpathSync(absolute);
+      if (isInside(repositoryRoot, canonical) || isInside(realpathSync(process.cwd()), canonical)) continue;
+      resolvedExecutables.set(command, canonical);
+      return canonical;
+    } catch {
+      // Try the next trusted absolute candidate.
+    }
+  }
+  throw new Error(`${command} was not found at a trusted absolute path`);
+}
+
+function isInside(parent, candidate) {
+  const path = relative(parent, candidate);
+  return path === "" || (!isAbsolute(path) && !path.startsWith(`..${sep}`) && path !== "..");
 }
 
 function normalizeRemote(value) {

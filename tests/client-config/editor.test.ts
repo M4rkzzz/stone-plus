@@ -9,166 +9,46 @@ import { resolveClientConfigPaths } from '../../src/main/client-config/paths'
 
 const paths = resolveClientConfigPaths({ homeDir: '/home/tester', platform: 'linux' })
 
-describe('client configuration editor protection', () => {
-  it('redacts strings in JSON environment/header containers and secret-named fields', () => {
-    const secrets = [
-      'env-token-value',
-      'nested-env-value',
-      'array-env-value',
-      'object-env-value',
-      'named-secret-value',
-      'header-key-value',
-      'header-content-type-value',
-    ]
-    const source = JSON.stringify({
-      model: 'visible-model',
-      env: {
-        ANTHROPIC_AUTH_TOKEN: secrets[0],
-        nested: { value: secrets[1], enabled: true },
-        list: [secrets[2], { apiKey: secrets[3] }],
-      },
-      integration: {
-        clientSecret: secrets[4],
-        endpoint: 'https://visible.example',
-      },
-      headers: {
-        'x-api-key': secrets[5],
-        'content-type': secrets[6],
-      },
-    }, null, 2) + '\n'
+describe('client configuration editor display', () => {
+  it('shows JSON, dotenv, TOML, and Codex authentication values in plaintext', () => {
+    const json = '{"env":{"ANTHROPIC_AUTH_TOKEN":"claude-secret"}}\n'
+    const dotenv = 'GEMINI_API_KEY="gemini-secret"\r\n'
+    const toml = 'api_key = "grok-secret"\n'
+    const auth = '{"OPENAI_API_KEY":"codex-secret"}\n'
 
-    const editor = createClientConfigEditorFile(paths.claude.settings, source)
-    const content = editor.content!
-    const protectedConfig = JSON.parse(content)
-
-    expect(protectedConfig.model).toBe('visible-model')
-    expect(protectedConfig.integration.endpoint).toBe('https://visible.example')
-    expect(protectedConfig.env).toEqual({
-      ANTHROPIC_AUTH_TOKEN: protectedValuePlaceholder,
-      nested: { value: protectedValuePlaceholder, enabled: true },
-      list: [protectedValuePlaceholder, { apiKey: protectedValuePlaceholder }],
+    expect(createClientConfigEditorFile(paths.claude.settings, json)).toMatchObject({ content: json, protectedValueCount: 0 })
+    expect(createClientConfigEditorFile(paths.gemini.env, dotenv)).toMatchObject({ content: dotenv, protectedValueCount: 0 })
+    expect(createClientConfigEditorFile(paths.grokbuild.config, toml)).toMatchObject({ content: toml, protectedValueCount: 0 })
+    expect(createClientConfigEditorFile(paths.codex.auth, auth)).toMatchObject({
+      content: auth,
+      editable: false,
+      protectedValueCount: 0,
     })
-    expect(protectedConfig.integration.clientSecret).toBe(protectedValuePlaceholder)
-    expect(protectedConfig.headers).toEqual({
-      'x-api-key': protectedValuePlaceholder,
-      'content-type': protectedValuePlaceholder,
-    })
-    expect(editor.protectedValueCount).toBe(7)
-    for (const secret of secrets) expect(content).not.toContain(secret)
   })
 
-  it('redacts every dotenv assignment while preserving comments, syntax, and line endings', () => {
-    const source = [
-      '# Gemini environment',
-      'PLAIN=value-one',
-      'export SPACED = "value two"',
-      'EMPTY=',
-      'DUPLICATE=first-value',
-      'DUPLICATE=second-value',
-      'not an assignment',
-      '',
-    ].join('\r\n')
+  it('persists explicit plaintext changes without replacing them from the original', () => {
+    const jsonSource = '{"env":{"TOKEN":"old-json-secret"}}\n'
+    const tomlSource = 'api_key = "old-toml-secret"\n'
+    const dotenvSource = 'API_KEY="old-dotenv-secret"\n'
 
-    const editor = createClientConfigEditorFile(paths.gemini.env, source)
-    const content = editor.content!
-    const placeholder = JSON.stringify(protectedValuePlaceholder)
-
-    expect(content).toBe([
-      '# Gemini environment',
-      `PLAIN=${placeholder}`,
-      `export SPACED = ${placeholder}`,
-      `EMPTY=${placeholder}`,
-      `DUPLICATE=${placeholder}`,
-      `DUPLICATE=${placeholder}`,
-      'not an assignment',
-      '',
-    ].join('\r\n'))
-    expect(editor.protectedValueCount).toBe(5)
-    for (const value of ['value-one', 'value two', 'first-value', 'second-value']) {
-      expect(content).not.toContain(value)
-    }
-  })
-
-  it('redacts and restores nested TOML credentials while preserving ordinary provider settings', () => {
-    const source = [
-      'model = "gpt-visible"',
-      'cli_auth_credentials_store = "file"',
-      '',
-      '[model_providers.private]',
-      'name = "Visible provider"',
-      'base_url = "https://visible.example/v1"',
-      'experimental_bearer_token = "private-bearer-token" # secret comment',
-      'api_key = "private-api-key"',
-      '',
-      '[model_providers.private.http_headers]',
-      'Authorization = "Bearer private-header-token"',
-      'Content-Type = "application/json"',
-      '',
-    ].join('\n')
-
-    const editor = createClientConfigEditorFile(paths.codex.config, source)
-    const content = editor.content!
-
-    expect(content).toContain('model = "gpt-visible"')
-    expect(content).toContain('cli_auth_credentials_store = "file"')
-    expect(content).toContain('name = "Visible provider"')
-    expect(content).toContain('base_url = "https://visible.example/v1"')
-    expect(content).toContain(`experimental_bearer_token = "${protectedValuePlaceholder}" # secret comment`)
-    expect(content).toContain(`api_key = "${protectedValuePlaceholder}"`)
-    expect(content).toContain(`Authorization = "${protectedValuePlaceholder}"`)
-    expect(content).toContain(`Content-Type = "${protectedValuePlaceholder}"`)
-    expect(editor.protectedValueCount).toBe(4)
-    expect(content).not.toContain('private-bearer-token')
-    expect(content).not.toContain('private-api-key')
-    expect(content).not.toContain('private-header-token')
-
-    const draft = content
-      .replace('model = "gpt-visible"', 'model = "gpt-updated"')
-      .replace('name = "Visible provider"', 'name = "Updated provider"')
-    const restored = restoreClientConfigEditorContent(paths.codex.config, draft, source)
-
-    expect(restored).toContain('model = "gpt-updated"')
-    expect(restored).toContain('name = "Updated provider"')
-    expect(restored).toContain('experimental_bearer_token = "private-bearer-token" # secret comment')
-    expect(restored).toContain('api_key = "private-api-key"')
-    expect(restored).toContain('Authorization = "Bearer private-header-token"')
-    expect(restored).toContain('Content-Type = "application/json"')
-  })
-
-  it('restores protected JSON values and still accepts edits to ordinary fields', () => {
-    const source = JSON.stringify({
-      model: 'old-model',
-      enabled: true,
-      env: {
-        ANTHROPIC_AUTH_TOKEN: 'original-token',
-        KEEP: 'original-environment-value',
-      },
-      nested: { api_key: 'original-api-key', visible: 'old-visible-value' },
-    }, null, 2) + '\n'
-    const editor = createClientConfigEditorFile(paths.claude.settings, source)
-    const draft = JSON.parse(editor.content!)
-    draft.model = 'new-model'
-    draft.enabled = false
-    draft.nested.visible = 'new-visible-value'
-
-    const restored = restoreClientConfigEditorContent(
+    expect(restoreClientConfigEditorContent(
       paths.claude.settings,
-      JSON.stringify(draft, null, 2) + '\n',
-      source,
-    )
-
-    expect(JSON.parse(restored)).toEqual({
-      model: 'new-model',
-      enabled: false,
-      env: {
-        ANTHROPIC_AUTH_TOKEN: 'original-token',
-        KEEP: 'original-environment-value',
-      },
-      nested: { api_key: 'original-api-key', visible: 'new-visible-value' },
-    })
+      jsonSource.replace('old-json-secret', 'new-json-secret'),
+      jsonSource,
+    )).toContain('new-json-secret')
+    expect(restoreClientConfigEditorContent(
+      paths.grokbuild.config,
+      tomlSource.replace('old-toml-secret', 'new-toml-secret'),
+      tomlSource,
+    )).toContain('new-toml-secret')
+    expect(restoreClientConfigEditorContent(
+      paths.gemini.env,
+      dotenvSource.replace('old-dotenv-secret', 'new-dotenv-secret'),
+      dotenvSource,
+    )).toContain('new-dotenv-secret')
   })
 
-  it('projects only Claude MCP servers from the protected user state file', () => {
+  it('projects only Claude MCP servers while displaying their values in plaintext', () => {
     const source = JSON.stringify({
       oauthAccount: { accessToken: 'oauth-secret', accountId: 'private-account' },
       projects: { 'C:/work': { hasTrustDialogAccepted: true } },
@@ -184,10 +64,11 @@ describe('client configuration editor protection', () => {
     const draft = JSON.parse(editor.content!)
 
     expect(Object.keys(draft)).toEqual(['mcpServers'])
-    expect(draft.mcpServers.workspace.env.MCP_TOKEN).toBe(protectedValuePlaceholder)
+    expect(draft.mcpServers.workspace.env.MCP_TOKEN).toBe('mcp-secret')
+    expect(editor.protectedValueCount).toBe(0)
     expect(editor.content).not.toContain('oauth-secret')
     expect(editor.content).not.toContain('private-account')
-    expect(editor.content).not.toContain('mcp-secret')
+    expect(editor.content).toContain('mcp-secret')
 
     draft.mcpServers.workspace.command = 'new-command'
     const restored = JSON.parse(restoreClientConfigEditorContent(
@@ -203,7 +84,7 @@ describe('client configuration editor protection', () => {
     })
   })
 
-  it('restores dotenv placeholders by key occurrence and permits explicit ordinary replacements', () => {
+  it('still restores legacy dotenv placeholders by key occurrence', () => {
     const source = [
       'GEMINI_API_KEY="original-token"',
       'THEME=original-theme',
@@ -211,9 +92,13 @@ describe('client configuration editor protection', () => {
       'DUPLICATE=second',
       '',
     ].join('\n')
-    const editor = createClientConfigEditorFile(paths.gemini.env, source)
-    const draft = editor.content!
-      .replace(`THEME=${JSON.stringify(protectedValuePlaceholder)}`, 'THEME=updated-theme')
+    const draft = [
+      `GEMINI_API_KEY=${JSON.stringify(protectedValuePlaceholder)}`,
+      'THEME=updated-theme',
+      `DUPLICATE=${JSON.stringify(protectedValuePlaceholder)}`,
+      `DUPLICATE=${JSON.stringify(protectedValuePlaceholder)}`,
+      '',
+    ].join('\n')
 
     const restored = restoreClientConfigEditorContent(paths.gemini.env, draft, source)
 

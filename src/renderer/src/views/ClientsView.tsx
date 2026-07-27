@@ -722,6 +722,7 @@ export function ClientsView({
     const modelMap = oneClickRouteModelMap(
       route?.modelMap ?? {},
       enumerateRouteSourceModels(selectedSource, snapshot),
+      { client: activeClient, sourceProtocol: selectedSource?.summary.protocol },
     )
     return {
       ...(route ?? {
@@ -997,6 +998,15 @@ export function ClientsView({
       `${roleLabel(activeDocument.role, language)} 已复制`,
       `${roleLabel(activeDocument.role, language)} copied`,
     ))
+  }
+
+  const openPreviewFile = async () => {
+    if (!activeDocument?.exists) return
+    const opened = await run(`open-config-${activeDocument.role}`, async () => {
+      await api.openClientConfigFile(activeClient, activeDocument.role, activeProfileId)
+      return true
+    })
+    if (opened) setNotice(t('已使用系统默认应用打开配置文件', 'Configuration file opened with the system default application'))
   }
 
   const selectPreviewLine = (lineNumber: number) => {
@@ -1569,7 +1579,7 @@ export function ClientsView({
 
                   <aside className="client-preview-pane" aria-label={t('配置预览', 'Configuration preview')}>
                     <header className="client-preview-pane__header">
-                      <div><Eye size={18} /><span><strong>{t('配置预览', 'Configuration preview')}</strong><small>{t('敏感值不会显示', 'Sensitive values are not shown')}</small></span></div>
+                      <div><Eye size={18} /><span><strong>{t('配置预览', 'Configuration preview')}</strong></span></div>
                       <span className="client-preview-live"><i />{t('实时', 'Live')}</span>
                     </header>
                     <div className="client-preview-toolbar">
@@ -1584,6 +1594,7 @@ export function ClientsView({
                         <button className={`icon-button ${previewMode === 'preview' ? 'active' : ''}`} type="button" title={t('预览', 'Preview')} onClick={() => setPreviewMode('preview')}><Eye size={14} /></button>
                         <button className={`icon-button ${previewMode === 'source' ? 'active' : ''}`} type="button" title={t('编辑完整文件', 'Edit full file')} disabled={!activeDocument?.editable} onClick={() => setPreviewMode('source')}><Braces size={14} /></button>
                         <button className="icon-button" type="button" title={t('复制', 'Copy')} disabled={!activeDocument?.content} onClick={() => void copyPreview()}><Clipboard size={14} /></button>
+                        <button className="icon-button" type="button" title={t('打开文件', 'Open file')} disabled={!activeDocument?.exists || Boolean(busy)} onClick={() => void openPreviewFile()}><ExternalLink size={14} /></button>
                       </div>
                     </div>
                     {activeDocument && (
@@ -1592,18 +1603,18 @@ export function ClientsView({
                           <code>{activeDocument.path}</code>
                           <div><Badge tone={activeDocument.changed ? 'warning' : 'neutral'}>{activeDocument.changed
                             ? t('待写入', 'Pending write')
-                            : t('磁盘版本', 'On-disk version')}</Badge>{activeDocument.protectedValueCount > 0 && <Badge tone="success"><ShieldCheck size={11} />{t('敏感值已保护', 'Sensitive values protected')}</Badge>}</div>
+                            : t('磁盘版本', 'On-disk version')}</Badge></div>
                         </div>
                         {activeDocument.error && <div className="client-preview-error"><AlertTriangle size={15} /><span>{localizeBackendMessage(activeDocument.error, language, t('无法预览配置文件', 'Unable to preview the configuration file.'))}</span></div>}
-                        {!activeDocument.editable ? (
-                          <div className="client-preview-protected"><ShieldCheck size={28} /><strong>{t('认证文件受保护', 'Authentication file protected')}</strong><span>{t('只检测状态，不读取 Token。', 'Only its status is checked; tokens are never read.')}</span></div>
-                        ) : previewMode === 'source' ? (
+                        {previewMode === 'source' && activeDocument.editable ? (
                           <div className="client-source-mode">
                             <div><Pencil size={14} /><span>{t('专家模式：直接编辑完整文件', 'Expert mode: edit the complete file directly')}</span></div>
                             <textarea className="client-source-editor mono" spellCheck={false} value={activeSourceFile ? fileDrafts[activeSourceFile.role] ?? activeSourceFile.content ?? '' : ''} onChange={(event) => activeSourceFile && setFileDrafts((current) => ({ ...current, [activeSourceFile.role]: event.target.value }))} />
                           </div>
-                        ) : (
+                        ) : activeDocument.content !== undefined ? (
                           <CodePreview content={activeDocument.content ?? ''} startLine={activeLocation?.role === activeDocument.role ? activeLocation.startLine : undefined} endLine={activeLocation?.role === activeDocument.role ? activeLocation.endLine : undefined} onSelectLine={selectPreviewLine} />
+                        ) : (
+                          <div className="client-preview-protected"><FileCode2 size={28} /><strong>{t('文件尚未创建', 'File not created yet')}</strong></div>
                         )}
                       </div>
                     )}

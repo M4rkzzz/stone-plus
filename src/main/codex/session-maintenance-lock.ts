@@ -1,4 +1,4 @@
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 
 const LOCK_NAME = 'provider-sync.lock'
@@ -21,7 +21,8 @@ export async function acquireCodexSessionMaintenanceLock(
   const compatibleOwnerPath = join(lockPath, 'owner.json')
   await mkdir(dirname(lockPath), { recursive: true })
   const owner: LockOwner = { pid: process.pid, token, operation, createdAt: now.toISOString() }
-  for (let attempt = 0; attempt < 2; attempt += 1) {
+  const quarantinePath = `${lockPath}.stale-${process.pid}-${token.replace(/[^A-Za-z0-9_-]/g, '')}`
+  for (let attempt = 0; attempt < 4; attempt += 1) {
     try {
       await mkdir(lockPath, { recursive: false })
       try {
@@ -43,10 +44,19 @@ export async function acquireCodexSessionMaintenanceLock(
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
       const stale = await staleMaintenanceLockOwner([ownerPath, compatibleOwnerPath])
-      if (!stale || attempt > 0) {
+      if (!stale) {
         throw new Error('另一个 Stone+ / Codex++ 实例正在维护 Codex 会话，请稍后重试。')
       }
-      await rm(lockPath, { recursive: true, force: true })
+      try {
+        // Atomically detach the stale directory before deleting it. Removing
+        // the observed path directly has a TOCTOU window where another Stone+
+        // process can acquire a fresh lock that this process then deletes.
+        await rename(lockPath, quarantinePath)
+      } catch (renameError) {
+        if ((renameError as NodeJS.ErrnoException).code === 'ENOENT') continue
+        throw renameError
+      }
+      await rm(quarantinePath, { recursive: true, force: true }).catch(() => undefined)
     }
   }
   throw new Error('无法获取 Codex 会话维护锁。')

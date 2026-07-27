@@ -95,6 +95,24 @@ describe('connection-only CLI lifecycle adapters', () => {
     })
   })
 
+  it('keeps previously running managed instances stopped when preservation is disabled', async () => {
+    const { adapter, events, runtime } = harness()
+
+    const result = await adapter.restore(connection, {}, false)
+
+    expect(events).toEqual(['close:one', 'repair', 'validate'])
+    expect(runtime.startManaged).not.toHaveBeenCalled()
+    expect(result.restartedManagedInstanceIds).toEqual([])
+  })
+
+  it('validates the effective Stone+ connection instead of trusting file presence', async () => {
+    const { adapter, config } = harness()
+    vi.mocked(config.validate).mockRejectedValueOnce(new Error('stale endpoint'))
+
+    await expect(adapter.isConfiguredFor(connection)).resolves.toBe(false)
+    await expect(adapter.isConfiguredFor(connection)).resolves.toBe(true)
+  })
+
   it('rolls configuration back and restores managed instances when validation fails', async () => {
     const { adapter, config, events } = harness('gemini-cli')
     vi.mocked(config.validate).mockImplementationOnce(async () => {

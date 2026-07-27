@@ -177,6 +177,7 @@ interface RunningChildContext {
   ready: boolean
   intentional: boolean
   generation: number
+  request: NormalizedStartRequest
   configPath: string
   controllerSecret: string
   mixedPort: number
@@ -286,10 +287,16 @@ export class SingBoxService {
       if (this.state.status === 'ready' && this.lastRequest?.key === normalized.key) return this.getState()
 
       this.cancelRestart()
-      this.lastRequest = normalized
+      // Preserve the active generation's restart request until a replacement
+      // is actually healthy. A failed candidate is rolled back by the
+      // orchestrator and must not become the configuration used after a later
+      // core crash.
+      if (!this.childContext) this.lastRequest = normalized
       this.setDesiredEnabled(true)
       this.setState({ restartAttempt: 0, error: undefined })
-      return this.startAttempt(normalized)
+      const state = await this.startAttempt(normalized)
+      this.lastRequest = normalized
+      return state
     })
   }
 
@@ -345,6 +352,7 @@ export class SingBoxService {
       this.cancelRestart()
       this.childContext = context
       this.startingContext = undefined
+      this.lastRequest = context.request
       this.setDesiredEnabled(true)
       this.setState({
         status: 'ready',
@@ -617,6 +625,7 @@ export class SingBoxService {
         ready: false,
         intentional: false,
         generation: this.nextGeneration++,
+        request,
         configPath,
         controllerSecret: secret,
         mixedPort: mixedLease.port,
@@ -716,7 +725,9 @@ export class SingBoxService {
     host: string
   ): Promise<LoopbackPortLease> {
     try {
-      return await this.reservePort(requestedPort, host)
+      return code === 'controller_port'
+        ? await reserveFetchSafeLoopbackPort(requestedPort, host, this.reservePort)
+        : await this.reservePort(requestedPort, host)
     } catch (error) {
       const label = code === 'mixed_port' ? 'Mixed' : 'Controller'
       const requested = requestedPort ? ` ${requestedPort}` : ''
@@ -1166,6 +1177,38 @@ export async function reserveLoopbackPort(
       await closeServer(server)
     }
   }
+}
+
+const FETCH_FORBIDDEN_PORTS = new Set([
+  1, 7, 9, 11, 13, 15, 17, 19, 20, 21, 22, 23, 25, 37, 42, 43, 53, 69,
+  77, 79, 87, 95, 101, 102, 103, 104, 109, 110, 111, 113, 115, 117, 119,
+  123, 135, 137, 139, 143, 161, 179, 389, 427, 465, 512, 513, 514, 515,
+  526, 530, 531, 532, 540, 548, 554, 556, 563, 587, 601, 636, 989, 990,
+  993, 995, 1719, 1720, 1723, 2049, 3659, 4045, 4190, 5060, 5061, 6000,
+  6566, 6665, 6666, 6667, 6668, 6669, 6697, 10080,
+])
+
+/** Chromium/WHATWG Fetch rejects these ports before issuing a request. */
+export function isFetchForbiddenPort(port: number): boolean {
+  return FETCH_FORBIDDEN_PORTS.has(port)
+}
+
+export async function reserveFetchSafeLoopbackPort(
+  requestedPort: number,
+  host = LOOPBACK_HOST,
+  reserve: ReserveLoopbackPort = reserveLoopbackPort,
+): Promise<LoopbackPortLease> {
+  const explicit = normalizePort(requestedPort, true)
+  if (explicit !== 0 && isFetchForbiddenPort(explicit)) {
+    throw new Error(`Port ${explicit} is blocked by the Fetch network policy.`)
+  }
+  for (let attempt = 0; attempt < 128; attempt += 1) {
+    const lease = await reserve(explicit, host)
+    if (!isFetchForbiddenPort(lease.port)) return lease
+    await lease.release().catch(() => undefined)
+    if (explicit !== 0) break
+  }
+  throw new Error('Could not reserve a Fetch-safe loopback port.')
 }
 
 export function probeTcpPort(host: string, port: number, timeoutMs: number): Promise<void> {

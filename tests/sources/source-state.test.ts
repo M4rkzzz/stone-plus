@@ -124,6 +124,79 @@ describe('API source state changes', () => {
     }), encrypt, NOW)).toThrow(/does not support/)
   })
 
+  it('creates relay accounts with an open model policy while persisting the selected default first', () => {
+    const state = emptyState()
+    const saved = saveApiSourceDraft(state, relayInput({
+      credential: 'relay-key',
+      models: ['model-b', 'model-a', 'model-c'],
+      defaultModel: 'model-a',
+    }), (value) => `encrypted:${value}`, NOW)
+
+    expect(state.providers.find((provider) => provider.id === saved.providerId)?.models)
+      .toEqual(['model-a', 'model-b', 'model-c'])
+    expect(state.accounts.find((account) => account.id === saved.accountId)).toMatchObject({
+      modelPolicy: 'all',
+      modelAllowlist: [],
+    })
+  })
+
+  it('preserves an existing relay model policy when only its name changes', () => {
+    const state = emptyState()
+    const encrypt = (value: string) => `encrypted:${value}`
+    const created = saveApiSourceDraft(state, relayInput({
+      credential: 'relay-key',
+      models: ['model-a', 'model-b'],
+      defaultModel: 'model-a',
+    }), encrypt, NOW)
+    Object.assign(state.accounts[0], {
+      modelPolicy: 'selected',
+      modelAllowlist: ['model-b'],
+    })
+
+    const saved = saveApiSourceDraft(state, relayInput({
+      id: created.sourceId,
+      name: 'Renamed relay',
+      credential: '',
+      models: ['model-a', 'model-b'],
+      defaultModel: 'model-a',
+    }), encrypt, NOW + 1)
+
+    expect(saved.connectionChanged).toBe(false)
+    expect(state.accounts[0]).toMatchObject({
+      name: 'Renamed relay',
+      modelPolicy: 'selected',
+      modelAllowlist: ['model-b'],
+    })
+  })
+
+  it('preserves an explicit relay allowlist across connection edits', () => {
+    const state = emptyState()
+    const encrypt = (value: string) => `encrypted:${value}`
+    const created = saveApiSourceDraft(state, relayInput({
+      credential: 'relay-key',
+      models: ['model-a', 'model-b'],
+      defaultModel: 'model-a',
+    }), encrypt, NOW)
+    Object.assign(state.accounts[0], {
+      modelPolicy: 'selected',
+      modelAllowlist: ['model-b'],
+    })
+
+    const saved = saveApiSourceDraft(state, relayInput({
+      id: created.sourceId,
+      credential: 'replacement-key',
+      baseUrl: 'https://replacement.example/v1',
+      models: ['model-a', 'model-b'],
+      defaultModel: 'model-a',
+    }), encrypt, NOW + 1)
+
+    expect(saved.connectionChanged).toBe(true)
+    expect(state.accounts[0]).toMatchObject({
+      modelPolicy: 'selected',
+      modelAllowlist: ['model-b'],
+    })
+  })
+
   it('persists Kiro Claude only as an exact-endpoint relay with manual models and unverified tools', () => {
     const state = emptyState()
     const encrypt = (value: string) => `encrypted:${value}`
@@ -224,6 +297,64 @@ describe('API source state changes', () => {
       expect.objectContaining({ id: 'kiro-direct', enabled: false, poolId: first.sourceId, updatedAt: NOW + 3 }),
       expect.objectContaining({ id: 'kiro-aggregate', enabled: false, poolId: aggregate.poolId, updatedAt: NOW + 3 }),
     ])
+  })
+
+  it('invalidates Kiro tool evidence when only the selected default changes within the same catalog', () => {
+    const state = emptyState()
+    const encrypt = (value: string) => `encrypted:${value}`
+    const created = saveApiSourceDraft(state, verifiedKiroRelayInput({
+      credential: 'kiro-key',
+      models: ['model-a', 'model-b'],
+      defaultModel: 'model-a',
+      modelCatalog: [
+        { id: 'model-a', capabilities: { toolCalls: true } },
+        { id: 'model-b', capabilities: { toolCalls: true } },
+      ],
+    }), encrypt, NOW)
+    state.routes.push({
+      id: 'kiro-route', client: 'claude', enabled: true, poolId: created.sourceId,
+      inboundProtocol: 'anthropic-messages', modelMap: {}, localToken: 'route-token',
+      createdAt: NOW, updatedAt: NOW,
+    })
+
+    const changed = saveApiSourceDraft(state, kiroRelayInput({
+      id: created.sourceId,
+      credential: '',
+      models: ['model-a', 'model-b'],
+      defaultModel: 'model-b',
+    }), encrypt, NOW + 1)
+
+    expect(changed.connectionChanged).toBe(true)
+    expect(state.providers[0]).toMatchObject({
+      models: ['model-b', 'model-a'],
+      toolRoundtripVerified: false,
+      capabilityProfile: { origin: 'inferred', toolCalls: false },
+    })
+    expect(state.providers[0].capabilityProfile?.checkedAt).toBeUndefined()
+    expect(state.routes[0]).toMatchObject({ enabled: false, updatedAt: NOW + 1 })
+  })
+
+  it('invalidates Anthropic relay tool evidence when its selected test model changes', () => {
+    const state = emptyState()
+    const encrypt = (value: string) => `encrypted:${value}`
+    const created = saveApiSourceDraft(state, verifiedAnthropicRelayInput({
+      credential: 'anthropic-key',
+    }), encrypt, NOW)
+
+    const changed = saveApiSourceDraft(state, verifiedAnthropicRelayInput({
+      id: created.sourceId,
+      credential: '',
+      models: ['model-a', 'model-b'],
+      defaultModel: 'model-b',
+    }), encrypt, NOW + 1)
+
+    expect(changed.connectionChanged).toBe(true)
+    expect(state.providers[0]).toMatchObject({
+      models: ['model-b', 'model-a'],
+      toolRoundtripVerified: false,
+      capabilityProfile: { origin: 'inferred', toolCalls: false },
+    })
+    expect(state.providers[0].capabilityProfile?.checkedAt).toBeUndefined()
   })
 
   it('locks official xAI credentials to the native Responses endpoint', () => {
@@ -493,8 +624,8 @@ describe('API source state changes', () => {
       status: 'active',
       maskedCredential: '****9876',
       availableModels: [],
-      modelPolicy: 'selected',
-      modelAllowlist: ['new-model'],
+      modelPolicy: 'all',
+      modelAllowlist: [],
       proxyId: 'proxy-1',
       circuitState: 'closed',
       consecutiveFailures: 0,
@@ -1031,6 +1162,31 @@ function verifiedKiroRelayInput(overrides: Partial<ApiSourceInput> = {}): ApiSou
       id: 'claude-sonnet-4.5',
       capabilities: { streaming: true, nonStreaming: true, toolCalls: true, modelDiscovery: false },
     }],
+    ...overrides,
+  })
+}
+
+function verifiedAnthropicRelayInput(overrides: Partial<ApiSourceInput> = {}): ApiSourceInput {
+  return relayInput({
+    name: 'Anthropic relay',
+    kind: 'anthropic-compatible',
+    baseUrl: 'https://anthropic-relay.example.test',
+    protocol: 'anthropic-messages',
+    models: ['model-a', 'model-b'],
+    defaultModel: 'model-a',
+    toolRoundtripVerified: true,
+    capabilityProfile: {
+      version: 1,
+      origin: 'probed',
+      checkedAt: NOW - 1,
+      streaming: true,
+      nonStreaming: true,
+      toolCalls: true,
+    },
+    modelCatalog: [
+      { id: 'model-a', capabilities: { streaming: true, nonStreaming: true, toolCalls: true } },
+      { id: 'model-b', capabilities: { streaming: true, nonStreaming: true, toolCalls: true } },
+    ],
     ...overrides,
   })
 }

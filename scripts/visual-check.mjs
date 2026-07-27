@@ -23,6 +23,28 @@ const modalCases = [
     }
   },
   {
+    name: 'official-source-edit-modal',
+    page: '账号与中转',
+    scrollTo: '#provider-form',
+    open: async (page) => openSourceEditModal(page, {
+      tabName: /官方 API/,
+      panelId: 'providers-panel-official',
+      modalName: '编辑官方 API',
+      sourceType: '官方 API',
+    })
+  },
+  {
+    name: 'relay-source-edit-modal',
+    page: '账号与中转',
+    scrollTo: '#provider-form',
+    open: async (page) => openSourceEditModal(page, {
+      tabName: /中转站/,
+      panelId: 'providers-panel-relays',
+      modalName: '编辑中转站',
+      sourceType: '中转站',
+    })
+  },
+  {
     name: 'pool-model-modal',
     page: '号池',
     open: async (page) => {
@@ -159,6 +181,25 @@ async function navigate(page, label, viewportName) {
     await page.locator('.topbar__menu').click()
   }
   await page.locator('.nav-item').filter({ hasText: label }).click()
+}
+
+async function openSourceEditModal(page, { tabName, panelId, modalName, sourceType }) {
+  await page.getByRole('tab', { name: tabName }).click()
+  const panel = page.locator(`#${panelId}`)
+  await panel.waitFor({ state: 'visible' })
+  const card = panel.locator('.provider-card:not(.aggregate-relay-card)').first()
+  if (await card.count() === 0) {
+    console.warn(`[visual-check] Skipping ${sourceType} edit modal: no source card is available.`)
+    return false
+  }
+
+  await card.scrollIntoViewIfNeeded()
+  await card.getByRole('button', { name: '来源操作' }).click()
+  const menu = page.getByRole('menu', { name: '来源操作' })
+  await menu.waitFor({ state: 'visible' })
+  await menu.getByRole('menuitem', { name: '编辑' }).click()
+  await page.getByRole('dialog', { name: modalName }).waitFor({ state: 'visible' })
+  return true
 }
 
 async function inspectLayout(page, scopeSelector, includeTopbar = false) {

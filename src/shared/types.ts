@@ -2062,6 +2062,7 @@ export interface GatewayApi {
   restoreClientConfigBackupSet(groupId: string, client: RouteClient, profileId?: string): Promise<ClientConfigBackupSetRestoreResult>
   restoreClientConfig(backupPath: string, client: RouteClient, profileId?: string): Promise<ClientConfigRestoreResult>
   getClientConfigEditor(client: RouteClient, profileId?: string): Promise<ClientConfigEditorState>
+  openClientConfigFile(client: RouteClient, role: ClientConfigFileRole, profileId?: string): Promise<void>
   saveClientConfigEditor(input: ClientConfigEditorSaveInput): Promise<ClientConfigApplyResult>
   listManagedClientInstances(): Promise<ManagedClientInstance[]>
   saveManagedClientInstance(input: ManagedClientInstanceInput): Promise<ManagedClientInstance[]>

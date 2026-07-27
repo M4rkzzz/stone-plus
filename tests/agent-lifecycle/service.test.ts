@@ -288,6 +288,32 @@ describe('AgentLifecycleService', () => {
     }
   })
 
+  it.each(launchOnlyTargets)('repairs launch-only %s during aggregate repair without opening its host', async (target) => {
+    const restore = vi.fn(async () => ({ changed: true }))
+    const start = vi.fn(async () => undefined)
+    const inspect = vi.fn(async () => ({
+      ...healthySnapshot(),
+      running: false,
+      managedInstanceCount: 0,
+      processControl: 'unavailable' as const,
+    }))
+    const service = createService(adaptersWith({ [target]: { inspect, restore, start } }))
+
+    const result = await service.repairAllAffected()
+
+    expect(restore).toHaveBeenCalledWith({
+      preserveRunningState: true,
+      ensureRunning: false,
+      repairSessions: true,
+      repairWorkspaceIndex: true,
+    })
+    expect(start).not.toHaveBeenCalled()
+    expect(result.results.find((entry) => entry.target === target)).toMatchObject({
+      status: 'succeeded',
+      runningAfter: false,
+    })
+  })
+
   it('coalesces concurrent smart repair and repair-all requests', async () => {
     let release!: () => void
     const gate = new Promise<void>((resolve) => { release = resolve })

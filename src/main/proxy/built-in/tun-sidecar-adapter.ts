@@ -1,7 +1,7 @@
 import { randomBytes, randomUUID } from 'node:crypto'
 import { lookup } from 'node:dns/promises'
 import { existsSync } from 'node:fs'
-import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { mkdir, open, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
 import { isIP } from 'node:net'
 import {
@@ -11,6 +11,7 @@ import {
 } from './binary-manifest'
 import {
   reserveLoopbackPort,
+  reserveFetchSafeLoopbackPort,
   type LoopbackPortLease,
   type ReserveLoopbackPort
 } from './sing-box-service'
@@ -80,9 +81,32 @@ export interface TunSidecarFileSystem {
   ): Promise<unknown>
   rename(source: string, destination: string): Promise<unknown>
   rm(path: string, options: { force: true }): Promise<unknown>
+  syncFile?(path: string): Promise<unknown>
+  syncDirectory?(path: string): Promise<unknown>
 }
 
-const DEFAULT_FILE_SYSTEM: TunSidecarFileSystem = { mkdir, writeFile, rename, rm }
+const DEFAULT_FILE_SYSTEM: TunSidecarFileSystem = {
+  mkdir,
+  writeFile,
+  rename,
+  rm,
+  syncFile: async (path) => {
+    const handle = await open(path, 'r+')
+    try { await handle.sync() } finally { await handle.close() }
+  },
+  syncDirectory: async (path) => {
+    let handle
+    try {
+      handle = await open(path, 'r')
+      await handle.sync()
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code
+      if (process.platform !== 'win32' || (code !== 'EINVAL' && code !== 'EPERM' && code !== 'EACCES')) throw error
+    } finally {
+      await handle?.close().catch(() => undefined)
+    }
+  },
+}
 
 export interface ElevatedSingBoxTunAdapterOptions {
   userDataPath: string
@@ -279,7 +303,7 @@ export class ElevatedSingBoxTunAdapter implements TunPlatformAdapter {
     }
     let controllerLease: LoopbackPortLease
     try {
-      controllerLease = await this.reservePort(0, '127.0.0.1')
+      controllerLease = await reserveFetchSafeLoopbackPort(0, '127.0.0.1', this.reservePort)
     } catch (error) {
       throw new ElevatedSingBoxTunError(
         'tun_start_failed',
@@ -653,9 +677,10 @@ Set-Acl -LiteralPath $Target -AclObject $acl
     const destination = record.phase === 'pending' ? this.pendingRecoveryPath : this.recoveryPath
     const temporaryPath = `${destination}.${process.pid}.${Date.now()}.tmp`
     await writeFile(temporaryPath, `${JSON.stringify(record)}\n`, { encoding: 'utf8', flag: 'wx', mode: 0o600 })
-    await rm(destination, { force: true })
     try {
+      await this.fileSystem.syncFile?.(temporaryPath)
       await rename(temporaryPath, destination)
+      await this.fileSystem.syncDirectory?.(this.configDirectory)
     } catch (error) {
       await rm(temporaryPath, { force: true }).catch(() => undefined)
       throw error

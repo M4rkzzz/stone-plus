@@ -155,6 +155,15 @@ export class ConnectionOnlyCliLifecycleAdapter {
     }
   }
 
+  async isConfiguredFor(connection: ClientConnectionTarget): Promise<boolean> {
+    try {
+      await this.config.validate(this.client, connection)
+      return true
+    } catch {
+      return false
+    }
+  }
+
   close(): Promise<CliCloseResult> {
     return this.serialize(() => this.closeUnlocked())
   }
@@ -162,8 +171,9 @@ export class ConnectionOnlyCliLifecycleAdapter {
   restore(
     connection: ClientConnectionTarget,
     options: ClientConfigApplyOptions = {},
+    preserveRunningState = true,
   ): Promise<CliRestoreResult> {
-    return this.serialize(() => this.restoreUnlocked(connection, options))
+    return this.serialize(() => this.restoreUnlocked(connection, options, preserveRunningState))
   }
 
   start(options?: CliStartOptions, connection?: ClientConnectionTarget): Promise<void> {
@@ -237,6 +247,7 @@ export class ConnectionOnlyCliLifecycleAdapter {
   private async restoreUnlocked(
     connection: ClientConnectionTarget,
     options: ClientConfigApplyOptions,
+    preserveRunningState: boolean,
   ): Promise<CliRestoreResult> {
     const before = await this.runtime.snapshot(this.client)
     const runningIds = before.managedInstances
@@ -289,7 +300,7 @@ export class ConnectionOnlyCliLifecycleAdapter {
       )
     }
 
-    const restartErrors = await this.restartManaged(closed)
+    const restartErrors = preserveRunningState ? await this.restartManaged(closed) : []
     if (restartErrors.length > 0) {
       throw new CliLifecycleOperationError(
         this.target,
@@ -303,7 +314,7 @@ export class ConnectionOnlyCliLifecycleAdapter {
       target: this.target,
       repair: mergeRepairResults(this.client, repairs),
       closedManagedInstanceIds: closed,
-      restartedManagedInstanceIds: [...closed],
+      restartedManagedInstanceIds: preserveRunningState ? [...closed] : [],
       externalSessionsUnaffected: before.externalSessionDetected,
       pendingNewSession: before.externalSessionDetected,
     }

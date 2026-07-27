@@ -6,7 +6,7 @@ export type { UiTheme, UiThemePreference } from '@shared/types'
 export const UI_THEME_STORAGE_KEY = 'stone.ui.theme'
 const UI_THEME_COLORS: Record<UiTheme, string> = {
   light: '#f9fbfa',
-  dark: '#161c1a',
+  dark: '#141517',
 }
 
 interface ThemeContextValue {

@@ -117,6 +117,7 @@ describe('ClientInstanceManager', () => {
     const manager = new ClientInstanceManager({
       store: new MemoryMetadata(),
       processAdapter: { spawn },
+      inspectProcess: async () => undefined,
       baseEnvironment: {
         KEEP_ME: 'yes',
         ANTHROPIC_MODEL: 'gpt-5.5',
@@ -511,7 +512,7 @@ describe('ClientInstanceManager', () => {
       .toThrow('requires Stone+ to run from a controlling terminal')
     expect(clientInstanceNodeSpawnOptions('linux', 'background', false)).toEqual({
       windowsHide: true,
-      detached: false,
+      detached: true,
       stdio: 'ignore',
     })
     expect(clientInstanceNodeSpawnOptions('win32', 'terminal', false)).toEqual({

@@ -26,6 +26,25 @@ import type {
 } from '../../src/main/proxy/built-in/sing-box-service'
 
 describe('BuiltInProxyOrchestrator', () => {
+  it('rejects a proxy node that points back to the Stone+ local gateway', async () => {
+    const harness = createHarness()
+    const profile = parsedProfile()
+    profile.nodes[0] = {
+      ...profile.nodes[0],
+      server: 'localhost',
+      serverPort: 15721,
+    }
+    harness.store.secrets.set('profile-one', { configuration: profile })
+
+    await expect(harness.orchestrator.setEnabled(true)).rejects.toMatchObject({
+      category: 'configuration-invalid',
+      message: expect.stringContaining('points back to a Stone+ local endpoint'),
+    })
+
+    expect(harness.core.start).not.toHaveBeenCalled()
+    expect(harness.system.acquire).not.toHaveBeenCalled()
+  })
+
   it('recovers a stale system lease before the strict core -> access -> Chromium -> route activation sequence', async () => {
     const harness = createHarness({ desiredEnabled: true, autoStart: true })
     const routeStatuses: string[] = []

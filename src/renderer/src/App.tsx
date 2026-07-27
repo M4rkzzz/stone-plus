@@ -51,6 +51,7 @@ import { useI18n } from './i18n'
 import { applyRuntimeDelta, RuntimeSnapshotReloadCoordinator, shouldAcceptSnapshotRevision } from './runtime-delta'
 import { AgentLifecycleControl, type AgentLifecycleControlAction } from './agent-lifecycle-control'
 import { agentLifecycleRenderKey, appSnapshotAffectsPage } from './app-render-state'
+import { PageErrorBoundary } from './page-error-boundary'
 
 export type PageId = 'overview' | 'setup' | 'providers' | 'proxies' | 'pools' | 'routes' | 'clients' | 'session-repair' | 'tunnel' | 'browser' | 'diagnostics' | 'requests' | 'settings' | 'help'
 export type ActionRunner = (key: string, operation: () => Promise<AppSnapshot>) => Promise<boolean>
@@ -763,15 +764,19 @@ export default function App() {
         )}
 
         <main className="page-content" onScroll={revealContentScrollbar}>
-          <ActivePage
-            page={page}
-            snapshot={pageSnapshot}
-            api={api}
-            runAction={runAction}
-            busyKeys={busyKeys}
-            update={updateController}
-            navigate={setActivePage}
-          />
+          <PageErrorBoundary resetKey={page}>
+            <div className="page-transition" key={page}>
+              <ActivePage
+                page={page}
+                snapshot={pageSnapshot}
+                api={api}
+                runAction={runAction}
+                busyKeys={busyKeys}
+                update={updateController}
+                navigate={setActivePage}
+              />
+            </div>
+          </PageErrorBoundary>
         </main>
       </div>
       <UpdateDialog

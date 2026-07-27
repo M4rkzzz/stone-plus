@@ -2,12 +2,10 @@ import { spawn, execFile, type ChildProcessByStdio } from 'node:child_process'
 import { access, chmod, mkdir, readFile, realpath, rename, unlink, writeFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import type { Readable } from 'node:stream'
-import { parse, stringify } from 'smol-toml'
+import { parse } from 'smol-toml'
 import type { FrpTunnelState } from '@shared/types'
 
 const MAX_LOG_LINES = 120
-const REDACTED_TUNNEL_SECRET = '[REDACTED]'
-const SENSITIVE_TUNNEL_KEY = /(token|secret|password|credential|authorization)/i
 type FrpcProcess = ChildProcessByStdio<null, Readable, Readable>
 
 interface ParsedTunnelEndpoint {
@@ -80,7 +78,7 @@ export class FrpTunnelService {
   public async getState(): Promise<FrpTunnelState> {
     const endpoint = parseTunnelEndpoint(this.config)
     return {
-      config: redactTunnelConfig(this.config),
+      config: this.config,
       configSaved: Boolean(this.config.trim()),
       binaryAvailable: await this.binaryExists(this.binaryPath),
       running: Boolean(this.recoveredPid || (this.child && this.child.exitCode === null && !this.child.killed)),
@@ -94,7 +92,7 @@ export class FrpTunnelService {
 
   public async saveConfig(content: string): Promise<FrpTunnelState> {
     if (this.child || this.recoveredPid) throw new Error('Stop frpc before changing its configuration.')
-    const normalized = normalizeConfig(restoreRedactedSecrets(content, this.config))
+    const normalized = normalizeConfig(content)
     parseTunnelEndpoint(normalized, true)
     await mkdir(dirname(this.configPath), { recursive: true })
     if (this.platform !== 'win32') await chmod(dirname(this.configPath), 0o700)
@@ -324,94 +322,6 @@ function normalizeConfig(content: string): string {
   if (!normalized) throw new Error('frpc configuration is empty.')
   if (normalized.length > 256_000) throw new Error('frpc configuration is too large.')
   return `${normalized}\n`
-}
-
-function redactTunnelConfig(content: string): string {
-  if (!content.trim()) return content
-  const document = parseTomlDocument(content)
-  const redacted = transformTomlSecrets(document, undefined, [], 'redact')
-  if (!isTomlTable(redacted)) throw new Error('frpc redaction did not produce a TOML document.')
-  return serializeTomlDocument(redacted)
-}
-
-function restoreRedactedSecrets(content: string, current: string): string {
-  if (!content.includes(REDACTED_TUNNEL_SECRET)) return content
-  const candidate = parseTomlDocument(content)
-  const persisted = current.trim() ? parseTomlDocument(current) : undefined
-  const restored = transformTomlSecrets(candidate, persisted, [], 'restore')
-  if (!isTomlTable(restored)) throw new Error('frpc secret restoration did not produce a TOML document.')
-  return serializeTomlDocument(restored)
-}
-
-type TomlDocument = Record<string, unknown>
-type TunnelSecretMode = 'redact' | 'restore'
-
-function parseTomlDocument(content: string): TomlDocument {
-  const value = parse(content)
-  if (!isTomlTable(value)) throw new Error('frpc configuration root must be a TOML table.')
-  return value
-}
-
-function serializeTomlDocument(document: TomlDocument): string {
-  const serialized = stringify(document).replace(/\r\n/g, '\n').trimEnd()
-  return serialized ? `${serialized}\n` : ''
-}
-
-function transformTomlSecrets(
-  candidate: unknown,
-  persisted: unknown,
-  path: Array<string | number>,
-  mode: TunnelSecretMode,
-): unknown {
-  if (Array.isArray(candidate)) {
-    const persistedItems = Array.isArray(persisted) ? persisted : []
-    return candidate.map((item, index) => transformTomlSecrets(
-      item,
-      matchingPersistedArrayItem(item, index, persistedItems),
-      [...path, index],
-      mode,
-    ))
-  }
-  if (!isTomlTable(candidate)) return candidate
-
-  const persistedTable = isTomlTable(persisted) ? persisted : undefined
-  return Object.fromEntries(Object.entries(candidate).map(([key, value]) => {
-    const nextPath = [...path, key]
-    const previous = persistedTable?.[key]
-    if (SENSITIVE_TUNNEL_KEY.test(key)) {
-      if (mode === 'redact') return [key, REDACTED_TUNNEL_SECRET]
-      if (value === REDACTED_TUNNEL_SECRET) {
-        if (previous === undefined) {
-          throw new Error(`The redacted frpc secret at ${formatTomlPath(nextPath)} has no stored secret to restore.`)
-        }
-        return [key, cloneTomlValue(previous)]
-      }
-      return [key, value]
-    }
-    return [key, transformTomlSecrets(value, previous, nextPath, mode)]
-  }))
-}
-
-function matchingPersistedArrayItem(candidate: unknown, index: number, persisted: unknown[]): unknown {
-  if (!isTomlTable(candidate) || typeof candidate.name !== 'string') return persisted[index]
-  const matches = persisted.filter((item) => isTomlTable(item) && item.name === candidate.name)
-  return matches.length === 1 ? matches[0] : undefined
-}
-
-function cloneTomlValue(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(cloneTomlValue)
-  if (isTomlTable(value)) return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, cloneTomlValue(item)]))
-  return value
-}
-
-function isTomlTable(value: unknown): value is TomlDocument {
-  return Boolean(value) && typeof value === 'object' && !Array.isArray(value) && !(value instanceof Date)
-}
-
-function formatTomlPath(path: Array<string | number>): string {
-  return path.reduce<string>((result, part) => {
-    return typeof part === 'number' ? `${result}[${part}]` : result ? `${result}.${part}` : part
-  }, '')
 }
 
 async function verifyConfiguration(binaryPath: string, configPath: string): Promise<void> {
