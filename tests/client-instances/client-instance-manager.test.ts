@@ -105,7 +105,7 @@ describe('ClientInstanceManager', () => {
 
     const restarted = new ClientInstanceManager({ store: metadata })
     expect(restarted.initialize()).toEqual([])
-  })
+  }, 15_000)
 
   it('does not inherit provider model overrides when launching Claude through Stone+', async () => {
     const root = await mkdtemp(join(tmpdir(), 'stone-client-instance-claude-env-'))

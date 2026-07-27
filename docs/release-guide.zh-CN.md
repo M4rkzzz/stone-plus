@@ -664,8 +664,9 @@ gh release view $releaseTag -R M4rkzzz/stone-plus
 gh api "repos/M4rkzzz/stone-plus/git/ref/tags/$releaseTag"
 ```
 
-两个命令都应返回“未找到”。如果已经存在公开 Release 或标签，不得移动、覆盖或重建；
-提升补丁版本后重新准备。
+首次启动该版本时，两个命令都应返回“未找到”。如果已经存在草稿或公开 Release，不得移动、
+覆盖或重建标签；提升补丁版本后重新准备。若只有一次从未形成任何 Release 的失败签名标签，
+必须先满足第 8 节的“未发布失败标签受控替换”全部条件，才可替换同版本标签。
 
 还要确认当前提交中已有本版本人工编写的 Release Note：
 
@@ -779,12 +780,52 @@ gh api "repos/M4rkzzz/stone-plus/actions/jobs/$releaseJobId/logs"
 - StonePlus 源码归档缺文件：不得手工上传临时压缩包；修复 `git archive` 输入或追踪文件后，
   直接推送新的 `main` 提交并启动新运行。
 - Windows 签名失败：检查 Secret、身份文件、证书有效期、指纹和时间戳网络；不要降级成未签名发布。
-- 资产上传前失败：通常没有公开 Release。修复并直接推送 `main` 后启动一条新 workflow run。
+- 资产上传前失败：通常没有公开 Release。修复并直接推送 `main` 后，按下方受控替换流程重新创建
+  同版本签名标签，或按团队版本策略提升补丁版本。
 - 已存在草稿 Release：工作流可以核对并覆盖草稿资产后发布；先确认草稿标签和目标 SHA 正确。
 - 已存在公开 Release：工作流会拒绝覆盖。发布新补丁版本，不删除并重建同一稳定版本。
 
-签名标签视为不可变。代码或工作流有任何修改时，不得移动旧标签或使用 `gh run rerun`；提升补丁版本，
-重新创建签名发布提交和标签。只有外部瞬时故障且目标提交完全不变时，才可对同一标签重跑。
+已形成草稿或公开 Release 的签名标签永久不可变。只有外部瞬时故障且目标提交完全不变时，才可对
+同一标签重跑。
+
+### 8.1 未发布失败标签受控替换
+
+为避免仅因发布烟测、资产脚本或 Release Note 的可修复错误消耗版本号，允许替换“从未发布”的失败
+签名标签，但必须同时满足以下条件：
+
+- `gh release view` 明确返回不存在，既没有草稿 Release，也没有公开 Release；
+- 原工作流已经失败，`Publish GitHub Release` 未运行成功，`Attest release artifacts` 未运行成功；
+- 原标签和目标提交均曾通过 GitHub Verified 身份检查，失败运行仍保留在 Actions 作为审计记录；
+- 修复已进入 `main` 的新签名提交，完整质量门、版本元数据和人工 Release Note 再次通过；
+- 删除前记录原标签目标 SHA、失败 run ID 和失败原因；只允许授权维护者删除一次远端标签；
+- 新标签仍是同名的签名附注标签，必须指向新的 GitHub Verified 提交并重新执行全部 Release 工作流；
+- 禁止复用、覆盖或手工上传旧运行产物。
+
+受控替换示例：
+
+```powershell
+$releaseTag = 'vX.Y.Z'
+$failedRunId = 123456789
+$oldRef = gh api "repos/M4rkzzz/stone-plus/git/ref/tags/$releaseTag" | ConvertFrom-Json
+$oldTag = gh api "repos/M4rkzzz/stone-plus/git/tags/$($oldRef.object.sha)" | ConvertFrom-Json
+$releaseExists = gh release view $releaseTag -R M4rkzzz/stone-plus --json id 2>$null
+if ($LASTEXITCODE -eq 0 -or $releaseExists) { throw 'A Release already exists; the tag is immutable.' }
+$run = gh run view $failedRunId -R M4rkzzz/stone-plus --json status,conclusion,headSha,jobs | ConvertFrom-Json
+if ($run.status -ne 'completed' -or $run.conclusion -ne 'failure') { throw 'The prior run is not a completed failure.' }
+$forbiddenSuccess = $run.jobs | Where-Object {
+  $_.name -in @('Attest release artifacts', 'Publish GitHub Release') -and $_.conclusion -eq 'success'
+}
+if ($forbiddenSuccess) { throw 'Release publication or attestation already succeeded; the tag is immutable.' }
+Write-Output "Replacing unpublished failed tag $releaseTag; oldTarget=$($oldTag.object.sha); run=$failedRunId"
+
+git tag -d $releaseTag
+git push origin ":refs/tags/$releaseTag"
+git tag -s $releaseTag -m "Stone+ $releaseTag"
+git verify-tag $releaseTag
+git push origin $releaseTag
+```
+
+该例外不适用于“想补功能”“已公开后发现缺陷”或替换已上传资产；这些情况必须提升补丁版本。
 
 ## 9. 发布后线上验收
 

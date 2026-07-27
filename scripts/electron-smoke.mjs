@@ -564,11 +564,11 @@ try {
   const restoredProfileSettings = JSON.parse(await readFile(profileSettingsPath, 'utf8'))
   const clientEditor = await window.evaluate((profileId) => window.stone.getClientConfigEditor('claude', profileId), profile?.id)
   const profileToken = profileWritten.env?.ANTHROPIC_AUTH_TOKEN
-  const clientEditorSafe = Boolean(
+  const clientEditorPlaintextVisible = Boolean(
     profileToken
     && clientEditor.fields.some((field) => field.id === 'claude.model')
     && clientEditor.files.some((file) => file.role === 'claude-settings' && file.editable)
-    && !JSON.stringify(clientEditor).includes(profileToken)
+    && JSON.stringify(clientEditor).includes(profileToken)
   )
   const clientEditorSaved = await window.evaluate((profileId) => window.stone.saveClientConfigEditor({
     client: 'claude',
@@ -952,7 +952,7 @@ try {
       && profileRestored.restoredFile === profileSettingsPath
       && restoredProfileSettings.env?.ANTHROPIC_BASE_URL === 'http://127.0.0.1:1'
       && restoredProfileSettings.env?.ANTHROPIC_AUTH_TOKEN === profileToken,
-    clientEditorSafe,
+    clientEditorPlaintextVisible,
     clientEditorSaved: clientEditorSaved.changedFiles.includes(profileSettingsPath)
       && editorWrittenProfile.model === 'claude-smoke-model'
       && editorWrittenProfile.env?.ANTHROPIC_AUTH_TOKEN === profileToken,
@@ -1068,7 +1068,7 @@ try {
     !result.profileCreated ||
     !result.profileScoped ||
     !result.profileBackupRestored ||
-    !result.clientEditorSafe ||
+    !result.clientEditorPlaintextVisible ||
     !result.clientEditorSaved ||
     !result.sqliteStateCreated ||
     !result.legacyJsonAbsent ||

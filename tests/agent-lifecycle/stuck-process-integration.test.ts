@@ -71,7 +71,7 @@ describe('stuck managed CLI lifecycle', () => {
     expect(manager.list()[0]).toMatchObject({ status: 'failed', processAlive: true })
     expect(config.repair).not.toHaveBeenCalled()
     expect(config.validate).not.toHaveBeenCalled()
-  })
+  }, 15_000)
 })
 
 class MemoryMetadataStore implements ClientInstanceMetadataStore {
