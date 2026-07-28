@@ -1,5 +1,5 @@
 import { isIP } from 'node:net'
-import type { BuiltInProxyCustomRuleSet, BuiltInProxyEditableRule } from '@shared/types'
+import type { BuiltInProxyCustomRuleSet } from '@shared/types'
 import type {
   BuiltInProxyRuleMode,
   InternalProxyNode,
@@ -9,8 +9,26 @@ import type {
 
 const DIRECT_TAG = 'stone-direct'
 const DIRECT_DNS_TAG = 'stone-direct-dns'
-const GEOSITE_CN_TAG = 'stone-geosite-cn'
-const GEOIP_CN_TAG = 'stone-geoip-cn'
+
+/**
+ * Stable first-party service domains that must remain reachable when a
+ * subscription's own rules would otherwise route them directly or reject
+ * them. Configured relay/provider hosts are appended by the orchestrator.
+ */
+export const BUILT_IN_REQUIRED_PROXY_DOMAINS = Object.freeze([
+  'openai.com',
+  'chatgpt.com',
+  'anthropic.com',
+  'claude.ai',
+  'claude.com',
+  'x.ai',
+  'grok.com',
+  'cli-chat-proxy.grok.com',
+  'generativelanguage.googleapis.com',
+  'aiplatform.googleapis.com',
+  'oauth2.googleapis.com',
+  'cloudcode-pa.googleapis.com',
+])
 
 export type BuiltInProxyAccessMode = 'system' | 'tun'
 
@@ -18,7 +36,17 @@ export type SingBoxJson = null | boolean | number | string | SingBoxJson[] | { [
 
 export interface SingBoxSourceConfiguration extends Record<string, unknown> {
   log: { level: string; timestamp: boolean }
-  dns: { servers: Array<{ type: string; tag: string; server: string; server_port: number; detour: string }>; final: string; strategy: string }
+  dns: {
+    servers: Array<{
+      type: string
+      tag: string
+      server?: string
+      server_port?: number
+      detour?: string
+    }>
+    final: string
+    strategy: string
+  }
   outbounds: Array<Record<string, SingBoxJson>>
   route: {
     auto_detect_interface: boolean
@@ -36,6 +64,9 @@ export interface BuildSingBoxConfigInput {
   accessMode: BuiltInProxyAccessMode
   /** Explicit visual override for rule mode. Undefined preserves profile rules/fallback behavior. */
   customRules?: BuiltInProxyCustomRuleSet
+  /** Configured relay/provider hosts supplement the stable first-party list. */
+  requiredProxyDomains?: readonly string[]
+  /** Explicit legacy override. Omitted uses the platform resolver. */
   dnsServers?: string[]
 }
 
@@ -47,7 +78,7 @@ export interface BuildSingBoxConfigResult {
   /** Main-process-only node/tag map used by controller delay tests. */
   outboundTags: Record<string, string>
   requestedNodeMissing: boolean
-  routePolicy: 'preserved' | 'fallback' | 'custom' | 'global' | 'direct'
+  routePolicy: 'preserved' | 'fallback' | 'global' | 'direct'
   warnings: string[]
 }
 
@@ -81,7 +112,7 @@ export function buildSingBoxConfig(input: BuildSingBoxConfigInput): BuildSingBox
   if (requestedNodeMissing && active) warnings.push(`The active node is no longer available; switched to "${safeLabel(active.name)}".`)
   if (needsProxy && !active) throw new BuiltInProxyConfigError('no-active-node', 'The selected profile has no active proxy node.')
 
-  const dnsServers = normalizeDnsServers(input.dnsServers)
+  const dnsServers = buildDnsServers(input.dnsServers)
   const outboundTags = Object.fromEntries(input.profile.nodes.map((node) => [node.id, outboundTagForNodeId(node.id)]))
   const activeTag = active ? outboundTags[active.id] : undefined
   const outbounds: Array<Record<string, SingBoxJson>> = [directOutbound()]
@@ -89,26 +120,35 @@ export function buildSingBoxConfig(input: BuildSingBoxConfigInput): BuildSingBox
     outbounds.unshift(...input.profile.nodes.map((node) => nodeOutbound(node, outboundTags[node.id])))
   }
 
+  const importedRules = input.profile.rules.filter((rule) => !rule.ruleSetTags?.length)
+  if (importedRules.length !== input.profile.rules.length) {
+    warnings.push('Subscription GEOIP/GEOSITE rules requiring an external database were skipped; remaining supported subscription rules were preserved.')
+  }
   const selectedPolicy = input.mode === 'direct'
     ? 'direct'
     : input.mode === 'global'
       ? 'global'
-      : input.customRules !== undefined
-        ? 'custom'
-      : input.profile.ruleStatus === 'preserved' && input.profile.rules.length > 0
+      : importedRules.length > 0
         ? 'preserved'
         : 'fallback'
-  if (selectedPolicy === 'fallback' && input.profile.ruleDowngrade?.message) warnings.push(input.profile.ruleDowngrade.message)
+  if (input.mode === 'rule' && input.customRules !== undefined) {
+    warnings.push('The saved standalone custom rule set was ignored; rule mode now follows the active subscription rules.')
+  }
+  if (input.mode === 'rule' && input.profile.ruleDowngrade?.message) {
+    warnings.push(input.profile.ruleDowngrade.message)
+  }
 
-  const route = buildRoute(input.profile.rules, selectedPolicy, activeTag, input.customRules)
+  const route = buildRoute(
+    importedRules,
+    selectedPolicy,
+    activeTag,
+    normalizeRequiredProxyDomains(input.requiredProxyDomains),
+  )
   return {
     config: {
       log: { level: 'warn', timestamp: true },
       dns: {
-        servers: dnsServers.map((server, index) => ({
-          type: 'udp', tag: index === 0 ? DIRECT_DNS_TAG : `${DIRECT_DNS_TAG}-${index + 1}`,
-          server, server_port: 53, detour: DIRECT_TAG
-        })),
+        servers: dnsServers,
         final: DIRECT_DNS_TAG,
         strategy: 'prefer_ipv4'
       },
@@ -128,7 +168,7 @@ function buildRoute(
   importedRules: InternalProxyRule[],
   policy: BuildSingBoxConfigResult['routePolicy'],
   proxyTag?: string,
-  customRules?: BuiltInProxyCustomRuleSet
+  requiredProxyDomains: readonly string[] = BUILT_IN_REQUIRED_PROXY_DOMAINS,
 ): SingBoxSourceConfiguration['route'] {
   const rules: Array<Record<string, SingBoxJson>> = [
     routeRule({ ip_cidr: ['127.0.0.0/8', '::1/128'] }, 'direct', proxyTag)
@@ -147,75 +187,49 @@ function buildRoute(
     }
     rules.push(rule)
   }
-  let final = policy === 'direct' ? DIRECT_TAG : requireProxyTag(proxyTag)
-  let needsChinaRuleSets = false
+  let finalAction: InternalProxyRule['action'] = policy === 'direct' ? 'direct' : 'proxy'
+  let policyRules: InternalProxyRule[] = []
 
   if (policy === 'fallback') {
-    pushPolicyRule(routeRule({ ip_is_private: true }, 'direct', proxyTag))
-    pushPolicyRule(
-      routeRule({ rule_set: [GEOSITE_CN_TAG, GEOIP_CN_TAG] }, 'direct', proxyTag),
-      true
-    )
-    needsChinaRuleSets = true
-  } else if (policy === 'custom') {
-    if (!customRules) throw new BuiltInProxyConfigError('invalid-profile', 'The custom proxy rule set is missing.')
-    for (const rule of customRules.rules) {
-      if (rule.condition === 'mainland-china') needsChinaRuleSets = true
-      pushPolicyRule(convertEditableRule(rule, proxyTag), editableRuleRequiresSniff(rule))
-    }
-    final = customRules.finalAction === 'direct' ? DIRECT_TAG : requireProxyTag(proxyTag)
+    // A subscription without safely convertible rules simply uses the
+    // selected node. Stone+ no longer downloads or owns a geographic ruleset.
   } else if (policy === 'preserved') {
-    for (const rule of importedRules) {
-      if (rule.ruleSetTags?.length) needsChinaRuleSets = true
-      if (isCatchAll(rule) && rule.action !== 'block') {
-        final = rule.action === 'direct' ? DIRECT_TAG : requireProxyTag(proxyTag)
-      } else {
-        pushPolicyRule(convertRule(rule, proxyTag), importedRuleRequiresSniff(rule))
+    policyRules = importedRules
+    for (let index = importedRules.length - 1; index >= 0; index -= 1) {
+      const candidate = importedRules[index]
+      if (candidate && isCatchAll(candidate) && candidate.action !== 'block') {
+        finalAction = candidate.action
+        break
       }
     }
   }
 
+  if (policy !== 'direct') {
+    const missingDomains = requiredProxyDomains.filter((domain) => (
+      !isDomainGuaranteedProxy(domain, policyRules, finalAction)
+    ))
+    if (missingDomains.length > 0) {
+      pushPolicyRule(
+        routeRule({ domain_suffix: missingDomains }, 'proxy', proxyTag),
+        true,
+      )
+    }
+  }
+
+  for (const rule of policyRules) {
+    if (isCatchAll(rule) && rule.action !== 'block') continue
+    pushPolicyRule(convertRule(rule, proxyTag), importedRuleRequiresSniff(rule))
+  }
+
+  const final = finalAction === 'direct'
+    ? DIRECT_TAG
+    : requireProxyTag(proxyTag)
+
   return {
     auto_detect_interface: true,
     rules,
-    // These Stone-owned rule sets live on GitHub, which is commonly
-    // unreachable on the very networks the built-in proxy is intended to
-    // repair.  Download them through the selected outbound instead of
-    // blocking core startup on an unavailable direct path.  Node-server and
-    // DNS bootstrap traffic remain direct and TUN-excluded elsewhere.
-    ...(needsChinaRuleSets ? { rule_set: chinaRuleSets(requireProxyTag(proxyTag)) } : {}),
     final
   }
-}
-
-function convertEditableRule(
-  rule: BuiltInProxyEditableRule,
-  proxyTag?: string
-): Record<string, SingBoxJson> {
-  const values = rule.values
-  let match: Record<string, SingBoxJson>
-  switch (rule.condition) {
-    case 'domain': match = { domain: values }; break
-    case 'domain-suffix': match = { domain_suffix: values }; break
-    case 'domain-keyword': match = { domain_keyword: values }; break
-    case 'ip-cidr': match = { ip_cidr: values }; break
-    case 'port': match = { port: values.map(Number) }; break
-    case 'port-range': match = { port_range: values }; break
-    case 'network': match = { network: values }; break
-    case 'protocol': match = { protocol: values }; break
-    case 'private-network': match = { ip_is_private: true }; break
-    case 'mainland-china': match = { rule_set: [GEOSITE_CN_TAG, GEOIP_CN_TAG] }; break
-    default: throw new BuiltInProxyConfigError('invalid-profile', 'The custom proxy rule set contains an unsupported condition.')
-  }
-  return routeRule(match, rule.action, proxyTag)
-}
-
-function editableRuleRequiresSniff(rule: BuiltInProxyEditableRule): boolean {
-  return rule.condition === 'domain'
-    || rule.condition === 'domain-suffix'
-    || rule.condition === 'domain-keyword'
-    || rule.condition === 'protocol'
-    || rule.condition === 'mainland-china'
 }
 
 function importedRuleRequiresSniff(rule: InternalProxyRule): boolean {
@@ -224,7 +238,6 @@ function importedRuleRequiresSniff(rule: InternalProxyRule): boolean {
     || rule.domainSuffixes?.length
     || rule.domainKeywords?.length
     || rule.protocols?.length
-    || rule.ruleSetTags?.includes('geosite-cn')
   )
 }
 
@@ -239,9 +252,6 @@ function convertRule(rule: InternalProxyRule, proxyTag?: string): Record<string,
   if (rule.portRanges?.length) match.port_range = rule.portRanges
   if (rule.networks?.length) match.network = rule.networks
   if (rule.protocols?.length) match.protocol = rule.protocols
-  if (rule.ruleSetTags?.length) {
-    match.rule_set = rule.ruleSetTags.map((tag) => tag === 'geosite-cn' ? GEOSITE_CN_TAG : GEOIP_CN_TAG)
-  }
   return routeRule(match, rule.action, proxyTag)
 }
 
@@ -323,28 +333,74 @@ function transportConfig(transport: NonNullable<InternalProxyNode['transport']>)
   return result
 }
 
-function chinaRuleSets(downloadDetour: string): Array<Record<string, SingBoxJson>> {
-  return [
-    {
-      type: 'remote', tag: GEOSITE_CN_TAG, format: 'binary',
-      url: 'https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs',
-      download_detour: downloadDetour, update_interval: '168h'
-    },
-    {
-      type: 'remote', tag: GEOIP_CN_TAG, format: 'binary',
-      url: 'https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs',
-      download_detour: downloadDetour, update_interval: '168h'
-    }
-  ]
-}
-
-function normalizeDnsServers(value?: string[]): string[] {
-  const servers = value?.length ? value : ['1.1.1.1', '8.8.8.8']
+function buildDnsServers(value?: string[]): SingBoxSourceConfiguration['dns']['servers'] {
+  if (value === undefined) return [{ type: 'local', tag: DIRECT_DNS_TAG }]
+  const servers = value
   const normalized = [...new Set(servers.map((server) => server.trim()))]
   if (normalized.length === 0 || normalized.length > 4 || normalized.some((server) => isIP(server) === 0 || isLoopback(server))) {
     throw new BuiltInProxyConfigError('invalid-dns-server', 'DNS upstreams must be one to four non-loopback IP addresses.')
   }
-  return normalized
+  return normalized.map((server, index) => ({
+    type: 'udp',
+    tag: index === 0 ? DIRECT_DNS_TAG : `${DIRECT_DNS_TAG}-${index + 1}`,
+    server,
+    server_port: 53,
+    detour: DIRECT_TAG,
+  }))
+}
+
+function normalizeRequiredProxyDomains(value?: readonly string[]): string[] {
+  const candidates = [...BUILT_IN_REQUIRED_PROXY_DOMAINS, ...(value ?? [])]
+  return [...new Set(candidates.map((domain) => domain.trim().toLowerCase().replace(/^\.+|\.+$/g, '')))]
+    .filter((domain) => (
+      domain.length > 0
+      && domain.length <= 253
+      && isIP(domain) === 0
+      && !isLoopback(domain)
+      && domain.split('.').every((label) => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label))
+    ))
+}
+
+function isDomainGuaranteedProxy(
+  domain: string,
+  rules: readonly InternalProxyRule[],
+  finalAction: InternalProxyRule['action'],
+): boolean {
+  for (const rule of rules) {
+    if (!ruleMatchesDomainWithoutExtraConditions(rule, domain)) continue
+    return rule.action === 'proxy'
+  }
+  return finalAction === 'proxy'
+}
+
+function ruleMatchesDomainWithoutExtraConditions(rule: InternalProxyRule, domain: string): boolean {
+  if (
+    rule.ipCidrs?.length
+    || rule.ipIsPrivate !== undefined
+    || rule.ports?.length
+    || rule.portRanges?.length
+    || rule.networks?.length
+    || rule.protocols?.length
+    || rule.ruleSetTags?.length
+  ) return false
+  if (isCatchAll(rule)) return true
+  let hasDomainMatcher = false
+  if (rule.domains?.length) {
+    hasDomainMatcher = true
+    if (!rule.domains.some((candidate) => candidate.toLowerCase() === domain)) return false
+  }
+  if (rule.domainSuffixes?.length) {
+    hasDomainMatcher = true
+    if (!rule.domainSuffixes.some((suffix) => {
+      const normalized = suffix.toLowerCase().replace(/^\./, '')
+      return domain === normalized || domain.endsWith(`.${normalized}`)
+    })) return false
+  }
+  if (rule.domainKeywords?.length) {
+    hasDomainMatcher = true
+    if (!rule.domainKeywords.some((keyword) => domain.includes(keyword.toLowerCase()))) return false
+  }
+  return hasDomainMatcher
 }
 
 function validateProfileShape(profile: ParsedBuiltInProxyProfile): void {

@@ -414,7 +414,7 @@ function RouteEditor({
   return (
     <article className={`route-editor ${!draft.enabled ? 'route-editor--disabled' : ''}`}>
       <header className="route-editor__header">
-        <span className="client-logo route-client-brand"><img src={meta.icon} alt="" /></span>
+        <span className="client-logo route-client-brand"><img className={meta.iconClassName} src={meta.icon} alt="" /></span>
         <div><h2>{meta.name}</h2><span>{draft.client === 'grokbuild' ? t('Grok 原生 · Responses', 'Grok native · Responses') : protocolLabels[draft.inboundProtocol]}</span></div>
         <div className="route-editor__state"><span>{draft.enabled ? t('已启用', 'Enabled') : t('已停用', 'Disabled')}</span><Toggle checked={draft.enabled} disabled={busy || localMutation !== null || (!draft.enabled && (!draft.poolId || !sourceAllowed))} onChange={(value) => void toggleEnabled(value)} label={draft.enabled ? t(`停用 ${meta.name} 路由`, `Disable ${meta.name} route`) : t(`启用 ${meta.name} 路由`, `Enable ${meta.name} route`)} /></div>
       </header>

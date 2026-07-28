@@ -39,7 +39,7 @@
 .nodes-workspace__section-heading > div:first-child > svg,
 .nodes-workspace__collapse > svg:first-child {
   flex: 0 0 auto;
-  color: var(--accent);
+  color: var(--accent-text);
 }
 
 .nodes-workspace__section-heading strong,
@@ -139,7 +139,7 @@
   border: 1px solid var(--border-strong);
   border-radius: 50%;
   background: var(--surface);
-  color: var(--accent);
+  color: var(--accent-text);
 }
 
 .nodes-workspace__profile-card.is-active .nodes-workspace__radio,
@@ -178,7 +178,7 @@
 
 .nodes-workspace__icon-button:hover:not(:disabled) {
   border-color: var(--border-strong);
-  color: var(--accent);
+  color: var(--accent-text);
 }
 
 .nodes-workspace__icon-button--danger:hover:not(:disabled) {
@@ -195,7 +195,7 @@
   text-align: center;
 }
 
-.nodes-workspace__import-card > svg { color: var(--accent); }
+.nodes-workspace__import-card > svg { color: var(--accent-text); }
 .nodes-workspace__import-card strong { color: var(--text-soft); font-size: 10px; }
 .nodes-workspace__import-card small { max-width: 230px; font-size: 8px; line-height: 1.45; }
 .nodes-workspace__import-card:hover:not(:disabled) { border-color: var(--border-accent); background: var(--accent-soft); }
@@ -237,7 +237,7 @@
   column-gap: 7px;
 }
 
-.nodes-workspace__selection svg { grid-row: 1 / 3; color: var(--accent); }
+.nodes-workspace__selection svg { grid-row: 1 / 3; color: var(--accent-text); }
 .nodes-workspace__selection small { color: var(--muted); font-size: 8px; }
 .nodes-workspace__selection strong { overflow: hidden; color: var(--text-soft); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
 .nodes-workspace__selection > i { width: 1px; height: 25px; background: var(--border); }
@@ -267,7 +267,7 @@
 }
 
 .nodes-workspace__groups button span { color: var(--faint); font-size: 8px; }
-.nodes-workspace__groups button.is-active { border-color: var(--border-accent); background: var(--accent-soft); color: var(--accent); font-weight: 650; }
+.nodes-workspace__groups button.is-active { border-color: var(--border-accent); background: var(--accent-soft); color: var(--accent-text); font-weight: 650; }
 
 .nodes-workspace__node-toolbar {
   display: flex;

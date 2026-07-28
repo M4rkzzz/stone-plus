@@ -134,6 +134,8 @@ export interface BuiltInProxyOrchestratorOptions {
   localGateway: TunEndpoint
   dnsUpstreams?: readonly TunEndpoint[]
   additionalTunExcludedCidrs?: readonly string[]
+  /** Current enabled provider/relay hosts that must traverse the selected node. */
+  requiredProxyDomains?: () => readonly string[]
   parseProfile?: (
     input: string | Buffer,
     options?: ParseBuiltInProxyProfileOptions,
@@ -208,6 +210,7 @@ export class BuiltInProxyOrchestrator implements BuiltInProxyStoreFacade, BuiltI
   private readonly localGateway: TunEndpoint
   private readonly dnsUpstreams: readonly TunEndpoint[]
   private readonly additionalTunExcludedCidrs: readonly string[]
+  private readonly requiredProxyDomains: () => readonly string[]
   private readonly parseProfile: NonNullable<BuiltInProxyOrchestratorOptions['parseProfile']>
   private readonly buildConfiguration: NonNullable<BuiltInProxyOrchestratorOptions['buildConfiguration']>
   private readonly reloadExternalSystemProxy?: () => Promise<void>
@@ -254,11 +257,9 @@ export class BuiltInProxyOrchestrator implements BuiltInProxyStoreFacade, BuiltI
     this.createChromiumGeneration = options.createChromiumGeneration
     this.subscriptionFetch = options.subscriptionFetch
     this.localGateway = { ...options.localGateway }
-    this.dnsUpstreams = options.dnsUpstreams?.map((endpoint) => ({ ...endpoint })) ?? [
-      { host: '1.1.1.1', port: 53, transport: 'udp' },
-      { host: '8.8.8.8', port: 53, transport: 'udp' },
-    ]
+    this.dnsUpstreams = options.dnsUpstreams?.map((endpoint) => ({ ...endpoint })) ?? []
     this.additionalTunExcludedCidrs = [...(options.additionalTunExcludedCidrs ?? [])]
+    this.requiredProxyDomains = options.requiredProxyDomains ?? (() => [])
     this.parseProfile = options.parseProfile ?? parseBuiltInProxyProfile
     this.buildConfiguration = options.buildConfiguration ?? buildSingBoxConfig
     this.reloadExternalSystemProxy = options.reloadExternalSystemProxy
@@ -1097,13 +1098,19 @@ export class BuiltInProxyOrchestrator implements BuiltInProxyStoreFacade, BuiltI
     const secrets = this.requireProfileSecrets(profile.id)
     const parsed = validateParsedProfile(secrets.configuration)
     this.assertNoOwnedEndpointNode(parsed, settings)
+    const subscriptionDomain = secrets.subscriptionUrl
+      ? safeHostname(secrets.subscriptionUrl)
+      : undefined
     const built = this.buildConfiguration({
       profile: parsed,
       activeNodeId: profile.activeNodeId,
       mode: settings.ruleMode,
       accessMode: settings.accessMode,
       ...(settings.customRules !== undefined ? { customRules: structuredClone(settings.customRules) } : {}),
-      dnsServers: this.dnsUpstreams.map((endpoint) => endpoint.host),
+      requiredProxyDomains: [
+        ...this.requiredProxyDomains(),
+        ...(subscriptionDomain ? [subscriptionDomain] : []),
+      ],
     })
     return { profile, parsed, built }
   }
@@ -1877,6 +1884,14 @@ export class BuiltInProxyOrchestrator implements BuiltInProxyStoreFacade, BuiltI
 
   private assertOpen(): void {
     if (this.closed) throw new BuiltInProxyOperationError('unknown', 'The built-in proxy orchestrator is closed.', false)
+  }
+}
+
+function safeHostname(value: string): string | undefined {
+  try {
+    return new URL(value).hostname
+  } catch {
+    return undefined
   }
 }
 

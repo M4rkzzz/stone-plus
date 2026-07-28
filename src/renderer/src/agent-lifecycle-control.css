@@ -16,7 +16,7 @@
   border: 0;
   border-radius: 7px;
   background: transparent;
-  color: var(--accent);
+  color: var(--accent-text);
   cursor: pointer;
 }
 
@@ -80,7 +80,7 @@
   border: 1px solid var(--border-strong);
   border-radius: 10px;
   background: var(--surface);
-  box-shadow: 0 18px 44px rgb(31 47 41 / 18%);
+  box-shadow: 0 18px 44px rgb(var(--shadow-rgb) / 18%);
   color: var(--text);
 }
 
@@ -113,7 +113,7 @@
 }
 
 .agent-lifecycle__header > svg {
-  color: var(--accent);
+  color: var(--accent-text);
 }
 
 .agent-lifecycle__trigger--failed + .agent-lifecycle__panel .agent-lifecycle__header > svg,
@@ -172,7 +172,7 @@
 
 .agent-lifecycle__state {
   flex: 0 0 auto;
-  color: var(--accent);
+  color: var(--accent-text);
   font-size: 9px;
   font-weight: 700;
 }
@@ -238,7 +238,7 @@
 .agent-lifecycle__config-link:hover:not(:disabled) {
   border-color: var(--border-strong);
   background: var(--surface-subtle);
-  color: var(--accent);
+  color: var(--accent-text);
 }
 
 .agent-lifecycle__agent-actions button:focus-visible,
@@ -292,7 +292,7 @@
 }
 
 .agent-lifecycle__outcome--succeeded svg {
-  color: var(--accent);
+  color: var(--accent-text);
 }
 
 .agent-lifecycle__outcome--failed,
@@ -331,7 +331,7 @@
 
 .agent-lifecycle__config-link {
   border-color: transparent;
-  color: var(--accent);
+  color: var(--accent-text);
 }
 
 @media (max-width: 720px) {

@@ -91,6 +91,7 @@ pnpm-debug.log*
 
 # Downloaded sing-box runtimes are verified build inputs, not source files.
 /build/sing-box/*/
+/build/installer-license.txt
 
 # Local promotion metrics, automation state and unpublished drafts
 /.promo/

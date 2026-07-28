@@ -60,11 +60,12 @@ export interface AgentLifecycleControlProps {
 interface AgentDisplayMeta {
   name: string
   icon: string
+  iconClassName?: string
 }
 
 const targetMeta: Record<AgentTarget, AgentDisplayMeta> = {
-  'codex-desktop': { name: 'Codex Desktop', icon: clientBrandMeta.codex.icon },
-  'codex-cli': { name: 'Codex CLI', icon: clientBrandMeta.codex.icon },
+  'codex-desktop': { name: 'Codex Desktop', icon: clientBrandMeta.codex.icon, iconClassName: clientBrandMeta.codex.iconClassName },
+  'codex-cli': { name: 'Codex CLI', icon: clientBrandMeta.codex.icon, iconClassName: clientBrandMeta.codex.iconClassName },
   'claude-code': { name: 'Claude Code CLI', icon: clientBrandMeta.claude.icon },
   'claude-code-desktop': { name: 'Claude Code Desktop', icon: clientBrandMeta.claude.icon },
   'claude-code-vsc': { name: 'Claude Code VSC', icon: clientBrandMeta.claude.icon },
@@ -216,7 +217,7 @@ export function AgentLifecycleControl({
         onClick={() => setOpen((current) => !current)}
       >
         <span className="agent-lifecycle__brands" aria-hidden="true">
-          <img src={clientBrandMeta.codex.icon} alt="" />
+          <img className={clientBrandMeta.codex.iconClassName} src={clientBrandMeta.codex.icon} alt="" />
           <img src={clientBrandMeta.claude.icon} alt="" />
           <img src={clientBrandMeta.gemini.icon} alt="" />
           <img src={clientBrandMeta.grokbuild.icon} alt="" />
@@ -315,7 +316,7 @@ function AgentRow({
   const displayState = displayStateForAgent(agent)
   return (
     <article className={`agent-lifecycle__agent agent-lifecycle__agent--${displayState}`}>
-      <img className="agent-lifecycle__agent-icon" src={meta.icon} alt="" />
+      <img className={`agent-lifecycle__agent-icon ${meta.iconClassName ?? ''}`.trim()} src={meta.icon} alt="" />
       <div className="agent-lifecycle__agent-copy">
         <div className="agent-lifecycle__agent-title">
           <strong>{meta.name}</strong>

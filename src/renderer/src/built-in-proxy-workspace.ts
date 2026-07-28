@@ -90,7 +90,7 @@ export type BuiltInProxyRouteChainStep =
   | {
     kind: 'policy'
     mode: BuiltInProxyRuleMode
-    source: 'profile' | 'built-in-fallback' | 'custom' | 'not-applicable' | 'unconfirmed'
+    source: 'profile' | 'subscription-fallback' | 'not-applicable' | 'unconfirmed'
   }
   | {
     kind: 'node'
@@ -372,9 +372,8 @@ function resolvePolicySource(
   profile: BuiltInProxyProfileSummary | undefined,
 ): Extract<BuiltInProxyRouteChainStep, { kind: 'policy' }>['source'] {
   if (runtime.settings.ruleMode !== 'rule') return 'not-applicable'
-  if (runtime.settings.customRules !== undefined) return 'custom'
   if (!profile) return 'unconfirmed'
-  return profile.ruleStatus === 'preserved' ? 'profile' : 'built-in-fallback'
+  return profile.ruleStatus === 'preserved' ? 'profile' : 'subscription-fallback'
 }
 
 function validPort(value: unknown): value is number {

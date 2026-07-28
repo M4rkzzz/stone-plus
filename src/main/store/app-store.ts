@@ -10,6 +10,7 @@ import {
   supportsPoolFastServiceTier,
 } from '@shared/types'
 import { accountMatchesPoolProtocol } from '@shared/pool-protocol'
+import { normalizeProviderHttpUrl } from '@shared/provider-url'
 import {
   accumulateOpenAiTokenCost,
   createOpenAiTokenCostAccumulator,
@@ -1679,13 +1680,15 @@ export class AppStore {
       const missing = selectedIds.filter((id) => !state.accounts.some((account) => account.id === id))
       if (missing.length) throw new Error('One of the selected accounts no longer exists.')
       const deletedPoolIds = new Set<string>()
+      const emptiedPoolIds = new Set<string>()
       state.pools = state.pools.flatMap((pool) => {
         const members = pool.members.filter((member) => !selectedIdSet.has(member.accountId))
         if (members.length === pool.members.length) return [pool]
-        if (members.length === 0 || (pool.kind === 'relay-aggregate' && members.length < 2)) {
+        if (pool.kind === 'relay-aggregate' && members.length < 2) {
           deletedPoolIds.add(pool.id)
           return []
         }
+        if (members.length === 0) emptiedPoolIds.add(pool.id)
         return [{
           ...pool,
           members: pool.kind === 'relay-aggregate'
@@ -1706,6 +1709,8 @@ export class AppStore {
       state.providers = state.providers.filter((provider) => !orphanedSourceIds.has(provider.id))
       state.routes = state.routes.map((route) => orphanedSourceIds.has(route.poolId) || deletedPoolIds.has(route.poolId)
         ? { ...route, enabled: false, poolId: '', updatedAt: timestamp }
+        : emptiedPoolIds.has(route.poolId) && route.enabled
+          ? { ...route, enabled: false, updatedAt: timestamp }
         : route)
       reconcilePoolModelAllowlists(state, timestamp)
     }, ['providers', 'accounts', 'credentials', 'pools', 'routes'])
@@ -4145,21 +4150,7 @@ function maskAccountId(accountId: string): string {
 }
 
 function normalizeUrl(value: string): string {
-  const url = new URL(value.trim())
-  if (url.protocol !== 'https:' && url.protocol !== 'http:') {
-    throw new Error('Provider URLs must use HTTP or HTTPS.')
-  }
-  const loopback = url.hostname === '127.0.0.1' || url.hostname === 'localhost' || url.hostname === '[::1]'
-  if (url.protocol === 'http:' && !loopback) {
-    throw new Error('Provider URLs must use HTTPS unless they are local.')
-  }
-  if (url.username || url.password) {
-    throw new Error('Provider credentials must be stored on the account, not in the URL.')
-  }
-  if (url.search || url.hash) {
-    throw new Error('Provider base URLs cannot contain a query string or fragment.')
-  }
-  return url.toString().replace(/\/$/, '')
+  return normalizeProviderHttpUrl(value)
 }
 
 function normalizeProxyHost(value: string): string {

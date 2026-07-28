@@ -33,6 +33,7 @@ import type {
 import { previewRoute as buildRoutePreview } from '@shared/route-preview'
 import { DEFAULT_ACCOUNT_MAX_CONCURRENCY, supportsFastServiceTier, supportsPoolFastServiceTier } from '@shared/types'
 import { accountMatchesPoolProtocol } from '@shared/pool-protocol'
+import { normalizeProviderHttpUrl } from '@shared/provider-url'
 import { providerSourceFamily } from '@shared/source-family'
 import {
   AGENT_CAPABILITIES,
@@ -785,14 +786,11 @@ function mockMaskCredential(credential: string): string {
 }
 
 function normalizeMockSourceUrl(value: string, exact: boolean): string {
-  const url = new URL(value.trim())
-  if (url.protocol !== 'https:' && url.protocol !== 'http:') throw new Error(mockText('来源地址必须使用 HTTP 或 HTTPS', 'Source URLs must use HTTP or HTTPS'))
-  const loopback = url.hostname === '127.0.0.1' || url.hostname === 'localhost' || url.hostname === '[::1]'
-  if (url.protocol === 'http:' && !loopback) throw new Error(mockText('非本地来源必须使用 HTTPS', 'Non-local sources must use HTTPS'))
-  if (url.username || url.password) throw new Error(mockText('来源地址不能嵌入凭据', 'Credentials cannot be embedded in the source URL'))
-  if (url.search || url.hash) throw new Error(mockText('来源地址不能包含查询参数或片段', 'Source URLs cannot contain a query string or fragment'))
-  const normalized = url.toString()
-  return exact ? normalized : normalized.replace(/\/$/, '')
+  try {
+    return normalizeProviderHttpUrl(value, exact)
+  } catch {
+    throw new Error(mockText('请输入有效的 HTTP(S) 来源地址；裸 IP 可省略 http://', 'Enter a valid HTTP(S) source URL; a bare IP may omit http://'))
+  }
 }
 
 function normalizeMockApiSourceInput(input: ApiSourceInput): ApiSourceInput & { baseUrl: string; models: string[] } {
@@ -1727,20 +1725,42 @@ export function createMockApi(): GatewayApi {
     },
     async deleteAccount(id: string) {
       snapshot.accounts = snapshot.accounts.filter((account) => account.id !== id)
-      snapshot.pools = snapshot.pools.map((pool) => ({
-        ...pool,
-        members: pool.members.filter((member) => member.accountId !== id),
-      }))
+      const deletedAggregatePoolIds = new Set<string>()
+      snapshot.pools = snapshot.pools.flatMap((pool) => {
+        const members = pool.members.filter((member) => member.accountId !== id)
+        if (pool.kind === 'relay-aggregate' && members.length < 2) {
+          deletedAggregatePoolIds.add(pool.id)
+          return []
+        }
+        return [{ ...pool, members }]
+      })
+      const emptyPoolIds = new Set(snapshot.pools
+        .filter((pool) => pool.kind === 'standard' && pool.members.length === 0)
+        .map((pool) => pool.id))
+      snapshot.routes = snapshot.routes.map((route) => deletedAggregatePoolIds.has(route.poolId)
+        ? { ...route, enabled: false, poolId: '' }
+        : emptyPoolIds.has(route.poolId) ? { ...route, enabled: false } : route)
       reconcileMockPoolModels()
       return changed()
     },
     async deleteAccounts(ids: string[]) {
       const selected = new Set(ids)
       snapshot.accounts = snapshot.accounts.filter((account) => !selected.has(account.id))
-      snapshot.pools = snapshot.pools.map((pool) => ({
-        ...pool,
-        members: pool.members.filter((member) => !selected.has(member.accountId)),
-      }))
+      const deletedAggregatePoolIds = new Set<string>()
+      snapshot.pools = snapshot.pools.flatMap((pool) => {
+        const members = pool.members.filter((member) => !selected.has(member.accountId))
+        if (pool.kind === 'relay-aggregate' && members.length < 2) {
+          deletedAggregatePoolIds.add(pool.id)
+          return []
+        }
+        return [{ ...pool, members }]
+      })
+      const emptyPoolIds = new Set(snapshot.pools
+        .filter((pool) => pool.kind === 'standard' && pool.members.length === 0)
+        .map((pool) => pool.id))
+      snapshot.routes = snapshot.routes.map((route) => deletedAggregatePoolIds.has(route.poolId)
+        ? { ...route, enabled: false, poolId: '' }
+        : emptyPoolIds.has(route.poolId) ? { ...route, enabled: false } : route)
       reconcileMockPoolModels()
       return changed()
     },

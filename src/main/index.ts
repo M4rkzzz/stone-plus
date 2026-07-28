@@ -12,6 +12,7 @@ import { DatabaseBackupService, WebDavBackupService } from './backup'
 import { resolveChatGptCredential } from './providers'
 import { resolveChatGptAgentIdentity, resolveGrokOAuthCredential } from './auth'
 import {
+  collectEnabledOutboundTargets,
   createOutboundReloadCoordinator,
   OutboundTransportManager,
   resolveEffectiveProxy,
@@ -211,6 +212,20 @@ async function bootstrap(): Promise<void> {
     }),
     subscriptionFetch: outboundTransport.fetchFor(undefined),
     localGateway: { host: '127.0.0.1', port: gatewaySettings.port, transport: 'tcp' },
+    requiredProxyDomains: () => {
+      try {
+        return [...collectEnabledOutboundTargets(store).values()].flatMap((target) => {
+          try {
+            return [new URL(target.targetUrl).hostname]
+          } catch {
+            return []
+          }
+        })
+      } catch (error) {
+        console.warn('[built-in-proxy] Could not collect dynamic required proxy domains', error)
+        return []
+      }
+    },
     reloadExternalSystemProxy: () => outboundReloadCoordinator.reloadExternalSystemRouteStrict(),
     detectBuiltInTargets: async (targets) => {
       await outboundTransport.builtInRoutes.warm(targets)

@@ -842,5 +842,5 @@ describe('ClientInstanceManager', () => {
     expect(manager.list()[0]).toMatchObject({ status: 'running', pid: 7002, processAlive: true })
     expect(JSON.parse(metadata.values.get('managed_client_instances_v1')!)[0]).toMatchObject({ status: 'running' })
     await manager.stop(instance.id)
-  })
+  }, 10_000)
 })

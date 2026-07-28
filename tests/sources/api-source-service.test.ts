@@ -115,6 +115,26 @@ describe('API source probe service', () => {
     expect(JSON.stringify(result)).not.toContain(storedCredential)
   })
 
+  it('probes a bare IP relay over inferred HTTP', async () => {
+    const fetchImplementation = vi.fn(async (request: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(request)
+      if (init?.method === 'POST') {
+        expect(url).toBe('http://10.20.30.40:8080/v1/chat/completions')
+        return jsonResponse({ choices: [{ message: { content: 'OK' } }] })
+      }
+      expect(url).toBe('http://10.20.30.40:8080/v1/models')
+      return jsonResponse({ data: [{ id: 'test-model' }] })
+    }) as typeof fetch
+
+    const result = await probeApiSource({
+      ...sourceInput(probeCases[1]),
+      baseUrl: '10.20.30.40:8080/v1',
+    }, { fetchImplementation })
+
+    expect(result.ok).toBe(true)
+    expect(fetchImplementation).toHaveBeenCalledTimes(3)
+  })
+
   it('does not make a request when neither a new nor stored credential is available', async () => {
     const fetchImplementation = vi.fn() as unknown as typeof fetch
     const result = await probeApiSource({

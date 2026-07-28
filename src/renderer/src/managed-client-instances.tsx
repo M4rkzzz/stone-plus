@@ -153,7 +153,7 @@ export function ManagedClientInstancesPanel({ snapshot, api }: { snapshot: AppSn
       {instances.length === 0 ? <span className="muted">{t('尚未创建受管实例', 'No managed instances')}</span> : instances.map((instance) => {
         const brand = clientBrandMeta[instance.client]
         return <article key={instance.id}>
-          <img className="managed-instance-brand" src={brand.icon} alt="" /><span><strong>{instance.name}</strong><small>{instance.stopError ?? instance.workingDirectory ?? instance.configDirectory}</small></span>
+          <img className={`managed-instance-brand ${brand.iconClassName ?? ''}`.trim()} src={brand.icon} alt="" /><span><strong>{instance.name}</strong><small>{instance.stopError ?? instance.workingDirectory ?? instance.configDirectory}</small></span>
           <i className={`managed-instance-status is-${instance.status}`}>{managedInstanceStatusLabel(instance.status, t)}{instance.pid ? ` · PID ${instance.pid}` : ''}</i>
           {instance.processAlive || instance.status === 'running' || instance.status === 'stopping'
             ? <button className="icon-button" type="button" title={t('停止', 'Stop')} aria-label={t(`停止 ${instance.name}`, `Stop ${instance.name}`)} disabled={Boolean(busy)} onClick={() => void stopInstance(instance)}>{busy === `stop-${instance.id}` ? <LoaderCircle className="spin" size={15} /> : <Square size={15} />}</button>

@@ -4,6 +4,7 @@ import { lstat, readFile, writeFile } from 'node:fs/promises'
 import { basename, extname, join } from 'node:path'
 import { clientNativeProtocols } from '@shared/types'
 import { previewRoute } from '@shared/route-preview'
+import { normalizeProviderHttpUrl } from '@shared/provider-url'
 import {
   hasRouteSourceIdCollision,
   isAvailableRouteAccount,
@@ -3009,12 +3010,7 @@ function apiSourceSaveMatchesProbeModels(
 }
 
 function normalizeApiSourceEvidenceUrl(value: string): string {
-  const url = new URL(value.trim())
-  if (url.protocol !== 'http:' && url.protocol !== 'https:') throw new Error('API source URL is invalid.')
-  const loopback = url.hostname === '127.0.0.1' || url.hostname === 'localhost' || url.hostname === '[::1]'
-  if (url.protocol === 'http:' && !loopback) throw new Error('API source URL is invalid.')
-  if (url.username || url.password || url.search || url.hash) throw new Error('API source URL is invalid.')
-  return url.toString().replace(/\/$/, '')
+  return normalizeProviderHttpUrl(value)
 }
 
 function toGatewayConfig(store: AppStore): GatewayConfig {

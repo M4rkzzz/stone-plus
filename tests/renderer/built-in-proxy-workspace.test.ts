@@ -171,7 +171,7 @@ describe('built-in proxy workspace backend-truth projection', () => {
     expect(summarizeBuiltInProxyRuntime(afterRestart).effectiveNodeId).toBeUndefined()
   })
 
-  it('identifies generic custom rules as the active policy instead of a fixed scope preset', () => {
+  it('ignores legacy standalone custom rules and reports the subscription policy', () => {
     const current = runtime()
     current.settings.customRules = {
       rules: [
@@ -184,7 +184,7 @@ describe('built-in proxy workspace backend-truth projection', () => {
     }
 
     expect(summarizeBuiltInProxyRouteChain(current).steps).toContainEqual({
-      kind: 'policy', mode: 'rule', source: 'custom',
+      kind: 'policy', mode: 'rule', source: 'profile',
     })
   })
 })
@@ -646,7 +646,7 @@ describe('built-in proxy workspace server-rendered guardrails', () => {
     expect(tunHtml).toContain('Devices on the same network may reach the mixed endpoint without additional authentication')
   })
 
-  it('renders the generic ordered rule editor and never the rejected fixed custom-scope design', () => {
+  it('uses subscription rules even when a legacy custom rule payload remains persisted', () => {
     const current = runtime()
     current.settings.customRules = {
       rules: [{ id: 'domain', condition: 'domain', values: ['api.example.com'], action: 'proxy' }],
@@ -654,20 +654,10 @@ describe('built-in proxy workspace server-rendered guardrails', () => {
     }
     const html = renderWorkspace(current, { tab: 'rules' })
 
-    for (const label of [
-      'Exact domain',
-      'Domain suffix',
-      'IP / CIDR',
-      'Port range',
-      'Network',
-      'Application protocol',
-      'Private network',
-      'Mainland China',
-    ]) expect(html).toContain(label)
-    expect(html).toContain('Custom rules are a global setting shared by every profile')
-    expect(html).toContain('Unmatched traffic')
-    expect(html).not.toContain('Custom scope')
-    expect(html).not.toContain('自定义范围')
+    expect(html).toContain('Use profile rules')
+    expect(html).toContain('missing Stone+ service domains supplemented')
+    expect(html).not.toContain('Custom rules are a global setting shared by every profile')
+    expect(html).not.toContain('Exact domain')
   })
 
   it('restores the selected node and group when the renderer starts again', () => {

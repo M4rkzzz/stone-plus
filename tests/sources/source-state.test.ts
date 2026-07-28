@@ -705,6 +705,24 @@ describe('API source state changes', () => {
     }), encrypt, NOW + 1)).toThrow('compatible or custom')
   })
 
+  it('accepts plaintext remote relays and normalizes bare IP endpoints', () => {
+    const state = emptyState()
+    const encrypt = (value: string) => `encrypted:${value}`
+    const remote = saveApiSourceDraft(state, relayInput({
+      name: 'Remote HTTP relay',
+      baseUrl: 'http://relay.example.test:8080/v1',
+    }), encrypt, NOW)
+    const bareIp = saveApiSourceDraft(state, relayInput({
+      name: 'Bare IP relay',
+      baseUrl: '10.20.30.40:9000/v1',
+    }), encrypt, NOW + 1)
+
+    expect(state.providers.find((provider) => provider.id === remote.providerId)?.baseUrl)
+      .toBe('http://relay.example.test:8080/v1')
+    expect(state.providers.find((provider) => provider.id === bareIp.providerId)?.baseUrl)
+      .toBe('http://10.20.30.40:9000/v1')
+  })
+
   it('cascades deletion through credentials and members, removing invalid aggregates safely', () => {
     const state = emptyState()
     const encrypt = (value: string) => `encrypted:${value}`

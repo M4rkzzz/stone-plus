@@ -1,5 +1,6 @@
 import path from 'node:path'
 
+import { prepareInstallerLicense } from './prepare-installer-license.mjs'
 import { verifyFrpcRuntime } from './verify-frpc-runtime.mjs'
 import { runtimeTargetName, verifyRuntimeTarget } from './verify-sing-box-runtime.mjs'
 
@@ -21,6 +22,8 @@ export default async function verifyRuntimeInputsBeforePack(context) {
   })
   console.info(`Verified sing-box ${result.version} before packaging ${targetName}.`)
   if (context.electronPlatformName === 'win32') {
+    const installerLicense = await prepareInstallerLicense(context.packager.projectDir)
+    console.info(`Prepared Unicode NSIS license before packaging: ${installerLicense}.`)
     const frpc = await verifyFrpcRuntime({
       runtimeRoot: path.join(context.packager.projectDir, 'build', 'frp')
     })

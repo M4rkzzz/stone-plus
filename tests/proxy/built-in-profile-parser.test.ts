@@ -100,9 +100,10 @@ rules:
     })
     expect(profile.rules).toEqual([
       { domainSuffixes: ['example.cn'], action: 'direct' },
-      { ruleSetTags: ['geoip-cn'], action: 'direct' },
       { action: 'proxy' }
     ])
+    expect(profile.ruleStatus).toBe('fallback')
+    expect(profile.ruleDowngrade).toMatchObject({ code: 'unsupported-rules', unsupportedCount: 1 })
   })
 
   it('decodes Base64 subscriptions and parses common URI nodes', () => {
@@ -126,7 +127,7 @@ rules:
     expect(profile.ruleDowngrade?.code).toBe('no-rules')
   })
 
-  it('downgrades the complete rule set when an external provider or unsafe rule is referenced', () => {
+  it('skips an external provider rule while preserving the supported subscription subset', () => {
     const profile = parseBuiltInProxyProfile(`
 proxy-providers:
   vendor:
@@ -142,7 +143,7 @@ rules:
 `)
 
     expect(profile.ruleStatus).toBe('fallback')
-    expect(profile.rules).toEqual([])
+    expect(profile.rules).toEqual([{ action: 'proxy' }])
     expect(profile.ruleDowngrade).toMatchObject({ code: 'unsupported-rules', unsupportedCount: 1 })
     expect(profile.warnings.join(' ')).toContain('not imported or executed')
     expect(JSON.stringify(profile)).not.toContain('untrusted.invalid')

@@ -106,7 +106,7 @@ export function parseBuiltInProxyProfile(
     sourceFingerprint,
     nodes,
     groups: parsed.groups(nodes),
-    rules: parsed.downgrade ? [] : parsed.rules,
+    rules: parsed.rules,
     ruleStatus: parsed.downgrade ? 'fallback' : 'preserved',
     ...(parsed.downgrade ? { ruleDowngrade: parsed.downgrade } : {}),
     warnings: [...new Set(context.warnings)].slice(0, 100)
@@ -207,7 +207,7 @@ function parseSingBoxJson(content: string, context: ParseContext): FormatParseRe
     groups: (finalNodes) => buildGroups(groupRecords, tagToDraft, finalNodes),
     rules: rulesResult.rules,
     downgrade: rulesResult.downgrade ?? (groupNames.size > 0 && nodes.length === 0
-      ? downgrade('missing-targets', 1, 'Imported groups do not reference a supported node; built-in safe rules will be used.')
+      ? downgrade('missing-targets', 1, 'Imported groups do not reference a supported node; unmatched traffic will use the selected node.')
       : undefined)
   }
 }
@@ -330,11 +330,11 @@ function parseSingBoxRules(
   blockTags: ReadonlySet<string>
 ): { rules: InternalProxyRule[]; downgrade?: ProxyRuleDowngrade } {
   if (!isRecord(routeValue) || !Array.isArray(routeValue.rules) || routeValue.rules.length === 0) {
-    return { rules: [], downgrade: downgrade('no-rules', 0, 'No safely convertible rules were found; built-in safe rules will be used.') }
+    return { rules: [], downgrade: downgrade('no-rules', 0, 'No safely convertible subscription rules were found; unmatched traffic will use the selected node.') }
   }
   const importedRules: unknown[] = routeValue.rules
   if (importedRules.length > MAX_RULES) {
-    return { rules: [], downgrade: downgrade('unsupported-rules', importedRules.length, 'The imported rule set is too large; built-in safe rules will be used.') }
+    return { rules: [], downgrade: downgrade('unsupported-rules', importedRules.length, 'The imported rule set is too large to preserve safely; unmatched traffic will use the selected node.') }
   }
   const rules: InternalProxyRule[] = []
   let unsupported = 0
@@ -345,8 +345,13 @@ function parseSingBoxRules(
     if (!converted || (isCatchAll(converted) && index !== importedRules.length - 1)) unsupported += 1
     else rules.push(converted)
   })
-  if (unsupported > 0 || rules.length === 0) {
-    return { rules: [], downgrade: downgrade('unsupported-rules', unsupported || 1, 'Some imported rules are unsafe or unsupported; built-in safe rules will be used instead.') }
+  if (unsupported > 0 || rules.length === 0) return {
+    rules,
+    downgrade: downgrade(
+      'unsupported-rules',
+      unsupported || 1,
+      'Some imported rules were unsafe or unsupported and were skipped; supported subscription rules were preserved and unmatched traffic will use the selected node.',
+    ),
   }
   return { rules }
 }
@@ -512,8 +517,8 @@ function parseClashTransport(value: Record<string, unknown>): InternalProxyTrans
 
 function parseClashRules(value: unknown, proxyTargets: ReadonlySet<string>): { rules: InternalProxyRule[]; downgrade?: ProxyRuleDowngrade } {
   const values = arrayValue(value)
-  if (values.length === 0) return { rules: [], downgrade: downgrade('no-rules', 0, 'No Clash rules were found; built-in safe rules will be used.') }
-  if (values.length > MAX_RULES) return { rules: [], downgrade: downgrade('unsupported-rules', values.length, 'The imported rule set is too large; built-in safe rules will be used.') }
+  if (values.length === 0) return { rules: [], downgrade: downgrade('no-rules', 0, 'No Clash rules were found; unmatched traffic will use the selected node.') }
+  if (values.length > MAX_RULES) return { rules: [], downgrade: downgrade('unsupported-rules', values.length, 'The imported rule set is too large to preserve safely; unmatched traffic will use the selected node.') }
   const rules: InternalProxyRule[] = []
   let unsupported = 0
   values.forEach((entry, index) => {
@@ -521,7 +526,14 @@ function parseClashRules(value: unknown, proxyTargets: ReadonlySet<string>): { r
     if (!rule || (isCatchAll(rule) && index !== values.length - 1)) unsupported += 1
     else rules.push(rule)
   })
-  if (unsupported > 0 || rules.length === 0) return { rules: [], downgrade: downgrade('unsupported-rules', unsupported || 1, 'Some Clash rules are unsafe or unsupported; built-in safe rules will be used instead.') }
+  if (unsupported > 0 || rules.length === 0) return {
+    rules,
+    downgrade: downgrade(
+      'unsupported-rules',
+      unsupported || 1,
+      'Some Clash rules were unsafe or unsupported and were skipped; supported subscription rules were preserved and unmatched traffic will use the selected node.',
+    ),
+  }
   return { rules }
 }
 
@@ -541,8 +553,7 @@ function convertClashRule(raw: string, proxyTargets: ReadonlySet<string>): Inter
     if (type === 'DOMAIN-SUFFIX') return { domainSuffixes: safeDomains(payload, true), action }
     if (type === 'DOMAIN-KEYWORD') return { domainKeywords: safeKeywords(payload), action }
     if (type === 'IP-CIDR' || type === 'IP-CIDR6') return { ipCidrs: safeCidrs(payload), action }
-    if (type === 'GEOIP' && payload.toUpperCase() === 'CN') return { ruleSetTags: ['geoip-cn'], action }
-    if (type === 'GEOSITE' && payload.toUpperCase() === 'CN') return { ruleSetTags: ['geosite-cn'], action }
+    if (type === 'GEOIP' || type === 'GEOSITE') return undefined
     if (type === 'DST-PORT') return { ports: safePorts(payload), action }
     if (type === 'NETWORK' && ['TCP', 'UDP'].includes(payload.toUpperCase())) return { networks: [payload.toLowerCase() as 'tcp' | 'udp'], action }
     return undefined
@@ -576,7 +587,7 @@ function parseUriList(content: string, context: ParseContext): FormatParseResult
     nodes,
     groups: (finalNodes) => finalNodes.length === 0 ? [] : [{ id: stableGroupId('All nodes'), name: 'All nodes', type: 'selector', nodeIds: finalNodes.map((node) => node.id) }],
     rules: [],
-    downgrade: downgrade('no-rules', 0, 'URI subscriptions do not include safely convertible rules; built-in safe rules will be used.')
+    downgrade: downgrade('no-rules', 0, 'URI subscriptions do not include safely convertible rules; unmatched traffic will use the selected node.')
   }
 }
 

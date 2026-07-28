@@ -27,14 +27,15 @@ import {
 
 const LOOPBACK_HOST = '127.0.0.1'
 const CONFIG_SIZE_LIMIT = 8 * 1024 * 1024
-// Remote Stone-owned rule sets are initialized before sing-box exposes its
-// mixed/controller listeners.  Allow a bounded proxy handshake and cold rule
-// download without misclassifying a live core as unhealthy on slower links.
+// Keep startup bounded while allowing slower endpoint initialization on
+// remote machines. Stone+ does not download a separate geographic ruleset.
 const DEFAULT_HEALTH_TIMEOUT_MS = 30_000
 const DEFAULT_HEALTH_INTERVAL_MS = 100
 const DEFAULT_RESTART_DELAYS_MS = [250, 1_000, 3_000] as const
 const DEFAULT_TERMINATION_TIMEOUT_MS = 8_000
 const MAX_EVENT_LOG_LENGTH = 2_000
+const MAX_RECENT_CORE_LOGS = 8
+const ANSI_ESCAPE_PATTERN = new RegExp(`${String.fromCharCode(27)}\\[[0-?]*[ -/]*[@-~]`, 'g')
 const MAX_TRACKED_CONNECTION_IDS = 50_000
 const DEFAULT_LATENCY_TEST_URL = 'http://www.gstatic.com/generate_204'
 const LATENCY_SAMPLE_COUNT = 3
@@ -182,6 +183,7 @@ interface RunningChildContext {
   controllerSecret: string
   mixedPort: number
   controllerPort: number
+  recentLogs: string[]
 }
 
 interface ControllerConnectionPayload {
@@ -630,6 +632,7 @@ export class SingBoxService {
         controllerSecret: secret,
         mixedPort: mixedLease.port,
         controllerPort: controllerLease.port,
+        recentLogs: [],
       }
       this.startingContext = context
       this.childContexts.add(context)
@@ -677,7 +680,8 @@ export class SingBoxService {
       } else {
         await this.removeRuntimeConfig(configPath)
       }
-      return this.failStart(asServiceError(error, 'start_failed', 'sing-box failed to start.'))
+      const failure = asServiceError(error, 'start_failed', 'sing-box failed to start.')
+      return this.failStart(context ? withCoreStartupDetail(failure, context.recentLogs) : failure)
     }
   }
 
@@ -838,12 +842,23 @@ export class SingBoxService {
 
   private attachChild(context: RunningChildContext): void {
     const { child } = context
-    pipeProcessLines(child.stdout, (line) => this.emit({ type: 'log', stream: 'stdout', line }))
-    pipeProcessLines(child.stderr, (line) => this.emit({ type: 'log', stream: 'stderr', line }))
+    pipeProcessLines(child.stdout, (line) => this.recordCoreLog(context, 'stdout', line))
+    pipeProcessLines(child.stderr, (line) => this.recordCoreLog(context, 'stderr', line))
     child.on('error', (error) => {
-      this.emit({ type: 'log', stream: 'stderr', line: sanitizeLogLine(error.message) })
+      this.recordCoreLog(context, 'stderr', sanitizeLogLine(error.message))
     })
     child.once('exit', (code, signal) => this.handleChildExit(context, code, signal))
+  }
+
+  private recordCoreLog(
+    context: RunningChildContext,
+    stream: 'stdout' | 'stderr',
+    line: string,
+  ): void {
+    if (!line) return
+    context.recentLogs.push(line)
+    if (context.recentLogs.length > MAX_RECENT_CORE_LOGS) context.recentLogs.shift()
+    this.emit({ type: 'log', stream, line })
   }
 
   private handleChildExit(
@@ -1462,11 +1477,29 @@ function sanitizeProcessFailure(error: unknown): string {
 
 function sanitizeLogLine(value: string): string {
   return value
+    .replace(ANSI_ESCAPE_PATTERN, '')
     .replace(/(?:https?|socks\d?):\/\/[^\s/@:]+:[^\s/@]+@/gi, (match) => match.replace(/\/\/.*@/, '//[REDACTED]@'))
+    .replace(/\b(?:trojan|hysteria2|hy2):\/\/[^\s/@]+@/gi, (match) => match.replace(/\/\/.*@/, '//[REDACTED]@'))
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/-]+/gi, 'Bearer [REDACTED]')
+    .replace(/([?&](?:access_token|refresh_token|token|key|secret|password)=)[^&\s]+/gi, '$1[REDACTED]')
     .replace(/(["']?\b(?:secret|password|passwd|token|authorization|uuid|private_key|pre_shared_key|psk|auth)\b["']?\s*[:=]\s*)(?:"[^"]*"|'[^']*'|\S+)/gi, '$1[REDACTED]')
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, MAX_EVENT_LOG_LENGTH)
+}
+
+function withCoreStartupDetail(
+  error: SingBoxServiceError,
+  recentLogs: readonly string[],
+): SingBoxServiceError {
+  const detail = [...recentLogs].reverse().find((line) => /\b(?:FATAL|ERROR)\b/i.test(line))
+    ?? recentLogs[recentLogs.length - 1]
+  if (!detail || error.message.includes(detail)) return error
+  return new SingBoxServiceError(
+    error.code,
+    `${error.message} Core: ${detail}`.slice(0, MAX_EVENT_LOG_LENGTH + 512),
+    { cause: error },
+  )
 }
 
 function pipeProcessLines(stream: Readable | null | undefined, listener: (line: string) => void): void {

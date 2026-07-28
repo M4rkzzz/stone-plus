@@ -40,7 +40,7 @@ describe('built-in proxy import and rule accessibility', () => {
     expect(css).toContain('.built-in-proxy-file input:focus-visible + .built-in-proxy-file__trigger')
   })
 
-  it('marks custom rule toggles as pressed and labels each free-form match editor', () => {
+  it('exposes subscription rules as the only rule source', () => {
     const markup = renderToStaticMarkup(createElement(
       I18nProvider,
       null,
@@ -55,11 +55,10 @@ describe('built-in proxy import and rule accessibility', () => {
       }),
     ))
 
-    expect(markup).toMatch(/aria-pressed="false"[^>]*><strong>Use profile rules<\/strong>/)
-    expect(markup).toMatch(/aria-pressed="true"[^>]*><strong>Custom rules<\/strong>/)
-    expect(markup).toContain('aria-label="Rule 1 match values"')
-    expect(markup).toMatch(/aria-pressed="true"[^>]*>Proxy<\/button>/)
-    expect(markup).toMatch(/aria-pressed="false"[^>]*>Direct<\/button>/)
+    expect(markup).toContain('aria-current="true"><strong>Use profile rules</strong>')
+    expect(markup).toContain('missing Stone+ service domains supplemented')
+    expect(markup).not.toContain('Custom rules')
+    expect(markup).not.toContain('Rule 1 match values')
   })
 })
 

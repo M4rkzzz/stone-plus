@@ -31,7 +31,7 @@
   justify-content: center;
   border-radius: 10px;
   background: var(--accent-soft);
-  color: var(--accent);
+  color: var(--accent-text);
 }
 
 .heading h2,
@@ -80,7 +80,7 @@
 .statusReady {
   border-color: color-mix(in srgb, var(--accent) 24%, var(--border));
   background: var(--accent-soft);
-  color: var(--accent);
+  color: var(--accent-text);
 }
 
 .statusDanger {
@@ -163,7 +163,7 @@
   justify-content: space-between;
   gap: 12px;
   margin-bottom: 12px;
-  color: var(--accent);
+  color: var(--accent-text);
 }
 
 .routeState {
@@ -218,7 +218,7 @@
   justify-content: center;
   border-radius: 8px;
   background: var(--accent-soft);
-  color: var(--accent);
+  color: var(--accent-text);
 }
 
 .routeActive .routeHop {
@@ -322,7 +322,7 @@
   align-items: center;
   gap: 7px;
   margin-bottom: 12px;
-  color: var(--accent);
+  color: var(--accent-text);
 }
 
 .cardHeading h3 {
@@ -408,7 +408,7 @@
 .pillSuccess {
   border-color: color-mix(in srgb, var(--accent) 20%, var(--border));
   background: var(--accent-soft);
-  color: var(--accent);
+  color: var(--accent-text);
 }
 
 .pillWarning {
@@ -513,7 +513,7 @@
 .navigationButton:hover:not(:disabled) {
   border-color: color-mix(in srgb, var(--accent) 28%, var(--border-strong));
   background: var(--accent-soft);
-  color: var(--accent);
+  color: var(--accent-text);
 }
 
 .navigationButton {

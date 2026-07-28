@@ -39,7 +39,7 @@
 .built-in-proxy-workspace-nav button:hover { background: var(--surface-subtle); color: var(--text-soft); }
 .built-in-proxy-workspace-nav button.is-active {
   background: var(--surface-raised);
-  color: var(--accent);
+  color: var(--accent-text);
   box-shadow: var(--shadow-sm);
 }
 .built-in-proxy-workspace-nav button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
@@ -79,7 +79,7 @@
   place-items: center;
   border-radius: 12px;
   background: var(--accent-soft);
-  color: var(--accent);
+  color: var(--accent-text);
 }
 
 .built-in-proxy-master--error .built-in-proxy-master__icon {
@@ -202,7 +202,7 @@
   place-items: center;
   border-radius: 15px;
   background: var(--accent-soft);
-  color: var(--accent);
+  color: var(--accent-text);
 }
 
 .built-in-proxy-guide h2 { margin-top: 8px; font-size: 16px; }
@@ -228,7 +228,7 @@
   gap: 9px;
 }
 
-.built-in-proxy-section-heading > div:first-child > svg { flex: 0 0 auto; color: var(--accent); }
+.built-in-proxy-section-heading > div:first-child > svg { flex: 0 0 auto; color: var(--accent-text); }
 .built-in-proxy-section-heading > div:first-child > span { display: grid; min-width: 0; gap: 2px; }
 .built-in-proxy-section-heading strong { color: var(--text); font-size: 12px; }
 .built-in-proxy-section-heading small { color: var(--muted); font-size: 9px; line-height: 1.4; }
@@ -260,7 +260,7 @@
 
 .built-in-proxy-tabs button.active {
   background: var(--surface-raised);
-  color: var(--accent);
+  color: var(--accent-text);
   box-shadow: var(--shadow-sm);
 }
 
@@ -293,7 +293,7 @@
   align-items: center;
   gap: 5px;
   border-radius: 4px;
-  color: var(--accent);
+  color: var(--accent-text);
   font-size: 9px;
   font-weight: 650;
 }
@@ -323,7 +323,7 @@
   font-size: 9px;
 }
 
-.built-in-proxy-import__footer > span svg { color: var(--accent); }
+.built-in-proxy-import__footer > span svg { color: var(--accent-text); }
 .built-in-proxy-import--compact { margin-top: 2px; }
 
 .built-in-proxy-profiles,
@@ -367,7 +367,7 @@
   border: 1px solid var(--control-border);
   border-radius: 50%;
   background: var(--surface-raised);
-  color: var(--accent);
+  color: var(--accent-text);
 }
 
 .built-in-proxy-profile.is-active .built-in-proxy-profile__check,
@@ -446,7 +446,7 @@
   text-align: left;
 }
 
-.built-in-proxy-nodes__toggle > svg:first-child { flex: 0 0 auto; color: var(--accent); }
+.built-in-proxy-nodes__toggle > svg:first-child { flex: 0 0 auto; color: var(--accent-text); }
 .built-in-proxy-nodes__toggle > span { display: grid; min-width: 0; flex: 1; gap: 2px; }
 .built-in-proxy-nodes__toggle strong { color: var(--text); font-size: 12px; }
 .built-in-proxy-nodes__toggle small {
@@ -488,7 +488,7 @@
 }
 
 .built-in-proxy-group-filter button span { color: var(--faint); font-size: 8px; }
-.built-in-proxy-group-filter button.active { border-color: var(--border-accent); background: var(--accent-soft); color: var(--accent); font-weight: 650; }
+.built-in-proxy-group-filter button.active { border-color: var(--border-accent); background: var(--accent-soft); color: var(--accent-text); font-weight: 650; }
 
 .built-in-proxy-node-table tr.is-active td { background: var(--surface-hover); }
 .built-in-proxy-node-name { display: flex; align-items: center; min-width: 220px; gap: 8px; }
@@ -538,7 +538,7 @@
 .built-in-proxy-choice-grid button small { color: var(--muted); font-size: 8px; line-height: 1.45; }
 .built-in-proxy-choice-grid button.is-selected { border-color: var(--border-active); background: var(--surface-raised); }
 .built-in-proxy-choice-grid button.is-selected > span { border-color: var(--accent); background: var(--accent); }
-.built-in-proxy-mode__preserved { display: flex; align-items: center; gap: 6px; color: var(--accent); font-size: 9px; }
+.built-in-proxy-mode__preserved { display: flex; align-items: center; gap: 6px; color: var(--accent-text); font-size: 9px; }
 
 .built-in-proxy-mode,
 .built-in-proxy-access { grid-column: 1 / -1; }
@@ -568,7 +568,7 @@
 
 .built-in-proxy-rule-source > button strong { font-size: 10px; }
 .built-in-proxy-rule-source > button small { color: var(--muted); font-size: 8px; }
-.built-in-proxy-rule-source > button.active { border-color: var(--border-active); background: var(--accent-soft); color: var(--accent); }
+.built-in-proxy-rule-source > button.active { border-color: var(--border-active); background: var(--accent-soft); color: var(--accent-text); }
 .built-in-proxy-rule-editor__hint { color: var(--muted); font-size: 9px; }
 .built-in-proxy-rule-list { display: grid; gap: 6px; }
 .built-in-proxy-rule-row {
@@ -639,7 +639,7 @@
   flex-wrap: wrap;
   width: 100%;
 }
-.built-in-proxy-rule-actions button.action-proxy { background: var(--accent-soft); color: var(--accent); }
+.built-in-proxy-rule-actions button.action-proxy { background: var(--accent-soft); color: var(--accent-text); }
 .built-in-proxy-rule-actions button.action-direct { background: var(--blue-soft); color: var(--blue); }
 .built-in-proxy-rule-actions button.action-block { background: var(--red-soft); color: var(--danger-text); }
 .built-in-proxy-rule-row__controls { display: flex; gap: 3px; }
@@ -692,10 +692,10 @@
 .built-in-proxy-access__choices button > div { display: grid; min-width: 0; gap: 2px; }
 .built-in-proxy-access__choices strong { font-size: 10px; }
 .built-in-proxy-access__choices small { color: var(--muted); font-size: 8px; line-height: 1.35; }
-.built-in-proxy-access__choices em { color: var(--accent); font-size: 8px; font-style: normal; font-weight: 650; }
-.built-in-proxy-access__choices button > svg { color: var(--accent); }
+.built-in-proxy-access__choices em { color: var(--accent-text); font-size: 8px; font-style: normal; font-weight: 650; }
+.built-in-proxy-access__choices button > svg { color: var(--accent-text); }
 .built-in-proxy-access__choices button.is-selected { border-color: var(--border-active); background: var(--surface-raised); }
-.built-in-proxy-access__choices button.is-selected > span { background: var(--accent-soft); color: var(--accent); }
+.built-in-proxy-access__choices button.is-selected > span { background: var(--accent-soft); color: var(--accent-text); }
 .built-in-proxy-access__choices button.is-pending { border-color: var(--warn-border); background: var(--warn-soft); }
 
 .built-in-proxy-access__endpoint {
@@ -741,7 +741,7 @@
 .built-in-proxy-traffic { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border-bottom: 1px solid var(--border); }
 .built-in-proxy-traffic__metric { display: flex; align-items: center; min-width: 0; gap: 9px; padding: 13px 17px; border-right: 1px solid var(--border); }
 .built-in-proxy-traffic__metric:last-child { border-right: 0; }
-.built-in-proxy-traffic__metric > span { display: grid; width: 30px; height: 30px; flex: 0 0 auto; place-items: center; border-radius: 7px; background: var(--accent-soft); color: var(--accent); }
+.built-in-proxy-traffic__metric > span { display: grid; width: 30px; height: 30px; flex: 0 0 auto; place-items: center; border-radius: 7px; background: var(--accent-soft); color: var(--accent-text); }
 .built-in-proxy-traffic__metric > div { display: grid; min-width: 0; gap: 1px; }
 .built-in-proxy-traffic__metric small { color: var(--muted); font-size: 8px; }
 .built-in-proxy-traffic__metric strong { overflow: hidden; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }

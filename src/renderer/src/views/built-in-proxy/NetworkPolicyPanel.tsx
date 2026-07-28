@@ -25,7 +25,7 @@ export function NetworkPolicyPanel({
   const ruleSource = summary.rules.importedRules === 'safe-converted'
     ? t('配置规则已转换为安全子集', 'Profile rules converted to the safe subset')
     : summary.rules.importedRules === 'downgraded'
-      ? t('配置规则无法安全转换，正在使用 Stone+ 规则', 'Profile rules were downgraded to the Stone+ policy')
+      ? t('部分配置规则无法安全转换；保留可转换规则，其余流量走选中节点', 'Unsupported profile rules were skipped; supported rules remain and unmatched traffic uses the selected node')
       : t('当前模式不读取配置规则', 'The current mode does not read profile rules')
 
   return <section className="panel built-in-policy" aria-labelledby="built-in-policy-title">
@@ -39,7 +39,9 @@ export function NetworkPolicyPanel({
             : t('只展示 Stone+ 真正生成并交给核心的安全配置', 'Shows only the safe configuration Stone+ actually gives the core')}</small>
         </span>
       </div>
-      <span className="built-in-policy__managed">{t('Stone+ 托管', 'Stone+ managed')}</span>
+      <span className="built-in-policy__managed">{runtime.settings.ruleMode === 'rule'
+        ? t('订阅规则', 'Subscription rules')
+        : t('Stone+ 模式', 'Stone+ mode')}</span>
     </div>
 
     <div className="built-in-policy__grid">
@@ -49,7 +51,7 @@ export function NetworkPolicyPanel({
       </article>
       <article>
         <span><DatabaseZap size={16} /></span>
-        <div><small>DNS</small><strong>{t('非回环上游 · IPv4 优先', 'Non-loopback upstreams · IPv4 preferred')}</strong><p>{t('由主进程校验，UDP/53 直连解析', 'Validated by the main process; direct UDP/53 resolution')}</p></div>
+        <div><small>DNS</small><strong>{t('系统解析器 · IPv4 优先', 'System resolver · IPv4 preferred')}</strong><p>{t('沿用远端电脑可用的系统 DNS，不依赖固定公共 DNS', 'Uses the remote computer\'s working system DNS instead of fixed public DNS')}</p></div>
       </article>
       <article>
         <span><FileLock2 size={16} /></span>
@@ -61,9 +63,6 @@ export function NetworkPolicyPanel({
       {t('当前已发布代次的规则模式未包含在运行时快照中，因此不会用待应用设置冒充当前策略。', 'The published generation does not expose its rule mode in the runtime snapshot, so pending settings are not presented as the current policy.')}
     </p>}
 
-    {summary.rules.chinaRuleSets !== 'not-used' && <p className="built-in-policy__footnote">
-      {t('中国大陆规则集由 Stone+ 固定管理，并通过当前选中节点按需更新。', 'Mainland China rule sets are fixed by Stone+ and updated through the selected node only when needed.')}
-    </p>}
   </section>
 }
 
@@ -73,8 +72,7 @@ function rulePolicyText(
 ): string {
   switch (policy) {
     case 'safe-imported': return t('配置规则', 'Profile rules')
-    case 'stone-custom': return t('自定义有序规则', 'Custom ordered rules')
-    case 'stone-fallback': return t('Stone+ 安全规则', 'Stone+ safe rules')
+    case 'subscription-fallback': return t('配置默认代理', 'Profile default proxy')
     case 'global': return t('全局代理', 'Global proxy')
     case 'direct': return t('全部直连', 'Direct only')
   }

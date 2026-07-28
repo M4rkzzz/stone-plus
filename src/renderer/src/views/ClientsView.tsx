@@ -1052,7 +1052,7 @@ export function ClientsView({
                 onClick={() => requestContextSwitch(client)}
                 key={client}
               >
-                <img className="client-manager-tabs__icon" src={item.icon} alt="" />
+                <img className={`client-manager-tabs__icon ${item.iconClassName ?? ''}`.trim()} src={item.icon} alt="" />
                 <span className="client-manager-tabs__label">{item.name}</span>
               </button>
             )
@@ -1117,7 +1117,7 @@ export function ClientsView({
             <section className="client-install" key={target} data-testid={`client-install-${target}`}>
               <div className="client-install__main">
                 <div className="client-install__identity">
-                  <span className="client-install__icon"><img src={clientMeta[itemMeta.client].icon} alt="" /><span className="client-install__surface-icon">{agentSurfaceIcon(itemMeta.surface)}</span></span>
+                  <span className="client-install__icon"><img className={clientMeta[itemMeta.client].iconClassName} src={clientMeta[itemMeta.client].icon} alt="" /><span className="client-install__surface-icon">{agentSurfaceIcon(itemMeta.surface)}</span></span>
                   <div className="client-install__copy">
                     <div className="client-install__title">
                       <strong>{itemMeta.name}</strong>
@@ -1197,7 +1197,7 @@ export function ClientsView({
       <section className={`client-easy-card ${connectionReady ? 'is-ready' : ''}`}>
         <header className="client-easy-card__header">
           <div className="client-easy-identity">
-            <span className="client-logo client-easy-identity__icon"><img src={meta.icon} alt="" /></span>
+            <span className="client-logo client-easy-identity__icon"><img className={meta.iconClassName} src={meta.icon} alt="" /></span>
             <div>
               <div><strong>{meta.name}</strong><Badge tone={connectionReady ? 'success' : configHealth === 'invalid' ? 'danger' : configHealth === 'needs-repair' ? 'warning' : 'neutral'}>{connectionSummary}</Badge></div>
               <span>{status?.directory ?? selectedProfile?.directory ?? t('默认配置目录', 'Default configuration directory')}</span>

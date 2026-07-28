@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import type { Protocol } from '../../shared/types'
+import { inferProviderUrlScheme } from '../../shared/provider-url'
 import { classifyProviderFailure } from './failure'
 import type {
   ModelDiscoveryResult,
@@ -106,21 +107,14 @@ function assertKiroProtocol(protocol: Protocol): void {
 }
 
 function normalizeExactEndpoint(value: string): string {
-  const trimmed = value.trim()
   let url: URL
   try {
-    url = new URL(trimmed)
+    url = new URL(inferProviderUrlScheme(value))
   } catch {
     throw new Error('Kiro Claude endpoint must be an absolute HTTP(S) URL')
   }
   if (url.protocol !== 'https:' && url.protocol !== 'http:') {
     throw new Error('Kiro Claude endpoint must use HTTP(S)')
-  }
-  const loopback = url.hostname === '127.0.0.1'
-    || url.hostname === 'localhost'
-    || url.hostname === '[::1]'
-  if (url.protocol === 'http:' && !loopback) {
-    throw new Error('Kiro Claude endpoint must use HTTPS unless it is local')
   }
   if (url.username || url.password) {
     throw new Error('Kiro Claude endpoint must not contain credentials')

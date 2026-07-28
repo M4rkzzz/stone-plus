@@ -13,7 +13,8 @@ describe('renderer to native theme contract', () => {
   const main = source('src/main/index.ts')
 
   it('carries both resolved colors and the user preference across IPC', () => {
-    expect(rendererTheme).toContain('setUiTheme(theme, preference)')
+    expect(rendererTheme).toContain('setUiTheme(theme, nativePreference)')
+    expect(rendererTheme).toContain("preference === 'system' || preference === 'light' || preference === 'dark'")
     expect(preload).toContain("ipcRenderer.invoke('stone:set-ui-theme', theme, preference)")
     expect(gatewayApi).toContain("preference !== 'system' && preference !== 'light' && preference !== 'dark'")
     expect(gatewayApi).toContain('onUiThemeApplied?.(theme, preference)')

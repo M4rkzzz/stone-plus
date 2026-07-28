@@ -48,6 +48,7 @@ import type {
 import { DEFAULT_ACCOUNT_MAX_CONCURRENCY } from '@shared/types'
 import { providerSourceFamily, type ProviderSourceFamily } from '@shared/source-family'
 import { accountMatchesPoolProtocol } from '@shared/pool-protocol'
+import { normalizeProviderHttpUrl } from '@shared/provider-url'
 import { hasVerifiedKiroToolBridge } from '@shared/route-sources'
 import type { ActionRunner } from '../App'
 import { accountIsCooling, accountQuotaIsExhausted, accountRecoveryAt, thawCountdown } from '../account-quota'
@@ -441,7 +442,7 @@ function ApiSourceForm({
       </div>}
       <label className="field field--full">
         <span className="field-label-with-help">{draft.kind === KIRO_COMPATIBLE_KIND ? t('完整 GenerateAssistantResponse 端点', 'Full GenerateAssistantResponse endpoint') : t('基础地址', 'Base URL')}{draft.sourceType === 'official-api' && <InfoTip text={t('官方 API 地址由 Stone+ 锁定，避免误接到第三方中转端点。', 'Stone+ locks official API URLs to prevent accidental routing through a third-party relay.')} />}</span>
-        <input className="mono" disabled={draft.sourceType === 'official-api'} value={draft.baseUrl} onChange={(event) => setDraft({ ...draft, baseUrl: event.target.value })} placeholder={draft.kind === KIRO_COMPATIBLE_KIND ? 'https://relay.example.com/generateAssistantResponse' : 'https://api.example.com/v1'} />
+        <input className="mono" disabled={draft.sourceType === 'official-api'} value={draft.baseUrl} onChange={(event) => setDraft({ ...draft, baseUrl: event.target.value })} placeholder={draft.kind === KIRO_COMPATIBLE_KIND ? '192.168.1.10:8080/generateAssistantResponse' : '192.168.1.10:8080/v1'} />
         {draft.kind === KIRO_COMPATIBLE_KIND && <small>{t('该地址按原样请求，不会追加 /v1/messages 或 /models。', 'This exact URL is requested as-is; /v1/messages and /models are never appended.')}</small>}
         <FieldError>{errors.baseUrl}</FieldError>
       </label>
@@ -1196,9 +1197,13 @@ export function ProvidersView({
   const submitProvider = async (event: React.FormEvent) => {
     event.preventDefault()
     const nextErrors: Record<string, string> = {}
+    let normalizedBaseUrl = ''
     if (!providerDraft.name.trim()) nextErrors.name = t('请输入来源名称', 'Enter a source name.')
-    try { new URL(providerDraft.baseUrl) } catch { nextErrors.baseUrl = t('请输入有效的 HTTP(S) 地址', 'Enter a valid HTTP(S) URL.') }
-    if (!/^https?:\/\//.test(providerDraft.baseUrl)) nextErrors.baseUrl = t('地址必须以 http:// 或 https:// 开头', 'The URL must start with http:// or https://.')
+    try {
+      normalizedBaseUrl = normalizeProviderHttpUrl(providerDraft.baseUrl, providerDraft.kind === KIRO_COMPATIBLE_KIND)
+    } catch {
+      nextErrors.baseUrl = t('请输入有效的 HTTP(S) 地址；裸 IP 可省略 http://', 'Enter a valid HTTP(S) URL; a bare IP may omit http://.')
+    }
     if (!providerDraft.id && !providerDraft.credential?.trim()) nextErrors.credential = t('首次添加需要填写 API Key', 'An API key is required when adding a source.')
     if (providerDraft.kind === KIRO_COMPATIBLE_KIND) {
       const models = providerDraft.modelsText.split(/[\n,]/).map((model) => model.trim()).filter(Boolean)
@@ -1238,7 +1243,7 @@ export function ProvidersView({
       name: providerDraft.name.trim(),
       sourceType: providerDraft.sourceType,
       kind: providerDraft.kind,
-      baseUrl: providerDraft.kind === KIRO_COMPATIBLE_KIND ? providerDraft.baseUrl.trim() : providerDraft.baseUrl.replace(/\/$/, ''),
+      baseUrl: normalizedBaseUrl,
       protocol: providerDraft.protocol,
       responsesCompactMode: responsesCompactModeForSave(
         providerDraft.sourceType,
@@ -1845,7 +1850,7 @@ export function ProvidersView({
       </div>
       {tab === 'accounts' && <div className="segmented-control account-family-tabs" role="tablist" aria-label={t('账号来源', 'Account source')} onKeyDown={handleTabListKeyDown}>
         <button id="account-family-tab-openai" type="button" role="tab" tabIndex={accountFamily === 'openai' ? 0 : -1} aria-selected={accountFamily === 'openai'} aria-controls="account-family-panel" className={accountFamily === 'openai' ? 'active' : ''} onClick={() => selectAccountFamily('openai')}>
-          <img src={providerBrandIcon('openai')} alt="" />OpenAI <span>{accountFamilyCounts.openai}</span>
+          <img className="brand-icon--openai" src={providerBrandIcon('openai')} alt="" />OpenAI <span>{accountFamilyCounts.openai}</span>
         </button>
         <button id="account-family-tab-grok" type="button" role="tab" tabIndex={accountFamily === 'grok' ? 0 : -1} aria-selected={accountFamily === 'grok'} aria-controls="account-family-panel" className={accountFamily === 'grok' ? 'active' : ''} onClick={() => selectAccountFamily('grok')}>
           <img src={providerBrandIcon('xai-compatible')} alt="" />Grok <span>{accountFamilyCounts.grok}</span>
@@ -1952,7 +1957,7 @@ export function ProvidersView({
           ) : (
             <EmptyState
               icon={accountFamily === 'openai'
-                ? <img className="account-family-empty-icon" src={providerBrandIcon('openai')} alt="" />
+                ? <img className="account-family-empty-icon brand-icon--openai" src={providerBrandIcon('openai')} alt="" />
                 : <img className="account-family-empty-icon" src={providerBrandIcon('xai-compatible')} alt="" />}
               title={accountFamily === 'openai' ? t('尚未添加 Codex 账号', 'No Codex accounts yet') : t('尚未添加 Grok 账号', 'No Grok accounts yet')}
               action={accountFamily === 'openai' ? <button className="button button--primary" type="button" onClick={openChatGptAccountDialog}><Plus size={16} />{t('添加 Codex 账号', 'Add Codex account')}</button> : <button className="button button--primary" type="button" onClick={openGrokCredential}><Plus size={16} />{t('添加 Grok 凭据', 'Add Grok credential')}</button>}
@@ -2333,8 +2338,8 @@ export function ProvidersView({
         open={bulkDeleteOpen}
         title={t('批量删除账号', 'Delete accounts in bulk')}
         message={t(
-          `将删除 ${selectedAccounts.length} 个账号：${selectedAccountSummary.names.join('、') || '—'}${selectedAccountSummary.remainingCount ? `，以及另外 ${selectedAccountSummary.remainingCount} 个账号` : ''}。${selectedAccountSummary.hiddenCount ? `其中 ${selectedAccountSummary.hiddenCount} 个在当前筛选下不可见。` : ''}账号会从所属号池移除；空号池或成员不足的聚合中转会被删除，引用它们的路由会停用。此操作无法撤销。`,
-          `Delete ${selectedAccounts.length} accounts: ${selectedAccountSummary.names.join(', ') || '—'}${selectedAccountSummary.remainingCount ? `, plus ${selectedAccountSummary.remainingCount} more` : ''}. ${selectedAccountSummary.hiddenCount ? `${selectedAccountSummary.hiddenCount} are hidden by the current filters. ` : ''}Accounts will be removed from their pools; empty pools or aggregate relays with too few members will be deleted, and routes using them will be disabled. This cannot be undone.`,
+          `将删除 ${selectedAccounts.length} 个账号：${selectedAccountSummary.names.join('、') || '—'}${selectedAccountSummary.remainingCount ? `，以及另外 ${selectedAccountSummary.remainingCount} 个账号` : ''}。${selectedAccountSummary.hiddenCount ? `其中 ${selectedAccountSummary.hiddenCount} 个在当前筛选下不可见。` : ''}账号会从所属号池移除；空号池会保留并停用引用它的路由，成员不足的聚合中转仍会删除。此操作无法撤销。`,
+          `Delete ${selectedAccounts.length} accounts: ${selectedAccountSummary.names.join(', ') || '—'}${selectedAccountSummary.remainingCount ? `, plus ${selectedAccountSummary.remainingCount} more` : ''}. ${selectedAccountSummary.hiddenCount ? `${selectedAccountSummary.hiddenCount} are hidden by the current filters. ` : ''}Accounts will be removed from their pools; empty pools are retained and routes using them are disabled, while aggregate relays with too few members are still deleted. This cannot be undone.`,
         )}
         busy={busyKeys.has('delete-accounts')}
         onCancel={() => setBulkDeleteOpen(false)}
@@ -2345,7 +2350,7 @@ export function ProvidersView({
         open={Boolean(deleteTarget)}
         title={deleteTarget?.kind === 'provider' ? t('删除来源', 'Delete source') : t('删除账号', 'Delete account')}
         message={deleteTarget?.kind === 'account'
-          ? t(`确定删除“${deleteTarget.name}”吗？该账号会自动从所属号池移除，此操作无法撤销。`, `Delete “${deleteTarget.name}”? It will be removed from its pools automatically. This cannot be undone.`)
+          ? t(`确定删除“${deleteTarget.name}”吗？该账号会自动从所属号池移除；号池即使变空也会保留。此操作无法撤销。`, `Delete “${deleteTarget.name}”? It will be removed from its pools, and a pool is retained even if it becomes empty. This cannot be undone.`)
           : t(`确定删除“${deleteTarget?.name ?? ''}”吗？此操作无法撤销。`, `Delete “${deleteTarget?.name ?? ''}”? This cannot be undone.`)}
         busy={busyKeys.has('delete-item')}
         onCancel={() => setDeleteTarget(null)}

@@ -362,17 +362,21 @@ describe('AppStore', () => {
     expect((await store.deleteProxy(proxyId)).proxies).toHaveLength(0)
   })
 
-  it('rejects insecure remote providers and non-loopback gateway hosts', async () => {
+  it('accepts remote HTTP providers while still rejecting non-loopback gateway hosts', async () => {
     const store = createStore()
     await store.initialize()
 
-    await expect(store.saveProvider({
+    const saved = await store.saveProvider({
       name: 'Remote HTTP',
       kind: 'openai-compatible',
       baseUrl: 'http://example.com/v1',
       protocol: 'openai-chat',
       models: []
-    })).rejects.toThrow(/HTTPS/)
+    })
+    expect(saved.providers).toContainEqual(expect.objectContaining({
+      name: 'Remote HTTP',
+      baseUrl: 'http://example.com/v1',
+    }))
 
     await expect(store.updateGateway({
       host: '0.0.0.0',
@@ -381,6 +385,24 @@ describe('AppStore', () => {
       logPayloads: false,
       requestTimeoutSeconds: 120
     })).rejects.toThrow(/loopback/)
+  })
+
+  it('normalizes a bare relay IP as HTTP', async () => {
+    const store = createStore()
+    await store.initialize()
+
+    const saved = await store.saveProvider({
+      name: 'Bare IP relay',
+      kind: 'openai-compatible',
+      baseUrl: '192.168.10.25:8080/v1',
+      protocol: 'openai-chat',
+      models: [],
+    })
+
+    expect(saved.providers).toContainEqual(expect.objectContaining({
+      name: 'Bare IP relay',
+      baseUrl: 'http://192.168.10.25:8080/v1',
+    }))
   })
 
   it('keeps system OAuth sources behind the import flow across legacy provider and account methods', async () => {
@@ -2698,7 +2720,7 @@ describe('AppStore', () => {
     })
   })
 
-  it('cascades account removal from pools while still blocking other referenced deletes', async () => {
+  it('keeps an emptied standard pool and its route binding when deleting the last account', async () => {
     const store = createStore()
     await store.initialize()
     const withAccount = await store.saveAccount({
@@ -2732,10 +2754,12 @@ describe('AppStore', () => {
     const afterAccountDelete = await store.deleteAccounts([accountId, secondAccountId])
     expect(afterAccountDelete.accounts.map((account) => account.id)).not.toContain(accountId)
     expect(afterAccountDelete.accounts.map((account) => account.id)).not.toContain(secondAccountId)
-    expect(afterAccountDelete.pools.some((pool) => pool.id === withPool.pools[0].id)).toBe(false)
+    expect(afterAccountDelete.pools.find((pool) => pool.id === withPool.pools[0].id)).toMatchObject({
+      members: [],
+    })
     expect(afterAccountDelete.routes.find((candidate) => candidate.id === route.id)).toMatchObject({
       enabled: false,
-      poolId: '',
+      poolId: withPool.pools[0].id,
     })
   })
 

@@ -114,8 +114,8 @@ html[data-theme='dark'] .page-stack.client-manager-page {
   border: 1px solid var(--border-accent);
   border-radius: 8px;
   background: var(--surface-raised);
-  box-shadow: 0 8px 26px rgb(23 67 52 / 14%);
-  color: var(--accent-strong);
+  box-shadow: 0 8px 26px rgb(var(--shadow-rgb) / 14%);
+  color: var(--accent-text-strong);
   font-size: 11px;
   animation: client-toast-in 160ms ease-out;
 }
@@ -257,7 +257,7 @@ html[data-theme='dark'] .page-stack.client-manager-page {
   display: flex;
   align-items: center;
   justify-content: center;
-  color: var(--accent);
+  color: var(--accent-text);
 }
 
 .client-easy-route__arrow span {
@@ -278,7 +278,7 @@ html[data-theme='dark'] .page-stack.client-manager-page {
 
 .client-easy-gateway code {
   overflow: hidden;
-  color: var(--accent-strong);
+  color: var(--accent-text-strong);
   font-size: 10px;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -362,7 +362,7 @@ html[data-theme='dark'] .page-stack.client-manager-page {
 .client-easy-status__item.is-ok {
   border-color: transparent;
   background: transparent;
-  color: var(--accent);
+  color: var(--accent-text);
 }
 
 .client-easy-status__item.is-warn {
@@ -456,7 +456,7 @@ html[data-theme='dark'] .page-stack.client-manager-page {
   border: 1px solid var(--border);
   border-radius: 9px;
   background: var(--surface);
-  box-shadow: 0 1px 2px rgb(25 45 38 / 3%);
+  box-shadow: 0 1px 2px rgb(var(--shadow-rgb) / 3%);
 }
 
 .client-advanced__toggle {
@@ -480,7 +480,7 @@ html[data-theme='dark'] .page-stack.client-manager-page {
   display: flex;
   align-items: center;
   gap: 9px;
-  color: var(--accent);
+  color: var(--accent-text);
 }
 
 .client-advanced__toggle > span > span { display: grid; gap: 1px; }
@@ -577,8 +577,8 @@ html[data-theme='dark'] .page-stack.client-manager-page {
 .client-manager-files > button.active {
   border-color: var(--border);
   background: var(--surface);
-  box-shadow: 0 1px 3px rgb(20 50 40 / 7%);
-  color: var(--accent-strong);
+  box-shadow: 0 1px 3px rgb(var(--shadow-rgb) / 7%);
+  color: var(--accent-text-strong);
 }
 
 .client-manager-files > button > span {
@@ -636,7 +636,7 @@ html[data-theme='dark'] .page-stack.client-manager-page {
 .client-manager-actions .button.is-active {
   border-color: var(--border-active);
   background: var(--accent-soft);
-  color: var(--accent-strong);
+  color: var(--accent-text-strong);
 }
 
 .client-manager-save-state {
@@ -690,7 +690,7 @@ html[data-theme='dark'] .page-stack.client-manager-page {
   display: flex;
   align-items: center;
   gap: 8px;
-  color: var(--accent);
+  color: var(--accent-text);
 }
 
 .client-manager-backups > header span {
@@ -785,7 +785,7 @@ html[data-theme='dark'] .page-stack.client-manager-page {
   min-width: 0;
   align-items: center;
   gap: 9px;
-  color: var(--accent);
+  color: var(--accent-text);
 }
 
 .client-settings-pane__header span,
@@ -868,8 +868,8 @@ html[data-theme='dark'] .page-stack.client-manager-page {
 
 .client-settings-scope button.active {
   background: var(--surface);
-  box-shadow: 0 1px 3px rgb(20 33 28 / 10%);
-  color: var(--accent-strong);
+  box-shadow: 0 1px 3px rgb(var(--shadow-rgb) / 10%);
+  color: var(--accent-text-strong);
   font-weight: 650;
 }
 
@@ -982,7 +982,7 @@ html[data-theme='dark'] .page-stack.client-manager-page {
 
 .client-setting-path:hover {
   background: var(--accent-soft);
-  color: var(--accent-strong);
+  color: var(--accent-text-strong);
 }
 
 .client-setting-path code {
@@ -1113,7 +1113,7 @@ html[data-theme='dark'] .page-stack.client-manager-page {
 .client-setting-options > span.active {
   border-color: transparent;
   background: transparent;
-  color: var(--accent-strong);
+  color: var(--accent-text-strong);
 }
 
 .client-setting-options > span.active--maximum {
@@ -1142,7 +1142,7 @@ html[data-theme='dark'] .page-stack.client-manager-page {
   grid-auto-flow: column;
   align-items: center;
   gap: 5px !important;
-  color: var(--accent-strong);
+  color: var(--accent-text-strong);
   font-size: 8px;
 }
 
@@ -1151,7 +1151,7 @@ html[data-theme='dark'] .page-stack.client-manager-page {
   height: 6px;
   border-radius: 999px;
   background: var(--accent);
-  box-shadow: 0 0 0 3px rgb(45 154 119 / 12%);
+  box-shadow: 0 0 0 3px rgb(var(--accent-rgb) / 12%);
 }
 
 .client-preview-toolbar {
@@ -1379,7 +1379,7 @@ html[data-theme='dark'] .page-stack.client-manager-page {
   border: 1px solid var(--border-active);
   border-radius: 6px;
   background: var(--accent-soft);
-  color: var(--accent-strong);
+  color: var(--accent-text-strong);
   font-size: 9px;
 }
 
@@ -1451,7 +1451,7 @@ html[data-theme='dark'] .page-stack.client-manager-page {
   border: 2px solid var(--surface);
   border-radius: 50%;
   background: var(--accent-soft);
-  color: var(--accent-strong);
+  color: var(--accent-text-strong);
 }
 
 .client-install__copy {
@@ -1502,7 +1502,7 @@ html[data-theme='dark'] .page-stack.client-manager-page {
 .client-install__status.is-installed {
   border-color: transparent;
   background: transparent;
-  color: var(--accent-strong);
+  color: var(--accent-text-strong);
 }
 
 .client-install__status.is-missing {
@@ -1562,7 +1562,7 @@ html[data-theme='dark'] .page-stack.client-manager-page {
 
 .client-install__progress {
   background: var(--surface-hover);
-  color: var(--accent-strong);
+  color: var(--accent-text-strong);
 }
 
 .client-install__error {
@@ -1915,7 +1915,7 @@ html[data-theme='dark'] .page-stack.client-manager-page {
 .managed-instance-brand { width:24px; height:24px; object-fit:contain; }
 .managed-instances__list article small { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .managed-instance-status { font-style:normal; font-size:12px; color:var(--text-muted); }
-.managed-instance-status.is-running { color:var(--success); }
+.managed-instance-status.is-running { color:var(--accent-text); }
 .managed-instance-status.is-failed { color:var(--danger); }
 .managed-instance-form { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
 .managed-instance-form label { display:flex; flex-direction:column; gap:6px; }

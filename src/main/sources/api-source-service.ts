@@ -5,6 +5,7 @@ import type {
   ProviderKind
 } from '@shared/types'
 import { buildModelCatalog, inferUpstreamCapabilities } from '@shared/source-capabilities'
+import { normalizeProviderHttpUrl } from '@shared/provider-url'
 import {
   AccountModelProbeError,
   getProviderAdapter,
@@ -77,8 +78,11 @@ export async function probeApiSource(
     return failedResult(stages, [], warnings, '缺少可用凭据。', now, startedAt, capabilityProfile)
   }
 
-  const baseUrlError = validateBaseUrl(input.baseUrl)
-  if (baseUrlError) {
+  let baseUrl: string
+  try {
+    baseUrl = normalizeProviderHttpUrl(input.baseUrl, kiroClaude)
+  } catch {
+    const baseUrlError = '请输入有效的 HTTP(S) Base URL；裸 IP 可省略 http://。'
     stages.push(errorStage('network', baseUrlError))
     appendSkippedStages(stages, ['authentication', 'models', 'generation'], '来源地址无效，未继续检测。')
     if (kiroClaude || anthropicRelayToolProbe) stages.push(skippedStage('tool-roundtrip', '来源地址无效，未检测两轮工具链。'))
@@ -123,7 +127,7 @@ export async function probeApiSource(
 
   if (input.protocol === 'kiro-claude') {
     return probeKiroClaudeSource({
-      input,
+      input: { ...input, baseUrl },
       credential,
       model: normalizeModel(input.model),
       adapter,
@@ -138,7 +142,7 @@ export async function probeApiSource(
   let healthFailure: ProviderFailure | undefined
   try {
     const health = await adapter.probeHealth({
-      baseUrl: input.baseUrl.trim(),
+      baseUrl,
       protocol: input.protocol,
       credential,
       fetchImplementation,
@@ -185,7 +189,7 @@ export async function probeApiSource(
   if (!healthFailure) {
     try {
       const discovery = await adapter.discoverModels({
-        baseUrl: input.baseUrl.trim(),
+        baseUrl,
         protocol: input.protocol,
         credential,
         fetchImplementation,
@@ -230,7 +234,7 @@ export async function probeApiSource(
   try {
     const generation = await (dependencies.probeModel ?? probeProviderModel)({
       adapter,
-      baseUrl: input.baseUrl.trim(),
+      baseUrl,
       protocol: input.protocol,
       credential,
       model,
@@ -248,7 +252,7 @@ export async function probeApiSource(
     }
     if (anthropicRelayToolProbe) {
       const roundtrip = await probeAnthropicMessagesToolRoundtrip({
-        baseUrl: input.baseUrl.trim(),
+        baseUrl,
         credential,
         model,
         adapter,
@@ -327,20 +331,6 @@ function isAnthropicRelayToolProbe(input: ApiSourceProbeInput): boolean {
   return input.sourceType === 'relay'
     && input.kind === 'anthropic-compatible'
     && input.protocol === 'anthropic-messages'
-}
-
-function validateBaseUrl(value: string): string | undefined {
-  try {
-    const url = new URL(value.trim())
-    if (url.protocol !== 'http:' && url.protocol !== 'https:') return 'Base URL 仅支持 HTTP 或 HTTPS。'
-    if (!url.hostname) return '请输入有效的 Base URL。'
-    const loopback = url.hostname === '127.0.0.1' || url.hostname === 'localhost' || url.hostname === '[::1]'
-    if (url.protocol === 'http:' && !loopback) return '非本地 Base URL 必须使用 HTTPS。'
-    if (url.username || url.password || url.search || url.hash) return 'Base URL 不能嵌入凭据、查询参数或片段。'
-    return undefined
-  } catch {
-    return '请输入有效的 Base URL。'
-  }
 }
 
 function normalizeModel(value: string | undefined): string | undefined {

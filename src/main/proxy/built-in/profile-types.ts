@@ -92,6 +92,7 @@ export interface InternalProxyRule {
   portRanges?: string[]
   networks?: Array<'tcp' | 'udp'>
   protocols?: string[]
+  /** Legacy encrypted-profile compatibility only; new imports never create these tags. */
   ruleSetTags?: Array<'geosite-cn' | 'geoip-cn'>
   action: InternalProxyRuleAction
 }

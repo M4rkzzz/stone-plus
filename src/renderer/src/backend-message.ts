@@ -94,7 +94,7 @@ const backendMessageEnglish = new Map<string, string>([
   ['最小真实生成请求未能完成。', 'The minimal real generation request could not be completed.'],
   ['Base URL 仅支持 HTTP 或 HTTPS。', 'The Base URL must use HTTP or HTTPS.'],
   ['请输入有效的 Base URL。', 'Enter a valid Base URL.'],
-  ['非本地 Base URL 必须使用 HTTPS。', 'A non-local Base URL must use HTTPS.'],
+  ['请输入有效的 HTTP(S) Base URL；裸 IP 可省略 http://。', 'Enter a valid HTTP(S) Base URL; a bare IP may omit http://.'],
   ['Base URL 不能嵌入凭据、查询参数或片段。', 'The Base URL cannot contain credentials, query parameters, or a fragment.'],
 
   // Application updater.

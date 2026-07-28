@@ -136,11 +136,16 @@ describe('provider adapter endpoints', () => {
       protocol: 'kiro-claude',
       operation: 'generate',
     })).toThrow(/query string or fragment/)
-    expect(() => kiroClaudeAdapter.buildEndpoint({
+    expect(kiroClaudeAdapter.buildEndpoint({
       baseUrl: 'http://kiro-relay.example.test/generateAssistantResponse',
       protocol: 'kiro-claude',
       operation: 'generate',
-    })).toThrow(/HTTPS unless it is local/)
+    })).toBe('http://kiro-relay.example.test/generateAssistantResponse')
+    expect(kiroClaudeAdapter.buildEndpoint({
+      baseUrl: '10.20.30.40:8080/generateAssistantResponse',
+      protocol: 'kiro-claude',
+      operation: 'generate',
+    })).toBe('http://10.20.30.40:8080/generateAssistantResponse')
   })
 
   it('rejects credentials embedded in provider URLs', () => {

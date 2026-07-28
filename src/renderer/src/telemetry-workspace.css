@@ -30,7 +30,7 @@
   place-items: center;
   border-radius: 9px;
   background: var(--accent-soft);
-  color: var(--accent);
+  color: var(--accent-text);
 }
 
 .telemetry-workspace__title > span:last-child {
@@ -76,7 +76,7 @@
 .telemetry-workspace__clear:hover:not(:disabled),
 .telemetry-workspace__empty button:hover:not(:disabled) {
   border-color: var(--accent);
-  color: var(--accent);
+  color: var(--accent-text);
 }
 
 .telemetry-workspace__unavailable {
@@ -153,7 +153,7 @@
 
 .telemetry-workspace__metric.is-upload .telemetry-workspace__metric-icon {
   background: var(--accent-soft);
-  color: var(--accent);
+  color: var(--accent-text);
 }
 
 .telemetry-workspace__metric > span:last-child {
@@ -336,7 +336,7 @@
   border: 1px solid var(--border-strong);
   border-radius: 7px;
   background: var(--surface);
-  color: var(--accent);
+  color: var(--accent-text);
   font-size: 9px;
   font-weight: 700;
 }
@@ -412,7 +412,7 @@
 }
 
 .telemetry-workspace__bytes > span:first-child svg { color: var(--blue); }
-.telemetry-workspace__bytes > span:last-child svg { color: var(--accent); }
+.telemetry-workspace__bytes > span:last-child svg { color: var(--accent-text); }
 
 .telemetry-workspace__age {
   color: var(--muted);

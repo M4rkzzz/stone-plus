@@ -17,9 +17,9 @@ export interface BuiltInProxyPolicySummaryInput {
 
 /** Credential-free description of the DNS configuration Stone+ actually generates. */
 export interface BuiltInProxyDnsPolicySummary {
-  owner: 'stone'
-  upstreams: 'one-to-four-validated-non-loopback-ips'
-  transport: 'udp-53'
+  owner: 'platform'
+  upstreams: 'system-resolver'
+  transport: 'platform'
   detour: 'direct'
   strategy: 'prefer-ipv4'
   importedDnsUsed: false
@@ -29,15 +29,14 @@ export interface BuiltInProxyDnsPolicySummary {
 export type BuiltInProxyEffectiveRulePolicy =
   | 'direct'
   | 'global'
-  | 'stone-custom'
   | 'safe-imported'
-  | 'stone-fallback'
+  | 'subscription-fallback'
 
 export interface BuiltInProxyRuleSourceSummary {
   policy: BuiltInProxyEffectiveRulePolicy
   importedRules: 'not-used' | 'safe-converted' | 'downgraded'
-  chinaRuleSets: 'not-used' | 'stone-managed' | 'stone-managed-if-referenced'
-  ruleSetDownload: 'not-used' | 'selected-node'
+  chinaRuleSets: 'not-used'
+  ruleSetDownload: 'not-used'
   importedRuleSetSourcesUsed: false
   importedProvidersExecuted: false
   importedLocalFilesUsed: false
@@ -51,9 +50,9 @@ export interface BuiltInProxyNetworkPolicySummary {
 }
 
 const DNS_POLICY = Object.freeze<BuiltInProxyDnsPolicySummary>({
-  owner: 'stone',
-  upstreams: 'one-to-four-validated-non-loopback-ips',
-  transport: 'udp-53',
+  owner: 'platform',
+  upstreams: 'system-resolver',
+  transport: 'platform',
   detour: 'direct',
   strategy: 'prefer-ipv4',
   importedDnsUsed: false,
@@ -77,7 +76,7 @@ export function summarizeBuiltInProxyNetworkPolicy(
 function summarizeRules(input: BuiltInProxyPolicySummaryInput): BuiltInProxyRuleSourceSummary {
   let policy: BuiltInProxyEffectiveRulePolicy
   let importedRules: BuiltInProxyRuleSourceSummary['importedRules']
-  let chinaRuleSets: BuiltInProxyRuleSourceSummary['chinaRuleSets'] = 'not-used'
+  const chinaRuleSets: BuiltInProxyRuleSourceSummary['chinaRuleSets'] = 'not-used'
 
   if (input.ruleMode === 'direct') {
     policy = 'direct'
@@ -85,33 +84,19 @@ function summarizeRules(input: BuiltInProxyPolicySummaryInput): BuiltInProxyRule
   } else if (input.ruleMode === 'global') {
     policy = 'global'
     importedRules = 'not-used'
-  } else if (input.customRules !== undefined) {
-    policy = 'stone-custom'
-    importedRules = 'not-used'
-    if (input.customRules.rules.some((rule) => rule.condition === 'mainland-china')) {
-      chinaRuleSets = 'stone-managed'
-    }
   } else if (input.profile?.ruleStatus === 'preserved') {
     policy = 'safe-imported'
     importedRules = 'safe-converted'
-    // The sing-box allow-list excludes rule_set references entirely. Clash
-    // GEOIP/GEOSITE CN rules are the only preserved import that can request
-    // Stone's fixed China rule sets, but the renderer-safe profile projection
-    // intentionally does not expose individual rule contents.
-    if (input.profile.format === 'clash-meta-yaml') {
-      chinaRuleSets = 'stone-managed-if-referenced'
-    }
   } else {
-    policy = 'stone-fallback'
+    policy = 'subscription-fallback'
     importedRules = input.profile ? 'downgraded' : 'not-used'
-    chinaRuleSets = 'stone-managed'
   }
 
   return {
     policy,
     importedRules,
     chinaRuleSets,
-    ruleSetDownload: chinaRuleSets === 'not-used' ? 'not-used' : 'selected-node',
+    ruleSetDownload: 'not-used',
     importedRuleSetSourcesUsed: false,
     importedProvidersExecuted: false,
     importedLocalFilesUsed: false,

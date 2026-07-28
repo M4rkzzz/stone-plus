@@ -355,6 +355,30 @@ describe('SingBoxService', () => {
     expect(harness.service.getState().generation).toBe(0)
   })
 
+  it('surfaces a sanitized fatal core line when startup exits before listeners are ready', async () => {
+    const directory = await temporaryDirectory()
+    const holder: { current?: ReturnType<typeof createHarness> } = {}
+    const harness = createHarness(directory, {
+      fetchImplementation: vi.fn(async () => { throw new Error('controller refused connection') }),
+      healthTimeoutMs: 10,
+      healthIntervalMs: 1,
+      sleep: vi.fn(async () => {
+        const child = holder.current!.children[0]
+        child.stderr.write('\u001b[31mFATAL initialize outbound: dial tcp: connection refused token=top-secret\u001b[0m\n')
+        child.finish(1, null)
+      }),
+    })
+    holder.current = harness
+
+    await expect(harness.service.start({ config: {}, mixedPort: 20_829, controllerPort: 20_830 }))
+      .rejects.toMatchObject({
+        code: 'health_check',
+        message: expect.stringContaining('FATAL initialize outbound: dial tcp: connection refused token=[REDACTED]'),
+      })
+    expect(JSON.stringify(harness.service.getState())).not.toContain('top-secret')
+    expect(JSON.stringify(harness.service.getState())).not.toContain('\u001b[')
+  })
+
   it('reports a mixed-listener failure separately after authenticating the controller', async () => {
     const directory = await temporaryDirectory()
     const harness = createHarness(directory, {

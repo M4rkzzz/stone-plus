@@ -1,6 +1,6 @@
 {
   "name": "stone-desktop",
-  "version": "0.9.10",
+  "version": "0.9.11",
   "private": true,
   "packageManager": "npm@10.9.3",
   "engines": {
@@ -272,7 +272,7 @@
         "en_US"
       ],
       "displayLanguageSelector": false,
-      "license": "LICENSE",
+      "license": "build/installer-license.txt",
       "include": "build/installer.nsh"
     },
     "portable": {

@@ -218,7 +218,7 @@ const profileFormatLabels: Record<BuiltInProxyProfileFormat, readonly [string, s
 }
 
 const ruleModeLabels: Record<BuiltInProxyRuleMode, readonly [string, string, string, string]> = {
-  rule: ['规则', 'Rule', '按配置规则、安全降级规则或已保存的自定义规则从上到下匹配。', 'Match the profile, safe fallback, or saved custom rules from top to bottom.'],
+  rule: ['规则', 'Rule', '按订阅规则从上到下匹配，并补齐 Stone+ 必需代理域名。', 'Match subscription rules from top to bottom and supplement required Stone+ proxy domains.'],
   global: ['全局', 'Global', '除必要的本地回环外，所有请求使用选中节点。', 'Use the selected node for all traffic except required local loopback traffic.'],
   direct: ['直连', 'Direct', '不通过节点转发，用于临时排查规则与节点问题。', 'Bypass the selected node temporarily to diagnose rules and node issues.'],
 }
@@ -1579,7 +1579,7 @@ function _NodePanel({ profile, nodes, groups, hasUngroupedNodes, groupFilter, co
       </table>
       {nodes.length === 0 && <div className="built-in-proxy-empty-row"><Unplug size={21} /><span>{t('此分组没有节点', 'No nodes in this group')}</span></div>}
     </div>
-    {(profile.warning || profile.ruleStatus === 'fallback') && <div className="built-in-proxy-rule-warning"><AlertTriangle size={16} /><span>{profile.warning ?? t('订阅规则无法安全转换，已使用“私网直连、中国大陆直连、其余走选中节点”的内置规则。', 'Subscription rules could not be converted safely. The built-in private/direct-mainland-China/selected-node fallback is active.')}</span></div>}
+    {(profile.warning || profile.ruleStatus === 'fallback') && <div className="built-in-proxy-rule-warning"><AlertTriangle size={16} /><span>{profile.warning ?? t('部分订阅规则无法安全转换；已保留支持的规则，其余流量走选中节点。', 'Unsupported subscription rules were skipped; supported rules remain and unmatched traffic uses the selected node.')}</span></div>}
     </>}
   </section>
 }
@@ -1658,6 +1658,10 @@ export function shouldSyncBuiltInProxyRuleDraft(
   return !dirty && serverSignature !== baselineSignature
 }
 
+function activeStandaloneRuleSet(_persisted?: BuiltInProxyCustomRuleSet): BuiltInProxyCustomRuleSet | undefined {
+  return undefined
+}
+
 export function ModePanel({ runtime, profile, disabled, pending, onMode, onCustomRules, t }: {
   runtime: BuiltInProxyRuntimeState
   profile?: BuiltInProxyProfileSummary
@@ -1667,7 +1671,9 @@ export function ModePanel({ runtime, profile, disabled, pending, onMode, onCusto
   onCustomRules: (rules: BuiltInProxyCustomRuleSet | null) => Promise<boolean>
   t: Translator
 }) {
-  const serverRules = runtime.settings.customRules
+  // Standalone Stone+ rule sets are retained only for persisted-schema
+  // compatibility. Rule mode now always follows the active subscription.
+  const serverRules = activeStandaloneRuleSet(runtime.settings.customRules)
   const serverSignature = JSON.stringify(serverRules ?? null)
   const [baselineSignature, setBaselineSignature] = useState(serverSignature)
   const [editorMode, setEditorMode] = useState<'profile' | 'custom'>(serverRules ? 'custom' : 'profile')
@@ -1717,10 +1723,6 @@ export function ModePanel({ runtime, profile, disabled, pending, onMode, onCusto
     }
     if (await onCustomRules(ruleSet)) setDirty(false)
   }
-  const chooseProfileRules = () => {
-    if (serverRules || dirty) setConfirmRestore(true)
-    else discardDraft()
-  }
   const restoreProfileRules = async () => {
     if (serverRules && !await onCustomRules(null)) return
     setBaselineSignature(JSON.stringify(null))
@@ -1743,22 +1745,14 @@ export function ModePanel({ runtime, profile, disabled, pending, onMode, onCusto
     </div>
     {runtime.settings.ruleMode === 'rule' && <div className="built-in-proxy-rule-editor">
       <div className="built-in-proxy-rule-source" role="group" aria-label={t('规则来源', 'Rule source')}>
-        <button type="button" className={editorMode === 'profile' ? 'active' : ''} aria-pressed={editorMode === 'profile'} disabled={disabled || pending} onClick={chooseProfileRules}>
+        <div className="active" aria-current="true">
           <strong>{t('使用配置规则', 'Use profile rules')}</strong>
-          <small>{profile?.ruleStatus === 'preserved' ? t('订阅规则已安全保留', 'Imported rules preserved') : t('使用安全内置规则', 'Use safe built-in rules')}</small>
-        </button>
-        <button type="button" className={editorMode === 'custom' ? 'active' : ''} aria-pressed={editorMode === 'custom'} disabled={disabled || pending} onClick={() => {
-          if (editorMode === 'custom') return
-          setEditorMode('custom')
-          setDirty(true)
-        }}>
-          <strong>{t('自定义规则', 'Custom rules')}</strong>
-          <small>{t(`${drafts.length} 条有序规则`, `${drafts.length} ordered rule(s)`)}</small>
-        </button>
+          <small>{profile?.ruleStatus === 'preserved' ? t('订阅规则已安全保留，并自动补齐 Stone+ 必需域名', 'Imported rules preserved with missing Stone+ service domains supplemented') : t('保留可转换规则，其余流量走选中节点', 'Supported rules remain; unmatched traffic uses the selected node')}</small>
+        </div>
       </div>
       {editorMode === 'profile' && <div className="built-in-proxy-mode__preserved"><ShieldCheck size={15} />{profile?.ruleStatus === 'preserved'
         ? t('请求将按当前配置中的规则从上到下匹配', 'Requests match the current profile rules from top to bottom')
-        : t('使用“私网直连、中国大陆直连、其余代理”的安全规则', 'Uses the safe private-direct, mainland-direct, otherwise-proxy policy')}</div>}
+        : t('没有可安全转换的订阅规则；其余流量走选中节点', 'No safely convertible subscription rules; unmatched traffic uses the selected node')}</div>}
       {editorMode === 'custom' && <>
         <div className="built-in-proxy-rule-editor__hint">{t('自定义规则是所有配置共用的全局设置；从上到下匹配，命中第一条后停止。切换到全局或直连模式不会删除已保存规则。', 'Custom rules are a global setting shared by every profile. They run top to bottom and stop after the first match. Switching to Global or Direct mode keeps them saved.')}</div>
         <div className="built-in-proxy-rule-list">

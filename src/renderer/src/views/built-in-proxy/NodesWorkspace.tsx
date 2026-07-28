@@ -268,7 +268,7 @@ export function NodesWorkspace({
           {(!activeProfile || selectedNodes.length === 0) && <div className="nodes-workspace__empty"><Unplug size={20} /><span>{activeProfile ? nodeQuery.trim() ? t('没有匹配的节点', 'No matching nodes') : t('此分组没有节点', 'No nodes in this group') : t('请先导入一份代理配置', 'Import a proxy profile first')}</span>{!activeProfile && <button type="button" className="button button--primary" disabled={disabled} onClick={onImportProfile}><Plus size={14} />{t('导入配置', 'Import profile')}</button>}</div>}
         </div>
 
-        {activeProfile && (activeProfile.warning || activeProfile.ruleStatus === 'fallback') && <div className="nodes-workspace__warning"><AlertTriangle size={16} /><span>{activeProfile.warning ?? t('配置规则无法安全转换，当前使用内置安全规则。', 'Profile rules could not be converted safely; the built-in safe rules are active.')}</span></div>}
+        {activeProfile && (activeProfile.warning || activeProfile.ruleStatus === 'fallback') && <div className="nodes-workspace__warning"><AlertTriangle size={16} /><span>{activeProfile.warning ?? t('部分配置规则无法安全转换；已保留支持的规则，其余流量走选中节点。', 'Unsupported profile rules were skipped; supported rules remain and unmatched traffic uses the selected node.')}</span></div>}
       </>}
     </section>}
   </div>

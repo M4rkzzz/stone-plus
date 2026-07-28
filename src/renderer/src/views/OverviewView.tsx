@@ -17,7 +17,6 @@ import type {
   AppSnapshot,
   HealthEvent,
   OpenAiTokenCostBreakdown,
-  RouteClient,
   TokenRatePoint,
   TokenRateSeries
 } from '@shared/types'
@@ -35,13 +34,7 @@ import {
 } from '../ui'
 import { translate, useI18n, type UiLanguage } from '../i18n'
 import { accountDisplayName, setupPoolDisplayName } from '../system-generated-text'
-
-const clientNames: Record<RouteClient, string> = {
-  claude: 'Claude Code',
-  codex: 'Codex',
-  gemini: 'Gemini CLI',
-  grokbuild: 'Grok Build',
-}
+import { clientBrandMeta } from '../brand-icons'
 
 type TokenRateRange = keyof TokenRateSeries
 
@@ -394,11 +387,12 @@ export function OverviewView({ snapshot, navigate }: { snapshot: AppSnapshot; na
           <div className="route-summary__list">
             {snapshot.routes.map((route) => {
               const source = resolveRouteSource(route.poolId, snapshot)
+              const brand = clientBrandMeta[route.client]
               return (
                 <div className="route-summary__row" key={route.id}>
-                  <div className={`client-glyph client-glyph--${route.client}`}>{route.client === 'grokbuild' ? 'X' : route.client.slice(0, 1).toUpperCase()}</div>
+                  <div className="client-glyph" aria-hidden="true"><img className={brand.iconClassName} src={brand.icon} alt="" /></div>
                   <div className="route-summary__name">
-                    <strong>{clientNames[route.client]}</strong>
+                    <strong>{brand.name}</strong>
                     <span>{source ? setupPoolDisplayName(source.summary.name, t) : t('未选择源', 'No source selected')}</span>
                   </div>
                   <Badge tone={route.enabled ? 'success' : 'neutral'}>{route.enabled ? t('已启用', 'Enabled') : t('已停用', 'Disabled')}</Badge>
@@ -495,7 +489,7 @@ export function OverviewView({ snapshot, navigate }: { snapshot: AppSnapshot; na
               <tbody>
                 {recentLogs.map((log) => (
                   <tr key={log.id}>
-                    <td><div className="cell-with-icon"><span className={`client-dot client-dot--${log.client}`} /><span>{clientNames[log.client]}</span></div></td>
+                    <td><div className="cell-with-icon"><span className={`client-dot client-dot--${log.client}`} /><span>{clientBrandMeta[log.client].name}</span></div></td>
                     <td><span className="mono table-model">{log.model}</span></td>
                     <td><div className="table-primary"><strong>{log.providerName}</strong><span>{accountDisplayName(log.accountName, t)}</span></div></td>
                     <td><RequestStatusBadge status={log.status} statusCode={log.statusCode} requestKind={log.requestKind} /></td>

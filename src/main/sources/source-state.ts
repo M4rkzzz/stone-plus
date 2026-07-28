@@ -8,6 +8,7 @@ import {
 } from '@shared/source-capabilities'
 import { providerSourceFamily, type ProviderSourceFamily } from '@shared/source-family'
 import { accountMatchesPoolProtocol } from '@shared/pool-protocol'
+import { normalizeProviderHttpUrl } from '@shared/provider-url'
 import { hasVerifiedKiroToolBridge, isNativeGrokRouteSource, resolveRouteSource } from '@shared/route-sources'
 import type {
   Account,
@@ -788,25 +789,11 @@ function trimPoolModelAllowlist(
 }
 
 function normalizeUrl(value: string): string {
-  return validatedSourceUrl(value).toString().replace(/\/$/, '')
+  return normalizeProviderHttpUrl(value)
 }
 
 function normalizeExactEndpoint(value: string): string {
-  return validatedSourceUrl(value).toString()
-}
-
-function validatedSourceUrl(value: string): URL {
-  const url = new URL(value.trim())
-  if (url.protocol !== 'https:' && url.protocol !== 'http:') {
-    throw new Error('Source URLs must use HTTP or HTTPS.')
-  }
-  const loopback = url.hostname === '127.0.0.1' || url.hostname === 'localhost' || url.hostname === '[::1]'
-  if (url.protocol === 'http:' && !loopback) {
-    throw new Error('Source URLs must use HTTPS unless they are local.')
-  }
-  if (url.username || url.password) throw new Error('Credentials cannot be embedded in the source URL.')
-  if (url.search || url.hash) throw new Error('Source base URLs cannot contain a query string or fragment.')
-  return url
+  return normalizeProviderHttpUrl(value, true)
 }
 
 function optionalProxyId(value: string | undefined, state: PersistedState): string | undefined {

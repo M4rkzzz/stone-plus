@@ -2,7 +2,7 @@ import { Children, Fragment, cloneElement, isValidElement, useEffect, useId, use
 import { createPortal } from 'react-dom'
 import { AlertCircle, Check, LoaderCircle, MoreHorizontal, X } from 'lucide-react'
 import type { AccountCircuitState, AccountImportProgress, AccountStatus, PoolProtocol, ProviderKind, RequestLog } from '@shared/types'
-import { providerBrandIcon } from './brand-icons'
+import { providerBrandIcon, providerBrandIconClass } from './brand-icons'
 import { useI18n } from './i18n'
 
 export const protocolLabels: Record<PoolProtocol, string> = {
@@ -40,7 +40,7 @@ export function ProviderAvatar({ kind, name, color = '#61736f', large = false, c
       style={{ '--provider-color': color } as CSSProperties}
       aria-hidden="true"
     >
-      {brandIcon ? <img src={brandIcon} alt="" /> : name?.slice(0, 1) ?? '?'}
+      {brandIcon ? <img className={kind ? providerBrandIconClass(kind) : undefined} src={brandIcon} alt="" /> : name?.slice(0, 1) ?? '?'}
     </span>
   )
 }

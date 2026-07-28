@@ -2,13 +2,13 @@ import { describe, expect, it } from 'vitest'
 import { summarizeBuiltInProxyNetworkPolicy } from '../../src/shared/built-in-proxy-policy'
 
 describe('built-in proxy network policy summary', () => {
-  it('describes the fixed main-process DNS policy without exposing upstream values', () => {
+  it('describes platform DNS without exposing upstream values', () => {
     const summary = summarizeBuiltInProxyNetworkPolicy({ ruleMode: 'global' })
 
     expect(summary.dns).toEqual({
-      owner: 'stone',
-      upstreams: 'one-to-four-validated-non-loopback-ips',
-      transport: 'udp-53',
+      owner: 'platform',
+      upstreams: 'system-resolver',
+      transport: 'platform',
       detour: 'direct',
       strategy: 'prefer-ipv4',
       importedDnsUsed: false,
@@ -22,15 +22,15 @@ describe('built-in proxy network policy summary', () => {
     })
   })
 
-  it('reports fallback and custom mainland rules as Stone-managed remote rule sets', () => {
+  it('never reports Stone-managed remote rules and ignores legacy custom settings', () => {
     expect(summarizeBuiltInProxyNetworkPolicy({
       ruleMode: 'rule',
       profile: { format: 'uri-list', ruleStatus: 'fallback' },
     }).rules).toMatchObject({
-      policy: 'stone-fallback',
+      policy: 'subscription-fallback',
       importedRules: 'downgraded',
-      chinaRuleSets: 'stone-managed',
-      ruleSetDownload: 'selected-node',
+      chinaRuleSets: 'not-used',
+      ruleSetDownload: 'not-used',
     })
 
     expect(summarizeBuiltInProxyNetworkPolicy({
@@ -40,14 +40,14 @@ describe('built-in proxy network policy summary', () => {
         finalAction: 'proxy',
       },
     }).rules).toMatchObject({
-      policy: 'stone-custom',
+      policy: 'subscription-fallback',
       importedRules: 'not-used',
-      chinaRuleSets: 'stone-managed',
-      ruleSetDownload: 'selected-node',
+      chinaRuleSets: 'not-used',
+      ruleSetDownload: 'not-used',
     })
   })
 
-  it('distinguishes safely converted inline sing-box rules from conditional Clash CN rules', () => {
+  it('describes safely converted inline rules without external rule-set downloads', () => {
     expect(summarizeBuiltInProxyNetworkPolicy({
       ruleMode: 'rule',
       profile: { format: 'sing-box-json', ruleStatus: 'preserved' },
@@ -62,8 +62,8 @@ describe('built-in proxy network policy summary', () => {
     }).rules).toMatchObject({
       policy: 'safe-imported',
       importedRules: 'safe-converted',
-      chinaRuleSets: 'stone-managed-if-referenced',
-      ruleSetDownload: 'selected-node',
+      chinaRuleSets: 'not-used',
+      ruleSetDownload: 'not-used',
     })
   })
 

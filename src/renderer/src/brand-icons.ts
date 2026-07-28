@@ -6,9 +6,15 @@ const openAiIcon = new URL('./assets/client-icons/openai.svg', import.meta.url).
 const geminiIcon = new URL('./assets/client-icons/gemini.svg', import.meta.url).href
 export const grokIcon = new URL('./assets/client-icons/grok.svg', import.meta.url).href
 
-export const clientBrandMeta: Record<RouteClient, { name: string; icon: string }> = {
+export interface ClientBrandMeta {
+  name: string
+  icon: string
+  iconClassName?: string
+}
+
+export const clientBrandMeta: Record<RouteClient, ClientBrandMeta> = {
   claude: { name: 'Claude Code', icon: claudeIcon },
-  codex: { name: 'Codex', icon: openAiIcon },
+  codex: { name: 'Codex', icon: openAiIcon, iconClassName: 'brand-icon--openai' },
   gemini: { name: 'Gemini CLI', icon: geminiIcon },
   grokbuild: { name: 'Grok Build', icon: grokIcon },
 }
@@ -19,4 +25,8 @@ export function providerBrandIcon(kind: ProviderKind): string | undefined {
   if (kind === 'google') return geminiIcon
   if (kind === 'xai' || kind === 'xai-compatible') return grokIcon
   return undefined
+}
+
+export function providerBrandIconClass(kind: ProviderKind): string | undefined {
+  return kind === 'openai' || kind === 'openai-compatible' ? 'brand-icon--openai' : undefined
 }
