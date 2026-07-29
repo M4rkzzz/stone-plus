@@ -34,7 +34,10 @@ import type {
   AppSnapshot,
   ChatGptAccountImportResult,
   ChatGptOAuthSessionStart,
+  ClientConfigStatus,
+  EnsureGatewayRunningResult,
   GatewayApi,
+  NetworkDiagnosticReport,
   ProviderKind,
   Protocol,
   RouteClient,
@@ -55,9 +58,11 @@ import {
   routeSourceUsesKiroClaude,
 } from '@shared/route-sources'
 import { Badge, ConfirmDialog, InfoTip, protocolLabels } from '../ui'
+import { clientBrandMeta } from '../brand-icons'
 import { ExclusiveAsyncOperation, SerializedAsyncOperation } from '../async-operation'
 import { BUILT_IN_PROXY_BINDING_NOTICE, useBuiltInProxyInterlock } from '../built-in-proxy-interlocks'
 import { useI18n } from '../i18n'
+import { useVisibilityAwareInterval } from '../visibility-interval'
 import {
   effectiveResponsesCompactMode,
   officialOpenAiUsesNativeCompact,
@@ -85,6 +90,14 @@ import {
   XAI_COMPATIBLE_KIND,
 } from '../grok-relay-ui'
 import { setupPoolDisplayName } from '../system-generated-text'
+import {
+  parseSetupSourceDraft,
+  serializeSetupSourceDraft,
+  setupWizardDraftStorageKey,
+  setupWizardPhaseForStep,
+  setupWizardPhases,
+  setupWizardStepLabel,
+} from '../setup-wizard-presentation'
 import '../setup-wizard.css'
 
 type SourceMode = 'existing' | 'oauth-import' | 'official-api' | 'relay' | 'aggregate'
@@ -94,20 +107,24 @@ type WizardProgressPatch = Omit<SetupWizardProgressInput, 'sessionId' | 'step'>
 
 type Translate = <T>(chinese: T, english: T) => T
 
-function wizardSteps(t: Translate): Array<{ id: SetupWizardStep; label: string }> {
-  return [
-    { id: 'scan', label: t('环境扫描', 'Environment scan') },
-    { id: 'source', label: t('选择来源', 'Choose source') },
-    { id: 'source-config', label: t('配置来源', 'Configure source') },
-    { id: 'network', label: t('网络出口', 'Network exit') },
-    { id: 'upstream-test', label: t('上游验证', 'Verify upstream') },
-    { id: 'client', label: t('选择客户端', 'Choose client') },
-    { id: 'routing', label: t('号池与路由', 'Pool and route') },
-    { id: 'gateway', label: t('启动网关', 'Start gateway') },
-    { id: 'verify', label: t('端到端验证', 'End-to-end test') },
-    { id: 'client-config', label: t('客户端配置', 'Configure client') },
-    { id: 'complete', label: t('完成', 'Complete') },
-  ]
+const wizardStepOrder: SetupWizardStep[] = [
+  'scan',
+  'source',
+  'source-config',
+  'network',
+  'upstream-test',
+  'client',
+  'routing',
+  'gateway',
+  'verify',
+  'client-config',
+  'complete',
+]
+
+interface SetupEnvironmentScan {
+  network: NetworkDiagnosticReport
+  clients: ClientConfigStatus[]
+  clientScanFailed: boolean
 }
 
 const clientLabels: Record<RouteClient, string> = {
@@ -147,11 +164,12 @@ export function SetupWizardView({
 }) {
   const { t } = useI18n()
   const builtInProxyInterlocked = useBuiltInProxyInterlock(snapshot, api)
-  const steps = useMemo(() => wizardSteps(t), [t])
+  const phases = useMemo(() => setupWizardPhases(t), [t])
   const [wizard, setWizard] = useState<SetupWizardState | null>(null)
   const [sourceMode, setSourceMode] = useState<SourceMode>('existing')
   const [selectedAccountId, setSelectedAccountId] = useState('')
   const [aggregatePoolId, setAggregatePoolId] = useState('')
+  const [aggregateMemberId, setAggregateMemberId] = useState('')
   const [sourceDraft, setSourceDraft] = useState<ApiSourceInput>(() => emptyApiSource('official-api'))
   const [accountAddMethod, setAccountAddMethod] = useState<AccountAddMethod>('oauth')
   const [accountName, setAccountName] = useState('')
@@ -166,7 +184,9 @@ export function SetupWizardView({
   const [client, setClient] = useState<RouteClient>('codex')
   const [clientProfileId, setClientProfileId] = useState('')
   const [routing, setRouting] = useState<SetupRoutingResult | null>(null)
+  const [connectedGateway, setConnectedGateway] = useState<EnsureGatewayRunningResult | null>(null)
   const [verification, setVerification] = useState<SetupRouteVerificationResult | null>(null)
+  const [environmentScan, setEnvironmentScan] = useState<SetupEnvironmentScan | null>(null)
   const [previewText, setPreviewText] = useState('')
   const [busy, setBusy] = useState('load')
   const [discardConfirmOpen, setDiscardConfirmOpen] = useState(false)
@@ -190,6 +210,7 @@ export function SetupWizardView({
   const modelRef = useRef(model)
   const actionOperationRef = useRef(new ExclusiveAsyncOperation())
   const progressOperationRef = useRef(new SerializedAsyncOperation())
+  const hydratedDraftSessionRef = useRef<string | null>(null)
   const busyRef = useRef('load')
   sourceDraftRef.current = sourceDraft
   proxyIdRef.current = proxyId
@@ -222,13 +243,32 @@ export function SetupWizardView({
       const provider = providerById.get(account?.providerId ?? '')
       return provider !== undefined && providerSourceFamily(provider.kind) === 'openai'
     }))
-  const aggregatePools = snapshot.pools.filter((pool) => pool.kind === 'relay-aggregate'
+  const aggregatePools = useMemo(() => snapshot.pools.filter((pool) => pool.kind === 'relay-aggregate'
     && pool.members.some((member) => member.enabled
       && setupEligibleAccounts.some((account) => account.id === member.accountId))
     && (!routeSourceUsesKiroClaude(resolveRouteSource(pool.id, snapshot), snapshot)
-      || isKiroClaudeRouteSource(resolveRouteSource(pool.id, snapshot), snapshot)))
+      || isKiroClaudeRouteSource(resolveRouteSource(pool.id, snapshot), snapshot))), [setupEligibleAccounts, snapshot])
+  const selectedAggregate = useMemo(
+    () => aggregatePools.find((pool) => pool.id === aggregatePoolId),
+    [aggregatePoolId, aggregatePools],
+  )
+  const aggregateCandidates = useMemo(() => selectedAggregate?.members.flatMap((member) => {
+    if (!member.enabled) return []
+    const account = setupEligibleAccounts.find((candidate) => candidate.id === member.accountId)
+    return account ? [{ member, account, provider: providerById.get(account.providerId) }] : []
+  }) ?? [], [providerById, selectedAggregate, setupEligibleAccounts])
+  const effectivePoolId = routing?.poolId ?? poolId ?? wizard?.poolId
+  const effectivePool = routing?.snapshot.pools.find((pool) => pool.id === effectivePoolId)
+    ?? snapshot.pools.find((pool) => pool.id === effectivePoolId)
+  const connectedGatewayHost = connectedGateway?.host ?? snapshot.gatewayStatus.host
+  const connectedGatewayPort = connectedGateway?.port ?? snapshot.gatewayStatus.port
+  const selectedSourceName = selectedProvider?.name ?? selectedAccount?.name ?? (selectedAccountId || t('已配置来源', 'Configured source'))
   const currentStep = wizard?.step ?? 'scan'
-  const currentIndex = Math.max(0, steps.findIndex((step) => step.id === currentStep))
+  const currentIndex = Math.max(0, wizardStepOrder.indexOf(currentStep))
+  const currentPhaseId = setupWizardPhaseForStep(currentStep)
+  const currentPhaseIndex = Math.max(0, phases.findIndex((phase) => phase.id === currentPhaseId))
+  const previousStepIndexRef = useRef(currentIndex)
+  const stepMotionDirection = currentIndex < previousStepIndexRef.current ? 'backward' : 'forward'
   const oauthActive = oauthStage === 'starting' || oauthStage === 'waiting' || oauthStage === 'submitting' || oauthStage === 'exchanging' || oauthStage === 'cancelling'
   const importConfigurationLocked = oauthActive || Boolean(busy)
   const oauthExpiresInSeconds = oauthSession ? Math.max(0, Math.ceil((oauthSession.expiresAt - oauthNow) / 1_000)) : 0
@@ -242,6 +282,10 @@ export function SetupWizardView({
     return [...values]
   }, [probe, selectedAccount, selectedProvider, sourceDraft])
   const currentProbe = probe && setupSourceProbeMatches(probeBinding, sourceDraft, proxyId, model) ? probe : null
+
+  useEffect(() => {
+    previousStepIndexRef.current = currentIndex
+  }, [currentIndex])
 
   useEffect(() => {
     let cancelled = false
@@ -262,6 +306,14 @@ export function SetupWizardView({
           setSourceMode(restoredMode)
           setAccountAddMethod(next.sourceMethod === 'token-json' ? 'token-json' : 'oauth')
           if (next.sourceMethod === 'aggregate' && next.poolId) setAggregatePoolId(next.poolId)
+          const cachedDraft = readSetupSourceDraftCache(next.sessionId)
+          if (cachedDraft && (restoredMode === 'official-api' || restoredMode === 'relay')) {
+            setSourceDraft(cachedDraft)
+            sourceDraftRef.current = cachedDraft
+            setProxyId(next.proxyId ?? cachedDraft.proxyId ?? '')
+            setModel(next.model ?? cachedDraft.defaultModel ?? '')
+          }
+          hydratedDraftSessionRef.current = next.sessionId
         }
       })
       .catch((cause) => setError(messageOf(cause, t)))
@@ -272,12 +324,13 @@ export function SetupWizardView({
     return () => { cancelled = true }
   }, [api, t])
 
-  useEffect(() => {
-    if (!oauthSession || !oauthActive) return
-    setOauthNow(Date.now())
-    const timer = window.setInterval(() => setOauthNow(Date.now()), 1_000)
-    return () => window.clearInterval(timer)
-  }, [oauthActive, oauthSession])
+  useVisibilityAwareInterval(
+    () => setOauthNow(Date.now()),
+    1_000,
+    Boolean(oauthSession) && oauthActive,
+    true,
+    oauthSession?.sessionId,
+  )
 
   useEffect(() => () => {
     oauthAttemptRef.current += 1
@@ -289,6 +342,27 @@ export function SetupWizardView({
   useEffect(() => {
     if (!model && modelOptions.length) setModel(modelOptions[0])
   }, [model, modelOptions])
+
+  useEffect(() => {
+    const sessionId = wizard?.sessionId
+    if (!sessionId || hydratedDraftSessionRef.current !== sessionId) return
+    if (sourceMode !== 'official-api' && sourceMode !== 'relay') return
+    writeSetupSourceDraftCache(sessionId, {
+      ...sourceDraft,
+      proxyId: proxyId || sourceDraft.proxyId,
+      defaultModel: model || sourceDraft.defaultModel,
+    })
+  }, [model, proxyId, sourceDraft, sourceMode, wizard?.sessionId])
+
+  useEffect(() => {
+    if (!aggregateCandidates.length) {
+      if (aggregateMemberId) setAggregateMemberId('')
+      return
+    }
+    if (!aggregateCandidates.some(({ account }) => account.id === aggregateMemberId)) {
+      setAggregateMemberId(aggregateCandidates[0].account.id)
+    }
+  }, [aggregateCandidates, aggregateMemberId])
 
   useEffect(() => {
     const profiles = snapshot.clientProfiles.filter((profile) => profile.client === client)
@@ -338,10 +412,16 @@ export function SetupWizardView({
     })
   }
 
+  const moveWithNotice = async (step: SetupWizardStep, patch: WizardProgressPatch, message: string) => {
+    const next = await move(step, patch)
+    if (next) setNotice(message)
+    return next
+  }
+
   const back = async () => {
     if (currentIndex <= 0) return
     if (oauthSessionIdRef.current && !await cancelWizardOAuth()) return
-    await move(steps[currentIndex - 1].id)
+    await move(wizardStepOrder[currentIndex - 1])
   }
 
   const exitWizard = async () => {
@@ -350,12 +430,20 @@ export function SetupWizardView({
   }
 
   const scan = async () => {
-    const report = await run('scan', () => api.runNetworkDiagnostics(proxyId ? { proxyId } : {}))
-    if (!report) return
-    setNotice(report.summary === 'error'
+    const result = await run('scan', async (): Promise<SetupEnvironmentScan> => {
+      const [network, clientResult] = await Promise.all([
+        api.runNetworkDiagnostics(proxyId ? { proxyId } : {}),
+        api.getClientConfigs().then((clients) => ({ clients, failed: false })).catch(() => ({ clients: [], failed: true })),
+      ])
+      return { network, clients: clientResult.clients, clientScanFailed: clientResult.failed }
+    })
+    if (!result) return
+    setEnvironmentScan(result)
+    setNotice(result.network.summary === 'error'
       ? t('基础网络存在异常，仍可继续并在网络步骤选择代理。', 'Basic network checks found a problem. You can continue and choose a proxy in the network step.')
-      : t('环境扫描完成，可以开始选择来源。', 'Environment scan complete. You can now choose a source.'))
-    await move('source')
+      : result.clientScanFailed
+        ? t('网络检查完成；客户端配置检测未完成，但不影响继续。', 'Network checks completed. Client configuration detection did not finish, but you can continue.')
+        : t('环境检查完成，可以开始添加来源。', 'Environment checks completed. You can now add a source.'))
   }
 
   const chooseMode = (mode: SourceMode) => {
@@ -398,18 +486,17 @@ export function SetupWizardView({
   const selectAggregate = async () => {
     const pool = snapshot.pools.find((candidate) => candidate.id === aggregatePoolId && candidate.kind === 'relay-aggregate')
     if (!pool) return setError(t('请选择一个聚合中转。', 'Choose an aggregate relay.'))
-    const first = pool.members.find((member) => member.enabled
-      && setupEligibleAccounts.some((account) => account.id === member.accountId))
-    if (!first) return setError(t('聚合中转没有启用成员。', 'The aggregate relay has no enabled members.'))
-    setSelectedAccountId(first.accountId)
+    const selectedCandidate = aggregateCandidates.find(({ account }) => account.id === aggregateMemberId)
+    if (!selectedCandidate) return setError(t('请选择一个可用于验证的聚合成员。', 'Choose an aggregate member to verify.'))
+    setSelectedAccountId(selectedCandidate.account.id)
     setPoolId(pool.id)
     const nextProxyId = pool.proxyId ?? ''
     setProxyId(nextProxyId)
-    const account = setupEligibleAccounts.find((candidate) => candidate.id === first.accountId)
-    const provider = account ? providerById.get(account.providerId) : undefined
+    const account = selectedCandidate.account
+    const provider = selectedCandidate.provider
     const nextModel = pool.modelAllowlist[0] || account?.availableModels[0] || provider?.models[0] || ''
     setModel(nextModel)
-    await move('network', { sourceMethod: 'aggregate', sourceId: first.accountId, poolId: pool.id, sourceType: 'relay', proxyId: nextProxyId || null, model: nextModel || undefined })
+    await move('network', { sourceMethod: 'aggregate', sourceId: account.id, poolId: pool.id, sourceType: 'relay', proxyId: nextProxyId || null, model: nextModel || undefined })
   }
 
   const clearOAuthUi = () => {
@@ -490,11 +577,11 @@ export function SetupWizardView({
       : t('未标记', 'Untagged')
     const poolAppendError = assignment.poolAppendError ? localizedGatewayMessage(assignment.poolAppendError, t) : ''
     const warnings = result.warnings.map((warning) => localizedGatewayMessage(warning, t))
-    setNotice(t(
+    const completionNotice = t(
       `OAuth 添加完成：新增 ${result.createdAccountIds.length} 个，更新 ${result.updatedAccountIds.length} 个，检测可用 ${detected} 个；Tag：${selectedTag}${assignment.poolMembersAdded ? `；加入号池 ${assignment.poolMembersAdded} 个` : ''}${assignment.poolAppendError ? `；号池追加失败：${assignment.poolAppendError}` : ''}${result.warnings.length ? `；${result.warnings.join(' ')}` : ''}`,
       `OAuth import complete: ${result.createdAccountIds.length} created, ${result.updatedAccountIds.length} updated, ${detected} passed checks; tag: ${selectedTag}${assignment.poolMembersAdded ? `; ${assignment.poolMembersAdded} added to the pool` : ''}${poolAppendError ? `; could not add to pool: ${poolAppendError}` : ''}${warnings.length ? `; ${warnings.join(' ')}` : ''}`,
-    ))
-    await move('network', {
+    )
+    await moveWithNotice('network', {
       sourceMethod: 'oauth',
       sourceType: 'oauth-system',
       sourceId: accountId,
@@ -502,7 +589,7 @@ export function SetupWizardView({
       poolId: assignment.poolId,
       proxyId: proxyId || null,
       model: nextModel || undefined,
-    })
+    }, completionNotice)
   }
 
   const waitForChatGptOAuth = async (session: ChatGptOAuthSessionStart, attempt: number) => {
@@ -656,11 +743,11 @@ export function SetupWizardView({
     const poolAppendError = result.assignmentSummary.poolAppendError
       ? localizedGatewayMessage(result.assignmentSummary.poolAppendError, t)
       : ''
-    setNotice(t(
+    const completionNotice = t(
       `已导入 ${result.importedAccountIds.length} 个账号，检测成功 ${result.detectionResults.filter((item) => item.ok).length} 个，Tag 更新 ${result.assignmentSummary.tagUpdatedAccountCount} 个，加入号池 ${result.assignmentSummary.poolMembersAdded} 个。${result.assignmentSummary.poolAppendError ? ` 号池追加失败：${result.assignmentSummary.poolAppendError}` : ''}`,
       `Imported ${result.importedAccountIds.length} account(s); ${result.detectionResults.filter((item) => item.ok).length} passed checks, ${result.assignmentSummary.tagUpdatedAccountCount} tag assignment(s) updated, and ${result.assignmentSummary.poolMembersAdded} added to the pool.${poolAppendError ? ` Could not add to pool: ${poolAppendError}` : ''}`,
-    ))
-    await move('network', { sourceMethod: 'token-json', sourceId: accountId, sourceType: 'oauth-system', tagId, poolId, proxyId: proxyId || null })
+    )
+    await moveWithNotice('network', { sourceMethod: 'token-json', sourceId: accountId, sourceType: 'oauth-system', tagId, poolId, proxyId: proxyId || null }, completionNotice)
   }
 
   const createImportTag = async () => {
@@ -751,26 +838,82 @@ export function SetupWizardView({
     if (!account) return setError(t('来源已保存，但未找到对应凭据账号。', 'The source was saved, but its credential account could not be found.'))
     setOauthImportedSnapshot(result)
     setSelectedAccountId(account.id)
-    await move('network', { sourceId: account.id, sourceType: sourceDraft.sourceType, proxyId: account.proxyId })
+    if (wizard?.sessionId) clearSetupSourceDraftCache(wizard.sessionId)
+    const nextClient = provider?.protocol === 'kiro-claude' ? 'claude' : client
+    setClient(nextClient)
+    const completionNotice = t(
+      '来源已经通过真实请求验证，已跳过重复的网络与上游测试。',
+      'The source already passed a real request, so duplicate network and upstream tests were skipped.',
+    )
+    await moveWithNotice('client', {
+      sourceId: account.id,
+      sourceType: sourceDraft.sourceType,
+      proxyId: account.proxyId,
+      model: model || sourceDraft.defaultModel,
+      client: nextClient,
+    }, completionNotice)
   }
 
   const checkNetwork = async () => {
-    const report = await run('network', () => api.runNetworkDiagnostics(proxyId ? { proxyId } : {}))
-    if (!report) return
-    if (report.summary === 'error') return setError(report.diagnoses[0]
-      ? t(report.diagnoses[0], containsCjk(report.diagnoses[0]) ? 'Network diagnostics reported an error for this exit.' : report.diagnoses[0])
-      : t('当前网络出口不可用。', 'The selected network exit is unavailable.'))
     if (!selectedAccount) return setError(t('来源账号不存在。', 'The source account does not exist.'))
     const aggregate = aggregatePoolId
       ? snapshot.pools.find((pool) => pool.id === aggregatePoolId && pool.kind === 'relay-aggregate')
       : undefined
-    const updated = await run('network', () => persistSetupWizardSourceProxy(api, selectedAccount, proxyId, aggregate))
-    if (updated === undefined) return
-    if (updated) setOauthImportedSnapshot(updated)
-    setNotice(report.summary === 'warning'
-      ? t('网络部分项目有警告，可继续验证来源。', 'Some network checks returned warnings. You can continue to verify the source.')
-      : t('网络出口可用。', 'The network exit is available.'))
-    await move('upstream-test', { proxyId: proxyId || undefined })
+    const outcome = await run('network', async () => {
+      const report = await api.runNetworkDiagnostics(proxyId ? { proxyId } : {})
+      if (report.summary === 'error') {
+        throw new Error(report.diagnoses[0]
+          ? t(report.diagnoses[0], containsCjk(report.diagnoses[0]) ? 'Network diagnostics reported an error for this exit.' : report.diagnoses[0])
+          : t('当前网络出口不可用。', 'The selected network exit is unavailable.'))
+      }
+      const updated = await persistSetupWizardSourceProxy(api, selectedAccount, proxyId, aggregate)
+      if (selectedProvider && (selectedProvider.protocol === 'kiro-claude' || aggregate)) {
+        const checkedModel = model || selectedAccount.availableModels[0] || selectedProvider.models[0] || ''
+        if (!checkedModel) throw new Error(selectedProvider.protocol === 'kiro-claude'
+          ? t('Kiro Claude 必须手动填写测试模型。', 'Enter a test model for Kiro Claude.')
+          : t('聚合成员没有可用于真实测试的模型。', 'The aggregate member has no model available for a real test.'))
+        const checked = await api.probeApiSource({
+          id: selectedProvider.id,
+          name: selectedProvider.name,
+          sourceType: selectedProvider.sourceType === 'oauth-system' ? 'relay' : selectedProvider.sourceType,
+          kind: selectedProvider.kind,
+          baseUrl: selectedProvider.baseUrl,
+          protocol: selectedProvider.protocol,
+          model: checkedModel,
+          proxyId: proxyId || selectedAccount.proxyId,
+          persistCapabilities: true,
+        })
+        return {
+          report,
+          updated,
+          checked: { ok: checked.ok, responsePreview: checked.error },
+          checkedModel: checked.testedModel ?? checkedModel,
+        }
+      }
+      await api.checkAccount(selectedAccount.id)
+      let checkedModel = model
+      if (!checkedModel) {
+        const refreshed = await api.refreshAccountModels(selectedAccount.id)
+        const refreshedAccount = refreshed.accounts.find((candidate) => candidate.id === selectedAccount.id)
+        const refreshedProvider = refreshedAccount
+          ? refreshed.providers.find((candidate) => candidate.id === refreshedAccount.providerId)
+          : undefined
+        checkedModel = refreshedAccount?.availableModels[0] ?? refreshedProvider?.models[0] ?? ''
+      }
+      if (!checkedModel) throw new Error(t('没有可用于真实测试的模型。', 'No model is available for a real test.'))
+      const checked = await api.testAccountModel(selectedAccount.id, checkedModel)
+      return { report, updated, checked, checkedModel }
+    })
+    if (!outcome) return
+    if (outcome.updated) setOauthImportedSnapshot(outcome.updated)
+    if (!outcome.checked.ok) return setError(outcome.checked.responsePreview
+      ? t(outcome.checked.responsePreview, containsCjk(outcome.checked.responsePreview) ? 'The real upstream request failed. Check the source details.' : outcome.checked.responsePreview)
+      : t('来源真实请求未通过。', 'The real source request failed.'))
+    setModel(outcome.checkedModel)
+    const completionNotice = outcome.report.summary === 'warning'
+      ? t('网络存在非阻塞警告，但来源真实请求已经通过。', 'The network has a non-blocking warning, but the real source request passed.')
+      : t('网络与来源真实请求均已通过。', 'Both the network and the real source request passed.')
+    await moveWithNotice('client', { proxyId: proxyId || undefined, model: outcome.checkedModel }, completionNotice)
   }
 
   const verifyExistingSource = async () => {
@@ -795,8 +938,7 @@ export function SetupWizardView({
         ? localizedProbeMessage('tool-roundtrip', 'error', checked.error, t)
         : t('Kiro Claude 两轮工具链测试未通过。', 'The Kiro Claude two-round tool test failed.'))
       setClient('claude')
-      setNotice(t(`Kiro Claude 两轮工具链测试通过，耗时 ${checked.latencyMs ?? 0} ms。`, `The Kiro Claude two-round tool test passed in ${checked.latencyMs ?? 0} ms.`))
-      await move('client', { sourceId: selectedAccountId, model: checked.testedModel ?? model, client: 'claude' })
+      await moveWithNotice('client', { sourceId: selectedAccountId, model: checked.testedModel ?? model, client: 'claude' }, t(`Kiro Claude 两轮工具链测试通过，耗时 ${checked.latencyMs ?? 0} ms。`, `The Kiro Claude two-round tool test passed in ${checked.latencyMs ?? 0} ms.`))
       return
     }
     const checked = await run('upstream', async () => {
@@ -815,35 +957,71 @@ export function SetupWizardView({
     if (!checked.ok) return setError(checked.responsePreview
       ? t(checked.responsePreview, containsCjk(checked.responsePreview) ? 'The real upstream request failed. Check the source details.' : checked.responsePreview)
       : t('上游真实请求未通过。', 'The real upstream request failed.'))
-    setNotice(t(`上游验证成功，耗时 ${checked.latencyMs} ms。`, `Upstream verification succeeded in ${checked.latencyMs} ms.`))
-    await move('client', { sourceId: selectedAccountId, model: checked.model })
+    await moveWithNotice('client', { sourceId: selectedAccountId, model: checked.model }, t(`上游验证成功，耗时 ${checked.latencyMs} ms。`, `Upstream verification succeeded in ${checked.latencyMs} ms.`))
   }
 
   const createRouting = async () => {
     if (!wizard?.sessionId || !selectedAccountId || !model) return setError(t('缺少来源、模型或向导会话。', 'The source, model, or wizard session is missing.'))
     if (client === 'grokbuild' && !selectedSourceIsGrok) return setError(t('Grok Build 仅可连接原生 Responses 的 Grok 号池或中转站。', 'Grok Build can connect only to Responses-native Grok pools or relays.'))
     if (selectedSourceIsKiroClaude && client !== 'claude') return setError(t('Kiro Claude 中转只能绑定 Claude Code 客户端。', 'Kiro Claude relays can be bound only to Claude Code clients.'))
-    const result = await run('routing', () => api.applySetupRouting({
-      sessionId: wizard.sessionId,
-      sourceId: selectedAccountId,
+    const sessionId = wizard.sessionId
+    const result = await run('connect', async () => {
+      const routingResult = await api.applySetupRouting({
+        sessionId,
+        sourceId: selectedAccountId,
+        client,
+        model,
+        aggregatePoolId: aggregatePoolId || (snapshot.pools.find((pool) => pool.id === poolId)?.kind === 'relay-aggregate' ? poolId ?? undefined : undefined),
+      })
+      const gatewayResult = await api.ensureGatewayRunning({
+        host: routingResult.snapshot.gateway.host,
+        port: routingResult.snapshot.gateway.port,
+      })
+      const verificationResult = await api.verifySetupRoute({
+        sessionId,
+        routeId: routingResult.routeId,
+        client,
+        model,
+      })
+      const nextWizard = await api.getSetupWizardState()
+      return { routingResult, gatewayResult, verificationResult, nextWizard }
+    })
+    if (!result) {
+      const resumable = await api.getSetupWizardState().catch(() => null)
+      if (resumable?.sessionId === sessionId) setWizard(resumable)
+      return
+    }
+    setRouting(result.routingResult)
+    setConnectedGateway(result.gatewayResult)
+    setPoolId(result.routingResult.poolId)
+    setVerification(result.verificationResult)
+    if (result.nextWizard) setWizard(result.nextWizard)
+    else if (result.verificationResult.ok) setWizard((current) => current ? {
+      ...current,
+      step: 'client-config',
+      poolId: result.routingResult.poolId,
+      routeId: result.routingResult.routeId,
       client,
       model,
-      aggregatePoolId: aggregatePoolId || (snapshot.pools.find((pool) => pool.id === poolId)?.kind === 'relay-aggregate' ? poolId ?? undefined : undefined),
-    }))
-    if (!result) return
-    setRouting(result)
-    setPoolId(result.poolId)
-    await move('gateway', { poolId: result.poolId, routeId: result.routeId, client, model })
+    } : current)
+    if (!result.verificationResult.ok) return setError(result.verificationResult.error
+      ? t(result.verificationResult.error, containsCjk(result.verificationResult.error) ? 'The end-to-end request failed. Check the route and upstream source.' : result.verificationResult.error)
+      : t('端到端请求失败。', 'The end-to-end request failed.'))
+    setNotice(t(
+      `连接已建立并通过真实请求验证，耗时 ${result.verificationResult.latencyMs} ms${result.gatewayResult.changedPort ? '；网关已自动切换到可用端口' : ''}。`,
+      `The connection passed a real request in ${result.verificationResult.latencyMs} ms${result.gatewayResult.changedPort ? '; the gateway automatically selected an available port' : ''}.`,
+    ))
   }
 
   const startGateway = async () => {
     const result = await run('gateway', () => api.ensureGatewayRunning({ host: snapshot.gateway.host, port: snapshot.gateway.port }))
     if (!result) return
-    setNotice(t(
+    setConnectedGateway(result)
+    const completionNotice = t(
       `网关已监听 http://${result.host}:${result.port}${result.changedPort ? '（原端口被占用，已改用可用端口）' : ''}`,
       `Gateway is listening at http://${result.host}:${result.port}${result.changedPort ? ' (the requested port was busy, so an available port was used)' : ''}`,
-    ))
-    await move('verify')
+    )
+    await moveWithNotice('verify', {}, completionNotice)
   }
 
   const verifyRoute = async () => {
@@ -856,8 +1034,7 @@ export function SetupWizardView({
     if (!result.ok) return setError(result.error
       ? t(result.error, containsCjk(result.error) ? 'The end-to-end request failed. Check the route and upstream source.' : result.error)
       : t('端到端请求失败。', 'The end-to-end request failed.'))
-    setNotice(t(`本地端到端请求成功，耗时 ${result.latencyMs} ms。`, `The local end-to-end request succeeded in ${result.latencyMs} ms.`))
-    await move('client-config')
+    await moveWithNotice('client-config', {}, t(`本地端到端请求成功，耗时 ${result.latencyMs} ms。`, `The local end-to-end request succeeded in ${result.latencyMs} ms.`))
   }
 
   const previewClient = async () => {
@@ -871,37 +1048,45 @@ export function SetupWizardView({
   const applyClient = async () => {
     const result = await run('apply-client', () => api.applyClientConfig(client, clientProfileId || undefined))
     if (!result) return
-    setNotice(result.changedFiles.length
+    const completionNotice = result.changedFiles.length
       ? t(`已更新 ${result.changedFiles.length} 个客户端配置文件并创建备份。`, `Updated ${result.changedFiles.length} client configuration file(s) and created backups.`)
-      : t('客户端配置已经正确。', 'The client configuration is already correct.'))
-    await finish()
+      : t('客户端配置已经正确，无需改动。', 'The client configuration is already correct; no changes were needed.')
+    await finish(completionNotice)
   }
 
-  const finish = async () => {
+  const finish = async (completionNotice?: string) => {
     if (!wizard?.sessionId || (wizard.step !== 'client-config' && !verification?.ok)) return setError(t('必须先完成端到端验证。', 'Complete the end-to-end test first.'))
     const completed = await run('finish', () => confirmSetupWizardAction(() => api.completeSetupWizard(wizard.sessionId)))
     if (!completed) return
+    clearSetupSourceDraftCache(wizard.sessionId)
     setWizard((current) => current ? { ...current, step: 'complete', completed: true } : current)
+    setNotice(completionNotice ?? t('连接已经验证完成；客户端配置保持不变。', 'The connection is verified. Client configuration was left unchanged.'))
   }
 
   const discard = async () => {
     if (oauthSessionIdRef.current && !await cancelWizardOAuth()) return
     const discarded = await run('discard', () => confirmSetupWizardAction(() => api.discardSetupWizard()))
     if (!discarded) return
+    if (wizard?.sessionId) clearSetupSourceDraftCache(wizard.sessionId)
     setDiscardConfirmOpen(false)
     onExit()
   }
 
   const configureAnotherSource = async () => {
+    const previousSessionId = wizard?.sessionId
     const next = await run('restart', async () => {
       await api.discardSetupWizard()
       return api.saveSetupWizardProgress({ step: 'source' })
     })
     if (!next) return
+    if (previousSessionId) clearSetupSourceDraftCache(previousSessionId)
+    hydratedDraftSessionRef.current = next.sessionId
     setWizard(next)
     setSourceMode('existing')
     setSelectedAccountId('')
     setAggregatePoolId('')
+    setAggregateMemberId('')
+    setSourceDraft(emptyApiSource('official-api'))
     setTagId(null)
     setPoolId(null)
     setProxyId('')
@@ -910,6 +1095,7 @@ export function SetupWizardView({
     setModel('')
     setClientProfileId('')
     setRouting(null)
+    setConnectedGateway(null)
     setVerification(null)
     setPreviewText('')
     setOauthImportedSnapshot(null)
@@ -918,33 +1104,38 @@ export function SetupWizardView({
   return (
     <div className="setup-wizard page-stack">
       <header className="setup-wizard__header">
-        <div><span className="eyebrow">STONE+ QUICK START</span><h1>{t('配置向导', 'Setup wizard')}</h1><p>{t('逐步完成来源、号池、路由和真实请求验证。', 'Set up a source, pool, route, and a verified real request step by step.')}</p></div>
-        <button className="button button--secondary" type="button" disabled={oauthCommitLocked || Boolean(busy)} onClick={() => void exitWizard()}>{oauthCommitLocked ? t('正在保存账号…', 'Saving account…') : t('暂时退出', 'Exit for now')}</button>
+        <div><span className="eyebrow">STONE+ QUICK START</span><h1>{t('配置向导', 'Setup wizard')}</h1><p>{t('五个阶段完成来源接入、客户端连接和真实请求验证。', 'Connect a source and client, then verify a real request in five stages.')}</p></div>
+        <div className="setup-wizard__exit"><small>{t('非敏感表单会自动保存；Key 和导入内容不会落盘。', 'Non-sensitive fields are saved automatically. Keys and import payloads are never cached.')}</small><button className="button button--secondary" type="button" disabled={oauthCommitLocked || Boolean(busy)} onClick={() => void exitWizard()}>{oauthCommitLocked ? t('正在保存账号…', 'Saving account…') : t('暂时退出', 'Exit for now')}</button></div>
       </header>
 
       <div className="setup-wizard__layout">
         <aside className="setup-wizard__steps" aria-label={t('配置步骤', 'Setup steps')}>
-          {steps.map((item, index) => <div className={`${index === currentIndex ? 'active' : ''} ${index < currentIndex ? 'done' : ''}`} key={item.id}>
-            <span>{index < currentIndex ? <CheckCircle2 size={15} /> : index + 1}</span><strong>{item.label}</strong>
+          {phases.map((item, index) => <div className={`${index === currentPhaseIndex ? 'active' : ''} ${index < currentPhaseIndex ? 'done' : ''}`} key={item.id}>
+            <span>{index < currentPhaseIndex ? <CheckCircle2 size={15} /> : index + 1}</span><strong>{item.label}</strong>
           </div>)}
         </aside>
 
         <main className="setup-wizard__content">
+          <div className="setup-wizard__phase-context" data-phase-index={currentPhaseIndex} key={`${currentPhaseId}-${currentStep}`} aria-live="polite"><span>{t(`阶段 ${currentPhaseIndex + 1} / ${phases.length}`, `Stage ${currentPhaseIndex + 1} / ${phases.length}`)}</span><strong>{setupWizardStepLabel(currentStep, t)}</strong></div>
+          <div className={`setup-wizard__stage setup-wizard__stage--${stepMotionDirection}`} key={currentStep}>
           {error && <div className="setup-message setup-message--error"><CircleAlert size={17} /><span>{error}</span></div>}
           {notice && <div className="setup-message setup-message--success"><CheckCircle2 size={17} /><span>{notice}</span></div>}
 
-          {currentStep === 'scan' && <WizardSection icon={<Gauge />} title={t('先检查当前环境', 'Check your environment first')} description={t('扫描本地配置、网络出口和已有资源，不会修改任何文件。', 'Scan local configuration, network exits, and existing resources without changing any files.')}>
-            <ScanSummary snapshot={snapshot} />
-            <PrimaryAction busy={busy === 'scan'} disabled={Boolean(busy)} onClick={() => void scan()} label={t('开始扫描', 'Start scan')} icon={<RefreshCw size={16} />} />
+          {currentStep === 'scan' && <WizardSection icon={<Gauge />} title={t('先检查当前环境', 'Check your environment first')} description={t('真实检查网络出口、四类客户端配置和现有 Stone+ 资源，不会修改任何文件。', 'Check the network exit, all four client configurations, and existing Stone+ resources without changing files.')}>
+            <ScanSummary snapshot={snapshot} scan={environmentScan} />
+            {environmentScan && <ScanDetails scan={environmentScan} />}
+            {!environmentScan
+              ? <PrimaryAction busy={busy === 'scan'} disabled={Boolean(busy)} onClick={() => void scan()} label={t('开始检查', 'Start checks')} icon={<RefreshCw size={16} />} />
+              : <div className="setup-actions"><button className="button button--secondary" type="button" disabled={Boolean(busy)} onClick={() => void scan()}>{busy === 'scan' ? <LoaderCircle size={16} className="spin" /> : <RefreshCw size={16} />}{t('重新检查', 'Run again')}</button><PrimaryAction busy={false} disabled={Boolean(busy)} onClick={() => void move('source')} label={t('下一步：添加来源', 'Next: add a source')} /></div>}
           </WizardSection>}
 
           {currentStep === 'source' && <WizardSection icon={<Waypoints />} title={t('你准备使用什么来源？', 'What kind of source will you use?')} description={t('可以导入订阅账号、添加 API，也可以复用已有配置。', 'Import a subscription account, add an API, or reuse an existing configuration.')}>
             <div className="setup-choice-grid">
-              <Choice icon={<ShieldCheck />} title="Codex OAuth / Sub2API CPA" description={t('浏览器 OAuth 授权，或使用 Token / JSON 兼容导入', 'Authorize with OAuth in your browser, or import a compatible Token / JSON file')} onClick={() => chooseMode('oauth-import')} disabled={Boolean(busy)} />
-              <Choice icon={<Cloud />} title={t('官方 API', 'Official API')} description={t('OpenAI、Anthropic 或 Google Gemini', 'OpenAI, Anthropic, or Google Gemini')} onClick={() => chooseMode('official-api')} disabled={Boolean(busy)} />
-              <Choice icon={<Server />} title={t('中转站', 'Relay')} description={t('配置兼容 Base URL 与单把 Key', 'Configure a compatible Base URL and one API key')} onClick={() => chooseMode('relay')} disabled={Boolean(busy)} />
-              <Choice icon={<KeyRound />} title={t('已有来源', 'Existing source')} description={t(`${setupEligibleAccounts.length} 个可绑定凭据`, `${setupEligibleAccounts.length} bindable credential(s)`)} onClick={() => chooseMode('existing')} disabled={Boolean(busy) || !setupEligibleAccounts.length} />
-              <Choice icon={<Network />} title={t('已有聚合中转', 'Existing aggregate relay')} description={t(`${aggregatePools.length} 个聚合配置`, `${aggregatePools.length} aggregate configuration(s)`)} onClick={() => chooseMode('aggregate')} disabled={Boolean(busy) || !aggregatePools.length} />
+              <Choice icon={<ShieldCheck />} title={t('ChatGPT / Codex 账号', 'ChatGPT / Codex account')} description={t('推荐使用浏览器登录，也支持 Sub2API / CPA JSON 或 Token 导入', 'Browser sign-in is recommended; Sub2API / CPA JSON and token imports are also supported')} onClick={() => chooseMode('oauth-import')} disabled={Boolean(busy)} />
+              <Choice icon={<Cloud />} title={t('官方 API', 'Official API')} description={t('OpenAI、xAI、Anthropic 或 Google Gemini', 'OpenAI, xAI, Anthropic, or Google Gemini')} onClick={() => chooseMode('official-api')} disabled={Boolean(busy)} />
+              <Choice icon={<Server />} title={t('API 中转站', 'API relay')} description={t('填写中转地址、兼容协议和一把 Key', 'Enter the relay address, compatible protocol, and one API key')} onClick={() => chooseMode('relay')} disabled={Boolean(busy)} />
+              <Choice icon={<KeyRound />} title={t('使用已添加来源', 'Use an existing source')} description={t(`已有 ${setupEligibleAccounts.length} 个可用来源`, `${setupEligibleAccounts.length} source(s) are ready`)} onClick={() => chooseMode('existing')} disabled={Boolean(busy) || !setupEligibleAccounts.length} />
+              <Choice icon={<Network />} title={t('使用聚合中转', 'Use an aggregate relay')} description={t(`已有 ${aggregatePools.length} 个可用聚合`, `${aggregatePools.length} aggregate relay(s) are ready`)} onClick={() => chooseMode('aggregate')} disabled={Boolean(busy) || !aggregatePools.length} />
             </div>
           </WizardSection>}
 
@@ -957,11 +1148,12 @@ export function SetupWizardView({
           </WizardSection>}
 
           {currentStep === 'source-config' && sourceMode === 'aggregate' && <WizardSection icon={<Network />} title={t('选择聚合中转', 'Choose an aggregate relay')} description={t('路由将直接复用聚合中转的成员和策略。', 'The route will reuse the aggregate relay members and scheduling policy.')}>
-            <select className="setup-select" value={aggregatePoolId} disabled={Boolean(busy)} onChange={(event) => { setAggregatePoolId(event.target.value); setModel('') }}>
-              <option value="">{t('选择聚合中转', 'Choose an aggregate relay')}</option>
-              {aggregatePools.map((pool) => <option value={pool.id} key={pool.id}>{setupPoolDisplayName(pool.name, t)} · {protocolLabels[pool.protocol]} · {t(`${pool.members.length} 个成员`, `${pool.members.length} member(s)`)}</option>)}
-            </select>
-            <PrimaryAction disabled={Boolean(busy) || !aggregatePoolId} busy={false} onClick={() => void selectAggregate()} label={t('使用此聚合', 'Use this aggregate')} />
+            <div className="setup-form-grid">
+              <label className="full"><span>{t('聚合中转', 'Aggregate relay')}</span><select value={aggregatePoolId} disabled={Boolean(busy)} onChange={(event) => { setAggregatePoolId(event.target.value); setAggregateMemberId(''); setModel('') }}><option value="">{t('选择聚合中转', 'Choose an aggregate relay')}</option>{aggregatePools.map((pool) => <option value={pool.id} key={pool.id}>{setupPoolDisplayName(pool.name, t)} · {protocolLabels[pool.protocol]} · {t(`${pool.members.length} 个成员`, `${pool.members.length} member(s)`)}</option>)}</select></label>
+              {selectedAggregate && <label className="full"><span>{t('先用哪个成员做来源验证', 'Member used for the source check')}</span><select value={aggregateMemberId} disabled={Boolean(busy)} onChange={(event) => { setAggregateMemberId(event.target.value); setModel('') }}><option value="">{t('选择验证成员', 'Choose a member')}</option>{aggregateCandidates.map(({ account, provider }) => <option value={account.id} key={account.id}>{account.name} · {provider?.name ?? t('未知来源', 'Unknown source')} · {t('可用', 'Ready')}</option>)}</select><small>{t(`当前 ${aggregateCandidates.length} 个启用成员可验证。这里只决定先检查谁；最终端到端测试仍会经过聚合调度。`, `${aggregateCandidates.length} enabled member(s) can be checked. This only chooses the initial source check; the final end-to-end test still uses aggregate scheduling.`)}</small></label>}
+            </div>
+            {selectedAggregate && <SummaryRows rows={[[t('调度策略', 'Scheduling'), selectedAggregate.strategy], [t('启用且可用', 'Enabled and ready'), String(aggregateCandidates.length)], [t('成员总数', 'Total members'), String(selectedAggregate.members.length)]]} />}
+            <PrimaryAction disabled={Boolean(busy) || !aggregatePoolId || !aggregateMemberId} busy={false} onClick={() => void selectAggregate()} label={t('使用此聚合', 'Use this aggregate')} />
           </WizardSection>}
 
           {currentStep === 'source-config' && sourceMode === 'oauth-import' && <WizardSection icon={<ShieldCheck />} title={t('添加 Codex 账号', 'Add a Codex account')} description={t('先完成 OAuth 授权或选择 JSON 文件；账号归类与网络设置可在下方按需展开。', 'Authorize with OAuth or select a JSON file. Expand the optional section to organize the account or choose its network exit.')}>
@@ -1027,9 +1219,10 @@ export function SetupWizardView({
             <div className="setup-actions"><button className="button button--secondary" type="button" disabled={Boolean(busy)} onClick={() => void probeDraft()}>{busy === 'probe' ? <LoaderCircle size={16} className="spin" /> : <ShieldCheck size={16} />}{sourceDraft.kind === KIRO_COMPATIBLE_KIND ? t('测试 Kiro 工具链', 'Test Kiro tool chain') : t('测试连接', 'Test connection')}</button><PrimaryAction disabled={Boolean(busy) || !currentProbe?.ok} busy={busy === 'save-source'} onClick={() => void saveDraft()} label={t('保存并继续', 'Save and continue')} /></div>
           </WizardSection>}
 
-          {currentStep === 'network' && <WizardSection icon={<Router />} title={t('检查网络出口', 'Check the network exit')} description={t('使用来源配置的实际出口运行网络诊断。', 'Run network diagnostics through the actual exit configured for this source.')}>
+          {currentStep === 'network' && <WizardSection icon={<Router />} title={t('验证这个来源', 'Verify this source')} description={t('一次完成网络出口、账号状态、模型发现和最小真实请求。', 'Check the network exit, account status, model discovery, and a minimal real request in one action.')}>
             <label className="setup-field"><span>{t('代理', 'Proxy')}</span><select value={proxyId} disabled={builtInProxyInterlocked || Boolean(busy)} onChange={(event) => setProxyId(event.target.value)}><option value="">{t('直连 / 跟随全局网络设置', 'Direct / use global network setting')}</option>{snapshot.proxies.map((proxy) => <option value={proxy.id} key={proxy.id}>{proxy.name} · {proxy.protocol.toUpperCase()}</option>)}</select>{builtInProxyInterlocked && <small>{t(BUILT_IN_PROXY_BINDING_NOTICE.zh, BUILT_IN_PROXY_BINDING_NOTICE.en)}</small>}</label>
-            <PrimaryAction busy={busy === 'network'} disabled={Boolean(busy)} onClick={() => void checkNetwork()} label={t('检测此出口', 'Test this exit')} icon={<Network size={16} />} />
+            <ModelChoice value={model} options={modelOptions} disabled={Boolean(busy)} onChange={setModel} />
+            <PrimaryAction busy={busy === 'network'} disabled={Boolean(busy)} onClick={() => void checkNetwork()} label={t('验证来源并继续', 'Verify source and continue')} icon={<ShieldCheck size={16} />} />
           </WizardSection>}
 
           {currentStep === 'upstream-test' && <WizardSection icon={<ShieldCheck />} title={t('验证账号与模型', 'Verify the account and model')} description={t('这一步会发送一次极小的真实模型请求。', 'This step sends one very small real model request.')}>
@@ -1038,19 +1231,23 @@ export function SetupWizardView({
           </WizardSection>}
 
           {currentStep === 'client' && <WizardSection icon={<Settings2 />} title={t('选择主客户端', 'Choose your primary client')} description={t('向导一次配置一个客户端，完成后可以继续配置其他客户端。', 'The wizard configures one client at a time. You can add more after this setup.')}>
-            <div className="setup-choice-grid setup-choice-grid--clients">{(['codex', 'claude', 'gemini', 'grokbuild'] as RouteClient[]).map((item) => <Choice key={item} title={clientLabels[item]} description={item === 'codex' ? t('推荐用于 OAuth / Responses 来源', 'Recommended for OAuth / Responses sources') : item === 'grokbuild' ? t('仅连接原生 Responses 的 Grok 号池或中转站', 'Connects only to Responses-native Grok pools or relays') : t(`通过 Stone+ 协议转换接入 ${clientLabels[item]}`, `Connect ${clientLabels[item]} through Stone+ protocol conversion`)} selected={client === item} onClick={() => setClient(item)} disabled={Boolean(busy) || (item === 'grokbuild' && !selectedSourceIsGrok) || (selectedSourceIsKiroClaude && item !== 'claude')} />)}</div>
+            <div className="setup-choice-grid setup-choice-grid--clients">{(['codex', 'claude', 'gemini', 'grokbuild'] as RouteClient[]).map((item) => {
+              const brand = clientBrandMeta[item]
+              return <Choice key={item} icon={<img className={brand.iconClassName} src={brand.icon} alt="" />} title={clientLabels[item]} description={item === 'codex' ? t('推荐用于 OAuth / Responses 来源', 'Recommended for OAuth / Responses sources') : item === 'grokbuild' ? t('仅连接原生 Responses 的 Grok 号池或中转站', 'Connects only to Responses-native Grok pools or relays') : t(`通过 Stone+ 协议转换接入 ${clientLabels[item]}`, `Connect ${clientLabels[item]} through Stone+ protocol conversion`)} selected={client === item} onClick={() => setClient(item)} disabled={Boolean(busy) || (item === 'grokbuild' && !selectedSourceIsGrok) || (selectedSourceIsKiroClaude && item !== 'claude')} />
+            })}</div>
             {!selectedSourceIsGrok && <small>{t('当前来源不是 Grok 原生 Responses 来源，因此不能选择 Grok Build。', 'The current source is not a Responses-native Grok source, so Grok Build is unavailable.')}</small>}
             {selectedSourceIsKiroClaude && <small>{t('Kiro Claude 使用 Anthropic Messages 入站并直转 AWS Event Stream，仅支持 Claude Code CLI、Desktop 与 VSC。', 'Kiro Claude accepts Anthropic Messages and translates directly to AWS Event Stream. It is available only to Claude Code CLI, Desktop, and VSC.')}</small>}
-            <PrimaryAction busy={false} disabled={Boolean(busy) || (client === 'grokbuild' && !selectedSourceIsGrok) || (selectedSourceIsKiroClaude && client !== 'claude')} onClick={() => void move('routing', { client, model })} label={t('继续配置路由', 'Continue to routing')} />
+            <PrimaryAction busy={false} disabled={Boolean(busy) || (client === 'grokbuild' && !selectedSourceIsGrok) || (selectedSourceIsKiroClaude && client !== 'claude')} onClick={() => void move('routing', { client, model })} label={t('下一步：确认连接', 'Next: confirm connection')} />
           </WizardSection>}
 
-          {currentStep === 'routing' && <WizardSection icon={<Waypoints />} title={t('创建号池与路由', 'Create the pool and route')} description={t('Stone+ 会原子创建或复用号池，并启用对应客户端路由。', 'Stone+ atomically creates or reuses a pool and enables the matching client route.')}>
-            <SummaryRows rows={[[t('来源', 'Source'), selectedAccount?.name ?? selectedAccountId], [t('客户端', 'Client'), clientLabels[client]], [t('模型', 'Model'), model || t('未选择', 'Not selected')], [t('目标号池', 'Target pool'), snapshot.pools.find((pool) => pool.id === (aggregatePoolId || poolId))?.name ?? t('自动创建或复用', 'Create or reuse automatically')]]} />
-            <PrimaryAction busy={busy === 'routing'} disabled={Boolean(busy)} onClick={() => void createRouting()} label={t('应用号池与路由', 'Apply pool and route')} />
+          {currentStep === 'routing' && <WizardSection icon={<Waypoints />} title={t('建立连接并自动验证', 'Connect and verify automatically')} description={t('确认后 Stone+ 会连续完成号池与路由、网关启动和端到端真实请求。', 'Stone+ will create the pool and route, start the gateway, and run a real end-to-end request in one sequence.')}>
+            <SummaryRows rows={[[t('来源', 'Source'), selectedSourceName], [t('客户端', 'Client'), clientLabels[client]], [t('模型', 'Model'), model || t('未选择', 'Not selected')], [t('目标号池', 'Target pool'), snapshot.pools.find((pool) => pool.id === (aggregatePoolId || poolId))?.name ?? t('自动创建或复用', 'Create or reuse automatically')]]} />
+            <div className="setup-auto-flow"><span><CheckCircle2 size={16} />{t('原子创建或复用号池与客户端路由', 'Atomically create or reuse the pool and client route')}</span><span><CheckCircle2 size={16} />{t('启动本地网关；端口冲突时自动选择可用端口', 'Start the local gateway and select an available port if needed')}</span><span><CheckCircle2 size={16} />{t('通过本地鉴权、调度和协议转换发送真实请求', 'Send a real request through local authentication, scheduling, and protocol conversion')}</span></div>
+            <PrimaryAction busy={busy === 'connect'} disabled={Boolean(busy)} onClick={() => void createRouting()} label={t('一键连接并验证', 'Connect and verify')} />
           </WizardSection>}
 
           {currentStep === 'gateway' && <WizardSection icon={<Server />} title={t('启动本地网关', 'Start the local gateway')} description={t('默认监听 127.0.0.1:15721；端口冲突时会选择相邻可用端口。', 'The default is 127.0.0.1:15721. If that port is busy, Stone+ chooses a nearby available port.')}>
-            <SummaryRows rows={[[t('监听地址', 'Listen address'), `${snapshot.gateway.host}:${snapshot.gateway.port}`], [t('当前状态', 'Current status'), snapshot.gatewayStatus.running ? t('运行中', 'Running') : t('已停止', 'Stopped')], [t('号池', 'Pool'), routing?.poolId ?? poolId ?? t('已配置', 'Configured')]]} />
+            <SummaryRows rows={[[t('监听地址', 'Listen address'), `${snapshot.gateway.host}:${snapshot.gateway.port}`], [t('当前状态', 'Current status'), snapshot.gatewayStatus.running ? t('运行中', 'Running') : t('已停止', 'Stopped')], [t('号池', 'Pool'), effectivePool ? setupPoolDisplayName(effectivePool.name, t) : t('已配置', 'Configured')]]} />
             <PrimaryAction busy={busy === 'gateway'} disabled={Boolean(busy)} onClick={() => void startGateway()} label={t('确保网关运行', 'Ensure gateway is running')} />
           </WizardSection>}
 
@@ -1061,25 +1258,27 @@ export function SetupWizardView({
           </WizardSection>}
 
           {currentStep === 'client-config' && <WizardSection icon={<Settings2 />} title={t('连接客户端（可选）', 'Connect the client (optional)')} description={t('可以先预览并备份配置，也可以跳过后手动处理。', 'Preview and back up the configuration now, or skip this step and configure it manually later.')}>
+            <SummaryRows rows={[[t('已验证来源', 'Verified source'), selectedSourceName], [t('号池', 'Pool'), effectivePool ? setupPoolDisplayName(effectivePool.name, t) : t('已配置', 'Configured')], [t('本地网关', 'Local gateway'), `http://${connectedGatewayHost}:${connectedGatewayPort}`], [t('真实请求', 'Real request'), verification ? t(`已通过 · ${verification.latencyMs} ms`, `Passed · ${verification.latencyMs} ms`) : t('已通过', 'Passed')]]} />
             {snapshot.clientProfiles.some((profile) => profile.client === client) && <label className="setup-field"><span>{t('配置目录', 'Configuration directory')}</span><select value={clientProfileId} disabled={Boolean(busy)} onChange={(event) => { setClientProfileId(event.target.value); setPreviewText(''); void move('client-config', { profileId: event.target.value || null }) }}>{snapshot.clientProfiles.filter((profile) => profile.client === client).map((profile) => <option value={profile.id} key={profile.id}>{profile.name} · {profile.directory || t('默认目录', 'Default directory')}</option>)}</select><small>{t('向导只会写入所选目录的 Stone+ 受管连接字段；托管实例和高级字段请在客户端页配置。', 'The wizard writes only Stone+-managed connection fields in the selected directory. Configure managed instances and advanced fields on the Clients page.')}</small></label>}
             {previewText && <pre className="setup-preview">{previewText}</pre>}
             <div className="setup-actions"><button className="button button--secondary" type="button" disabled={Boolean(busy)} onClick={() => void previewClient()}>{t('预览配置', 'Preview configuration')}</button><button className="button button--secondary" type="button" disabled={Boolean(busy)} onClick={() => void finish()}>{t('暂时跳过', 'Skip for now')}</button><PrimaryAction busy={busy === 'apply-client'} disabled={Boolean(busy)} onClick={() => void applyClient()} label={t('应用并备份', 'Apply and back up')} /></div>
           </WizardSection>}
 
           {currentStep === 'complete' && <WizardSection icon={<CheckCircle2 />} title={t('配置已经跑通', 'Setup is working')} description={t('Stone+ 已完成一次从本地网关到上游模型的真实请求。', 'Stone+ completed a real request from the local gateway to the upstream model.')}>
-            <SummaryRows rows={[[t('客户端', 'Client'), clientLabels[client]], [t('模型', 'Model'), model], [t('号池', 'Pool'), poolId ?? routing?.poolId ?? '—'], [t('本地网关', 'Local gateway'), `http://${snapshot.gatewayStatus.host}:${snapshot.gatewayStatus.port}`], [t('测试耗时', 'Test duration'), verification ? `${verification.latencyMs} ms` : '—']]} />
+            <SummaryRows rows={[[t('来源', 'Source'), selectedSourceName], [t('客户端', 'Client'), clientLabels[client]], [t('模型', 'Model'), model], [t('号池', 'Pool'), effectivePool ? setupPoolDisplayName(effectivePool.name, t) : t('已配置', 'Configured')], [t('本地网关', 'Local gateway'), `http://${connectedGatewayHost}:${connectedGatewayPort}`], [t('测试耗时', 'Test duration'), verification ? `${verification.latencyMs} ms` : t('已验证', 'Verified')]]} />
             <div className="setup-actions"><button className="button button--secondary" type="button" disabled={Boolean(busy)} onClick={() => void configureAnotherSource()}>{busy === 'restart' ? <LoaderCircle size={16} className="spin" /> : null}{t('继续配置另一个来源', 'Configure another source')}</button><button className="button button--primary" type="button" disabled={Boolean(busy)} onClick={() => void exitWizard()}>{t('返回总览', 'Return to overview')}</button></div>
           </WizardSection>}
+          </div>
 
-          {currentStep !== 'complete' && <footer className="setup-wizard__footer"><button className="text-button" type="button" disabled={currentIndex === 0 || Boolean(busy) || oauthCommitLocked} onClick={() => void back()}><ArrowLeft size={15} />{t('上一步', 'Previous')}</button><button className="text-button danger" type="button" disabled={Boolean(busy) || oauthCommitLocked} onClick={() => setDiscardConfirmOpen(true)}>{t('放弃本次向导', 'Discard this setup')}</button></footer>}
+          {currentStep !== 'complete' && <footer className="setup-wizard__footer"><button className="text-button" type="button" disabled={currentIndex === 0 || Boolean(busy) || oauthCommitLocked} onClick={() => void back()}><ArrowLeft size={15} />{t('上一步', 'Previous')}</button><button className="text-button danger" type="button" disabled={Boolean(busy) || oauthCommitLocked} onClick={() => setDiscardConfirmOpen(true)}>{t('放弃连接配置', 'Discard connection setup')}</button></footer>}
         </main>
       </div>
       <ConfirmDialog
         open={discardConfirmOpen}
-        title={t('放弃本次配置向导？', 'Discard this setup?')}
+        title={t('放弃本次连接配置？', 'Discard this connection setup?')}
         message={t(
-          '这会回滚本次向导创建或修改的来源、号池和路由。已存在且未被本次向导修改的数据会保留。',
-          'This rolls back sources, pools, and routes created or changed by this setup. Existing data untouched by this setup is kept.',
+          '为避免误删凭据，已导入账号和已保存的 API / 中转来源会保留；本向导创建或修改的号池与路由会安全回滚。',
+          'Imported accounts and saved API or relay sources are kept to avoid deleting credentials. Pools and routes created or changed by this setup are safely rolled back.',
         )}
         confirmLabel={t('确认放弃', 'Discard setup')}
         busy={busy === 'discard'}
@@ -1102,11 +1301,29 @@ function PrimaryAction({ label, onClick, busy, disabled = false, icon }: { label
   return <button className="button button--primary setup-primary" type="button" disabled={busy || disabled} onClick={onClick}>{busy ? <LoaderCircle size={16} className="spin" /> : icon}{label}<ArrowRight size={15} /></button>
 }
 
-function ScanSummary({ snapshot }: { snapshot: AppSnapshot }) {
+function ScanSummary({ snapshot, scan }: { snapshot: AppSnapshot; scan: SetupEnvironmentScan | null }) {
   const { t } = useI18n()
   const usable = snapshot.accounts.filter((account) => account.status === 'active').length
   const enabledRoutes = snapshot.routes.filter((route) => route.enabled).length
-  return <div className="setup-metrics"><div><span>{t('可用来源', 'Usable sources')}</span><strong>{usable}</strong></div><div><span>{t('号池', 'Pools')}</span><strong>{snapshot.pools.length}</strong></div><div><span>{t('启用路由', 'Enabled routes')}</span><strong>{enabledRoutes}</strong></div><div><span>{t('网关', 'Gateway')}</span><strong>{snapshot.gatewayStatus.running ? t('运行中', 'Running') : t('未启动', 'Not started')}</strong></div></div>
+  const configuredClients = scan?.clients.filter((client) => client.configured).length ?? 0
+  const networkLabel = !scan
+    ? t('待检查', 'Not checked')
+    : scan.network.summary === 'success'
+      ? t('正常', 'Ready')
+      : scan.network.summary === 'warning'
+        ? t('有警告', 'Warning')
+        : t('需处理', 'Needs attention')
+  return <div className="setup-metrics"><div><span>{t('网络出口', 'Network exit')}</span><strong>{networkLabel}</strong></div><div><span>{t('客户端配置', 'Client configs')}</span><strong>{scan?.clientScanFailed ? t('检测失败', 'Check failed') : scan ? `${configuredClients} / ${scan.clients.length}` : '—'}</strong></div><div><span>{t('可用来源', 'Usable sources')}</span><strong>{usable}</strong></div><div><span>{t('现有连接', 'Existing connections')}</span><strong>{t(`${enabledRoutes} 条路由`, `${enabledRoutes} route(s)`)}</strong></div></div>
+}
+
+function ScanDetails({ scan }: { scan: SetupEnvironmentScan }) {
+  const { t } = useI18n()
+  return <div className="setup-scan-details">
+    <section><header><strong>{t('网络检查', 'Network checks')}</strong><span>{scan.network.route.name}</span></header><div>{scan.network.results.map((result) => <span className={`setup-scan-item setup-scan-item--${result.status}`} key={result.id}><i /> <b>{result.label}</b><small>{result.status === 'success' ? t('正常', 'Ready') : result.message}{result.latencyMs > 0 ? ` · ${result.latencyMs} ms` : ''}</small></span>)}</div>{scan.network.diagnoses.length > 0 && <p><CircleAlert size={14} />{scan.network.diagnoses[0]}</p>}</section>
+    <section><header><strong>{t('客户端配置', 'Client configurations')}</strong><span>{scan.clientScanFailed ? t('本次未完成检测', 'Detection did not finish') : t('只读检查，不修改文件', 'Read-only; no files changed')}</span></header><div>{scan.clientScanFailed
+      ? <span className="setup-scan-item setup-scan-item--warning"><i /><b>{t('稍后可在客户端配置页重试', 'Retry later on the Clients page')}</b></span>
+      : scan.clients.map((config) => <span className={`setup-scan-item setup-scan-item--${config.configured ? 'success' : 'skipped'}`} key={`${config.client}:${config.directory}`}><i /><b>{clientLabels[config.client]}</b><small>{config.configured ? t('已配置', 'Configured') : config.directoryExists ? t('检测到目录，尚未连接 Stone+', 'Directory found; not connected to Stone+') : t('未检测到配置目录', 'Configuration directory not found')}</small></span>)}</div></section>
+  </div>
 }
 
 function ApiSourceForm({ draft, proxies, proxyId, proxyInterlocked, official, onChange, onProxyChange, onVendor }: { draft: ApiSourceInput; proxies: AppSnapshot['proxies']; proxyId: string; proxyInterlocked: boolean; official: boolean; onChange: (value: ApiSourceInput) => void; onProxyChange: (value: string) => void; onVendor: (kind: ProviderKind) => void }) {
@@ -1173,6 +1390,30 @@ function sourceModeFromProgress(method?: SetupSourceMethod, sourceType?: SetupWi
   if (sourceType === 'official-api' || sourceType === 'relay') return sourceType
   if (sourceType === 'oauth-system') return 'existing'
   return 'existing'
+}
+
+function readSetupSourceDraftCache(sessionId: string): ApiSourceInput | null {
+  try {
+    return parseSetupSourceDraft(window.localStorage.getItem(setupWizardDraftStorageKey(sessionId)))
+  } catch {
+    return null
+  }
+}
+
+function writeSetupSourceDraftCache(sessionId: string, draft: ApiSourceInput): void {
+  try {
+    window.localStorage.setItem(setupWizardDraftStorageKey(sessionId), serializeSetupSourceDraft(draft))
+  } catch {
+    // Draft persistence is a convenience only; setup must remain usable when storage is unavailable.
+  }
+}
+
+function clearSetupSourceDraftCache(sessionId: string): void {
+  try {
+    window.localStorage.removeItem(setupWizardDraftStorageKey(sessionId))
+  } catch {
+    // Ignore unavailable renderer storage while completing or discarding setup.
+  }
 }
 
 function stageLabel(id: string, t: Translate): string {

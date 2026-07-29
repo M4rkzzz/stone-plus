@@ -15,6 +15,8 @@ import {
 } from 'lucide-react'
 import type {
   AppSnapshot,
+  ClientConfigStatus,
+  GatewayApi,
   HealthEvent,
   OpenAiTokenCostBreakdown,
   TokenRatePoint,
@@ -35,6 +37,9 @@ import {
 import { translate, useI18n, type UiLanguage } from '../i18n'
 import { accountDisplayName, setupPoolDisplayName } from '../system-generated-text'
 import { clientBrandMeta } from '../brand-icons'
+import { evaluateHelpReadiness } from '../help-readiness'
+import { ReadinessPanel } from '../readiness-panel'
+import { buildSmartGuidanceActions } from '../smart-guidance'
 
 type TokenRateRange = keyof TokenRateSeries
 
@@ -282,9 +287,11 @@ function healthEventMessage(event: HealthEvent, language: UiLanguage): string {
   return event.kind === 'account-disabled' ? 'The account was disabled.' : 'The account entered cooldown.'
 }
 
-export function OverviewView({ snapshot, navigate }: { snapshot: AppSnapshot; navigate: (page: PageId) => void }) {
+export function OverviewView({ snapshot, api, navigate }: { snapshot: AppSnapshot; api: GatewayApi; navigate: (page: PageId) => void }) {
   const { t, language, locale } = useI18n()
   const [tokenRateRange, setTokenRateRange] = useState<TokenRateRange>(initialTokenRateRange)
+  const [clientConfigs, setClientConfigs] = useState<ClientConfigStatus[]>([])
+  const [clientScanBusy, setClientScanBusy] = useState(true)
   const enabledRoutes = snapshot.routes.filter((route) => route.enabled)
   const availableAccounts = snapshot.accounts.filter((account) => account.status === 'active')
   const recentLogs = snapshot.requestLogs.slice(0, 6)
@@ -293,6 +300,9 @@ export function OverviewView({ snapshot, navigate }: { snapshot: AppSnapshot; na
   const daily = snapshot.observability.last24Hours
   const tokenCosts = snapshot.observability.tokenCosts
   const tokenRatePoints = snapshot.observability.tokenRates?.[tokenRateRange] ?? EMPTY_TOKEN_RATE_POINTS
+  const clientDetectionKey = `${snapshot.routes.map((route) => `${route.id}:${route.enabled}:${route.poolId}:${route.updatedAt}`).join('|')}::${snapshot.clientProfiles.map((profile) => `${profile.id}:${profile.updatedAt}`).join('|')}`
+  const readiness = useMemo(() => evaluateHelpReadiness(snapshot, clientConfigs, t), [clientConfigs, snapshot, t])
+  const smartActions = useMemo(() => buildSmartGuidanceActions(snapshot, readiness, t), [readiness, snapshot, t])
   const tokenRateStats = useMemo(() => {
     const selected = tokenRatePoints.filter((point) => point.requestCount > 0)
     const requestCount = selected.reduce((total, point) => total + point.requestCount, 0)
@@ -312,9 +322,21 @@ export function OverviewView({ snapshot, navigate }: { snapshot: AppSnapshot; na
     }
   }, [tokenRateRange])
 
+  useEffect(() => {
+    let active = true
+    setClientScanBusy(true)
+    void api.getClientConfigs()
+      .then((result) => { if (active) setClientConfigs(result) })
+      .catch(() => { if (active) setClientConfigs([]) })
+      .finally(() => { if (active) setClientScanBusy(false) })
+    return () => { active = false }
+  }, [api, clientDetectionKey])
+
   return (
     <div className="page-stack">
       <PageHeader title={t('总览', 'Overview')} />
+
+      <ReadinessPanel readiness={readiness} actions={smartActions} scanning={clientScanBusy} navigate={navigate} />
 
       <section className="metrics-grid" aria-label={t('网关指标', 'Gateway metrics')}>
         <article className="metric-card">

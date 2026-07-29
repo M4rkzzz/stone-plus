@@ -474,6 +474,18 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   }, [])
 
   useEffect(() => {
+    const syncStoredTheme = (event: StorageEvent) => {
+      if (event.key !== null && event.key !== UI_THEME_STORAGE_KEY && event.key !== UI_CUSTOM_THEMES_STORAGE_KEY) return
+      const nextThemes = readCustomThemes()
+      customThemesRef.current = nextThemes
+      setCustomThemes(nextThemes)
+      setStoredPreference(readSelection(nextThemes))
+    }
+    window.addEventListener('storage', syncStoredTheme)
+    return () => window.removeEventListener('storage', syncStoredTheme)
+  }, [])
+
+  useEffect(() => {
     applyDocumentTheme(theme, activeCustomTheme)
     const nativePreference: UiThemePreference = preference === 'system' || preference === 'light' || preference === 'dark'
       ? preference

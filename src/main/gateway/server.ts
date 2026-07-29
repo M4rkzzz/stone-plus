@@ -1342,9 +1342,12 @@ export class GatewayServer implements GatewayController {
             runtimeGeneration,
             account.id
           )
-          if (!highConcurrencyMode && this.activeRequests < TELEMETRY_PRESSURE_ACTIVE_REQUESTS) {
-            this.emitRuntimeState({ accountIds: [account.id] })
-          }
+          // Account concurrency is live routing state, not optional progress
+          // telemetry. The desktop-side runtime delta publisher coalesces
+          // account ids under load, so always publish slot acquisition; if it
+          // is suppressed here the header can show an active request while
+          // every account remains stuck at 0 / N until the request finishes.
+          this.emitRuntimeState({ accountIds: [account.id] })
           scheduleProgressLog('resolving-credential')
 
           const provider = requestIndex.providersById.get(account.providerId)
@@ -1586,7 +1589,10 @@ export class GatewayServer implements GatewayController {
                   : () => {
                       const acquired = this.scheduler.tryAcquireAccount(account, schedulingPool)
                       if (!acquired) return undefined
-                      if (!highConcurrencyMode) this.emitRuntimeState({ accountIds: [account.id] })
+                      // A hedge occupies another real upstream slot. Keep the
+                      // account row authoritative even when the route has
+                      // reduced progress telemetry enabled.
+                      this.emitRuntimeState({ accountIds: [account.id] })
                       return this.runtimeTrackedRelease(acquired, runtimeGeneration, account.id)
                     }
               ),

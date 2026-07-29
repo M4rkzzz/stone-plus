@@ -422,7 +422,7 @@ export function PoolsView({
         </div>
       ) : (
         <section className="panel">
-          <EmptyState icon={<Layers3 size={25} />} title={t('尚未建立号池', 'No pools yet')} description={poolEligibleAccounts.length ? undefined : t('请先添加账号或官方 API，再建立号池', 'Add an account or official API before creating a pool.')} action={poolEligibleAccounts.length ? <button className="button button--primary" type="button" onClick={() => openPool()}><Plus size={16} />{t('新建号池', 'New pool')}</button> : undefined} />
+          <EmptyState icon={<Layers3 size={25} />} title={t('尚未建立号池', 'No pools yet')} description={poolEligibleAccounts.length ? t('把同协议来源组合起来，即可获得轮换、故障转移和并发控制。', 'Combine sources using the same protocol for rotation, failover, and concurrency control.') : t('请先添加账号或官方 API，再建立号池。', 'Add an account or official API before creating a pool.')} action={poolEligibleAccounts.length ? <button className="button button--primary" type="button" onClick={() => openPool()}><Plus size={16} />{t('新建号池', 'New pool')}</button> : <button className="button button--primary" type="button" onClick={() => { window.location.hash = '#providers' }}><Plus size={16} />{t('前往添加来源', 'Add a source first')}</button>} />
         </section>
       )}
 

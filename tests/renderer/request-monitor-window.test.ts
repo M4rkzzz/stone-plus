@@ -1,0 +1,31 @@
+import { readFileSync } from 'node:fs'
+import { describe, expect, it } from 'vitest'
+
+describe('request monitor renderer', () => {
+  it('uses a dedicated mini surface with four summary metrics and bounded live rows', () => {
+    const source = readFileSync(new URL('../../src/renderer/src/request-monitor-window.tsx', import.meta.url), 'utf8')
+    const main = readFileSync(new URL('../../src/renderer/src/main.tsx', import.meta.url), 'utf8')
+    const styles = readFileSync(new URL('../../src/renderer/src/request-monitor-window.css', import.meta.url), 'utf8')
+    const theme = readFileSync(new URL('../../src/renderer/src/theme.tsx', import.meta.url), 'utf8')
+
+    expect(main).toContain("surface') === 'request-monitor'")
+    expect(main).toContain('<RequestMonitorWindow />')
+    expect(main).toContain('isElectron && !isRequestMonitor')
+    expect(source).toContain("t('活跃', 'Active')")
+    expect(source).toContain("t('首字', 'First')")
+    expect(source).toContain("t('耗时', 'Time')")
+    expect(source).toContain('<span>Token</span>')
+    expect(source).toContain('snapshot.observability.tokenCosts.allTime.totalTokens')
+    expect(source).toContain('formatTokenBillions(')
+    expect(source).not.toContain('request-monitor__header')
+    expect(source).not.toContain('setPreference')
+    expect(source).toContain('logs.slice(0, visibleRequestLimit)')
+    expect(source).toContain('applyRuntimeDelta(current, delta)')
+    expect(styles).toContain('grid-template-columns: repeat(4, minmax(0, 1fr))')
+    expect(styles).toContain('grid-template-columns: 5px 40px 39px minmax(28px, 1fr) auto auto')
+    expect(styles).toContain('-webkit-app-region: drag')
+    expect(styles.match(/-webkit-app-region: drag/g)).toHaveLength(1)
+    expect(theme).toContain("window.addEventListener('storage', syncStoredTheme)")
+    expect(styles).toContain('.request-monitor__list')
+  })
+})

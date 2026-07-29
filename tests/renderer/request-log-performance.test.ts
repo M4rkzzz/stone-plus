@@ -9,6 +9,7 @@ import {
 } from '../../src/renderer/src/request-log-page'
 import {
   filterRequestLogs,
+  formatTokenBillions,
   summarizeRequestLogs,
 } from '../../src/renderer/src/request-log-view-model'
 import { RequestsView } from '../../src/renderer/src/views/RequestsView'
@@ -116,6 +117,14 @@ describe('request log renderer pressure bounds', () => {
       totalTokens: 17,
       hasStreaming: true,
     })
+  })
+
+  it('formats lifetime token totals in compact billions', () => {
+    expect(formatTokenBillions(0)).toBe('0b')
+    expect(formatTokenBillions(7_346_800)).toBe('0.007b')
+    expect(formatTokenBillions(1_250_000_000)).toBe('1.25b')
+    expect(formatTokenBillions(12_340_000_000)).toBe('12.3b')
+    expect(formatTokenBillions(123_000_000_000)).toBe('123b')
   })
 })
 

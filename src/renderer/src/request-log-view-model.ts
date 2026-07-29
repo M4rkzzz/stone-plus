@@ -13,6 +13,14 @@ export interface RequestLogSummary {
   hasStreaming: boolean
 }
 
+export function formatTokenBillions(totalTokens: number): string {
+  const billions = Math.max(0, Number.isFinite(totalTokens) ? totalTokens : 0) / 1_000_000_000
+  if (billions === 0) return '0b'
+  const digits = billions >= 100 ? 0 : billions >= 10 ? 1 : billions >= 1 ? 2 : 3
+  const formatted = billions.toFixed(digits)
+  return `${digits ? formatted.replace(/\.?0+$/u, '') : formatted}b`
+}
+
 export const displayedRequestFirstTokenMs = (log: RequestLog): number | undefined =>
   log.requestKind === 'compaction' ? undefined : log.upstreamFirstByteMs ?? log.firstTokenMs
 

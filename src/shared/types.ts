@@ -2042,6 +2042,7 @@ export interface GatewayApi {
   getAccountCodexQuotaHistory(id: string, from?: number, to?: number): Promise<CodexQuotaHistoryPoint[]>
   getAccountCodexQuotaCycleCosts(id: string): Promise<CodexQuotaCycleCosts>
   clearLogs(): Promise<AppSnapshot>
+  openRequestMonitor(): Promise<void>
   getRequestReplayTemplate(id: string): Promise<RequestReplayTemplate | null>
   replayRequest(id: string): Promise<RequestReplayResult>
   getLocalEventServerStatus(): Promise<LocalEventServerStatus>

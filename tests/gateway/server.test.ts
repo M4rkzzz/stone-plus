@@ -251,7 +251,7 @@ async function getModels(port: number, path = '/v1/models', token = 'local-secre
 async function runConcurrencyModeRequest(highConcurrencyMode: boolean): Promise<{
   gateway: GatewayServer
   rawLogs: RequestLog[]
-  runtimeAccountUpdates: string[][]
+  runtimeAccountUpdates: Array<{ accountIds: string[]; inFlight: number }>
   status: number
   titleResolver: ReturnType<typeof vi.fn>
   upstreamFetch: ReturnType<typeof vi.fn>
@@ -267,7 +267,7 @@ async function runConcurrencyModeRequest(highConcurrencyMode: boolean): Promise<
   gatewayConfig.pools[0].hedgeDelayMs = 250
   const titleResolver = vi.fn(() => 'Resolved concurrency title')
   const rawLogs: RequestLog[] = []
-  const runtimeAccountUpdates: string[][] = []
+  const runtimeAccountUpdates: Array<{ accountIds: string[]; inFlight: number }> = []
   const firstFrame = [
     'data: {"id":"chat-concurrency-mode","model":"source-model","choices":[{"index":0,"delta":{"content":"Mode output"},"finish_reason":null}]}',
     '', ''
@@ -297,7 +297,10 @@ async function runConcurrencyModeRequest(highConcurrencyMode: boolean): Promise<
     onLog: (log) => rawLogs.push(log)
   })
   gateway.onRuntimeState((update) => {
-    if (update.accountIds?.length) runtimeAccountUpdates.push([...update.accountIds])
+    if (update.accountIds?.length) runtimeAccountUpdates.push({
+      accountIds: [...update.accountIds],
+      inFlight: gateway.getAccountInFlight().first,
+    })
   })
   runningServers.push(gateway)
   await gateway.start()
@@ -708,9 +711,13 @@ describe('GatewayServer', () => {
     expect(terminal?.upstreamHeadersMs).toEqual(expect.any(Number))
     expect(gateway.getRequestReplayTemplate(rawLogs[0].id)).toBeUndefined()
     expect(gateway.getAccountInFlight().first).toBe(0)
-    // Acquisition chatter is paused, but the release delta is retained so a
-    // renderer can never be left displaying a stale in-flight count.
-    expect(runtimeAccountUpdates).toEqual([['first']])
+    // High-concurrency mode only suppresses noisy progress telemetry. Slot
+    // acquisition and release remain visible so the account row agrees with
+    // the gateway-wide active-request indicator throughout the request.
+    expect(runtimeAccountUpdates).toEqual([
+      { accountIds: ['first'], inFlight: 1 },
+      { accountIds: ['first'], inFlight: 0 },
+    ])
 
     expect(rawLogs.map((log) => [log.status, log.progressStage])).toEqual([
       ['streaming', 'receiving-body'],

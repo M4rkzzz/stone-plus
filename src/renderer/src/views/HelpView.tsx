@@ -619,10 +619,7 @@ export function HelpView({ snapshot, api, navigate }: HelpViewProps) {
     const handleShortcut = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement | null
       const isTyping = target?.tagName === 'INPUT' || target?.tagName === 'TEXTAREA' || target?.isContentEditable
-      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') {
-        event.preventDefault()
-        searchRef.current?.focus()
-      } else if (event.key === '/' && !isTyping) {
+      if (event.key === '/' && !isTyping) {
         event.preventDefault()
         searchRef.current?.focus()
       } else if (event.key === 'Escape' && document.activeElement === searchRef.current) {

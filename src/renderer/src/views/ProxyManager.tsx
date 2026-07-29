@@ -119,7 +119,7 @@ export function ProxyManager({
             </table>
           </div>
         </section>
-      ) : <section className="panel"><EmptyState icon={<Network size={25} />} title={t('尚未配置代理', 'No proxies configured')} action={<button className="button button--primary" type="button" onClick={() => openProxy()}><Plus size={16} />{t('添加代理', 'Add proxy')}</button>} /></section>}
+      ) : <section className="panel"><EmptyState icon={<Network size={25} />} title={t('尚未配置代理', 'No proxies configured')} description={t('代理可绑定到账号和号池；如果只使用系统网络，可以保持为空。', 'Proxies can be assigned to accounts and pools. Leave this empty when using only the system network.')} action={<button className="button button--primary" type="button" onClick={() => openProxy()}><Plus size={16} />{t('添加代理', 'Add proxy')}</button>} /></section>}
 
       <Modal
         open={modalOpen}

@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { chmod, copyFile, lstat, mkdir, readdir, rename, rm, stat } from 'node:fs/promises'
 import { basename, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
+import { Worker } from 'node:worker_threads'
 import { SQLITE_SCHEMA_VERSION } from '../store/sqlite-state-store'
 import type {
   DatabaseBackupInfo,
@@ -40,6 +41,132 @@ const REQUIRED_SCHEMA_ONE_TABLES = [
   'routes',
   'schema_migrations'
 ] as const
+
+interface BackupVerificationWorkerItem {
+  path: string
+  id: string
+  kind: DatabaseBackupKind
+  createdAt: number
+  sizeBytes: number
+}
+
+const BACKUP_VERIFICATION_WORKER_SOURCE = String.raw`
+const { parentPort, workerData } = require('node:worker_threads')
+const { DatabaseSync } = require('node:sqlite')
+
+function errorMessage(error) {
+  return error instanceof Error ? error.message : String(error)
+}
+
+function pragmaNumber(database, name) {
+  const row = database.prepare('PRAGMA ' + name).get()
+  const value = row && row[name]
+  return typeof value === 'number' ? value : 0
+}
+
+function verify(item) {
+  const fallback = {
+    id: item.id,
+    kind: item.kind,
+    createdAt: item.createdAt,
+    sizeBytes: item.sizeBytes,
+    valid: false,
+    integrityCheck: [],
+  }
+  let database
+  try {
+    database = new DatabaseSync(item.path, { readOnly: true })
+    database.exec('PRAGMA trusted_schema = OFF')
+    const integrityCheck = database.prepare('PRAGMA integrity_check').all()
+      .map((row) => String(row.integrity_check ?? Object.values(row)[0] ?? 'unknown integrity error'))
+    const schemaVersion = pragmaNumber(database, 'user_version')
+    const tables = new Set(database.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all()
+      .map((row) => row.name))
+    const requiredTables = [
+      ...workerData.requiredSchemaOneTables,
+      ...(schemaVersion >= 3 ? ['client_profiles'] : []),
+      ...(schemaVersion >= 4 ? ['health_events'] : []),
+      ...(schemaVersion >= 5 ? ['proxies', 'account_codex_quota_samples'] : []),
+      ...(schemaVersion >= 8 ? ['persistent_tasks'] : []),
+      ...(schemaVersion >= 9 ? ['built_in_proxy_settings', 'proxy_profiles'] : []),
+    ]
+    const missingTables = requiredTables.filter((table) => !tables.has(table))
+    const initialized = tables.has('app_metadata')
+      ? database.prepare("SELECT value FROM app_metadata WHERE key = 'state_initialized'").get()
+      : undefined
+    const issues = [
+      ...integrityCheck.filter((result) => result.toLowerCase() !== 'ok'),
+      ...(schemaVersion < 1 ? ['Database schema version is missing'] : []),
+      ...(schemaVersion > workerData.maxSchemaVersion
+        ? ['Database schema ' + schemaVersion + ' is newer than supported schema ' + workerData.maxSchemaVersion]
+        : []),
+      ...(missingTables.length > 0 ? ['Missing Stone+ tables: ' + missingTables.join(', ')] : []),
+      ...(initialized?.value !== '1' ? ['Stone+ database initialization marker is missing'] : []),
+    ]
+    return {
+      ...fallback,
+      schemaVersion,
+      valid: issues.length === 0,
+      issue: issues[0],
+      integrityCheck,
+    }
+  } catch (error) {
+    return { ...fallback, issue: errorMessage(error) }
+  } finally {
+    database?.close()
+  }
+}
+
+parentPort.postMessage(workerData.items.map(verify))
+`
+
+function verifyDatabaseBackupsOffMainThread(
+  items: BackupVerificationWorkerItem[],
+): Promise<DatabaseBackupVerification[]> {
+  if (items.length === 0) return Promise.resolve([])
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(BACKUP_VERIFICATION_WORKER_SOURCE, {
+      eval: true,
+      workerData: {
+        items,
+        maxSchemaVersion: SQLITE_SCHEMA_VERSION,
+        requiredSchemaOneTables: REQUIRED_SCHEMA_ONE_TABLES,
+      },
+    })
+    let settled = false
+    const timeout = setTimeout(() => {
+      if (settled) return
+      settled = true
+      void worker.terminate()
+      reject(new Error('Database backup verification timed out'))
+    }, Math.min(120_000, 15_000 + items.length * 5_000))
+    timeout.unref()
+
+    worker.once('message', (message: unknown) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timeout)
+      void worker.terminate()
+      if (!Array.isArray(message) || message.length !== items.length) {
+        reject(new Error('Database backup verification worker returned an invalid result'))
+        return
+      }
+      resolve(message as DatabaseBackupVerification[])
+    })
+    worker.once('error', (error) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timeout)
+      reject(error)
+    })
+    worker.once('exit', (code) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timeout)
+      reject(new Error(`Database backup verification worker exited before returning a result (${code})`))
+    })
+  })
+}
 
 export class DatabaseBackupService<T> {
   private readonly backupDirectory: string
@@ -151,9 +278,10 @@ export class DatabaseBackupService<T> {
   public async listBackups(): Promise<DatabaseBackupInfo[]> {
     await this.ensureDirectory()
     const entries = await readdir(this.backupDirectory, { withFileTypes: true })
-    const backups = await Promise.all(entries
+    const requests = entries
       .filter((entry) => entry.isFile() && parseBackupId(entry.name))
-      .map(async (entry) => withoutIntegrityRows(await this.verifyPath(this.pathForId(entry.name), entry.name))))
+      .map((entry) => ({ path: this.pathForId(entry.name), id: entry.name }))
+    const backups = (await this.verifyPaths(requests)).map(withoutIntegrityRows)
     return backups.sort((left, right) => right.createdAt - left.createdAt || right.id.localeCompare(left.id))
   }
 
@@ -471,62 +599,27 @@ export class DatabaseBackupService<T> {
     await Promise.all(ordered.slice(retention).map((backup) => rm(this.pathForId(backup.id), { force: true })))
   }
 
-  private async verifyPath(path: string, id: string): Promise<DatabaseBackupVerification> {
-    const parsed = parseBackupId(id)
-    const file = await stat(path)
-    const fallback: DatabaseBackupVerification = {
-      id,
-      kind: parsed?.kind ?? 'manual',
-      createdAt: parsed?.createdAt ?? file.mtimeMs,
-      sizeBytes: file.size,
-      valid: false,
-      integrityCheck: []
-    }
-    let database: DatabaseSync | undefined
-    try {
-      database = new DatabaseSync(path, { readOnly: true })
-      database.exec('PRAGMA trusted_schema = OFF')
-      const integrityCheck = (database.prepare('PRAGMA integrity_check').all() as Array<Record<string, unknown>>)
-        .map((row) => String(row.integrity_check ?? Object.values(row)[0] ?? 'unknown integrity error'))
-      const schemaVersion = readPragmaNumber(database, 'user_version')
-      const tables = new Set((database.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{
-        name: string
-      }>).map((row) => row.name))
-      const requiredTables = [
-        ...REQUIRED_SCHEMA_ONE_TABLES,
-        ...(schemaVersion >= 3 ? ['client_profiles'] : []),
-        ...(schemaVersion >= 4 ? ['health_events'] : []),
-        ...(schemaVersion >= 5 ? ['proxies', 'account_codex_quota_samples'] : []),
-        ...(schemaVersion >= 8 ? ['persistent_tasks'] : []),
-        ...(schemaVersion >= 9 ? ['built_in_proxy_settings', 'proxy_profiles'] : [])
-      ]
-      const missingTables = requiredTables.filter((table) => !tables.has(table))
-      const initialized = tables.has('app_metadata')
-        ? database.prepare("SELECT value FROM app_metadata WHERE key = 'state_initialized'").get() as
-          | { value?: unknown }
-          | undefined
-        : undefined
-      const issues = [
-        ...integrityCheck.filter((result) => result.toLowerCase() !== 'ok'),
-        ...(schemaVersion < 1 ? ['Database schema version is missing'] : []),
-        ...(schemaVersion > SQLITE_SCHEMA_VERSION
-          ? [`Database schema ${schemaVersion} is newer than supported schema ${SQLITE_SCHEMA_VERSION}`]
-          : []),
-        ...(missingTables.length > 0 ? [`Missing Stone+ tables: ${missingTables.join(', ')}`] : []),
-        ...(initialized?.value !== '1' ? ['Stone+ database initialization marker is missing'] : [])
-      ]
+  private async verifyPaths(
+    requests: Array<{ path: string; id: string }>,
+  ): Promise<DatabaseBackupVerification[]> {
+    const items = await Promise.all(requests.map(async ({ path, id }) => {
+      const parsed = parseBackupId(id)
+      const file = await stat(path)
       return {
-        ...fallback,
-        schemaVersion,
-        valid: issues.length === 0,
-        issue: issues[0],
-        integrityCheck
+        path,
+        id,
+        kind: parsed?.kind ?? 'manual',
+        createdAt: parsed?.createdAt ?? file.mtimeMs,
+        sizeBytes: file.size,
       }
-    } catch (error) {
-      return { ...fallback, issue: messageOf(error) }
-    } finally {
-      database?.close()
-    }
+    }))
+    return verifyDatabaseBackupsOffMainThread(items)
+  }
+
+  private async verifyPath(path: string, id: string): Promise<DatabaseBackupVerification> {
+    const [verification] = await this.verifyPaths([{ path, id }])
+    if (!verification) throw new Error('Database backup verification returned no result')
+    return verification
   }
 
   private async requireRegularBackup(id: string): Promise<string> {
@@ -581,12 +674,6 @@ function parseBackupId(id: string): { createdAt: number; kind: DatabaseBackupKin
   const createdAt = Number(match[1])
   if (!Number.isSafeInteger(createdAt)) return undefined
   return { createdAt, kind: match[2] as DatabaseBackupKind }
-}
-
-function readPragmaNumber(database: DatabaseSync, name: 'user_version'): number {
-  const row = database.prepare(`PRAGMA ${name}`).get() as Record<string, unknown> | undefined
-  const value = row?.[name]
-  return typeof value === 'number' ? value : 0
 }
 
 function withoutIntegrityRows(verification: DatabaseBackupVerification): DatabaseBackupInfo {

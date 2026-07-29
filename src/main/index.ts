@@ -43,6 +43,7 @@ import type { AgentLifecycleService } from './agent-lifecycle/service'
 import { AgentInstallationService } from './agent-installation'
 import { registerCodexSessionManagerApi } from './ipc/session-manager-api'
 import { registerPersistentTaskApi } from './ipc/persistent-task-api'
+import { registerRequestMonitorApi } from './ipc/request-monitor-api'
 import { BROWSER_SESSION_PARTITION, BrowserImportQueue } from './browser-import-queue'
 import { LocalEventServer, startLocalEventServerForBootstrap } from './events'
 import { SystemLifecycleCoordinator } from './system-lifecycle'
@@ -55,6 +56,7 @@ import { SystemProxyLease } from './proxy/built-in/system-proxy-lease'
 import { builtInProxyPlatformCapabilities, createSystemProxyPlatformAdapter } from './proxy/built-in/platform-adapters'
 import { ElevatedSingBoxTunAdapter } from './proxy/built-in/tun-sidecar-adapter'
 import { TunController } from './proxy/built-in/tun-controller'
+import { RequestMonitorWindowController } from './request-monitor-window'
 
 const { autoUpdater } = electronUpdater
 const WINDOWS_APP_USER_MODEL_ID = 'io.github.m4rkzzz.stoneplus'
@@ -94,6 +96,8 @@ let disposeBuiltInProxyApi: (() => Promise<void>) | undefined
 let disposeClientInstanceApi: (() => Promise<void>) | undefined
 let disposeAgentLifecycleApi: (() => Promise<void>) | undefined
 let disposeClaudeDesktopApi: (() => Promise<void>) | undefined
+let disposeRequestMonitorApi: (() => void) | undefined
+let requestMonitorWindow: RequestMonitorWindowController | undefined
 let focusMainWindowOnReady = false
 let mainWindowReadyToShow = false
 let rendererThemeReady = false
@@ -542,6 +546,14 @@ async function bootstrap(): Promise<void> {
   registerPersistentTaskApi(store.getPersistentTaskRunner())
   registerUpdateApi(updateService)
   registerTunnelApi(tunnelService)
+  requestMonitorWindow = new RequestMonitorWindowController({
+    preloadPath: join(__dirname, '../preload/index.cjs'),
+    rendererTarget: rendererTargetUrl(),
+    iconPath: stoneIconPath(),
+    windowsAppUserModelId: windowsAppUserModelId(),
+    showMainWindow,
+  })
+  disposeRequestMonitorApi = registerRequestMonitorApi(requestMonitorWindow)
   createWindow()
   createTray()
   await builtInProxy.initialize().catch((error) => {
@@ -631,8 +643,7 @@ function createWindow(): void {
   }
 
   mainWindow.setMenuBarVisibility(false)
-  const rendererTarget = trustedDevelopmentRendererUrl()
-    ?? pathToFileURL(join(__dirname, '../renderer/index.html')).toString()
+  const rendererTarget = rendererTargetUrl()
   mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
   mainWindow.webContents.on('will-attach-webview', (event, webPreferences, params) => {
     delete webPreferences.preload
@@ -692,6 +703,11 @@ function trustedDevelopmentRendererUrl(): string | undefined {
   } catch {
     return undefined
   }
+}
+
+function rendererTargetUrl(): string {
+  return trustedDevelopmentRendererUrl()
+    ?? pathToFileURL(join(__dirname, '../renderer/index.html')).toString()
 }
 
 function createTray(): void {
@@ -894,6 +910,12 @@ function shutdownServices(): Promise<void> {
     // have state to checkpoint while they are closing.
     await shutdownStep('update service', () => {
       if (!shutdownForUpdate && updateService) updateService.close()
+    })
+    await shutdownStep('request monitor', () => {
+      disposeRequestMonitorApi?.()
+      disposeRequestMonitorApi = undefined
+      requestMonitorWindow?.dispose()
+      requestMonitorWindow = undefined
     })
     await shutdownStep('managed client instances', async () => {
       await Promise.all([

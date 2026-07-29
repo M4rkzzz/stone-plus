@@ -11,6 +11,7 @@ import {
   TriangleAlert,
   Clipboard,
   LoaderCircle,
+  PictureInPicture2,
   Play,
 } from 'lucide-react'
 import type { AppSnapshot, GatewayApi, RequestLog, RequestReplayResult, RequestReplayTemplate, RouteClient } from '@shared/types'
@@ -30,6 +31,7 @@ import {
   RequestStatusBadge,
 } from '../ui'
 import { useI18n } from '../i18n'
+import { useVisibilityAwareInterval } from '../visibility-interval'
 import { accountDisplayName, conversationDisplayName } from '../system-generated-text'
 import { paginateRequestLogs } from '../request-log-page'
 import {
@@ -215,6 +217,7 @@ export function RequestsView({
   const [columnWidths, setColumnWidths] = useState<RequestColumnWidths>(loadRequestColumnWidths)
   const [liveNow, setLiveNow] = useState(Date.now())
   const [logPage, setLogPage] = useState(0)
+  const [monitorOpening, setMonitorOpening] = useState(false)
   const resizingColumn = useRef<{ id: RequestColumnId; startX: number; startWidth: number } | null>(null)
   const accountCredentialTypes = useMemo(
     () => new Map(snapshot.accounts.map((account) => [account.id, account.credentialType])),
@@ -287,12 +290,14 @@ export function RequestsView({
     if (logPage !== visibleLogPage.page) setLogPage(visibleLogPage.page)
   }, [logPage, visibleLogPage.page])
 
-  useEffect(() => {
-    if (!summary.hasStreaming) return
-    setLiveNow(Date.now())
-    const timer = window.setInterval(() => setLiveNow(Date.now()), 500)
-    return () => window.clearInterval(timer)
-  }, [summary.hasStreaming])
+  useVisibilityAwareInterval(
+    () => setLiveNow(Date.now()),
+    1_000,
+    summary.hasStreaming,
+    true,
+    undefined,
+    2,
+  )
 
   useEffect(() => {
     if (!selected) return
@@ -369,12 +374,26 @@ export function RequestsView({
     URL.revokeObjectURL(link.href)
   }
 
+  const openRequestMonitor = async () => {
+    if (monitorOpening) return
+    setMonitorOpening(true)
+    try {
+      await api.openRequestMonitor()
+    } catch {
+      // The main process owns window creation; keep the request page usable if
+      // the operating system rejects an auxiliary window during shutdown.
+    } finally {
+      setMonitorOpening(false)
+    }
+  }
+
   return (
     <div className="page-stack">
       <PageHeader
         title={t('请求日志', 'Request Logs')}
         actions={
           <>
+            <button className="button button--secondary" type="button" disabled={monitorOpening} onClick={() => void openRequestMonitor()}><PictureInPicture2 size={16} />{t('弹出浮窗', 'Open Monitor')}</button>
             <button className="button button--secondary" type="button" disabled={!filtered.length} onClick={exportLogs}><Download size={16} />{t('导出', 'Export')}</button>
             <button className="button button--secondary button--danger-text" type="button" disabled={!snapshot.requestLogs.length} onClick={() => setConfirmClear(true)}><Eraser size={16} />{t('清空', 'Clear')}</button>
           </>

@@ -63,6 +63,7 @@ import type {
   OutboundNetworkMode,
 } from '@shared/types'
 import { useI18n } from '../i18n'
+import { useVisibilityAwareInterval } from '../visibility-interval'
 import { BoundAsyncOperation, SingleFlightAsyncOperation } from '../async-operation'
 import { Badge, ConfirmDialog, durationLabel, relativeTime } from '../ui'
 import {
@@ -605,22 +606,17 @@ export function BuiltInProxyView({
       setTelemetryBusy(false)
       setTraffic(null)
       setConnections([])
-      return
     }
-    if (activeWorkspaceTab !== 'activity') return
+  }, [routeReady])
 
-    const refreshIfVisible = () => {
-      if (!shouldPollBuiltInProxyTelemetry(routeReady, activeWorkspaceTab, document.visibilityState)) return
-      void refreshTelemetry(false)
-    }
-    refreshIfVisible()
-    const timer = window.setInterval(refreshIfVisible, 3_000)
-    document.addEventListener('visibilitychange', refreshIfVisible)
-    return () => {
-      window.clearInterval(timer)
-      document.removeEventListener('visibilitychange', refreshIfVisible)
-    }
-  }, [activeWorkspaceTab, refreshTelemetry, routeReady, telemetryContext])
+  useVisibilityAwareInterval(
+    () => refreshTelemetry(false),
+    3_000,
+    routeReady && activeWorkspaceTab === 'activity',
+    true,
+    telemetryContext,
+    3,
+  )
 
   const toggleMaster = async () => {
     if (!runtime || masterBusy) return

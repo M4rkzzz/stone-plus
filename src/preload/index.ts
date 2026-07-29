@@ -101,6 +101,7 @@ const stone: GatewayApi = {
   getAccountCodexQuotaHistory: (id, from, to) => ipcRenderer.invoke('stone:get-account-codex-quota-history', id, from, to),
   getAccountCodexQuotaCycleCosts: (id) => ipcRenderer.invoke('stone:get-account-codex-quota-cycle-costs', id),
   clearLogs: () => ipcRenderer.invoke('stone:clear-logs'),
+  openRequestMonitor: () => ipcRenderer.invoke('stone:open-request-monitor'),
   getRequestReplayTemplate: (id) => ipcRenderer.invoke('stone:get-request-replay-template', id),
   replayRequest: (id) => ipcRenderer.invoke('stone:replay-request', id),
   getLocalEventServerStatus: () => ipcRenderer.invoke('stone:get-local-event-server-status'),

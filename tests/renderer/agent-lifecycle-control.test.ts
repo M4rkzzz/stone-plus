@@ -51,6 +51,17 @@ function agent(overrides: Partial<AgentLifecycleState> = {}): AgentLifecycleStat
 }
 
 describe('agent lifecycle control summary', () => {
+  it('keeps the dark-mode OpenAI filter off the icon background surface', () => {
+    const source = readFileSync(new URL('../../src/renderer/src/agent-lifecycle-control.tsx', import.meta.url), 'utf8')
+    const styles = readFileSync(new URL('../../src/renderer/src/agent-lifecycle-control.css', import.meta.url), 'utf8')
+
+    expect(source).toContain('<span className="agent-lifecycle__agent-icon"')
+    expect(source).toContain('<img className={meta.iconClassName}')
+    expect(source).toContain('<span><img className={clientBrandMeta.codex.iconClassName}')
+    expect(styles).toContain('.agent-lifecycle__brands > span')
+    expect(styles).toContain('.agent-lifecycle__agent-icon img')
+  })
+
   it('does not render a running-instance count badge in the header trigger', () => {
     const source = readFileSync(new URL('../../src/renderer/src/agent-lifecycle-control.tsx', import.meta.url), 'utf8')
     const styles = readFileSync(new URL('../../src/renderer/src/agent-lifecycle-control.css', import.meta.url), 'utf8')

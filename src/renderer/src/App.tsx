@@ -1,10 +1,12 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState, type UIEvent } from 'react'
+import { lazy, memo, Suspense, useCallback, useEffect, useMemo, useRef, useState, type UIEvent } from 'react'
 import {
   Activity,
+  ArrowUp,
   Boxes,
   ChevronLeft,
   CircleGauge,
   Globe2,
+  History,
   CircleHelp,
   Menu,
   MonitorCog,
@@ -13,8 +15,10 @@ import {
   Power,
   RefreshCw,
   Route as RouteIcon,
+  Search,
   Share2,
   Settings,
+  Sparkles,
   Stethoscope,
   Wrench,
   Waypoints,
@@ -26,19 +30,6 @@ import type { AgentLifecycleOperationResult, AgentLifecycleSnapshot, AgentTarget
 import { listRouteSources } from '@shared/route-sources'
 import { getGatewayApi } from './api'
 import { OverviewView } from './views/OverviewView'
-import { ProvidersView } from './views/ProvidersView'
-import { ProxyView } from './views/ProxyView'
-import { PoolsView } from './views/PoolsView'
-import { RoutesView } from './views/RoutesView'
-import { RequestsView } from './views/RequestsView'
-import { SettingsView } from './views/SettingsView'
-import { ClientsView } from './views/ClientsView'
-import { TunnelView } from './views/TunnelView'
-import { SessionRepairView } from './views/SessionRepairView'
-import { NetworkTestView } from './views/NetworkTestView'
-import { BrowserView } from './views/BrowserView'
-import { SetupWizardView } from './views/SetupWizardView'
-import { HelpView } from './views/HelpView'
 import { gatewayBaseUrl } from './ui'
 import { StoneMark } from './StoneMark'
 import { summarizeAccountQuota } from './account-quota'
@@ -52,9 +43,67 @@ import { applyRuntimeDelta, RuntimeSnapshotReloadCoordinator, shouldAcceptSnapsh
 import { AgentLifecycleControl, type AgentLifecycleControlAction } from './agent-lifecycle-control'
 import { agentLifecycleRenderKey, appSnapshotAffectsPage } from './app-render-state'
 import { PageErrorBoundary } from './page-error-boundary'
+import { QuickNavigation } from './quick-navigation'
+import type { QuickNavigationItem } from './quick-navigation-model'
+import {
+  OperationCenter,
+  OperationToast,
+  operationLabelForKey,
+  operationShouldNotify,
+  type OperationRecord,
+  type OperationStatus,
+} from './operation-center'
 
 export type PageId = 'overview' | 'setup' | 'providers' | 'proxies' | 'pools' | 'routes' | 'clients' | 'session-repair' | 'tunnel' | 'browser' | 'diagnostics' | 'requests' | 'settings' | 'help'
 export type ActionRunner = (key: string, operation: () => Promise<AppSnapshot>) => Promise<boolean>
+
+const loadSetupWizardView = () => import('./views/SetupWizardView')
+const loadProvidersView = () => import('./views/ProvidersView')
+const loadProxyView = () => import('./views/ProxyView')
+const loadPoolsView = () => import('./views/PoolsView')
+const loadRoutesView = () => import('./views/RoutesView')
+const loadClientsView = () => import('./views/ClientsView')
+const loadSessionRepairView = () => import('./views/SessionRepairView')
+const loadTunnelView = () => import('./views/TunnelView')
+const loadBrowserView = () => import('./views/BrowserView')
+const loadNetworkTestView = () => import('./views/NetworkTestView')
+const loadRequestsView = () => import('./views/RequestsView')
+const loadSettingsView = () => import('./views/SettingsView')
+const loadHelpView = () => import('./views/HelpView')
+
+const LazySetupWizardView = lazy(() => loadSetupWizardView().then((module) => ({ default: module.SetupWizardView })))
+const LazyProvidersView = lazy(() => loadProvidersView().then((module) => ({ default: module.ProvidersView })))
+const LazyProxyView = lazy(() => loadProxyView().then((module) => ({ default: module.ProxyView })))
+const LazyPoolsView = lazy(() => loadPoolsView().then((module) => ({ default: module.PoolsView })))
+const LazyRoutesView = lazy(() => loadRoutesView().then((module) => ({ default: module.RoutesView })))
+const LazyClientsView = lazy(() => loadClientsView().then((module) => ({ default: module.ClientsView })))
+const LazySessionRepairView = lazy(() => loadSessionRepairView().then((module) => ({ default: module.SessionRepairView })))
+const LazyTunnelView = lazy(() => loadTunnelView().then((module) => ({ default: module.TunnelView })))
+const LazyBrowserView = lazy(() => loadBrowserView().then((module) => ({ default: module.BrowserView })))
+const LazyNetworkTestView = lazy(() => loadNetworkTestView().then((module) => ({ default: module.NetworkTestView })))
+const LazyRequestsView = lazy(() => loadRequestsView().then((module) => ({ default: module.RequestsView })))
+const LazySettingsView = lazy(() => loadSettingsView().then((module) => ({ default: module.SettingsView })))
+const LazyHelpView = lazy(() => loadHelpView().then((module) => ({ default: module.HelpView })))
+
+const pagePreloaders: Partial<Record<PageId, () => Promise<unknown>>> = {
+  setup: loadSetupWizardView,
+  providers: loadProvidersView,
+  proxies: loadProxyView,
+  pools: loadPoolsView,
+  routes: loadRoutesView,
+  clients: loadClientsView,
+  'session-repair': loadSessionRepairView,
+  tunnel: loadTunnelView,
+  browser: loadBrowserView,
+  diagnostics: loadNetworkTestView,
+  requests: loadRequestsView,
+  settings: loadSettingsView,
+  help: loadHelpView,
+}
+
+function preloadAppPage(page: PageId): void {
+  void pagePreloaders[page]?.().catch(() => undefined)
+}
 
 function localizedError(cause: unknown, fallback: string, language: 'zh-CN' | 'en'): string {
   if (!(cause instanceof Error)) return fallback
@@ -63,22 +112,32 @@ function localizedError(cause: unknown, fallback: string, language: 'zh-CN' | 'e
 
 const desktopTunnelSupported = !window.stone || window.stonePlatform === 'win32'
 
-const allNavigation: Array<{ id: PageId; label: readonly [string, string]; icon: typeof Activity }> = [
-  { id: 'overview', label: ['总览', 'Overview'], icon: CircleGauge },
-  { id: 'providers', label: ['账号与中转', 'Accounts & Relays'], icon: Boxes },
-  { id: 'proxies', label: ['代理', 'Proxies'], icon: Waypoints },
-  { id: 'pools', label: ['号池', 'Pools'], icon: Network },
-  { id: 'routes', label: ['路由', 'Routes'], icon: RouteIcon },
-  { id: 'clients', label: ['客户端配置', 'Client Configuration'], icon: MonitorCog },
-  { id: 'session-repair', label: ['会话修复', 'Session Repair'], icon: Wrench },
-  { id: 'tunnel', label: ['内网穿透', 'Tunnel'], icon: Share2 },
-  { id: 'browser', label: ['内置浏览器', 'Built-in Browser'], icon: Globe2 },
-  { id: 'diagnostics', label: ['诊断', 'Diagnostics'], icon: Stethoscope },
-  { id: 'requests', label: ['请求记录', 'Request Logs'], icon: Activity },
-  { id: 'settings', label: ['设置', 'Settings'], icon: Settings },
+const allNavigation: Array<QuickNavigationItem<PageId>> = [
+  { id: 'overview', label: ['总览', 'Overview'], description: ['查看运行状态、额度、请求和健康概况', 'See gateway status, quota, requests, and health'], keywords: ['主页 状态 健康 额度', 'home status health quota'], icon: CircleGauge },
+  { id: 'providers', label: ['账号与中转', 'Accounts & Relays'], description: ['管理 OpenAI、Grok 账号、官方 API 和中转站', 'Manage OpenAI and Grok accounts, official APIs, and relays'], keywords: ['账户 key 密钥 oauth api 中转 导入', 'account key oauth api relay import'], icon: Boxes },
+  { id: 'proxies', label: ['代理', 'Proxies'], description: ['管理外部代理、订阅节点和内置代理接管', 'Manage external proxies, subscriptions, nodes, and built-in takeover'], keywords: ['系统代理 sing-box clash tun 节点 订阅', 'system proxy sing-box clash tun node subscription'], icon: Waypoints },
+  { id: 'pools', label: ['号池', 'Pools'], description: ['组合来源并设置轮换、粘性、并发和重试', 'Combine sources and configure rotation, stickiness, concurrency, and retries'], keywords: ['聚合 轮询 负载均衡 并发', 'aggregate rotation load balance concurrency'], icon: Network },
+  { id: 'routes', label: ['路由', 'Routes'], description: ['为 Codex、Claude、Gemini 和 Grok Build 选择上游', 'Choose upstreams for Codex, Claude, Gemini, and Grok Build'], keywords: ['模型 映射 协议 来源 客户端', 'model mapping protocol source client'], icon: RouteIcon },
+  { id: 'clients', label: ['客户端配置', 'Client Configuration'], description: ['一键连接、修复、启动并管理 AI 客户端', 'Connect, repair, launch, and manage AI clients'], keywords: ['codex claude gemini grok vscode desktop cli 启动 配置', 'codex claude gemini grok vscode desktop cli launch config'], icon: MonitorCog },
+  { id: 'session-repair', label: ['会话修复', 'Session Repair'], description: ['检查并修复会话索引、记录和残留状态', 'Inspect and repair session indexes, records, and stale state'], keywords: ['对话 恢复 历史 索引', 'conversation recovery history index'], icon: Wrench },
+  { id: 'tunnel', label: ['内网穿透', 'Tunnel'], description: ['配置 FRP，将本地网关提供给远端设备', 'Configure FRP access to the local gateway from remote devices'], keywords: ['frp frpc 远程 公网', 'frp frpc remote public network'], icon: Share2 },
+  { id: 'browser', label: ['内置浏览器', 'Built-in Browser'], description: ['在 Stone+ 内完成登录、授权和账号导入', 'Complete sign-in, authorization, and account imports inside Stone+'], keywords: ['登录 网页 oauth 导入 cookie', 'login web oauth import cookie'], icon: Globe2 },
+  { id: 'diagnostics', label: ['诊断', 'Diagnostics'], description: ['测试网关、代理、DNS、TLS 和上游连通性', 'Test gateway, proxy, DNS, TLS, and upstream connectivity'], keywords: ['网络 检测 故障 测试 证书', 'network test troubleshoot certificate'], icon: Stethoscope },
+  { id: 'requests', label: ['请求记录', 'Request Logs'], description: ['查看实时请求、延迟、Token、费用和错误', 'Inspect live requests, latency, tokens, cost, and errors'], keywords: ['日志 统计 流量 费用 失败', 'log statistics traffic cost failure'], icon: Activity },
+  { id: 'settings', label: ['设置', 'Settings'], description: ['调整网关、主题、备份、更新和高级选项', 'Configure gateway, themes, backups, updates, and advanced options'], keywords: ['偏好 端口 深色 语言 更新 备份', 'preferences port dark language update backup'], icon: Settings },
 ]
 
 const navigation = allNavigation.filter((item) => desktopTunnelSupported || item.id !== 'tunnel')
+const auxiliaryNavigation: Array<QuickNavigationItem<PageId>> = [
+  { id: 'setup', label: ['配置向导', 'Setup Wizard'], description: ['按步骤完成来源、号池、路由和客户端连接', 'Configure sources, pools, routes, and client connections step by step'], keywords: ['首次 新手 引导 开始', 'first run onboarding guide start'], icon: Play },
+  { id: 'help', label: ['帮助与下一步', 'Help & Next Steps'], description: ['按功能、现象或错误码查找解决方案', 'Find solutions by feature, symptom, or error code'], keywords: ['文档 教程 faq 问题', 'docs guide faq problem'], icon: CircleHelp },
+]
+const quickNavigationItems = [...navigation, ...auxiliaryNavigation]
+const quickNavigationPageIds = new Set<string>(quickNavigationItems.map((item) => item.id))
+
+function isPageId(value: string): value is PageId {
+  return quickNavigationPageIds.has(value)
+}
 
 function pageFromHash(): PageId {
   const candidate = window.location.hash.slice(1) as PageId
@@ -86,7 +145,28 @@ function pageFromHash(): PageId {
 }
 
 const SETUP_AUTO_SHOWN_STORAGE_KEY = 'stone.setup.auto-shown.v1'
+const SIDEBAR_COLLAPSED_STORAGE_KEY = 'stone.sidebar.collapsed.v1'
+const RECENT_PAGES_STORAGE_KEY = 'stone.navigation.recent.v1'
 const MOBILE_NAVIGATION_QUERY = '(max-width: 780px)'
+
+function storedBoolean(key: string): boolean {
+  try {
+    return window.localStorage.getItem(key) === 'true'
+  } catch {
+    return false
+  }
+}
+
+function storedRecentPages(): PageId[] {
+  try {
+    const value = JSON.parse(window.localStorage.getItem(RECENT_PAGES_STORAGE_KEY) ?? '[]')
+    if (!Array.isArray(value)) return []
+    const valid = new Set(quickNavigationItems.map((item) => item.id))
+    return value.filter((id): id is PageId => typeof id === 'string' && valid.has(id as PageId)).slice(0, 5)
+  } catch {
+    return []
+  }
+}
 const mobileSidebarFocusableSelector = [
   'a[href]',
   'button:not([disabled])',
@@ -136,6 +216,16 @@ function LoadingScreen() {
   )
 }
 
+function PageLoadingScreen() {
+  const { t } = useI18n()
+  return (
+    <div className="page-loading" role="status" aria-live="polite">
+      <RefreshCw size={18} className="spin" />
+      <span>{t('正在加载页面…', 'Loading page…')}</span>
+    </div>
+  )
+}
+
 interface ActivePageProps {
   page: PageId
   snapshot: AppSnapshot
@@ -155,20 +245,20 @@ const ActivePage = memo(function ActivePage({
   update,
   navigate,
 }: ActivePageProps) {
-  if (page === 'overview') return <OverviewView snapshot={snapshot} navigate={navigate} />
-  if (page === 'setup') return <SetupWizardView snapshot={snapshot} api={api} onExit={() => navigate('overview')} />
-  if (page === 'providers') return <ProvidersView snapshot={snapshot} api={api} runAction={runAction} busyKeys={busyKeys} />
-  if (page === 'proxies') return <ProxyView snapshot={snapshot} api={api} runAction={runAction} busyKeys={busyKeys} />
-  if (page === 'pools') return <PoolsView snapshot={snapshot} api={api} runAction={runAction} busyKeys={busyKeys} />
-  if (page === 'routes') return <RoutesView snapshot={snapshot} api={api} runAction={runAction} busyKeys={busyKeys} />
-  if (page === 'clients') return <ClientsView snapshot={snapshot} api={api} />
-  if (page === 'session-repair') return <SessionRepairView api={api} />
-  if (page === 'tunnel' && desktopTunnelSupported) return <TunnelView snapshot={snapshot} api={api} />
-  if (page === 'browser') return <BrowserView snapshot={snapshot} api={api} />
-  if (page === 'diagnostics') return <NetworkTestView snapshot={snapshot} api={api} />
-  if (page === 'requests') return <RequestsView snapshot={snapshot} api={api} runAction={runAction} busyKeys={busyKeys} />
-  if (page === 'settings') return <SettingsView snapshot={snapshot} api={api} runAction={runAction} busyKeys={busyKeys} update={update} />
-  if (page === 'help') return <HelpView snapshot={snapshot} api={api} navigate={navigate} />
+  if (page === 'overview') return <OverviewView snapshot={snapshot} api={api} navigate={navigate} />
+  if (page === 'setup') return <LazySetupWizardView snapshot={snapshot} api={api} onExit={() => navigate('overview')} />
+  if (page === 'providers') return <LazyProvidersView snapshot={snapshot} api={api} runAction={runAction} busyKeys={busyKeys} />
+  if (page === 'proxies') return <LazyProxyView snapshot={snapshot} api={api} runAction={runAction} busyKeys={busyKeys} />
+  if (page === 'pools') return <LazyPoolsView snapshot={snapshot} api={api} runAction={runAction} busyKeys={busyKeys} />
+  if (page === 'routes') return <LazyRoutesView snapshot={snapshot} api={api} runAction={runAction} busyKeys={busyKeys} />
+  if (page === 'clients') return <LazyClientsView snapshot={snapshot} api={api} />
+  if (page === 'session-repair') return <LazySessionRepairView api={api} />
+  if (page === 'tunnel' && desktopTunnelSupported) return <LazyTunnelView snapshot={snapshot} api={api} />
+  if (page === 'browser') return <LazyBrowserView snapshot={snapshot} api={api} />
+  if (page === 'diagnostics') return <LazyNetworkTestView snapshot={snapshot} api={api} />
+  if (page === 'requests') return <LazyRequestsView snapshot={snapshot} api={api} runAction={runAction} busyKeys={busyKeys} />
+  if (page === 'settings') return <LazySettingsView snapshot={snapshot} api={api} runAction={runAction} busyKeys={busyKeys} update={update} />
+  if (page === 'help') return <LazyHelpView snapshot={snapshot} api={api} navigate={navigate} />
   return null
 })
 
@@ -181,7 +271,13 @@ export default function App() {
   const [page, setPage] = useState<PageId>(pageFromHash)
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
   const [mobileLayout, setMobileLayout] = useState(() => window.matchMedia?.(MOBILE_NAVIGATION_QUERY).matches ?? false)
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => storedBoolean(SIDEBAR_COLLAPSED_STORAGE_KEY))
+  const [quickNavigationOpen, setQuickNavigationOpen] = useState(false)
+  const [operationCenterOpen, setOperationCenterOpen] = useState(false)
+  const [operationRecords, setOperationRecords] = useState<OperationRecord[]>([])
+  const [operationToast, setOperationToast] = useState<OperationRecord>()
+  const [recentPages, setRecentPages] = useState<PageId[]>(storedRecentPages)
+  const [backToTopVisible, setBackToTopVisible] = useState(false)
   const [busyKeys, setBusyKeys] = useState<Set<string>>(new Set())
   const [error, setError] = useState<string | null>(null)
   const [updateState, setUpdateState] = useState<AppUpdateState | null>(null)
@@ -199,8 +295,11 @@ export default function App() {
   const agentLifecycleRefreshInFlight = useRef<Promise<void> | null>(null)
   const activePageSnapshot = useRef<{ page: PageId; snapshot: AppSnapshot } | undefined>(undefined)
   const scrollbarHideTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+  const pageContentRef = useRef<HTMLElement>(null)
+  const backToTopVisibleRef = useRef(false)
   const mobileSidebarRef = useRef<HTMLElement>(null)
   const mobileNavTriggerRef = useRef<HTMLButtonElement>(null)
+  const operationSequence = useRef(0)
 
   const acceptUpdateState = useCallback((next: AppUpdateState) => {
     if (next.revision <= updateRevision.current) return
@@ -322,6 +421,41 @@ export default function App() {
   }, [])
 
   useEffect(() => {
+    const handleQuickNavigationShortcut = (event: KeyboardEvent) => {
+      if (!(event.ctrlKey || event.metaKey) || event.altKey || event.key.toLocaleLowerCase() !== 'k') return
+      event.preventDefault()
+      if (!quickNavigationOpen && document.querySelector('.modal-backdrop')) return
+      setQuickNavigationOpen((current) => !current)
+    }
+    document.addEventListener('keydown', handleQuickNavigationShortcut)
+    return () => document.removeEventListener('keydown', handleQuickNavigationShortcut)
+  }, [quickNavigationOpen])
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(SIDEBAR_COLLAPSED_STORAGE_KEY, String(sidebarCollapsed))
+    } catch {
+      // The UI remains usable when local storage is unavailable.
+    }
+  }, [sidebarCollapsed])
+
+  useEffect(() => {
+    pageContentRef.current?.scrollTo({ top: 0, left: 0 })
+    backToTopVisibleRef.current = false
+    setBackToTopVisible(false)
+    setRecentPages((current) => {
+      if (current[0] === page) return current
+      const next = [page, ...current.filter((id) => id !== page)].slice(0, 5)
+      try {
+        window.localStorage.setItem(RECENT_PAGES_STORAGE_KEY, JSON.stringify(next))
+      } catch {
+        // Recent navigation is an optional convenience only.
+      }
+      return next
+    })
+  }, [page])
+
+  useEffect(() => {
     const media = window.matchMedia?.(MOBILE_NAVIGATION_QUERY)
     if (!media) return
     const syncLayout = () => {
@@ -379,14 +513,56 @@ export default function App() {
     return () => window.removeEventListener('online', rebuildAfterNetworkReturn)
   }, [api])
 
+  const beginOperation = useCallback((key: string): string => {
+    const id = `${Date.now()}-${operationSequence.current += 1}`
+    const record: OperationRecord = {
+      id,
+      key,
+      label: operationLabelForKey(key, language),
+      status: 'running',
+      startedAt: Date.now(),
+    }
+    setOperationRecords((current) => [record, ...current].slice(0, 20))
+    return id
+  }, [language])
+
+  const finishOperation = useCallback((id: string, key: string, status: Exclude<OperationStatus, 'running'>, message?: string) => {
+    const completedAt = Date.now()
+    let completed: OperationRecord = {
+      id,
+      key,
+      label: operationLabelForKey(key, language),
+      status,
+      startedAt: completedAt,
+      completedAt,
+      message,
+    }
+    setOperationRecords((current) => current.map((record) => {
+      if (record.id !== id) return record
+      completed = { ...record, status, completedAt, message }
+      return completed
+    }))
+    if (operationShouldNotify(key, status)) setOperationToast(completed)
+  }, [language])
+
+  useEffect(() => {
+    if (!operationToast) return
+    const timer = window.setTimeout(() => setOperationToast(undefined), operationToast.status === 'error' ? 6000 : 3200)
+    return () => window.clearTimeout(timer)
+  }, [operationToast])
+
   const runAction: ActionRunner = useCallback(async (key, operation) => {
+    const operationId = beginOperation(key)
     setBusyKeys((current) => new Set(current).add(key))
     setError(null)
     try {
       acceptSnapshot(await operation())
+      finishOperation(operationId, key, 'success')
       return true
     } catch (cause) {
-      setError(localizedError(cause, t('操作失败，请稍后重试', 'The operation failed. Please try again later.'), language))
+      const message = localizedError(cause, t('操作失败，请稍后重试', 'The operation failed. Please try again later.'), language)
+      setError(message)
+      finishOperation(operationId, key, 'error', message)
       return false
     } finally {
       setBusyKeys((current) => {
@@ -395,12 +571,14 @@ export default function App() {
         return next
       })
     }
-  }, [acceptSnapshot, language, t])
+  }, [acceptSnapshot, beginOperation, finishOperation, language, t])
 
   const runAgentLifecycle = useCallback(async (
     operation: () => Promise<AgentLifecycleOperationResult>,
+    operationKey = 'agent-operation',
   ) => {
     if (agentOperationInFlight.current) return
+    const operationId = beginOperation(operationKey)
     agentOperationInFlight.current = true
     setAgentOperationPending(true)
     setError(null)
@@ -408,13 +586,16 @@ export default function App() {
       const result = await operation()
       setLastAgentOperation(result)
       acceptAgentLifecycleSnapshot(result.snapshot)
+      finishOperation(operationId, operationKey, 'success')
     } catch (cause) {
-      setError(localizedError(cause, t('Agent 操作失败', 'Agent operation failed'), language))
+      const message = localizedError(cause, t('Agent 操作失败', 'Agent operation failed'), language)
+      setError(message)
+      finishOperation(operationId, operationKey, 'error', message)
     } finally {
       agentOperationInFlight.current = false
       setAgentOperationPending(false)
     }
-  }, [acceptAgentLifecycleSnapshot, language, t])
+  }, [acceptAgentLifecycleSnapshot, beginOperation, finishOperation, language, t])
 
   const runAgentAction = useCallback((target: AgentTarget, action: AgentLifecycleControlAction) => {
     const operation = action === 'close'
@@ -424,7 +605,7 @@ export default function App() {
         : action === 'restart'
           ? () => api.restartAgent(target)
           : () => api.startAgent(target)
-    return runAgentLifecycle(operation)
+    return runAgentLifecycle(operation, `agent-${action}`)
   }, [api, runAgentLifecycle])
 
   const setActivePage = useCallback((id: PageId) => {
@@ -434,11 +615,11 @@ export default function App() {
   }, [])
 
   const repairAllAgents = useCallback(
-    () => runAgentLifecycle(() => api.repairAllAffectedAgents()),
+    () => runAgentLifecycle(() => api.repairAllAffectedAgents(), 'agent-repair-all'),
     [api, runAgentLifecycle],
   )
   const closeAllAgents = useCallback(
-    () => runAgentLifecycle(() => api.closeAllManagedAgents()),
+    () => runAgentLifecycle(() => api.closeAllManagedAgents(), 'agent-close-all'),
     [api, runAgentLifecycle],
   )
   const openClientConfiguration = useCallback(
@@ -448,6 +629,11 @@ export default function App() {
 
   const revealContentScrollbar = useCallback((event: UIEvent<HTMLElement>) => {
     const element = event.currentTarget
+    const nextBackToTopVisible = element.scrollTop > 420
+    if (backToTopVisibleRef.current !== nextBackToTopVisible) {
+      backToTopVisibleRef.current = nextBackToTopVisible
+      setBackToTopVisible(nextBackToTopVisible)
+    }
     element.classList.add('page-content--scrolling')
     if (scrollbarHideTimer.current) clearTimeout(scrollbarHideTimer.current)
     scrollbarHideTimer.current = setTimeout(() => {
@@ -464,19 +650,24 @@ export default function App() {
     action: UpdateAction,
     operation: () => Promise<AppUpdateState>,
   ): Promise<AppUpdateState | undefined> => {
+    const operationKey = `update-${action}`
+    const operationId = beginOperation(operationKey)
     setUpdateAction(action)
     setUpdateError(null)
     try {
       const next = await operation()
       acceptUpdateState(next)
+      finishOperation(operationId, operationKey, 'success')
       return next
     } catch (cause) {
-      setUpdateError(localizedError(cause, t('应用更新操作失败', 'The app update operation failed'), language))
+      const message = localizedError(cause, t('应用更新操作失败', 'The app update operation failed'), language)
+      setUpdateError(message)
+      finishOperation(operationId, operationKey, 'error', message)
       return undefined
     } finally {
       setUpdateAction(null)
     }
-  }, [acceptUpdateState, language, t])
+  }, [acceptUpdateState, beginOperation, finishOperation, language, t])
 
   const checkForUpdates = useCallback(async () => {
     const next = await runUpdateStateOperation('check', () => api.checkForUpdates())
@@ -561,6 +752,84 @@ export default function App() {
     install: installUpdate,
     openPage: openUpdatePage,
   }), [checkForUpdates, downloadUpdate, ignoreUpdate, installUpdate, openUpdatePage, updateAction, updateError, updateState])
+
+  const quickActionItems = useMemo<Array<QuickNavigationItem<string>>>(() => [
+    {
+      id: 'action:gateway-power',
+      label: snapshot?.gatewayStatus.running ? ['停止网关', 'Stop gateway'] : ['启动网关', 'Start gateway'],
+      description: snapshot?.gatewayStatus.running
+        ? ['停止接收新请求；执行前会再次确认', 'Stop accepting new requests after confirmation']
+        : ['启动本地网关并恢复客户端入口', 'Start the local gateway and restore client access'],
+      keywords: ['网关 开关 启动 停止', 'gateway power start stop'],
+      icon: Power,
+      kind: 'action',
+    },
+    {
+      id: 'action:rebuild-outbound',
+      label: ['重建低延迟出口', 'Rebuild low-latency connections'],
+      description: ['刷新连接并预热当前启用来源，不修改路由配置', 'Refresh connections and warm enabled sources without changing routes'],
+      keywords: ['网络 代理 节点 预热 重连', 'network proxy node warm reconnect'],
+      icon: RefreshCw,
+      kind: 'action',
+    },
+    {
+      id: 'action:check-updates',
+      label: ['检查应用更新', 'Check for updates'],
+      description: ['检查新的 Stone+ 正式版本', 'Check for a newer Stone+ release'],
+      keywords: ['版本 升级 release github', 'version upgrade release github'],
+      icon: Sparkles,
+      kind: 'action',
+    },
+    {
+      id: 'action:recent-operations',
+      label: ['查看最近操作', 'View recent operations'],
+      description: ['查看本次运行中的保存、检测、网关和重建结果', 'Review save, check, gateway, and rebuild results from this run'],
+      keywords: ['历史 进度 结果 失败', 'history progress result failure'],
+      icon: History,
+      kind: 'action',
+    },
+  ], [snapshot?.gatewayStatus.running])
+
+  const allQuickNavigationItems = useMemo(
+    () => [...quickNavigationItems, ...quickActionItems],
+    [quickActionItems],
+  )
+
+  const selectQuickNavigationItem = useCallback((id: string) => {
+    if (isPageId(id)) {
+      setActivePage(id)
+      return
+    }
+    if (id === 'action:recent-operations') {
+      setOperationCenterOpen(true)
+      return
+    }
+    if (!snapshot) return
+    if (id === 'action:gateway-power') {
+      if (snapshot.gatewayStatus.running) {
+        const active = snapshot.gatewayStatus.activeRequests
+        const confirmed = window.confirm(t(
+          active > 0
+            ? `停止网关会中断当前 ${active} 个活跃请求，是否继续？`
+            : '停止网关后客户端将暂时无法发送请求，是否继续？',
+          active > 0
+            ? `Stopping the gateway will interrupt ${active} active request(s). Continue?`
+            : 'Clients cannot send requests while the gateway is stopped. Continue?',
+        ))
+        if (!confirmed) return
+      }
+      void runAction('gateway-power', () => snapshot.gatewayStatus.running ? api.stopGateway() : api.startGateway())
+      return
+    }
+    if (id === 'action:rebuild-outbound') {
+      void runAction('rebuild-outbound', async () => {
+        await api.rebuildOutboundConnections()
+        return api.getSnapshot()
+      })
+      return
+    }
+    if (id === 'action:check-updates') void checkForUpdates()
+  }, [api, checkForUpdates, runAction, setActivePage, snapshot, t])
 
   const lifecycleAgents = useMemo(
     () => agentLifecycleSnapshot ? Object.values(agentLifecycleSnapshot.agents) : [],
@@ -670,7 +939,10 @@ export default function App() {
                 className={`nav-item ${page === item.id ? 'nav-item--active' : ''}`}
                 key={item.id}
                 type="button"
-                title={sidebarCollapsed ? t(item.label[0], item.label[1]) : undefined}
+                title={t(item.description[0], item.description[1])}
+                aria-current={page === item.id ? 'page' : undefined}
+                onPointerEnter={() => preloadAppPage(item.id)}
+                onFocus={() => preloadAppPage(item.id)}
                 onClick={() => setActivePage(item.id)}
               >
                 <Icon size={18} />
@@ -689,6 +961,8 @@ export default function App() {
             type="button"
             title={sidebarCollapsed ? t('帮助与下一步', 'Help & Next Steps') : undefined}
             aria-current={page === 'help' ? 'page' : undefined}
+            onPointerEnter={() => preloadAppPage('help')}
+            onFocus={() => preloadAppPage('help')}
             onClick={() => setActivePage('help')}
           >
             <CircleHelp size={18} />
@@ -714,11 +988,31 @@ export default function App() {
                 <span className="mono">{endpoint}</span>
               </div>
             </div>
+            <button
+              className="quick-navigation-trigger"
+              type="button"
+              aria-keyshortcuts="Control+K Meta+K"
+              onClick={() => setQuickNavigationOpen(true)}
+              title={t('查找功能或执行操作（Ctrl+K）', 'Find a feature or run an action (Ctrl+K)')}
+            >
+              <Search size={15} />
+              <span>{t('查找 / 操作', 'Find / Run')}</span>
+              <kbd>Ctrl K</kbd>
+            </button>
           </div>
 
           <div className="topbar__right">
+            <button
+              className="icon-button topbar__operations"
+              type="button"
+              onClick={() => setOperationCenterOpen(true)}
+              title={t('查看最近操作', 'View recent operations')}
+              aria-label={t('查看最近操作', 'View recent operations')}
+            >
+              <History size={17} />
+            </button>
             {(page === 'overview' || page === 'providers') && (
-              <button className="button button--secondary topbar__setup" type="button" onClick={() => setActivePage('setup')}>
+              <button className="button button--secondary topbar__setup" type="button" onPointerEnter={() => preloadAppPage('setup')} onFocus={() => preloadAppPage('setup')} onClick={() => setActivePage('setup')}>
                 <Play size={15} />{t('配置向导', 'Setup Wizard')}
               </button>
             )}
@@ -763,22 +1057,50 @@ export default function App() {
           </div>
         )}
 
-        <main className="page-content" onScroll={revealContentScrollbar}>
+        <main ref={pageContentRef} className="page-content" onScroll={revealContentScrollbar}>
           <PageErrorBoundary resetKey={page}>
             <div className="page-transition" key={page}>
-              <ActivePage
-                page={page}
-                snapshot={pageSnapshot}
-                api={api}
-                runAction={runAction}
-                busyKeys={busyKeys}
-                update={updateController}
-                navigate={setActivePage}
-              />
+              <Suspense fallback={<PageLoadingScreen />}>
+                <ActivePage
+                  page={page}
+                  snapshot={pageSnapshot}
+                  api={api}
+                  runAction={runAction}
+                  busyKeys={busyKeys}
+                  update={updateController}
+                  navigate={setActivePage}
+                />
+              </Suspense>
             </div>
           </PageErrorBoundary>
         </main>
+        {backToTopVisible && (
+          <button
+            className="page-back-to-top"
+            type="button"
+            onClick={() => pageContentRef.current?.scrollTo({ top: 0, behavior: 'smooth' })}
+            title={t('返回页面顶部', 'Back to the top of this page')}
+          >
+            <ArrowUp size={15} />
+            <span>{t('返回顶部', 'Back to top')}</span>
+          </button>
+        )}
       </div>
+      <QuickNavigation
+        open={quickNavigationOpen}
+        activeId={page}
+        recentIds={recentPages}
+        items={allQuickNavigationItems}
+        onClose={() => setQuickNavigationOpen(false)}
+        onSelect={selectQuickNavigationItem}
+      />
+      <OperationCenter
+        open={operationCenterOpen}
+        records={operationRecords}
+        onClose={() => setOperationCenterOpen(false)}
+        onClear={() => setOperationRecords([])}
+      />
+      <OperationToast record={operationToast} onClose={() => setOperationToast(undefined)} />
       <UpdateDialog
         open={updateDialogOpen}
         state={updateState}

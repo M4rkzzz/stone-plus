@@ -41,6 +41,7 @@ import { StoneMark } from '../StoneMark'
 import { UpdateProgress, statusLabel, statusTone, type AppUpdateController } from '../UpdateDialog'
 import { translate, useI18n, type UiLanguage } from '../i18n'
 import { ThemeEditor } from '../theme-editor'
+import { useLowResourceMode } from '../low-resource-mode'
 import {
   LatestAutosaveScheduler,
   SETTINGS_AUTOSAVE_DELAY_MS,
@@ -187,6 +188,7 @@ export function SettingsView({
   update: AppUpdateController
 }) {
   const { t, language, locale, preference, setPreference } = useI18n()
+  const { enabled: lowResourceMode, setEnabled: setLowResourceMode } = useLowResourceMode()
   const builtInProxyInterlocked = useBuiltInProxyInterlock(snapshot, api)
   const [draft, setDraft] = useState<GatewaySettings>(snapshot.gateway)
   const [errors, setErrors] = useState<Record<string, string>>({})
@@ -717,6 +719,14 @@ export function SettingsView({
         <header><div className="settings-section__icon"><Palette size={18} /></div><div><h2>{t('外观', 'Appearance')}</h2></div></header>
         <div className="settings-section__content">
           <ThemeEditor />
+          <SettingRow
+            title={t('低资源模式', 'Low-resource mode')}
+            description={t(
+              '降低非关键遥测的刷新频率、暂停隐藏窗口的后台工作并关闭装饰性动画；不影响网关转发、代理核心或客户端进程。',
+              'Refresh non-critical telemetry less often, pause hidden-window background work, and disable decorative motion. Gateway forwarding, proxy cores, and client processes are unaffected.',
+            )}
+            control={<Toggle checked={lowResourceMode} onChange={setLowResourceMode} label={t('低资源模式', 'Low-resource mode')} />}
+          />
         </div>
       </section>
 

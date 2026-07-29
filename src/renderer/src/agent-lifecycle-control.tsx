@@ -28,6 +28,7 @@ import {
 } from '@shared/agent-lifecycle'
 import { clientBrandMeta } from './brand-icons'
 import { useI18n } from './i18n'
+import { useVisibilityAwareInterval } from './visibility-interval'
 import './agent-lifecycle-control.css'
 
 export type AgentLifecycleControlAction = 'close' | 'restore' | 'restart' | 'start'
@@ -191,12 +192,14 @@ export function AgentLifecycleControl({
     }
   }, [open])
 
-  useEffect(() => {
-    if (!open || !onRequestRefresh) return undefined
-    void onRequestRefresh()
-    const timer = window.setInterval(() => void onRequestRefresh(), 2_000)
-    return () => window.clearInterval(timer)
-  }, [onRequestRefresh, open])
+  useVisibilityAwareInterval(
+    () => onRequestRefresh?.(),
+    2_000,
+    open && Boolean(onRequestRefresh),
+    true,
+    undefined,
+    2,
+  )
 
   const invoke = (target: AgentTarget, action: AgentLifecycleControlAction) => {
     void onAction(target, action)
@@ -217,10 +220,10 @@ export function AgentLifecycleControl({
         onClick={() => setOpen((current) => !current)}
       >
         <span className="agent-lifecycle__brands" aria-hidden="true">
-          <img className={clientBrandMeta.codex.iconClassName} src={clientBrandMeta.codex.icon} alt="" />
-          <img src={clientBrandMeta.claude.icon} alt="" />
-          <img src={clientBrandMeta.gemini.icon} alt="" />
-          <img src={clientBrandMeta.grokbuild.icon} alt="" />
+          <span><img className={clientBrandMeta.codex.iconClassName} src={clientBrandMeta.codex.icon} alt="" /></span>
+          <span><img src={clientBrandMeta.claude.icon} alt="" /></span>
+          <span><img src={clientBrandMeta.gemini.icon} alt="" /></span>
+          <span><img src={clientBrandMeta.grokbuild.icon} alt="" /></span>
         </span>
         {busy ? <RefreshCw className="agent-lifecycle__busy spin" size={13} aria-hidden="true" /> : <ChevronDown className="agent-lifecycle__chevron" size={13} aria-hidden="true" />}
       </button>
@@ -316,7 +319,9 @@ function AgentRow({
   const displayState = displayStateForAgent(agent)
   return (
     <article className={`agent-lifecycle__agent agent-lifecycle__agent--${displayState}`}>
-      <img className={`agent-lifecycle__agent-icon ${meta.iconClassName ?? ''}`.trim()} src={meta.icon} alt="" />
+      <span className="agent-lifecycle__agent-icon" aria-hidden="true">
+        <img className={meta.iconClassName} src={meta.icon} alt="" />
+      </span>
       <div className="agent-lifecycle__agent-copy">
         <div className="agent-lifecycle__agent-title">
           <strong>{meta.name}</strong>

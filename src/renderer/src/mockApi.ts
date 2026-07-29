@@ -1289,6 +1289,7 @@ export function createMockApi(): GatewayApi {
       await pause(280)
       return localizeMockSnapshot(snapshot)
     },
+    async openRequestMonitor() {},
     async saveProvider(input: ProviderInput) {
       const timestamp = Date.now()
       const existing = input.id ? snapshot.providers.find((provider) => provider.id === input.id) : undefined

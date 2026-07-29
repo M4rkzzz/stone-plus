@@ -73,6 +73,15 @@ try {
   await window.evaluate(() => window.localStorage.setItem('stone.ui.language', 'zh-CN'))
   await window.reload({ waitUntil: 'domcontentloaded' })
   await window.locator('.app-shell').waitFor({ timeout: 30_000 })
+  await window.keyboard.press('Control+K')
+  const quickNavigationSearch = window.getByRole('combobox', { name: '搜索 Stone+ 功能' })
+  await quickNavigationSearch.waitFor()
+  await quickNavigationSearch.fill('请求记录')
+  await quickNavigationSearch.press('Enter')
+  await window.getByRole('heading', { name: '请求日志', exact: true }).waitFor()
+  const quickNavigationWorks = await window.evaluate(() => window.location.hash === '#requests')
+  await window.locator('.nav-item').filter({ hasText: '总览' }).click()
+  await window.getByRole('heading', { name: '总览', exact: true }).waitFor()
   const agentControlButton = window.getByRole('button', { name: 'Agent 控制' })
   await agentControlButton.waitFor({ timeout: 30_000 })
   const chatGptRepairRestartButtonVisible = await agentControlButton.isVisible()
@@ -392,12 +401,16 @@ try {
   const routeSourceSaveWorks = routeSourceSnapshot.routes.some((route) => route.client === 'codex' && route.poolId === relayOneProvider.id)
 
   await window.locator('.nav-item').filter({ hasText: '号池' }).click()
+  await window.getByRole('heading', { name: '号池', exact: true }).waitFor()
   const apiPoolCard = window.locator('.pool-card').filter({ hasText: 'Smoke Official API Pool' })
   const aggregatePoolCard = window.locator('.pool-card').filter({ hasText: 'Smoke Aggregate Relay' })
   const relayPoolCard = window.locator('.pool-card--relay-source').filter({ hasText: 'Smoke Relay One' })
   const apiFastSwitch = apiPoolCard.getByRole('switch', { name: '号池 Smoke Official API Pool FAST' })
   const aggregateFastSwitch = aggregatePoolCard.getByRole('switch', { name: '号池 Smoke Aggregate Relay FAST' })
   const relayFastSwitch = relayPoolCard.getByRole('switch', { name: '中转站 Smoke Relay One FAST' })
+  await apiPoolCard.waitFor()
+  await aggregatePoolCard.waitFor()
+  await relayPoolCard.waitFor()
   const poolFastSurfaceTogglesVisible = await apiFastSwitch.isVisible()
     && await aggregateFastSwitch.isVisible()
     && await relayFastSwitch.isVisible()
@@ -472,7 +485,7 @@ try {
   }), { sessionId: wizard.sessionId })
   await window.evaluate(() => { window.location.hash = '#setup' })
   await window.getByRole('heading', { name: '你准备使用什么来源？' }).waitFor({ timeout: 15_000 })
-  await window.getByRole('button', { name: /Codex OAuth \/ Sub2API CPA/ }).click()
+  await window.getByRole('button', { name: /ChatGPT \/ Codex 账号/ }).click()
   await window.getByRole('heading', { name: '添加 Codex 账号', exact: true }).waitFor()
   const setupOauthTab = window.getByRole('tab', { name: /OAuth 授权/ })
   const setupTokenJsonTab = window.getByRole('tab', { name: /Token \/ JSON/ })
@@ -823,6 +836,7 @@ try {
   await window.reload({ waitUntil: 'domcontentloaded' })
   await window.locator('.nav-item').filter({ hasText: 'Overview' }).waitFor()
   await window.locator('.nav-item').filter({ hasText: 'Settings' }).click()
+  await window.getByRole('heading', { name: 'Settings' }).waitFor()
   const languageSelect = window.getByLabel('界面语言 / Display language')
   const englishUiWorks = await window.getByRole('heading', { name: 'Settings' }).isVisible()
     && await window.locator('.settings-section').first().getByText('语言 / Language').isVisible()
@@ -845,6 +859,7 @@ try {
 
   const result = {
     title: await window.title(),
+    quickNavigationWorks,
     providers: initial.providers.length,
     routes: initial.routes.length,
     credentialsExposed: Object.hasOwn(initial, 'credentials'),
@@ -1029,6 +1044,7 @@ try {
 
   if (
     result.title !== 'Stone+' ||
+    !result.quickNavigationWorks ||
     result.providers < 1 ||
     result.routes !== 4 ||
     result.credentialsExposed ||

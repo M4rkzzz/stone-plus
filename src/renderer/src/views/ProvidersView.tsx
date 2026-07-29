@@ -73,6 +73,7 @@ import {
   providerProbeStatusLabel,
 } from '../backend-message'
 import { useI18n } from '../i18n'
+import { useVisibilityAwareInterval } from '../visibility-interval'
 import {
   KIRO_COMPATIBLE_KIND,
   newRelayConnectionDefaults,
@@ -246,15 +247,9 @@ function AccountFitness({ fitness }: { fitness?: AccountFitnessSnapshot }) {
   </div>
 }
 
-function CooldownCountdown({ account }: { account: PublicAccount }) {
+function CooldownCountdown({ account, now }: { account: PublicAccount; now: number }) {
   const { t, locale } = useI18n()
-  const [now, setNow] = useState(() => Date.now())
   const until = accountRecoveryAt(account, now)
-  useEffect(() => {
-    if (until === undefined || until <= Date.now()) return
-    const timer = window.setInterval(() => setNow(Date.now()), 30_000)
-    return () => window.clearInterval(timer)
-  }, [until])
   if (until === undefined || until <= now) return null
   return <span className="row-note row-note--warning" title={t(`预计解冻：${new Date(until).toLocaleString(locale)}`, `Expected recovery: ${new Date(until).toLocaleString(locale)}`)}>
     {account.cooldownReason === 'quota' || accountQuotaIsExhausted(account, now) ? t('额度恢复', 'Quota recovery') : t('冷却恢复', 'Cooldown recovery')} {thawCountdown(until, now)}
@@ -264,16 +259,13 @@ function CooldownCountdown({ account }: { account: PublicAccount }) {
 function OAuthExpiryCountdown({ expiresAt }: { expiresAt: number }) {
   const { t } = useI18n()
   const [now, setNow] = useState(() => Date.now())
-  useEffect(() => {
-    setNow(Date.now())
-    if (expiresAt <= Date.now()) return
-    const timer = window.setInterval(() => {
-      const current = Date.now()
-      setNow(current)
-      if (current >= expiresAt) window.clearInterval(timer)
-    }, 1_000)
-    return () => window.clearInterval(timer)
-  }, [expiresAt])
+  useVisibilityAwareInterval(
+    () => setNow(Date.now()),
+    1_000,
+    expiresAt > now,
+    true,
+    expiresAt,
+  )
   const seconds = Math.max(0, Math.ceil((expiresAt - now) / 1_000))
   return <strong>{seconds > 0 ? `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}` : t('即将过期', 'Expiring soon')}</strong>
 }
@@ -653,6 +645,7 @@ export function ProvidersView({
   const [quotaAccountId, setQuotaAccountId] = useState<string | null>(null)
   const [selectedAccountIds, setSelectedAccountIds] = useState<string[]>([])
   const [accountPage, setAccountPage] = useState(0)
+  const [cooldownNow, setCooldownNow] = useState(() => Date.now())
   const [bulkDeleteOpen, setBulkDeleteOpen] = useState(false)
   const [exportOpen, setExportOpen] = useState(false)
   const [exportFormat, setExportFormat] = useState<'sub2api' | 'cpa'>('sub2api')
@@ -713,6 +706,18 @@ export function ProvidersView({
     return true
   }), [hideExhaustedAccounts, oauthAccounts, tagFilter])
   const visibleAccountPage = useMemo(() => paginateAccounts(visibleAccounts, accountPage), [accountPage, visibleAccounts])
+  const hasVisibleCooldown = visibleAccountPage.items.some((account) => {
+    const recoveryAt = accountRecoveryAt(account, cooldownNow)
+    return recoveryAt !== undefined && recoveryAt > cooldownNow
+  })
+  useVisibilityAwareInterval(
+    () => setCooldownNow(Date.now()),
+    30_000,
+    hasVisibleCooldown,
+    true,
+    undefined,
+    2,
+  )
   const exportAccountPageState = useMemo(() => paginateAccounts(oauthAccounts, exportAccountPage), [exportAccountPage, oauthAccounts])
   const selectedAccountIdSet = useMemo(() => new Set(selectedAccountIds), [selectedAccountIds])
   const exportAccountIdSet = useMemo(() => new Set(exportAccountIds), [exportAccountIds])
@@ -1920,7 +1925,7 @@ export function ProvidersView({
                         <td className="account-select-column"><input type="checkbox" aria-label={t(`选择账号 ${account.name}`, `Select account ${account.name}`)} checked={selectedAccountIdSet.has(account.id)} onChange={() => toggleSelectedAccount(account.id)} /></td>
                         <td><div className="provider-cell"><ProviderAvatar kind={provider?.kind} name={provider?.name} color={provider?.color} /><div><strong title={account.name}>{accountNameById.get(account.id) ?? account.name}</strong><span>{provider?.name ?? t('供应商已删除', 'Provider deleted')}{account.proxyId ? ` · ${proxyById.get(account.proxyId)?.name ?? t('代理已删除', 'Proxy deleted')}` : ''} · {modelSummary}</span></div></div></td>
                         <td>{account.tagId && tagById.has(account.tagId) ? <span className="account-tag-chip"><Tag size={12} />{tagById.get(account.tagId)?.name}</span> : <span className="muted">{t('未标记', 'Untagged')}</span>}</td>
-                        <td><AccountStatusBadge status={account.status} circuitState={account.circuitState} /><CooldownCountdown account={account} />{isOAuthManagedCredential(account.credentialType) && <span className="row-note">{account.credentialType === 'chatgpt-agent-identity' ? 'Agent Identity' : account.credentialType === 'grok-oauth' ? 'Grok OAuth' : 'ChatGPT OAuth'} · {account.renewable ? t('可续期', 'Renewable') : t('会话到期即停用', 'Disabled when the session expires')}</span>}{provider?.kind === 'xai' && account.credentialType !== 'grok-oauth' && <span className="row-note">xAI API Key</span>}{Boolean(account.consecutiveFailures) && <span className="row-note">{t('连续失败', 'Consecutive failures')} {account.consecutiveFailures}</span>}{account.lastError && <span className="row-note row-note--danger" title={localizeBackendMessage(account.lastError, language, t('账号检测失败', 'Account check failed.'))}>{localizeBackendMessage(account.lastError, language, t('账号检测失败', 'Account check failed.'))}</span>}</td>
+                        <td><AccountStatusBadge status={account.status} circuitState={account.circuitState} /><CooldownCountdown account={account} now={cooldownNow} />{isOAuthManagedCredential(account.credentialType) && <span className="row-note">{account.credentialType === 'chatgpt-agent-identity' ? 'Agent Identity' : account.credentialType === 'grok-oauth' ? 'Grok OAuth' : 'ChatGPT OAuth'} · {account.renewable ? t('可续期', 'Renewable') : t('会话到期即停用', 'Disabled when the session expires')}</span>}{provider?.kind === 'xai' && account.credentialType !== 'grok-oauth' && <span className="row-note">xAI API Key</span>}{Boolean(account.consecutiveFailures) && <span className="row-note">{t('连续失败', 'Consecutive failures')} {account.consecutiveFailures}</span>}{account.lastError && <span className="row-note row-note--danger" title={localizeBackendMessage(account.lastError, language, t('账号检测失败', 'Account check failed.'))}>{localizeBackendMessage(account.lastError, language, t('账号检测失败', 'Account check failed.'))}</span>}</td>
                         <td><AccountFitness fitness={account.fitness} /></td>
                         <td><span className="mono masked-key">{account.maskedCredential}</span></td>
                         <td><div className="concurrency-cell"><strong>{account.inFlight} / {account.maxConcurrency}</strong><div className="mini-progress"><span style={{ width: `${Math.min(100, account.inFlight / account.maxConcurrency * 100)}%` }} /></div></div></td>
@@ -1960,6 +1965,7 @@ export function ProvidersView({
                 ? <img className="account-family-empty-icon brand-icon--openai" src={providerBrandIcon('openai')} alt="" />
                 : <img className="account-family-empty-icon" src={providerBrandIcon('xai-compatible')} alt="" />}
               title={accountFamily === 'openai' ? t('尚未添加 Codex 账号', 'No Codex accounts yet') : t('尚未添加 Grok 账号', 'No Grok accounts yet')}
+              description={accountFamily === 'openai' ? t('支持 OAuth、Token JSON 和批量导入，添加后可以加入同协议号池。', 'Use OAuth, token JSON, or batch import, then add accounts to a matching pool.') : t('导入 Grok OAuth 凭据后会自动标记来源，并可加入 Grok 号池。', 'Imported Grok OAuth credentials are tagged automatically and can join Grok pools.')}
               action={accountFamily === 'openai' ? <button className="button button--primary" type="button" onClick={openChatGptAccountDialog}><Plus size={16} />{t('添加 Codex 账号', 'Add Codex account')}</button> : <button className="button button--primary" type="button" onClick={openGrokCredential}><Plus size={16} />{t('添加 Grok 凭据', 'Add Grok credential')}</button>}
             />
           )}
@@ -2014,7 +2020,7 @@ export function ProvidersView({
             })}
           </div>
         ) : (
-          <section id={`providers-panel-${tab}`} className="panel" role="tabpanel" aria-labelledby={`providers-tab-${tab}`}><EmptyState icon={<Server size={24} />} title={tab === 'official' ? t('尚未配置官方 API', 'No official APIs configured') : t('尚未配置中转站', 'No relays configured')} action={<button className="button button--primary" type="button" onClick={() => openProvider(tab === 'official' ? 'official-api' : 'relay')}><Plus size={16} />{tab === 'official' ? t('添加官方 API', 'Add official API') : t('添加中转站', 'Add relay')}</button>} /></section>
+          <section id={`providers-panel-${tab}`} className="panel" role="tabpanel" aria-labelledby={`providers-tab-${tab}`}><EmptyState icon={<Server size={24} />} title={tab === 'official' ? t('尚未配置官方 API', 'No official APIs configured') : t('尚未配置中转站', 'No relays configured')} description={tab === 'official' ? t('添加官方 Key 后可直接建立路由或加入同协议号池。', 'Add an official API key to route directly or include it in a matching pool.') : t('填写地址、协议和凭据；保存前可以先执行能力检测。', 'Enter the endpoint, protocol, and credential, then probe capabilities before use.')} action={<button className="button button--primary" type="button" onClick={() => openProvider(tab === 'official' ? 'official-api' : 'relay')}><Plus size={16} />{tab === 'official' ? t('添加官方 API', 'Add official API') : t('添加中转站', 'Add relay')}</button>} /></section>
         )
       )}
 
