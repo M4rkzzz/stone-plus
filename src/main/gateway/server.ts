@@ -1,6 +1,10 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { createHash, randomUUID } from 'node:crypto'
-import { isSafeRouteModelMapKey, resolveRouteModel } from '../../shared/route-models'
+import {
+  isSafeRouteModelMapKey,
+  resolveRouteModel,
+  resolveRouteSourceId,
+} from '../../shared/route-models'
 import { supportsFastServiceTier } from '../../shared/types'
 import { providerSourceFamily } from '../../shared/source-family'
 import {
@@ -142,7 +146,7 @@ const QUOTA_EXHAUSTED_RECHECK_MS = 30_000
 // and Responses can receive response.completed without reviving indefinite
 // half-open streams. The configured idle timeout still wins when it is lower.
 const TRAILING_FRAME_DRAIN_MS = 2_000
-const RESPONSES_TERMINAL_IDLE_TIMEOUT_MS = 30_000
+const RESPONSES_TERMINAL_IDLE_TIMEOUT_MS = 65_000
 // Search entitlement is attached to the concrete OAuth grant, not merely to
 // the account's broad credential type. Remember a proven endpoint capability
 // long enough to remove a guaranteed 401 from normal use, while periodically
@@ -943,6 +947,9 @@ export class GatewayServer implements GatewayController {
         : { hasToolState: false, hasToolResult: false }
       model = getRequestModel(incoming.protocol, body, pathname)
       if (!model) throw new GatewayHttpError(400, 'A model is required')
+      const targetModel = resolveRouteModel(logRoute.modelMap, model)
+      const effectiveSourceId = resolveRouteSourceId(logRoute.poolId, logRoute.modelSourceMap, model)
+      upstreamModel = targetModel
       const codexSearch = incoming.operation === 'codex-search'
       const codexCompact = incoming.operation === 'codex-compact'
       const countTokens = incoming.operation === 'count-tokens'
@@ -964,7 +971,7 @@ export class GatewayServer implements GatewayController {
         : false
 
       failureStage = 'scheduler'
-      const pool = requestIndex.poolsById.get(logRoute?.poolId ?? '')
+      const pool = requestIndex.poolsById.get(effectiveSourceId)
       if (!pool) throw new GatewayHttpError(503, 'The matched route has no available pool')
       const configuredProviderAccounts = requestIndex.accountsByPoolId.get(pool.id) ?? []
       let providerAccounts = configuredProviderAccounts
@@ -1122,8 +1129,6 @@ export class GatewayServer implements GatewayController {
             .catch(() => undefined)
         }
       }
-      const targetModel = resolveRouteModel(logRoute.modelMap, model)
-      upstreamModel = targetModel
       const kiroProviderAccounts = providerAccounts.filter((account) => (
         requestIndex.providersById.get(account.providerId)?.protocol === 'kiro-claude'
       ))
@@ -1516,6 +1521,8 @@ export class GatewayServer implements GatewayController {
           const tieredOutboundBody = !codexSearch && !codexCompact && !compactFallback
             && provider.kind !== 'xai'
             && provider.kind !== 'xai-compatible'
+            && provider.kind !== 'deepseek'
+            && provider.kind !== 'deepseek-compatible'
             && supportsFastServiceTier(provider.protocol)
             ? normalizeOpenAIServiceTier(outboundBody, pool.forceFastMode === true)
             : outboundBody
@@ -2855,6 +2862,10 @@ export class GatewayServer implements GatewayController {
           const compactCapabilityFailure = codexCompactV2
             && !attemptedCompactFallback
             && !hardAccountFailure
+          const failureCooldownDisabled = this.config.settings.disableCooldown === true
+            && accountAction !== 'disable'
+            && gatewayError.providerFailure?.category !== 'rate_limit'
+            && !quotaExhausted
           if (attemptedAccount && requestScopedModelFailure && hasCurrentModeAlternative) {
             // A model-scoped denial says nothing about the account's other
             // models or overall credential health. Exclude it only from this
@@ -2879,12 +2890,14 @@ export class GatewayServer implements GatewayController {
               || explicitRetryAfterAdmissionFailure
             )) {
               failedAccountIds.add(attemptedAccount.id)
-              this.scheduler.recordStickyFailure(schedulingPool.id, sessionId, attemptedAccount.id)
+              if (!failureCooldownDisabled) {
+                this.scheduler.recordStickyFailure(schedulingPool.id, sessionId, attemptedAccount.id)
+              }
               const retryAfterMs = Math.max(
                 gatewayError.providerFailure?.retryAfterMs ?? 0,
                 actualResetAt === undefined ? 0 : Math.max(0, actualResetAt - failureNow)
               )
-              const health = this.scheduler.recordFailure(attemptedAccount.id, {
+              const health = failureCooldownDisabled ? undefined : this.scheduler.recordFailure(attemptedAccount.id, {
                 retryAfterMs,
                 maxConcurrency: attemptedAccount.maxConcurrency,
                 expectedRevision: selectedHealthRevision,
@@ -2893,7 +2906,7 @@ export class GatewayServer implements GatewayController {
                   ? 'quota'
                   : 'failure'
               })
-              if (health.applied) {
+              if (health?.applied) {
                 this.emitAccountState({
                   accountId: attemptedAccount.id,
                   status: accountAction === 'disable' ? 'disabled' : 'cooldown',
@@ -3162,9 +3175,16 @@ export class GatewayServer implements GatewayController {
       const pool = index.poolsById.get(route.poolId)
       if (!pool) throw new GatewayHttpError(503, 'The matched route has no available pool')
       const accounts = index.accountsByPoolId.get(pool.id) ?? []
-      const models = projectRouteModels(
+      const models = uniqueModels([
+        ...projectRouteModels(
         enumerablePoolModels(pool, accounts, index.providersById),
         route.modelMap
+        ),
+        ...Object.keys(route.modelSourceMap ?? {}).filter((model) => model !== '*' && isSafeRouteModelMapKey(model)),
+      ])
+      const sourceUpdatedAt = Math.max(
+        pool.updatedAt,
+        ...Object.values(route.modelSourceMap ?? {}).map((sourceId) => index.poolsById.get(sourceId)?.updatedAt ?? 0),
       )
       response.setHeader('cache-control', 'no-store')
       await this.writeJson(
@@ -3173,8 +3193,8 @@ export class GatewayServer implements GatewayController {
         kind === 'gemini'
           ? geminiModelList(models)
           : route.inboundProtocol === 'anthropic-messages'
-            ? anthropicModelList(models, pool.updatedAt)
-            : openAiModelList(models, pool.updatedAt)
+            ? anthropicModelList(models, sourceUpdatedAt)
+            : openAiModelList(models, sourceUpdatedAt)
       )
     } catch (error) {
       const gatewayError = normalizeError(error)

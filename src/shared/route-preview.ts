@@ -1,5 +1,5 @@
 import { evaluateSourceEligibility } from './source-eligibility'
-import { resolveRouteModel } from './route-models'
+import { resolveRouteModel, resolveRouteSourceId } from './route-models'
 import {
   analyzeRouteSourceCompatibility,
   isCurrentlySchedulableRouteAccount,
@@ -24,15 +24,21 @@ export function previewRoute(
   const issues: RoutePreviewIssue[] = []
   const requestedModel = normalizeModel(input.requestedModel)
   const upstreamModel = requestedModel ? resolveRouteModel(route.modelMap, requestedModel) : undefined
+  const sourceId = requestedModel
+    ? resolveRouteSourceId(route.poolId, route.modelSourceMap, requestedModel)
+    : route.poolId
   if (!route.enabled) issues.push(issue('route-disabled', 'warning', '路由当前处于停用状态。'))
   if (route.inboundProtocol !== clientNativeProtocols[route.client]) {
     issues.push(issue('invalid-inbound-protocol', 'error', '入站协议与客户端原生协议不一致。'))
   }
 
-  const source = resolveRouteSource(route.poolId, snapshot)
+  const source = resolveRouteSource(sourceId, snapshot)
   if (!source) {
     issues.push(issue('source-missing', 'error', '目标来源不存在或配置不完整。'))
-    return result(route.poolId, route.inboundProtocol, requestedModel, upstreamModel, 0, issues)
+    return result(sourceId, route.inboundProtocol, requestedModel, upstreamModel, 0, issues)
+  }
+  if (sourceId !== route.poolId) {
+    issues.push(issue('source-overridden', 'info', `模型 ${requestedModel} 将改走来源 ${source.summary.name}。`))
   }
   const topologyValid = isRouteSourcePoolTopologyValid(source.pool, snapshot)
   const sourceCompatibility = analyzeRouteSourceCompatibility(route.client, source, snapshot)
@@ -116,7 +122,7 @@ export function previewRoute(
   }
 
   return {
-    ...result(route.poolId, route.inboundProtocol, requestedModel, upstreamModel, eligibility.schedulable.length, issues),
+    ...result(sourceId, route.inboundProtocol, requestedModel, upstreamModel, eligibility.schedulable.length, issues),
     sourceName: source.summary.name,
     sourceProtocol: previewSourceProtocol,
   }

@@ -33,9 +33,11 @@ export function supportsPoolFastServiceTier(protocol: PoolProtocol): boolean {
 export type ProviderKind =
   | 'anthropic'
   | 'openai'
+  | 'deepseek'
   | 'xai'
   | 'google'
   | 'openai-compatible'
+  | 'deepseek-compatible'
   | 'xai-compatible'
   | 'anthropic-compatible'
   | 'kiro-compatible'
@@ -762,6 +764,10 @@ export interface CodexQuotaHistoryPoint {
 export interface CodexQuotaCycleCosts {
   fiveHourUsd?: number
   sevenDayUsd?: number
+  fiveHourCredits?: number
+  sevenDayCredits?: number
+  fiveHourUnpricedCreditTokens?: number
+  sevenDayUnpricedCreditTokens?: number
 }
 
 export interface PoolMember {
@@ -807,6 +813,8 @@ export interface Route {
   poolId: string
   inboundProtocol: Protocol
   modelMap: Record<string, string>
+  /** Exact requested-model to route-source overrides. Unmatched models keep using poolId. */
+  modelSourceMap?: Record<string, string>
   localToken: string
   createdAt: number
   updatedAt: number
@@ -822,6 +830,8 @@ export interface GatewaySettings {
   responsesWebSocketEnabled?: boolean
   /** Disable the optional Work Louder Codex Micro integration on managed Codex restarts. */
   disableCodexMicro?: boolean
+  /** Keep retry/failover behavior but do not place sources into failure cooldown. Quota cooldowns remain enforced. */
+  disableCooldown?: boolean
   launchAtLogin?: boolean
   desktopNotifications?: boolean
   automaticBackups?: boolean
@@ -1516,6 +1526,7 @@ export interface RoutePreviewIssue {
     | 'invalid-inbound-protocol'
     | 'source-missing'
     | 'source-unavailable'
+    | 'source-overridden'
     | 'protocol-conversion'
     | 'model-mapped'
     | 'model-unavailable'
@@ -1620,7 +1631,7 @@ export interface SetupWizardRoutingRollback {
   routeCreated: boolean
   expectedUpdatedAt: number
   createdPoolIds: string[]
-  previous?: Pick<Route, 'poolId' | 'enabled' | 'highConcurrencyMode' | 'inboundProtocol' | 'modelMap'>
+  previous?: Pick<Route, 'poolId' | 'enabled' | 'highConcurrencyMode' | 'inboundProtocol' | 'modelMap' | 'modelSourceMap'>
 }
 
 export interface SetupWizardProgressInput {
@@ -1972,6 +1983,7 @@ export interface GatewayApi {
   deleteAccountTag(id: string): Promise<AppSnapshot>
   setAccountTags(input: AccountTagAssignmentInput): Promise<AppSnapshot>
   refreshAccountModels(id: string): Promise<AppSnapshot>
+  openChatGptWebLogin(id: string): Promise<AppSnapshot>
   testAccountModel(accountId: string, model: string): Promise<AccountModelTestResult>
   importChatGptAccounts(input: ChatGptAccountImportInput): Promise<ChatGptAccountImportResult>
   importGrokAccounts(input: GrokAccountImportInput): Promise<GrokAccountImportResult>
@@ -2043,6 +2055,9 @@ export interface GatewayApi {
   getAccountCodexQuotaCycleCosts(id: string): Promise<CodexQuotaCycleCosts>
   clearLogs(): Promise<AppSnapshot>
   openRequestMonitor(): Promise<void>
+  getRequestMonitorAlwaysOnTop(): Promise<boolean>
+  toggleRequestMonitorAlwaysOnTop(): Promise<boolean>
+  setRequestMonitorDragging(active: boolean): Promise<void>
   getRequestReplayTemplate(id: string): Promise<RequestReplayTemplate | null>
   replayRequest(id: string): Promise<RequestReplayResult>
   getLocalEventServerStatus(): Promise<LocalEventServerStatus>

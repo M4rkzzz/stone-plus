@@ -1,4 +1,4 @@
-import type { Protocol, ResponsesCompactMode, UpstreamSourceType } from '@shared/types'
+import type { Protocol, ProviderKind, ResponsesCompactMode, UpstreamSourceType } from '@shared/types'
 
 export type { ResponsesCompactMode } from '@shared/types'
 
@@ -50,8 +50,11 @@ export function effectiveResponsesCompactMode(value: unknown): ResponsesCompactM
 export function relayCanConfigureResponsesCompact(
   sourceType: UpstreamSourceType,
   protocol: Protocol,
+  kind?: ProviderKind,
 ): boolean {
-  return sourceType === 'relay' && protocol === 'openai-responses'
+  return sourceType === 'relay'
+    && protocol === 'openai-responses'
+    && kind !== 'deepseek-compatible'
 }
 
 export function officialOpenAiUsesNativeCompact(
@@ -66,8 +69,9 @@ export function responsesCompactModeForSave(
   sourceType: UpstreamSourceType,
   protocol: Protocol,
   value: unknown,
+  kind?: ProviderKind,
 ): ResponsesCompactMode | undefined {
-  return relayCanConfigureResponsesCompact(sourceType, protocol)
+  return relayCanConfigureResponsesCompact(sourceType, protocol, kind)
     ? effectiveResponsesCompactMode(value)
     : undefined
 }

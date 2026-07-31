@@ -1,6 +1,6 @@
 import type { ProviderKind } from './types'
 
-export type ProviderSourceFamily = 'openai' | 'grok' | 'anthropic' | 'google' | 'kiro' | 'custom'
+export type ProviderSourceFamily = 'openai' | 'deepseek' | 'grok' | 'anthropic' | 'google' | 'kiro' | 'custom'
 
 /** Stable routing family used to prevent semantically different sources sharing one pool. */
 export function providerSourceFamily(kind: ProviderKind): ProviderSourceFamily {
@@ -8,6 +8,9 @@ export function providerSourceFamily(kind: ProviderKind): ProviderSourceFamily {
     case 'openai':
     case 'openai-compatible':
       return 'openai'
+    case 'deepseek':
+    case 'deepseek-compatible':
+      return 'deepseek'
     case 'xai':
     case 'xai-compatible':
       return 'grok'

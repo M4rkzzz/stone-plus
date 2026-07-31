@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest'
 import {
+  estimateCodexTokenCredits,
   estimateOpenAiTokenCosts,
   localNaturalDayStart,
+  resolveCodexTokenCreditPricing,
   resolveOpenAiModelPricing,
   summarizeAccountCodexQuotaCycleCosts,
   summarizeOpenAiTokenCosts
@@ -27,6 +29,55 @@ function log(model: string, overrides: Partial<RequestLog> = {}): RequestLog {
 
 describe('Standard API token pricing', () => {
   it.each([
+    ['gpt-5.6-sol', 'gpt-5.6-sol', 125, 12.5, 750],
+    ['gpt-5.6', 'gpt-5.6-sol', 125, 12.5, 750],
+    ['gpt-5.6-terra', 'gpt-5.6-terra', 50, 5, 300],
+    ['gpt-5.6-luna', 'gpt-5.6-luna', 5, 0.5, 30],
+    ['gpt-5.5', 'gpt-5.5', 125, 12.5, 750],
+    ['gpt-5.5-cyber', 'gpt-5.5-cyber', 312.5, 31.25, 1_875],
+    ['gpt-5.4', 'gpt-5.4', 62.5, 6.25, 375],
+    ['gpt-5.4-mini', 'gpt-5.4-mini', 18.75, 1.875, 113],
+    ['gpt-5.3-codex', 'gpt-5.3-codex', 43.75, 4.375, 350],
+    ['gpt-5.2', 'gpt-5.2', 43.75, 4.375, 350]
+  ] as const)('maps %s to official Codex credit family %s', (model, family, input, cached, output) => {
+    expect(resolveCodexTokenCreditPricing(model)).toEqual({
+      family,
+      inputCreditsPerMillion: input,
+      cachedInputCreditsPerMillion: cached,
+      outputCreditsPerMillion: output
+    })
+  })
+
+  it.each(['gpt-5.3-codex-spark', 'gpt-5.5-pro', 'gpt-5.4-pro', 'grok-4.5', 'anthropic/gpt-5.6'])(
+    'does not guess Codex credits for unlisted model %j',
+    (model) => expect(resolveCodexTokenCreditPricing(model)).toBeUndefined()
+  )
+
+  it('uses official Codex token rates and does not charge cache writes', () => {
+    const result = estimateCodexTokenCredits([
+      log('gpt-5.6-terra', {
+        inputTokens: 1_000_000,
+        cachedInputTokens: 200_000,
+        cacheWriteInputTokens: 300_000,
+        outputTokens: 100_000
+      }),
+      log('private-model', { inputTokens: 10_000, outputTokens: 1_000 })
+    ])
+
+    expect(result).toMatchObject({
+      inputCredits: 25,
+      cachedInputCredits: 1,
+      outputCredits: 30,
+      totalCredits: 56,
+      pricedTokens: 1_100_000,
+      unpricedTokens: 11_000,
+      pricedRequestCount: 1,
+      unpricedRequestCount: 1,
+      unknownModels: ['private-model']
+    })
+  })
+
+  it.each([
     ['gpt-5.6-sol', 'gpt-5.6-sol'],
     ['gpt-5.6', 'gpt-5.6-sol'],
     ['gpt-5.6-sol-2026-07-19', 'gpt-5.6-sol'],
@@ -43,6 +94,22 @@ describe('Standard API token pricing', () => {
     ['gpt-5.4-nano-2026-07-19-preview', 'gpt-5.4-nano']
   ] as const)('maps %s to the %s price family', (model, family) => {
     expect(resolveOpenAiModelPricing(model)?.family).toBe(family)
+  })
+
+  it.each([
+    ['gpt-5.6-sol', 5, 0.5, 6.25, 30],
+    ['gpt-5.6-terra', 2, 0.2, 2.5, 12],
+    ['gpt-5.6-luna', 0.2, 0.02, 0.25, 1.2]
+  ] as const)('uses the current official API rates for %s', (model, input, cached, cacheWrite, output) => {
+    expect(resolveOpenAiModelPricing(model)).toMatchObject({
+      inputUsdPerMillion: input,
+      cachedInputUsdPerMillion: cached,
+      cacheWriteUsdPerMillion: cacheWrite,
+      outputUsdPerMillion: output,
+      longContextThresholdTokens: 272_000,
+      longContextInputMultiplier: 2,
+      longContextOutputMultiplier: 1.5
+    })
   })
 
   it.each(['gpt-5.6-sol-pro', 'gpt-5.5-mini', 'gpt-5.4-ultra', 'gpt-5.4-pro-max', 'o4-mini', '', 'custom/gpt-5.6-sol'])(
@@ -272,7 +339,7 @@ describe('Standard API token pricing', () => {
     ].every((value) => Number.isFinite(value) && value >= 0)).toBe(true)
   })
 
-  it('prices the actual gpt-5.6-sol log model without double-counting cached reads', () => {
+  it('prices the actual gpt-5.6-sol log model with cache and long-context rules', () => {
     const result = estimateOpenAiTokenCosts([
       log('gpt-5.6-sol', { inputTokens: 1_000_000, cachedInputTokens: 400_000, outputTokens: 100_000 })
     ])
@@ -285,10 +352,11 @@ describe('Standard API token pricing', () => {
       cachedInputTokens: 400_000,
       pricedTokens: 1_100_000,
       unpricedTokens: 0,
-      inputCostUsd: 3,
-      cachedInputCostUsd: 0.2,
-      outputCostUsd: 3,
-      totalCostUsd: 6.2
+      inputCostUsd: 6,
+      cachedInputCostUsd: 0.4,
+      outputCostUsd: 4.5,
+      totalCostUsd: 10.9,
+      longContextRequestCount: 1
     })
   })
 
@@ -307,10 +375,11 @@ describe('Standard API token pricing', () => {
       standardInputTokens: 500_000,
       cachedInputTokens: 200_000,
       cacheWriteInputTokens: 300_000,
-      inputCostUsd: 4.375,
-      cacheWriteCostUsd: 1.875,
-      cachedInputCostUsd: 0.1,
-      totalCostUsd: 4.475
+      inputCostUsd: 8.75,
+      cacheWriteCostUsd: 3.75,
+      cachedInputCostUsd: 0.2,
+      totalCostUsd: 8.95,
+      longContextRequestCount: 1
     })
   })
 
@@ -341,7 +410,7 @@ describe('Standard API token pricing', () => {
     expect(result.totalTokens).toBe(1_855_000)
     expect(result.pricedTokens).toBe(1_800_000)
     expect(result.unpricedTokens).toBe(55_000)
-    expect(result.totalCostUsd).toBeCloseTo(5.25, 10)
+    expect(result.totalCostUsd).toBeCloseTo(6.18, 10)
     expect(result.unknownModels).toEqual(['vendor-private-model'])
   })
 
@@ -351,7 +420,7 @@ describe('Standard API token pricing', () => {
       log('gpt-5.5', { inputTokens: 100_000, outputTokens: 10_000 }),
       log('gpt-5.4-mini', { inputTokens: 1_000_000, cachedInputTokens: 500_000, outputTokens: 100_000 })
     ])
-    expect(result.totalCostUsd).toBeCloseTo(6.6625, 10)
+    expect(result.totalCostUsd).toBeCloseTo(11.6625, 10)
     expect(result.pricedRequestCount).toBe(3)
   })
 
@@ -392,19 +461,19 @@ describe('Standard API token pricing', () => {
     })
   })
 
-  it('does not apply the 272K rule to 5.6 or 5.4 Mini/Nano', () => {
+  it('applies the 272K rule to 5.6 but not 5.4 Mini/Nano', () => {
     const result = estimateOpenAiTokenCosts([
       log('gpt-5.6-sol', { inputTokens: 300_000, outputTokens: 1_000 }),
       log('gpt-5.4-mini', { inputTokens: 300_000, outputTokens: 1_000 }),
       log('gpt-5.4-nano', { inputTokens: 300_000, outputTokens: 1_000 })
     ])
     expect(result.totalCostUsd).toBeCloseTo(
-      (300_000 / 1_000_000 * 5 + 1_000 / 1_000_000 * 30)
+      (300_000 / 1_000_000 * 5 * 2 + 1_000 / 1_000_000 * 30 * 1.5)
       + (300_000 / 1_000_000 * 0.75 + 1_000 / 1_000_000 * 4.5)
       + (300_000 / 1_000_000 * 0.2 + 1_000 / 1_000_000 * 1.25),
       12
     )
-    expect(result.longContextRequestCount).toBe(0)
+    expect(result.longContextRequestCount).toBe(1)
   })
 
   it('clamps malformed cache details to the reported input total', () => {
@@ -455,7 +524,13 @@ describe('Standard API token pricing', () => {
       source: 'usage-endpoint',
     }, now)
 
-    expect(costs.fiveHourUsd).toBe(5)
-    expect(costs.sevenDayUsd).toBe(40)
+    expect(costs).toMatchObject({
+      fiveHourUsd: 10,
+      sevenDayUsd: 50,
+      fiveHourCredits: 125,
+      sevenDayCredits: 1_000,
+      fiveHourUnpricedCreditTokens: 0,
+      sevenDayUnpricedCreditTokens: 0
+    })
   })
 })

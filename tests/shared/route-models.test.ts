@@ -3,6 +3,10 @@ import {
   isSafeRouteModelMapKey,
   isSafeRouteModelMapTarget,
   normalizeRouteModelMap,
+  normalizeRouteModelSourceMap,
+  resolveRouteSourceId,
+  routeReferencedSourceIds,
+  routeReferencesSource,
   resolveRouteModel,
   validateRouteModelMapping,
 } from '../../src/shared/route-models'
@@ -75,5 +79,31 @@ describe('route model mappings', () => {
     for (const target of ['', 'bad\u0000target', 'm'.repeat(257)]) {
       expect(validateRouteModelMapping('alias', target)).toEqual({ valid: false, reason: 'invalid-target' })
     }
+  })
+
+  it('normalizes and resolves exact per-model source overrides safely', () => {
+    const sourceMap = normalizeRouteModelSourceMap(JSON.parse(
+      '{" gpt-5.6-luna ":" pool-luna ","*":"pool-wildcard","__proto__":"bad","control\\u0000key":"bad"}',
+    ))
+
+    expect(Object.getPrototypeOf(sourceMap)).toBeNull()
+    expect(sourceMap).toEqual({ 'gpt-5.6-luna': 'pool-luna' })
+    expect(resolveRouteSourceId('pool-default', sourceMap, 'gpt-5.6-luna')).toBe('pool-luna')
+    expect(resolveRouteSourceId('pool-default', sourceMap, 'gpt-5.6-sol')).toBe('pool-default')
+    expect(resolveRouteSourceId('pool-default', Object.create({ 'gpt-5.6-sol': 'pool-inherited' }), 'gpt-5.6-sol'))
+      .toBe('pool-default')
+  })
+
+  it('reports every unique route source used by the default and model rules', () => {
+    const route = {
+      poolId: 'pool-default',
+      modelSourceMap: {
+        'gpt-5.6-luna': 'pool-luna',
+        'gpt-5.6-sol': 'pool-default',
+      },
+    }
+    expect(routeReferencedSourceIds(route)).toEqual(['pool-default', 'pool-luna'])
+    expect(routeReferencesSource(route, 'pool-luna')).toBe(true)
+    expect(routeReferencesSource(route, 'pool-unused')).toBe(false)
   })
 })

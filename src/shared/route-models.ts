@@ -42,6 +42,58 @@ export function normalizeRouteModelMap(modelMap: unknown): Record<string, string
   return normalized
 }
 
+/** Creates a persistence-safe exact model-to-source map. A wildcard is not
+ * accepted because Route.poolId is the explicit and observable default. */
+export function normalizeRouteModelSourceMap(modelSourceMap: unknown): Record<string, string> {
+  const normalized = Object.create(null) as Record<string, string>
+  if (!modelSourceMap || typeof modelSourceMap !== 'object' || Array.isArray(modelSourceMap)) return normalized
+
+  for (const [rawModel, rawSourceId] of Object.entries(modelSourceMap)) {
+    const model = rawModel.trim()
+    const sourceId = normalizeRouteSourceId(rawSourceId)
+    if (model === '*' || !isSafeRouteModelMapKey(model) || sourceId === undefined) continue
+    Object.defineProperty(normalized, model, {
+      value: sourceId,
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    })
+  }
+  return normalized
+}
+
+/** Resolves an exact per-model source override without inherited-property or
+ * wildcard ambiguity, then falls back to the route's ordinary source. */
+export function resolveRouteSourceId(
+  defaultSourceId: string,
+  modelSourceMap: Readonly<Record<string, unknown>> | null | undefined,
+  requestedModel: string,
+): string {
+  if (!isSafeRouteModelMapKey(requestedModel) || requestedModel === '*') return defaultSourceId
+  if (!modelSourceMap || typeof modelSourceMap !== 'object' || !Object.hasOwn(modelSourceMap, requestedModel)) {
+    return defaultSourceId
+  }
+  return normalizeRouteSourceId(modelSourceMap[requestedModel]) ?? defaultSourceId
+}
+
+export function routeReferencedSourceIds(
+  route: { poolId: string; modelSourceMap?: Readonly<Record<string, unknown>> },
+): string[] {
+  const ids = new Set<string>()
+  const defaultSourceId = normalizeRouteSourceId(route.poolId)
+  if (defaultSourceId) ids.add(defaultSourceId)
+  for (const sourceId of Object.values(normalizeRouteModelSourceMap(route.modelSourceMap))) ids.add(sourceId)
+  return [...ids]
+}
+
+export function routeReferencesSource(
+  route: { poolId: string; modelSourceMap?: Readonly<Record<string, unknown>> },
+  sourceId: string,
+): boolean {
+  const normalized = normalizeRouteSourceId(sourceId)
+  return normalized !== undefined && routeReferencedSourceIds(route).includes(normalized)
+}
+
 export function isSafeRouteModelMapKey(value: string): boolean {
   return value.length > 0
     && value.length <= MAX_ROUTE_MODEL_NAME_LENGTH
@@ -81,6 +133,13 @@ function normalizeTarget(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined
   const normalized = value.trim()
   if (!isSafeRouteModelMapTarget(normalized)) return undefined
+  return normalized
+}
+
+function normalizeRouteSourceId(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined
+  const normalized = value.trim()
+  if (!normalized || normalized.length > MAX_ROUTE_MODEL_NAME_LENGTH || hasControlCharacter(normalized)) return undefined
   return normalized
 }
 

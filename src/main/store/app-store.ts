@@ -12,6 +12,11 @@ import {
 import { accountMatchesPoolProtocol } from '@shared/pool-protocol'
 import { normalizeProviderHttpUrl } from '@shared/provider-url'
 import {
+  DEEPSEEK_RESPONSES_DEFAULT_MODEL,
+  filterOfficialDeepSeekResponsesModels,
+  isOfficialDeepSeekResponsesModel,
+} from '@shared/deepseek'
+import {
   accumulateOpenAiTokenCost,
   createOpenAiTokenCostAccumulator,
   finishOpenAiTokenCostAccumulator,
@@ -29,7 +34,12 @@ import {
   routeSourceUsesKiroClaude,
   resolveRouteSource,
 } from '@shared/route-sources'
-import { normalizeRouteModelMap } from '@shared/route-models'
+import {
+  normalizeRouteModelMap,
+  normalizeRouteModelSourceMap,
+  routeReferencedSourceIds,
+  routeReferencesSource,
+} from '@shared/route-models'
 import { providerSourceFamily } from '@shared/source-family'
 import {
   buildModelCatalog,
@@ -79,6 +89,7 @@ import type {
   QuotaProtectionPolicy,
   ProviderDefinition,
   ProviderInput,
+  ProviderKind,
   ResponsesCompactMode,
   RequestLog,
   Route,
@@ -141,6 +152,7 @@ const DEFAULT_GATEWAY: GatewaySettings = {
   requestTimeoutSeconds: 120,
   responsesWebSocketEnabled: false,
   disableCodexMicro: false,
+  disableCooldown: false,
   launchAtLogin: false,
   desktopNotifications: true,
   automaticBackups: true,
@@ -762,7 +774,7 @@ export class AppStore {
         hasPassword: Boolean(_credentialId && state.credentials[_credentialId])
       })),
       pools: appendRuntimeRouteSourcePools(
-        state.routes.map((route) => route.poolId),
+        state.routes.flatMap(routeReferencedSourceIds),
         state,
       ),
       routes: state.routes,
@@ -794,6 +806,20 @@ export class AppStore {
       }
       if (input.kind === 'xai-compatible' && sourceType !== 'relay') {
         throw new Error('xAI-compatible providers are supported only as relay sources.')
+      }
+      if (input.kind === 'deepseek-compatible' && sourceType !== 'relay') {
+        throw new Error('DeepSeek-compatible providers are supported only as relay sources.')
+      }
+      if (input.kind === 'deepseek' && sourceType !== 'official-api') {
+        throw new Error('Official DeepSeek providers must use the official API source type.')
+      }
+      if ((input.kind === 'deepseek' || input.kind === 'deepseek-compatible')
+        && input.protocol !== 'openai-responses') {
+        throw new Error('DeepSeek providers use the native Responses API.')
+      }
+      if (input.kind === 'deepseek'
+        && normalizeModels(input.models).some((model) => !isOfficialDeepSeekResponsesModel(model))) {
+        throw new Error(`Official DeepSeek Responses currently supports only ${DEEPSEEK_RESPONSES_DEFAULT_MODEL}.`)
       }
       if (input.kind === 'xai' && sourceType !== 'official-api') {
         throw new Error('Official xAI providers must use the official API source type.')
@@ -829,20 +855,27 @@ export class AppStore {
         input.responsesCompactMode,
         existing?.responsesCompactMode,
         sourceType,
-        input.protocol
+        input.protocol,
+        input.kind
       )
+      const normalizedProviderModels = input.kind === 'deepseek'
+        ? filterOfficialDeepSeekResponsesModels(normalizeModels(input.models))
+        : normalizeModels(input.models)
       const provider: ProviderDefinition = {
         id: existing?.id ?? createId(),
         name,
         sourceType,
         kind: input.kind,
-        baseUrl: input.kind === 'xai' ? 'https://api.x.ai/v1' : normalizeUrl(input.baseUrl),
+        baseUrl: input.kind === 'xai'
+          ? 'https://api.x.ai/v1'
+          : input.kind === 'deepseek' ? 'https://api.deepseek.com' : normalizeUrl(input.baseUrl),
         protocol: input.protocol,
-        models: normalizeModels(input.models),
+        models: normalizedProviderModels,
         icon: existing?.icon,
         color: existing?.color,
         forceFastMode: sourceType === 'relay'
           && supportsFastServiceTier(input.protocol)
+          && providerSourceFamily(input.kind) !== 'deepseek'
           && existing?.forceFastMode === true,
         ...(responsesCompactMode ? { responsesCompactMode } : {}),
         capabilityProfile: normalizeCapabilityProfile(
@@ -851,7 +884,7 @@ export class AppStore {
         ),
         modelCatalog: normalizeModelCatalog(
           input.modelCatalog ?? existing?.modelCatalog,
-          normalizeModels(input.models),
+          normalizedProviderModels,
           normalizeCapabilityProfile(
             input.capabilityProfile ?? existing?.capabilityProfile,
             inferUpstreamCapabilities({ protocol: input.protocol, kind: input.kind, sourceType, responsesCompactMode }),
@@ -888,9 +921,7 @@ export class AppStore {
       }
       state.providers = state.providers.filter((provider) => provider.id !== id)
       const timestamp = Date.now()
-      state.routes = state.routes.map((route) => route.poolId === id
-        ? { ...route, enabled: false, poolId: '', updatedAt: timestamp }
-        : route)
+      state.routes = state.routes.map((route) => detachRemovedRouteSources(route, new Set([id]), timestamp))
     }, ['providers', 'routes'])
     return this.getSnapshot()
   }
@@ -951,9 +982,12 @@ export class AppStore {
       const capabilityProfile = requiresToolRoundtripEvidence
         ? { ...normalizedProfile, toolCalls: toolRoundtripVerified }
         : normalizedProfile
-      const models = !result.ok && requiresToolRoundtripEvidence
+      const probedModels = !result.ok && requiresToolRoundtripEvidence
         ? provider.models
         : result.models.length ? normalizeModels(result.models) : provider.models
+      const models = provider.kind === 'deepseek'
+        ? filterOfficialDeepSeekResponsesModels(probedModels)
+        : probedModels
       const probeUpdatedAt = Math.max(timestamp, provider.updatedAt + 1)
       const normalizedCatalog = !result.ok && requiresToolRoundtripEvidence
         ? buildModelCatalog(models, capabilityProfile)
@@ -1029,7 +1063,14 @@ export class AppStore {
     await this.store.mutate((state) => {
       const provider = state.providers.find((candidate) => candidate.id === id)
       if (!provider) throw new Error('Provider not found.')
-      provider.models = normalizeModels(models)
+      const normalizedModels = normalizeModels(models)
+      if (provider.kind === 'deepseek'
+        && normalizedModels.some((model) => !isOfficialDeepSeekResponsesModel(model))) {
+        throw new Error(`Official DeepSeek Responses currently supports only ${DEEPSEEK_RESPONSES_DEFAULT_MODEL}.`)
+      }
+      provider.models = provider.kind === 'deepseek'
+        ? filterOfficialDeepSeekResponsesModels(normalizedModels)
+        : normalizedModels
       provider.updatedAt = timestamp
     }, ['providers', 'accounts'])
     return this.getSnapshot()
@@ -1044,12 +1085,16 @@ export class AppStore {
     models: string[],
     expectedDiscoveryFingerprint?: string
   ): Promise<AppSnapshot> {
-    const availableModels = normalizeModels(models)
-    if (availableModels.length === 0) throw new Error('Provider returned an empty model list.')
     const timestamp = Date.now()
     await this.store.mutate((state) => {
       const account = state.accounts.find((candidate) => candidate.id === id)
       if (!account) throw new Error('Account not found.')
+      const provider = state.providers.find((candidate) => candidate.id === account.providerId)
+      const discoveredModels = normalizeModels(models)
+      const availableModels = provider?.kind === 'deepseek'
+        ? filterOfficialDeepSeekResponsesModels(discoveredModels)
+        : discoveredModels
+      if (availableModels.length === 0) throw new Error('Provider returned no supported model.')
       if (
         expectedDiscoveryFingerprint !== undefined
         && accountModelDiscoveryFingerprint(state, id) !== expectedDiscoveryFingerprint
@@ -1707,11 +1752,16 @@ export class AppStore {
         .filter((provider) => !state.accounts.some((account) => account.providerId === provider.id))
         .map((provider) => provider.id))
       state.providers = state.providers.filter((provider) => !orphanedSourceIds.has(provider.id))
-      state.routes = state.routes.map((route) => orphanedSourceIds.has(route.poolId) || deletedPoolIds.has(route.poolId)
-        ? { ...route, enabled: false, poolId: '', updatedAt: timestamp }
-        : emptiedPoolIds.has(route.poolId) && route.enabled
-          ? { ...route, enabled: false, updatedAt: timestamp }
-        : route)
+      // An empty standard pool is intentionally preserved so users can refill it
+      // without rebuilding route configuration. Only sources that were actually
+      // deleted are detached from default or per-model route selections.
+      const removedSourceIds = new Set([...orphanedSourceIds, ...deletedPoolIds])
+      state.routes = state.routes.map((route) => {
+        const detached = detachRemovedRouteSources(route, removedSourceIds, timestamp)
+        return emptiedPoolIds.has(route.poolId) && detached.enabled
+          ? { ...detached, enabled: false, updatedAt: timestamp }
+          : detached
+      })
       reconcilePoolModelAllowlists(state, timestamp)
     }, ['providers', 'accounts', 'credentials', 'pools', 'routes'])
     this.pruneCredentialCache()
@@ -2227,7 +2277,8 @@ export class AppStore {
         stickySessions: input.stickySessions,
         stickyTtlMinutes,
         maxRetries,
-        forceFastMode: supportsPoolFastServiceTier(protocol)
+        forceFastMode: !finalFamilies.has('deepseek')
+          && supportsPoolFastServiceTier(protocol)
           && (input.forceFastMode ?? existing?.forceFastMode) === true,
         quotaProtection: input.quotaProtection === undefined
           ? existing?.quotaProtection
@@ -2259,7 +2310,7 @@ export class AppStore {
 
   public async deletePool(id: string): Promise<AppSnapshot> {
     await this.store.mutate((state) => {
-      if (state.routes.some((route) => route.poolId === id)) {
+      if (state.routes.some((route) => routeReferencesSource(route, id))) {
         throw new Error('Switch or unassign the routes that use this pool before deleting it.')
       }
       state.pools = state.pools.filter((pool) => pool.id !== id)
@@ -2286,6 +2337,15 @@ export class AppStore {
       if (route.inboundProtocol !== clientNativeProtocols[route.client]) {
         throw new Error(`The ${route.client} route must use its native inbound protocol.`)
       }
+      // Preserve model-specific rules when an older renderer updates another
+      // route field without knowing about the optional modelSourceMap shape.
+      // An explicit empty object remains the supported way to clear all rules.
+      const modelSourceMap = normalizeRouteModelSourceMap(
+        route.modelSourceMap === undefined ? existing.modelSourceMap : route.modelSourceMap,
+      )
+      if (route.client !== 'codex' && Object.keys(modelSourceMap).length > 0) {
+        throw new Error('Per-model source routing is available only for the Codex route.')
+      }
       if (route.enabled && hasRouteSourceIdCollision(route.poolId, state)) {
         throw new Error('The selected source id conflicts with an existing pool id.')
       }
@@ -2296,6 +2356,17 @@ export class AppStore {
       }
       if (route.poolId.trim() && routeSource && (route.enabled || sourceSelectionChanged)) {
         assertRouteSourceEligible(route.client, routeSource, state)
+      }
+      for (const sourceId of new Set(Object.values(modelSourceMap))) {
+        if (hasRouteSourceIdCollision(sourceId, state)) {
+          throw new Error('A per-model route source id conflicts with an existing pool id.')
+        }
+        const modelSource = resolveRouteSource(sourceId, state)
+        if (!modelSource) throw new Error('Choose an existing pool or API source for every model-specific route.')
+        assertRouteSourceEligible(route.client, modelSource, state)
+        if (route.enabled && modelSource.provider && !modelSource.accounts.some(isAvailableRouteAccount)) {
+          throw new Error('A selected model-specific API source has no available account.')
+        }
       }
       if (route.enabled
         && routeSource
@@ -2327,6 +2398,7 @@ export class AppStore {
           : route.highConcurrencyMode === true,
         localToken: route.localToken.trim() || createLocalToken(),
         modelMap: normalizeRouteModelMap(route.modelMap),
+        modelSourceMap,
         createdAt: route.createdAt || timestamp,
         updatedAt: timestamp
       }
@@ -2434,6 +2506,7 @@ export class AppStore {
         highConcurrencyMode: route.highConcurrencyMode === true,
         inboundProtocol: route.inboundProtocol,
         modelMap: { ...route.modelMap },
+        modelSourceMap: { ...route.modelSourceMap },
       } : undefined
     })
     let result: Omit<SetupRoutingResult, 'snapshot'> | undefined
@@ -2454,6 +2527,7 @@ export class AppStore {
         highConcurrencyMode: previousRoute.highConcurrencyMode,
         inboundProtocol: previousRoute.inboundProtocol,
         modelMap: previousRoute.modelMap,
+        modelSourceMap: previousRoute.modelSourceMap,
       } : undefined,
     })
     await this.setupWizard.save({
@@ -3533,21 +3607,34 @@ function normalizePersistedState(
     const persistedKiroShapeIsValid = provider.kind === 'kiro-compatible'
       && persistedSourceType === 'relay'
       && provider.protocol === 'kiro-claude'
-    const sourceType = provider.kind === 'xai-compatible' || provider.kind === 'kiro-compatible'
+    const sourceType = provider.kind === 'xai-compatible'
+      || provider.kind === 'deepseek-compatible'
+      || provider.kind === 'kiro-compatible'
       ? 'relay'
-      : provider.kind === 'xai' && !grokOAuthProvider ? 'official-api' : persistedSourceType
+      : (provider.kind === 'xai' && !grokOAuthProvider) || provider.kind === 'deepseek'
+        ? 'official-api' : persistedSourceType
     const protocol = provider.kind === 'xai'
       ? 'openai-responses'
+      : provider.kind === 'deepseek' || provider.kind === 'deepseek-compatible'
+        ? 'openai-responses'
       : provider.kind === 'kiro-compatible' ? 'kiro-claude' : provider.protocol
     const responsesCompactMode = normalizePersistedResponsesCompactMode(
       provider.responsesCompactMode,
       sourceType,
-      protocol
+      protocol,
+      provider.kind
     )
     // Provider rows are JSON payloads, so this capability is forward-compatible
     // without a SQLite schema migration. Rebuild the row to remove stale or
     // unknown values before it can enter the runtime gateway configuration.
     const { responsesCompactMode: _discardedCompactMode, ...baseProvider } = provider
+    const persistedModels = normalizeModels(provider.models)
+    const normalizedProviderModels = provider.kind === 'deepseek'
+      ? filterOfficialDeepSeekResponsesModels(persistedModels)
+      : persistedModels
+    if (provider.kind === 'deepseek' && normalizedProviderModels.length === 0) {
+      normalizedProviderModels.push(DEEPSEEK_RESPONSES_DEFAULT_MODEL)
+    }
     const capabilityProfile = normalizeCapabilityProfile(
       provider.kind === 'kiro-compatible' && !persistedKiroShapeIsValid
         ? undefined
@@ -3562,14 +3649,23 @@ function normalizePersistedState(
     const normalizedProvider: ProviderDefinition = {
       ...baseProvider,
       sourceType,
-      baseUrl: provider.kind === 'xai' ? (grokOAuthProvider ? GROK_OAUTH_BASE_URL : 'https://api.x.ai/v1') : baseProvider.baseUrl,
+      baseUrl: provider.kind === 'xai'
+        ? (grokOAuthProvider ? GROK_OAUTH_BASE_URL : 'https://api.x.ai/v1')
+        : provider.kind === 'deepseek' ? 'https://api.deepseek.com' : baseProvider.baseUrl,
       protocol,
+      models: normalizedProviderModels,
       forceFastMode: sourceType === 'relay'
         && supportsFastServiceTier(protocol)
+        && providerSourceFamily(provider.kind) !== 'deepseek'
         && provider.forceFastMode === true,
       ...(responsesCompactMode ? { responsesCompactMode } : {}),
       capabilityProfile,
-      modelCatalog: normalizeModelCatalog(provider.modelCatalog, provider.models, capabilityProfile),
+      modelCatalog: normalizeModelCatalog(
+        provider.modelCatalog?.filter((model) => provider.kind !== 'deepseek'
+          || isOfficialDeepSeekResponsesModel(model.id)),
+        normalizedProviderModels,
+        capabilityProfile,
+      ),
     }
     if (provider.kind !== 'kiro-compatible') return normalizedProvider
 
@@ -3581,7 +3677,7 @@ function normalizePersistedState(
       capabilityProfile: verifiedCapabilityProfile,
       modelCatalog: normalizeModelCatalog(
         provider.modelCatalog,
-        provider.models,
+        normalizedProviderModels,
         verifiedCapabilityProfile,
       ).map((model) => ({
         ...model,
@@ -3597,7 +3693,12 @@ function normalizePersistedState(
       : account.credentialType === 'chatgpt-oauth' || Boolean(account.chatgptAccountId)
         ? 'chatgpt-oauth' as const
         : 'api-key' as const
-    const persistedAvailableModels = normalizeModels(account.availableModels)
+    const linkedProvider = providers.find((provider) => provider.id === account.providerId)
+    const providerModels = normalizeModels(linkedProvider?.models)
+    const normalizedPersistedAvailableModels = normalizeModels(account.availableModels)
+    const persistedAvailableModels = linkedProvider?.kind === 'deepseek'
+      ? filterOfficialDeepSeekResponsesModels(normalizedPersistedAvailableModels)
+      : normalizedPersistedAvailableModels
     const grokProviderModels = credentialType === 'grok-oauth'
       ? normalizeModels(providers.find((provider) => provider.id === account.providerId)?.models)
       : []
@@ -3605,17 +3706,26 @@ function normalizePersistedState(
       ? (grokProviderModels.length > 0 ? grokProviderModels : persistedAvailableModels)
       : persistedAvailableModels
     const modelsRefreshedAt = normalizeTimestamp(account.modelsRefreshedAt)
-    const persistedAllowlist = normalizeModels(account.modelAllowlist)
+    const normalizedPersistedAllowlist = normalizeModels(account.modelAllowlist)
+    const persistedAllowlist = linkedProvider?.kind === 'deepseek'
+      ? filterOfficialDeepSeekResponsesModels(normalizedPersistedAllowlist)
+      : normalizedPersistedAllowlist
     const modelPolicy = credentialType === 'grok-oauth'
       ? 'selected' as const
       : normalizePersistedModelPolicy(account.modelPolicy, persistedAllowlist)
-    const modelAllowlist = credentialType === 'grok-oauth'
+    let modelAllowlist = credentialType === 'grok-oauth'
       ? availableModels
       : modelPolicy === 'selected'
       ? modelsRefreshedAt === undefined
         ? persistedAllowlist
         : intersectModels(persistedAllowlist, availableModels)
       : []
+    if (linkedProvider?.kind === 'deepseek'
+      && modelPolicy === 'selected'
+      && modelAllowlist.length === 0
+      && providerModels.length > 0) {
+      modelAllowlist = [providerModels[0]]
+    }
     return {
       ...account,
       credentialType,
@@ -3748,10 +3858,26 @@ function createDefaultRoutes(timestamp: number): Route[] {
     poolId: '',
     inboundProtocol: clientNativeProtocols[client],
     modelMap: {},
+    modelSourceMap: {},
     localToken: createLocalToken(),
     createdAt: timestamp,
     updatedAt: timestamp,
   }))
+}
+
+function detachRemovedRouteSources(
+  route: Route,
+  removedSourceIds: ReadonlySet<string>,
+  timestamp: number,
+): Route {
+  if (removedSourceIds.has(route.poolId)) {
+    return { ...route, enabled: false, poolId: '', updatedAt: timestamp }
+  }
+  const entries = Object.entries(route.modelSourceMap ?? {})
+  const modelSourceMap = Object.fromEntries(entries.filter(([, sourceId]) => !removedSourceIds.has(sourceId)))
+  return entries.length === Object.keys(modelSourceMap).length
+    ? route
+    : { ...route, modelSourceMap, updatedAt: timestamp }
 }
 
 function normalizePersistedRoutes(
@@ -3765,12 +3891,21 @@ function normalizePersistedRoutes(
     const sourceEligible = Boolean(source)
       && isRouteSourcePoolTopologyValid(source!.pool, collections)
       && analyzeRouteSourceCompatibility(route.client, source, collections).eligible
+    const normalizedModelSourceMap = route.client === 'codex'
+      ? Object.fromEntries(Object.entries(normalizeRouteModelSourceMap(route.modelSourceMap)).filter(([, sourceId]) => {
+          const modelSource = resolveRouteSource(sourceId, collections)
+          return Boolean(modelSource)
+            && isRouteSourcePoolTopologyValid(modelSource!.pool, collections)
+            && analyzeRouteSourceCompatibility(route.client, modelSource, collections).eligible
+        }))
+      : {}
     return {
       ...route,
       enabled: route.enabled === true && sourceEligible,
       inboundProtocol: clientNativeProtocols[route.client] ?? route.inboundProtocol,
       highConcurrencyMode: route.highConcurrencyMode === true,
       modelMap: normalizeRouteModelMap(route.modelMap),
+      modelSourceMap: normalizedModelSourceMap,
     }
   }
   const defaults = createDefaultRoutes(timestamp).map((fallback) => {
@@ -4389,6 +4524,7 @@ function inferProviderSourceType(kind: ProviderInput['kind'], baseUrl: string): 
     if (
       (kind === 'openai' && hostname === 'api.openai.com')
       || (kind === 'xai' && hostname === 'api.x.ai')
+      || (kind === 'deepseek' && hostname === 'api.deepseek.com')
       || (kind === 'anthropic' && hostname === 'api.anthropic.com')
       || (kind === 'google' && hostname === 'generativelanguage.googleapis.com')
     ) return 'official-api'
@@ -4408,38 +4544,44 @@ function isResponsesCompactMode(value: unknown): value is ResponsesCompactMode {
 
 function supportsExplicitResponsesCompactMode(
   sourceType: ProviderDefinition['sourceType'],
-  protocol: ProviderDefinition['protocol']
+  protocol: ProviderDefinition['protocol'],
+  kind: ProviderKind
 ): boolean {
-  return sourceType === 'relay' && protocol === 'openai-responses'
+  return sourceType === 'relay'
+    && protocol === 'openai-responses'
+    && kind !== 'deepseek-compatible'
 }
 
 function resolveResponsesCompactModeInput(
   requested: unknown,
   existing: unknown,
   sourceType: ProviderDefinition['sourceType'],
-  protocol: ProviderDefinition['protocol']
+  protocol: ProviderDefinition['protocol'],
+  kind: ProviderKind
 ): ResponsesCompactMode | undefined {
+  if (kind === 'deepseek' || kind === 'deepseek-compatible') return undefined
   if (requested !== undefined) {
     if (!isResponsesCompactMode(requested)) {
       throw new Error('Responses compact mode must be auto, legacy, passthrough, or native.')
     }
-    if (!supportsExplicitResponsesCompactMode(sourceType, protocol)) {
+    if (!supportsExplicitResponsesCompactMode(sourceType, protocol, kind)) {
       throw new Error('Responses compact mode can be configured only for OpenAI Responses relay sources.')
     }
     return requested
   }
   // Editing an existing source through an older renderer must not silently
   // reset its capability. A source/protocol change, however, clears the field.
-  if (!supportsExplicitResponsesCompactMode(sourceType, protocol)) return undefined
+  if (!supportsExplicitResponsesCompactMode(sourceType, protocol, kind)) return undefined
   return isResponsesCompactMode(existing) ? existing : 'auto'
 }
 
 function normalizePersistedResponsesCompactMode(
   value: unknown,
   sourceType: ProviderDefinition['sourceType'],
-  protocol: ProviderDefinition['protocol']
+  protocol: ProviderDefinition['protocol'],
+  kind: ProviderKind
 ): ResponsesCompactMode | undefined {
-  if (!supportsExplicitResponsesCompactMode(sourceType, protocol)) return undefined
+  if (!supportsExplicitResponsesCompactMode(sourceType, protocol, kind)) return undefined
   return isResponsesCompactMode(value) ? value : 'auto'
 }
 
@@ -5125,6 +5267,7 @@ function normalizeGatewaySettings(settings: GatewaySettings): GatewaySettings {
     requestTimeoutSeconds: Math.max(5, Math.min(600, Math.floor(settings.requestTimeoutSeconds))),
     responsesWebSocketEnabled: settings.responsesWebSocketEnabled === true,
     disableCodexMicro: settings.disableCodexMicro === true,
+    disableCooldown: settings.disableCooldown === true,
     launchAtLogin: Boolean(settings.launchAtLogin),
     desktopNotifications: settings.desktopNotifications !== false,
     automaticBackups: settings.automaticBackups !== false,

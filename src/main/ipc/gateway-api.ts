@@ -5,6 +5,7 @@ import { basename, extname, join } from 'node:path'
 import { clientNativeProtocols } from '@shared/types'
 import { previewRoute } from '@shared/route-preview'
 import { normalizeProviderHttpUrl } from '@shared/provider-url'
+import { routeReferencesSource } from '@shared/route-models'
 import {
   hasRouteSourceIdCollision,
   isAvailableRouteAccount,
@@ -62,6 +63,7 @@ import {
 import { ChatGptOAuthFlowManager, type ChatGptOAuthSessionController } from '../auth/chatgpt-oauth-flow'
 import { GROK_OAUTH_BASE_URL, resolveChatGptAgentIdentity, resolveGrokOAuthCredential, serializeChatGptCredential } from '../auth'
 import type { LocalEventServer } from '../events'
+import type { ChatGptWebLoginController } from '../chatgpt-web-login'
 
 export interface GatewayController {
   start(settings?: GatewaySettings): Promise<void>
@@ -96,6 +98,7 @@ export function registerGatewayApi(
   sharedOutboundReloadCoordinator?: OutboundReloadCoordinator,
   sharedWebDavBackups?: WebDavBackupService,
   onUiThemeApplied?: (theme: UiTheme, preference: UiThemePreference) => void,
+  chatGptWebLogin?: ChatGptWebLoginController,
 ): () => Promise<void> {
   const webDavBackups = sharedWebDavBackups ?? (backups ? new WebDavBackupService({
     metadata: store.getStateRepository(),
@@ -791,7 +794,7 @@ export function registerGatewayApi(
       || context.configGeneration !== currentGeneration) return new Set()
     const configuration = store.getRuntimeConfiguration()
     const route = configuration.routes.find((candidate) => candidate.id === context.routeId)
-    if (!route?.enabled || route.poolId !== context.poolId) return new Set()
+    if (!route?.enabled || !routeReferencesSource(route, context.poolId)) return new Set()
     const source = resolveRouteSource(context.poolId, {
       // Persisted pools, rather than runtime-only leftovers, decide whether a
       // scheduler event still belongs to a live source.
@@ -1173,6 +1176,18 @@ export function registerGatewayApi(
   })
 
   const persistAccountState = async (state: GatewayAccountState, revision: number): Promise<void> => {
+    if (store.getRuntimeGatewaySettings().disableCooldown === true
+      && state.status === 'cooldown'
+      && state.cooldownReason === 'failure') {
+      state = {
+        ...state,
+        status: 'active',
+        circuitState: 'closed',
+        consecutiveFailures: 0,
+        cooldownUntil: undefined,
+        cooldownReason: undefined,
+      }
+    }
     const before = store.getRuntimeAccount(state.accountId)
     await store.updateAccountRuntimeState(state.accountId, {
       status: state.status,
@@ -1421,6 +1436,13 @@ export function registerGatewayApi(
     const discoveryFingerprint = store.getAccountModelDiscoveryFingerprint(id)
     const models = await discoverAccountModels(store, outboundTransport, id)
     return mutate(() => store.setAccountModels(id, models, discoveryFingerprint))
+  })
+  ipcMain.handle('stone:open-chatgpt-web-login', async (event, id: string) => {
+    assertTrustedSender(event)
+    if (typeof id !== 'string' || !id.trim()) throw new Error('ChatGPT 网页登录账号参数无效。')
+    if (!chatGptWebLogin) throw new Error('ChatGPT 网页登录能力不可用。')
+    await chatGptWebLogin.open(id.trim())
+    return withRuntimeMetrics(store.getSnapshot())
   })
   ipcMain.handle('stone:test-account-model', async (event, accountId: string, model: string) => {
     assertTrustedSender(event)
@@ -2234,6 +2256,23 @@ export function registerGatewayApi(
       if (enablingAutomaticBackups) await backups.prepareForRawBackup()
       await store.updateGateway(settings)
       const savedGateway = store.getSnapshot().gateway
+      if (previousSettings.disableCooldown !== true && savedGateway.disableCooldown === true) {
+        const failureCooledAccounts = store.getSnapshot().accounts.filter((account) => (
+          account.status === 'cooldown' && account.cooldownReason === 'failure'
+        ))
+        await store.updateAccountRuntimeStates(failureCooledAccounts.map((account) => ({
+          id: account.id,
+          patch: {
+            status: 'active' as const,
+            circuitState: 'closed' as const,
+            consecutiveFailures: 0,
+            cooldownUntil: undefined,
+            cooldownReason: undefined,
+            lastError: undefined,
+          },
+        })))
+        for (const account of failureCooledAccounts) gateway.resetAccountHealth(account.id)
+      }
       if (backups
         && (previousSettings.automaticBackups !== false) !== (savedGateway.automaticBackups !== false)) {
         if (savedGateway.automaticBackups === false) {
@@ -2778,6 +2817,7 @@ export function registerGatewayApi(
     closed = true
     unregisterBulkAccountCheckTask()
     await persistentTaskRunner.interruptAllForShutdown()
+    await chatGptWebLogin?.dispose()
     // Stop accepting new gateway callbacks before draining the work already
     // observed below. Otherwise a late account/log event can be enqueued after
     // the shutdown snapshots have been taken and race the store close.
@@ -2935,6 +2975,12 @@ function normalizeApiSourceProbeInput(
     }
     return { ...input, baseUrl: 'https://api.openai.com/v1' }
   }
+  if (input.kind === 'deepseek') {
+    if (input.protocol !== 'openai-responses') {
+      throw new Error('DeepSeek 官方 API 仅支持原生 Responses。')
+    }
+    return { ...input, baseUrl: 'https://api.deepseek.com', responsesCompactMode: undefined }
+  }
   if (input.kind === 'xai') {
     if (input.protocol !== 'openai-chat') throw new Error('xAI 官方 API 当前使用 Chat Completions 兼容桥。')
     return { ...input, baseUrl: 'https://api.x.ai/v1' }
@@ -2947,7 +2993,7 @@ function normalizeApiSourceProbeInput(
     if (input.protocol !== 'gemini') throw new Error('Google 官方 API 仅支持 Gemini。')
     return { ...input, baseUrl: 'https://generativelanguage.googleapis.com' }
   }
-  throw new Error('官方 API 仅支持 OpenAI、xAI、Anthropic 和 Google Gemini。')
+  throw new Error('官方 API 仅支持 OpenAI、DeepSeek、xAI、Anthropic 和 Google Gemini。')
 }
 
 function apiSourceProbeConnectionFingerprint(input: Pick<

@@ -3936,6 +3936,23 @@ html[data-theme='dark'] .brand-icon--openai {
   opacity: 0.48;
 }
 
+.provider-cooldown-toggle {
+  display: inline-flex;
+  min-height: 36px;
+  align-items: center;
+  gap: 7px;
+  padding: 0 10px;
+  color: var(--text-soft);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--surface);
+  font-size: 12px;
+  font-weight: 650;
+  white-space: nowrap;
+}
+
+.provider-cooldown-toggle > .toggle { margin-left: 2px; }
+
 .badge-row {
   display: flex;
   align-items: center;
@@ -4188,6 +4205,18 @@ html[data-theme='dark'] .brand-icon--openai {
   line-height: 1.45;
 }
 
+.model-source-routing-note {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+  color: var(--text-soft);
+  font-size: 9px;
+  line-height: 1.4;
+}
+
+.model-source-routing-note svg { flex: 0 0 auto; color: var(--accent); }
+
 .mapping-list {
   display: flex;
   flex-direction: column;
@@ -4202,12 +4231,30 @@ html[data-theme='dark'] .brand-icon--openai {
   gap: 5px;
 }
 
+.mapping-section--source-routing .mapping-row {
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr) minmax(120px, .85fr) 28px;
+}
+
 .mapping-row input {
   min-width: 0;
   height: 31px;
   padding: 0 7px;
   font-size: 8px;
 }
+
+.mapping-row__source {
+  width: 100%;
+  min-width: 0;
+  height: 31px;
+  padding: 0 7px;
+  border: 1px solid var(--control-border);
+  border-radius: 5px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 9px;
+}
+
+.mapping-row__source:focus { border-color: var(--accent); }
 
 .mapping-row > span {
   color: var(--muted);
@@ -4224,6 +4271,10 @@ html[data-theme='dark'] .brand-icon--openai {
     align-items: stretch;
     flex-direction: column;
   }
+
+  .mapping-section--source-routing .mapping-row { grid-template-columns: minmax(0, 1fr) 20px; }
+  .mapping-section--source-routing .mapping-row__source { grid-column: 1; grid-row: 3; }
+  .mapping-section--source-routing .mapping-row .icon-button { grid-column: 2; grid-row: 3; }
 }
 
 .client-config {
@@ -6009,6 +6060,7 @@ html.is-electron .boot-screen { background: var(--app-chrome); }
 
 .quota-modal { display: grid; gap: 18px; }
 .quota-modal__source { min-width: 0; margin-right: auto; overflow: hidden; color: var(--muted); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.quota-credit-note { margin-top: -10px; color: var(--muted); font-size: 9px; line-height: 1.55; }
 
 .quota-summary-grid {
   display: grid;

@@ -1,5 +1,6 @@
 import type { AppSnapshot, NetworkDiagnosticStatus } from '@shared/types'
 import { listRouteSources } from '@shared/route-sources'
+import { routeReferencedSourceIds } from '@shared/route-models'
 import { localizeBackendMessage } from './backend-message'
 import type { UiLanguage } from './i18n'
 
@@ -20,8 +21,9 @@ export function buildLocalChecks(snapshot: AppSnapshot, proxyId: string, languag
     account.cooldownReason === 'quota' && (account.cooldownUntil === undefined || account.cooldownUntil > now)).length
   const enabledRoutes = snapshot.routes.filter((route) => route.enabled)
   const availableSourceIds = new Set(listRouteSources(snapshot).map((source) => source.id))
-  const invalidRoutes = enabledRoutes.filter((route) => !availableSourceIds.has(route.poolId)).length
-  const enabledRoutePoolIds = new Set(enabledRoutes.map((route) => route.poolId))
+  const invalidRoutes = enabledRoutes.filter((route) => routeReferencedSourceIds(route)
+    .some((sourceId) => !availableSourceIds.has(sourceId))).length
+  const enabledRoutePoolIds = new Set(enabledRoutes.flatMap(routeReferencedSourceIds))
   const emptyPools = snapshot.pools.filter((pool) => enabledRoutePoolIds.has(pool.id) && !pool.members.some((member) =>
     member.enabled && snapshot.accounts.some((account) => account.id === member.accountId))).length
   const expiringOAuth = snapshot.accounts.filter((account) => (account.credentialType === 'chatgpt-oauth' || account.credentialType === 'grok-oauth')

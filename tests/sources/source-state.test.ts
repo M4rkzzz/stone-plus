@@ -124,6 +124,80 @@ describe('API source state changes', () => {
     }), encrypt, NOW)).toThrow(/does not support/)
   })
 
+  it('creates locked official and custom relay DeepSeek Responses sources', () => {
+    const encrypt = (value: string) => `encrypted:${value}`
+    const officialState = emptyState()
+    saveApiSourceDraft(officialState, sourceInput({
+      name: 'DeepSeek API',
+      sourceType: 'official-api',
+      kind: 'deepseek',
+      baseUrl: 'https://not-deepseek.example/v9',
+      protocol: 'openai-responses',
+      credential: 'deepseek-key',
+      models: ['deepseek-v4-flash'],
+      defaultModel: 'deepseek-v4-flash',
+    }), encrypt, NOW)
+    expect(officialState.providers[0]).toMatchObject({
+      sourceType: 'official-api',
+      kind: 'deepseek',
+      baseUrl: 'https://api.deepseek.com',
+      protocol: 'openai-responses',
+      forceFastMode: false,
+      capabilityProfile: expect.objectContaining({ compact: false, reasoning: true, parallelToolCalls: true }),
+    })
+
+    const relayState = emptyState()
+    const relay = saveApiSourceDraft(relayState, relayInput({
+      name: 'DeepSeek relay',
+      kind: 'deepseek-compatible',
+      baseUrl: '10.20.30.40:8080/api',
+      protocol: 'openai-responses',
+      credential: 'relay-key',
+      models: ['deepseek-v4-flash'],
+      defaultModel: 'deepseek-v4-flash',
+      responsesCompactMode: 'native',
+    }), encrypt, NOW)
+    expect(relayState.providers[0]).toMatchObject({
+      id: relay.providerId,
+      sourceType: 'relay',
+      kind: 'deepseek-compatible',
+      baseUrl: 'http://10.20.30.40:8080/api',
+      protocol: 'openai-responses',
+      forceFastMode: false,
+    })
+    expect(relayState.providers[0]).not.toHaveProperty('responsesCompactMode')
+    expect(() => setRouteSourceFastModeDraft(relayState, { sourceId: relay.sourceId, enabled: true }, NOW + 1))
+      .toThrow(/DeepSeek Responses/)
+    expect(() => saveApiSourceDraft(emptyState(), relayInput({
+      kind: 'deepseek-compatible',
+      protocol: 'openai-chat',
+    }), encrypt, NOW)).toThrow(/does not support/)
+  })
+
+  it('rejects unsupported models only for the official DeepSeek Responses source', () => {
+    const encrypt = (value: string) => `encrypted:${value}`
+    expect(() => saveApiSourceDraft(emptyState(), sourceInput({
+      name: 'DeepSeek API',
+      sourceType: 'official-api',
+      kind: 'deepseek',
+      protocol: 'openai-responses',
+      credential: 'deepseek-key',
+      models: ['deepseek-v4-flash', 'deepseek-v4-pro'],
+      defaultModel: 'deepseek-v4-pro',
+    }), encrypt, NOW)).toThrow(/currently supports only deepseek-v4-flash/)
+
+    const relayState = emptyState()
+    saveApiSourceDraft(relayState, relayInput({
+      name: 'Future-compatible DeepSeek relay',
+      kind: 'deepseek-compatible',
+      protocol: 'openai-responses',
+      credential: 'relay-key',
+      models: ['deepseek-v4-pro'],
+      defaultModel: 'deepseek-v4-pro',
+    }), encrypt, NOW)
+    expect(relayState.providers[0].models).toEqual(['deepseek-v4-pro'])
+  })
+
   it('creates relay accounts with an open model policy while persisting the selected default first', () => {
     const state = emptyState()
     const saved = saveApiSourceDraft(state, relayInput({

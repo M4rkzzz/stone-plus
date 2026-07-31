@@ -3,6 +3,8 @@ import {
   anthropicAdapter,
   anthropicCompatibleAdapter,
   customAdapter,
+  deepSeekAdapter,
+  deepSeekCompatibleAdapter,
   getProviderAdapter,
   googleAdapter,
   kiroClaudeAdapter,
@@ -108,6 +110,24 @@ describe('provider adapter endpoints', () => {
     })
   })
 
+  it('uses native Responses endpoints for official and compatible DeepSeek sources', () => {
+    expect(getProviderAdapter('deepseek')).toBe(deepSeekAdapter)
+    expect(getProviderAdapter('deepseek-compatible')).toBe(deepSeekCompatibleAdapter)
+    expect(deepSeekAdapter.buildEndpoint({
+      baseUrl: 'https://api.deepseek.com',
+      protocol: 'openai-responses',
+      operation: 'generate',
+    })).toBe('https://api.deepseek.com/v1/responses')
+    expect(deepSeekCompatibleAdapter.buildEndpoint({
+      baseUrl: 'http://10.20.30.40:8080/api/v1',
+      protocol: 'openai-responses',
+      operation: 'generate',
+    })).toBe('http://10.20.30.40:8080/api/v1/responses')
+    expect(deepSeekAdapter.capabilities.protocols).toEqual({
+      'openai-responses': { streaming: true, toolCalls: true, modelInPath: false },
+    })
+  })
+
   it('uses the dedicated xAI adapter for official Grok credentials', () => {
     expect(getProviderAdapter('xai')).toBe(xAIAdapter)
     expect(xAIAdapter.buildEndpoint({
@@ -204,6 +224,27 @@ describe('provider adapter authentication', () => {
     })
 
     expect(headers.get('authorization')).toBe('Bearer xai-relay-secret')
+    expect(headers.has('user-agent')).toBe(false)
+    expect(headers.has('openai-organization')).toBe(false)
+    expect(headers.has('openai-project')).toBe(false)
+  })
+
+  it('uses only Bearer auth for DeepSeek and strips OpenAI tenant identity', () => {
+    const headers = new Headers({
+      'user-agent': 'downstream-client',
+      'openai-organization': 'downstream-org',
+      'openai-project': 'downstream-project',
+    })
+    deepSeekAdapter.applyRequestHeaders(headers, {
+      protocol: 'openai-responses',
+      credential: 'deepseek-secret',
+      sourceHeaders: {
+        'user-agent': 'Codex/test',
+        'openai-organization': 'org_test',
+        'openai-project': 'project_test',
+      },
+    })
+    expect(headers.get('authorization')).toBe('Bearer deepseek-secret')
     expect(headers.has('user-agent')).toBe(false)
     expect(headers.has('openai-organization')).toBe(false)
     expect(headers.has('openai-project')).toBe(false)
@@ -369,6 +410,27 @@ describe('provider discovery and health probes', () => {
 
     expect(result).toMatchObject({ ok: true, models: ['gpt-5', 'gpt-5-mini'], statusCode: 200 })
     expect(JSON.stringify(result)).not.toContain('discovery-secret')
+  })
+
+  it('exposes only documented Codex models from the official DeepSeek catalog', async () => {
+    const payload = JSON.stringify({
+      data: [{ id: 'deepseek-v4-flash' }, { id: 'deepseek-v4-pro' }],
+    })
+    const official = await deepSeekAdapter.discoverModels({
+      baseUrl: 'https://api.deepseek.com',
+      protocol: 'openai-responses',
+      credential: 'deepseek-secret',
+      fetchImplementation: vi.fn(async () => new Response(payload, { status: 200 })) as typeof fetch,
+    })
+    const relay = await deepSeekCompatibleAdapter.discoverModels({
+      baseUrl: 'https://relay.example.test',
+      protocol: 'openai-responses',
+      credential: 'relay-secret',
+      fetchImplementation: vi.fn(async () => new Response(payload, { status: 200 })) as typeof fetch,
+    })
+
+    expect(official).toMatchObject({ ok: true, models: ['deepseek-v4-flash'] })
+    expect(relay).toMatchObject({ ok: true, models: ['deepseek-v4-flash', 'deepseek-v4-pro'] })
   })
 
   it('discovers only generative Gemini models and strips the models prefix', async () => {

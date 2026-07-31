@@ -42,6 +42,29 @@ const backendMessageEnglish = new Map<string, string>([
   ['OAuth 授权失败。', 'OAuth authorization failed.'],
   ['选择的代理已被删除，请重新开始 OAuth 授权。', 'The selected proxy was deleted. Restart OAuth authorization.'],
   ['OAuth 授权期间所选 Tag 已被删除，账号已按“未标记”导入。', 'The selected Tag was deleted during OAuth authorization. The account was imported as untagged.'],
+  ['Stone+ 正在退出，无法打开 ChatGPT 网页。', 'Stone+ is shutting down and cannot open ChatGPT web.'],
+  ['账号不存在或已被删除。', 'The account does not exist or has been deleted.'],
+  ['仅 ChatGPT OAuth 账号支持网页登录。', 'Web login is available only for ChatGPT OAuth accounts.'],
+  ['无法读取该 ChatGPT OAuth 凭据。', 'The ChatGPT OAuth credential could not be read.'],
+  ['ChatGPT 网页登录账号参数无效。', 'The ChatGPT web-login account parameter is invalid.'],
+  ['ChatGPT 网页登录能力不可用。', 'ChatGPT web login is unavailable.'],
+  ['ChatGPT OAuth 已失效，请重新授权该账号。', 'ChatGPT OAuth is no longer valid. Authorize this account again.'],
+  ['该 ChatGPT 账号或工作区当前不可用。', 'This ChatGPT account or workspace is currently unavailable.'],
+  ['ChatGPT OAuth 验活超时。', 'ChatGPT OAuth validation timed out.'],
+  ['无法连接 ChatGPT 网页进行 OAuth 验活。', 'Could not reach ChatGPT web to validate OAuth.'],
+  ['ChatGPT OAuth 验活失败。', 'ChatGPT OAuth validation failed.'],
+  ['刷新 ChatGPT OAuth 凭据超时。', 'Refreshing the ChatGPT OAuth credential timed out.'],
+  ['无法连接 OpenAI OAuth 服务刷新凭据。', 'Could not reach the OpenAI OAuth service to refresh the credential.'],
+  ['无法准备 ChatGPT OAuth 凭据。', 'Could not prepare the ChatGPT OAuth credential.'],
+  ['内置代理当前不可用，已阻止 ChatGPT 网页直连。', 'The built-in proxy is unavailable, so ChatGPT web direct access was blocked.'],
+  ['内置代理 mixed 端口不可用。', 'The built-in proxy mixed port is unavailable.'],
+  ['代理密码无法从凭据保险库读取。', 'The proxy password could not be read from the credential vault.'],
+  ['ChatGPT 网页认证结构已变化，Stone+ 已阻止匿名回退。', 'ChatGPT web authentication changed, so Stone+ blocked anonymous fallback.'],
+  ['无法建立 ChatGPT 网页认证桥。', 'Could not establish the ChatGPT web authentication bridge.'],
+  ['ChatGPT 网页未能进入登录状态。', 'ChatGPT web did not enter an authenticated state.'],
+  ['ChatGPT 网页连接超时。', 'Connecting to ChatGPT web timed out.'],
+  ['ChatGPT 网页加载超时。', 'Loading ChatGPT web timed out.'],
+  ['ChatGPT 网页认证桥启动超时。', 'Starting the ChatGPT web authentication bridge timed out.'],
 
   // Account import/export and browser queue.
   ['未找到 access_token。', 'No access_token was found.'],
@@ -131,6 +154,10 @@ type PatternTranslation = {
 }
 
 const backendMessagePatterns: PatternTranslation[] = [
+  {
+    pattern: /^ChatGPT OAuth 验活失败（HTTP (\d{3})）。$/,
+    translate: (match) => `ChatGPT OAuth validation failed (HTTP ${match[1]}).`,
+  },
   {
     pattern: /^OpenAI OAuth Token 交换失败（HTTP (\d{3})）。$/,
     translate: (match) => `OpenAI OAuth token exchange failed (HTTP ${match[1]}).`,

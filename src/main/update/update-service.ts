@@ -35,6 +35,12 @@ export interface UpdateServiceOptions {
   fetchImplementation: FetchImplementation
   openExternal: (url: string) => Promise<void>
   prepareToInstall: () => Promise<void>
+  /** Called after the installer accepted the handoff. The host may arm a
+   * bounded forced-exit fallback because prepareToInstall has closed services. */
+  onInstallHandoff?: () => void
+  /** Restores a usable application process when installer startup fails after
+   * prepareToInstall has irreversibly closed runtime services. */
+  recoverAfterInstallFailure?: (error: unknown) => void | Promise<void>
   now?: () => number
   automaticCheckDelayMs?: number
   automaticCheckIntervalMs?: number
@@ -53,6 +59,8 @@ export class UpdateService {
   private automaticCheckTimer: ReturnType<typeof setTimeout> | undefined
   private initialized = false
   private closed = false
+  private installPrepared = false
+  private installFailureRecoveryStarted = false
 
   public constructor(private readonly options: UpdateServiceOptions) {
     const support = determineAutomaticUpdateSupport(
@@ -249,8 +257,11 @@ export class UpdateService {
       throw new Error('The update has not been downloaded and cannot be installed.')
     }
     this.updateState({ status: 'installing', error: undefined })
+    this.installPrepared = false
+    this.installFailureRecoveryStarted = false
     try {
       await this.options.prepareToInstall()
+      this.installPrepared = true
       this.options.updater.quitAndInstall(true, true)
       // electron-updater reports a missing installer or a synchronous launch
       // failure through its error event and otherwise returns void. Do not
@@ -259,8 +270,10 @@ export class UpdateService {
       if (stateAfterInstall.error) {
         throw new Error(stateAfterInstall.error ?? 'The update installer could not be started.')
       }
+      this.options.onInstallHandoff?.()
     } catch (error) {
       this.updateState({ status: 'error', error: updateDownloadErrorMessage(error) })
+      await this.recoverFromInstallFailure(error)
       throw error
     }
   }
@@ -305,7 +318,19 @@ export class UpdateService {
 
   private readonly handleUpdaterError = (error: Error): void => {
     if (this.closed || (this.state.status !== 'downloading' && this.state.status !== 'installing')) return
+    const failedDuringInstall = this.state.status === 'installing'
     this.updateState({ status: 'error', progress: undefined, error: updateDownloadErrorMessage(error) })
+    if (failedDuringInstall) void this.recoverFromInstallFailure(error)
+  }
+
+  private async recoverFromInstallFailure(error: unknown): Promise<void> {
+    if (!this.installPrepared || this.installFailureRecoveryStarted || !this.options.recoverAfterInstallFailure) return
+    this.installFailureRecoveryStarted = true
+    try {
+      await this.options.recoverAfterInstallFailure(error)
+    } catch (recoveryError) {
+      console.error('Stone+ could not recover after the update installer failed to start', recoveryError)
+    }
   }
 
   private updateState(patch: Partial<Omit<AppUpdateState, 'revision' | 'currentVersion' | 'automaticUpdateSupported'>>): void {

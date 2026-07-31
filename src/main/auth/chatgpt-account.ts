@@ -296,7 +296,12 @@ function firstTimestamp(object: Record<string, unknown> | undefined, ...paths: s
     let value: unknown = object
     for (const key of path) value = objectValue(value)?.[key]
     const numeric = numberValue(value)
-    if (numeric !== undefined) return numeric > 1_000_000_000_000 ? numeric : numeric * 1000
+    // Some Sub2API exports use 0 to mean "not populated". Treat it as
+    // missing so callers can fall back to the access-token JWT expiration.
+    if (numeric !== undefined) {
+      if (numeric <= 0) continue
+      return numeric > 1_000_000_000_000 ? numeric : numeric * 1000
+    }
     const parsed = typeof value === 'string' ? Date.parse(value) : Number.NaN
     if (Number.isFinite(parsed)) return parsed
   }

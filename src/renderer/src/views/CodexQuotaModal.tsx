@@ -89,9 +89,10 @@ export function CodexQuotaModal({
     >
       <div className="quota-modal">
         <div className="quota-summary-grid">
-          <QuotaSummary label={t('5 小时额度', '5-hour quota')} window={quota?.fiveHour} stale={stale} costUsd={cycleCosts.fiveHourUsd} />
-          <QuotaSummary label={t(`${longQuotaPeriod}额度`, `${longQuotaPeriod} quota`)} window={quota?.sevenDay} stale={stale} costUsd={cycleCosts.sevenDayUsd} />
+          <QuotaSummary label={t('5 小时额度', '5-hour quota')} window={quota?.fiveHour} stale={stale} credits={cycleCosts.fiveHourCredits} unpricedCreditTokens={cycleCosts.fiveHourUnpricedCreditTokens} />
+          <QuotaSummary label={t(`${longQuotaPeriod}额度`, `${longQuotaPeriod} quota`)} window={quota?.sevenDay} stale={stale} credits={cycleCosts.sevenDayCredits} unpricedCreditTokens={cycleCosts.sevenDayUnpricedCreditTokens} />
         </div>
+        <div className="quota-credit-note">{t('Credits 按 OpenAI 当前官方 Token 费率由本地请求记录估算；左侧为已记录消耗，右侧为按额度使用比例推算的整周期消耗。缓存写入不计费，Fast 模式附加费不作猜测。', 'Credits are estimated from local request logs using OpenAI’s current official token rate card. The left value is recorded usage and the right value projects the full cycle from the quota percentage. Cache writes are free; Fast-mode surcharges are not guessed.')}</div>
         {quota?.limitReached && <div className="warning-banner"><Clock3 size={17} /><div><strong>{t('上游已标记额度耗尽', 'Upstream reports that the quota is exhausted')}</strong><span>{t('Stone+ 会按实际 429 重置时间冷却账号', 'Stone+ cools the account down until the reset time reported by the actual 429 response.')}</span></div></div>}
         <QuotaTrend
           label={t('5 小时额度 · 最近 24 小时', '5-hour quota · Last 24 hours')}
@@ -122,11 +123,36 @@ function CompactWindow({ label, window }: { label: string; window?: CodexQuotaWi
   return <span className="quota-compact__row"><span>{label}</span><span className="quota-compact__track"><i style={{ width: `${clampPercent(percent)}%` }} /></span><strong>{percent === undefined ? '—' : `${formatPercent(percent)}%`}</strong></span>
 }
 
-function QuotaSummary({ label, window, stale, costUsd }: { label: string; window?: CodexQuotaWindow; stale: boolean; costUsd?: number }) {
+function QuotaSummary({
+  label,
+  window,
+  stale,
+  credits,
+  unpricedCreditTokens
+}: {
+  label: string
+  window?: CodexQuotaWindow
+  stale: boolean
+  credits?: number
+  unpricedCreditTokens?: number
+}) {
   const { t, locale } = useI18n()
+  const incomplete = (unpricedCreditTokens ?? 0) > 0
+  const displayedCredits = incomplete ? undefined : credits
   return <section className="quota-summary">
     <header><span>{label}</span><Badge tone={!window ? 'neutral' : stale ? 'warning' : window.usedPercent >= 90 ? 'danger' : 'success'}>{!window ? t('未知', 'Unknown') : stale ? t('待刷新', 'Stale') : t('实时', 'Live')}</Badge></header>
-    <div className="quota-summary__value"><strong>{window ? formatPercent(window.usedPercent, locale) : '—'}</strong><span>{t('% 已使用', '% used')}</span><b><span>{formatUsd(costUsd, locale)}</span><i>/</i><span>{formatUsd(projectedQuotaUsd(costUsd, window?.usedPercent), locale)}</span></b></div>
+    <div className="quota-summary__value">
+      <strong>{window ? formatPercent(window.usedPercent, locale) : '—'}</strong>
+      <span>{t('% 已使用', '% used')}</span>
+      <b title={incomplete
+        ? t('包含官方费率表未列出的模型，无法无损估算 Credits', 'Contains a model absent from the official rate card; credits cannot be estimated losslessly.')
+        : undefined}
+      >
+        <span>{formatCredits(displayedCredits, locale)}</span>
+        <i>/</i>
+        <span>{formatCredits(projectedQuotaAmount(displayedCredits, window?.usedPercent), locale)}</span>
+      </b>
+    </div>
     <div className="quota-summary__track"><span style={{ width: `${clampPercent(window?.usedPercent)}%` }} /></div>
     <footer><span>{window?.windowSeconds ? formatWindow(window.windowSeconds, t) : t('窗口时长未知', 'Window duration unknown')}</span><span>{resetLabel(window?.resetAt, t)}</span></footer>
   </section>
@@ -168,15 +194,15 @@ function formatPercent(value: number, locale = 'zh-CN'): string {
   return new Intl.NumberFormat(locale, { maximumFractionDigits: 1 }).format(value)
 }
 
-function formatUsd(value: number | undefined, locale: string): string {
-  if (value === undefined) return '$—'
-  const digits = value >= 100 ? 2 : value >= 1 ? 3 : value >= 0.01 ? 4 : 6
-  return new Intl.NumberFormat(locale, { style: 'currency', currency: 'USD', currencyDisplay: 'narrowSymbol', minimumFractionDigits: digits, maximumFractionDigits: digits }).format(value)
+function formatCredits(value: number | undefined, locale: string): string {
+  if (value === undefined) return '— cr'
+  const digits = value >= 100 ? 1 : value >= 1 ? 2 : 3
+  return `${new Intl.NumberFormat(locale, { maximumFractionDigits: digits }).format(value)} cr`
 }
 
-function projectedQuotaUsd(usedUsd: number | undefined, usedPercent: number | undefined): number | undefined {
-  if (usedUsd === undefined || usedPercent === undefined || usedPercent <= 0) return undefined
-  return usedUsd * 100 / Math.min(100, usedPercent)
+function projectedQuotaAmount(used: number | undefined, usedPercent: number | undefined): number | undefined {
+  if (used === undefined || usedPercent === undefined || usedPercent <= 0) return undefined
+  return used * 100 / Math.min(100, usedPercent)
 }
 
 function formatWindow(seconds: number, t: ReturnType<typeof useI18n>['t']): string {

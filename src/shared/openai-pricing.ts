@@ -39,21 +39,24 @@ const PRICING: Record<OpenAiPricedModelFamily, OpenAiModelPricing> = {
     inputUsdPerMillion: 5,
     cachedInputUsdPerMillion: 0.5,
     cacheWriteUsdPerMillion: 6.25,
-    outputUsdPerMillion: 30
+    outputUsdPerMillion: 30,
+    ...longContextPricing
   },
   'gpt-5.6-terra': {
     family: 'gpt-5.6-terra',
-    inputUsdPerMillion: 2.5,
-    cachedInputUsdPerMillion: 0.25,
-    cacheWriteUsdPerMillion: 3.125,
-    outputUsdPerMillion: 15
+    inputUsdPerMillion: 2,
+    cachedInputUsdPerMillion: 0.2,
+    cacheWriteUsdPerMillion: 2.5,
+    outputUsdPerMillion: 12,
+    ...longContextPricing
   },
   'gpt-5.6-luna': {
     family: 'gpt-5.6-luna',
-    inputUsdPerMillion: 1,
-    cachedInputUsdPerMillion: 0.1,
-    cacheWriteUsdPerMillion: 1.25,
-    outputUsdPerMillion: 6
+    inputUsdPerMillion: 0.2,
+    cachedInputUsdPerMillion: 0.02,
+    cacheWriteUsdPerMillion: 0.25,
+    outputUsdPerMillion: 1.2,
+    ...longContextPricing
   },
   'gpt-5.5': {
     family: 'gpt-5.5',
@@ -197,6 +200,70 @@ function isModelOrSnapshot(model: string, base: string): boolean {
   return /^(?:latest|preview|snapshot(?:-\d{4}-\d{2}-\d{2})?|\d{8}|\d{4}-\d{2}-\d{2}(?:-(?:preview|snapshot))?)$/.test(suffix)
 }
 
+export interface CodexTokenCreditPricing {
+  family: string
+  inputCreditsPerMillion: number
+  cachedInputCreditsPerMillion: number
+  outputCreditsPerMillion: number
+}
+
+export interface CodexTokenCreditEstimate {
+  totalCredits: number
+  inputCredits: number
+  cachedInputCredits: number
+  outputCredits: number
+  pricedTokens: number
+  unpricedTokens: number
+  pricedRequestCount: number
+  unpricedRequestCount: number
+  unknownModels: string[]
+}
+
+const CODEX_CREDIT_PRICING: Record<string, CodexTokenCreditPricing> = {
+  'gpt-5.6-sol': codexCreditPricing('gpt-5.6-sol', 125, 12.5, 750),
+  'gpt-5.6-terra': codexCreditPricing('gpt-5.6-terra', 50, 5, 300),
+  'gpt-5.6-luna': codexCreditPricing('gpt-5.6-luna', 5, 0.5, 30),
+  'gpt-5.5': codexCreditPricing('gpt-5.5', 125, 12.5, 750),
+  'gpt-5.5-cyber': codexCreditPricing('gpt-5.5-cyber', 312.5, 31.25, 1_875),
+  'gpt-5.4': codexCreditPricing('gpt-5.4', 62.5, 6.25, 375),
+  'gpt-5.4-mini': codexCreditPricing('gpt-5.4-mini', 18.75, 1.875, 113),
+  'gpt-5.3-codex': codexCreditPricing('gpt-5.3-codex', 43.75, 4.375, 350),
+  'gpt-5.2': codexCreditPricing('gpt-5.2', 43.75, 4.375, 350)
+}
+
+function codexCreditPricing(
+  family: string,
+  inputCreditsPerMillion: number,
+  cachedInputCreditsPerMillion: number,
+  outputCreditsPerMillion: number
+): CodexTokenCreditPricing {
+  return {
+    family,
+    inputCreditsPerMillion,
+    cachedInputCreditsPerMillion,
+    outputCreditsPerMillion
+  }
+}
+
+/** Current official Codex token-credit rate card. Research previews and model
+ * variants absent from the rate card intentionally remain unpriced. */
+export function resolveCodexTokenCreditPricing(model: string): CodexTokenCreditPricing | undefined {
+  const parsed = normalizedModel(model)
+  if (parsed.namespace && parsed.namespace !== 'openai') return undefined
+  const normalized = parsed.model
+  if (isModelOrSnapshot(normalized, 'gpt-5.6-sol')) return CODEX_CREDIT_PRICING['gpt-5.6-sol']
+  if (isModelOrSnapshot(normalized, 'gpt-5.6-terra')) return CODEX_CREDIT_PRICING['gpt-5.6-terra']
+  if (isModelOrSnapshot(normalized, 'gpt-5.6-luna')) return CODEX_CREDIT_PRICING['gpt-5.6-luna']
+  if (isModelOrSnapshot(normalized, 'gpt-5.6')) return CODEX_CREDIT_PRICING['gpt-5.6-sol']
+  if (isModelOrSnapshot(normalized, 'gpt-5.5-cyber')) return CODEX_CREDIT_PRICING['gpt-5.5-cyber']
+  if (isModelOrSnapshot(normalized, 'gpt-5.5')) return CODEX_CREDIT_PRICING['gpt-5.5']
+  if (isModelOrSnapshot(normalized, 'gpt-5.4-mini')) return CODEX_CREDIT_PRICING['gpt-5.4-mini']
+  if (isModelOrSnapshot(normalized, 'gpt-5.4')) return CODEX_CREDIT_PRICING['gpt-5.4']
+  if (isModelOrSnapshot(normalized, 'gpt-5.3-codex')) return CODEX_CREDIT_PRICING['gpt-5.3-codex']
+  if (isModelOrSnapshot(normalized, 'gpt-5.2')) return CODEX_CREDIT_PRICING['gpt-5.2']
+  return undefined
+}
+
 const CLAUDE_MODEL_IDS: Partial<Record<OpenAiPricedModelFamily, readonly string[]>> = {
   'claude-fable-5': ['claude-fable-5'],
   'claude-mythos-5': ['claude-mythos-5'],
@@ -287,6 +354,76 @@ export function resolveOpenAiModelPricing(model: string, effectiveAt = Date.now(
 
 function tokens(value: number | undefined): number {
   return Number.isFinite(value) && value! > 0 ? value! : 0
+}
+
+interface CodexTokenCreditAccumulator {
+  estimate: CodexTokenCreditEstimate
+  unknownModels: Set<string>
+}
+
+function createCodexTokenCreditAccumulator(): CodexTokenCreditAccumulator {
+  return {
+    estimate: {
+      totalCredits: 0,
+      inputCredits: 0,
+      cachedInputCredits: 0,
+      outputCredits: 0,
+      pricedTokens: 0,
+      unpricedTokens: 0,
+      pricedRequestCount: 0,
+      unpricedRequestCount: 0,
+      unknownModels: []
+    },
+    unknownModels: new Set<string>()
+  }
+}
+
+function accumulateCodexTokenCredits(
+  accumulator: CodexTokenCreditAccumulator,
+  log: Readonly<RequestLog>
+): void {
+  const result = accumulator.estimate
+  const input = tokens(log.inputTokens)
+  const output = tokens(log.outputTokens)
+  const total = input + output
+  if (!total) return
+  const billingModel = log.upstreamModel?.trim() || log.model
+  const pricing = resolveCodexTokenCreditPricing(billingModel)
+  if (!pricing) {
+    result.unpricedTokens += total
+    result.unpricedRequestCount += 1
+    accumulator.unknownModels.add(billingModel.trim() || '未知模型')
+    return
+  }
+  const cachedInput = Math.min(input, tokens(log.cachedInputTokens))
+  const cacheWrite = Math.min(Math.max(0, input - cachedInput), tokens(log.cacheWriteInputTokens))
+  const standardInput = Math.max(0, input - cachedInput - cacheWrite)
+  const inputCredits = standardInput / MILLION * pricing.inputCreditsPerMillion
+  const cachedInputCredits = cachedInput / MILLION * pricing.cachedInputCreditsPerMillion
+  const outputCredits = output / MILLION * pricing.outputCreditsPerMillion
+  result.inputCredits += inputCredits
+  result.cachedInputCredits += cachedInputCredits
+  result.outputCredits += outputCredits
+  result.totalCredits += inputCredits + cachedInputCredits + outputCredits
+  result.pricedTokens += total
+  result.pricedRequestCount += 1
+}
+
+function finishCodexTokenCreditAccumulator(
+  accumulator: CodexTokenCreditAccumulator
+): CodexTokenCreditEstimate {
+  accumulator.estimate.unknownModels = [...accumulator.unknownModels]
+    .sort((left, right) => left.localeCompare(right))
+  return accumulator.estimate
+}
+
+/** Estimates current Codex credits from retained request usage. Cache writes
+ * are deliberately excluded because the official Codex rate card does not
+ * charge for them. Fast-mode multipliers are not inferred from ordinary logs. */
+export function estimateCodexTokenCredits(logs: readonly RequestLog[]): CodexTokenCreditEstimate {
+  const accumulator = createCodexTokenCreditAccumulator()
+  for (const log of logs) accumulateCodexTokenCredits(accumulator, log)
+  return finishCodexTokenCreditAccumulator(accumulator)
 }
 
 function isClaudePricingFamily(family: OpenAiPricedModelFamily): boolean {
@@ -461,6 +598,12 @@ export function summarizeAccountCodexQuotaCycleCosts(
   const sevenDay = quota?.sevenDay
     ? createOpenAiTokenCostAccumulator()
     : undefined
+  const fiveHourCredits = quota?.fiveHour
+    ? createCodexTokenCreditAccumulator()
+    : undefined
+  const sevenDayCredits = quota?.sevenDay
+    ? createCodexTokenCreditAccumulator()
+    : undefined
   const fiveHourBounds = quota?.fiveHour
     ? quotaWindowBounds(quota.fiveHour, 5 * 60 * 60, now)
     : undefined
@@ -474,14 +617,30 @@ export function summarizeAccountCodexQuotaCycleCosts(
     if (log.accountId !== accountId) continue
     if (fiveHourBounds && log.timestamp >= fiveHourBounds.start && log.timestamp < fiveHourBounds.end) {
       accumulateOpenAiTokenCost(fiveHour!, log)
+      accumulateCodexTokenCredits(fiveHourCredits!, log)
     }
     if (sevenDayBounds && log.timestamp >= sevenDayBounds.start && log.timestamp < sevenDayBounds.end) {
       accumulateOpenAiTokenCost(sevenDay!, log)
+      accumulateCodexTokenCredits(sevenDayCredits!, log)
     }
   }
+  const fiveHourCreditEstimate = fiveHourCredits
+    ? finishCodexTokenCreditAccumulator(fiveHourCredits)
+    : undefined
+  const sevenDayCreditEstimate = sevenDayCredits
+    ? finishCodexTokenCreditAccumulator(sevenDayCredits)
+    : undefined
   return {
     ...(fiveHour ? { fiveHourUsd: finishOpenAiTokenCostAccumulator(fiveHour).totalCostUsd } : {}),
-    ...(sevenDay ? { sevenDayUsd: finishOpenAiTokenCostAccumulator(sevenDay).totalCostUsd } : {})
+    ...(sevenDay ? { sevenDayUsd: finishOpenAiTokenCostAccumulator(sevenDay).totalCostUsd } : {}),
+    ...(fiveHourCreditEstimate ? {
+      fiveHourCredits: fiveHourCreditEstimate.totalCredits,
+      fiveHourUnpricedCreditTokens: fiveHourCreditEstimate.unpricedTokens
+    } : {}),
+    ...(sevenDayCreditEstimate ? {
+      sevenDayCredits: sevenDayCreditEstimate.totalCredits,
+      sevenDayUnpricedCreditTokens: sevenDayCreditEstimate.unpricedTokens
+    } : {})
   }
 }
 

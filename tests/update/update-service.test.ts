@@ -77,6 +77,8 @@ interface HarnessOptions {
   fetchImplementation?: (input: string, init?: RequestInit) => Promise<Response>
   preferences?: MemoryPreferences
   prepareToInstall?: () => Promise<void>
+  onInstallHandoff?: () => void
+  recoverAfterInstallFailure?: (error: unknown) => void | Promise<void>
   platform?: NodeJS.Platform
   environment?: NodeJS.ProcessEnv
   isPackaged?: boolean
@@ -111,6 +113,8 @@ function createHarness(options: HarnessOptions = {}) {
     fetchImplementation,
     openExternal,
     prepareToInstall,
+    onInstallHandoff: options.onInstallHandoff,
+    recoverAfterInstallFailure: options.recoverAfterInstallFailure,
     now: () => 1_234,
     automaticCheckDelayMs: options.automaticCheckDelayMs,
     automaticCheckIntervalMs: options.automaticCheckIntervalMs
@@ -289,7 +293,8 @@ describe('UpdateService', () => {
   it('shuts down services before handing installation to electron-updater', async () => {
     const order: string[] = []
     const { service, updater } = createHarness({
-      prepareToInstall: async () => { order.push('shutdown') }
+      prepareToInstall: async () => { order.push('shutdown') },
+      onInstallHandoff: () => { order.push('handoff') },
     })
     updater.onQuit = () => { order.push('installer') }
     await service.initialize()
@@ -298,13 +303,14 @@ describe('UpdateService', () => {
 
     await service.installUpdate()
 
-    expect(order).toEqual(['shutdown', 'installer'])
+    expect(order).toEqual(['shutdown', 'installer', 'handoff'])
     expect(updater.quitArguments).toEqual([true, true])
     expect(service.getState().status).toBe('installing')
   })
 
   it('surfaces a synchronous installer error instead of remaining stuck installing', async () => {
-    const { service, updater } = createHarness()
+    const recoverAfterInstallFailure = vi.fn(async () => undefined)
+    const { service, updater } = createHarness({ recoverAfterInstallFailure })
     updater.quitError = new Error('installer could not be started')
     await service.initialize()
     await service.checkForUpdates()
@@ -312,6 +318,34 @@ describe('UpdateService', () => {
 
     await expect(service.installUpdate()).rejects.toThrow('在线更新失败')
     expect(service.getState().status).toBe('error')
+    expect(recoverAfterInstallFailure).toHaveBeenCalledOnce()
+  })
+
+  it('recovers when electron-updater reports an asynchronous install failure after handoff', async () => {
+    const recoverAfterInstallFailure = vi.fn(async () => undefined)
+    const { service, updater } = createHarness({ recoverAfterInstallFailure })
+    await service.initialize()
+    await service.checkForUpdates()
+    await service.downloadUpdate()
+    await service.installUpdate()
+
+    updater.emit('error', new Error('late installer launch failure'))
+    await vi.waitFor(() => expect(recoverAfterInstallFailure).toHaveBeenCalledOnce())
+    expect(service.getState()).toMatchObject({ status: 'error' })
+  })
+
+  it('does not recover when preparation fails before services are closed', async () => {
+    const recoverAfterInstallFailure = vi.fn(async () => undefined)
+    const { service } = createHarness({
+      prepareToInstall: async () => { throw new Error('shutdown rejected') },
+      recoverAfterInstallFailure,
+    })
+    await service.initialize()
+    await service.checkForUpdates()
+    await service.downloadUpdate()
+
+    await expect(service.installUpdate()).rejects.toThrow('shutdown rejected')
+    expect(recoverAfterInstallFailure).not.toHaveBeenCalled()
   })
 
   it('absorbs a late updater error after closing', () => {

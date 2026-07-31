@@ -20,27 +20,31 @@ describe('outbound reload coordinator', () => {
     const direct = account('direct-account')
     const explicit = { ...account('explicit-account'), proxyId: 'proxy-explicit' }
     const discarded = account('discarded-account')
+    const modelSpecific = account('model-specific-account')
     const proxy = proxyDefinition('proxy-explicit')
     const activePool = pool('pool-active', [direct.id, explicit.id])
     const discardedPool = pool('pool-discarded', [discarded.id])
+    const modelSpecificPool = pool('pool-model-specific', [modelSpecific.id])
     const configuration = {
       providers: [provider],
-      accounts: [direct, explicit, discarded],
+      accounts: [direct, explicit, discarded, modelSpecific],
       proxies: [proxy],
-      pools: [activePool, discardedPool],
+      pools: [activePool, discardedPool, modelSpecificPool],
       routes: [
-        route('route-active', activePool.id, true),
+        { ...route('route-active', activePool.id, true), modelSourceMap: { 'gpt-5.6-luna': modelSpecificPool.id } },
         route('route-disabled', discardedPool.id, false)
       ]
     }
     const store = {
       getRuntimeConfiguration: () => configuration,
-      getSnapshot: () => ({ pools: [activePool, discardedPool] }),
+      getSnapshot: () => ({ pools: [activePool, discardedPool, modelSpecificPool] }),
       getProxyPassword: vi.fn(() => 'proxy-password')
     } as unknown as AppStore
 
     const targets = [...collectEnabledOutboundTargets(store).values()]
 
+    // Direct accounts sharing the same endpoint/proxy policy are coalesced into
+    // one detection target, including the account reached only by a model rule.
     expect(targets).toHaveLength(2)
     expect(targets.map((target) => target.targetUrl)).toEqual([
       'https://relay.example/custom/v1/responses?tenant=stone',
@@ -48,7 +52,8 @@ describe('outbound reload coordinator', () => {
     ])
     expect([...new Set(targets.flatMap((target) => [...target.accountIds]))].sort()).toEqual([
       direct.id,
-      explicit.id
+      explicit.id,
+      modelSpecific.id,
     ])
     expect(targets.find((target) => target.proxy)?.password).toBe('proxy-password')
     expect(targets.some((target) => target.accountIds.has(discarded.id))).toBe(false)

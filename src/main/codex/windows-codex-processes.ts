@@ -25,14 +25,7 @@ export async function findBlockingWindowsCodexPids(options: {
   if ((options.platform ?? process.platform) !== 'win32') return []
   const runCommand = options.runCommand ?? runProcessCommand
   try {
-    const result = await runCommand('powershell.exe', [
-      '-NoProfile',
-      '-NonInteractive',
-      '-ExecutionPolicy',
-      'Bypass',
-      '-Command',
-      listBlockingDesktopCommand,
-    ])
+    const result = await runCommand('powershell.exe', encodedPowerShellArgs(listBlockingDesktopCommand))
     return parseProcessIds(result.stdout)
   } catch (powershellCause) {
     try {
@@ -41,10 +34,23 @@ export async function findBlockingWindowsCodexPids(options: {
         runCommand('tasklist.exe', ['/FO', 'CSV', '/NH', '/FI', 'IMAGENAME eq Codex.exe']),
       ])
       return parseTaskListProcessIds(`${chatGpt.stdout}\n${portableCodex.stdout}`)
-    } catch {
-      throw new Error('无法确认 Codex 是否已关闭：' + messageOf(powershellCause))
+    } catch (taskListCause) {
+      throw new Error(
+        `无法确认 Codex 是否已关闭：PowerShell：${messageOf(powershellCause)}；tasklist：${messageOf(taskListCause)}`,
+      )
     }
   }
+}
+
+export function encodedPowerShellArgs(script: string): string[] {
+  return [
+    '-NoProfile',
+    '-NonInteractive',
+    '-ExecutionPolicy',
+    'Bypass',
+    '-EncodedCommand',
+    Buffer.from(script, 'utf16le').toString('base64'),
+  ]
 }
 
 export function parseProcessIds(output: string): number[] {

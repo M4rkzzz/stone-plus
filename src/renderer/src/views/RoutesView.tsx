@@ -27,7 +27,11 @@ import {
   routeSourceUsesKiroClaude,
   type RouteSourceKind,
 } from '@shared/route-sources'
-import { normalizeRouteModelMap, validateRouteModelMapping } from '@shared/route-models'
+import {
+  normalizeRouteModelMap,
+  normalizeRouteModelSourceMap,
+  validateRouteModelMapping,
+} from '@shared/route-models'
 import type { AppSnapshot, GatewayApi, Route, RouteClient, RoutePreviewIssue, RoutePreviewResult } from '@shared/types'
 import type { ActionRunner } from '../App'
 import { clientBrandMeta as clientMeta } from '../brand-icons'
@@ -41,7 +45,7 @@ import {
   routeSourceNeedsClaudeToolchainWarning,
 } from '../claude-toolchain-ui'
 
-type MappingRow = { id: string; source: string; target: string }
+type MappingRow = { id: string; source: string; target: string; sourceId?: string }
 export const DEFAULT_ROUTE_MODEL_KEY = '*'
 
 export function splitRouteModelMap(modelMap: Readonly<Record<string, string>>): {
@@ -56,30 +60,52 @@ export function splitRouteModelMap(modelMap: Readonly<Record<string, string>>): 
   }
 }
 
+export function splitRouteModelRules(
+  modelMap: Readonly<Record<string, string>>,
+  modelSourceMap: Readonly<Record<string, string>> = {},
+): Array<{ source: string; target: string; sourceId: string }> {
+  const models = new Set([
+    ...Object.keys(modelMap).filter((source) => source !== DEFAULT_ROUTE_MODEL_KEY),
+    ...Object.keys(modelSourceMap).filter((source) => source !== DEFAULT_ROUTE_MODEL_KEY),
+  ])
+  return [...models].map((source) => ({
+    source,
+    target: modelMap[source] ?? '',
+    sourceId: modelSourceMap[source] ?? '',
+  }))
+}
+
 export type RouteMappingValidation = {
   valid: true
   modelMap: Record<string, string>
+  modelSourceMap: Record<string, string>
 } | {
   valid: false
-  reason: 'incomplete' | 'duplicate-source' | 'reserved-source' | 'unsafe-source' | 'unsafe-target'
+  reason: 'incomplete' | 'duplicate-source' | 'reserved-source' | 'unsafe-source' | 'unsafe-target' | 'unsafe-source-id'
 }
 
 /** Validate without silently dropping rows the user can still see in the editor. */
-export function validateRouteMappings(rows: readonly Pick<MappingRow, 'source' | 'target'>[], defaultUpstreamModel = ''): RouteMappingValidation {
+export function validateRouteMappings(
+  rows: readonly Pick<MappingRow, 'source' | 'target' | 'sourceId'>[],
+  defaultUpstreamModel = '',
+): RouteMappingValidation {
   const entries: Array<[string, string]> = []
+  const sourceEntries: Array<[string, string]> = []
   const sources = new Set<string>()
   for (const row of rows) {
     const source = row.source.trim()
     const target = row.target.trim()
-    if (!source || !target) return { valid: false, reason: 'incomplete' }
+    const sourceId = row.sourceId?.trim() ?? ''
+    if (!source || (!target && !sourceId)) return { valid: false, reason: 'incomplete' }
     if (source === DEFAULT_ROUTE_MODEL_KEY) return { valid: false, reason: 'reserved-source' }
-    const sharedValidation = validateRouteModelMapping(source, target)
+    const sharedValidation = validateRouteModelMapping(source, target || source)
     if (!sharedValidation.valid) {
       return { valid: false, reason: sharedValidation.reason === 'invalid-source' ? 'unsafe-source' : 'unsafe-target' }
     }
     if (sources.has(source)) return { valid: false, reason: 'duplicate-source' }
     sources.add(source)
-    entries.push([source, target])
+    if (target) entries.push([source, target])
+    if (sourceId) sourceEntries.push([source, sourceId])
   }
   const normalizedDefault = defaultUpstreamModel.trim()
   if (normalizedDefault) {
@@ -88,13 +114,21 @@ export function validateRouteMappings(rows: readonly Pick<MappingRow, 'source' |
     }
     entries.push([DEFAULT_ROUTE_MODEL_KEY, normalizedDefault])
   }
-  return { valid: true, modelMap: { ...normalizeRouteModelMap(Object.fromEntries(entries)) } }
+  const modelSourceMap = { ...normalizeRouteModelSourceMap(Object.fromEntries(sourceEntries)) }
+  if (Object.keys(modelSourceMap).length !== sourceEntries.length) {
+    return { valid: false, reason: 'unsafe-source-id' }
+  }
+  return {
+    valid: true,
+    modelMap: { ...normalizeRouteModelMap(Object.fromEntries(entries)) },
+    modelSourceMap,
+  }
 }
 
 /** Every field sent to previewRoute participates in the result identity. */
 export function routePreviewBinding(
   draft: Route,
-  mappings: readonly Pick<MappingRow, 'source' | 'target'>[],
+  mappings: readonly Pick<MappingRow, 'source' | 'target' | 'sourceId'>[],
   defaultUpstreamModel: string,
   requestedModel: string,
 ): string {
@@ -106,9 +140,10 @@ export function routePreviewBinding(
       highConcurrencyMode: draft.highConcurrencyMode === true,
       poolId: draft.poolId,
       inboundProtocol: draft.inboundProtocol,
+      modelSourceMap: draft.modelSourceMap ?? {},
       localToken: draft.localToken,
     },
-    mappings: mappings.map(({ source, target }) => ({ source, target })),
+    mappings: mappings.map(({ source, target, sourceId }) => ({ source, target, sourceId: sourceId ?? '' })),
     defaultUpstreamModel,
     requestedModel,
   })
@@ -172,6 +207,7 @@ export function routeToggleAcknowledgementSignature(route: Route): string {
     poolId: route.poolId,
     inboundProtocol: route.inboundProtocol,
     modelMap: route.modelMap,
+    modelSourceMap: route.modelSourceMap ?? {},
     localToken: route.localToken,
     createdAt: route.createdAt,
   })
@@ -179,16 +215,20 @@ export function routeToggleAcknowledgementSignature(route: Route): string {
 
 export function routeEditorHasChanges(
   draft: Route,
-  mappings: readonly Pick<MappingRow, 'source' | 'target'>[],
+  mappings: readonly Pick<MappingRow, 'source' | 'target' | 'sourceId'>[],
   persisted: Route,
   defaultUpstreamModel = splitRouteModelMap(persisted.modelMap).defaultUpstreamModel,
 ): boolean {
-  const { modelMap: _draftModelMap, updatedAt: _draftUpdatedAt, ...draftFields } = draft
-  const { modelMap: _persistedModelMap, updatedAt: _persistedUpdatedAt, ...persistedFields } = persisted
-  return JSON.stringify({ fields: draftFields, mappings: mappings.map(({ source, target }) => ({ source, target })), defaultUpstreamModel })
+  const { modelMap: _draftModelMap, modelSourceMap: _draftModelSourceMap, updatedAt: _draftUpdatedAt, ...draftFields } = draft
+  const { modelMap: _persistedModelMap, modelSourceMap: _persistedModelSourceMap, updatedAt: _persistedUpdatedAt, ...persistedFields } = persisted
+  return JSON.stringify({
+    fields: draftFields,
+    mappings: mappings.map(({ source, target, sourceId }) => ({ source, target, sourceId: sourceId ?? '' })),
+    defaultUpstreamModel,
+  })
     !== JSON.stringify({
       fields: persistedFields,
-      mappings: splitRouteModelMap(persisted.modelMap).exactMappings,
+      mappings: splitRouteModelRules(persisted.modelMap, persisted.modelSourceMap),
       defaultUpstreamModel: splitRouteModelMap(persisted.modelMap).defaultUpstreamModel,
     })
 }
@@ -224,6 +264,10 @@ function previewIssueText(
   if (item.code === 'source-unavailable') return item.message.includes('Grok Build')
     ? t('Grok Build 只能使用 Grok 号池或 Grok 中转站。', 'Grok Build can use only Grok pools or Grok relays.')
     : t('来源没有可参与调度的账号。', 'The source has no account eligible for scheduling.')
+  if (item.code === 'source-overridden') return t(
+    `该请求模型将改走 ${preview.sourceName ?? '指定来源'}。`,
+    `This requested model will use ${preview.sourceName ?? 'the selected source'}.`,
+  )
   if (item.code === 'protocol-conversion') {
     const target = preview.sourceProtocol ? protocolLabels[preview.sourceProtocol] : undefined
     return t(`将转换为 ${target ?? '上游协议'}。`, `The request will be converted to ${target ?? 'the upstream protocol'}.`)
@@ -250,8 +294,8 @@ function RouteEditor({
 }) {
   const { t, language } = useI18n()
   const [draft, setDraft] = useState(route)
-  const [mappings, setMappings] = useState<MappingRow[]>(() => splitRouteModelMap(route.modelMap).exactMappings
-    .map(({ source, target }) => ({ id: crypto.randomUUID(), source, target })))
+  const [mappings, setMappings] = useState<MappingRow[]>(() => splitRouteModelRules(route.modelMap, route.modelSourceMap)
+    .map((rule) => ({ id: crypto.randomUUID(), ...rule })))
   const [defaultUpstreamModel, setDefaultUpstreamModel] = useState(() => splitRouteModelMap(route.modelMap).defaultUpstreamModel)
   const [showToken, setShowToken] = useState(false)
   const [copied, setCopied] = useState<string | null>(null)
@@ -285,7 +329,8 @@ function RouteEditor({
     pendingToggle.current = undefined
     setDraft(route)
     const mapping = splitRouteModelMap(route.modelMap)
-    setMappings(mapping.exactMappings.map(({ source, target }) => ({ id: crypto.randomUUID(), source, target })))
+    setMappings(splitRouteModelRules(route.modelMap, route.modelSourceMap)
+      .map((rule) => ({ id: crypto.randomUUID(), ...rule })))
     setDefaultUpstreamModel(mapping.defaultUpstreamModel)
     setMappingValidationAttempted(false)
   }, [route, routeSignature])
@@ -341,7 +386,11 @@ function RouteEditor({
     await mutation.current.run(async () => {
       setLocalMutation('save')
       try {
-        return await runAction(`save-route-${route.id}`, () => api.updateRoute({ ...draft, modelMap: validation.modelMap }))
+        return await runAction(`save-route-${route.id}`, () => api.updateRoute({
+          ...draft,
+          modelMap: validation.modelMap,
+          modelSourceMap: draft.client === 'codex' ? validation.modelSourceMap : {},
+        }))
       } finally {
         setLocalMutation(null)
       }
@@ -362,7 +411,11 @@ function RouteEditor({
       binding,
       () => previewBindingRef.current,
       () => api.previewRoute({
-        route: { ...draft, modelMap: validation.modelMap },
+        route: {
+          ...draft,
+          modelMap: validation.modelMap,
+          modelSourceMap: draft.client === 'codex' ? validation.modelSourceMap : {},
+        },
         requestedModel: previewModel.trim() || undefined,
       }),
     )
@@ -405,6 +458,12 @@ function RouteEditor({
   const mappingValidation = validateRouteMappings(mappings, defaultUpstreamModel)
   const hasChanges = routeEditorHasChanges(draft, mappings, route, defaultUpstreamModel)
   const sourceModelOptions = routeSourceModelOptions(draft.poolId, snapshot)
+  const modelSourceAllowed = draft.client !== 'codex' || mappings.every((row) => (
+    !row.sourceId || routeSources.some((item) => item.id === row.sourceId)
+  ))
+  const modelSourceOverrideCount = draft.client === 'codex'
+    ? mappings.filter((row) => row.sourceId).length
+    : 0
   const changeSource = (sourceId: string) => {
     setDraft({ ...draft, poolId: sourceId })
     setDefaultUpstreamModel((current) => defaultModelAfterRouteSourceChange(sourceId, current, snapshot))
@@ -496,8 +555,15 @@ function RouteEditor({
           <code>{showToken ? draft.localToken : `••••••••••••${draft.localToken.slice(-6)}`}</code>
         </div>
 
-        <div className="mapping-section">
-          <div className="mapping-section__heading"><div><strong>{t('模型映射', 'Model mapping')}</strong><span>{defaultUpstreamModel ? t(`${mappings.length} 条精确规则 + 1 条默认`, `${mappings.length} exact + 1 default`) : mappings.length ? t(`${mappings.length} 条规则`, `${mappings.length} ${mappings.length === 1 ? 'rule' : 'rules'}`) : t('直接使用请求中的模型标识', 'Use the requested model identifier directly')}</span></div><button className="text-button" type="button" onClick={() => { updateMappings([...mappings, { id: crypto.randomUUID(), source: '', target: '' }]); setMappingValidationAttempted(false) }}><Plus size={15} />{t('添加规则', 'Add rule')}</button></div>
+        <div className={`mapping-section ${draft.client === 'codex' ? 'mapping-section--source-routing' : ''}`}>
+          <div className="mapping-section__heading"><div><strong>{draft.client === 'codex' ? t('按模型分流与映射', 'Per-model routing and mapping') : t('模型映射', 'Model mapping')}</strong><span>{draft.client === 'codex' && modelSourceOverrideCount > 0
+            ? t(`${modelSourceOverrideCount} 个模型使用独立来源`, `${modelSourceOverrideCount} model(s) use a separate source`)
+            : defaultUpstreamModel
+              ? t(`${mappings.length} 条精确规则 + 1 条默认`, `${mappings.length} exact + 1 default`)
+              : mappings.length
+                ? t(`${mappings.length} 条规则`, `${mappings.length} ${mappings.length === 1 ? 'rule' : 'rules'}`)
+                : t('未命中规则时使用上方默认来源', 'Unmatched models use the default source above')}</span></div><button className="text-button" type="button" onClick={() => { updateMappings([...mappings, { id: crypto.randomUUID(), source: '', target: '', sourceId: '' }]); setMappingValidationAttempted(false) }}><Plus size={15} />{t('添加规则', 'Add rule')}</button></div>
+          {draft.client === 'codex' && <div className="model-source-routing-note"><RouteIcon size={14} /><span>{t('每条规则都可单独选择来源/号池；不选择时继续使用上方默认来源。上游模型留空表示保持请求模型不变。', 'Each rule may select its own source or pool. Leaving it unset keeps the default source above; leaving the upstream model blank preserves the requested model.')}</span></div>}
           <div className="mapping-default">
             <label className="field">
               <span>{t('默认上游模型', 'Default upstream model')}</span>
@@ -515,7 +581,11 @@ function RouteEditor({
                 <div className="mapping-row" key={row.id}>
                   <input className="mono" value={row.source} onChange={(event) => updateMappings(mappings.map((item) => item.id === row.id ? { ...item, source: event.target.value } : item))} placeholder={t('请求模型', 'Requested model')} />
                   <span>→</span>
-                  <input className="mono" value={row.target} onChange={(event) => updateMappings(mappings.map((item) => item.id === row.id ? { ...item, target: event.target.value } : item))} placeholder={t('上游模型', 'Upstream model')} />
+                  <input className="mono" value={row.target} onChange={(event) => updateMappings(mappings.map((item) => item.id === row.id ? { ...item, target: event.target.value } : item))} placeholder={draft.client === 'codex' ? t('上游模型（留空保持）', 'Upstream model (keep if blank)') : t('上游模型', 'Upstream model')} />
+                  {draft.client === 'codex' && <select className="mapping-row__source" value={row.sourceId ?? ''} onChange={(event) => updateMappings(mappings.map((item) => item.id === row.id ? { ...item, sourceId: event.target.value } : item))} aria-label={t(`${row.source || '该模型'} 的来源`, `Source for ${row.source || 'this model'}`)}>
+                    <option value="">{t('默认来源', 'Default source')}</option>
+                    {routeSources.map((item) => <option key={item.id} value={item.id}>{setupPoolDisplayName(item.name, t)}</option>)}
+                  </select>}
                   <button className="icon-button" type="button" title={t('删除映射', 'Delete mapping')} onClick={() => updateMappings(mappings.filter((item) => item.id !== row.id))}><Trash2 size={15} /></button>
                 </div>
               ))}
@@ -529,7 +599,10 @@ function RouteEditor({
                 ? t('请求模型名称无效：不能使用保留对象键、控制字符或超过 256 个字符。', 'The requested model name is invalid: reserved object keys, control characters, and names over 256 characters are not allowed.')
                 : mappingValidation.reason === 'unsafe-target'
                   ? t('上游模型名称无效：不能包含控制字符或超过 256 个字符。', 'The upstream model name is invalid: control characters and names over 256 characters are not allowed.')
-            : t('请填写完整的请求模型和上游模型，或删除未完成的规则。', 'Complete both model fields or remove the unfinished rule.')}</FieldError>}
+                  : mappingValidation.reason === 'unsafe-source-id'
+                    ? t('模型来源标识无效，请重新选择来源。', 'The model source identifier is invalid. Select the source again.')
+            : t('请填写请求模型，并至少选择一个独立来源或填写上游模型。', 'Enter the requested model and either select a separate source or provide an upstream model.')}</FieldError>}
+          {!modelSourceAllowed && <FieldError>{t('某条模型分流规则引用了已不可用的来源，请重新选择。', 'A model-routing rule references an unavailable source. Select it again.')}</FieldError>}
         </div>
 
         <details className="client-config route-preview">
@@ -549,7 +622,7 @@ function RouteEditor({
 
       <footer className="route-editor__footer">
         <span>{hasChanges ? t('有未保存的更改', 'Unsaved changes') : t('配置已同步', 'Configuration synced')}</span>
-        <button className="button button--primary" type="button" onClick={() => void save()} disabled={busy || localMutation !== null || !hasChanges || (draft.enabled && (!draft.poolId || !sourceAllowed))}>{busy || localMutation === 'save' ? <LoaderCircle size={16} className="spin" /> : <Save size={16} />}{t('保存路由', 'Save route')}</button>
+        <button className="button button--primary" type="button" onClick={() => void save()} disabled={busy || localMutation !== null || !hasChanges || !modelSourceAllowed || (draft.enabled && (!draft.poolId || !sourceAllowed))}>{busy || localMutation === 'save' ? <LoaderCircle size={16} className="spin" /> : <Save size={16} />}{t('保存路由', 'Save route')}</button>
       </footer>
     </article>
   )

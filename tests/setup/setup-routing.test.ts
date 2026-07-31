@@ -113,6 +113,44 @@ describe('setup routing transaction', () => {
     expect(draft.pools).toEqual([])
   })
 
+  it('allows DeepSeek Responses only for Codex routes', () => {
+    const codexDraft = state()
+    codexDraft.providers[0] = {
+      ...codexDraft.providers[0],
+      sourceType: 'official-api',
+      kind: 'deepseek',
+      baseUrl: 'https://api.deepseek.com',
+      protocol: 'openai-responses',
+      models: ['deepseek-v4-flash'],
+    }
+    codexDraft.accounts.forEach((account) => {
+      account.credentialType = 'api-key'
+      account.availableModels = ['deepseek-v4-flash']
+    })
+    applySetupRoutingDraft(codexDraft, {
+      sessionId: 'session', sourceId: 'one', client: 'codex', model: 'deepseek-v4-flash',
+    })
+    expect(codexDraft.routes[0]).toMatchObject({
+      client: 'codex',
+      inboundProtocol: 'openai-responses',
+      modelMap: {},
+    })
+
+    for (const client of ['claude', 'gemini', 'grokbuild'] as const) {
+      const rejected = state()
+      rejected.providers[0] = { ...codexDraft.providers[0] }
+      rejected.accounts.forEach((account) => {
+        account.credentialType = 'api-key'
+        account.availableModels = ['deepseek-v4-flash']
+      })
+      expect(() => applySetupRoutingDraft(rejected, {
+        sessionId: 'session', sourceId: 'one', client, model: 'deepseek-v4-flash',
+      })).toThrow(/DeepSeek Responses/)
+      expect(rejected.routes).toEqual([])
+      expect(rejected.pools).toEqual([])
+    }
+  })
+
   it('maps Codex aliases to the only Claude model across the protocol bridge', () => {
     const draft = state()
     draft.providers[0] = {

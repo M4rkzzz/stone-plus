@@ -5,6 +5,8 @@ describe('provider source family', () => {
   it('keeps official and compatible OpenAI separate from Grok as routing families', () => {
     expect(providerSourceFamily('openai')).toBe('openai')
     expect(providerSourceFamily('openai-compatible')).toBe('openai')
+    expect(providerSourceFamily('deepseek')).toBe('deepseek')
+    expect(providerSourceFamily('deepseek-compatible')).toBe('deepseek')
     expect(providerSourceFamily('xai')).toBe('grok')
     expect(providerSourceFamily('xai-compatible')).toBe('grok')
   })

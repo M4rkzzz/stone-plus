@@ -34,6 +34,7 @@ describe('account renderer pressure bounds', () => {
     const body = markup.match(/<tbody>([\s\S]*?)<\/tbody>/)?.[1] ?? ''
 
     expect(body.match(/<tr(?:\s|>)/g)).toHaveLength(100)
+    expect(body.match(/title="Open ChatGPT web with this account"/g)).toHaveLength(100)
     expect(markup).toContain('Showing 1–100 of 500 filtered accounts')
     expect(markup).toContain('Select-all, checks, and bulk actions still apply to the complete filtered result')
   })

@@ -15,6 +15,7 @@ import type { ChatGptOAuthSessionController } from '../../src/main/auth/chatgpt-
 import { PersistentTaskRunner } from '../../src/main/tasks'
 import type { DatabaseBackupService, WebDavBackupService } from '../../src/main/backup'
 import type { PersistedState } from '../../src/main/store/types'
+import type { ChatGptWebLoginController } from '../../src/main/chatgpt-web-login'
 
 type InvokeHandler = (event: unknown, ...args: unknown[]) => unknown
 
@@ -782,6 +783,60 @@ describe('refresh provider models IPC', () => {
 
     expect(harness.store.updateGateway).toHaveBeenCalledWith(expect.objectContaining({ disableCodexMicro: true }))
     expect(result.gateway.disableCodexMicro).toBe(true)
+    expect(harness.gateway.stop).not.toHaveBeenCalled()
+    expect(harness.gateway.start).not.toHaveBeenCalled()
+  })
+
+  it('clears only failure cooldowns when cooldown is disabled', async () => {
+    const failureCooled = oauthAccount()
+    failureCooled.id = 'account-failure-cooled'
+    const quotaCooled = oauthAccount()
+    quotaCooled.id = 'account-quota-cooled'
+    const harness = createHarness([failureCooled, quotaCooled], {}, vi.fn())
+    const failureState = {
+      status: 'cooldown' as const,
+      circuitState: 'open' as const,
+      consecutiveFailures: 3,
+      cooldownUntil: Date.now() + 60_000,
+      cooldownReason: 'failure' as const,
+      lastError: 'temporary upstream failure',
+    }
+    const quotaState = {
+      status: 'cooldown' as const,
+      circuitState: 'open' as const,
+      cooldownUntil: Date.now() + 60_000,
+      cooldownReason: 'quota' as const,
+    }
+    Object.assign(failureCooled, failureState)
+    Object.assign(quotaCooled, quotaState)
+    Object.assign(harness.store.getSnapshot().accounts.find(({ id }) => id === failureCooled.id), failureState)
+    Object.assign(harness.store.getSnapshot().accounts.find(({ id }) => id === quotaCooled.id), quotaState)
+    const handler = electron.handlers.get('stone:update-gateway')
+    if (!handler) throw new Error('update-gateway handler was not registered')
+
+    const result = await handler(rendererEvent(104), {
+      ...harness.store.getSnapshot().gateway,
+      disableCooldown: true,
+    }) as AppSnapshot
+
+    expect(result.gateway.disableCooldown).toBe(true)
+    expect(harness.store.updateAccountRuntimeStates).toHaveBeenCalledWith([{
+      id: failureCooled.id,
+      patch: expect.objectContaining({
+        status: 'active',
+        circuitState: 'closed',
+        consecutiveFailures: 0,
+        cooldownReason: undefined,
+        cooldownUntil: undefined,
+      }),
+    }])
+    expect(quotaCooled).toMatchObject({
+      status: 'cooldown',
+      circuitState: 'open',
+      cooldownReason: 'quota',
+    })
+    expect(harness.gateway.resetAccountHealth).toHaveBeenCalledOnce()
+    expect(harness.gateway.resetAccountHealth).toHaveBeenCalledWith(failureCooled.id)
     expect(harness.gateway.stop).not.toHaveBeenCalled()
     expect(harness.gateway.start).not.toHaveBeenCalled()
   })
@@ -3050,6 +3105,7 @@ function createHarness(
     backups: DatabaseBackupService<PersistedState>
     webDavBackups: WebDavBackupService
   },
+  chatGptWebLogin?: ChatGptWebLoginController,
 ): {
   store: AppStore
   gateway: GatewayController
@@ -3360,6 +3416,8 @@ function createHarness(
     undefined,
     sharedOutboundReloadCoordinator,
     backupServices?.webDavBackups,
+    undefined,
+    chatGptWebLogin,
   )
   return {
     store,
@@ -3399,6 +3457,36 @@ function activeAccountState(accountId: string, latencyMs: number, lastUsedAt: nu
     lastUsedAt
   }
 }
+
+describe('ChatGPT web login IPC', () => {
+  it('opens the exact selected account and disposes the owned controller at shutdown', async () => {
+    const webLogin = {
+      open: vi.fn(async () => undefined),
+      dispose: vi.fn(async () => undefined),
+    } satisfies ChatGptWebLoginController
+    const harness = createHarness(
+      [oauthAccount()],
+      { 'credential-oauth': oauthCredential() },
+      vi.fn(),
+      [],
+      { current: 'web-login-fingerprint' },
+      {} as ClientConfigService,
+      undefined,
+      undefined,
+      webLogin,
+    )
+    const handler = electron.handlers.get('stone:open-chatgpt-web-login')
+    if (!handler) throw new Error('open-chatgpt-web-login handler was not registered')
+    const mainFrame = { url: 'http://127.0.0.1:5173/index.html' }
+
+    const snapshot = await handler({ senderFrame: mainFrame, sender: { mainFrame } }, 'account-oauth') as AppSnapshot
+
+    expect(webLogin.open).toHaveBeenCalledWith('account-oauth')
+    expect(snapshot.accounts.some((account) => account.id === 'account-oauth')).toBe(true)
+    await harness.dispose()
+    expect(webLogin.dispose).toHaveBeenCalledOnce()
+  })
+})
 
 async function invokeRefresh(harness: { store: AppStore; transport: OutboundTransportManager }): Promise<AppSnapshot> {
   void harness

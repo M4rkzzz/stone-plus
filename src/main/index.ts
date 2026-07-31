@@ -57,6 +57,8 @@ import { builtInProxyPlatformCapabilities, createSystemProxyPlatformAdapter } fr
 import { ElevatedSingBoxTunAdapter } from './proxy/built-in/tun-sidecar-adapter'
 import { TunController } from './proxy/built-in/tun-controller'
 import { RequestMonitorWindowController } from './request-monitor-window'
+import { FileRequestMonitorWindowStateStore } from './request-monitor-window-state'
+import { ChatGptWebLoginService } from './chatgpt-web-login'
 
 const { autoUpdater } = electronUpdater
 const WINDOWS_APP_USER_MODEL_ID = 'io.github.m4rkzzz.stoneplus'
@@ -483,7 +485,24 @@ async function bootstrap(): Promise<void> {
         shutdownForUpdate = false
         throw error
       }
-    }
+    },
+    onInstallHandoff: () => {
+      // electron-updater accepted the installer launch, and every runtime
+      // service is already closed. If its scheduled app.quit never completes,
+      // do not leave a visible process serving a gateway with a closed
+      // outbound transport. The installer owns reopening the application.
+      const timer = setTimeout(() => app.exit(0), 5_000)
+      timer.unref()
+    },
+    recoverAfterInstallFailure: () => {
+      // Full shutdown is intentionally irreversible. Relaunch the current
+      // build when installer startup fails instead of leaving a half-dead UI
+      // that can only return "Outbound transport manager is closed".
+      setImmediate(() => {
+        app.relaunch()
+        app.exit(0)
+      })
+    },
   })
   await updateService.initialize()
   if (bootstrapShouldStop()) return
@@ -519,6 +538,12 @@ async function bootstrap(): Promise<void> {
     })
   })
 
+  const chatGptWebLogin = new ChatGptWebLoginService({
+    store,
+    outboundTransport,
+    iconPath: stoneIconPath(),
+  })
+
   flushGatewayApiState = registerGatewayApi(
     store, gateway, clientConfig, outboundTransport, backups,
     updateTrayMenu, browserImportQueue, undefined, localEventServer, outboundReloadCoordinator, webDavBackups,
@@ -528,7 +553,8 @@ async function bootstrap(): Promise<void> {
       if (rendererThemeReadyTimeout) clearTimeout(rendererThemeReadyTimeout)
       rendererThemeReadyTimeout = undefined
       revealMainWindowIfReady()
-    }
+    },
+    chatGptWebLogin,
   )
   disposeBuiltInProxyApi = registerBuiltInProxyApi(builtInProxy, builtInProxy)
   systemLifecycle = new SystemLifecycleCoordinator({
@@ -552,10 +578,12 @@ async function bootstrap(): Promise<void> {
     iconPath: stoneIconPath(),
     windowsAppUserModelId: windowsAppUserModelId(),
     showMainWindow,
+    stateStore: new FileRequestMonitorWindowStateStore(join(app.getPath('userData'), 'request-monitor-window.json')),
   })
   disposeRequestMonitorApi = registerRequestMonitorApi(requestMonitorWindow)
   createWindow()
   createTray()
+  requestMonitorWindow.restore()
   await builtInProxy.initialize().catch((error) => {
     // The window and IPC surface are ready before optional proxy auto-start so
     // slow subscriptions and health checks remain visible to the user.

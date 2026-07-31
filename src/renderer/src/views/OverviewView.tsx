@@ -53,40 +53,42 @@ const tokenRateRanges: Array<{ id: TokenRateRange; label: readonly [string, stri
 ]
 
 const TOKEN_COST_TOOLTIP_ZH = [
-  '按 2026-07-25 可核验的 OpenAI、xAI 与 Anthropic 标准 API 价格估算（每 100 万 Token）。',
+  '按 2026-07-31 可核验的 OpenAI、xAI 与 Anthropic 标准 API 价格估算（每 100 万 Token）。',
   '路由发生模型映射时，按实际上游模型计价；旧日志没有上游模型时才使用请求模型。',
   'gpt-5.6 / Sol：输入 $5、缓存读取 $0.5、输出 $30；',
-  'Terra：$2.5 / $0.25 / $15；Luna：$1 / $0.1 / $6。',
+  'Terra：$2 / $0.20 / $12；Luna：$0.20 / $0.02 / $1.20。',
   'gpt-5.5：$5 / $0.5 / $30；5.5 Pro：$30 / $30 / $180。',
   'gpt-5.4：$2.5 / $0.25 / $15；5.4 Pro：$30 / $30 / $180；',
   '5.4 Mini：$0.75 / $0.075 / $4.5；5.4 Nano：$0.20 / $0.02 / $1.25。',
   '非 Pro 型号的缓存读取价为普通输入价的 10%，即 90% 折扣。',
   '普通输入 = max(输入 - 缓存读取 - 缓存写入, 0)，避免重复计费。',
   '5.6 缓存写入若由上游单独上报则按输入价 1.25 倍计入输入成本；未单独上报时计入普通输入。',
-  '5.4、5.4 Pro、5.5、5.5 Pro 单次输入超过 272K Token 时，整次输入价格 2 倍、输出价格 1.5 倍；恰好 272K 不加价。5.6 不套用该规则。',
+  '5.6、5.5、5.5 Pro、5.4、5.4 Pro 单次输入超过 272K Token 时，整次输入价格 2 倍、输出价格 1.5 倍；恰好 272K 不加价。',
   'Pro 没有缓存读取折扣，缓存读取按普通输入价格计算。',
   'Grok 4.5：输入 $2、缓存读取 $0.30、输出 $6；输入达到 200K 时分别为 $4 / $0.60 / $12。',
   'Claude 缓存依次按 5 分钟写入 / 1 小时写入 / 读取计价：Fable 5、Mythos 5 为 $10 / $12.5 / $20 / $1 / $50；Opus 5、4.8–4.5 为 $5 / $6.25 / $10 / $0.5 / $25；Opus 4.1、4 为 $15 / $18.75 / $30 / $1.5 / $75。',
   'Sonnet 5 在 2026-08-31 前为 $2 / $2.5 / $4 / $0.2 / $10，2026-09-01 起为 $3 / $3.75 / $6 / $0.3 / $15；Sonnet 4.6–4 使用后一组价格。Haiku 4.5 为 $1 / $1.25 / $2 / $0.1 / $5，Haiku 3.5 为 $0.8 / $1 / $1.6 / $0.08 / $4。',
+  'Codex 订阅 Credits 使用官方独立费率，在账号额度详情展示，不与这里的标准 API 美元估算混合。',
   '未知模型或无法证明缓存口径的旧日志会显示为未计价，不会套用猜测价格。这是标准 API 等价估算，不包含中转加价、服务端工具或优先级费用。'
 ].join(' ')
 
 const TOKEN_COST_TOOLTIP_EN = [
-  'Estimated from verifiable OpenAI, xAI, and Anthropic standard API pricing as of 2026-07-25 (per 1 million Tokens).',
+  'Estimated from verifiable OpenAI, xAI, and Anthropic standard API pricing as of 2026-07-31 (per 1 million Tokens).',
   'When a route maps the model, pricing uses the actual upstream model; old logs fall back to the requested model only when no upstream model was recorded.',
   'gpt-5.6 / Sol: $5 input, $0.5 cached input, $30 output;',
-  'Terra: $2.5 / $0.25 / $15; Luna: $1 / $0.1 / $6.',
+  'Terra: $2 / $0.20 / $12; Luna: $0.20 / $0.02 / $1.20.',
   'gpt-5.5: $5 / $0.5 / $30; 5.5 Pro: $30 / $30 / $180.',
   'gpt-5.4: $2.5 / $0.25 / $15; 5.4 Pro: $30 / $30 / $180;',
   '5.4 Mini: $0.75 / $0.075 / $4.5; 5.4 Nano: $0.20 / $0.02 / $1.25.',
   'Cached input for non-Pro models costs 10% of regular input, a 90% discount.',
   'Regular input = max(input - cached input - cache writes, 0), preventing duplicate charges.',
   'Separately reported 5.6 cache writes are priced at 1.25x input; otherwise they count as regular input.',
-  'For 5.4, 5.4 Pro, 5.5, and 5.5 Pro requests above 272K input Tokens, all input costs 2x and output costs 1.5x. Exactly 272K is not surcharged. This rule does not apply to 5.6.',
+  'For 5.6, 5.5, 5.5 Pro, 5.4, and 5.4 Pro requests above 272K input Tokens, all input costs 2x and output costs 1.5x. Exactly 272K is not surcharged.',
   'Pro models do not receive a cached-input discount.',
   'Grok 4.5: $2 input, $0.30 cached input, and $6 output; at 200K input or more, $4 / $0.60 / $12.',
   'Claude rates are input / 5-minute cache write / 1-hour cache write / cache read / output: Fable 5 and Mythos 5 are $10 / $12.5 / $20 / $1 / $50; Opus 5 and 4.8–4.5 are $5 / $6.25 / $10 / $0.5 / $25; Opus 4.1 and 4 are $15 / $18.75 / $30 / $1.5 / $75.',
   'Sonnet 5 is $2 / $2.5 / $4 / $0.2 / $10 through 2026-08-31 and $3 / $3.75 / $6 / $0.3 / $15 from 2026-09-01; Sonnet 4.6–4 use the latter rates. Haiku 4.5 is $1 / $1.25 / $2 / $0.1 / $5 and Haiku 3.5 is $0.8 / $1 / $1.6 / $0.08 / $4.',
+  'Codex subscription credits use a separate official rate card shown in account quota details and are not mixed with this standard-API USD estimate.',
   'Unknown models and legacy logs whose cache accounting cannot be proven remain unpriced instead of using guessed rates. This is a standard-API-equivalent estimate and excludes relay markups, server tools, and priority charges.',
 ].join(' ')
 

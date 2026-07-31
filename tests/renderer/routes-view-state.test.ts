@@ -10,6 +10,7 @@ import {
   routeSourceUsesNativeGrok,
   routeToggleAcknowledgementSignature,
   splitRouteModelMap,
+  splitRouteModelRules,
   validateRouteMappings,
 } from '../../src/renderer/src/views/RoutesView'
 
@@ -50,11 +51,29 @@ describe('route editor state boundaries', () => {
       { source: ' alias ', target: 'second' },
     ])).toEqual({ valid: false, reason: 'duplicate-source' })
     expect(validateRouteMappings([{ source: ' alias ', target: ' gpt-5 ' }]))
-      .toEqual({ valid: true, modelMap: { alias: 'gpt-5' } })
+      .toEqual({ valid: true, modelMap: { alias: 'gpt-5' }, modelSourceMap: {} })
     expect(validateRouteMappings([{ source: '*', target: 'gpt-5' }]))
       .toEqual({ valid: false, reason: 'reserved-source' })
     expect(validateRouteMappings([{ source: 'alias', target: 'gpt-5' }], ' grok-4 '))
-      .toEqual({ valid: true, modelMap: { alias: 'gpt-5', '*': 'grok-4' } })
+      .toEqual({ valid: true, modelMap: { alias: 'gpt-5', '*': 'grok-4' }, modelSourceMap: {} })
+  })
+
+  it('keeps per-model source selection independent from upstream model mapping', () => {
+    expect(validateRouteMappings([
+      { source: 'gpt-5.6-luna', target: '', sourceId: 'pool-luna' },
+      { source: 'gpt-5.6-sol', target: 'gpt-5.6-sol-latest', sourceId: 'pool-k12' },
+    ])).toEqual({
+      valid: true,
+      modelMap: { 'gpt-5.6-sol': 'gpt-5.6-sol-latest' },
+      modelSourceMap: { 'gpt-5.6-luna': 'pool-luna', 'gpt-5.6-sol': 'pool-k12' },
+    })
+    expect(splitRouteModelRules(
+      { 'gpt-5.6-sol': 'gpt-5.6-sol-latest' },
+      { 'gpt-5.6-luna': 'pool-luna', 'gpt-5.6-sol': 'pool-k12' },
+    )).toEqual([
+      { source: 'gpt-5.6-sol', target: 'gpt-5.6-sol-latest', sourceId: 'pool-k12' },
+      { source: 'gpt-5.6-luna', target: '', sourceId: 'pool-luna' },
+    ])
   })
 
   it('reuses persistence-safe model-map validation instead of accepting unsafe visible values', () => {
@@ -76,6 +95,7 @@ describe('route editor state boundaries', () => {
     expect(routePreviewBinding({ ...route, highConcurrencyMode: true }, rows, '', 'alias')).not.toBe(base)
     expect(routePreviewBinding({ ...route, localToken: 'stone_other' }, rows, '', 'alias')).not.toBe(base)
     expect(routePreviewBinding(route, [{ source: 'alias', target: 'gpt-other' }], '', 'alias')).not.toBe(base)
+    expect(routePreviewBinding(route, [{ source: 'alias', target: 'gpt-saved', sourceId: 'pool-other' }], '', 'alias')).not.toBe(base)
     expect(routePreviewBinding(route, rows, 'gpt-default', 'alias')).not.toBe(base)
     expect(routePreviewBinding(route, rows, '', 'other')).not.toBe(base)
   })
@@ -99,6 +119,7 @@ describe('route editor state boundaries', () => {
       { source: 'unfinished', target: '' },
     ], route)).toBe(true)
     expect(routeEditorHasChanges(route, [{ source: 'alias', target: 'gpt-saved' }], route, 'grok-4')).toBe(true)
+    expect(routeEditorHasChanges(route, [{ source: 'alias', target: 'gpt-saved', sourceId: 'pool-other' }], route)).toBe(true)
   })
 
   it('recognizes a toggle acknowledgement despite a server timestamp update', () => {
@@ -106,6 +127,12 @@ describe('route editor state boundaries', () => {
     expect(routeToggleAcknowledgementSignature({ ...route, enabled: false, updatedAt: 99 })).toBe(expected)
     expect(routeToggleAcknowledgementSignature({ ...route, enabled: false, poolId: 'other', updatedAt: 99 }))
       .not.toBe(expected)
+    expect(routeToggleAcknowledgementSignature({
+      ...route,
+      enabled: false,
+      modelSourceMap: { alias: 'pool-other' },
+      updatedAt: 99,
+    })).not.toBe(expected)
   })
 
   it('surfaces the Grok compatibility layer even when both route protocols are Responses', () => {

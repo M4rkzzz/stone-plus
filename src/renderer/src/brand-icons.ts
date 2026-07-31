@@ -3,6 +3,7 @@ import type { ProviderKind, RouteClient } from '@shared/types'
 const anthropicIcon = new URL('./assets/client-icons/anthropic.svg', import.meta.url).href
 const claudeIcon = new URL('./assets/client-icons/claude.svg', import.meta.url).href
 const openAiIcon = new URL('./assets/client-icons/openai.svg', import.meta.url).href
+const deepSeekIcon = new URL('./assets/client-icons/deepseek.svg', import.meta.url).href
 const geminiIcon = new URL('./assets/client-icons/gemini.svg', import.meta.url).href
 export const grokIcon = new URL('./assets/client-icons/grok.svg', import.meta.url).href
 
@@ -22,6 +23,7 @@ export const clientBrandMeta: Record<RouteClient, ClientBrandMeta> = {
 export function providerBrandIcon(kind: ProviderKind): string | undefined {
   if (kind === 'anthropic' || kind === 'anthropic-compatible') return anthropicIcon
   if (kind === 'openai' || kind === 'openai-compatible') return openAiIcon
+  if (kind === 'deepseek' || kind === 'deepseek-compatible') return deepSeekIcon
   if (kind === 'google') return geminiIcon
   if (kind === 'xai' || kind === 'xai-compatible') return grokIcon
   return undefined

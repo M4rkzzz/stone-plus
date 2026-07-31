@@ -453,6 +453,15 @@ export function analyzeRouteSourceCompatibility<TAccount extends RouteSourceAcco
     }
     return { eligible: true, inboundProtocol, sourceProtocol, mode: 'kiro-claude' }
   }
+  if (routeSourceUsesDeepSeek(source, collections) && client !== 'codex') {
+    return {
+      eligible: false,
+      inboundProtocol,
+      sourceProtocol,
+      mode: 'unsupported',
+      reason: 'DeepSeek Responses sources are available only to Codex clients.',
+    }
+  }
   if (client === 'grokbuild' && !isNativeGrokRouteSource(source, collections)) {
     return {
       eligible: false,
@@ -484,6 +493,20 @@ export function routeSourceUsesKiroClaude<TAccount extends RouteSourceAccount>(
   return source.accounts.some((account) => {
     const provider = providersById.get(account.providerId)
     return provider?.kind === 'kiro-compatible' || provider?.protocol === 'kiro-claude'
+  })
+}
+
+/** DeepSeek Responses is a Codex-specific native source family. */
+export function routeSourceUsesDeepSeek<TAccount extends RouteSourceAccount>(
+  source: ResolvedRouteSource<TAccount> | undefined,
+  collections: Pick<RouteSourceCollections<TAccount>, 'providers'>,
+): boolean {
+  if (!source) return false
+  if (source.provider && providerSourceFamily(source.provider.kind) === 'deepseek') return true
+  const providersById = new Map(collections.providers.map((provider) => [provider.id, provider]))
+  return source.accounts.length > 0 && source.accounts.every((account) => {
+    const provider = providersById.get(account.providerId)
+    return provider !== undefined && providerSourceFamily(provider.kind) === 'deepseek'
   })
 }
 

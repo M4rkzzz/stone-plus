@@ -9,6 +9,10 @@ import {
 import { providerSourceFamily, type ProviderSourceFamily } from '@shared/source-family'
 import { accountMatchesPoolProtocol } from '@shared/pool-protocol'
 import { normalizeProviderHttpUrl } from '@shared/provider-url'
+import {
+  DEEPSEEK_RESPONSES_DEFAULT_MODEL,
+  isOfficialDeepSeekResponsesModel,
+} from '@shared/deepseek'
 import { hasVerifiedKiroToolBridge, isNativeGrokRouteSource, resolveRouteSource } from '@shared/route-sources'
 import type {
   Account,
@@ -69,6 +73,10 @@ const OFFICIAL_SOURCES: Readonly<Partial<Record<ProviderKind, {
     baseUrl: 'https://api.openai.com/v1',
     protocols: ['openai-responses', 'openai-chat']
   },
+  deepseek: {
+    baseUrl: 'https://api.deepseek.com',
+    protocols: ['openai-responses']
+  },
   xai: {
     baseUrl: 'https://api.x.ai/v1',
     protocols: ['openai-responses']
@@ -85,6 +93,7 @@ const OFFICIAL_SOURCES: Readonly<Partial<Record<ProviderKind, {
 
 const RELAY_PROTOCOLS: Readonly<Partial<Record<ProviderKind, readonly Protocol[]>>> = Object.freeze({
   'openai-compatible': ['openai-responses', 'openai-chat'],
+  'deepseek-compatible': ['openai-responses'],
   'xai-compatible': ['openai-responses', 'openai-chat'],
   'anthropic-compatible': ['anthropic-messages'],
   'kiro-compatible': ['kiro-claude'],
@@ -133,6 +142,15 @@ export function saveApiSourceDraft(
   const sourceConfiguration = normalizeSourceConfiguration(input)
   const models = normalizeModels(input.models)
   const defaultModel = normalizeOptionalModel(input.defaultModel)
+  if (sourceConfiguration.kind === 'deepseek') {
+    const unsupportedModels = models.filter((model) => !isOfficialDeepSeekResponsesModel(model))
+    if (unsupportedModels.length > 0) {
+      throw new Error(`Official DeepSeek Responses currently supports only ${DEEPSEEK_RESPONSES_DEFAULT_MODEL}.`)
+    }
+    if (defaultModel && !isOfficialDeepSeekResponsesModel(defaultModel)) {
+      throw new Error(`Official DeepSeek Responses currently supports only ${DEEPSEEK_RESPONSES_DEFAULT_MODEL}.`)
+    }
+  }
   if (defaultModel) moveModelToFront(models, defaultModel)
   if (sourceConfiguration.protocol === 'kiro-claude' && models.length === 0) {
     throw new Error('Kiro Claude relay sources require a manually configured model.')
@@ -163,7 +181,8 @@ export function saveApiSourceDraft(
     input.responsesCompactMode,
     existingProvider?.responsesCompactMode,
     input.sourceType,
-    sourceConfiguration.protocol
+    sourceConfiguration.protocol,
+    sourceConfiguration.kind
   )
 
   const suppliedCredential = input.credential?.trim() || undefined
@@ -292,6 +311,7 @@ export function saveApiSourceDraft(
     color: existingProvider?.color,
     forceFastMode: input.sourceType === 'relay'
       && supportsFastServiceTier(sourceConfiguration.protocol)
+      && providerSourceFamily(sourceConfiguration.kind) !== 'deepseek'
       && existingProvider?.forceFastMode === true,
     ...(responsesCompactMode ? { responsesCompactMode } : {}),
     capabilityProfile,
@@ -365,9 +385,7 @@ function unlinkIncompatiblePoolMemberships(
       updatedAt: timestamp
     }]
   })
-  state.routes = state.routes.map((route) => deletedPoolIds.has(route.poolId)
-    ? { ...route, enabled: false, poolId: '', updatedAt: timestamp }
-    : route)
+  state.routes = state.routes.map((route) => detachRemovedRouteSources(route, deletedPoolIds, timestamp))
 }
 
 function poolAcceptsSourceChange(
@@ -456,9 +474,11 @@ export function deleteApiSourceDraft(
   state.providers = remainingProviders
   state.accounts = remainingAccounts
   state.pools = pools
-  state.routes = state.routes.map((route) => route.poolId === sourceId || deletedPoolIds.has(route.poolId)
-    ? { ...route, enabled: false, poolId: '', updatedAt: timestamp }
-    : route)
+  state.routes = state.routes.map((route) => detachRemovedRouteSources(
+    route,
+    new Set([sourceId, ...deletedPoolIds]),
+    timestamp,
+  ))
   for (const account of accounts) delete state.credentials[account.credentialId]
 
   return { sourceId, accountIds, deletedAggregatePoolIds }
@@ -484,6 +504,11 @@ export function saveAggregateRelayDraft(
   const normalizedMembers = normalizeAggregateMembers(input, state)
   const stickyTtlMinutes = boundedInteger(input.stickyTtlMinutes, 1, 1_440, 'Sticky TTL')
   const maxRetries = boundedInteger(input.maxRetries, 0, 10, 'Maximum retries')
+  const aggregateUsesDeepSeek = normalizedMembers.some((member) => {
+    const account = state.accounts.find((candidate) => candidate.id === member.accountId)
+    const provider = state.providers.find((candidate) => candidate.id === account?.providerId)
+    return provider !== undefined && providerSourceFamily(provider.kind) === 'deepseek'
+  })
   const pool: Pool = {
     id: existing?.id ?? randomUUID(),
     name,
@@ -496,7 +521,9 @@ export function saveAggregateRelayDraft(
     stickySessions: input.protocol === 'kiro-claude' || Boolean(input.stickySessions),
     stickyTtlMinutes,
     maxRetries,
-    forceFastMode: supportsFastServiceTier(input.protocol) && existing?.forceFastMode === true,
+    forceFastMode: !aggregateUsesDeepSeek
+      && supportsFastServiceTier(input.protocol)
+      && existing?.forceFastMode === true,
     quotaProtection: input.quotaProtection ?? existing?.quotaProtection,
     proxyId,
     createdAt: existing?.createdAt ?? timestamp,
@@ -534,6 +561,13 @@ export function setRouteSourceFastModeDraft(
   if (pool && provider) throw new Error('The source id conflicts with an existing pool id.')
 
   if (pool) {
+    if (input.enabled && pool.members.some((member) => {
+      const account = state.accounts.find((candidate) => candidate.id === member.accountId)
+      const memberProvider = state.providers.find((candidate) => candidate.id === account?.providerId)
+      return memberProvider !== undefined && providerSourceFamily(memberProvider.kind) === 'deepseek'
+    })) {
+      throw new Error('FAST is not supported by DeepSeek Responses sources.')
+    }
     assertFastProtocol(pool.protocol, input.enabled)
     if (pool.forceFastMode !== input.enabled) {
       replaceById(state.pools, { ...pool, forceFastMode: input.enabled, updatedAt: timestamp })
@@ -547,6 +581,9 @@ export function setRouteSourceFastModeDraft(
   }
   if (provider.sourceType !== 'relay') {
     throw new Error('FAST can be toggled directly only for relay sources; use a pool for other sources.')
+  }
+  if (input.enabled && providerSourceFamily(provider.kind) === 'deepseek') {
+    throw new Error('FAST is not supported by DeepSeek Responses sources.')
   }
   assertFastProtocol(provider.protocol, input.enabled)
   if (provider.forceFastMode !== input.enabled) {
@@ -569,9 +606,12 @@ function resolveResponsesCompactModeInput(
   requested: unknown,
   existing: unknown,
   sourceType: ApiSourceInput['sourceType'],
-  protocol: Protocol
+  protocol: Protocol,
+  kind: ProviderKind
 ): ResponsesCompactMode | undefined {
-  const supported = sourceType === 'relay' && protocol === 'openai-responses'
+  if (kind === 'deepseek' || kind === 'deepseek-compatible') return undefined
+  const supported = sourceType === 'relay'
+    && protocol === 'openai-responses'
   if (requested !== undefined) {
     if (!isResponsesCompactMode(requested)) {
       throw new Error('Responses compact mode must be auto, legacy, passthrough, or native.')
@@ -593,7 +633,7 @@ function normalizeSourceConfiguration(input: ApiSourceInput): {
 } {
   if (input.sourceType === 'official-api') {
     const definition = OFFICIAL_SOURCES[input.kind]
-    if (!definition) throw new Error('Official API sources support OpenAI, xAI, Anthropic, or Google only.')
+    if (!definition) throw new Error('Official API sources support OpenAI, DeepSeek, xAI, Anthropic, or Google only.')
     if (!definition.protocols.includes(input.protocol)) {
       throw new Error(`${input.kind} does not support the ${input.protocol} protocol.`)
     }
@@ -761,6 +801,21 @@ function assertBoundGrokBuildSource(state: PersistedState, sourceId: string): vo
   if (!isNativeGrokRouteSource(resolveRouteSource(sourceId, state), state)) {
     throw new Error('A source used by Grok Build must remain a Responses-native Grok account pool or relay source.')
   }
+}
+
+function detachRemovedRouteSources(
+  route: PersistedState['routes'][number],
+  removedSourceIds: ReadonlySet<string>,
+  timestamp: number,
+): PersistedState['routes'][number] {
+  if (removedSourceIds.has(route.poolId)) {
+    return { ...route, enabled: false, poolId: '', updatedAt: timestamp }
+  }
+  const entries = Object.entries(route.modelSourceMap ?? {})
+  const modelSourceMap = Object.fromEntries(entries.filter(([, sourceId]) => !removedSourceIds.has(sourceId)))
+  return entries.length === Object.keys(modelSourceMap).length
+    ? route
+    : { ...route, modelSourceMap, updatedAt: timestamp }
 }
 
 function trimPoolModelAllowlist(

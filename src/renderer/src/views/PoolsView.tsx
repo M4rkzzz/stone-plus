@@ -17,6 +17,7 @@ import { supportsFastServiceTier, supportsPoolFastServiceTier } from '@shared/ty
 import type { AppSnapshot, GatewayApi, ModelPolicy, Pool, PoolInput, PoolProtocol, PoolStrategy } from '@shared/types'
 import { accountMatchesPoolProtocol, accountPoolProtocol } from '@shared/pool-protocol'
 import { providerSourceFamily } from '@shared/source-family'
+import { routeReferencesSource } from '@shared/route-models'
 import type { ActionRunner } from '../App'
 import { accountSourceLabel } from '../account-source-label'
 import { BUILT_IN_PROXY_BINDING_NOTICE, useBuiltInProxyInterlock } from '../built-in-proxy-interlocks'
@@ -259,10 +260,17 @@ export function PoolsView({
 
   const updateMemberIds = (accountIds: string[]) => {
     const candidates = coverageForAccounts(accountIds).options.map((option) => option.model)
+    const sourceFamily = accountIds
+      .map((id) => accountById.get(id))
+      .map((account) => providerById.get(account?.providerId ?? ''))
+      .find(Boolean)
     setDraft((current) => ({
       ...current,
       accountIds,
       modelAllowlist: pruneModelSelection(current.modelAllowlist, candidates),
+      forceFastMode: sourceFamily && providerSourceFamily(sourceFamily.kind) === 'deepseek'
+        ? false
+        : current.forceFastMode,
     }))
   }
 
@@ -285,6 +293,7 @@ export function PoolsView({
     const provider = providerById.get(account?.providerId ?? '')
     return provider ? providerSourceFamily(provider.kind) : undefined
   }, [accountById, draft.accountIds, providerById])
+  const draftFastSupported = supportsPoolFastServiceTier(draft.protocol) && draftSourceFamily !== 'deepseek'
 
   const removePool = async () => {
     if (!deleteTarget) return
@@ -313,15 +322,19 @@ export function PoolsView({
             const availableCount = members.filter((member) => member?.status === 'active').length
             const inFlight = members.reduce((sum, member) => sum + (member?.inFlight ?? 0), 0)
             const capacity = members.reduce((sum, member) => sum + (member?.maxConcurrency ?? 0), 0)
-            const routeCount = snapshot.routes.filter((route) => route.poolId === pool.id).length
-            const fastSupported = supportsPoolFastServiceTier(pool.protocol)
+            const routeCount = snapshot.routes.filter((route) => routeReferencesSource(route, pool.id)).length
+            const poolUsesDeepSeek = enabledMembers.some((account) => {
+              const provider = providerById.get(account.providerId)
+              return provider !== undefined && providerSourceFamily(provider.kind) === 'deepseek'
+            })
+            const fastSupported = supportsPoolFastServiceTier(pool.protocol) && !poolUsesDeepSeek
             const fastEnabled = fastSupported && (pendingFastModes[pool.id] ?? pool.forceFastMode ?? false)
             const fastBusy = busyKeys.has(`set-fast-mode:${pool.id}`)
             return (
               <article className="pool-card" key={pool.id}>
                 <header className="pool-card__header">
                   <div className="pool-icon"><Network size={19} /></div>
-                  <div><h2>{setupPoolDisplayName(pool.name, t)}</h2><span>{protocolLabels[pool.protocol]} · {wildcard ? t(`兼容通配（已枚举 ${openModels.length}）`, `Compatible wildcard (${openModels.length} enumerated)`) : t(`开放 ${openModels.length} 个模型`, `${openModels.length} ${openModels.length === 1 ? 'model' : 'models'} allowed`)}</span></div>
+                  <div><h2>{setupPoolDisplayName(pool.name, t)}</h2><span>{poolUsesDeepSeek ? 'DeepSeek Responses' : protocolLabels[pool.protocol]} · {wildcard ? t(`兼容通配（已枚举 ${openModels.length}）`, `Compatible wildcard (${openModels.length} enumerated)`) : t(`开放 ${openModels.length} 个模型`, `${openModels.length} ${openModels.length === 1 ? 'model' : 'models'} allowed`)}</span></div>
                   <FastModeControl
                     sourceName={setupPoolDisplayName(pool.name, t)}
                     sourceKind="pool"
@@ -371,15 +384,16 @@ export function PoolsView({
           {relaySources.map(({ provider, account }) => {
             const openModels = effectiveAccountModels(account, provider.models)
             const wildcard = isAccountModelWildcard(account)
-            const routeCount = snapshot.routes.filter((route) => route.poolId === provider.id).length
+            const routeCount = snapshot.routes.filter((route) => routeReferencesSource(route, provider.id)).length
             const fastSupported = supportsFastServiceTier(provider.protocol)
+              && providerSourceFamily(provider.kind) !== 'deepseek'
             const fastEnabled = fastSupported && (pendingFastModes[provider.id] ?? provider.forceFastMode ?? false)
             const fastBusy = busyKeys.has(`set-fast-mode:${provider.id}`)
             return (
               <article className="pool-card pool-card--relay-source" key={`relay-source:${provider.id}`}>
                 <header className="pool-card__header">
                   <div className="pool-icon pool-icon--relay"><RadioTower size={19} /></div>
-                  <div><h2>{provider.name}</h2><span>{protocolLabels[provider.protocol]} · {t('独立中转来源', 'Standalone relay source')}</span></div>
+                  <div><h2>{provider.name}</h2><span>{providerSourceFamily(provider.kind) === 'deepseek' ? 'DeepSeek Responses' : protocolLabels[provider.protocol]} · {t('独立中转来源', 'Standalone relay source')}</span></div>
                   <FastModeControl
                     sourceName={provider.name}
                     sourceKind="relay"
@@ -543,14 +557,14 @@ export function PoolsView({
               />
             </div>
             <div className="field field--full inline-settings">
-              <div><strong>{t('FAST 服务层', 'FAST service tier')}<InfoTip text={supportsPoolFastServiceTier(draft.protocol) ? t('强制号池内所有对话使用上游 Fast 服务层，可能消耗对应服务额度。', 'Force every conversation in the pool to use the upstream FAST service tier, which may consume the corresponding service quota.') : t('仅 OpenAI Responses 与 OpenAI Chat 协议支持此选项。', 'Only OpenAI Responses and OpenAI Chat support this option.')} /></strong></div>
+              <div><strong>{t('FAST 服务层', 'FAST service tier')}<InfoTip text={draftFastSupported ? t('强制号池内所有对话使用上游 Fast 服务层，可能消耗对应服务额度。', 'Force every conversation in the pool to use the upstream FAST service tier, which may consume the corresponding service quota.') : draftSourceFamily === 'deepseek' ? t('DeepSeek Responses 不支持 FAST 服务层。', 'DeepSeek Responses does not support the FAST service tier.') : t('仅 OpenAI Responses 与 OpenAI Chat 协议支持此选项。', 'Only OpenAI Responses and OpenAI Chat support this option.')} /></strong></div>
               <button
                 className={`toggle ${draft.forceFastMode ? 'toggle--on' : ''}`}
                 role="switch"
                 aria-label={t('FAST 服务层', 'FAST service tier')}
                 aria-checked={draft.forceFastMode}
                 type="button"
-                disabled={!supportsPoolFastServiceTier(draft.protocol)}
+                disabled={!draftFastSupported}
                 onClick={() => setDraft({ ...draft, forceFastMode: !draft.forceFastMode })}
               ><span /></button>
             </div>

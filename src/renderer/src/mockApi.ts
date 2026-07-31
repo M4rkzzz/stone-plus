@@ -31,9 +31,14 @@ import type {
   SetupWizardState,
 } from '@shared/types'
 import { previewRoute as buildRoutePreview } from '@shared/route-preview'
+import { normalizeRouteModelSourceMap, routeReferencesSource } from '@shared/route-models'
 import { DEFAULT_ACCOUNT_MAX_CONCURRENCY, supportsFastServiceTier, supportsPoolFastServiceTier } from '@shared/types'
 import { accountMatchesPoolProtocol } from '@shared/pool-protocol'
 import { normalizeProviderHttpUrl } from '@shared/provider-url'
+import {
+  DEEPSEEK_RESPONSES_DEFAULT_MODEL,
+  isOfficialDeepSeekResponsesModel,
+} from '@shared/deepseek'
 import { providerSourceFamily } from '@shared/source-family'
 import {
   AGENT_CAPABILITIES,
@@ -761,6 +766,7 @@ const defaultMockSourceModels = (kind: ProviderDefinition['kind'], protocol: Pro
   }
   if (protocol === 'gemini') return ['gemini-2.5-pro', 'gemini-2.5-flash']
   if (kind === 'xai' || kind === 'xai-compatible') return ['grok-4.5']
+  if (kind === 'deepseek' || kind === 'deepseek-compatible') return ['deepseek-v4-flash']
   return ['gpt-5', 'gpt-5-mini', 'o3']
 }
 
@@ -776,6 +782,7 @@ const mockOfficialSources: Readonly<Partial<Record<ProviderDefinition['kind'], {
   protocols: readonly Protocol[]
 }>>> = Object.freeze({
   openai: { baseUrl: 'https://api.openai.com/v1', protocols: ['openai-responses', 'openai-chat'] },
+  deepseek: { baseUrl: 'https://api.deepseek.com', protocols: ['openai-responses'] },
   xai: { baseUrl: 'https://api.x.ai/v1', protocols: ['openai-responses'] },
   anthropic: { baseUrl: 'https://api.anthropic.com', protocols: ['anthropic-messages'] },
   google: { baseUrl: 'https://generativelanguage.googleapis.com', protocols: ['gemini'] },
@@ -808,6 +815,14 @@ function normalizeMockApiSourceInput(input: ApiSourceInput): ApiSourceInput & { 
   }
   const normalizedModels = [...new Set(input.models.map((model) => model.trim()).filter(Boolean))]
   const defaultModel = input.defaultModel?.trim()
+  if (input.kind === 'deepseek'
+    && (normalizedModels.some((model) => !isOfficialDeepSeekResponsesModel(model))
+      || (defaultModel !== undefined && !isOfficialDeepSeekResponsesModel(defaultModel)))) {
+    throw new Error(mockText(
+      `DeepSeek 官方 Responses 当前仅支持 ${DEEPSEEK_RESPONSES_DEFAULT_MODEL}`,
+      `Official DeepSeek Responses currently supports only ${DEEPSEEK_RESPONSES_DEFAULT_MODEL}`,
+    ))
+  }
   if (defaultModel && !normalizedModels.includes(defaultModel)) normalizedModels.unshift(defaultModel)
   else if (defaultModel) {
     normalizedModels.splice(normalizedModels.indexOf(defaultModel), 1)
@@ -826,6 +841,9 @@ function normalizeMockApiSourceInput(input: ApiSourceInput): ApiSourceInput & { 
     credential: input.credential?.trim() || undefined,
     models: normalizedModels,
     defaultModel,
+    responsesCompactMode: input.kind === 'deepseek' || input.kind === 'deepseek-compatible'
+      ? undefined
+      : input.responsesCompactMode,
     proxyId: input.proxyId?.trim() || undefined,
   }
 }
@@ -946,13 +964,19 @@ function normalizeLoadedModelPolicies(snapshot: AppSnapshot): AppSnapshot {
     ...snapshot.routes,
     ...routes.filter((fallback) => !snapshot.routes.some((route) => route.client === fallback.client)).map(clone),
   ].map((route) => {
-    if (route.client !== 'grokbuild') return route
-    const source = resolveRouteSource(route.poolId, {
+    const normalizedRoute = {
+      ...route,
+      modelSourceMap: route.client === 'codex'
+        ? normalizeRouteModelSourceMap(route.modelSourceMap)
+        : {},
+    }
+    if (normalizedRoute.client !== 'grokbuild') return normalizedRoute
+    const source = resolveRouteSource(normalizedRoute.poolId, {
       providers: normalizedProviders,
       accounts: normalizedAccounts,
       pools: normalizedPools,
     })
-    return source?.summary.protocol === 'grok' ? route : { ...route, poolId: 'pool-grok' }
+    return source?.summary.protocol === 'grok' ? normalizedRoute : { ...normalizedRoute, poolId: 'pool-grok' }
   })
   const normalizedClientProfiles = [
     ...snapshot.clientProfiles,
@@ -967,14 +991,28 @@ function normalizeLoadedModelPolicies(snapshot: AppSnapshot): AppSnapshot {
     accountTags: Array.isArray(snapshot.accountTags) ? snapshot.accountTags : clone(accountTags),
     providers: normalizedProviders.map((provider) => {
       const persistedSourceType = provider.sourceType
-        ?? (['anthropic', 'openai', 'xai', 'google'].includes(provider.kind) ? 'official-api' : 'relay')
+        ?? (['anthropic', 'openai', 'deepseek', 'xai', 'google'].includes(provider.kind) ? 'official-api' : 'relay')
       const grokOAuthProvider = provider.kind === 'xai' && persistedSourceType === 'oauth-system'
       return {
         ...provider,
-        sourceType: provider.kind === 'xai' && !grokOAuthProvider ? 'official-api' : persistedSourceType,
+        sourceType: provider.kind === 'deepseek'
+          ? 'official-api'
+          : provider.kind === 'deepseek-compatible'
+            ? 'relay'
+            : provider.kind === 'xai' && !grokOAuthProvider ? 'official-api' : persistedSourceType,
         ...(provider.kind === 'xai' ? {
           baseUrl: grokOAuthProvider ? 'https://cli-chat-proxy.grok.com/v1' : 'https://api.x.ai/v1',
           protocol: 'openai-responses' as const,
+        } : {}),
+        ...(provider.kind === 'deepseek' ? {
+          baseUrl: 'https://api.deepseek.com',
+          protocol: 'openai-responses' as const,
+          responsesCompactMode: undefined,
+          forceFastMode: false,
+        } : provider.kind === 'deepseek-compatible' ? {
+          protocol: 'openai-responses' as const,
+          responsesCompactMode: undefined,
+          forceFastMode: false,
         } : {}),
       }
     }),
@@ -1032,6 +1070,21 @@ function mockAgentLifecycleSnapshot(): AgentLifecycleSnapshot {
     needsRestart: false,
   }])) as AgentLifecycleSnapshot['agents']
   return { revision: 1, capturedAt: Date.now(), agents, busy: false }
+}
+
+function detachMockRouteSources(
+  route: Route,
+  removedSourceIds: ReadonlySet<string>,
+  timestamp: number,
+): Route {
+  if (removedSourceIds.has(route.poolId)) {
+    return { ...route, enabled: false, poolId: '', updatedAt: timestamp }
+  }
+  const entries = Object.entries(route.modelSourceMap ?? {})
+  const modelSourceMap = Object.fromEntries(entries.filter(([, sourceId]) => !removedSourceIds.has(sourceId)))
+  return entries.length === Object.keys(modelSourceMap).length
+    ? route
+    : { ...route, modelSourceMap, updatedAt: timestamp }
 }
 
 export function createMockApi(): GatewayApi {
@@ -1290,21 +1343,34 @@ export function createMockApi(): GatewayApi {
       return localizeMockSnapshot(snapshot)
     },
     async openRequestMonitor() {},
+    async getRequestMonitorAlwaysOnTop() { return true },
+    async toggleRequestMonitorAlwaysOnTop() { return true },
+    async setRequestMonitorDragging() {},
     async saveProvider(input: ProviderInput) {
       const timestamp = Date.now()
       const existing = input.id ? snapshot.providers.find((provider) => provider.id === input.id) : undefined
       const sourceType = input.sourceType ?? existing?.sourceType
-        ?? (['anthropic', 'openai', 'xai', 'google'].includes(input.kind) ? 'official-api' : 'relay')
+        ?? (['anthropic', 'openai', 'deepseek', 'xai', 'google'].includes(input.kind) ? 'official-api' : 'relay')
       if (input.kind === 'xai' && sourceType !== 'official-api') {
         throw new Error(mockText('官方 xAI 来源必须使用官方 API 类型', 'Official xAI sources must use the official API type'))
       }
       if (input.kind === 'xai' && input.protocol !== 'openai-responses') {
         throw new Error(mockText('官方 xAI 来源使用原生 OpenAI Responses API', 'Official xAI sources use the native OpenAI Responses API'))
       }
+      if (input.kind === 'deepseek' && sourceType !== 'official-api') {
+        throw new Error(mockText('官方 DeepSeek 来源必须使用官方 API 类型', 'Official DeepSeek sources must use the official API type'))
+      }
+      if (input.kind === 'deepseek-compatible' && sourceType !== 'relay') {
+        throw new Error(mockText('DeepSeek 兼容来源必须使用中转站类型', 'DeepSeek-compatible sources must use the relay type'))
+      }
+      if ((input.kind === 'deepseek' || input.kind === 'deepseek-compatible') && input.protocol !== 'openai-responses') {
+        throw new Error(mockText('DeepSeek 来源使用原生 Responses API', 'DeepSeek sources use the native Responses API'))
+      }
       const provider: ProviderDefinition = {
         ...input,
         sourceType,
         ...(input.kind === 'xai' ? { baseUrl: 'https://api.x.ai/v1', protocol: 'openai-responses' as const } : {}),
+        ...(input.kind === 'deepseek' ? { baseUrl: 'https://api.deepseek.com', protocol: 'openai-responses' as const } : {}),
         id: existing?.id ?? makeId('provider'),
         createdAt: existing?.createdAt ?? timestamp,
         updatedAt: timestamp,
@@ -1324,6 +1390,8 @@ export function createMockApi(): GatewayApi {
         throw new Error(mockText('请先删除该供应商下的账号', 'Delete the accounts under this provider first'))
       }
       snapshot.providers = snapshot.providers.filter((provider) => provider.id !== id)
+      const timestamp = Date.now()
+      snapshot.routes = snapshot.routes.map((route) => detachMockRouteSources(route, new Set([id]), timestamp))
       return changed()
     },
     async saveAccount(input: AccountInput) {
@@ -1427,6 +1495,9 @@ export function createMockApi(): GatewayApi {
       } : candidate)
       reconcileMockPoolModels()
       return changed()
+    },
+    async openChatGptWebLogin() {
+      return structuredClone(snapshot)
     },
     async testAccountModel(accountId: string, model: string) {
       const account = snapshot.accounts.find((candidate) => candidate.id === accountId)
@@ -1738,9 +1809,13 @@ export function createMockApi(): GatewayApi {
       const emptyPoolIds = new Set(snapshot.pools
         .filter((pool) => pool.kind === 'standard' && pool.members.length === 0)
         .map((pool) => pool.id))
-      snapshot.routes = snapshot.routes.map((route) => deletedAggregatePoolIds.has(route.poolId)
-        ? { ...route, enabled: false, poolId: '' }
-        : emptyPoolIds.has(route.poolId) ? { ...route, enabled: false } : route)
+      const timestamp = Date.now()
+      snapshot.routes = snapshot.routes.map((route) => {
+        const detached = detachMockRouteSources(route, deletedAggregatePoolIds, timestamp)
+        return emptyPoolIds.has(route.poolId) && detached.enabled
+          ? { ...detached, enabled: false, updatedAt: timestamp }
+          : detached
+      })
       reconcileMockPoolModels()
       return changed()
     },
@@ -1759,9 +1834,13 @@ export function createMockApi(): GatewayApi {
       const emptyPoolIds = new Set(snapshot.pools
         .filter((pool) => pool.kind === 'standard' && pool.members.length === 0)
         .map((pool) => pool.id))
-      snapshot.routes = snapshot.routes.map((route) => deletedAggregatePoolIds.has(route.poolId)
-        ? { ...route, enabled: false, poolId: '' }
-        : emptyPoolIds.has(route.poolId) ? { ...route, enabled: false } : route)
+      const timestamp = Date.now()
+      snapshot.routes = snapshot.routes.map((route) => {
+        const detached = detachMockRouteSources(route, deletedAggregatePoolIds, timestamp)
+        return emptyPoolIds.has(route.poolId) && detached.enabled
+          ? { ...detached, enabled: false, updatedAt: timestamp }
+          : detached
+      })
       reconcileMockPoolModels()
       return changed()
     },
@@ -2035,7 +2114,7 @@ export function createMockApi(): GatewayApi {
       return changed()
     },
     async deletePool(id: string) {
-      if (snapshot.routes.some((route) => route.poolId === id)) {
+      if (snapshot.routes.some((route) => routeReferencesSource(route, id))) {
         throw new Error(mockText('该号池正被客户端路由使用', 'This pool is used by a client route'))
       }
       snapshot.pools = snapshot.pools.filter((pool) => pool.id !== id)
@@ -2062,6 +2141,9 @@ export function createMockApi(): GatewayApi {
       if (provider.sourceType !== 'relay') throw new Error(mockText('FAST 仅能直接配置中转站来源', 'FAST can be configured directly only for relay sources'))
       if (input.enabled && !supportsFastServiceTier(provider.protocol)) {
         throw new Error(mockText('FAST 仅支持 OpenAI Responses 与 OpenAI Chat', 'FAST supports only OpenAI Responses and OpenAI Chat'))
+      }
+      if (input.enabled && providerSourceFamily(provider.kind) === 'deepseek') {
+        throw new Error(mockText('DeepSeek Responses 不支持 FAST', 'DeepSeek Responses does not support FAST'))
       }
       snapshot.providers = snapshot.providers.map((candidate) => candidate.id === sourceId
         ? { ...candidate, forceFastMode: input.enabled, updatedAt: Date.now() }
@@ -2114,12 +2196,14 @@ export function createMockApi(): GatewayApi {
         kind: input.kind,
         baseUrl: input.baseUrl,
         protocol: input.protocol,
-        responsesCompactMode: input.responsesCompactMode,
+        responsesCompactMode: input.kind === 'deepseek' || input.kind === 'deepseek-compatible'
+          ? undefined
+          : input.responsesCompactMode,
         models,
         capabilityProfile: evidence ? input.capabilityProfile : connectionChanged ? undefined : existing?.capabilityProfile,
         toolRoundtripVerified: connectionChanged ? false : existing?.toolRoundtripVerified,
         modelCatalog: evidence ? input.modelCatalog : connectionChanged ? undefined : existing?.modelCatalog,
-        forceFastMode: existing?.forceFastMode,
+        forceFastMode: providerSourceFamily(input.kind) === 'deepseek' ? false : existing?.forceFastMode,
         color: existing?.color ?? '#2f7668',
         createdAt: existing?.createdAt ?? timestamp,
         updatedAt: timestamp,
@@ -2186,9 +2270,7 @@ export function createMockApi(): GatewayApi {
           }
           return [{ ...pool, members, updatedAt: timestamp }]
         })
-        nextRoutes = nextRoutes.map((route) => deletedPoolIds.has(route.poolId)
-          ? { ...route, enabled: false, poolId: '', updatedAt: timestamp }
-          : route)
+        nextRoutes = nextRoutes.map((route) => detachMockRouteSources(route, deletedPoolIds, timestamp))
       }
 
       // Commit only after every validation and derived update has succeeded.
@@ -2283,9 +2365,12 @@ export function createMockApi(): GatewayApi {
         }
         return [{ ...pool, members, updatedAt: Date.now() }]
       })
-      snapshot.routes = snapshot.routes.map((route) => route.poolId === id || deletedPoolIds.has(route.poolId)
-        ? { ...route, enabled: false, poolId: '', updatedAt: Date.now() }
-        : route)
+      const timestamp = Date.now()
+      snapshot.routes = snapshot.routes.map((route) => detachMockRouteSources(
+        route,
+        new Set([id, ...deletedPoolIds]),
+        timestamp,
+      ))
       return changed()
     },
     async saveAggregateRelay() {
@@ -2374,6 +2459,7 @@ export function createMockApi(): GatewayApi {
       return changed()
     },
     async updateRoute(route: Route) {
+      const existingRoute = snapshot.routes.find((candidate) => candidate.id === route.id)
       if (route.enabled && hasRouteSourceIdCollision(route.poolId, snapshot)) {
         throw new Error(mockText('所选源 ID 与号池 ID 冲突', 'The selected source ID conflicts with a pool ID'))
       }
@@ -2385,8 +2471,19 @@ export function createMockApi(): GatewayApi {
       if (route.enabled && source?.provider && !source.accounts.some(isAvailableRouteAccount)) {
         throw new Error(mockText('所选 API 来源没有可用账号', 'The selected API source has no available accounts'))
       }
+      const modelSourceMap = normalizeRouteModelSourceMap(
+        route.modelSourceMap === undefined ? existingRoute?.modelSourceMap : route.modelSourceMap,
+      )
+      if (route.client !== 'codex' && Object.keys(modelSourceMap).length) {
+        throw new Error(mockText('只有 Codex 路由支持按模型选择来源', 'Only Codex routes support per-model sources'))
+      }
+      for (const sourceId of new Set(Object.values(modelSourceMap))) {
+        const modelSource = resolveRouteSource(sourceId, snapshot)
+        if (!modelSource) throw new Error(mockText('模型分流来源不存在', 'A model-routing source does not exist'))
+      }
       snapshot.routes = snapshot.routes.map((item) => (item.id === route.id ? {
         ...route,
+        modelSourceMap,
         highConcurrencyMode: route.highConcurrencyMode === true,
         updatedAt: Date.now()
       } : item))
@@ -2495,7 +2592,14 @@ export function createMockApi(): GatewayApi {
     },
     async getAccountCodexQuotaCycleCosts(id) {
       if (!snapshot.accounts.some((candidate) => candidate.id === id)) throw new Error(mockText('账号不存在', 'Account not found'))
-      return { fiveHourUsd: 12.486, sevenDayUsd: 184.32 }
+      return {
+        fiveHourUsd: 12.486,
+        sevenDayUsd: 184.32,
+        fiveHourCredits: 312.15,
+        sevenDayCredits: 4_608,
+        fiveHourUnpricedCreditTokens: 0,
+        sevenDayUnpricedCreditTokens: 0
+      }
     },
     async clearLogs() {
       snapshot.requestLogs = []

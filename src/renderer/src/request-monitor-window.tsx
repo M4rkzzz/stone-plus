@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { Pin } from 'lucide-react'
 import type { AppSnapshot, GatewayApi, RequestLog, RouteClient } from '@shared/types'
 import { getGatewayApi } from './api'
 import { requestLogSourceLabel } from './account-source-label'
@@ -78,6 +79,9 @@ export function RequestMonitorWindow() {
   const { snapshot, error } = useRuntimeSnapshot(api)
   const { t, locale } = useI18n()
   const [liveNow, setLiveNow] = useState(Date.now())
+  const [alwaysOnTop, setAlwaysOnTop] = useState(true)
+  const [pinPending, setPinPending] = useState(false)
+  const dragPointer = useRef<number | null>(null)
   const logs = useMemo(() => snapshot?.requestLogs ?? [], [snapshot?.requestLogs])
   const summary = useMemo(() => summarizeRequestLogs(logs), [logs])
   const timeFormatter = useMemo(() => new Intl.DateTimeFormat(locale, {
@@ -86,6 +90,16 @@ export function RequestMonitorWindow() {
   const accountCredentialTypes = useMemo(() => new Map(
     (snapshot?.accounts ?? []).map((account) => [account.id, account.credentialType] as const),
   ), [snapshot?.accounts])
+
+  useEffect(() => {
+    let disposed = false
+    void api.getRequestMonitorAlwaysOnTop()
+      .then((value) => {
+        if (!disposed) setAlwaysOnTop(value)
+      })
+      .catch(() => undefined)
+    return () => { disposed = true }
+  }, [api])
 
   useVisibilityAwareInterval(
     () => setLiveNow(Date.now()),
@@ -96,17 +110,59 @@ export function RequestMonitorWindow() {
     2,
   )
 
+  const toggleAlwaysOnTop = () => {
+    if (pinPending) return
+    setPinPending(true)
+    void api.toggleRequestMonitorAlwaysOnTop()
+      .then(setAlwaysOnTop)
+      .catch(() => undefined)
+      .finally(() => setPinPending(false))
+  }
+
+  const stopDragging = (pointerId?: number) => {
+    if (dragPointer.current === null || (pointerId !== undefined && dragPointer.current !== pointerId)) return
+    dragPointer.current = null
+    void api.setRequestMonitorDragging(false).catch(() => undefined)
+  }
+
+  const startDragging = (event: React.PointerEvent<HTMLElement>) => {
+    if (event.button !== 0 || (event.target as Element).closest('button')) return
+    dragPointer.current = event.pointerId
+    event.currentTarget.setPointerCapture(event.pointerId)
+    event.preventDefault()
+    void api.setRequestMonitorDragging(true).catch(() => {
+      dragPointer.current = null
+    })
+  }
+
   if (!snapshot) {
     return <main className="request-monitor request-monitor--loading"><span className="request-monitor__pulse" />{error || t('正在连接请求记录…', 'Connecting to request logs…')}</main>
   }
 
   return (
-    <main className="request-monitor">
+    <main
+      className="request-monitor"
+      onPointerDown={startDragging}
+      onPointerUp={(event) => stopDragging(event.pointerId)}
+      onPointerCancel={(event) => stopDragging(event.pointerId)}
+      onLostPointerCapture={(event) => stopDragging(event.pointerId)}
+    >
       <section className="request-monitor__stats" aria-label={t('请求统计', 'Request statistics')}>
         <div><span>{t('活跃', 'Active')}</span><strong>{snapshot.gatewayStatus.activeRequests}</strong></div>
         <div><span>{t('首字', 'First')}</span><strong>{summary.averageFirstToken ? durationLabel(summary.averageFirstToken) : '—'}</strong></div>
         <div><span>{t('耗时', 'Time')}</span><strong>{summary.averageLatency ? durationLabel(summary.averageLatency) : '—'}</strong></div>
         <div title={t('历史累计 Token', 'Lifetime tokens')}><span>Token</span><strong>{formatTokenBillions(snapshot.observability.tokenCosts.allTime.totalTokens)}</strong></div>
+        <button
+          type="button"
+          className={`request-monitor__pin${alwaysOnTop ? ' is-active' : ''}`}
+          aria-label={alwaysOnTop ? t('取消置顶', 'Unpin window') : t('置顶浮窗', 'Pin window')}
+          aria-pressed={alwaysOnTop}
+          title={alwaysOnTop ? t('取消置顶', 'Unpin window') : t('置顶浮窗', 'Pin window')}
+          disabled={pinPending}
+          onClick={toggleAlwaysOnTop}
+        >
+          <Pin size={10} strokeWidth={2.25} aria-hidden="true" />
+        </button>
       </section>
 
       <section className="request-monitor__list" aria-label={t('实时请求记录', 'Live request records')}>

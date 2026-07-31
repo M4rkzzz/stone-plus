@@ -1220,6 +1220,74 @@ describe('AppStore', () => {
     expect(({} as Record<string, unknown>).polluted).toBeUndefined()
   })
 
+  it('persists Codex per-model sources and removes only the affected rule when that source is deleted', async () => {
+    const store = createStore()
+    await store.initialize()
+    const primary = await store.saveApiSource({
+      name: 'Default Codex relay',
+      sourceType: 'relay',
+      kind: 'openai-compatible',
+      baseUrl: 'https://default-codex.example/v1',
+      protocol: 'openai-responses',
+      models: ['gpt-5.6-sol'],
+      credential: 'default-codex-secret',
+      priority: 1,
+      weight: 1,
+      maxConcurrency: 2,
+    })
+    const alternate = await store.saveApiSource({
+      name: 'Luna Codex relay',
+      sourceType: 'relay',
+      kind: 'openai-compatible',
+      baseUrl: 'https://luna-codex.example/v1',
+      protocol: 'openai-responses',
+      models: ['gpt-5.6-luna-upstream'],
+      credential: 'luna-codex-secret',
+      priority: 1,
+      weight: 1,
+      maxConcurrency: 2,
+    })
+    const codex = store.getSnapshot().routes.find((candidate) => candidate.client === 'codex')!
+    const saved = await store.updateRoute({
+      ...codex,
+      enabled: true,
+      poolId: primary.source.sourceId,
+      modelMap: { 'gpt-5.6-luna': 'gpt-5.6-luna-upstream' },
+      modelSourceMap: { 'gpt-5.6-luna': alternate.source.sourceId },
+    })
+    expect(saved.routes.find((candidate) => candidate.id === codex.id)).toMatchObject({
+      poolId: primary.source.sourceId,
+      modelMap: { 'gpt-5.6-luna': 'gpt-5.6-luna-upstream' },
+      modelSourceMap: { 'gpt-5.6-luna': alternate.source.sourceId },
+    })
+
+    const claude = saved.routes.find((candidate) => candidate.client === 'claude')!
+    await expect(store.updateRoute({
+      ...claude,
+      modelSourceMap: { 'claude-opus': alternate.source.sourceId },
+    })).rejects.toThrow(/only.*Codex route/i)
+
+    await store.close()
+    const restarted = createStore()
+    await restarted.initialize()
+    expect(restarted.getSnapshot().routes.find((candidate) => candidate.id === codex.id)?.modelSourceMap)
+      .toEqual({ 'gpt-5.6-luna': alternate.source.sourceId })
+
+    const legacyCallerRoute = { ...restarted.getSnapshot().routes.find((candidate) => candidate.id === codex.id)! }
+    delete legacyCallerRoute.modelSourceMap
+    const legacyUpdated = await restarted.updateRoute({ ...legacyCallerRoute, highConcurrencyMode: true })
+    expect(legacyUpdated.routes.find((candidate) => candidate.id === codex.id)?.modelSourceMap)
+      .toEqual({ 'gpt-5.6-luna': alternate.source.sourceId })
+
+    const afterDelete = await restarted.deleteApiSource(alternate.source.sourceId)
+    expect(afterDelete.routes.find((candidate) => candidate.id === codex.id)).toMatchObject({
+      enabled: true,
+      poolId: primary.source.sourceId,
+      modelMap: { 'gpt-5.6-luna': 'gpt-5.6-luna-upstream' },
+      modelSourceMap: {},
+    })
+  })
+
   it('rejects an empty route source or a client without a route', async () => {
     const state = { ...legacyJsonState(), routes: [] }
     await writeFile(join(directory, LEGACY_JSON_FILENAME), `${JSON.stringify(state)}\n`, 'utf8')
@@ -1323,6 +1391,45 @@ describe('AppStore', () => {
       protocol: 'gemini', models: [], credential: 'secret', priority: 1, weight: 1, maxConcurrency: 1
     })).rejects.toThrow(/does not support/)
     expect(store.getSnapshot().providers).toHaveLength(before.providers.length + 1)
+  })
+
+  it('repairs stale unsupported models on persisted official DeepSeek sources', async () => {
+    const store = createStore()
+    await store.initialize()
+    const saved = await store.saveApiSource({
+      name: 'DeepSeek official',
+      sourceType: 'official-api',
+      kind: 'deepseek',
+      baseUrl: 'https://api.deepseek.com',
+      protocol: 'openai-responses',
+      models: ['deepseek-v4-flash'],
+      defaultModel: 'deepseek-v4-flash',
+      credential: 'deepseek-secret',
+      priority: 1,
+      weight: 1,
+      maxConcurrency: 1,
+    })
+
+    await store.getStateRepository().mutate((state) => {
+      const provider = state.providers.find((candidate) => candidate.id === saved.source.providerId)!
+      provider.models = ['deepseek-v4-pro']
+      provider.modelCatalog = [{ id: 'deepseek-v4-pro' }]
+      const account = state.accounts.find((candidate) => candidate.id === saved.source.accountId)!
+      account.availableModels = ['deepseek-v4-pro']
+      account.modelsRefreshedAt = Date.now()
+      account.modelPolicy = 'selected'
+      account.modelAllowlist = ['deepseek-v4-pro']
+    }, ['providers', 'accounts'])
+
+    const snapshot = store.getSnapshot()
+    expect(snapshot.providers.find((candidate) => candidate.id === saved.source.providerId)).toMatchObject({
+      models: ['deepseek-v4-flash'],
+      modelCatalog: [expect.objectContaining({ id: 'deepseek-v4-flash' })],
+    })
+    expect(snapshot.accounts.find((candidate) => candidate.id === saved.source.accountId)).toMatchObject({
+      modelPolicy: 'selected',
+      modelAllowlist: ['deepseek-v4-flash'],
+    })
   })
 
   it('preserves explicit relay model restrictions and wildcard mappings across restart and backup restore', async () => {
@@ -1754,6 +1861,40 @@ describe('AppStore', () => {
     expect(JSON.stringify(imported.snapshot)).not.toContain('acct-team-import')
     expect(store.getChatGptCredential(store.getRuntimeAccount(account.id)!.credentialId)).toMatchObject({ accessToken: 'oauth-access-private', accountId: 'acct-team-import' })
     expect(imported.warnings).toHaveLength(1)
+  })
+
+  it('imports Sub2API OAuth accounts whose unset expiration is zero', async () => {
+    const store = createStore()
+    await store.initialize()
+    const expiresAtSeconds = Math.floor(Date.now() / 1000) + 3600
+    const imported = await store.importChatGptAccounts({
+      content: JSON.stringify({
+        accounts: [{
+          name: 'sub2api-zero-expiry@example.com',
+          platform: 'openai',
+          type: 'oauth',
+          credentials: {
+            access_token: chatGptAccessToken(
+              expiresAtSeconds,
+              'acct-sub2api-zero-expiry',
+              'user-sub2api-zero-expiry'
+            ),
+            refresh_token: 'refresh-sub2api-zero-expiry',
+            expires_at: 0
+          }
+        }]
+      })
+    })
+
+    const account = imported.snapshot.accounts.find(
+      (candidate) => candidate.id === imported.importedAccountIds[0]
+    )!
+    expect(account).toMatchObject({
+      name: 'sub2api-zero-expiry@example.com',
+      credentialExpiresAt: expiresAtSeconds * 1000,
+      renewable: true,
+      status: 'active'
+    })
   })
 
   it('manages a single account tag assignment and does not recreate deleted defaults', async () => {

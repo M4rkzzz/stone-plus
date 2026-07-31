@@ -318,6 +318,29 @@ describe('route sources', () => {
     aggregate.stickySessions = false
     expect(isKiroClaudeRouteSource(resolveRouteSource(aggregate.id, collections), collections)).toBe(false)
   })
+
+  it('exposes DeepSeek Responses only to Codex clients', () => {
+    const deepseek = provider('deepseek', 'official-api', 'openai-responses')
+    deepseek.kind = 'deepseek'
+    const deepseekAccount = account('deepseek-account', deepseek.id)
+    const collections = { pools: [] as Pool[], providers: [deepseek], accounts: [deepseekAccount] }
+    const source = resolveRouteSource(deepseek.id, collections)
+
+    expect(analyzeRouteSourceCompatibility('codex', source, collections)).toMatchObject({
+      eligible: true,
+      mode: 'native',
+      sourceProtocol: 'openai-responses',
+    })
+    for (const client of ['claude', 'gemini', 'grokbuild'] as const) {
+      expect(analyzeRouteSourceCompatibility(client, source, collections)).toMatchObject({
+        eligible: false,
+        mode: 'unsupported',
+      })
+      expect(listRouteSourcesForClient(client, collections)).toEqual([])
+    }
+    expect(listRouteSourcesForClient('codex', collections).map((candidate) => candidate.id))
+      .toEqual([deepseek.id])
+  })
 })
 
 function provider(

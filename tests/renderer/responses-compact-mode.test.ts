@@ -20,11 +20,13 @@ describe('Responses compact capability UI boundaries', () => {
     expect(relayCanConfigureResponsesCompact('relay', 'openai-responses')).toBe(true)
     expect(relayCanConfigureResponsesCompact('relay', 'openai-chat')).toBe(false)
     expect(relayCanConfigureResponsesCompact('official-api', 'openai-responses')).toBe(false)
+    expect(relayCanConfigureResponsesCompact('relay', 'openai-responses', 'deepseek-compatible')).toBe(false)
     for (const mode of responsesCompactModes) {
       expect(responsesCompactModeForSave('relay', 'openai-responses', mode)).toBe(mode)
     }
     expect(responsesCompactModeForSave('relay', 'openai-chat', 'native')).toBeUndefined()
     expect(responsesCompactModeForSave('official-api', 'openai-responses', 'legacy')).toBeUndefined()
+    expect(responsesCompactModeForSave('relay', 'openai-responses', 'native', 'deepseek-compatible')).toBeUndefined()
   })
 
   it('shows official OpenAI Responses as automatic native capability', () => {

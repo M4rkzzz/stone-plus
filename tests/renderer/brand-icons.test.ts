@@ -6,6 +6,11 @@ describe('provider brand icons', () => {
     expect(providerBrandIcon('xai-compatible')).toMatch(/grok\.svg$/)
   })
 
+  it('uses the DeepSeek brand mark for official and compatible sources', () => {
+    expect(providerBrandIcon('deepseek')).toMatch(/deepseek\.svg$/)
+    expect(providerBrandIcon('deepseek-compatible')).toMatch(/deepseek\.svg$/)
+  })
+
   it('keeps unknown custom providers on the text fallback', () => {
     expect(providerBrandIcon('custom')).toBeUndefined()
   })

@@ -56,6 +56,7 @@ import {
   isNativeGrokRouteSource,
   resolveRouteSource,
   routeSourceUsesKiroClaude,
+  routeSourceUsesDeepSeek,
 } from '@shared/route-sources'
 import { Badge, ConfirmDialog, InfoTip, protocolLabels } from '../ui'
 import { clientBrandMeta } from '../brand-icons'
@@ -79,6 +80,8 @@ import {
   type SetupSourceProbeBinding,
 } from '../setup-wizard-operations'
 import {
+  DEEPSEEK_COMPATIBLE_KIND,
+  DEEPSEEK_KIND,
   newRelayConnectionDefaults,
   protocolAfterProviderKindChange,
   protocolOptionLabel,
@@ -220,9 +223,10 @@ export function SetupWizardView({
   const availableAccounts = useMemo(() => snapshot.accounts.filter(isAvailableRouteAccount), [snapshot.accounts])
   const setupEligibleAccounts = useMemo(() => availableAccounts.filter((account) => {
     const provider = providerById.get(account.providerId)
+    if (provider && providerSourceFamily(provider.kind) === 'deepseek') return client === 'codex'
     if (!provider || provider.kind !== KIRO_COMPATIBLE_KIND && provider.protocol !== 'kiro-claude') return true
     return isKiroClaudeRouteSource(resolveRouteSource(provider.id, snapshot), snapshot)
-  }), [availableAccounts, providerById, snapshot])
+  }), [availableAccounts, client, providerById, snapshot])
   const selectedAccount = oauthImportedSnapshot?.accounts.find((account) => account.id === selectedAccountId)
     ?? snapshot.accounts.find((account) => account.id === selectedAccountId)
   const selectedProvider = selectedAccount
@@ -247,7 +251,8 @@ export function SetupWizardView({
     && pool.members.some((member) => member.enabled
       && setupEligibleAccounts.some((account) => account.id === member.accountId))
     && (!routeSourceUsesKiroClaude(resolveRouteSource(pool.id, snapshot), snapshot)
-      || isKiroClaudeRouteSource(resolveRouteSource(pool.id, snapshot), snapshot))), [setupEligibleAccounts, snapshot])
+      || isKiroClaudeRouteSource(resolveRouteSource(pool.id, snapshot), snapshot))
+    && (client === 'codex' || !routeSourceUsesDeepSeek(resolveRouteSource(pool.id, snapshot), snapshot))), [client, setupEligibleAccounts, snapshot])
   const selectedAggregate = useMemo(
     () => aggregatePools.find((pool) => pool.id === aggregatePoolId),
     [aggregatePoolId, aggregatePools],
@@ -766,15 +771,24 @@ export function SetupWizardView({
   }
 
   const applyOfficialVendor = (kind: ProviderKind) => {
-    const presets: Record<'openai' | 'xai' | 'anthropic' | 'google', Pick<ApiSourceInput, 'kind' | 'baseUrl' | 'protocol' | 'name'>> = {
+    const presets: Record<'openai' | 'deepseek' | 'xai' | 'anthropic' | 'google', Pick<ApiSourceInput, 'kind' | 'baseUrl' | 'protocol' | 'name'>> = {
       openai: { kind: 'openai', baseUrl: 'https://api.openai.com/v1', protocol: 'openai-responses', name: 'OpenAI API' },
+      deepseek: { kind: 'deepseek', baseUrl: 'https://api.deepseek.com', protocol: 'openai-responses', name: 'DeepSeek API' },
       xai: { kind: 'xai', baseUrl: 'https://api.x.ai/v1', protocol: 'openai-responses', name: 'Grok / xAI' },
       anthropic: { kind: 'anthropic', baseUrl: 'https://api.anthropic.com', protocol: 'anthropic-messages', name: 'Anthropic API' },
       google: { kind: 'google', baseUrl: 'https://generativelanguage.googleapis.com', protocol: 'gemini', name: 'Google Gemini API' },
     }
-    if (kind !== 'openai' && kind !== 'xai' && kind !== 'anthropic' && kind !== 'google') return
+    if (kind !== 'openai' && kind !== 'deepseek' && kind !== 'xai' && kind !== 'anthropic' && kind !== 'google') return
     setSourceDraft((current) => {
-      const next = { ...current, ...presets[kind], responsesCompactMode: undefined }
+      const next = {
+        ...current,
+        ...presets[kind],
+        responsesCompactMode: undefined,
+        ...(kind === 'deepseek' ? {
+          models: current.models.length ? current.models : ['deepseek-v4-flash'],
+          defaultModel: current.defaultModel || 'deepseek-v4-flash',
+        } : {}),
+      }
       sourceDraftRef.current = next
       return next
     })
@@ -1132,7 +1146,7 @@ export function SetupWizardView({
           {currentStep === 'source' && <WizardSection icon={<Waypoints />} title={t('你准备使用什么来源？', 'What kind of source will you use?')} description={t('可以导入订阅账号、添加 API，也可以复用已有配置。', 'Import a subscription account, add an API, or reuse an existing configuration.')}>
             <div className="setup-choice-grid">
               <Choice icon={<ShieldCheck />} title={t('ChatGPT / Codex 账号', 'ChatGPT / Codex account')} description={t('推荐使用浏览器登录，也支持 Sub2API / CPA JSON 或 Token 导入', 'Browser sign-in is recommended; Sub2API / CPA JSON and token imports are also supported')} onClick={() => chooseMode('oauth-import')} disabled={Boolean(busy)} />
-              <Choice icon={<Cloud />} title={t('官方 API', 'Official API')} description={t('OpenAI、xAI、Anthropic 或 Google Gemini', 'OpenAI, xAI, Anthropic, or Google Gemini')} onClick={() => chooseMode('official-api')} disabled={Boolean(busy)} />
+              <Choice icon={<Cloud />} title={t('官方 API', 'Official API')} description={t('OpenAI、DeepSeek、xAI、Anthropic 或 Google Gemini', 'OpenAI, DeepSeek, xAI, Anthropic, or Google Gemini')} onClick={() => chooseMode('official-api')} disabled={Boolean(busy)} />
               <Choice icon={<Server />} title={t('API 中转站', 'API relay')} description={t('填写中转地址、兼容协议和一把 Key', 'Enter the relay address, compatible protocol, and one API key')} onClick={() => chooseMode('relay')} disabled={Boolean(busy)} />
               <Choice icon={<KeyRound />} title={t('使用已添加来源', 'Use an existing source')} description={t(`已有 ${setupEligibleAccounts.length} 个可用来源`, `${setupEligibleAccounts.length} source(s) are ready`)} onClick={() => chooseMode('existing')} disabled={Boolean(busy) || !setupEligibleAccounts.length} />
               <Choice icon={<Network />} title={t('使用聚合中转', 'Use an aggregate relay')} description={t(`已有 ${aggregatePools.length} 个可用聚合`, `${aggregatePools.length} aggregate relay(s) are ready`)} onClick={() => chooseMode('aggregate')} disabled={Boolean(busy) || !aggregatePools.length} />
@@ -1328,14 +1342,14 @@ function ScanDetails({ scan }: { scan: SetupEnvironmentScan }) {
 
 function ApiSourceForm({ draft, proxies, proxyId, proxyInterlocked, official, onChange, onProxyChange, onVendor }: { draft: ApiSourceInput; proxies: AppSnapshot['proxies']; proxyId: string; proxyInterlocked: boolean; official: boolean; onChange: (value: ApiSourceInput) => void; onProxyChange: (value: string) => void; onVendor: (kind: ProviderKind) => void }) {
   const { t } = useI18n()
-  const compatibleKinds: ProviderKind[] = [XAI_COMPATIBLE_KIND, KIRO_COMPATIBLE_KIND, 'openai-compatible', 'anthropic-compatible', 'custom']
-  const protocols = official && draft.kind === 'xai'
+  const compatibleKinds: ProviderKind[] = [XAI_COMPATIBLE_KIND, DEEPSEEK_COMPATIBLE_KIND, KIRO_COMPATIBLE_KIND, 'openai-compatible', 'anthropic-compatible', 'custom']
+  const protocols = official && (draft.kind === 'xai' || draft.kind === DEEPSEEK_KIND)
     ? ['openai-responses'] as const
     : protocolsByProviderKind[draft.kind]
   const compactMode = effectiveResponsesCompactMode(draft.responsesCompactMode)
   const compactCopy = responsesCompactModeCopy[compactMode]
   return <div className="setup-form-grid">
-    {official && <label><span>{t('官方厂商', 'Official provider')}</span><select value={draft.kind} onChange={(event) => onVendor(event.target.value as ProviderKind)}><option value="openai">OpenAI</option><option value="xai">Grok / xAI</option><option value="anthropic">Anthropic</option><option value="google">Google Gemini</option></select></label>}
+    {official && <label><span>{t('官方厂商', 'Official provider')}</span><select value={draft.kind} onChange={(event) => onVendor(event.target.value as ProviderKind)}><option value="openai">OpenAI</option><option value="deepseek">DeepSeek</option><option value="xai">Grok / xAI</option><option value="anthropic">Anthropic</option><option value="google">Google Gemini</option></select></label>}
     {!official && <label><span>{t('兼容类型', 'Compatibility type')}</span><select value={draft.kind} onChange={(event) => {
       const kind = event.target.value as ProviderKind
       const protocol = protocolAfterProviderKindChange(kind, draft.protocol)
@@ -1343,26 +1357,26 @@ function ApiSourceForm({ draft, proxies, proxyId, proxyInterlocked, official, on
         ...draft,
         kind,
         protocol,
-        responsesCompactMode: relayCanConfigureResponsesCompact(draft.sourceType, protocol)
+        responsesCompactMode: relayCanConfigureResponsesCompact(draft.sourceType, protocol, kind)
           ? effectiveResponsesCompactMode(draft.responsesCompactMode)
           : undefined,
       })
     }}>{compatibleKinds.map((kind) => <option value={kind} key={kind}>{t(providerKindLabelsZh[kind], providerKindLabelsEn[kind])}</option>)}</select></label>}
     <label><span>{t('显示名称', 'Display name')}</span><input value={draft.name} onChange={(event) => onChange({ ...draft, name: event.target.value })} /></label>
     <label className="full"><span>{draft.kind === KIRO_COMPATIBLE_KIND ? t('完整 GenerateAssistantResponse 端点', 'Full GenerateAssistantResponse endpoint') : 'Base URL'}</span><input className="mono" disabled={official} value={draft.baseUrl} onChange={(event) => onChange({ ...draft, baseUrl: event.target.value })} />{draft.kind === KIRO_COMPATIBLE_KIND && <small>{t('按原样请求此完整端点，不会拼接 /v1/messages 或 /models。', 'This exact endpoint is requested as entered; Stone+ does not append /v1/messages or /models.')}</small>}</label>
-    <label><span>{t('协议', 'Protocol')}</span><select value={draft.protocol} disabled={(official && draft.kind === 'xai') || relayProtocolSelectLocked(draft.kind)} onChange={(event) => {
+    <label><span>{t('协议', 'Protocol')}</span><select value={draft.protocol} disabled={(official && (draft.kind === 'xai' || draft.kind === DEEPSEEK_KIND)) || relayProtocolSelectLocked(draft.kind)} onChange={(event) => {
       const protocol = event.target.value as Protocol
       onChange({
         ...draft,
         protocol,
-        responsesCompactMode: relayCanConfigureResponsesCompact(draft.sourceType, protocol)
+        responsesCompactMode: relayCanConfigureResponsesCompact(draft.sourceType, protocol, draft.kind)
           ? effectiveResponsesCompactMode(draft.responsesCompactMode)
           : undefined,
       })
-    }}>{protocols.map((protocol) => <option value={protocol} key={protocol}>{protocolOptionLabel(draft.kind, protocol, protocolLabels, t)}</option>)}</select>{draft.kind === XAI_COMPATIBLE_KIND && <small>{t('默认使用官方当前主路径 Responses；仅当中转明确只兼容 Chat Completions 时选择高级兼容模式。', 'Responses is the current primary API path. Choose advanced Chat compatibility only when the relay explicitly requires Chat Completions.')}</small>}{draft.kind === KIRO_COMPATIBLE_KIND && <small>{t('协议固定为 Kiro Claude；保存前必须通过两轮结构化工具测试。', 'The protocol is fixed to Kiro Claude. A two-round structured tool test is required before binding.')}</small>}</label>
-    {relayCanConfigureResponsesCompact(draft.sourceType, draft.protocol) && <label className="full"><span className="field-label-with-help">{t('Responses Compact 能力', 'Responses compact capability')}<InfoTip text={t(compactCopy.helpZh, compactCopy.helpEn)} /></span><select value={compactMode} onChange={(event) => onChange({ ...draft, responsesCompactMode: event.target.value as ResponsesCompactMode })}>{responsesCompactModes.map((mode) => <option value={mode} key={mode}>{t(responsesCompactModeCopy[mode].labelZh, responsesCompactModeCopy[mode].labelEn)}</option>)}</select></label>}
+    }}>{protocols.map((protocol) => <option value={protocol} key={protocol}>{protocolOptionLabel(draft.kind, protocol, protocolLabels, t)}</option>)}</select>{draft.kind === XAI_COMPATIBLE_KIND && <small>{t('默认使用官方当前主路径 Responses；仅当中转明确只兼容 Chat Completions 时选择高级兼容模式。', 'Responses is the current primary API path. Choose advanced Chat compatibility only when the relay explicitly requires Chat Completions.')}</small>}{draft.kind === KIRO_COMPATIBLE_KIND && <small>{t('协议固定为 Kiro Claude；保存前必须通过两轮结构化工具测试。', 'The protocol is fixed to Kiro Claude. A two-round structured tool test is required before binding.')}</small>}{(draft.kind === DEEPSEEK_KIND || draft.kind === DEEPSEEK_COMPATIBLE_KIND) && <small>{t('原生 DeepSeek Responses 直通，仅可绑定 Codex，不经过 Chat 转换。', 'Native DeepSeek Responses passthrough; Codex-only and no Chat conversion.')}</small>}</label>
+    {relayCanConfigureResponsesCompact(draft.sourceType, draft.protocol, draft.kind) && <label className="full"><span className="field-label-with-help">{t('Responses Compact 能力', 'Responses compact capability')}<InfoTip text={t(compactCopy.helpZh, compactCopy.helpEn)} /></span><select value={compactMode} onChange={(event) => onChange({ ...draft, responsesCompactMode: event.target.value as ResponsesCompactMode })}>{responsesCompactModes.map((mode) => <option value={mode} key={mode}>{t(responsesCompactModeCopy[mode].labelZh, responsesCompactModeCopy[mode].labelEn)}</option>)}</select></label>}
     {officialOpenAiUsesNativeCompact(draft.sourceType, draft.kind, draft.protocol) && <label className="full"><span className="field-label-with-help"><ShieldCheck size={13} />{t('Responses Compact 能力', 'Responses compact capability')}<InfoTip text={t('官方 OpenAI 按 Responses 协议自动使用完整原生 Compact，无需手动配置。', 'Official OpenAI automatically uses full native compact through the Responses protocol. No manual setting is needed.')} /></span><input disabled value={t('自动：完整原生 Compact', 'Automatic: full native compact')} /></label>}
-    <label><span>{t('测试/默认模型', 'Test/default model')}</span><input value={draft.defaultModel ?? ''} onChange={(event) => onChange({ ...draft, defaultModel: event.target.value })} placeholder={draft.kind === KIRO_COMPATIBLE_KIND ? t('手动填写 Kiro 模型', 'Enter the Kiro model manually') : t('例如 gpt-5.4', 'For example, gpt-5.4')} />{draft.kind === KIRO_COMPATIBLE_KIND && <small>{t('Kiro Claude 不进行模型发现。', 'Kiro Claude does not use model discovery.')}</small>}</label>
+    <label><span>{t('测试/默认模型', 'Test/default model')}</span><input value={draft.defaultModel ?? ''} onChange={(event) => onChange({ ...draft, defaultModel: event.target.value })} placeholder={draft.kind === KIRO_COMPATIBLE_KIND ? t('手动填写 Kiro 模型', 'Enter the Kiro model manually') : draft.kind === DEEPSEEK_KIND || draft.kind === DEEPSEEK_COMPATIBLE_KIND ? 'deepseek-v4-flash' : t('例如 gpt-5.4', 'For example, gpt-5.4')} />{draft.kind === KIRO_COMPATIBLE_KIND && <small>{t('Kiro Claude 不进行模型发现。', 'Kiro Claude does not use model discovery.')}</small>}</label>
     <label className="full"><span>API Key</span><input type="password" value={draft.credential ?? ''} onChange={(event) => onChange({ ...draft, credential: event.target.value })} /></label>
     <label><span>{t('最大并发', 'Max concurrency')}</span><input type="number" min={1} max={100} value={draft.maxConcurrency} onChange={(event) => onChange({ ...draft, maxConcurrency: Number(event.target.value) })} /></label>
     <label><span>{t('代理', 'Proxy')}</span><select value={proxyId} disabled={proxyInterlocked} onChange={(event) => onProxyChange(event.target.value)}><option value="">{t('直连', 'Direct')}</option>{proxies.map((proxy) => <option value={proxy.id} key={proxy.id}>{proxy.name}</option>)}</select>{proxyInterlocked && <small>{t(BUILT_IN_PROXY_BINDING_NOTICE.zh, BUILT_IN_PROXY_BINDING_NOTICE.en)}</small>}</label>

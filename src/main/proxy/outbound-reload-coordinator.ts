@@ -4,6 +4,7 @@ import type {
   SystemProxyDetectionResult
 } from '@shared/types'
 import { resolveRouteSource } from '@shared/route-sources'
+import { routeReferencedSourceIds } from '@shared/route-models'
 import {
   CHATGPT_CODEX_RESPONSES_URL,
   codexQuotaIsExhausted
@@ -48,31 +49,33 @@ export function collectEnabledOutboundTargets(
   const targets = new Map<string, EnabledOutboundTarget>()
   for (const route of configuration.routes) {
     if (!route.enabled) continue
-    const source = resolveRouteSource(route.poolId, sourceCollections)
-    if (!source) continue
-    for (const account of source.accounts) {
-      if (account.status === 'disabled' || account.status === 'expired') continue
-      const provider = configuration.providers.find((candidate) => candidate.id === account.providerId)
-      if (!provider) continue
-      const proxy = resolveEffectiveProxy(account, source.pool, configuration.proxies)
-      // Preserve the complete upstream path and query. PAC decisions may be
-      // path-sensitive, so reducing this to an origin changes routing.
-      const targetUrl = new URL(
-        account.credentialType === 'chatgpt-oauth' || account.credentialType === 'chatgpt-agent-identity'
-          ? CHATGPT_CODEX_RESPONSES_URL
-          : provider.baseUrl
-      ).toString()
-      const key = `${proxy?.id ?? 'direct'}\0${targetUrl}`
-      const existing = targets.get(key)
-      if (existing) {
-        existing.accountIds.add(account.id)
-      } else {
-        targets.set(key, {
-          proxy,
-          password: proxy ? store.getProxyPassword(proxy.id) : undefined,
-          targetUrl,
-          accountIds: new Set([account.id])
-        })
+    for (const sourceId of routeReferencedSourceIds(route)) {
+      const source = resolveRouteSource(sourceId, sourceCollections)
+      if (!source) continue
+      for (const account of source.accounts) {
+        if (account.status === 'disabled' || account.status === 'expired') continue
+        const provider = configuration.providers.find((candidate) => candidate.id === account.providerId)
+        if (!provider) continue
+        const proxy = resolveEffectiveProxy(account, source.pool, configuration.proxies)
+        // Preserve the complete upstream path and query. PAC decisions may be
+        // path-sensitive, so reducing this to an origin changes routing.
+        const targetUrl = new URL(
+          account.credentialType === 'chatgpt-oauth' || account.credentialType === 'chatgpt-agent-identity'
+            ? CHATGPT_CODEX_RESPONSES_URL
+            : provider.baseUrl
+        ).toString()
+        const key = `${proxy?.id ?? 'direct'}\0${targetUrl}`
+        const existing = targets.get(key)
+        if (existing) {
+          existing.accountIds.add(account.id)
+        } else {
+          targets.set(key, {
+            proxy,
+            password: proxy ? store.getProxyPassword(proxy.id) : undefined,
+            targetUrl,
+            accountIds: new Set([account.id])
+          })
+        }
       }
     }
   }

@@ -1,6 +1,6 @@
 {
   "name": "stone-desktop",
-  "version": "0.9.12",
+  "version": "0.9.13",
   "private": true,
   "packageManager": "npm@10.9.3",
   "engines": {
@@ -209,6 +209,9 @@
     "mac": {
       "category": "public.app-category.developer-tools",
       "icon": "build/icon.icns",
+      "extendInfo": {
+        "NSMicrophoneUsageDescription": "Stone+ uses the microphone only when you start ChatGPT Voice."
+      },
       "artifactName": "StonePlus-${version}-macos-${arch}.${ext}",
       "signIgnore": [
         "/sing-box/mac-(x64|arm64)/sing-box$"

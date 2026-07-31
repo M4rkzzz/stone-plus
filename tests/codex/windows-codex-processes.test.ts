@@ -1,16 +1,18 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
+  encodedPowerShellArgs,
   findBlockingWindowsCodexPids,
   parseTaskListProcessIds,
 } from '../../src/main/codex/windows-codex-processes'
 
 describe('Windows Codex process enumeration', () => {
-  it('uses a non-throwing PowerShell command and normalizes PIDs', async () => {
+  it('uses an encoded non-throwing PowerShell command and normalizes PIDs', async () => {
     const runCommand = vi.fn(async () => ({ stdout: '42\r\n7\r\n42\r\n', stderr: '' }))
 
     await expect(findBlockingWindowsCodexPids({ platform: 'win32', runCommand })).resolves.toEqual([7, 42])
-
-    const script = runCommand.mock.calls[0]?.[1].at(-1) ?? ''
+    expect(runCommand).toHaveBeenCalledWith('powershell.exe', expect.arrayContaining(['-EncodedCommand']))
+    const encoded = runCommand.mock.calls[0]?.[1].at(-1) ?? ''
+    const script = Buffer.from(encoded, 'base64').toString('utf16le')
     expect(script).toContain("$ErrorActionPreference = 'SilentlyContinue'")
     expect(script).toContain('$items = @(')
     expect(script).toMatch(/exit 0$/)
@@ -26,6 +28,21 @@ describe('Windows Codex process enumeration', () => {
     })
 
     await expect(findBlockingWindowsCodexPids({ platform: 'win32', runCommand })).resolves.toEqual([22, 33])
+  })
+
+  it('reports both enumeration failures', async () => {
+    const runCommand = vi.fn(async (file: string) => {
+      throw new Error(file === 'tasklist.exe' ? 'tasklist blocked' : 'PowerShell blocked')
+    })
+
+    await expect(findBlockingWindowsCodexPids({ platform: 'win32', runCommand }))
+      .rejects.toThrow(/PowerShell blocked.*tasklist blocked/)
+  })
+
+  it('encodes scripts as Windows PowerShell UTF-16LE command arguments', () => {
+    const args = encodedPowerShellArgs("$value = '测试'")
+    expect(args.at(-2)).toBe('-EncodedCommand')
+    expect(Buffer.from(args.at(-1) ?? '', 'base64').toString('utf16le')).toBe("$value = '测试'")
   })
 
   it('parses localized tasklist output conservatively', () => {

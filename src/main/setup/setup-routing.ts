@@ -10,6 +10,7 @@ import {
   isAvailableRouteAccount,
   isNativeGrokRouteSource,
   resolveRouteSource,
+  routeSourceUsesDeepSeek,
 } from '../../shared/route-sources'
 import type { PersistedState } from '../store/types'
 
@@ -33,6 +34,9 @@ export function applySetupRoutingDraft(
   const provider = state.providers.find((candidate) => candidate.id === source.providerId)
   if (!provider) throw new Error('向导选择的来源缺少上游定义。')
   const logicalProtocol = accountPoolProtocol(source, provider)
+  if (input.client !== 'codex' && providerSourceFamily(provider.kind) === 'deepseek') {
+    throw new Error('DeepSeek Responses 来源只能用于 Codex。')
+  }
   if (input.client === 'grokbuild'
     && (providerSourceFamily(provider.kind) !== 'grok' || provider.protocol !== 'openai-responses')) {
     throw new Error('Grok Build 只能连接原生 OpenAI Responses 协议的 Grok 号池或 Grok 中转站。')
@@ -95,6 +99,9 @@ export function applySetupRoutingDraft(
 
   if (input.client === 'grokbuild' && !isNativeGrokRouteSource(resolveRouteSource(pool.id, state), state)) {
     throw new Error('Grok Build 只能连接原生 OpenAI Responses 协议的 Grok 号池或 Grok 中转站。')
+  }
+  if (input.client !== 'codex' && routeSourceUsesDeepSeek(resolveRouteSource(pool.id, state), state)) {
+    throw new Error('DeepSeek Responses 来源只能用于 Codex。')
   }
 
   if (!poolSupportsSetupRequest(state, pool, model)) {

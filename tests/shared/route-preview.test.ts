@@ -38,6 +38,44 @@ describe('static route preview', () => {
     expect(result.issues).toContainEqual(expect.objectContaining({ code: 'model-mapped' }))
   })
 
+  it('previews the effective per-model source while preserving the default source for unmatched models', () => {
+    const routedSnapshot = {
+      ...snapshot,
+      providers: [
+        ...snapshot.providers,
+        { ...snapshot.providers[0], id: 'provider-luna', name: 'Luna pool', models: ['gpt-5.6-luna-upstream'] },
+      ],
+      accounts: [
+        ...snapshot.accounts,
+        {
+          ...snapshot.accounts[0],
+          id: 'account-luna',
+          providerId: 'provider-luna',
+          availableModels: ['gpt-5.6-luna-upstream'],
+        },
+      ],
+    } as Pick<AppSnapshot, 'providers' | 'accounts' | 'pools'>
+    const routed = {
+      ...route,
+      modelMap: { 'gpt-5.6-luna': 'gpt-5.6-luna-upstream' },
+      modelSourceMap: { 'gpt-5.6-luna': 'provider-luna' },
+    }
+
+    const luna = previewRoute({ route: routed, requestedModel: 'gpt-5.6-luna' }, routedSnapshot)
+    expect(luna).toMatchObject({
+      status: 'ready',
+      sourceId: 'provider-luna',
+      sourceName: 'Luna pool',
+      upstreamModel: 'gpt-5.6-luna-upstream',
+      eligibleAccountCount: 1,
+    })
+    expect(luna.issues).toContainEqual(expect.objectContaining({ code: 'source-overridden' }))
+
+    const unmatched = previewRoute({ route: routed, requestedModel: 'gpt-test' }, routedSnapshot)
+    expect(unmatched).toMatchObject({ sourceId: 'provider', sourceName: 'Relay' })
+    expect(unmatched.issues).not.toContainEqual(expect.objectContaining({ code: 'source-overridden' }))
+  })
+
   it('uses a wildcard mapping for an otherwise-unmapped model', () => {
     const result = previewRoute({
       route: { ...route, modelMap: { '*': 'grok-4.20' } },

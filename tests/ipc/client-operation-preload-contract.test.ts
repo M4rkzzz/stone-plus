@@ -69,6 +69,16 @@ describe('client operation preload contract', () => {
     ])
   })
 
+  it('opens the selected ChatGPT OAuth account through the dedicated web-login channel', async () => {
+    electron.invoke.mockResolvedValue({})
+    await import('../../src/preload/index')
+    const stone = exposedStone()
+
+    await stone.openChatGptWebLogin('account-oauth-1')
+
+    expect(electron.invoke).toHaveBeenCalledWith('stone:open-chatgpt-web-login', 'account-oauth-1')
+  })
+
   it('subscribes and unsubscribes both renderer event streams with the same callback wrapper', async () => {
     await import('../../src/preload/index')
     const stone = exposedStone()

@@ -39,7 +39,10 @@ export function inferUpstreamCapabilities(input: {
   const responses = input.protocol === 'openai-responses'
   const kiroClaude = input.protocol === 'kiro-claude'
   const officialResponses = responses && input.sourceType === 'official-api' && input.kind === 'openai'
-  const compact = responses
+  const deepSeekResponses = responses && (input.kind === 'deepseek' || input.kind === 'deepseek-compatible')
+  const compact = deepSeekResponses
+    ? false
+    : responses
     ? officialResponses
       || input.responsesCompactMode === 'auto'
       || input.responsesCompactMode === 'native'
@@ -66,6 +69,15 @@ export function inferUpstreamCapabilities(input: {
       previousResponseId: true,
       parallelToolCalls: true,
       websocket: true,
+    } : {}),
+    ...(deepSeekResponses ? {
+      imageInput: false,
+      webSearch: true,
+      promptCaching: false,
+      reasoning: true,
+      store: false,
+      previousResponseId: false,
+      parallelToolCalls: true,
     } : {}),
   }
 }

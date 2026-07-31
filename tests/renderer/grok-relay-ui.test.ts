@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
+  DEEPSEEK_COMPATIBLE_KIND,
+  DEEPSEEK_KIND,
   KIRO_COMPATIBLE_KIND,
   newRelayConnectionDefaults,
   protocolAfterProviderKindChange,
@@ -43,5 +45,16 @@ describe('Grok/xAI relay renderer defaults', () => {
     expect(protocolOptionLabel(KIRO_COMPATIBLE_KIND, 'kiro-claude', protocolLabels, (zh) => zh)).toBe('Kiro Claude')
     expect(relayProtocolSelectLocked(KIRO_COMPATIBLE_KIND)).toBe(true)
     expect(relayProtocolSelectLocked(XAI_COMPATIBLE_KIND)).toBe(false)
+  })
+
+  it('exposes DeepSeek Responses as a locked native protocol', () => {
+    expect(providerKindLabelsZh[DEEPSEEK_KIND]).toBe('DeepSeek')
+    expect(providerKindLabelsZh[DEEPSEEK_COMPATIBLE_KIND]).toBe('DeepSeek Responses 中转')
+    expect(protocolsByProviderKind[DEEPSEEK_KIND]).toEqual(['openai-responses'])
+    expect(protocolsByProviderKind[DEEPSEEK_COMPATIBLE_KIND]).toEqual(['openai-responses'])
+    expect(protocolAfterProviderKindChange(DEEPSEEK_COMPATIBLE_KIND, 'openai-chat')).toBe('openai-responses')
+    expect(protocolOptionLabel(DEEPSEEK_COMPATIBLE_KIND, 'openai-responses', protocolLabels, (zh) => zh))
+      .toBe('DeepSeek Responses')
+    expect(relayProtocolSelectLocked(DEEPSEEK_COMPATIBLE_KIND)).toBe(true)
   })
 })

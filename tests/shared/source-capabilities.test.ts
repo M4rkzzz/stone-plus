@@ -52,4 +52,24 @@ describe('source capability profiles', () => {
         expect.objectContaining({ id: 'gpt-test' }),
       ]))
   })
+
+  it('infers the documented native DeepSeek Responses boundary', () => {
+    expect(effectiveProviderCapabilities({
+      ...provider,
+      kind: 'deepseek-compatible',
+      responsesCompactMode: 'native',
+    })).toMatchObject({
+      streaming: true,
+      nonStreaming: true,
+      toolCalls: true,
+      compact: false,
+      imageInput: false,
+      webSearch: true,
+      promptCaching: false,
+      reasoning: true,
+      store: false,
+      previousResponseId: false,
+      parallelToolCalls: true,
+    })
+  })
 })

@@ -11,6 +11,7 @@ import {
   ExternalLink,
   Files,
   FolderOpen,
+  Globe2,
   KeyRound,
   Link2,
   LoaderCircle,
@@ -75,6 +76,8 @@ import {
 import { useI18n } from '../i18n'
 import { useVisibilityAwareInterval } from '../visibility-interval'
 import {
+  DEEPSEEK_COMPATIBLE_KIND,
+  DEEPSEEK_KIND,
   KIRO_COMPATIBLE_KIND,
   newRelayConnectionDefaults,
   protocolAfterProviderKindChange,
@@ -152,7 +155,7 @@ const ACCOUNT_COLUMNS: AccountColumnDefinition[] = [
   { id: 'quota', label: '额度', defaultWidth: 130, minimumWidth: 82 },
   { id: 'latency', label: '延迟', defaultWidth: 90, minimumWidth: 70 },
   { id: 'lastUsed', label: '最近使用', defaultWidth: 110, minimumWidth: 82 },
-  { id: 'actions', label: '操作', defaultWidth: 150, minimumWidth: 140 },
+  { id: 'actions', label: '操作', defaultWidth: 178, minimumWidth: 168 },
 ]
 
 const ACCOUNT_COLUMN_LABELS_EN: Record<AccountColumnId, string> = {
@@ -277,8 +280,9 @@ type AccountDraft = Omit<AccountInput, 'modelPolicy'> & { modelPolicy: ModelPoli
 type AggregateRelayDraft = AggregateRelayInput
 const aggregateProtocols: Protocol[] = ['anthropic-messages', 'openai-responses', 'openai-chat', 'kiro-claude', 'gemini']
 
-const officialSourceDefaults: Record<'openai' | 'xai' | 'anthropic' | 'google', Pick<ApiSourceDraft, 'baseUrl' | 'protocol'>> = {
+const officialSourceDefaults: Record<'openai' | 'deepseek' | 'xai' | 'anthropic' | 'google', Pick<ApiSourceDraft, 'baseUrl' | 'protocol'>> = {
   openai: { baseUrl: 'https://api.openai.com/v1', protocol: 'openai-responses' },
+  deepseek: { baseUrl: 'https://api.deepseek.com', protocol: 'openai-responses' },
   xai: { baseUrl: 'https://api.x.ai/v1', protocol: 'openai-responses' },
   anthropic: { baseUrl: 'https://api.anthropic.com', protocol: 'anthropic-messages' },
   google: { baseUrl: 'https://generativelanguage.googleapis.com', protocol: 'gemini' },
@@ -371,12 +375,13 @@ function ApiSourceForm({
   errors: Record<string, string>
 }) {
   const { t } = useI18n()
-  const availableProtocols = draft.sourceType === 'official-api' && draft.kind === 'xai'
+  const availableProtocols = draft.sourceType === 'official-api'
+    && (draft.kind === 'xai' || draft.kind === DEEPSEEK_KIND)
     ? ['openai-responses'] as const
     : protocolsByProviderKind[draft.kind]
   const availableKinds: ProviderKind[] = draft.sourceType === 'official-api'
-    ? draft.kind === 'xai' ? ['xai'] : ['openai', 'anthropic', 'google']
-    : [XAI_COMPATIBLE_KIND, KIRO_COMPATIBLE_KIND, 'openai-compatible', 'anthropic-compatible', 'custom']
+    ? draft.kind === 'xai' ? ['xai'] : ['openai', DEEPSEEK_KIND, 'anthropic', 'google']
+    : [XAI_COMPATIBLE_KIND, DEEPSEEK_COMPATIBLE_KIND, KIRO_COMPATIBLE_KIND, 'openai-compatible', 'anthropic-compatible', 'custom']
   const compactMode = effectiveResponsesCompactMode(draft.responsesCompactMode)
   const compactCopy = responsesCompactModeCopy[compactMode]
   return (
@@ -390,16 +395,20 @@ function ApiSourceForm({
         <span>{draft.sourceType === 'official-api' ? t('官方服务', 'Official service') : t('兼容类型', 'Compatibility type')}</span>
         <select value={draft.kind} disabled={draft.sourceType === 'official-api' && draft.kind === 'xai'} onChange={(event) => {
           const kind = event.target.value as ProviderKind
-          const official = kind === 'openai' || kind === 'xai' || kind === 'anthropic' || kind === 'google' ? officialSourceDefaults[kind] : undefined
+          const official = kind === 'openai' || kind === 'deepseek' || kind === 'xai' || kind === 'anthropic' || kind === 'google' ? officialSourceDefaults[kind] : undefined
           const protocol = official?.protocol ?? protocolAfterProviderKindChange(kind, draft.protocol)
           setDraft({
             ...draft,
             kind,
             protocol,
             baseUrl: official?.baseUrl ?? draft.baseUrl,
-            responsesCompactMode: relayCanConfigureResponsesCompact(draft.sourceType, protocol)
+            responsesCompactMode: relayCanConfigureResponsesCompact(draft.sourceType, protocol, kind)
               ? effectiveResponsesCompactMode(draft.responsesCompactMode)
               : undefined,
+            ...(kind === DEEPSEEK_KIND ? {
+              modelsText: draft.modelsText.trim() ? draft.modelsText : 'deepseek-v4-flash',
+              defaultModel: draft.defaultModel.trim() ? draft.defaultModel : 'deepseek-v4-flash',
+            } : {}),
           })
         }}>
           {availableKinds.map((kind) => <option value={kind} key={kind}>{t(providerKindLabelsZh[kind], providerKindLabelsEn[kind])}</option>)}
@@ -407,12 +416,12 @@ function ApiSourceForm({
       </label>
       <label className="field">
         <span>{t('上游协议', 'Upstream protocol')}</span>
-        <select value={draft.protocol} disabled={(draft.sourceType === 'official-api' && draft.kind === 'xai') || relayProtocolSelectLocked(draft.kind)} onChange={(event) => {
+        <select value={draft.protocol} disabled={(draft.sourceType === 'official-api' && (draft.kind === 'xai' || draft.kind === DEEPSEEK_KIND)) || relayProtocolSelectLocked(draft.kind)} onChange={(event) => {
           const protocol = event.target.value as Protocol
           setDraft({
             ...draft,
             protocol,
-            responsesCompactMode: relayCanConfigureResponsesCompact(draft.sourceType, protocol)
+            responsesCompactMode: relayCanConfigureResponsesCompact(draft.sourceType, protocol, draft.kind)
               ? effectiveResponsesCompactMode(draft.responsesCompactMode)
               : undefined,
           })
@@ -421,8 +430,9 @@ function ApiSourceForm({
         </select>
         {draft.kind === XAI_COMPATIBLE_KIND && <small>{t('默认使用官方当前主路径 Responses；仅当中转明确只兼容 Chat Completions 时选择高级兼容模式。', 'Responses is the current primary API path. Choose advanced Chat compatibility only when the relay explicitly requires Chat Completions.')}</small>}
         {draft.kind === KIRO_COMPATIBLE_KIND && <small>{t('仅供 Claude Code CLI、Desktop 与 VSC 使用；Stone+ 会强制启用结构化工具兼容。', 'Available only to Claude Code CLI, Desktop, and VSC. Stone+ always enables the structured tool bridge.')}</small>}
+        {(draft.kind === DEEPSEEK_KIND || draft.kind === DEEPSEEK_COMPATIBLE_KIND) && <small>{t('DeepSeek Responses 原生直通，仅供 Codex 路由选择；不经过 Chat Completions 转换。', 'Native DeepSeek Responses passthrough, available only to Codex routes; no Chat Completions conversion is used.')}</small>}
       </label>
-      {relayCanConfigureResponsesCompact(draft.sourceType, draft.protocol) && <label className="field field--full">
+      {relayCanConfigureResponsesCompact(draft.sourceType, draft.protocol, draft.kind) && <label className="field field--full">
         <span className="field-label-with-help">{t('Responses Compact 能力', 'Responses compact capability')}<InfoTip text={t(compactCopy.helpZh, compactCopy.helpEn)} /></span>
         <select value={compactMode} onChange={(event) => setDraft({ ...draft, responsesCompactMode: event.target.value as ResponsesCompactMode })}>
           {responsesCompactModes.map((mode) => <option value={mode} key={mode}>{t(responsesCompactModeCopy[mode].labelZh, responsesCompactModeCopy[mode].labelEn)}</option>)}
@@ -995,7 +1005,7 @@ export function ProvidersView({
       kind: provider.kind,
       baseUrl: provider.baseUrl,
       protocol: provider.protocol,
-      responsesCompactMode: provider.sourceType === 'relay' && provider.protocol === 'openai-responses'
+      responsesCompactMode: relayCanConfigureResponsesCompact(provider.sourceType, provider.protocol, provider.kind)
         ? effectiveResponsesCompactMode(provider.responsesCompactMode)
         : undefined,
       capabilityProfile: provider.capabilityProfile,
@@ -1254,6 +1264,7 @@ export function ProvidersView({
         providerDraft.sourceType,
         providerDraft.protocol,
         providerDraft.responsesCompactMode,
+        providerDraft.kind,
       ),
       credential: providerDraft.credential?.trim() || undefined,
       models: providerDraft.modelsText.split(/[\n,]/).map((model) => model.trim()).filter(Boolean),
@@ -1369,7 +1380,7 @@ export function ProvidersView({
       kind: provider.kind,
       baseUrl: provider.baseUrl,
       protocol: provider.protocol,
-      responsesCompactMode: provider.sourceType === 'relay' && provider.protocol === 'openai-responses'
+      responsesCompactMode: relayCanConfigureResponsesCompact(provider.sourceType, provider.protocol, provider.kind)
         ? effectiveResponsesCompactMode(provider.responsesCompactMode)
         : undefined,
       modelsText: provider.models.join('\n'),
@@ -1826,19 +1837,26 @@ export function ProvidersView({
   const selectedAccounts = snapshot.accounts.filter((account) => selectedAccountIdSet.has(account.id))
   const selectedVisibleIds = new Set(visibleAccounts.map((account) => account.id))
   const selectedAccountSummary = accountSelectionSummary(selectedAccounts, selectedVisibleIds)
+  const cooldownToggleBusy = busyKeys.has('toggle-disable-cooldown')
+  const toggleDisableCooldown = async (enabled: boolean) => {
+    await runAction('toggle-disable-cooldown', () => api.updateGateway({
+      ...snapshot.gateway,
+      disableCooldown: enabled,
+    }))
+  }
 
   return (
     <div className="page-stack">
       <PageHeader
         title={t('账号与中转', 'Accounts & relays')}
         actions={
-          tab === 'accounts'
+          <><div className="provider-cooldown-toggle" title={t('关闭故障冷却；额度耗尽、停用和过期状态仍然生效。', 'Disable failure cooldowns; quota exhaustion, disabled, and expired states remain enforced.')}><Clock3 size={15} /><span>{t('禁用冷却', 'Disable cooldown')}</span><button type="button" role="switch" aria-label={t('禁用冷却', 'Disable cooldown')} aria-checked={snapshot.gateway.disableCooldown === true} className={`toggle ${snapshot.gateway.disableCooldown === true ? 'toggle--on' : ''}`} disabled={cooldownToggleBusy} onClick={() => void toggleDisableCooldown(snapshot.gateway.disableCooldown !== true)}>{cooldownToggleBusy ? <LoaderCircle size={13} className="spin" /> : <span />}</button></div>{tab === 'accounts'
             ? accountFamily === 'openai'
               ? <button type="button" className="button button--primary" onClick={openChatGptAccountDialog}><Plus size={16} /> {t('添加 Codex 账号', 'Add Codex account')}</button>
               : <button type="button" className="button button--primary" onClick={openGrokCredential}><Plus size={16} /> {t('添加 Grok 凭据', 'Add Grok credential')}</button>
             : tab === 'official'
               ? <button type="button" className="button button--primary" onClick={() => openProvider('official-api')}><Plus size={16} /> {t('添加官方 API', 'Add official API')}</button>
-              : <><button type="button" className="button button--secondary" onClick={() => openAggregateRelay()}><Boxes size={16} /> {t('添加聚合中转', 'Add aggregate relay')}</button><button type="button" className="button button--primary" onClick={() => openProvider('relay')}><Plus size={16} /> {t('添加中转站', 'Add relay')}</button></>
+              : <><button type="button" className="button button--secondary" onClick={() => openAggregateRelay()}><Boxes size={16} /> {t('添加聚合中转', 'Add aggregate relay')}</button><button type="button" className="button button--primary" onClick={() => openProvider('relay')}><Plus size={16} /> {t('添加中转站', 'Add relay')}</button></>}</>
         }
       />
 
@@ -1906,6 +1924,8 @@ export function ProvidersView({
                     const provider = providerById.get(account.providerId)
                     const checking = checkingAllAccounts || busyKeys.has(`check-${account.id}`) || account.status === 'checking'
                     const refreshingModels = busyKeys.has(`refresh-account-models-${account.id}`)
+                    const openingWebLogin = busyKeys.has(`open-chatgpt-web-${account.id}`)
+                    const supportsWebLogin = account.credentialType === 'chatgpt-oauth'
                     const openModels = effectiveAccountModels(account, provider?.models)
                     const modelSummary = isAccountModelWildcard(account)
                       ? t('待刷新 · 兼容通配', 'Refresh pending · Compatible wildcard')
@@ -1937,6 +1957,7 @@ export function ProvidersView({
                         <td className="actions-cell">
                           <button className="icon-button" type="button" title={account.credentialType === 'grok-oauth' ? t('Grok OAuth 使用内置模型目录', 'Grok OAuth uses the built-in model catalog') : t('刷新此账号的可用模型', 'Refresh available models for this account')} disabled={refreshingModels || account.credentialType === 'grok-oauth'} onClick={() => void runAction(`refresh-account-models-${account.id}`, () => api.refreshAccountModels(account.id))}>{refreshingModels ? <LoaderCircle size={16} className="spin" /> : <Boxes size={16} />}</button>
                           <button className="icon-button" type="button" title={account.credentialType === 'grok-oauth' ? t('检测账号并刷新额度', 'Check account and refresh quota') : t('检测账号', 'Check account')} disabled={checking} onClick={() => void runAction(`check-${account.id}`, () => api.checkAccount(account.id))}>{checking ? <LoaderCircle size={16} className="spin" /> : <RefreshCw size={16} />}</button>
+                          <button className="icon-button" type="button" title={supportsWebLogin ? t('以此账号打开 ChatGPT 网页', 'Open ChatGPT web with this account') : t('仅 ChatGPT OAuth 账号支持网页登录', 'Web login is available only for ChatGPT OAuth accounts')} aria-label={supportsWebLogin ? t(`以账号 ${account.name} 打开 ChatGPT 网页`, `Open ChatGPT web with account ${account.name}`) : undefined} disabled={!supportsWebLogin || openingWebLogin} onClick={() => void runAction(`open-chatgpt-web-${account.id}`, () => api.openChatGptWebLogin(account.id))}>{openingWebLogin ? <LoaderCircle size={16} className="spin" /> : <Globe2 size={16} />}</button>
                           <OverflowMenu open={menuOpen === account.id} onOpenChange={(open) => setMenuOpen(open ? account.id : null)} label={t('更多操作', 'More actions')}><button type="button" onClick={() => provider?.kind === 'xai' && account.credentialType !== 'grok-oauth' ? openProvider('official-api', provider) : openAccount(account)}><Edit3 size={15} />{t('编辑', 'Edit')}</button><button className="danger" type="button" onClick={() => { setDeleteTarget(provider?.kind === 'xai' && account.credentialType !== 'grok-oauth' ? { kind: 'provider', id: provider.id, name: provider.name } : { kind: 'account', id: account.id, name: account.name }); setMenuOpen(null) }}><Trash2 size={15} />{t('删除', 'Delete')}</button></OverflowMenu>
                         </td>
                       </tr>
@@ -1987,7 +2008,7 @@ export function ProvidersView({
                     <OverflowMenu open={menuOpen === provider.id} onOpenChange={(open) => setMenuOpen(open ? provider.id : null)} label={t('来源操作', 'Source actions')}><button type="button" disabled={testingSourceId === provider.id || !sourceAccount} onClick={() => void testSavedSource(provider, sourceAccount)}>{testingSourceId === provider.id ? <LoaderCircle size={15} className="spin" /> : <RefreshCw size={15} />}{provider.protocol === 'kiro-claude' ? t('测试 Kiro 工具链', 'Test Kiro tool chain') : isAnthropicCompatibleRelay(provider) ? t('测试 Claude 工具链', 'Test Claude tool chain') : t('测试', 'Test')}</button><button type="button" onClick={() => openProvider(provider.sourceType === 'relay' ? 'relay' : 'official-api', provider)}><Edit3 size={15} />{t('编辑', 'Edit')}</button><button type="button" onClick={() => copySourceConfiguration(provider, sourceAccount)}><Copy size={15} />{t('复制配置', 'Copy configuration')}</button><button className="danger" type="button" onClick={() => { setDeleteTarget({ kind: 'provider', id: provider.id, name: provider.name }); setMenuOpen(null) }}><Trash2 size={15} />{t('删除', 'Delete')}</button></OverflowMenu>
                   </div>
                   <div className="provider-card__endpoint"><span>{provider.protocol === 'kiro-claude' ? t('完整端点', 'Full endpoint') : t('基础地址', 'Base URL')}</span><code>{provider.baseUrl}</code></div>
-                  <div className="provider-card__meta"><Badge tone="info">{protocolLabels[provider.protocol]}</Badge><span><KeyRound size={14} />{sourceAccount?.maskedCredential ?? t('凭据待完善', 'Credential required')}</span><span><Boxes size={14} />{t(`${provider.models.length} 个模型`, `${provider.models.length} ${provider.models.length === 1 ? 'model' : 'models'}`)}</span>{provider.protocol === 'kiro-claude' ? <Badge tone={hasVerifiedKiroToolBridge(provider) ? 'success' : 'warning'}>{hasVerifiedKiroToolBridge(provider) ? t('工具链已验证', 'Tool chain verified') : t('待工具验证', 'Tool verification required')}</Badge> : isAnthropicCompatibleRelay(provider) ? <Badge tone={claudeToolchainUnverified ? 'warning' : 'success'}>{claudeToolchainUnverified ? t('Claude 工具待验证', 'Claude tools unverified') : t('Claude 工具链已验证', 'Claude tool chain verified')}</Badge> : provider.capabilityProfile?.checkedAt && <Badge tone="success">{t('能力已探测', 'Capabilities probed')}</Badge>}</div>
+                  <div className="provider-card__meta"><Badge tone="info">{protocolOptionLabel(provider.kind, provider.protocol, protocolLabels, t)}</Badge><span><KeyRound size={14} />{sourceAccount?.maskedCredential ?? t('凭据待完善', 'Credential required')}</span><span><Boxes size={14} />{t(`${provider.models.length} 个模型`, `${provider.models.length} ${provider.models.length === 1 ? 'model' : 'models'}`)}</span>{provider.protocol === 'kiro-claude' ? <Badge tone={hasVerifiedKiroToolBridge(provider) ? 'success' : 'warning'}>{hasVerifiedKiroToolBridge(provider) ? t('工具链已验证', 'Tool chain verified') : t('待工具验证', 'Tool verification required')}</Badge> : isAnthropicCompatibleRelay(provider) ? <Badge tone={claudeToolchainUnverified ? 'warning' : 'success'}>{claudeToolchainUnverified ? t('Claude 工具待验证', 'Claude tools unverified') : t('Claude 工具链已验证', 'Claude tool chain verified')}</Badge> : provider.capabilityProfile?.checkedAt && <Badge tone="success">{t('能力已探测', 'Capabilities probed')}</Badge>}</div>
                   {claudeToolchainUnverified && <div className="claude-toolchain-warning"><CircleAlert size={15} /><span>{t(CLAUDE_TOOLCHAIN_UNVERIFIED_COPY.zh, CLAUDE_TOOLCHAIN_UNVERIFIED_COPY.en)}</span></div>}
                   {sourceAccount && <div className="provider-source-health"><AccountStatusBadge status={sourceAccount.status} circuitState={sourceAccount.circuitState} /><span>{t('并发', 'Concurrency')} {sourceAccount.inFlight} / {sourceAccount.maxConcurrency}</span><span>{t('权重', 'Weight')} {sourceAccount.weight}</span>{sourceAccount.latencyMs !== undefined && <span>{durationLabel(sourceAccount.latencyMs)}</span>}</div>}
                   <div className="model-tags">
@@ -2006,6 +2027,10 @@ export function ProvidersView({
               const claudeToolchainUnverified = members.some((account) => (
                 anthropicRelayNeedsClaudeToolchainWarning(providerById.get(account.providerId))
               ))
+              const aggregateUsesDeepSeek = members.length > 0 && members.every((account) => {
+                const provider = providerById.get(account.providerId)
+                return provider !== undefined && providerSourceFamily(provider.kind) === 'deepseek'
+              })
               return <article className="provider-card aggregate-relay-card" key={pool.id}>
                 <div className="provider-card__top">
                   <span className="provider-avatar provider-avatar--large aggregate-relay-card__icon"><Boxes size={18} /></span>
@@ -2013,7 +2038,7 @@ export function ProvidersView({
                   <OverflowMenu open={menuOpen === pool.id} onOpenChange={(open) => setMenuOpen(open ? pool.id : null)} label={t('聚合中转操作', 'Aggregate relay actions')}><button type="button" onClick={() => openAggregateRelay(pool)}><Edit3 size={15} />{t('编辑', 'Edit')}</button><button className="danger" type="button" onClick={() => { setAggregateDeleteTarget(pool); setMenuOpen(null) }}><Trash2 size={15} />{t('删除', 'Delete')}</button></OverflowMenu>
                 </div>
                 <div className="provider-card__endpoint"><span>{t('成员顺序', 'Member order')}</span><code>{members.map((account) => account.name).join(' → ') || t('暂无成员', 'No members')}</code></div>
-                <div className="provider-card__meta"><Badge tone="info">{protocolLabels[pool.protocol]}</Badge><span><KeyRound size={14} />{t(`${members.length} 个 API 来源`, `${members.length} API ${members.length === 1 ? 'source' : 'sources'}`)}</span><span>{t(`重试 ${pool.maxRetries} 次`, `${pool.maxRetries} ${pool.maxRetries === 1 ? 'retry' : 'retries'}`)}</span></div>
+                <div className="provider-card__meta"><Badge tone="info">{aggregateUsesDeepSeek ? 'DeepSeek Responses' : protocolLabels[pool.protocol]}</Badge><span><KeyRound size={14} />{t(`${members.length} 个 API 来源`, `${members.length} API ${members.length === 1 ? 'source' : 'sources'}`)}</span><span>{t(`重试 ${pool.maxRetries} 次`, `${pool.maxRetries} ${pool.maxRetries === 1 ? 'retry' : 'retries'}`)}</span></div>
                 {claudeToolchainUnverified && <div className="claude-toolchain-warning"><CircleAlert size={15} /><span>{t(CLAUDE_TOOLCHAIN_UNVERIFIED_COPY.zh, CLAUDE_TOOLCHAIN_UNVERIFIED_COPY.en)}</span></div>}
                 <div className="model-tags">{members.slice(0, 4).map((account) => <span key={account.id}>{account.name} · {t('权重', 'Weight')} {pool.members.find((member) => member.accountId === account.id)?.weight ?? account.weight}</span>)}{members.length > 4 && <span>+{members.length - 4}</span>}</div>
               </article>

@@ -1,6 +1,7 @@
 import type { ProviderKind } from '../../shared/types'
 import { anthropicAdapter, anthropicCompatibleAdapter } from './anthropic'
 import { customAdapter } from './custom'
+import { deepSeekAdapter, deepSeekCompatibleAdapter } from './deepseek'
 import { googleAdapter } from './google'
 import { kiroClaudeAdapter } from './kiro-claude'
 import { openAIAdapter, openAICompatibleAdapter } from './openai'
@@ -10,9 +11,11 @@ import { xAIAdapter, xAICompatibleAdapter } from './xai'
 const adapters: Readonly<Record<ProviderKind, ProviderAdapter>> = Object.freeze({
   anthropic: anthropicAdapter,
   openai: openAIAdapter,
+  deepseek: deepSeekAdapter,
   xai: xAIAdapter,
   google: googleAdapter,
   'openai-compatible': openAICompatibleAdapter,
+  'deepseek-compatible': deepSeekCompatibleAdapter,
   'xai-compatible': xAICompatibleAdapter,
   'anthropic-compatible': anthropicCompatibleAdapter,
   'kiro-compatible': kiroClaudeAdapter,
@@ -27,6 +30,8 @@ export {
   anthropicAdapter,
   anthropicCompatibleAdapter,
   customAdapter,
+  deepSeekAdapter,
+  deepSeekCompatibleAdapter,
   googleAdapter,
   kiroClaudeAdapter,
   openAIAdapter,

@@ -209,6 +209,23 @@ describe('ChatGPT account import', () => {
     expect(parsed.warnings.join(' ')).toContain('忽略 1 个')
   })
 
+  it('falls back to JWT expiry when a Sub2API export uses zero as an unset expiry', () => {
+    const expiresAtSeconds = Math.floor(Date.now() / 1000) + 3600
+    const parsed = parseChatGptAccountImport(JSON.stringify({
+      accounts: [{
+        platform: 'openai',
+        type: 'oauth',
+        credentials: {
+          access_token: token(expiresAtSeconds, 'acct_sub2api_zero_expiry', 'user_sub2api_zero_expiry'),
+          refresh_token: 'refresh-sub2api-zero-expiry',
+          expires_at: 0
+        }
+      }]
+    }))
+
+    expect(parsed.accounts[0]).toMatchObject({ expiresAt: expiresAtSeconds * 1000 })
+  })
+
   it('rejects expired sessions and round-trips valid encrypted payloads', () => {
     expect(() => parseChatGptAccountImport(JSON.stringify({
       access_token: token(1), account_id: 'acct_expired', expired: '2000-01-01T00:00:00Z'

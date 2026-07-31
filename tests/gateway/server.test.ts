@@ -2410,6 +2410,80 @@ describe('GatewayServer', () => {
     expect(JSON.parse(String(request.body))).toMatchObject({ store: false, stream: true, service_tier: 'priority' })
   })
 
+  it('binds DeepSeek Responses directly, preserves tools, and rejects lossy server-side history', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers[0] = {
+      ...gatewayConfig.providers[0],
+      sourceType: 'official-api',
+      kind: 'deepseek',
+      name: 'DeepSeek API',
+      baseUrl: 'https://api.deepseek.com',
+      protocol: 'openai-responses',
+      models: ['deepseek-v4-flash'],
+    }
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    gatewayConfig.accounts[1].status = 'disabled'
+    const completed = [
+      'event: response.completed',
+      'data: {"type":"response.completed","response":{"id":"resp_deepseek","object":"response","model":"deepseek-v4-flash","status":"completed","output":[]}}',
+      '', '',
+    ].join('\n')
+    const upstreamFetch = vi.fn(async () => new Response(completed, {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream' },
+    }))
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'deepseek-private',
+      fetchImplementation: upstreamFetch as typeof fetch,
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const lossyHistory = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'deepseek-v4-flash',
+        input: 'Continue',
+        stream: true,
+        previous_response_id: 'resp_not_available_on_deepseek',
+      }),
+    })
+    expect(lossyHistory.status).toBeGreaterThanOrEqual(400)
+    expect(upstreamFetch).not.toHaveBeenCalled()
+
+    const tools = [{
+      type: 'function',
+      name: 'memory_lookup',
+      description: 'Look up an in-memory value',
+      parameters: { type: 'object', properties: { key: { type: 'string' } }, required: ['key'] },
+    }]
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'deepseek-v4-flash',
+        input: [{ role: 'user', content: 'Use the memory tool.' }],
+        tools,
+        stream: true,
+      }),
+    })
+    expect(response.status).toBe(200)
+    expect(await response.text()).toContain('response.completed')
+    expect(upstreamFetch).toHaveBeenCalledTimes(1)
+    expect(upstreamFetch.mock.calls[0][0]).toBe('https://api.deepseek.com/v1/responses')
+    expect(new Headers(upstreamFetch.mock.calls[0][1]?.headers).get('authorization'))
+      .toBe('Bearer deepseek-private')
+    expect(JSON.parse(String(upstreamFetch.mock.calls[0][1]?.body))).toMatchObject({
+      model: 'deepseek-v4-flash',
+      tools,
+      stream: true,
+    })
+  })
+
   it('rebuilds all Agent Identity headers after recovering an invalid task', async () => {
     const port = await freePort()
     const gatewayConfig = config(port)
@@ -11093,6 +11167,78 @@ describe('GatewayServer', () => {
     expect(upstreamFetch).toHaveBeenCalledOnce()
   })
 
+  it('dispatches exact Codex models through their configured source while unmatched models keep the default pool', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.accounts[1].status = 'disabled'
+    gatewayConfig.providers.push({
+      ...gatewayConfig.providers[0],
+      id: 'provider-luna',
+      name: 'Luna provider',
+      baseUrl: 'https://luna.example.test/v1',
+      models: ['gpt-5.6-luna-upstream'],
+    })
+    gatewayConfig.accounts.push({
+      ...account('luna-account', 1),
+      providerId: 'provider-luna',
+      modelPolicy: 'selected',
+      modelAllowlist: ['gpt-5.6-luna-upstream'],
+    })
+    gatewayConfig.pools.push({
+      ...gatewayConfig.pools[0],
+      id: 'pool-luna',
+      name: 'Luna pool',
+      members: [{ accountId: 'luna-account', enabled: true }],
+    })
+    gatewayConfig.routes[0] = {
+      ...gatewayConfig.routes[0],
+      modelMap: { 'gpt-5.6-luna': 'gpt-5.6-luna-upstream' },
+      modelSourceMap: { 'gpt-5.6-luna': 'pool-luna' },
+    }
+
+    const attempts: Array<{ url: string; model: string; accountId: string }> = []
+    let selectedAccountId = ''
+    const upstreamFetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      attempts.push({
+        url: String(input),
+        model: (JSON.parse(String(init?.body)) as { model: string }).model,
+        accountId: selectedAccountId,
+      })
+      return new Response(JSON.stringify({
+        id: 'completion',
+        choices: [{ message: { role: 'assistant', content: 'Done' }, finish_reason: 'stop' }],
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    })
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: (selected) => {
+        selectedAccountId = selected.id
+        return `credential-${selected.id}`
+      },
+      fetchImplementation: upstreamFetch as typeof fetch,
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const lunaResponse = await post(port, 'local-secret', { model: 'gpt-5.6-luna' })
+    expect(lunaResponse.status, await lunaResponse.text()).toBe(200)
+    const defaultResponse = await post(port, 'local-secret', { model: 'gpt-5.6-sol' })
+    expect(defaultResponse.status, await defaultResponse.text()).toBe(200)
+
+    expect(attempts).toEqual([
+      {
+        url: 'https://luna.example.test/v1/chat/completions',
+        model: 'gpt-5.6-luna-upstream',
+        accountId: 'luna-account',
+      },
+      {
+        url: 'https://api.example.test/v1/chat/completions',
+        model: 'gpt-5.6-sol',
+        accountId: 'first',
+      },
+    ])
+  })
+
   it('maps a real Codex request alias through the xAI wildcard without exposing it in the model list', async () => {
     const port = await freePort()
     const gatewayConfig = config(port)
@@ -11559,6 +11705,33 @@ describe('GatewayServer', () => {
       status: 'cooldown',
       cooldownUntil: timestamp + 120_000
     }))
+  })
+
+  it('does not place a source into failure cooldown when cooldown is disabled', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.settings.disableCooldown = true
+    gatewayConfig.accounts[1].status = 'disabled'
+    gatewayConfig.pools[0].maxRetries = 0
+    const states: Array<{ accountId: string; status: string }> = []
+    const upstreamFetch = vi.fn(async () => new Response(JSON.stringify({ error: { message: 'overloaded' } }), {
+      status: 503,
+      headers: { 'content-type': 'application/json', 'retry-after': '120' }
+    }))
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'credential',
+      fetchImplementation: upstreamFetch as typeof fetch,
+      now: () => timestamp,
+      onAccountState: (state) => states.push(state)
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await post(port)
+    expect(response.status).toBe(503)
+    expect(upstreamFetch).toHaveBeenCalledOnce()
+    expect(states).toEqual([])
   })
 
   it('does not disable a Grok account for an explicit model-scoped 403', async () => {
