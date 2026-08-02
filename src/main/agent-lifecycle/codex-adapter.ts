@@ -101,7 +101,7 @@ export interface CodexRestoreResult extends CodexCloseResult {
 export class CodexLifecycleOperationError extends Error {
   constructor(
     public readonly target: CodexAgentTarget,
-    public readonly phase: 'inspect' | 'close' | 'restore-connection' | 'repair-sessions' | 'repair-workspace-index' | 'validate' | 'start',
+    public readonly phase: 'inspect' | 'close' | 'restore-connection' | 'repair-residue' | 'repair-sessions' | 'repair-workspace-index' | 'validate' | 'start',
     message: string,
     public readonly recoveryErrors: readonly string[] = [],
     options?: ErrorOptions,

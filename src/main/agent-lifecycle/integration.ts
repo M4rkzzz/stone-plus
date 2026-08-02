@@ -9,6 +9,7 @@ import {
   type RouteClient,
 } from '@shared/types'
 import { enumerateRouteSourceModels, listRouteSources, resolveRouteSource } from '@shared/route-sources'
+import { codexConnectionRouteMetadata } from '@shared/codex-model-repair'
 import {
   CodexSessionRepairService,
   type ChatGptDesktopController,
@@ -85,15 +86,19 @@ export function createAgentLifecycleService(options: CreateAgentLifecycleService
       repairOptions: CodexRepairAndRestartOptions = {},
       configDirectories: readonly string[] = [],
     ) => {
+      const effectiveRepairOptions: CodexRepairAndRestartOptions = {
+        ...repairOptions,
+        modelRepair: resolveConnection(options.store, 'codex').codexModelRepair,
+      }
       const homes = configDirectories.length > 0
         ? uniqueFilesystemPaths(configDirectories)
         : defaultCodexHome ? [defaultCodexHome] : []
       if (homes.length === 0) {
         return options.codexRepair.run({
-          ...repairOptions,
+          ...effectiveRepairOptions,
           beforeRepair: async () => {
             await prepareDefaultCodexConnection()
-            await repairOptions.beforeRepair?.()
+            await effectiveRepairOptions.beforeRepair?.()
           },
         })
       }
@@ -101,10 +106,10 @@ export function createAgentLifecycleService(options: CreateAgentLifecycleService
       for (const codexHome of homes) {
         if (defaultCodexHome && sameFilesystemPath(codexHome, defaultCodexHome)) {
           results.push(await options.codexRepair.run({
-            ...repairOptions,
+            ...effectiveRepairOptions,
             beforeRepair: async () => {
               await prepareDefaultCodexConnection()
-              await repairOptions.beforeRepair?.()
+              await effectiveRepairOptions.beforeRepair?.()
             },
           }))
           continue
@@ -112,9 +117,13 @@ export function createAgentLifecycleService(options: CreateAgentLifecycleService
         // Managed CLI instances can own an isolated CODEX_HOME. They have
         // already been stopped by CodexLifecycleAdapter, so repair that exact
         // home directly instead of silently rewriting ~/.codex.
-        await repairOptions.beforeRepair?.()
-        const operationOptions = repairOptions.signal || repairOptions.onProgress
-          ? { signal: repairOptions.signal, onProgress: repairOptions.onProgress }
+        await effectiveRepairOptions.beforeRepair?.()
+        const operationOptions = effectiveRepairOptions.signal || effectiveRepairOptions.onProgress || effectiveRepairOptions.modelRepair
+          ? {
+              signal: effectiveRepairOptions.signal,
+              onProgress: effectiveRepairOptions.onProgress,
+              modelRepair: effectiveRepairOptions.modelRepair,
+            }
           : undefined
         const scopedRepair = new CodexSessionRepairService({ codexHome })
         results.push(operationOptions
@@ -592,7 +601,13 @@ function resolveConnection(store: AppStore, client: RouteClient): ClientConnecti
   const route = enabledNativeRoute(store, client)
   if (!route.localToken) throw new Error(`The ${client} route has no local token.`)
   const host = snapshot.gateway.host.includes(':') ? `[${snapshot.gateway.host}]` : snapshot.gateway.host
-  return { gatewayBaseUrl: `http://${host}:${snapshot.gateway.port}`, token: route.localToken }
+  return {
+    gatewayBaseUrl: `http://${host}:${snapshot.gateway.port}`,
+    token: route.localToken,
+    ...(client === 'codex'
+      ? codexConnectionRouteMetadata(snapshot, route)
+      : {}),
+  }
 }
 
 function enabledNativeRoute(store: AppStore, client: RouteClient) {

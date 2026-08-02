@@ -10,6 +10,10 @@ import type {
   CodexSessionRepairTarget,
   CodexSessionRepairTargetSource,
 } from '@shared/types'
+import {
+  repairedCodexClientModel,
+  type CodexModelRepairPolicy,
+} from '@shared/codex-model-repair'
 import { atomicWriteFile } from '../client-config/filesystem'
 import { acquireCodexSessionMaintenanceLock } from './session-maintenance-lock'
 
@@ -22,12 +26,15 @@ const ROLLOUT_SCAN_BYTES = 1024 * 1024
 const ROLLOUT_META_SEARCH_BYTES = 16 * 1024 * 1024
 const ROLLOUT_READ_CHUNK_BYTES = 64 * 1024
 const GLOBAL_STATE_FILE = '.codex-global-state.json'
+const MODEL_CACHE_FILE = 'models_cache.json'
 const DEFAULT_SCAN_CONCURRENCY = 8
 const DEFAULT_MAX_ROLLOUT_FILES = 20_000
 
 export interface CodexSessionRepairOperationOptions {
   signal?: AbortSignal
   onProgress?: (progress: { stage: 'discover' | 'scan' | 'verify' | 'backup' | 'apply'; completed: number; total?: number }) => void
+  /** Repairs only clearly foreign/upstream models persisted by another switcher. */
+  modelRepair?: CodexModelRepairPolicy
 }
 
 interface RolloutReadHandle {
@@ -67,6 +74,8 @@ interface DatabaseThreadChange {
   id: string
   originalProvider: string | null
   nextProvider?: string
+  originalModel?: string | null
+  nextModel?: string
   originalHasUserEvent?: number | null
   nextHasUserEvent?: number
   originalCwd?: string | null
@@ -93,6 +102,12 @@ interface GlobalStatePlan {
   originalValue: Record<string, unknown>
 }
 
+interface ModelCachePlan {
+  path: string
+  originalBytes: Buffer
+  originalHash: string
+}
+
 interface RepairPlan {
   targetProvider: string
   currentProvider: string
@@ -100,6 +115,7 @@ interface RepairPlan {
   rollouts: RolloutPlan[]
   databases: DatabasePlan[]
   globalState?: GlobalStatePlan
+  modelCache?: ModelCachePlan
   skippedFiles: string[]
   revision: string
 }
@@ -192,7 +208,8 @@ export class CodexSessionRepairService {
       const changedRollouts = plan.rollouts.filter((item) => item.rewriteNeeded)
       const changedDatabases = plan.databases.filter((item) => item.changes.length > 0)
       const changedGlobalState = plan.globalState?.changedFields.length ? plan.globalState : undefined
-      if (!changedRollouts.length && !changedDatabases.length && !changedGlobalState) {
+      const changedModelCache = plan.modelCache
+      if (!changedRollouts.length && !changedDatabases.length && !changedGlobalState && !changedModelCache) {
         return resultFor(plan, undefined)
       }
 
@@ -200,12 +217,15 @@ export class CodexSessionRepairService {
       options.onProgress?.({ stage: 'verify', completed: 0, total: changedRollouts.length })
       await this.assertRolloutsUnchanged(changedRollouts, options)
       if (changedGlobalState) await this.assertGlobalStateUnchanged(changedGlobalState)
+      if (changedModelCache) await this.assertModelCacheUnchanged(changedModelCache)
       throwIfCancelled(options.signal)
-      const backupPath = await this.createBackup(plan, changedRollouts, changedDatabases, changedGlobalState, options)
+      const backupPath = await this.createBackup(plan, changedRollouts, changedDatabases, changedGlobalState, changedModelCache, options)
       const writtenRollouts: RolloutPlan[] = []
       const writtenDatabases: DatabasePlan[] = []
       let writtenGlobalState: GlobalStatePlan | undefined
+      let invalidatedModelCache: ModelCachePlan | undefined
       try {
+        const totalChanges = changedRollouts.length + changedDatabases.length + (changedGlobalState ? 1 : 0) + (changedModelCache ? 1 : 0)
         for (const rollout of changedRollouts) {
           throwIfCancelled(options.signal)
           const backupBytes = await readFile(join(backupPath, 'rollouts', rollout.relativePath))
@@ -221,23 +241,34 @@ export class CodexSessionRepairService {
           // already committed by atomicWriteFile.
           writtenRollouts.push(rollout)
           await this.preserveMtime(rollout)
-          options.onProgress?.({ stage: 'apply', completed: writtenRollouts.length, total: changedRollouts.length + changedDatabases.length + (changedGlobalState ? 1 : 0) })
+          options.onProgress?.({ stage: 'apply', completed: writtenRollouts.length, total: totalChanges })
         }
         for (const database of changedDatabases) {
           throwIfCancelled(options.signal)
           this.applyDatabasePlan(database)
           writtenDatabases.push(database)
-          options.onProgress?.({ stage: 'apply', completed: writtenRollouts.length + writtenDatabases.length, total: changedRollouts.length + changedDatabases.length + (changedGlobalState ? 1 : 0) })
+          options.onProgress?.({ stage: 'apply', completed: writtenRollouts.length + writtenDatabases.length, total: totalChanges })
+        }
+        if (changedModelCache) {
+          throwIfCancelled(options.signal)
+          await this.assertModelCacheUnchanged(changedModelCache)
+          await rm(changedModelCache.path)
+          invalidatedModelCache = changedModelCache
+          options.onProgress?.({
+            stage: 'apply',
+            completed: writtenRollouts.length + writtenDatabases.length + 1,
+            total: totalChanges,
+          })
         }
         if (changedGlobalState) {
           throwIfCancelled(options.signal)
           await this.assertGlobalStateUnchanged(changedGlobalState)
           await atomicWriteFile(changedGlobalState.path, changedGlobalState.nextText, this.randomId)
           writtenGlobalState = changedGlobalState
-          options.onProgress?.({ stage: 'apply', completed: changedRollouts.length + changedDatabases.length + 1, total: changedRollouts.length + changedDatabases.length + 1 })
+          options.onProgress?.({ stage: 'apply', completed: totalChanges, total: totalChanges })
         }
       } catch (error) {
-        const rollbackFailures = await this.rollback(writtenRollouts, writtenDatabases, writtenGlobalState, backupPath)
+        const rollbackFailures = await this.rollback(writtenRollouts, writtenDatabases, writtenGlobalState, invalidatedModelCache, backupPath)
         const suffix = rollbackFailures.length
           ? `；部分自动回滚失败，请从备份目录恢复：${backupPath}`
           : `；已自动回滚，备份保留在：${backupPath}`
@@ -282,6 +313,7 @@ export class CodexSessionRepairService {
 
     throwIfCancelled(options.signal)
     const globalState = await this.readGlobalStatePlan()
+    const modelCache = options.modelRepair ? await this.readModelCachePlan() : undefined
     const projectlessThreadIds = this.projectlessThreadIds(globalState)
     const userEventThreadIds = new Set(rollouts
       .filter((item) => item.hasUserEvent)
@@ -293,12 +325,18 @@ export class CodexSessionRepairService {
     )))
     const databases = (await this.findSessionDatabases()).flatMap((path) => {
       throwIfCancelled(options.signal)
-      const plan = this.readDatabasePlan(path, targetProvider, userEventThreadIds, cwdByThreadId)
+      const plan = this.readDatabasePlan(
+        path,
+        targetProvider,
+        userEventThreadIds,
+        cwdByThreadId,
+        options.modelRepair,
+      )
       return plan ? [plan] : []
     })
     const targets = await this.buildTargets(currentProvider, rollouts, databases)
-    const revision = revisionFor(targetProvider, rollouts, databases, globalState)
-    return { targetProvider, currentProvider, targets, rollouts, databases, globalState, skippedFiles, revision }
+    const revision = revisionFor(targetProvider, rollouts, databases, globalState, modelCache)
+    return { targetProvider, currentProvider, targets, rollouts, databases, globalState, modelCache, skippedFiles, revision }
   }
 
   private async readCurrentProvider(): Promise<string> {
@@ -483,6 +521,7 @@ export class CodexSessionRepairService {
     targetProvider: string,
     userEventThreadIds: Set<string>,
     cwdByThreadId: Map<string, string>,
+    modelRepair?: CodexModelRepairPolicy,
   ): DatabasePlan | undefined {
     let database: DatabaseSync
     try {
@@ -499,8 +538,10 @@ export class CodexSessionRepairService {
       }
       const hasUserColumn = columns.has('has_user_event')
       const hasCwdColumn = columns.has('cwd')
+      const hasModelColumn = columns.has('model')
       const rows = database.prepare(`
         SELECT id, model_provider,
+          ${hasModelColumn ? 'model' : 'NULL'} AS model,
           ${hasUserColumn ? 'has_user_event' : 'NULL'} AS has_user_event,
           ${hasCwdColumn ? 'cwd' : 'NULL'} AS cwd
         FROM threads
@@ -513,17 +554,22 @@ export class CodexSessionRepairService {
         if (originalProvider) providerIds.add(originalProvider)
         const originalHasUserEvent = typeof row.has_user_event === 'number' ? row.has_user_event : null
         const originalCwd = typeof row.cwd === 'string' ? row.cwd : null
+        const originalModel = typeof row.model === 'string' ? row.model : null
+        const nextModel = repairedCodexClientModel(originalModel, modelRepair)
         const nextCwd = cwdByThreadId.get(row.id)
         const change: DatabaseThreadChange = {
           id: row.id,
           originalProvider,
           ...(originalProvider !== targetProvider ? { nextProvider: targetProvider } : {}),
+          ...(hasModelColumn && originalModel && nextModel && nextModel !== originalModel.trim()
+            ? { originalModel, nextModel }
+            : {}),
           ...(hasUserColumn && userEventThreadIds.has(row.id) && originalHasUserEvent !== 1
             ? { originalHasUserEvent, nextHasUserEvent: 1 }
             : {}),
           ...(hasCwdColumn && nextCwd && originalCwd !== nextCwd ? { originalCwd, nextCwd } : {}),
         }
-        if (change.nextProvider !== undefined || change.nextHasUserEvent !== undefined || change.nextCwd !== undefined) {
+        if (change.nextProvider !== undefined || change.nextModel !== undefined || change.nextHasUserEvent !== undefined || change.nextCwd !== undefined) {
           changes.push(change)
         }
       }
@@ -603,16 +649,40 @@ export class CodexSessionRepairService {
     }
   }
 
+  private async readModelCachePlan(): Promise<ModelCachePlan | undefined> {
+    const path = join(this.codexHome, MODEL_CACHE_FILE)
+    try {
+      const originalBytes = await readFile(path)
+      return { path, originalBytes, originalHash: sha256(originalBytes) }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+      throw new Error(`无法读取 Codex 模型目录缓存：${messageOf(error)}`)
+    }
+  }
+
+  private async assertModelCacheUnchanged(plan: ModelCachePlan): Promise<void> {
+    let current: Buffer
+    try {
+      current = await readFile(plan.path)
+    } catch (error) {
+      throw new Error(`Codex 模型目录缓存在修复前发生变化，请重试：${messageOf(error)}`)
+    }
+    if (!current.equals(plan.originalBytes)) {
+      throw new Error('Codex 模型目录缓存已在修复期间更新；为避免删除新目录，本次修复已中止，请重试。')
+    }
+  }
+
   private async createBackup(
     plan: RepairPlan,
     rollouts: RolloutPlan[],
     databases: DatabasePlan[],
     globalState?: GlobalStatePlan,
+    modelCache?: ModelCachePlan,
     options: CodexSessionRepairOperationOptions = {},
   ): Promise<string> {
     const backupRoot = join(this.codexHome, 'backups_state', 'stone-session-repair')
     const backupPath = join(backupRoot, `${timestampName(this.now())}-${this.randomId()}`)
-    const total = rollouts.length + databases.length + (globalState ? 1 : 0)
+    const total = rollouts.length + databases.length + (globalState ? 1 : 0) + (modelCache ? 1 : 0)
     let completed = 0
     options.onProgress?.({ stage: 'backup', completed, total })
     try {
@@ -659,6 +729,12 @@ export class CodexSessionRepairService {
           if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
         }
       }
+      if (modelCache) {
+        throwIfCancelled(options.signal)
+        await writeFile(join(backupPath, MODEL_CACHE_FILE), modelCache.originalBytes, { mode: 0o600 })
+        completed += 1
+        options.onProgress?.({ stage: 'backup', completed, total })
+      }
       await writeFile(join(backupPath, 'metadata.json'), JSON.stringify({
         version: 1,
         managedBy: BACKUP_MARKER,
@@ -670,6 +746,7 @@ export class CodexSessionRepairService {
         changedDatabases: databases.map((item) => item.relativePath),
         changedGlobalStateFields: globalState?.changedFields ?? [],
         conflictingGlobalStateFields: globalState?.conflictingFields ?? [],
+        invalidatedModelCache: Boolean(modelCache),
       }, null, 2), { encoding: 'utf8', mode: 0o600 })
       return backupPath
     } catch (error) {
@@ -684,6 +761,9 @@ export class CodexSessionRepairService {
       database.exec('PRAGMA busy_timeout = 5000; BEGIN IMMEDIATE')
       try {
         const provider = database.prepare('UPDATE threads SET model_provider = ? WHERE id = ? AND model_provider IS ?')
+        const model = plan.columns.has('model')
+          ? database.prepare('UPDATE threads SET model = ? WHERE id = ? AND model IS ?')
+          : undefined
         const userEvent = plan.columns.has('has_user_event')
           ? database.prepare('UPDATE threads SET has_user_event = ? WHERE id = ? AND has_user_event IS ?')
           : undefined
@@ -693,6 +773,9 @@ export class CodexSessionRepairService {
         for (const change of plan.changes) {
           if (change.nextProvider !== undefined && Number(provider.run(change.nextProvider, change.id, change.originalProvider).changes) !== 1) {
             throw new Error(`线程 ${change.id} 的 provider 已发生变化`)
+          }
+          if (change.nextModel !== undefined && Number(model?.run(change.nextModel, change.id, change.originalModel ?? null)?.changes ?? 0) !== 1) {
+            throw new Error(`线程 ${change.id} 的 model 已发生变化`)
           }
           if (change.nextHasUserEvent !== undefined && Number(userEvent?.run(change.nextHasUserEvent, change.id, change.originalHasUserEvent ?? null)?.changes ?? 0) !== 1) {
             throw new Error(`线程 ${change.id} 的用户事件索引已发生变化`)
@@ -717,6 +800,9 @@ export class CodexSessionRepairService {
       database.exec('PRAGMA busy_timeout = 5000; BEGIN IMMEDIATE')
       try {
         const provider = database.prepare('UPDATE threads SET model_provider = ? WHERE id = ? AND model_provider IS ?')
+        const model = plan.columns.has('model')
+          ? database.prepare('UPDATE threads SET model = ? WHERE id = ? AND model IS ?')
+          : undefined
         const userEvent = plan.columns.has('has_user_event')
           ? database.prepare('UPDATE threads SET has_user_event = ? WHERE id = ? AND has_user_event IS ?')
           : undefined
@@ -729,6 +815,9 @@ export class CodexSessionRepairService {
           }
           if (change.nextHasUserEvent !== undefined && Number(userEvent?.run(change.originalHasUserEvent ?? null, change.id, change.nextHasUserEvent)?.changes ?? 0) !== 1) {
             throw new Error(`线程 ${change.id} 的用户事件索引无法安全回滚`)
+          }
+          if (change.nextModel !== undefined && Number(model?.run(change.originalModel ?? null, change.id, change.nextModel)?.changes ?? 0) !== 1) {
+            throw new Error(`线程 ${change.id} 的 model 无法安全回滚`)
           }
           if (change.nextProvider !== undefined && Number(provider.run(change.originalProvider, change.id, change.nextProvider).changes) !== 1) {
             throw new Error(`线程 ${change.id} 的 provider 无法安全回滚`)
@@ -748,6 +837,7 @@ export class CodexSessionRepairService {
     rollouts: RolloutPlan[],
     databases: DatabasePlan[],
     globalState: GlobalStatePlan | undefined,
+    modelCache: ModelCachePlan | undefined,
     backupPath: string,
   ): Promise<string[]> {
     const failures: string[] = []
@@ -759,6 +849,11 @@ export class CodexSessionRepairService {
           await atomicWriteFile(globalState.path, await readFile(join(backupPath, GLOBAL_STATE_FILE)), this.randomId)
         }
       } catch { failures.push(globalState.path) }
+    }
+    if (modelCache) {
+      try {
+        await atomicWriteFile(modelCache.path, await readFile(join(backupPath, MODEL_CACHE_FILE)), this.randomId)
+      } catch { failures.push(modelCache.path) }
     }
     for (const database of [...databases].reverse()) {
       try { this.rollbackDatabasePlan(database) } catch { failures.push(database.path) }
@@ -821,6 +916,7 @@ function overviewFor(plan: RepairPlan, codexHome: string): CodexSessionRepairOve
 
 function previewFor(plan: RepairPlan, codexHome: string): CodexSessionRepairPreview {
   const providerRows = plan.databases.reduce((sum, database) => sum + database.changes.filter((item) => item.nextProvider !== undefined).length, 0)
+  const modelRows = plan.databases.reduce((sum, database) => sum + database.changes.filter((item) => item.nextModel !== undefined).length, 0)
   const userEventRows = plan.databases.reduce((sum, database) => sum + database.changes.filter((item) => item.nextHasUserEvent !== undefined).length, 0)
   const cwdRows = plan.databases.reduce((sum, database) => sum + database.changes.filter((item) => item.nextCwd !== undefined).length, 0)
   const encryptedProviders = new Set(plan.rollouts
@@ -836,6 +932,7 @@ function previewFor(plan: RepairPlan, codexHome: string): CodexSessionRepairPrev
     rolloutFilesWithoutSessionMeta: plan.rollouts.filter((item) => item.sessionMetaCount === 0).length,
     rolloutFilesAlreadyTargetProvider: plan.rollouts.filter((item) => item.sessionMetaCount > 0 && !item.rewriteNeeded).length,
     sqliteProviderRowsToUpdate: providerRows,
+    sqliteModelRowsToUpdate: modelRows,
     sqliteUserEventRowsToUpdate: userEventRows,
     sqliteCwdRowsToUpdate: cwdRows,
     globalStateFieldsToUpdate: plan.globalState?.changedFields.length ?? 0,
@@ -851,6 +948,7 @@ function resultFor(plan: RepairPlan, backupPath: string | undefined): CodexSessi
     targetProvider: plan.targetProvider,
     repairedRolloutFiles: preview.rolloutFilesToUpdate,
     sqliteProviderRowsUpdated: preview.sqliteProviderRowsToUpdate,
+    sqliteModelRowsUpdated: preview.sqliteModelRowsToUpdate,
     sqliteUserEventRowsUpdated: preview.sqliteUserEventRowsToUpdate,
     sqliteCwdRowsUpdated: preview.sqliteCwdRowsToUpdate,
     globalStateFieldsUpdated: preview.globalStateFieldsToUpdate,
@@ -867,6 +965,7 @@ function revisionFor(
   rollouts: RolloutPlan[],
   databases: DatabasePlan[],
   globalState: GlobalStatePlan | undefined,
+  modelCache: ModelCachePlan | undefined,
 ): string {
   return sha256(JSON.stringify({
     targetProvider,
@@ -877,6 +976,8 @@ function revisionFor(
         change.id,
         change.originalProvider,
         change.nextProvider,
+        change.originalModel,
+        change.nextModel,
         change.originalHasUserEvent,
         change.nextHasUserEvent,
         change.originalCwd,
@@ -889,6 +990,7 @@ function revisionFor(
       globalState.changedFields,
       globalState.conflictingFields,
     ] : null,
+    modelCache: modelCache?.originalHash ?? null,
   }))
 }
 

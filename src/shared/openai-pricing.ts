@@ -104,6 +104,20 @@ const PRICING: Record<OpenAiPricedModelFamily, OpenAiModelPricing> = {
     cacheWriteUsdPerMillion: 0.2,
     outputUsdPerMillion: 1.25
   },
+  'deepseek-v4-flash': {
+    family: 'deepseek-v4-flash',
+    inputUsdPerMillion: 0.14,
+    cachedInputUsdPerMillion: 0.0028,
+    cacheWriteUsdPerMillion: 0.14,
+    outputUsdPerMillion: 0.28
+  },
+  'deepseek-v4-pro': {
+    family: 'deepseek-v4-pro',
+    inputUsdPerMillion: 0.435,
+    cachedInputUsdPerMillion: 0.003625,
+    cacheWriteUsdPerMillion: 0.435,
+    outputUsdPerMillion: 0.87
+  },
   'grok-4.5': {
     family: 'grok-4.5',
     inputUsdPerMillion: 2,
@@ -183,11 +197,11 @@ function claudePricing(
   }
 }
 
-type ModelNamespace = 'openai' | 'anthropic' | 'xai' | 'x-ai'
+type ModelNamespace = 'openai' | 'anthropic' | 'deepseek' | 'xai' | 'x-ai'
 
 function normalizedModel(model: string): { model: string; namespace?: ModelNamespace } {
   const normalized = model.trim().toLowerCase()
-  const match = /^(openai|anthropic|xai|x-ai)[/:](.+)$/.exec(normalized)
+  const match = /^(openai|anthropic|deepseek|xai|x-ai)[/:](.+)$/.exec(normalized)
   return match
     ? { namespace: match[1] as ModelNamespace, model: match[2] }
     : { model: normalized }
@@ -296,6 +310,12 @@ function isClaudeModelId(model: string, family: OpenAiPricedModelFamily): boolea
   return CLAUDE_MODEL_IDS[family]?.includes(model) === true
 }
 
+function deepSeekPriceFamily(model: string): 'deepseek-v4-flash' | 'deepseek-v4-pro' | undefined {
+  if (model === 'deepseek-v4-flash' || model === 'deepseek-v4-flash[1m]') return 'deepseek-v4-flash'
+  if (model === 'deepseek-v4-pro' || model === 'deepseek-v4-pro[1m]') return 'deepseek-v4-pro'
+  return undefined
+}
+
 /** Resolves known first-party model names and snapshots. Unknown variants remain deliberately unpriced. */
 export function resolveModelPricing(model: string, effectiveAt = Date.now()): OpenAiModelPricing | undefined {
   const parsed = normalizedModel(model)
@@ -312,6 +332,10 @@ export function resolveModelPricing(model: string, effectiveAt = Date.now()): Op
     if (isModelOrSnapshot(normalized, 'gpt-5.4-mini')) return PRICING['gpt-5.4-mini']
     if (isModelOrSnapshot(normalized, 'gpt-5.4-nano')) return PRICING['gpt-5.4-nano']
     if (isModelOrSnapshot(normalized, 'gpt-5.4')) return PRICING['gpt-5.4']
+  }
+  if (!parsed.namespace || parsed.namespace === 'deepseek') {
+    const family = deepSeekPriceFamily(normalized)
+    if (family) return PRICING[family]
   }
   if ((!parsed.namespace || parsed.namespace === 'xai' || parsed.namespace === 'x-ai')
     && (normalized === 'grok-4.5'
@@ -630,9 +654,21 @@ export function summarizeAccountCodexQuotaCycleCosts(
   const sevenDayCreditEstimate = sevenDayCredits
     ? finishCodexTokenCreditAccumulator(sevenDayCredits)
     : undefined
+  const fiveHourUsdEstimate = fiveHour
+    ? finishOpenAiTokenCostAccumulator(fiveHour)
+    : undefined
+  const sevenDayUsdEstimate = sevenDay
+    ? finishOpenAiTokenCostAccumulator(sevenDay)
+    : undefined
   return {
-    ...(fiveHour ? { fiveHourUsd: finishOpenAiTokenCostAccumulator(fiveHour).totalCostUsd } : {}),
-    ...(sevenDay ? { sevenDayUsd: finishOpenAiTokenCostAccumulator(sevenDay).totalCostUsd } : {}),
+    ...(fiveHourUsdEstimate ? {
+      fiveHourUsd: fiveHourUsdEstimate.totalCostUsd,
+      fiveHourUnpricedUsdTokens: fiveHourUsdEstimate.unpricedTokens,
+    } : {}),
+    ...(sevenDayUsdEstimate ? {
+      sevenDayUsd: sevenDayUsdEstimate.totalCostUsd,
+      sevenDayUnpricedUsdTokens: sevenDayUsdEstimate.unpricedTokens,
+    } : {}),
     ...(fiveHourCreditEstimate ? {
       fiveHourCredits: fiveHourCreditEstimate.totalCredits,
       fiveHourUnpricedCreditTokens: fiveHourCreditEstimate.unpricedTokens

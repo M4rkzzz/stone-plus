@@ -44,6 +44,8 @@ export interface CodexRepairAndRestartOptions {
   signal?: AbortSignal
   /** Reports progress from the single repair plan built after desktop shutdown. */
   onProgress?: CodexSessionRepairOperationOptions['onProgress']
+  /** Current Stone+ route policy for repairing models left by another switcher. */
+  modelRepair?: CodexSessionRepairOperationOptions['modelRepair']
 }
 
 interface WindowsControllerOptions {
@@ -350,8 +352,8 @@ export class CodexRepairAndRestartService {
     let relaunched = false
     let relaunchAttempted = false
     let repair: CodexSessionRepairRestartResult['repair'] | undefined
-    const operationOptions = options.signal || options.onProgress
-      ? { signal: options.signal, onProgress: options.onProgress }
+    const operationOptions = options.signal || options.onProgress || options.modelRepair
+      ? { signal: options.signal, onProgress: options.onProgress, modelRepair: options.modelRepair }
       : undefined
     try {
       if (options.targetProvider && options.expectedRevision) {

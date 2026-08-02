@@ -10,6 +10,9 @@ describe('resolveClientConfigPaths', () => {
     expect(linux.codex.config.path).toBe('/home/alice/.codex/config.toml')
     expect(linux.codex.config.containsCredential).toBe(true)
     expect(linux.codex.auth.path).toBe('/home/alice/.codex/auth.json')
+    expect(linux.codex.modelCatalog.path).toBe('/home/alice/.codex/stone-deepseek-model-catalog.json')
+    expect(linux.codex.agents.path).toBe('/home/alice/.codex/AGENTS.md')
+    expect(linux.codex.rules.path).toBe('/home/alice/.codex/rules/default.rules')
     expect(linux.gemini.settings.path).toBe('/home/alice/.gemini/settings.json')
     expect(linux.gemini.env.path).toBe('/home/alice/.gemini/.env')
     expect(mac.gemini.env.path).toBe('/Users/alice/.gemini/.env')
@@ -20,6 +23,9 @@ describe('resolveClientConfigPaths', () => {
 
     expect(paths.claude.settings.path).toBe('C:\\Users\\Alice\\.claude\\settings.json')
     expect(paths.codex.config.path).toBe('C:\\Users\\Alice\\.codex\\config.toml')
+    expect(paths.codex.modelCatalog.path).toBe('C:\\Users\\Alice\\.codex\\stone-deepseek-model-catalog.json')
+    expect(paths.codex.agents.path).toBe('C:\\Users\\Alice\\.codex\\AGENTS.md')
+    expect(paths.codex.rules.path).toBe('C:\\Users\\Alice\\.codex\\rules\\default.rules')
     expect(paths.gemini.env.path).toBe('C:\\Users\\Alice\\.gemini\\.env')
   })
 

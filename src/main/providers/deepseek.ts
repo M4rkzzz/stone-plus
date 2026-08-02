@@ -5,13 +5,21 @@ import { filterOfficialDeepSeekResponsesModels } from '../../shared/deepseek'
 import type { ProviderKind } from '../../shared/types'
 import type { ProviderAdapter, ProviderCapabilityMatrix } from './types'
 
-const capabilities: ProviderCapabilityMatrix = {
+const officialCapabilities: ProviderCapabilityMatrix = {
   protocols: {
     'openai-responses': { streaming: true, toolCalls: true, modelInPath: false },
   },
   modelDiscovery: true,
   healthProbe: true,
   authentication: 'bearer',
+}
+
+const compatibleCapabilities: ProviderCapabilityMatrix = {
+  ...officialCapabilities,
+  protocols: {
+    ...officialCapabilities.protocols,
+    'openai-chat': { streaming: true, toolCalls: true, modelInPath: false },
+  },
 }
 
 export const deepSeekAdapter = makeDeepSeekAdapter('deepseek')
@@ -26,7 +34,7 @@ function makeDeepSeekAdapter(
 ): ProviderAdapter {
   return createProviderAdapter({
     kind,
-    capabilities,
+    capabilities: kind === 'deepseek' ? officialCapabilities : compatibleCapabilities,
     forwardUserAgent: false,
     defaultVersion: 'v1',
     buildOperationPath: protocolOperationPath,

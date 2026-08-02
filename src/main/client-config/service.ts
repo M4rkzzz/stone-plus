@@ -129,7 +129,14 @@ export class ClientConfigService {
         client: candidate,
         directory,
         directoryExists: directoryInfo?.isDirectory() ?? false,
-        configured: files.some((file) => file.exists),
+        // Guidance, rules, and generated catalogs can exist before Codex has
+        // any connection/auth configuration. They must not look like an
+        // applied Stone+ connection on their own.
+        configured: files.some((file) => file.exists && (
+          candidate !== 'codex'
+          || file.role === 'codex-config'
+          || file.role === 'codex-auth'
+        )),
         files,
       }
     }))

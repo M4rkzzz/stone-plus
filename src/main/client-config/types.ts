@@ -7,6 +7,7 @@ import type {
   ClientConfigFileRole as SharedClientConfigFileRole,
   RouteClient,
 } from '@shared/types'
+import type { CodexModelRepairPolicy } from '@shared/codex-model-repair'
 
 export type SupportedClient = RouteClient
 export type ClientConfigFileRole = SharedClientConfigFileRole
@@ -43,6 +44,9 @@ export interface ResolvedClientConfigPaths {
     directory: string
     config: ClientConfigFilePath
     auth: ClientConfigFilePath
+    modelCatalog: ClientConfigFilePath
+    agents: ClientConfigFilePath
+    rules: ClientConfigFilePath
   }
   gemini: {
     directory: string
@@ -58,6 +62,10 @@ export interface ResolvedClientConfigPaths {
 export interface ClientConnectionTarget {
   gatewayBaseUrl: string
   token: string
+  /** Global Codex context override, used only for a provider-homogeneous route. */
+  modelContextWindow?: number
+  /** Applied only by conservative Codex repair, never by ordinary config saves. */
+  codexModelRepair?: CodexModelRepairPolicy
 }
 
 export type ExistingClientConfig = Partial<Record<ClientConfigFileRole, string>>

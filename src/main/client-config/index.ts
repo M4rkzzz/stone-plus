@@ -4,6 +4,7 @@ export { planClientConfig, planClientConfigRepair, planClaudeConfig, planCodexCo
 export { parseJsonObject } from './json-format'
 export { mutateDotenv } from './dotenv-format'
 export { locateCodexTomlPath, planCodexOfficialLoginToml, planCodexToml, repairCodexToml } from './toml-format'
+export { deepSeekCodexCatalogModels, renderDeepSeekCodexModelCatalog } from './codex-model-catalog'
 export type {
   ApplyClientConfigResult,
   BackupRecord,

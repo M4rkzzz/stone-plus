@@ -267,11 +267,14 @@ export type ClientConfigFileRole =
   | 'claude-mcp'
   | 'codex-config'
   | 'codex-auth'
+  | 'codex-model-catalog'
+  | 'codex-agents'
+  | 'codex-rules'
   | 'gemini-settings'
   | 'gemini-env'
   | 'grok-config'
 
-export type ClientConfigFileFormat = 'json' | 'toml' | 'dotenv'
+export type ClientConfigFileFormat = 'json' | 'toml' | 'dotenv' | 'text'
 export type ClientConfigFieldValue = string | number | boolean | string[] | null
 export type ClientConfigFieldControl = 'text' | 'number' | 'select' | 'toggle' | 'string-list'
 
@@ -583,6 +586,8 @@ export interface ProviderDefinition {
   icon?: string
   color?: string
   models: string[]
+  /** Source-level DeepSeek Responses thinking policy; legacy rows default to max. */
+  deepSeekReasoningEffort?: import('./deepseek').DeepSeekReasoningEffort
   /** Force the OpenAI priority service tier for this standalone relay source. */
   forceFastMode?: boolean
   /**
@@ -764,6 +769,8 @@ export interface CodexQuotaHistoryPoint {
 export interface CodexQuotaCycleCosts {
   fiveHourUsd?: number
   sevenDayUsd?: number
+  fiveHourUnpricedUsdTokens?: number
+  sevenDayUnpricedUsdTokens?: number
   fiveHourCredits?: number
   sevenDayCredits?: number
   fiveHourUnpricedCreditTokens?: number
@@ -899,6 +906,8 @@ export type OpenAiPricedModelFamily =
   | 'gpt-5.4-pro'
   | 'gpt-5.4-mini'
   | 'gpt-5.4-nano'
+  | 'deepseek-v4-flash'
+  | 'deepseek-v4-pro'
   | 'grok-4.5'
   | 'claude-fable-5'
   | 'claude-mythos-5'
@@ -1154,6 +1163,7 @@ export interface ProviderInput {
   protocol: Protocol
   models: string[]
   responsesCompactMode?: ResponsesCompactMode
+  deepSeekReasoningEffort?: import('./deepseek').DeepSeekReasoningEffort
   capabilityProfile?: UpstreamCapabilityProfile
   modelCatalog?: ModelCapabilityDefinition[]
 }
@@ -1441,6 +1451,7 @@ export interface ApiSourceInput {
   baseUrl: string
   protocol: Protocol
   responsesCompactMode?: ResponsesCompactMode
+  deepSeekReasoningEffort?: import('./deepseek').DeepSeekReasoningEffort
   credential?: string
   models: string[]
   defaultModel?: string
@@ -1465,6 +1476,7 @@ export interface ApiSourceProbeInput {
   baseUrl: string
   protocol: Protocol
   responsesCompactMode?: ResponsesCompactMode
+  deepSeekReasoningEffort?: import('./deepseek').DeepSeekReasoningEffort
   credential?: string
   model?: string
   proxyId?: string
@@ -1853,6 +1865,7 @@ export interface CodexSessionRepairPreview extends CodexSessionRepairOverview {
   rolloutFilesWithoutSessionMeta: number
   rolloutFilesAlreadyTargetProvider: number
   sqliteProviderRowsToUpdate: number
+  sqliteModelRowsToUpdate: number
   sqliteUserEventRowsToUpdate: number
   sqliteCwdRowsToUpdate: number
   globalStateFieldsToUpdate: number
@@ -1865,6 +1878,7 @@ export interface CodexSessionRepairResult {
   targetProvider: string
   repairedRolloutFiles: number
   sqliteProviderRowsUpdated: number
+  sqliteModelRowsUpdated: number
   sqliteUserEventRowsUpdated: number
   sqliteCwdRowsUpdated: number
   globalStateFieldsUpdated: number

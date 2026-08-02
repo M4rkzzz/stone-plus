@@ -7,6 +7,13 @@ import type {
   ToolBridgePlan,
   ToolCallBridgeBinding
 } from './types'
+import {
+  deepSeekDeferredToolExecInput,
+  DeepSeekDsmlError,
+  parseToolSearchArguments,
+  resolveDeepSeekToolBinding,
+  restoreDeepSeekResponsesDsml,
+} from './deepseek-dsml'
 
 type JsonObject = Record<string, unknown>
 
@@ -74,6 +81,10 @@ export interface ProtocolConversionAnalysis {
   issues: ProtocolConversionIssue[]
 }
 
+function usesResponsesChatToolBridge(context?: ProtocolConversionContext): boolean {
+  return context?.dialect === 'xai-grok' || context?.dialect === 'deepseek-chat'
+}
+
 /** Runtime authority for lossy cross-protocol request shapes. Native requests
  * remain untouched; cross-protocol requests must either have an explicit
  * mapping below or fail before an account slot is acquired. */
@@ -91,6 +102,23 @@ export function analyzeProtocolConversion(
         return {
           supported: false,
           issues: [{ path: error.path, capability: 'builtin-tool', reason: error.message }],
+        }
+      }
+      throw error
+    }
+  }
+  if (context?.dialect === 'deepseek-chat' && from === 'openai-responses') {
+    try {
+      body = prepareDeepSeekResponsesSource(body, context)
+    } catch (error) {
+      if (error instanceof DeepSeekDsmlError) {
+        return {
+          supported: false,
+          issues: [{
+            path: 'tools',
+            capability: 'builtin-tool',
+            reason: `DeepSeek tool bridge rejected tools: ${error.message}`,
+          }],
         }
       }
       throw error
@@ -144,7 +172,7 @@ export function analyzeProtocolConversion(
     const type = stringValue(tool.type)
     const isFunction = type === 'function' || (from === 'anthropic-messages' && !type && optionalString(tool.name))
     const isGeminiFunctionGroup = from === 'gemini' && Array.isArray(tool.functionDeclarations)
-    const isXaiCustom = context?.dialect === 'xai-grok'
+    const isXaiCustom = usesResponsesChatToolBridge(context)
       && from === 'openai-responses'
       && to === 'openai-chat'
       && type === 'custom'
@@ -271,7 +299,7 @@ export function analyzeProtocolConversion(
           `input[${itemIndex}].output`,
           add
         )
-      } else if (type === 'function_call' || (type === 'custom_tool_call' && context?.dialect === 'xai-grok' && to === 'openai-chat')) {
+      } else if (type === 'function_call' || (type === 'custom_tool_call' && usesResponsesChatToolBridge(context) && to === 'openai-chat')) {
         if (targetRequiresObjectToolArguments(to) && !isJsonObjectArgument(item.arguments)) {
           add(
             `input[${itemIndex}].arguments`,
@@ -279,7 +307,7 @@ export function analyzeProtocolConversion(
             `Function-call arguments must be a JSON object for ${to}`
           )
         }
-      } else if (type !== 'custom_tool_call_output' || context?.dialect !== 'xai-grok' || to !== 'openai-chat') {
+      } else if (type !== 'custom_tool_call_output' || !usesResponsesChatToolBridge(context) || to !== 'openai-chat') {
         add(`input[${itemIndex}]`, 'content-part', `Input item type ${type || 'unknown'} has no lossless ${to} mapping`)
       }
     }
@@ -503,7 +531,7 @@ function hasCompatibleFunctionDeclaration(from: Protocol, body: JsonObject, cont
   return arrayOfObjects(body.tools).some((tool) => {
     const type = stringValue(tool.type)
     if (type === 'function') return true
-    if (type === 'custom' && from === 'openai-responses' && context?.dialect === 'xai-grok') return true
+    if (type === 'custom' && from === 'openai-responses' && usesResponsesChatToolBridge(context)) return true
     if (from === 'anthropic-messages' && !type) return Boolean(optionalString(tool.name))
     if (from !== 'gemini') return false
     return arrayOfObjects(tool.functionDeclarations ?? tool.function_declarations)
@@ -563,6 +591,10 @@ export function convertRequest(
 ): ProtocolRequest {
   if (context?.dialect === 'xai-grok' && from === 'openai-responses') {
     body = prepareXaiResponsesSource(body, context)
+  }
+  if ((context?.dialect === 'deepseek-dsml' || context?.dialect === 'deepseek-chat')
+    && from === 'openai-responses') {
+    body = prepareDeepSeekResponsesSource(body, context)
   }
   prepareXaiBridgeContext(from, to, body, context)
   if (from === to) {
@@ -657,11 +689,13 @@ export function convertResponse(
     throw new ResponsesResponseFailedError(body)
   }
   if (from === to) {
-    return context?.dialect === 'xai-grok'
-      && from === 'openai-responses'
-      && context.toolBridgePlan
-      ? restoreXaiResponsesToolCalls(body, context)
-      : body
+    if (from === 'openai-responses' && context?.toolBridgePlan) {
+      if (context.dialect === 'xai-grok') return restoreXaiResponsesToolCalls(body, context)
+      if (context.dialect === 'deepseek-dsml') {
+        return restoreDeepSeekResponsesDsml(body, context.toolBridgePlan)
+      }
+    }
+    return body
   }
   if (from === 'openai-responses') {
     const status = stringValue(body.status).trim().toLowerCase()
@@ -736,6 +770,208 @@ function prepareXaiBridgeContext(
   if (from === 'openai-responses' && to === 'openai-chat') {
     context.toolBridgePlan ??= buildXaiToolBridgePlan(body)
   }
+}
+
+/**
+ * DeepSeek V4 can expose its native DSML tool syntax inside Responses text
+ * items. Record the exact current declarations so the response bridge can
+ * authorize and restore those calls without changing the request wire.
+ */
+function prepareDeepSeekResponsesSource(
+  body: JsonObject,
+  context: ProtocolConversionContext,
+): JsonObject {
+  const prepared = structuredClone(body)
+  promoteXaiAdditionalTools(prepared)
+  promoteDeepSeekToolSearchResults(prepared)
+  const namespaces = flattenXaiNamespaceTools(prepared)
+  const plan: ToolBridgePlan = {
+    dialect: context.dialect ?? 'deepseek-dsml',
+    tools: [],
+    calls: [],
+    // Codex can execute multiple independently identified tool calls even
+    // when its model hint asked for one-at-a-time generation. DeepSeek V4
+    // frequently batches safe reads, so accept and advertise that native
+    // capability instead of turning a valid batch into a retrying 502.
+    parallelToolCalls: true,
+  }
+  const seenNames = new Set<string>()
+  let rewroteTools = false
+  let toolSearchWireName: string | undefined
+  const sourceTools = arrayOfObjects(prepared.tools)
+  const occupiedNames = new Set(sourceTools.flatMap((tool) => {
+    const type = stringValue(tool.type)
+    const name = optionalString(tool.name)
+    return name && (type === 'function' || type === 'custom') ? [name] : []
+  }))
+  const tools = sourceTools.map((tool, index) => {
+    const type = stringValue(tool.type)
+    if (type === 'web_search_preview') {
+      rewroteTools = true
+      return { ...tool, type: 'web_search' }
+    }
+    if (type === 'tool_search') {
+      if (toolSearchWireName) {
+        throw new DeepSeekDsmlError('duplicate_tool_search', 'DeepSeek received more than one tool_search declaration.')
+      }
+      toolSearchWireName = deepSeekToolSearchWireName(occupiedNames)
+      seenNames.add(toolSearchWireName)
+      plan.tools.push({
+        sourceType: 'tool_search',
+        sourceName: 'tool_search',
+        wireName: toolSearchWireName,
+        declared: true,
+      })
+      rewroteTools = true
+      return {
+        type: 'function',
+        name: toolSearchWireName,
+        description: optionalString(tool.description)
+          ?? 'Search the Codex client tool registry. Call this before claiming a requested capability is unavailable.',
+        parameters: objectValue(tool.parameters) ?? {
+          type: 'object',
+          properties: {
+            query: { type: 'string', description: 'Tool name or capability to search for.' },
+            limit: { type: 'number', description: 'Maximum number of matching tools.' },
+          },
+          required: ['query'],
+          additionalProperties: false,
+        },
+      }
+    }
+    if (type !== 'function' && type !== 'custom') {
+      if (type === 'web_search' || type === 'web_search_2025_08_26') return tool
+      throw new DeepSeekDsmlError(
+        'unsupported_tool_type',
+        `DeepSeek Responses cannot execute tool type ${type || '<empty>'}.`,
+      )
+    }
+    const name = optionalString(tool.name)
+    if (!name) throw new DeepSeekDsmlError('missing_tool_name', `DeepSeek tool declaration ${index} has no name.`)
+    if (seenNames.has(name)) {
+      throw new DeepSeekDsmlError('duplicate_tool_name', `DeepSeek tool declaration ${name} is duplicated or ambiguous.`)
+    }
+    seenNames.add(name)
+    const namespace = namespaces.get(name)
+    plan.tools.push({
+      sourceType: type,
+      sourceName: namespace?.name ?? name,
+      ...(namespace ? { sourceNamespace: namespace.namespace } : {}),
+      wireName: name,
+      declared: true,
+    })
+    if (type !== 'custom') return tool
+    rewroteTools = true
+    const description = optionalString(tool.description)
+    return {
+      type: 'function',
+      name,
+      description: description
+        ? `${description}\n\nDeepSeek compatibility: pass the complete custom-tool input in the input string.`
+        : `Invoke the ${name} custom tool. Pass its complete input in the input string.`,
+      parameters: {
+        type: 'object',
+        properties: {
+          input: {
+            type: 'string',
+            description: 'Complete raw input for the custom tool.',
+          },
+        },
+        required: ['input'],
+        additionalProperties: false,
+      },
+    }
+  })
+  if (toolSearchWireName) rewriteDeepSeekToolSearchHistory(prepared, toolSearchWireName)
+  if (tools.length > 0) prepared.parallel_tool_calls = true
+  const exec = plan.tools.find((binding) => binding.sourceType === 'custom'
+    && (binding.sourceName === 'exec' || binding.sourceName === 'functions.exec'))
+  if (exec) plan.deferredExecSourceName = exec.sourceName
+  plan.requiresResponseBridge = plan.tools.length > 0
+  context.toolBridgePlan = plan
+  return rewroteTools || prepared !== body ? { ...prepared, tools } : prepared
+}
+
+function promoteDeepSeekToolSearchResults(body: JsonObject): void {
+  const input = arrayOfObjects(body.input)
+  const promoted = arrayOfObjects(body.tools)
+  const seen = new Set(promoted.map(xaiToolDedupKey))
+  const namespaceIndices = new Map<string, number>()
+  for (const [index, tool] of promoted.entries()) {
+    if (stringValue(tool.type) === 'namespace' && optionalString(tool.name)) {
+      namespaceIndices.set(stringValue(tool.name), index)
+    }
+  }
+  let changed = false
+  for (const item of input) {
+    if (stringValue(item.type) !== 'tool_search_output') continue
+    for (const tool of arrayOfObjects(item.tools)) {
+      const namespace = stringValue(tool.type) === 'namespace' ? optionalString(tool.name) : undefined
+      const existingIndex = namespace ? namespaceIndices.get(namespace) : undefined
+      if (existingIndex !== undefined) {
+        const existing = promoted[existingIndex]
+        const children = arrayOfObjects(existing.tools ?? existing.children)
+        const childKeys = new Set(children.map(xaiToolDedupKey))
+        const merged = [...children]
+        for (const child of arrayOfObjects(tool.tools ?? tool.children)) {
+          const childKey = xaiToolDedupKey(child)
+          if (childKeys.has(childKey)) continue
+          childKeys.add(childKey)
+          merged.push(child)
+          changed = true
+        }
+        if (merged.length !== children.length) promoted[existingIndex] = { ...existing, tools: merged }
+        continue
+      }
+      const key = xaiToolDedupKey(tool)
+      if (seen.has(key)) continue
+      seen.add(key)
+      promoted.push(tool)
+      if (namespace) namespaceIndices.set(namespace, promoted.length - 1)
+      changed = true
+    }
+  }
+  if (changed) body.tools = promoted
+}
+
+function deepSeekToolSearchWireName(occupied: ReadonlySet<string>): string {
+  if (!occupied.has('search_tools')) return 'search_tools'
+  if (!occupied.has('stone_tool_search')) return 'stone_tool_search'
+  const digest = createHash('sha256').update('deepseek:tool_search', 'utf8').digest('hex').slice(0, 16)
+  return `sp_tool_search_${digest}`
+}
+
+function rewriteDeepSeekToolSearchHistory(body: JsonObject, wireName: string): void {
+  if (!Array.isArray(body.input)) return
+  body.input = body.input.map((value) => {
+    const item = objectValue(value)
+    if (!item) return value
+    const type = stringValue(item.type)
+    if (type === 'tool_search_call') {
+      const directArguments = objectValue(item.arguments)
+      const argumentsObject = directArguments ?? {
+        ...(typeof item.query === 'string' ? { query: item.query } : {}),
+        ...(typeof item.limit === 'number' ? { limit: item.limit } : {}),
+      }
+      return {
+        ...item,
+        type: 'function_call',
+        name: wireName,
+        arguments: JSON.stringify(argumentsObject),
+      }
+    }
+    if (type === 'tool_search_output') {
+      const output = Object.hasOwn(item, 'output')
+        ? item.output
+        : { tools: arrayOfObjects(item.tools) }
+      return {
+        ...item,
+        type: 'function_call_output',
+        output: typeof output === 'string' ? output : JSON.stringify(output),
+      }
+    }
+    return value
+  })
 }
 
 const XAI_NATIVE_RESPONSES_TOOL_TYPES = new Set([
@@ -1296,6 +1532,15 @@ function findXaiToolByWire(context: ProtocolConversionContext | undefined, wireN
   return context?.toolBridgePlan?.tools.find((binding) => binding.wireName === wireName && binding.declared !== false)
 }
 
+function resolveResponsesChatToolBinding(
+  context: ProtocolConversionContext | undefined,
+  wireName: string,
+): ToolBridgeBinding | undefined {
+  const declared = findXaiToolByWire(context, wireName)
+  if (declared || context?.dialect !== 'deepseek-chat' || !context.toolBridgePlan) return declared
+  return resolveDeepSeekToolBinding(context.toolBridgePlan, wireName)
+}
+
 function findXaiToolInPlan(plan: ToolBridgePlan, sourceType: ToolBridgeBinding['sourceType'], sourceName: string): ToolBridgeBinding | undefined {
   return plan.tools.find((binding) => binding.sourceType === sourceType
     && (binding.sourceName === sourceName || (binding.sourceNamespace !== undefined && binding.wireName === sourceName)))
@@ -1327,10 +1572,13 @@ function rememberXaiCall(context: ProtocolConversionContext | undefined, item: J
   const callId = optionalString(item.call_id) ?? optionalString(item.id)
   if (!callId) return
   const sourceName = optionalString(item.name)
-  const binding = sourceName ? findXaiTool(plan === undefined ? undefined : context, sourceType, sourceName) : undefined
+  const binding = sourceName
+    ? findXaiTool(context, sourceType, sourceName)
+      ?? (sourceType === 'function' ? findXaiToolByWire(context, sourceName) : undefined)
+    : undefined
   rememberXaiCallBinding(plan, {
     callId,
-    sourceType,
+    sourceType: binding?.sourceType ?? sourceType,
     sourceName: binding?.sourceName ?? sourceName,
     sourceNamespace: binding?.sourceNamespace,
     wireName: binding?.wireName,
@@ -1367,6 +1615,20 @@ function parseXaiCustomWrapper(value: unknown, path: string): string {
     throw new InvalidToolBridgeError(path, 'custom arguments must be exactly { input: string }')
   }
   return object.input
+}
+
+function parseToolArgumentsObject(value: unknown, path: string): JsonObject {
+  let parsed: unknown = value
+  if (typeof value === 'string') {
+    try {
+      parsed = JSON.parse(value) as unknown
+    } catch {
+      throw new InvalidToolBridgeError(path, 'tool arguments are not valid JSON')
+    }
+  }
+  const object = objectValue(parsed)
+  if (!object) throw new InvalidToolBridgeError(path, 'tool arguments must be a JSON object')
+  return object
 }
 
 function applyXaiReasoning(body: JsonObject, output: JsonObject): void {
@@ -1524,16 +1786,16 @@ function responsesRequestToChat(body: JsonObject, model: string, context?: Proto
   ])
   const reasoningEffort = normalizeReasoningEffort(objectValue(body.reasoning)?.effort)
   if (reasoningEffort) output.reasoning_effort = reasoningEffort
-  const tools = context?.dialect === 'xai-grok'
-    ? xaiResponsesToolsToChat(body.tools, context)
+  const tools = usesResponsesChatToolBridge(context)
+    ? xaiResponsesToolsToChat(body.tools, context!)
     : responsesToolsToChat(body.tools)
   if (tools.length > 0) output.tools = tools
   if (tools.length > 0) {
-    const toolChoice = context?.dialect === 'xai-grok'
-      ? xaiResponsesToolChoiceToChat(body.tool_choice, context)
+    const toolChoice = usesResponsesChatToolBridge(context)
+      ? xaiResponsesToolChoiceToChat(body.tool_choice, context!)
       : responsesToolChoiceToChat(body.tool_choice)
     if (toolChoice !== undefined) output.tool_choice = toolChoice
-  } else if (context?.dialect === 'xai-grok') {
+  } else if (usesResponsesChatToolBridge(context)) {
     delete output.parallel_tool_calls
   }
   if (context?.dialect === 'xai-grok') {
@@ -2518,19 +2780,37 @@ function chatResponseToResponses(
   for (const toolCall of toolCalls) {
     const functionValue = objectValue(toolCall.function) ?? {}
     const wireName = stringValue(functionValue.name)
-    const binding = findXaiToolByWire(context, wireName)
-    if (context?.dialect === 'xai-grok' && !binding) {
+    const binding = resolveResponsesChatToolBinding(context, wireName)
+    if (usesResponsesChatToolBridge(context) && !binding) {
       throw new InvalidToolBridgeError('choices[0].message.tool_calls[].function.name', `unknown tool alias ${wireName || '<empty>'}`)
     }
     const callId = stringValue(toolCall.id)
     if (!callId) throw new InvalidToolBridgeError('choices[0].message.tool_calls[].id', 'tool call id is required')
-    if (binding?.sourceType === 'custom') {
+    if (binding?.sourceType === 'tool_search') {
+      output.push({
+        type: 'tool_search_call',
+        id: `tsc_${callId}`,
+        call_id: callId,
+        execution: 'client',
+        arguments: parseToolSearchArguments(stringValue(functionValue.arguments, '{}')),
+        status: completion.status,
+      })
+      rememberXaiChatCall(context, callId, binding)
+    } else if (binding?.sourceType === 'custom') {
       output.push({
         type: 'custom_tool_call',
         id: callId,
         call_id: callId,
         name: binding.sourceName,
-        input: parseXaiCustomWrapper(functionValue.arguments, 'choices[0].message.tool_calls[].function.arguments'),
+        input: binding.deferredToolName
+          ? deepSeekDeferredToolExecInput(
+              binding.deferredToolName,
+              parseToolArgumentsObject(
+                functionValue.arguments,
+                'choices[0].message.tool_calls[].function.arguments',
+              ),
+            )
+          : parseXaiCustomWrapper(functionValue.arguments, 'choices[0].message.tool_calls[].function.arguments'),
         status: completion.status
       })
       rememberXaiChatCall(context, callId, binding)
@@ -2540,6 +2820,7 @@ function chatResponseToResponses(
         id: callId,
         call_id: callId,
         name: binding?.sourceName ?? wireName,
+        ...(binding?.sourceNamespace ? { namespace: binding.sourceNamespace } : {}),
         arguments: stringValue(functionValue.arguments, '{}'),
         status: completion.status
       })
@@ -3062,8 +3343,10 @@ function chatToolContentToAnthropic(value: unknown): unknown {
 function responsesFunctionCallToChat(item: JsonObject, context?: ProtocolConversionContext): JsonObject {
   const sourceType = stringValue(item.type) === 'custom_tool_call' ? 'custom' : 'function'
   const sourceName = stringValue(item.name)
-  const binding = sourceType === 'custom' ? findXaiTool(context, 'custom', sourceName) : findXaiTool(context, 'function', sourceName)
-  if (context?.dialect === 'xai-grok' && sourceType === 'custom' && !binding) {
+  const binding = sourceType === 'custom'
+    ? findXaiTool(context, 'custom', sourceName)
+    : findXaiTool(context, 'function', sourceName) ?? findXaiToolByWire(context, sourceName)
+  if (usesResponsesChatToolBridge(context) && sourceType === 'custom' && !binding) {
     throw new InvalidToolBridgeError('input[].name', `custom tool ${sourceName || '<empty>'} was not declared`)
   }
   const name = binding?.wireName ?? sourceName
@@ -3202,13 +3485,28 @@ function chatFunctionCallToResponses(toolCall: JsonObject, context?: ProtocolCon
       && candidate.sourceType === historicalCall.sourceType
       && candidate.sourceName === historicalCall.sourceName)
     : undefined
-  const binding = findXaiToolByWire(context, wireName) ?? historicalBinding
-  if (context?.dialect === 'xai-grok' && !binding) {
+  const binding = resolveResponsesChatToolBinding(context, wireName) ?? historicalBinding
+  if (usesResponsesChatToolBridge(context) && !binding) {
     throw new InvalidToolBridgeError('messages[].tool_calls[].function.name', `unknown tool alias ${wireName || '<empty>'}`)
+  }
+  if (binding?.sourceType === 'tool_search') {
+    if (!callId) throw new InvalidToolBridgeError('messages[].tool_calls[].id', 'tool call id is required')
+    rememberXaiChatCall(context, callId, binding)
+    return {
+      type: 'tool_search_call',
+      call_id: callId,
+      execution: 'client',
+      arguments: parseToolSearchArguments(stringValue(definition.arguments, '{}')),
+    }
   }
   if (binding?.sourceType === 'custom') {
     if (!callId) throw new InvalidToolBridgeError('messages[].tool_calls[].id', 'tool call id is required')
-    const input = parseXaiCustomWrapper(definition.arguments, 'messages[].tool_calls[].function.arguments')
+    const input = binding.deferredToolName
+      ? deepSeekDeferredToolExecInput(
+          binding.deferredToolName,
+          parseToolArgumentsObject(definition.arguments, 'messages[].tool_calls[].function.arguments'),
+        )
+      : parseXaiCustomWrapper(definition.arguments, 'messages[].tool_calls[].function.arguments')
     rememberXaiChatCall(context, callId, binding)
     return {
       type: 'custom_tool_call',
@@ -3325,9 +3623,10 @@ function xaiResponsesToolsToChat(value: unknown, context: ProtocolConversionCont
   if (!plan) throw new InvalidToolBridgeError('tools', 'conversion plan is missing')
   const tools: JsonObject[] = []
   for (const binding of plan.tools.filter((candidate) => candidate.declared !== false)) {
-    if (binding.sourceType === 'function') {
+    if (binding.sourceType === 'function' || binding.sourceType === 'tool_search') {
       const sourceName = binding.sourceNamespace ? binding.wireName : binding.sourceName
-      const source = arrayOfObjects(value).find((tool) => stringValue(tool.type) === 'function' && stringValue(tool.name) === sourceName)
+      const source = arrayOfObjects(value).find((tool) => stringValue(tool.type) === 'function'
+        && (stringValue(tool.name) === binding.wireName || stringValue(tool.name) === sourceName))
       const definition = source ?? {}
       tools.push({ type: 'function', function: omitUndefined({
         name: binding.wireName,
@@ -3337,7 +3636,10 @@ function xaiResponsesToolsToChat(value: unknown, context: ProtocolConversionCont
       }) })
       continue
     }
-    const source = arrayOfObjects(value).find((tool) => stringValue(tool.type) === 'custom' && stringValue(tool.name) === binding.sourceName)
+    const source = arrayOfObjects(value).find((tool) => (
+      (stringValue(tool.type) === 'custom' && stringValue(tool.name) === binding.sourceName)
+      || (stringValue(tool.type) === 'function' && stringValue(tool.name) === binding.wireName)
+    ))
     tools.push({ type: 'function', function: omitUndefined({
       name: binding.wireName,
       description: [optionalString(source?.description), 'The argument must be a JSON object with one string property named input.'].filter(Boolean).join(' '),

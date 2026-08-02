@@ -1,5 +1,11 @@
 import { parse, stringify, TomlError } from 'smol-toml'
+import { DEEPSEEK_V4_FLASH_CONTEXT_WINDOW } from '@shared/deepseek'
+import {
+  repairedCodexClientModel,
+  type CodexModelRepairPolicy,
+} from '@shared/codex-model-repair'
 import type { TextMutation } from './json-format'
+import { STONE_CODEX_MODEL_CATALOG_FILENAME } from './codex-model-catalog'
 import { ClientConfigParseError } from './types'
 
 export type TomlValue = string | boolean | number | string[]
@@ -525,9 +531,14 @@ function setSection(
   lines.splice(bounds.end, 0, ...missing.map(({ key, value }) => `${key} = ${tomlValue(value)}`))
 }
 
-export function planCodexToml(content: string | undefined, baseUrl: string): TextMutation {
+export function planCodexToml(
+  content: string | undefined,
+  baseUrl: string,
+  modelContextWindow?: number,
+  modelCatalogPath?: string,
+): TextMutation {
   const source = content ?? ''
-  parseCodexToml(source)
+  const parsed = parseCodexToml(source)
 
   const eol = source.includes('\r\n') ? '\r\n' : '\n'
   const trailingNewline = content === undefined || /\r?\n$/.test(source)
@@ -536,6 +547,21 @@ export function planCodexToml(content: string | undefined, baseUrl: string): Tex
 
   setTopLevel(lines, { key: 'model_provider', value: 'stone' })
   setTopLevel(lines, { key: 'cli_auth_credentials_store', value: 'file' })
+  if (modelContextWindow) {
+    setTopLevel(lines, { key: 'model_context_window', value: modelContextWindow })
+  } else if (parsed.model_context_window === DEEPSEEK_V4_FLASH_CONTEXT_WINDOW) {
+    // This exact value is owned by the DeepSeek-only route integration. Do not
+    // remove any other user-defined context override.
+    removePath(lines, ['model_context_window'])
+  }
+  if (modelCatalogPath) {
+    setTopLevel(lines, { key: 'model_catalog_json', value: modelCatalogPath })
+  } else if (
+    typeof parsed.model_catalog_json === 'string'
+    && parsed.model_catalog_json.replace(/\\/g, '/').endsWith(`/${STONE_CODEX_MODEL_CATALOG_FILENAME}`)
+  ) {
+    removePath(lines, ['model_catalog_json'])
+  }
   // Prefer Codex's portable standalone compact path for relay pools. The
   // gateway can bridge an already-running V2 client with a bounded local
   // envelope, but managed configs keep that compatibility path exceptional.
@@ -561,9 +587,15 @@ export function planCodexToml(content: string | undefined, baseUrl: string): Tex
  * A genuinely malformed TOML document still throws so the service can back it
  * up and rebuild a minimal document.
  */
-export function repairCodexToml(content: string | undefined, baseUrl: string): TextMutation {
+export function repairCodexToml(
+  content: string | undefined,
+  baseUrl: string,
+  modelRepair?: CodexModelRepairPolicy,
+): TextMutation {
   try {
-    return planCodexToml(content, baseUrl)
+    const repaired = repairCodexModelSelections(content, modelRepair)
+    const planned = planCodexToml(repaired.content, baseUrl)
+    return { ...planned, changed: repaired.changed || planned.changed }
   } catch (patchError) {
     const source = content ?? ''
     // This second parse deliberately distinguishes invalid syntax from a valid
@@ -571,6 +603,7 @@ export function repairCodexToml(content: string | undefined, baseUrl: string): T
     const root = parseCodexToml(source)
     root.model_provider = 'stone'
     root.cli_auth_credentials_store = 'file'
+    repairCodexModelFields(root, modelRepair)
 
     const features = tomlObject(root.features) ?? {}
     root.features = features
@@ -601,6 +634,39 @@ export function repairCodexToml(content: string | undefined, baseUrl: string): T
   }
 }
 
+function repairCodexModelSelections(
+  content: string | undefined,
+  policy: CodexModelRepairPolicy | undefined,
+): TextMutation {
+  if (!policy) return { content: content ?? '', changed: content === undefined }
+  const root = parseCodexToml(content ?? '')
+  const patches: Array<{ path: string[]; value: TomlValue | null }> = []
+  for (const key of ['model', 'review_model'] as const) {
+    const current = root[key]
+    const repaired = repairedCodexClientModel(current, policy)
+    if (typeof current === 'string' && repaired !== current.trim()) {
+      patches.push({ path: [key], value: repaired ?? null })
+    }
+  }
+  return patches.length > 0
+    ? patchCodexTomlPaths(content, patches)
+    : { content: content ?? '', changed: content === undefined }
+}
+
+function repairCodexModelFields(
+  root: Record<string, unknown>,
+  policy: CodexModelRepairPolicy | undefined,
+): void {
+  if (!policy) return
+  for (const key of ['model', 'review_model'] as const) {
+    const current = root[key]
+    const repaired = repairedCodexClientModel(current, policy)
+    if (typeof current !== 'string' || repaired === current.trim()) continue
+    if (repaired) root[key] = repaired
+    else delete root[key]
+  }
+}
+
 /**
  * Return Codex to its built-in OpenAI provider without disturbing models, MCP,
  * projects, profiles, or unrelated providers. The compact override is removed
@@ -617,6 +683,12 @@ export function planCodexOfficialLoginToml(content: string | undefined): TextMut
 
   setPath(lines, ['model_provider'], 'openai')
   removePath(lines, ['cli_auth_credentials_store'])
+  if (
+    typeof root.model_catalog_json === 'string'
+    && root.model_catalog_json.replace(/\\/g, '/').endsWith(`/${STONE_CODEX_MODEL_CATALOG_FILENAME}`)
+  ) {
+    removePath(lines, ['model_catalog_json'])
+  }
   if (features?.remote_compaction_v2 === false) {
     removePath(lines, ['features', 'remote_compaction_v2'])
   }

@@ -2172,7 +2172,10 @@ describe('GatewayServer', () => {
     await response.text()
     await vi.waitFor(() => expect(cancelled).toBe(true))
     expect(gateway.getStatus().activeRequests).toBe(0)
-  }, 5_000)
+    // The gateway deadline remains one second. The wider test timeout only
+    // absorbs shared-runner scheduling and socket cleanup while the full suite
+    // executes hundreds of gateway cases in parallel.
+  }, 10_000)
 
   it('leaves first-token timing empty for buffered non-streaming responses', async () => {
     const port = await freePort()
@@ -2410,6 +2413,79 @@ describe('GatewayServer', () => {
     expect(JSON.parse(String(request.body))).toMatchObject({ store: false, stream: true, service_tier: 'priority' })
   })
 
+  it('bridges Codex tools to a DeepSeek Chat relay and applies its source-level effort', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers[0] = {
+      ...gatewayConfig.providers[0],
+      sourceType: 'relay',
+      kind: 'deepseek-compatible',
+      name: 'DeepSeek Chat relay',
+      baseUrl: 'https://deepseek-relay.example.test/v1',
+      protocol: 'openai-chat',
+      models: ['deepseek-v4-pro'],
+      deepSeekReasoningEffort: 'high',
+    }
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-chat'
+    gatewayConfig.accounts[1].status = 'disabled'
+    const upstreamFetch = vi.fn(async () => new Response(JSON.stringify({
+      id: 'chat_deepseek',
+      model: 'deepseek-v4-pro',
+      choices: [{
+        index: 0,
+        finish_reason: 'stop',
+        message: { role: 'assistant', content: 'Ready' },
+      }],
+    }), { status: 200, headers: { 'content-type': 'application/json' } }))
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'deepseek-chat-private',
+      fetchImplementation: upstreamFetch as typeof fetch,
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'deepseek-v4-pro',
+        input: 'Inspect the workspace.',
+        reasoning: { effort: 'xhigh' },
+        tools: [
+          { type: 'custom', name: 'exec', description: 'Codex runtime' },
+          {
+            type: 'namespace', name: 'codex_app', tools: [{
+              type: 'function', name: 'read_thread_terminal',
+              parameters: { type: 'object', properties: {} },
+            }],
+          },
+          {
+            type: 'tool_search',
+            parameters: {
+              type: 'object', properties: { query: { type: 'string' } }, required: ['query'],
+            },
+          },
+        ],
+      }),
+    })
+    const responseBody = await response.text()
+    expect(response.status, responseBody).toBe(200)
+    const forwarded = JSON.parse(String(upstreamFetch.mock.calls[0][1]?.body))
+    expect(forwarded.reasoning_effort).toBe('high')
+    expect(forwarded.parallel_tool_calls).toBe(true)
+    expect(forwarded.tools.map((tool: { function: { name: string } }) => tool.function.name)).toEqual([
+      'exec',
+      'codex_app__read_thread_terminal',
+      'search_tools',
+    ])
+    expect(forwarded.messages[0]).toMatchObject({
+      role: 'system', content: expect.stringContaining('<stone_deferred_tools>'),
+    })
+    expect(forwarded.messages[0].content).toContain('<stone_tool_search>')
+  })
+
   it('binds DeepSeek Responses directly, preserves tools, and rejects lossy server-side history', async () => {
     const port = await freePort()
     const gatewayConfig = config(port)
@@ -2425,11 +2501,33 @@ describe('GatewayServer', () => {
     gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
     gatewayConfig.pools[0].protocol = 'openai-responses'
     gatewayConfig.accounts[1].status = 'disabled'
+    const dsml = [
+      'I will report to the parent task.\n\n',
+      '<｜｜DSML｜｜tool_calls>\n',
+      '<｜｜DSML｜｜invoke name="codex_app__send_message_to_thread">\n',
+      '<｜｜DSML｜｜parameter name="threadId" string="true">thread_parent</｜｜DSML｜｜parameter>\n',
+      '<｜｜DSML｜｜parameter name="hostId" string="true">local</｜｜DSML｜｜parameter>\n',
+      '<｜｜DSML｜｜parameter name="prompt" string="true">report complete</｜｜DSML｜｜parameter>\n',
+      '</｜｜DSML｜｜invoke>\n',
+      '</｜｜DSML｜｜tool_calls>',
+    ].join('')
     const completed = [
-      'event: response.completed',
-      'data: {"type":"response.completed","response":{"id":"resp_deepseek","object":"response","model":"deepseek-v4-flash","status":"completed","output":[]}}',
+      `event: response.output_text.delta\ndata: ${JSON.stringify({
+        type: 'response.output_text.delta', response_id: 'resp_deepseek',
+        output_index: 0, content_index: 0, delta: dsml,
+      })}`,
+      `event: response.completed\ndata: ${JSON.stringify({
+        type: 'response.completed',
+        response: {
+          id: 'resp_deepseek', object: 'response', model: 'deepseek-v4-flash', status: 'completed',
+          output: [{
+            id: 'msg_deepseek', type: 'message', status: 'completed', role: 'assistant',
+            content: [{ type: 'output_text', text: dsml }],
+          }],
+        },
+      })}`,
       '', '',
-    ].join('\n')
+    ].join('\n\n')
     const upstreamFetch = vi.fn(async () => new Response(completed, {
       status: 200,
       headers: { 'content-type': 'text/event-stream' },
@@ -2455,11 +2553,27 @@ describe('GatewayServer', () => {
     expect(lossyHistory.status).toBeGreaterThanOrEqual(400)
     expect(upstreamFetch).not.toHaveBeenCalled()
 
+    const unsupportedConversation = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'deepseek-v4-flash', input: 'Continue', stream: true,
+        conversation: { id: 'server-side-state' },
+      }),
+    })
+    expect(unsupportedConversation.status).toBe(422)
+    expect(await unsupportedConversation.text()).toContain('conversation')
+    expect(upstreamFetch).not.toHaveBeenCalled()
+
     const tools = [{
       type: 'function',
       name: 'memory_lookup',
       description: 'Look up an in-memory value',
       parameters: { type: 'object', properties: { key: { type: 'string' } }, required: ['key'] },
+    }, {
+      type: 'custom',
+      name: 'exec',
+      description: 'Run JavaScript. Nested tools are available through tools and ALL_TOOLS lists their declarations.',
     }]
     const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
       method: 'POST',
@@ -2468,20 +2582,289 @@ describe('GatewayServer', () => {
         model: 'deepseek-v4-flash',
         input: [{ role: 'user', content: 'Use the memory tool.' }],
         tools,
+        reasoning: { effort: 'xhigh', summary: 'auto' },
+        metadata: { trace: 'ignored-by-deepseek' },
+        service_tier: 'auto',
+        stream_options: { include_usage: true },
+        text: { verbosity: 'high' },
         stream: true,
       }),
     })
     expect(response.status).toBe(200)
-    expect(await response.text()).toContain('response.completed')
+    const responseWire = await response.text()
+    expect(responseWire).toContain('response.completed')
+    expect(responseWire).toContain('"type":"custom_tool_call"')
+    expect(responseWire).toContain('"name":"exec"')
+    expect(responseWire).toContain('codex_app__send_message_to_thread')
+    expect(responseWire).toContain('tools[resolvedName]')
+    expect(responseWire).toContain('thread_parent')
+    expect(responseWire).not.toContain('DSML')
     expect(upstreamFetch).toHaveBeenCalledTimes(1)
     expect(upstreamFetch.mock.calls[0][0]).toBe('https://api.deepseek.com/v1/responses')
     expect(new Headers(upstreamFetch.mock.calls[0][1]?.headers).get('authorization'))
       .toBe('Bearer deepseek-private')
-    expect(JSON.parse(String(upstreamFetch.mock.calls[0][1]?.body))).toMatchObject({
+    const forwardedBody = JSON.parse(String(upstreamFetch.mock.calls[0][1]?.body))
+    expect(forwardedBody).toMatchObject({
       model: 'deepseek-v4-flash',
-      tools,
+      reasoning: { effort: 'max' },
       stream: true,
     })
+    expect(forwardedBody.reasoning.summary).toBeUndefined()
+    expect(forwardedBody.metadata).toBeUndefined()
+    expect(forwardedBody.service_tier).toBeUndefined()
+    expect(forwardedBody.stream_options).toBeUndefined()
+    expect(forwardedBody.text).toBeUndefined()
+    expect(forwardedBody.tools).toEqual([
+      tools[0],
+      expect.objectContaining({
+        type: 'function',
+        name: 'exec',
+        parameters: expect.objectContaining({
+          type: 'object',
+          required: ['input'],
+          additionalProperties: false,
+        }),
+      }),
+    ])
+    expect(forwardedBody.instructions).toContain('<stone_deferred_tools>')
+    expect(forwardedBody.instructions).toContain('ALL_TOOLS')
+    expect(forwardedBody.instructions).toContain('source_thread_id/threadId')
+  })
+
+  it('bridges DeepSeek tool search into a second-turn Codex namespace call', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers[0] = {
+      ...gatewayConfig.providers[0],
+      sourceType: 'official-api',
+      kind: 'deepseek',
+      name: 'DeepSeek API',
+      baseUrl: 'https://api.deepseek.com',
+      protocol: 'openai-responses',
+      models: ['deepseek-v4-flash'],
+    }
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    gatewayConfig.accounts[1].status = 'disabled'
+    const upstreamBodies: Array<Record<string, unknown>> = []
+    const upstreamFetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>
+      upstreamBodies.push(body)
+      const dsml = upstreamBodies.length === 1
+        ? [
+            '<｜｜DSML｜｜tool_calls>',
+            '<｜｜DSML｜｜invoke name="search_tools">',
+            '<｜｜DSML｜｜parameter name="query" string="true">send_message_to_thread</｜｜DSML｜｜parameter>',
+            '<｜｜DSML｜｜parameter name="limit" string="false">10</｜｜DSML｜｜parameter>',
+            '</｜｜DSML｜｜invoke>',
+            '</｜｜DSML｜｜tool_calls>',
+          ].join('')
+        : [
+            '<｜｜DSML｜｜tool_calls>',
+            '<｜｜DSML｜｜invoke name="codex_app__send_message_to_thread">',
+            '<｜｜DSML｜｜parameter name="threadId" string="true">parent</｜｜DSML｜｜parameter>',
+            '<｜｜DSML｜｜parameter name="hostId" string="true">local</｜｜DSML｜｜parameter>',
+            '<｜｜DSML｜｜parameter name="prompt" string="true">proof</｜｜DSML｜｜parameter>',
+            '</｜｜DSML｜｜invoke>',
+            '</｜｜DSML｜｜tool_calls>',
+          ].join('')
+      return new Response([
+        'event: response.output_text.delta',
+        `data: ${JSON.stringify({
+          type: 'response.output_text.delta', response_id: `resp_search_${upstreamBodies.length}`,
+          output_index: 0, content_index: 0, delta: dsml,
+        })}`,
+        '',
+        'event: response.completed',
+        `data: ${JSON.stringify({
+          type: 'response.completed',
+          response: {
+            id: `resp_search_${upstreamBodies.length}`, object: 'response', status: 'completed',
+            model: 'deepseek-v4-flash', output: [],
+          },
+        })}`,
+        '', '',
+      ].join('\n'), { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    })
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'deepseek-private',
+      fetchImplementation: upstreamFetch as typeof fetch,
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const toolSearch = {
+      type: 'tool_search', execution: 'client',
+      parameters: {
+        type: 'object', properties: { query: { type: 'string' }, limit: { type: 'number' } },
+        required: ['query'], additionalProperties: false,
+      },
+    }
+    const preloadedNamespace = {
+      type: 'namespace', name: 'codex_app', tools: [{
+        type: 'function', name: 'read_thread_terminal',
+        parameters: { type: 'object', properties: {}, additionalProperties: false },
+      }],
+    }
+    const first = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'gpt-5.6-terra', input: 'Find and send the cross-task report.',
+        tools: [preloadedNamespace, toolSearch], stream: true,
+      }),
+    })
+    const firstWire = await first.text()
+    expect(first.status, firstWire).toBe(200)
+    const firstEvents = firstWire.split('\n')
+      .filter((line) => line.startsWith('data: '))
+      .map((line) => JSON.parse(line.slice(6)) as Record<string, unknown>)
+    const searchDone = firstEvents.find((event) => event.type === 'response.output_item.done') as {
+      item: Record<string, unknown>
+    }
+    expect(searchDone.item).toMatchObject({
+      type: 'tool_search_call', execution: 'client', status: 'completed',
+      arguments: { query: 'send_message_to_thread', limit: 10 },
+    })
+    expect(JSON.stringify(upstreamBodies[0])).toContain('search_tools')
+    expect(String(upstreamBodies[0].instructions)).toContain('<stone_tool_search>')
+
+    const second = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'gpt-5.6-terra',
+        input: [searchDone.item, {
+          type: 'tool_search_output', call_id: searchDone.item.call_id, execution: 'client',
+          tools: [{
+            type: 'namespace', name: 'codex_app', tools: [{
+              type: 'function', name: 'send_message_to_thread',
+              parameters: {
+                type: 'object',
+                properties: {
+                  threadId: { type: 'string' }, hostId: { type: 'string' }, prompt: { type: 'string' },
+                },
+                required: ['threadId', 'prompt'], additionalProperties: false,
+              },
+            }],
+          }],
+        }],
+        tools: [preloadedNamespace, toolSearch], stream: true,
+      }),
+    })
+    const secondWire = await second.text()
+    expect(second.status, secondWire).toBe(200)
+    expect(secondWire).toContain('"type":"function_call"')
+    expect(secondWire).toContain('"namespace":"codex_app"')
+    expect(secondWire).toContain('"name":"send_message_to_thread"')
+    expect(secondWire).not.toContain('DSML')
+    const forwardedSecond = JSON.stringify(upstreamBodies[1])
+    expect(forwardedSecond).toContain('codex_app__send_message_to_thread')
+    expect(forwardedSecond).toContain('"type":"function_call_output"')
+    expect(forwardedSecond).not.toContain('"type":"tool_search_output"')
+  })
+
+  it('keeps Codex compaction portable across DeepSeek turns and drops app-only compaction markers', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers[0] = {
+      ...gatewayConfig.providers[0],
+      sourceType: 'official-api',
+      kind: 'deepseek',
+      name: 'DeepSeek API',
+      baseUrl: 'https://api.deepseek.com',
+      protocol: 'openai-responses',
+      models: ['deepseek-v4-flash'],
+    }
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    gatewayConfig.accounts[1].status = 'disabled'
+    const upstreamBodies: Array<Record<string, unknown>> = []
+    const upstreamFetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      const upstreamBody = JSON.parse(String(init?.body)) as Record<string, unknown>
+      upstreamBodies.push(upstreamBody)
+      const compactRequest = JSON.stringify(upstreamBody).includes('Create a concise handoff summary')
+      const text = compactRequest ? 'DeepSeek portable compact summary.' : 'continued after compact'
+      return new Response([
+        'event: response.output_text.delta',
+        `data: ${JSON.stringify({
+          type: 'response.output_text.delta',
+          response_id: `resp_deepseek_${upstreamBodies.length}`,
+          output_index: 0,
+          content_index: 0,
+          delta: text,
+        })}`,
+        '',
+        'event: response.completed',
+        `data: ${JSON.stringify({
+          type: 'response.completed',
+          response: {
+            id: `resp_deepseek_${upstreamBodies.length}`,
+            object: 'response',
+            model: 'deepseek-v4-flash',
+            status: 'completed',
+            output: [],
+          },
+        })}`,
+        '',
+        '',
+      ].join('\n'), {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' },
+      })
+    })
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'deepseek-private',
+      fetchImplementation: upstreamFetch as typeof fetch,
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const compactResponse = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'deepseek-v4-flash',
+        input: [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'history before compact' }] },
+          { type: 'compaction_trigger' },
+        ],
+        stream: true,
+      }),
+    })
+    const compactWire = await compactResponse.text()
+    expect(compactResponse.status, compactWire).toBe(200)
+    const compactEvent = compactWire.split('\n')
+      .filter((line) => line.startsWith('data: '))
+      .map((line) => JSON.parse(line.slice(6)) as Record<string, unknown>)
+      .find((event) => event.type === 'response.output_item.done')
+    const compactItem = compactEvent?.item as Record<string, unknown>
+    expect(String(compactItem.encrypted_content)).toMatch(/^stoneplus-compact-v1:/)
+    expect(JSON.stringify(upstreamBodies[0])).not.toContain('compaction_trigger')
+
+    const followup = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'deepseek-v4-flash',
+        input: [
+          compactItem,
+          { type: 'context_compaction', id: 'compact-ui-only' },
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'continue' }] },
+        ],
+        stream: true,
+      }),
+    })
+    const followupWire = await followup.text()
+    expect(followup.status, followupWire).toBe(200)
+    expect(followupWire).toContain('continued after compact')
+    const forwarded = JSON.stringify(upstreamBodies[1])
+    expect(forwarded).toContain('DeepSeek portable compact summary.')
+    expect(forwarded).not.toContain('context_compaction')
+    expect(forwarded).not.toContain('stoneplus-compact-v1:')
+    expect(forwarded).not.toContain('encrypted_content')
   })
 
   it('rebuilds all Agent Identity headers after recovering an invalid task', async () => {

@@ -118,6 +118,49 @@ describe('Standard API token pricing', () => {
   )
 
   it.each([
+    ['deepseek-v4-flash', 'deepseek-v4-flash', 0.14, 0.0028, 0.28],
+    ['deepseek/deepseek-v4-flash', 'deepseek-v4-flash', 0.14, 0.0028, 0.28],
+    ['deepseek-v4-flash[1m]', 'deepseek-v4-flash', 0.14, 0.0028, 0.28],
+    ['deepseek-v4-pro', 'deepseek-v4-pro', 0.435, 0.003625, 0.87],
+    ['deepseek:deepseek-v4-pro[1m]', 'deepseek-v4-pro', 0.435, 0.003625, 0.87]
+  ] as const)('uses the current official DeepSeek API rates for %s', (model, family, input, cached, output) => {
+    expect(resolveOpenAiModelPricing(model)).toMatchObject({
+      family,
+      inputUsdPerMillion: input,
+      cachedInputUsdPerMillion: cached,
+      cacheWriteUsdPerMillion: input,
+      outputUsdPerMillion: output
+    })
+  })
+
+  it('prices DeepSeek cache hits and removes supported V4 usage from the unpriced bucket', () => {
+    const result = estimateOpenAiTokenCosts([
+      log('deepseek-v4-flash', {
+        inputTokens: 1_000_000,
+        cachedInputTokens: 250_000,
+        outputTokens: 100_000
+      })
+    ])
+
+    expect(result).toMatchObject({
+      standardInputTokens: 750_000,
+      cachedInputTokens: 250_000,
+      pricedTokens: 1_100_000,
+      unpricedTokens: 0,
+      cachedInputCostUsd: 0.0007,
+      unknownModels: []
+    })
+    expect(result.inputCostUsd).toBeCloseTo(0.105, 12)
+    expect(result.outputCostUsd).toBeCloseTo(0.028, 12)
+    expect(result.totalCostUsd).toBeCloseTo(0.1337, 12)
+  })
+
+  it.each(['deepseek-v4-flash-preview', 'deepseek-v4-pro-max', 'openai/deepseek-v4-flash'])(
+    'does not guess DeepSeek pricing for unsupported model %j',
+    (model) => expect(resolveOpenAiModelPricing(model)).toBeUndefined()
+  )
+
+  it.each([
     ['grok-4.5', 'grok-4.5'],
     ['grok-4.5-latest', 'grok-4.5'],
     ['grok-build-latest', 'grok-4.5'],
@@ -527,10 +570,32 @@ describe('Standard API token pricing', () => {
     expect(costs).toMatchObject({
       fiveHourUsd: 10,
       sevenDayUsd: 50,
+      fiveHourUnpricedUsdTokens: 0,
+      sevenDayUnpricedUsdTokens: 0,
       fiveHourCredits: 125,
       sevenDayCredits: 1_000,
       fiveHourUnpricedCreditTokens: 0,
       sevenDayUnpricedCreditTokens: 0
     })
+  })
+
+  it('tracks USD and Codex-credit pricing completeness independently', () => {
+    const now = 1_800_000_000_000
+    const resetAt = now + 60 * 60 * 1000
+    const costs = summarizeAccountCodexQuotaCycleCosts([
+      log('gpt-5.4-nano', {
+        accountId: 'target', timestamp: now - 1_000, inputTokens: 100,
+      }),
+      log('gpt-5.5-cyber', {
+        accountId: 'target', timestamp: now - 500, outputTokens: 200,
+      }),
+    ], 'target', {
+      fiveHour: { usedPercent: 20, windowSeconds: 5 * 60 * 60, resetAt },
+      observedAt: now,
+      source: 'usage-endpoint',
+    }, now)
+
+    expect(costs.fiveHourUnpricedUsdTokens).toBe(200)
+    expect(costs.fiveHourUnpricedCreditTokens).toBe(100)
   })
 })

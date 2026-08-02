@@ -10,8 +10,11 @@ import { providerSourceFamily, type ProviderSourceFamily } from '@shared/source-
 import { accountMatchesPoolProtocol } from '@shared/pool-protocol'
 import { normalizeProviderHttpUrl } from '@shared/provider-url'
 import {
+  applyDeepSeekModelLimits,
+  DEEPSEEK_DEFAULT_REASONING_EFFORT,
   DEEPSEEK_RESPONSES_DEFAULT_MODEL,
   isOfficialDeepSeekResponsesModel,
+  normalizeDeepSeekReasoningEffort,
 } from '@shared/deepseek'
 import { hasVerifiedKiroToolBridge, isNativeGrokRouteSource, resolveRouteSource } from '@shared/route-sources'
 import type {
@@ -93,7 +96,7 @@ const OFFICIAL_SOURCES: Readonly<Partial<Record<ProviderKind, {
 
 const RELAY_PROTOCOLS: Readonly<Partial<Record<ProviderKind, readonly Protocol[]>>> = Object.freeze({
   'openai-compatible': ['openai-responses', 'openai-chat'],
-  'deepseek-compatible': ['openai-responses'],
+  'deepseek-compatible': ['openai-responses', 'openai-chat'],
   'xai-compatible': ['openai-responses', 'openai-chat'],
   'anthropic-compatible': ['anthropic-messages'],
   'kiro-compatible': ['kiro-claude'],
@@ -184,6 +187,12 @@ export function saveApiSourceDraft(
     sourceConfiguration.protocol,
     sourceConfiguration.kind
   )
+  const deepSeekReasoningEffort = providerSourceFamily(sourceConfiguration.kind) === 'deepseek'
+    ? normalizeDeepSeekReasoningEffort(
+        input.deepSeekReasoningEffort ?? existingProvider?.deepSeekReasoningEffort,
+        DEEPSEEK_DEFAULT_REASONING_EFFORT,
+      )
+    : undefined
 
   const suppliedCredential = input.credential?.trim() || undefined
   if (!existingAccount && !suppliedCredential) throw new Error('An API Key is required for a new source.')
@@ -298,6 +307,9 @@ export function saveApiSourceDraft(
       capabilities: { ...model.capabilities, toolCalls: toolRoundtripVerified },
     }))
   }
+  if (providerSourceFamily(sourceConfiguration.kind) === 'deepseek') {
+    modelCatalog = applyDeepSeekModelLimits(modelCatalog)
+  }
 
   const provider: ProviderDefinition = {
     id: providerId,
@@ -313,6 +325,7 @@ export function saveApiSourceDraft(
       && supportsFastServiceTier(sourceConfiguration.protocol)
       && providerSourceFamily(sourceConfiguration.kind) !== 'deepseek'
       && existingProvider?.forceFastMode === true,
+    ...(deepSeekReasoningEffort ? { deepSeekReasoningEffort } : {}),
     ...(responsesCompactMode ? { responsesCompactMode } : {}),
     capabilityProfile,
     ...(requiresToolRoundtripEvidence ? { toolRoundtripVerified } : {}),

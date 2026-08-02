@@ -172,6 +172,13 @@ describe('agent lifecycle control summary', () => {
     expect(primaryAgentActionFor(agent({ installed: false, configured: false }))).toBeUndefined()
   })
 
+  it('lets start repair a stale connection instead of blocking before main-process validation', () => {
+    const stale = agent({ configured: false })
+
+    expect(primaryAgentActionFor(stale)).toBe('start')
+    expect(agentActionBlockReasonFor(stale, [stale], 'start', zh)).toBeUndefined()
+  })
+
   it('shows close and restart for a running client, or only start for a stopped client', () => {
     expect(agentRowActionsFor(agent({ running: true, managedInstanceCount: 1 }))).toEqual(['close', 'restart'])
     expect(agentRowActionsFor(agent({

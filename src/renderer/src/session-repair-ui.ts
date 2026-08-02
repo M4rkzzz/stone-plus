@@ -71,7 +71,7 @@ export function summarizeSessionRepairChanges(
   const scannedSessionFiles = (overview?.sessionFiles ?? 0) + (overview?.archivedSessionFiles ?? 0)
   const sessionFilesToUpdate = preview?.rolloutFilesToUpdate ?? 0
   const indexRowsToUpdate = preview
-    ? preview.sqliteProviderRowsToUpdate + preview.sqliteUserEventRowsToUpdate + preview.sqliteCwdRowsToUpdate
+    ? preview.sqliteProviderRowsToUpdate + preview.sqliteModelRowsToUpdate + preview.sqliteUserEventRowsToUpdate + preview.sqliteCwdRowsToUpdate
     : 0
   const globalStateFieldsToUpdate = preview?.globalStateFieldsToUpdate ?? 0
   const totalChanges = sessionFilesToUpdate + indexRowsToUpdate + globalStateFieldsToUpdate

@@ -5,6 +5,7 @@ import {
   accountQuotaIsExhausted,
   accountRecoveryAt,
   accountRemainingPercent,
+  formatAccountQuotaUsd,
   summarizeAccountQuota,
   thawCountdown,
 } from '../../src/renderer/src/account-quota'
@@ -18,6 +19,12 @@ const baseAccount = {
 } as PublicAccount
 
 describe('account quota summary', () => {
+  it('formats account quota details in USD instead of credits', () => {
+    expect(formatAccountQuotaUsd(12.345, 'en-US')).toBe('$12.35')
+    expect(formatAccountQuotaUsd(0.125, 'zh-CN')).toBe('$0.125')
+    expect(formatAccountQuotaUsd(undefined, 'zh-CN')).toBe('—')
+  })
+
   it('uses the tightest Codex window as effective remaining quota', () => {
     expect(accountRemainingPercent({
       ...baseAccount,

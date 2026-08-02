@@ -5,6 +5,17 @@ export interface AccountQuotaSummary {
   accountCount: number
 }
 
+export function formatAccountQuotaUsd(value: number | undefined, locale: string): string {
+  if (value === undefined) return '—'
+  return new Intl.NumberFormat(locale, {
+    style: 'currency',
+    currency: 'USD',
+    currencyDisplay: 'narrowSymbol',
+    minimumFractionDigits: 2,
+    maximumFractionDigits: value >= 1 ? 2 : 3,
+  }).format(value)
+}
+
 /**
  * Returns the usable percentage for an account. When an upstream exposes
  * multiple rate windows, the tightest window is the account's effective quota.

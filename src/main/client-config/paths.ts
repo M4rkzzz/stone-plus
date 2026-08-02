@@ -50,6 +50,9 @@ export function resolveClientConfigPaths(options: ClientConfigPathOptions): Reso
       // Custom providers may embed bearer tokens or API keys directly in config.toml.
       config: file('codex', 'codex-config', 'toml', pathApi.join(codexDirectory, 'config.toml'), true),
       auth: file('codex', 'codex-auth', 'json', pathApi.join(codexDirectory, 'auth.json'), true),
+      modelCatalog: file('codex', 'codex-model-catalog', 'json', pathApi.join(codexDirectory, 'stone-deepseek-model-catalog.json'), false),
+      agents: file('codex', 'codex-agents', 'text', pathApi.join(codexDirectory, 'AGENTS.md'), false),
+      rules: file('codex', 'codex-rules', 'text', pathApi.join(codexDirectory, 'rules', 'default.rules'), false),
     },
     gemini: {
       directory: geminiDirectory,
@@ -65,7 +68,13 @@ export function resolveClientConfigPaths(options: ClientConfigPathOptions): Reso
 
 export function clientFiles(paths: ResolvedClientConfigPaths, client: SupportedClient): ClientConfigFilePath[] {
   if (client === 'claude') return [paths.claude.settings, ...(paths.claude.mcp ? [paths.claude.mcp] : [])]
-  if (client === 'codex') return [paths.codex.config, paths.codex.auth]
+  if (client === 'codex') return [
+    paths.codex.config,
+    paths.codex.auth,
+    paths.codex.modelCatalog,
+    paths.codex.agents,
+    paths.codex.rules,
+  ]
   if (client === 'gemini') return [paths.gemini.settings, paths.gemini.env]
   return [paths.grokbuild.config]
 }

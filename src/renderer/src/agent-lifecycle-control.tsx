@@ -117,9 +117,9 @@ export function primaryAgentActionFor(agent: AgentLifecycleState): AgentLifecycl
   const canRestore = agent.installed && agent.enabled
     && (agent.capabilities.canRestoreConnection || agent.capabilities.canRepairSessions)
   const canStart = agent.installed && agent.enabled
-    && (isLaunchOnly(agent) || agent.configured)
     && agent.compatibility !== 'unsupported' && canLaunchAgent(agent.capabilities)
   const needsRepair = agent.attention === 'repair' || agent.error?.phase === 'restore-connection'
+    || agent.error?.phase === 'repair-residue'
     || agent.error?.phase === 'repair-sessions' || agent.error?.phase === 'repair-workspace-index'
     || agent.error?.phase === 'validate'
   if (needsRepair && canRestore) return 'restore'
@@ -579,7 +579,7 @@ export function agentActionBlockReasonFor(
   }
 
   if (action === 'start' || action === 'restart' || action === 'restore') {
-    if (!agent.enabled || (!isLaunchOnly(agent) && !agent.configured)) {
+    if (!agent.enabled) {
       return t('该客户端尚未接入 Stone+。请先在“客户端配置”中完成配置。', 'This client is not connected to Stone+. Finish its setup in Client Configuration first.')
     }
     if (agent.compatibility === 'unsupported') {
@@ -648,6 +648,7 @@ export function localizedLifecycleError(error: AgentLifecycleError, t: Translato
     'process-close-failed': ['关闭客户端失败。请手动关闭后重试。', 'The client could not be closed. Close it manually, then try again.'],
     'backup-failed': ['创建安全备份失败，未继续修复。请检查磁盘空间和文件权限。', 'The safety backup failed, so repair did not continue. Check disk space and file permissions.'],
     'configuration-failed': ['写入客户端配置失败。请检查文件权限后重试。', 'Client configuration could not be written. Check file permissions and try again.'],
+    'residue-repair-failed': ['第三方配置残留修正失败，原配置已保留。请关闭 Codex 后重试。', 'Third-party configuration residue could not be repaired. The original configuration was preserved; close Codex and try again.'],
     'session-repair-failed': ['会话数据修复失败，原数据已保留。请重试或查看诊断。', 'Session repair failed and the original data was preserved. Try again or open Diagnostics.'],
     'workspace-index-repair-failed': ['工作区索引修复失败。请关闭客户端后重试。', 'Workspace index repair failed. Close the client and try again.'],
     'validation-failed': ['修复后校验未通过，未应用不完整的配置。请重试。', 'Post-repair validation failed, so the incomplete configuration was not applied. Try again.'],

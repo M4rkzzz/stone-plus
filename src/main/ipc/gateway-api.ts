@@ -3,6 +3,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { lstat, readFile, writeFile } from 'node:fs/promises'
 import { basename, extname, join } from 'node:path'
 import { clientNativeProtocols } from '@shared/types'
+import { codexConnectionRouteMetadata } from '@shared/codex-model-repair'
 import { previewRoute } from '@shared/route-preview'
 import { normalizeProviderHttpUrl } from '@shared/provider-url'
 import { routeReferencesSource } from '@shared/route-models'
@@ -41,7 +42,7 @@ import { applyWindowChromeTheme } from '../window-chrome'
 import type { GatewayAccountState, GatewayConfig, GatewayRuntimeStateUpdate } from '../gateway'
 import { applyGrokBuildHeaders, checkChatGptAccountAuthorized, codexQuotaCooldownUntil, codexQuotaIsExhausted, getProviderAdapter, probeChatGptAccountAuthorized, probeChatGptCodexModel, probeProviderModel, queryChatGptCodexModels, queryChatGptCodexModelsAuthorized, queryChatGptCodexQuota, queryChatGptCodexQuotaAuthorized, queryGrokBuildQuota, resolveChatGptCredential, type GrokBuildQuotaResult, type GrokBuildQuotaSnapshot, type ProviderFailure } from '../providers'
 import { validateAccountImportProxySelection, type AppStore } from '../store/app-store'
-import { clientFiles, type ClientConfigService } from '../client-config'
+import { clientFiles, type ClientConfigService, type ClientConnectionTarget } from '../client-config'
 import { WebDavBackupService, type DatabaseBackupService } from '../backup'
 import type { PersistedState } from '../store/types'
 import { serializeDiagnostics } from './diagnostics'
@@ -2922,7 +2923,10 @@ function scopedClientConfig(service: ClientConfigService, profile?: ClientConfig
   return service.withOverrides({ [key]: profile.directory })
 }
 
-function clientConnectionTarget(store: AppStore, client: RouteClient): { gatewayBaseUrl: string; token: string } {
+function clientConnectionTarget(
+  store: AppStore,
+  client: RouteClient,
+): ClientConnectionTarget {
   const snapshot = store.getSnapshot()
   const route = snapshot.routes.find((candidate) => candidate.client === client)
   if (!route) throw new Error(`The ${client} route does not exist.`)
@@ -2937,7 +2941,10 @@ function clientConnectionTarget(store: AppStore, client: RouteClient): { gateway
   const host = snapshot.gateway.host.includes(':') ? `[${snapshot.gateway.host}]` : snapshot.gateway.host
   return {
     gatewayBaseUrl: `http://${host}:${snapshot.gateway.port}`,
-    token: route.localToken
+    token: route.localToken,
+    ...(client === 'codex'
+      ? codexConnectionRouteMetadata(snapshot, route)
+      : {}),
   }
 }
 

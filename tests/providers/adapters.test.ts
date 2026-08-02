@@ -110,7 +110,7 @@ describe('provider adapter endpoints', () => {
     })
   })
 
-  it('uses native Responses endpoints for official and compatible DeepSeek sources', () => {
+  it('keeps official DeepSeek on Responses and allows compatible Chat relays', () => {
     expect(getProviderAdapter('deepseek')).toBe(deepSeekAdapter)
     expect(getProviderAdapter('deepseek-compatible')).toBe(deepSeekCompatibleAdapter)
     expect(deepSeekAdapter.buildEndpoint({
@@ -123,8 +123,17 @@ describe('provider adapter endpoints', () => {
       protocol: 'openai-responses',
       operation: 'generate',
     })).toBe('http://10.20.30.40:8080/api/v1/responses')
+    expect(deepSeekCompatibleAdapter.buildEndpoint({
+      baseUrl: 'http://10.20.30.40:8080/api/v1',
+      protocol: 'openai-chat',
+      operation: 'generate',
+    })).toBe('http://10.20.30.40:8080/api/v1/chat/completions')
     expect(deepSeekAdapter.capabilities.protocols).toEqual({
       'openai-responses': { streaming: true, toolCalls: true, modelInPath: false },
+    })
+    expect(deepSeekCompatibleAdapter.capabilities.protocols).toMatchObject({
+      'openai-responses': { streaming: true, toolCalls: true, modelInPath: false },
+      'openai-chat': { streaming: true, toolCalls: true, modelInPath: false },
     })
   })
 

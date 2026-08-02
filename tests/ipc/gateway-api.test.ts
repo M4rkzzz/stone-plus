@@ -652,7 +652,14 @@ describe('refresh provider models IPC', () => {
     expect(clientConfig.withOverrides).toHaveBeenCalledWith({ codexDirectory: 'D:\\profiles\\relay-b' })
     expect(repair).toHaveBeenCalledWith(
       'codex',
-      { gatewayBaseUrl: 'http://127.0.0.1:15721', token: 'local-repair-token' },
+      {
+        gatewayBaseUrl: 'http://127.0.0.1:15721',
+        token: 'local-repair-token',
+        codexModelRepair: {
+          modelMap: {},
+          fallbackModel: 'gpt-5.6-sol',
+        },
+      },
       { backupRetention: 7 }
     )
     expect(result).toMatchObject({ rebuiltRoles: ['codex-config'] })

@@ -219,6 +219,7 @@ export class AgentLifecycleService {
       assertRestoreOptions(options)
       const result = await adapter.restore({ preserveRunningState: true, ...options })
       const phases: AgentLifecyclePhase[] = ['inspect', 'close', 'restore-connection']
+      if (target === 'codex-desktop' || target === 'codex-cli') phases.push('repair-residue')
       if (AGENT_CAPABILITIES[target].canRepairSessions && options?.repairSessions !== false) phases.push('repair-sessions')
       phases.push('validate')
       const shouldRun = options?.ensureRunning === true || (before.running && options?.preserveRunningState !== false)
@@ -498,6 +499,7 @@ export class AgentLifecycleService {
       assertRestoreOptions(options)
       const result = await adapter.restore(options)
       const phases: AgentLifecyclePhase[] = ['inspect', 'close', 'restore-connection']
+      if (target === 'codex-desktop' || target === 'codex-cli') phases.push('repair-residue')
       if (AGENT_CAPABILITIES[target].canRepairSessions && options?.repairSessions !== false) phases.push('repair-sessions')
       phases.push('validate')
       const shouldRun = options?.ensureRunning === true || (before.running && options?.preserveRunningState !== false)
@@ -766,6 +768,7 @@ function repairRestartPhases(target: AgentTarget): AgentLifecyclePhase[] {
     'inspect',
     'close',
     'restore-connection',
+    ...(target === 'codex-desktop' || target === 'codex-cli' ? ['repair-residue' as const] : []),
     ...(capabilities.canRepairSessions ? ['repair-sessions' as const] : []),
     'validate',
     'start',
@@ -853,6 +856,7 @@ function phaseForBusyAction(action: AgentLifecycleBusyAction): AgentLifecyclePha
 function mapPhaseCode(phase?: AgentLifecyclePhase): AgentLifecycleError['code'] {
   if (phase === 'close') return 'process-close-failed'
   if (phase === 'restore-connection') return 'configuration-failed'
+  if (phase === 'repair-residue') return 'residue-repair-failed'
   if (phase === 'repair-sessions') return 'session-repair-failed'
   if (phase === 'repair-workspace-index') return 'workspace-index-repair-failed'
   if (phase === 'validate') return 'validation-failed'

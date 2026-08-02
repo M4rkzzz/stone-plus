@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Clock3, LoaderCircle, RefreshCw } from 'lucide-react'
 import type { AppSnapshot, CodexQuotaCycleCosts, CodexQuotaHistoryPoint, CodexQuotaWindow, GatewayApi } from '@shared/types'
 import type { ActionRunner } from '../App'
+import { formatAccountQuotaUsd } from '../account-quota'
 import { localizeBackendError } from '../backend-message'
 import { codexLongQuotaPeriodLabel } from '../codex-quota-period'
 import { useI18n } from '../i18n'
@@ -89,10 +90,10 @@ export function CodexQuotaModal({
     >
       <div className="quota-modal">
         <div className="quota-summary-grid">
-          <QuotaSummary label={t('5 小时额度', '5-hour quota')} window={quota?.fiveHour} stale={stale} credits={cycleCosts.fiveHourCredits} unpricedCreditTokens={cycleCosts.fiveHourUnpricedCreditTokens} />
-          <QuotaSummary label={t(`${longQuotaPeriod}额度`, `${longQuotaPeriod} quota`)} window={quota?.sevenDay} stale={stale} credits={cycleCosts.sevenDayCredits} unpricedCreditTokens={cycleCosts.sevenDayUnpricedCreditTokens} />
+          <QuotaSummary label={t('5 小时额度', '5-hour quota')} window={quota?.fiveHour} stale={stale} costUsd={cycleCosts.fiveHourUsd} unpricedTokens={cycleCosts.fiveHourUnpricedUsdTokens} />
+          <QuotaSummary label={t(`${longQuotaPeriod}额度`, `${longQuotaPeriod} quota`)} window={quota?.sevenDay} stale={stale} costUsd={cycleCosts.sevenDayUsd} unpricedTokens={cycleCosts.sevenDayUnpricedUsdTokens} />
         </div>
-        <div className="quota-credit-note">{t('Credits 按 OpenAI 当前官方 Token 费率由本地请求记录估算；左侧为已记录消耗，右侧为按额度使用比例推算的整周期消耗。缓存写入不计费，Fast 模式附加费不作猜测。', 'Credits are estimated from local request logs using OpenAI’s current official token rate card. The left value is recorded usage and the right value projects the full cycle from the quota percentage. Cache writes are free; Fast-mode surcharges are not guessed.')}</div>
+        <div className="quota-credit-note">{t('美元消耗按 OpenAI 当前官方 Token 费率由本地请求记录估算；左侧为已记录消耗，右侧为按额度使用比例推算的整周期消耗。缓存写入不计费，Fast 模式附加费不作猜测。', 'USD usage is estimated from local request logs using OpenAI’s current official token rate card. The left value is recorded usage and the right value projects the full cycle from the quota percentage. Cache writes are free; Fast-mode surcharges are not guessed.')}</div>
         {quota?.limitReached && <div className="warning-banner"><Clock3 size={17} /><div><strong>{t('上游已标记额度耗尽', 'Upstream reports that the quota is exhausted')}</strong><span>{t('Stone+ 会按实际 429 重置时间冷却账号', 'Stone+ cools the account down until the reset time reported by the actual 429 response.')}</span></div></div>}
         <QuotaTrend
           label={t('5 小时额度 · 最近 24 小时', '5-hour quota · Last 24 hours')}
@@ -127,30 +128,30 @@ function QuotaSummary({
   label,
   window,
   stale,
-  credits,
-  unpricedCreditTokens
+  costUsd,
+  unpricedTokens
 }: {
   label: string
   window?: CodexQuotaWindow
   stale: boolean
-  credits?: number
-  unpricedCreditTokens?: number
+  costUsd?: number
+  unpricedTokens?: number
 }) {
   const { t, locale } = useI18n()
-  const incomplete = (unpricedCreditTokens ?? 0) > 0
-  const displayedCredits = incomplete ? undefined : credits
+  const incomplete = (unpricedTokens ?? 0) > 0
+  const displayedUsd = incomplete ? undefined : costUsd
   return <section className="quota-summary">
     <header><span>{label}</span><Badge tone={!window ? 'neutral' : stale ? 'warning' : window.usedPercent >= 90 ? 'danger' : 'success'}>{!window ? t('未知', 'Unknown') : stale ? t('待刷新', 'Stale') : t('实时', 'Live')}</Badge></header>
     <div className="quota-summary__value">
       <strong>{window ? formatPercent(window.usedPercent, locale) : '—'}</strong>
       <span>{t('% 已使用', '% used')}</span>
       <b title={incomplete
-        ? t('包含官方费率表未列出的模型，无法无损估算 Credits', 'Contains a model absent from the official rate card; credits cannot be estimated losslessly.')
+        ? t('包含官方费率表未列出的模型，无法无损估算美元消耗', 'Contains a model absent from the official rate card; USD usage cannot be estimated losslessly.')
         : undefined}
       >
-        <span>{formatCredits(displayedCredits, locale)}</span>
+        <span>{formatAccountQuotaUsd(displayedUsd, locale)}</span>
         <i>/</i>
-        <span>{formatCredits(projectedQuotaAmount(displayedCredits, window?.usedPercent), locale)}</span>
+        <span>{formatAccountQuotaUsd(projectedQuotaAmount(displayedUsd, window?.usedPercent), locale)}</span>
       </b>
     </div>
     <div className="quota-summary__track"><span style={{ width: `${clampPercent(window?.usedPercent)}%` }} /></div>
@@ -192,12 +193,6 @@ function clampPercent(value: number | undefined): number {
 
 function formatPercent(value: number, locale = 'zh-CN'): string {
   return new Intl.NumberFormat(locale, { maximumFractionDigits: 1 }).format(value)
-}
-
-function formatCredits(value: number | undefined, locale: string): string {
-  if (value === undefined) return '— cr'
-  const digits = value >= 100 ? 1 : value >= 1 ? 2 : 3
-  return `${new Intl.NumberFormat(locale, { maximumFractionDigits: digits }).format(value)} cr`
 }
 
 function projectedQuotaAmount(used: number | undefined, usedPercent: number | undefined): number | undefined {

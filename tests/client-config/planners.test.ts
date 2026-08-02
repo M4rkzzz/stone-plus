@@ -4,6 +4,7 @@ import {
   ClientConfigValidationError,
   planClaudeConfig,
   planCodexConfig,
+  planClientConfigRepair,
   planCodexOfficialLoginConfig,
   planCodexOfficialLoginToml,
   planCodexToml,
@@ -81,6 +82,30 @@ describe('Claude Code planning', () => {
 })
 
 describe('Codex planning', () => {
+  it('repairs third-party model residue to the current Stone+ route alias without changing native models', () => {
+    const policy = {
+      modelMap: {
+        'gpt-5.6-terra': 'deepseek-v4-flash',
+        'gpt-5.6-sol': 'deepseek-v4-pro',
+      },
+      fallbackModel: 'gpt-5.6-sol',
+    }
+    const repaired = planClientConfigRepair('codex', paths, {
+      'codex-config': [
+        'model_provider = "third_party"',
+        'model = "deepseek-v4-flash" # replace upstream residue',
+        'review_model = "deepseek-unknown"',
+        'approval_policy = "never"',
+        '',
+      ].join('\n'),
+    }, { ...target, codexModelRepair: policy })
+    const config = repaired.files.find((file) => file.role === 'codex-config')!.content
+
+    expect(config).toContain('model = "gpt-5.6-terra" # replace upstream residue')
+    expect(config).toContain('review_model = "gpt-5.6-sol"')
+    expect(config).toContain('approval_policy = "never"')
+  })
+
   it('patches config.toml structurally and preserves unrelated sections and comments', () => {
     const source = [
       'model = "gpt-5"',
@@ -215,6 +240,36 @@ describe('Codex planning', () => {
       auth_mode: 'apikey',
       OPENAI_API_KEY: target.token,
     })
+  })
+
+  it('sets and safely clears the Stone-managed DeepSeek context window', () => {
+    const deepSeek = planCodexConfig(paths.codex, {
+      'codex-config': 'model = "deepseek-v4-flash"\n',
+    }, { ...target, modelContextWindow: 1_048_576 })
+    const configured = deepSeek.files.find((file) => file.role === 'codex-config')!.content
+    expect(configured).toContain('model_context_window = 1048576')
+    expect(configured).toContain(`model_catalog_json = "${paths.codex.modelCatalog.path}"`)
+    const catalog = JSON.parse(deepSeek.files.find((file) => file.role === 'codex-model-catalog')!.content)
+    expect(catalog.models.map((model: { slug: string }) => model.slug)).toContain('deepseek-v4-flash')
+    expect(catalog.models[0]).toMatchObject({
+      apply_patch_tool_type: 'freeform',
+      shell_type: 'shell_command',
+      supports_parallel_tool_calls: true,
+      context_window: 1_048_576,
+      max_context_window: 1_048_576,
+      input_modalities: ['text'],
+    })
+
+    const switched = planCodexConfig(paths.codex, { 'codex-config': configured }, target)
+    const switchedConfig = switched.files.find((file) => file.role === 'codex-config')!.content
+    expect(switchedConfig).not.toContain('model_context_window')
+    expect(switchedConfig).not.toContain('model_catalog_json')
+
+    const userOverride = planCodexConfig(paths.codex, {
+      'codex-config': 'model_context_window = 500000\n',
+    }, target)
+    expect(userOverride.files.find((file) => file.role === 'codex-config')!.content)
+      .toContain('model_context_window = 500000')
   })
 
   it('restores official login while preserving cached ChatGPT tokens and unrelated settings', () => {

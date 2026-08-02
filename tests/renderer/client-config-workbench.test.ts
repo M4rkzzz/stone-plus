@@ -192,6 +192,26 @@ describe('client configuration workbench drafts', () => {
 })
 
 describe('client configuration workbench preview', () => {
+  it('treats AGENTS.md and command rules as lossless text documents', () => {
+    const agents = file('codex-agents', '# Original\n', { format: 'text', editable: true })
+    const rules = file('codex-rules', 'prefix_rule(pattern = ["git"], decision = "allow")\n', {
+      format: 'text',
+      editable: true,
+    })
+    const source = editor('codex', [], [agents, rules])
+
+    const preview = buildClientConfigWorkbenchPreview(source, {}, {
+      'codex-agents': '# Updated\n\nUse focused tests.\n',
+      'codex-rules': 'this remains user-authored text even before Codex validates it\n',
+    })
+
+    expect(preview).toMatchObject({ dirty: true, hasErrors: false })
+    expect(preview.documents.map((document) => document.content)).toEqual([
+      '# Updated\n\nUse focused tests.\n',
+      'this remains user-authored text even before Codex validates it\n',
+    ])
+  })
+
   it('overlays changed Codex fields on the complete TOML draft and preserves unknown content', () => {
     const original = [
       '# user comment',

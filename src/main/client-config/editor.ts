@@ -14,14 +14,14 @@ export function createClientConfigEditorFile(
   source: string | undefined,
 ): ClientConfigEditorFile {
   const revision = revisionOf(file, source)
-  if (file.role === 'codex-auth') {
+  if (file.role === 'codex-auth' || file.role === 'codex-model-catalog') {
     return {
       role: file.role,
       path: file.path,
       format: file.format,
       exists: source !== undefined,
       editable: false,
-      containsCredential: true,
+      containsCredential: file.containsCredential,
       ...(source !== undefined ? { content: source } : {}),
       revision,
       protectedValueCount: 0,
@@ -64,11 +64,13 @@ export function restoreClientConfigEditorContent(
     throw new ClientConfigValidationError('A client configuration file is too large')
   }
   if (file.role === 'codex-auth') throw new ClientConfigValidationError('The Codex authentication file is protected')
+  if (file.role === 'codex-model-catalog') throw new ClientConfigValidationError('The generated Codex model catalog is read-only')
   const original = source ?? defaultContent(file.format)
   if (file.role === 'claude-mcp') return restoreClaudeMcp(draft, original)
   if (file.format === 'json') return restoreJsonDocument(draft, original, file.role)
   if (file.format === 'dotenv') return restoreDotenv(draft, original)
-  return restoreTomlDocument(draft, original, file.role)
+  if (file.format === 'toml') return restoreTomlDocument(draft, original, file.role)
+  return draft
 }
 
 /**

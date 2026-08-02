@@ -615,6 +615,165 @@ describe('canonical streaming protocol conversion', () => {
     expect(streamEncoder.getFailure()).toBeUndefined()
   })
 
+  it('passes a native DeepSeek Responses custom tool input through without wrapper validation', () => {
+    const rawInput = 'await tools.codex_app__send_message_to_thread({threadId:"thread_1",prompt:"done"})'
+    const plan: ToolBridgePlan = {
+      dialect: 'deepseek-dsml',
+      tools: [{ sourceType: 'custom', sourceName: 'exec', wireName: 'exec', declared: true }],
+      calls: [],
+    }
+    const streamEncoder = createCanonicalStreamEncoder('openai-responses', {
+      id: 'resp_deepseek_custom', model: 'deepseek-v4-flash', toolBridgePlan: plan,
+    })
+    const wire = new TextDecoder().decode(joinBytes([
+      ...streamEncoder.encode({
+        type: 'tool-call-delta', index: 0, id: 'call_exec', name: 'exec',
+        arguments: rawInput.slice(0, 32), toolType: 'custom_tool_call',
+      }),
+      ...streamEncoder.encode({
+        type: 'tool-call-delta', index: 0, arguments: rawInput.slice(32),
+        toolType: 'custom_tool_call',
+      }),
+      ...streamEncoder.encode({ type: 'tool-call-complete', index: 0 }),
+      ...streamEncoder.encode({ type: 'stop', reason: 'tool_calls' }),
+      ...streamEncoder.encode({ type: 'done' }),
+    ]))
+
+    expect(wire).toContain('event: response.custom_tool_call_input.done')
+    expect(wire).toContain('"name":"exec"')
+    expect(wire).toContain(JSON.stringify(rawInput).slice(1, -1))
+    expect(wire).not.toContain('invalid_custom_tool_arguments')
+    expect(streamEncoder.getFailure()).toBeUndefined()
+  })
+
+  it('restores DeepSeek function-wrapped exec to the original Codex custom tool', () => {
+    const rawInput = [
+      "const match = ALL_TOOLS.find((entry) => entry.name === 'codex_app__send_message_to_thread');",
+      "const result = await tools[match.name]({threadId:'parent',prompt:'ready'});",
+      'text(result);',
+    ].join('\n')
+    const plan: ToolBridgePlan = {
+      dialect: 'deepseek-dsml',
+      tools: [{ sourceType: 'custom', sourceName: 'exec', wireName: 'exec', declared: true }],
+      calls: [],
+      deferredExecSourceName: 'exec',
+    }
+    const streamEncoder = createCanonicalStreamEncoder('openai-responses', {
+      id: 'resp_deepseek_exec_function', model: 'deepseek-v4-flash', toolBridgePlan: plan,
+    })
+    const wire = new TextDecoder().decode(joinBytes([
+      ...streamEncoder.encode({
+        type: 'tool-call-delta', index: 0, id: 'call_exec', name: 'exec',
+        arguments: JSON.stringify({ input: rawInput }), toolType: 'function_call',
+      }),
+      ...streamEncoder.encode({ type: 'tool-call-complete', index: 0 }),
+      ...streamEncoder.encode({ type: 'stop', reason: 'tool_calls' }),
+      ...streamEncoder.encode({ type: 'done' }),
+    ]))
+
+    expect(wire).toContain('"type":"custom_tool_call"')
+    expect(wire).toContain('"name":"exec"')
+    expect(wire).toContain(JSON.stringify(rawInput).slice(1, -1))
+    expect(wire).not.toContain('invalid_custom_tool_arguments')
+    expect(streamEncoder.getFailure()).toBeUndefined()
+  })
+
+  it('routes any undeclared DeepSeek tool through the declared exec runtime', () => {
+    const plan: ToolBridgePlan = {
+      dialect: 'deepseek-dsml',
+      tools: [{ sourceType: 'custom', sourceName: 'exec', wireName: 'exec', declared: true }],
+      calls: [],
+      deferredExecSourceName: 'exec',
+    }
+    const streamEncoder = createCanonicalStreamEncoder('openai-responses', {
+      id: 'resp_deepseek_deferred', model: 'deepseek-v4-flash', toolBridgePlan: plan,
+    })
+    const wire = new TextDecoder().decode(joinBytes([
+      ...streamEncoder.encode({
+        type: 'tool-call-delta', index: 0, id: 'call_send', name: 'send_message_to_thread',
+        arguments: '{"threadId":"thread_1","prompt":"done"}',
+      }),
+      ...streamEncoder.encode({ type: 'tool-call-complete', index: 0 }),
+      ...streamEncoder.encode({ type: 'stop', reason: 'tool_calls' }),
+      ...streamEncoder.encode({ type: 'done' }),
+    ]))
+
+    expect(wire).toContain('"type":"custom_tool_call"')
+    expect(wire).toContain('"name":"exec"')
+    expect(wire).toContain('send_message_to_thread')
+    expect(wire).toContain('availableTools.find')
+    expect(wire).toContain('tools[resolvedName]')
+    expect(streamEncoder.getFailure()).toBeUndefined()
+  })
+
+  it('restores DeepSeek search_tools as a native client tool_search_call', () => {
+    const plan: ToolBridgePlan = {
+      dialect: 'deepseek-dsml',
+      tools: [{
+        sourceType: 'tool_search', sourceName: 'tool_search', wireName: 'search_tools', declared: true,
+      }],
+      calls: [],
+    }
+    const streamEncoder = createCanonicalStreamEncoder('openai-responses', {
+      id: 'resp_deepseek_search', model: 'deepseek-v4-flash', toolBridgePlan: plan,
+    })
+    const wire = new TextDecoder().decode(joinBytes([
+      ...streamEncoder.encode({
+        type: 'tool-call-delta', index: 0, id: 'call_search', name: 'search_tools',
+        arguments: '{"query":"send_message_to_thread","limit":10}',
+      }),
+      ...streamEncoder.encode({ type: 'tool-call-complete', index: 0 }),
+      ...streamEncoder.encode({ type: 'stop', reason: 'tool_calls' }),
+      ...streamEncoder.encode({ type: 'done' }),
+    ]))
+    const events = wire.split('\n')
+      .filter((line) => line.startsWith('data: '))
+      .map((line) => JSON.parse(line.slice(6)) as Record<string, unknown>)
+    const added = events.find((event) => event.type === 'response.output_item.added') as {
+      item: Record<string, unknown>
+    }
+    const done = events.find((event) => event.type === 'response.output_item.done') as {
+      item: Record<string, unknown>
+    }
+    expect(added.item).toMatchObject({
+      type: 'tool_search_call', execution: 'client', call_id: 'call_search',
+      arguments: { query: 'send_message_to_thread', limit: 10 },
+    })
+    expect(done.item).toMatchObject({
+      type: 'tool_search_call', status: 'completed', execution: 'client', call_id: 'call_search',
+    })
+    expect(wire).not.toContain('response.function_call_arguments')
+    expect(streamEncoder.getFailure()).toBeUndefined()
+  })
+
+  it('restores a discovered DeepSeek namespace function with its Codex namespace', () => {
+    const plan: ToolBridgePlan = {
+      dialect: 'deepseek-dsml',
+      tools: [{
+        sourceType: 'function', sourceName: 'send_message_to_thread', sourceNamespace: 'codex_app',
+        wireName: 'codex_app__send_message_to_thread', declared: true,
+      }],
+      calls: [],
+    }
+    const streamEncoder = createCanonicalStreamEncoder('openai-responses', {
+      id: 'resp_deepseek_namespace', model: 'deepseek-v4-flash', toolBridgePlan: plan,
+    })
+    const wire = new TextDecoder().decode(joinBytes([
+      ...streamEncoder.encode({
+        type: 'tool-call-delta', index: 0, id: 'call_send',
+        name: 'codex_app__send_message_to_thread', arguments: '{"threadId":"parent","prompt":"done"}',
+      }),
+      ...streamEncoder.encode({ type: 'tool-call-complete', index: 0 }),
+      ...streamEncoder.encode({ type: 'stop', reason: 'tool_calls' }),
+      ...streamEncoder.encode({ type: 'done' }),
+    ]))
+    expect(wire).toContain('"type":"function_call"')
+    expect(wire).toContain('"namespace":"codex_app"')
+    expect(wire).toContain('"name":"send_message_to_thread"')
+    expect(wire).not.toContain('"name":"codex_app__send_message_to_thread"')
+    expect(streamEncoder.getFailure()).toBeUndefined()
+  })
+
   it('keeps tool-first Responses output indices consistent with the terminal output array', () => {
     const streamEncoder = createCanonicalStreamEncoder('openai-responses', {
       id: 'resp_tool_first', model: 'claude-bridge'

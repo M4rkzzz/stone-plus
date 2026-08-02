@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.9.16
+
+- 完善 DeepSeek V4 在 Codex 中的完整工具链：同时支持原生 Responses DSML 与兼容中转的
+  Chat Completions 方言，恢复函数、自定义工具、工具搜索、命名空间及跨任务消息调用，保持调用 ID、
+  结构化参数、并行批次和流式终止语义；未声明、混合或损坏的工具输出继续 fail-closed。
+- 为 DeepSeek V4 Flash 默认启用最高 `max` 推理档，补齐 1,048,576 Token 上下文、384,000 Token
+  最大输出和 Codex 模型能力目录；仅在整条 Codex 路由均为 DeepSeek 时写入全局窗口，避免混合来源
+  被错误套用限制，并把健康流终态等待放宽到 65 秒。
+- 扩展 DeepSeek-compatible 中转，允许明确选择 OpenAI Responses 或 Chat Completions；来源保存、
+  探测、模型目录、持久化恢复和真实调度使用同一协议与推理强度规则。
+- 加固 Codex 全量配置维护与第三方残留修复：纳入 `config.toml`、认证文件、生成模型目录、
+  `AGENTS.md` 和默认规则文件；重启修复会同步会话 JSONL、SQLite 模型/Provider 索引和工作区状态，
+  并在备份、校验成功后再启动客户端。
+- 修复客户端页显示“配置正常”但生命周期仍判定“未接入”而无法启动的问题；页面与主进程改用同一
+  Codex 连接元数据，旧快照不会再阻止主进程执行配置修复、校验和启动事务。
+- 补齐 DeepSeek V4 Flash/Pro Token 定价与未定价 Token 诊断，额度卡片不再把未知价格误算为零。
+- 将开发、Lint 与 Electron 打包链路中的 `brace-expansion` 固定到对应主版本的安全修订，完整依赖
+  审计恢复为零漏洞，同时保持旧版 `minimatch` 消费者的兼容性。
+
 ## 0.9.13
 
 - 新增 Codex 按模型选择独立来源：默认模型继续使用主号池，精确模型可映射到另一号池或中转站，

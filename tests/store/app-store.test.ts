@@ -1424,7 +1424,11 @@ describe('AppStore', () => {
     const snapshot = store.getSnapshot()
     expect(snapshot.providers.find((candidate) => candidate.id === saved.source.providerId)).toMatchObject({
       models: ['deepseek-v4-flash'],
-      modelCatalog: [expect.objectContaining({ id: 'deepseek-v4-flash' })],
+      modelCatalog: [expect.objectContaining({
+        id: 'deepseek-v4-flash',
+        contextWindow: 1_048_576,
+        maxOutputTokens: 384_000,
+      })],
     })
     expect(snapshot.accounts.find((candidate) => candidate.id === saved.source.accountId)).toMatchObject({
       modelPolicy: 'selected',

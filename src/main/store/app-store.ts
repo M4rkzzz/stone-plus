@@ -12,9 +12,12 @@ import {
 import { accountMatchesPoolProtocol } from '@shared/pool-protocol'
 import { normalizeProviderHttpUrl } from '@shared/provider-url'
 import {
+  applyDeepSeekModelLimits,
+  DEEPSEEK_DEFAULT_REASONING_EFFORT,
   DEEPSEEK_RESPONSES_DEFAULT_MODEL,
   filterOfficialDeepSeekResponsesModels,
   isOfficialDeepSeekResponsesModel,
+  normalizeDeepSeekReasoningEffort,
 } from '@shared/deepseek'
 import {
   accumulateOpenAiTokenCost,
@@ -813,9 +816,13 @@ export class AppStore {
       if (input.kind === 'deepseek' && sourceType !== 'official-api') {
         throw new Error('Official DeepSeek providers must use the official API source type.')
       }
-      if ((input.kind === 'deepseek' || input.kind === 'deepseek-compatible')
-        && input.protocol !== 'openai-responses') {
-        throw new Error('DeepSeek providers use the native Responses API.')
+      if (input.kind === 'deepseek' && input.protocol !== 'openai-responses') {
+        throw new Error('Official DeepSeek providers use the native Responses API.')
+      }
+      if (input.kind === 'deepseek-compatible'
+        && input.protocol !== 'openai-responses'
+        && input.protocol !== 'openai-chat') {
+        throw new Error('DeepSeek-compatible relays must use Responses or Chat Completions.')
       }
       if (input.kind === 'deepseek'
         && normalizeModels(input.models).some((model) => !isOfficialDeepSeekResponsesModel(model))) {
@@ -861,6 +868,12 @@ export class AppStore {
       const normalizedProviderModels = input.kind === 'deepseek'
         ? filterOfficialDeepSeekResponsesModels(normalizeModels(input.models))
         : normalizeModels(input.models)
+      const deepSeekReasoningEffort = providerSourceFamily(input.kind) === 'deepseek'
+        ? normalizeDeepSeekReasoningEffort(
+            input.deepSeekReasoningEffort ?? existing?.deepSeekReasoningEffort,
+            DEEPSEEK_DEFAULT_REASONING_EFFORT,
+          )
+        : undefined
       const provider: ProviderDefinition = {
         id: existing?.id ?? createId(),
         name,
@@ -877,6 +890,7 @@ export class AppStore {
           && supportsFastServiceTier(input.protocol)
           && providerSourceFamily(input.kind) !== 'deepseek'
           && existing?.forceFastMode === true,
+        ...(deepSeekReasoningEffort ? { deepSeekReasoningEffort } : {}),
         ...(responsesCompactMode ? { responsesCompactMode } : {}),
         capabilityProfile: normalizeCapabilityProfile(
           input.capabilityProfile ?? existing?.capabilityProfile,
@@ -989,9 +1003,12 @@ export class AppStore {
         ? filterOfficialDeepSeekResponsesModels(probedModels)
         : probedModels
       const probeUpdatedAt = Math.max(timestamp, provider.updatedAt + 1)
-      const normalizedCatalog = !result.ok && requiresToolRoundtripEvidence
+      let normalizedCatalog = !result.ok && requiresToolRoundtripEvidence
         ? buildModelCatalog(models, capabilityProfile)
         : normalizeModelCatalog(result.modelCatalog, models, capabilityProfile)
+      if (providerSourceFamily(provider.kind) === 'deepseek') {
+        normalizedCatalog = applyDeepSeekModelLimits(normalizedCatalog)
+      }
       replaceById(state.providers, {
         ...provider,
         models,
@@ -3615,8 +3632,10 @@ function normalizePersistedState(
         ? 'official-api' : persistedSourceType
     const protocol = provider.kind === 'xai'
       ? 'openai-responses'
-      : provider.kind === 'deepseek' || provider.kind === 'deepseek-compatible'
+      : provider.kind === 'deepseek'
         ? 'openai-responses'
+      : provider.kind === 'deepseek-compatible'
+        ? provider.protocol === 'openai-chat' ? 'openai-chat' : 'openai-responses'
       : provider.kind === 'kiro-compatible' ? 'kiro-claude' : provider.protocol
     const responsesCompactMode = normalizePersistedResponsesCompactMode(
       provider.responsesCompactMode,
@@ -3627,7 +3646,11 @@ function normalizePersistedState(
     // Provider rows are JSON payloads, so this capability is forward-compatible
     // without a SQLite schema migration. Rebuild the row to remove stale or
     // unknown values before it can enter the runtime gateway configuration.
-    const { responsesCompactMode: _discardedCompactMode, ...baseProvider } = provider
+    const {
+      responsesCompactMode: _discardedCompactMode,
+      deepSeekReasoningEffort: _discardedDeepSeekReasoningEffort,
+      ...baseProvider
+    } = provider
     const persistedModels = normalizeModels(provider.models)
     const normalizedProviderModels = provider.kind === 'deepseek'
       ? filterOfficialDeepSeekResponsesModels(persistedModels)
@@ -3658,14 +3681,26 @@ function normalizePersistedState(
         && supportsFastServiceTier(protocol)
         && providerSourceFamily(provider.kind) !== 'deepseek'
         && provider.forceFastMode === true,
+      ...(providerSourceFamily(provider.kind) === 'deepseek' ? {
+        deepSeekReasoningEffort: normalizeDeepSeekReasoningEffort(
+          provider.deepSeekReasoningEffort,
+          DEEPSEEK_DEFAULT_REASONING_EFFORT,
+        ),
+      } : {}),
       ...(responsesCompactMode ? { responsesCompactMode } : {}),
       capabilityProfile,
-      modelCatalog: normalizeModelCatalog(
-        provider.modelCatalog?.filter((model) => provider.kind !== 'deepseek'
-          || isOfficialDeepSeekResponsesModel(model.id)),
-        normalizedProviderModels,
-        capabilityProfile,
-      ),
+      modelCatalog: providerSourceFamily(provider.kind) === 'deepseek'
+        ? applyDeepSeekModelLimits(normalizeModelCatalog(
+            provider.modelCatalog?.filter((model) => provider.kind !== 'deepseek'
+              || isOfficialDeepSeekResponsesModel(model.id)),
+            normalizedProviderModels,
+            capabilityProfile,
+          ))
+        : normalizeModelCatalog(
+            provider.modelCatalog,
+            normalizedProviderModels,
+            capabilityProfile,
+          ),
     }
     if (provider.kind !== 'kiro-compatible') return normalizedProvider
 

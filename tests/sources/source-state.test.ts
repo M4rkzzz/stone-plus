@@ -143,6 +143,7 @@ describe('API source state changes', () => {
       baseUrl: 'https://api.deepseek.com',
       protocol: 'openai-responses',
       forceFastMode: false,
+      deepSeekReasoningEffort: 'max',
       capabilityProfile: expect.objectContaining({ compact: false, reasoning: true, parallelToolCalls: true }),
     })
 
@@ -164,14 +165,47 @@ describe('API source state changes', () => {
       baseUrl: 'http://10.20.30.40:8080/api',
       protocol: 'openai-responses',
       forceFastMode: false,
+      deepSeekReasoningEffort: 'max',
     })
     expect(relayState.providers[0]).not.toHaveProperty('responsesCompactMode')
     expect(() => setRouteSourceFastModeDraft(relayState, { sourceId: relay.sourceId, enabled: true }, NOW + 1))
       .toThrow(/DeepSeek Responses/)
-    expect(() => saveApiSourceDraft(emptyState(), relayInput({
+
+    saveApiSourceDraft(relayState, relayInput({
+      id: relay.providerId,
+      name: 'DeepSeek relay',
+      kind: 'deepseek-compatible',
+      baseUrl: '10.20.30.40:8080/api',
+      protocol: 'openai-responses',
+      models: ['deepseek-v4-flash'],
+      defaultModel: 'deepseek-v4-flash',
+      deepSeekReasoningEffort: 'low',
+    }), encrypt, NOW + 2)
+    expect(relayState.providers[0].deepSeekReasoningEffort).toBe('low')
+
+    saveApiSourceDraft(relayState, relayInput({
+      id: relay.providerId,
+      name: 'DeepSeek relay',
+      kind: 'deepseek-compatible',
+      baseUrl: '10.20.30.40:8080/api',
+      protocol: 'openai-responses',
+      models: ['deepseek-v4-flash'],
+      defaultModel: 'deepseek-v4-flash',
+    }), encrypt, NOW + 3)
+    expect(relayState.providers[0].deepSeekReasoningEffort).toBe('low')
+
+    const chatState = emptyState()
+    saveApiSourceDraft(chatState, relayInput({
       kind: 'deepseek-compatible',
       protocol: 'openai-chat',
-    }), encrypt, NOW)).toThrow(/does not support/)
+      models: ['deepseek-v4-pro'],
+      defaultModel: 'deepseek-v4-pro',
+    }), encrypt, NOW)
+    expect(chatState.providers[0]).toMatchObject({
+      kind: 'deepseek-compatible',
+      protocol: 'openai-chat',
+      models: ['deepseek-v4-pro'],
+    })
   })
 
   it('rejects unsupported models only for the official DeepSeek Responses source', () => {

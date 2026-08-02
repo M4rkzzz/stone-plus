@@ -12,7 +12,7 @@ export const providerKindLabelsZh: Readonly<Record<ProviderKind, string>> = Obje
   xai: 'Grok / xAI',
   google: 'Google',
   'openai-compatible': 'OpenAI 兼容',
-  'deepseek-compatible': 'DeepSeek Responses 中转',
+  'deepseek-compatible': 'DeepSeek 兼容中转',
   'xai-compatible': 'Grok / xAI 兼容中转',
   'anthropic-compatible': 'Anthropic 兼容',
   'kiro-compatible': 'Kiro Claude 中转',
@@ -26,7 +26,7 @@ export const providerKindLabelsEn: Readonly<Record<ProviderKind, string>> = Obje
   xai: 'Grok / xAI',
   google: 'Google',
   'openai-compatible': 'OpenAI compatible',
-  'deepseek-compatible': 'DeepSeek Responses relay',
+  'deepseek-compatible': 'DeepSeek compatible relay',
   'xai-compatible': 'Grok / xAI compatible relay',
   'anthropic-compatible': 'Anthropic compatible',
   'kiro-compatible': 'Kiro Claude relay',
@@ -40,7 +40,7 @@ export const protocolsByProviderKind: Readonly<Record<ProviderKind, readonly Pro
   xai: ['openai-chat'],
   google: ['gemini'],
   'openai-compatible': ['openai-responses', 'openai-chat'],
-  'deepseek-compatible': ['openai-responses'],
+  'deepseek-compatible': ['openai-responses', 'openai-chat'],
   'xai-compatible': ['openai-responses', 'openai-chat'],
   'anthropic-compatible': ['anthropic-messages'],
   'kiro-compatible': ['kiro-claude'],
@@ -76,7 +76,7 @@ export function protocolAfterProviderKindChange(
 }
 
 export function relayProtocolSelectLocked(kind: ProviderKind): boolean {
-  return kind === KIRO_COMPATIBLE_KIND || kind === DEEPSEEK_COMPATIBLE_KIND
+  return kind === KIRO_COMPATIBLE_KIND
 }
 
 export function protocolOptionLabel(
@@ -86,8 +86,15 @@ export function protocolOptionLabel(
   t: (zh: string, en: string) => string,
 ): string {
   if (kind === KIRO_COMPATIBLE_KIND) return t('Kiro Claude', 'Kiro Claude')
-  if (kind === DEEPSEEK_KIND || kind === DEEPSEEK_COMPATIBLE_KIND) {
+  if (kind === DEEPSEEK_KIND) {
     return t('DeepSeek Responses', 'DeepSeek Responses')
+  }
+  if (kind === DEEPSEEK_COMPATIBLE_KIND) {
+    return protocol === 'openai-responses'
+      ? t('DeepSeek Responses（Flash 原生）', 'DeepSeek Responses (native Flash)')
+      : protocol === 'openai-chat'
+        ? t('DeepSeek Chat（Pro / 旧中转兼容）', 'DeepSeek Chat (Pro / legacy relay compatibility)')
+        : labels[protocol]
   }
   if (kind !== XAI_COMPATIBLE_KIND) return labels[protocol]
   if (protocol === 'openai-responses') {

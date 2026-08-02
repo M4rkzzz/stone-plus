@@ -648,6 +648,7 @@ describe('AgentLifecycleService', () => {
         'inspect',
         'close',
         'restore-connection',
+        'repair-residue',
         'repair-sessions',
         'validate',
         'start',

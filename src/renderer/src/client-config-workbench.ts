@@ -291,7 +291,7 @@ const englishSections: Readonly<Record<string, string>> = Object.freeze({
   'MCP 服务（扩展）': 'MCP servers (extended)',
   '功能开关（扩展）': 'Feature flags (extended)',
   '多代理（扩展）': 'Multi-agent (extended)',
-  'Codex Profiles（扩展）': 'Codex profiles (extended)',
+  '旧版 Codex Profiles（扩展）': 'Legacy Codex profiles (extended)',
   '项目配置（扩展）': 'Project configuration (extended)',
   '插件（扩展）': 'Plugins (extended)',
   '插件市场（扩展）': 'Plugin marketplaces (extended)',

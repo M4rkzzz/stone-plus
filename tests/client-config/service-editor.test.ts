@@ -85,6 +85,47 @@ describe('ClientConfigService editor workflow', () => {
     expect(saved).toContain(`Authorization = "Bearer ${headerSecret}"`)
   })
 
+  it('edits and restores AGENTS.md and default.rules inside the selected CODEX_HOME profile', async () => {
+    const profileDirectory = join(homeDir, 'codex-profiles', 'work')
+    const scoped = service.withOverrides({ codexDirectory: profileDirectory })
+    const target = {
+      gatewayBaseUrl: 'http://127.0.0.1:15721',
+      token: 'stone-target-token',
+    }
+    await scoped.apply('codex', target)
+    await mkdir(join(profileDirectory, 'rules'), { recursive: true })
+    const originalAgents = '# Work profile\n\nKeep the original instruction.\n'
+    const originalRules = 'prefix_rule(pattern = ["git", "status"], decision = "allow")\n'
+    await writeFile(scoped.paths.codex.agents.path, originalAgents)
+    await writeFile(scoped.paths.codex.rules.path, originalRules)
+
+    const snapshot = await scoped.editor('codex')
+    const agents = snapshot.files.find((file) => file.role === 'codex-agents')!
+    const rules = snapshot.files.find((file) => file.role === 'codex-rules')!
+    expect(agents).toMatchObject({ path: scoped.paths.codex.agents.path, format: 'text', editable: true })
+    expect(rules).toMatchObject({ path: scoped.paths.codex.rules.path, format: 'text', editable: true })
+
+    const changedAgents = originalAgents.replace('original', 'updated')
+    const changedRules = originalRules.replace('"allow"', '"prompt"')
+    const result = await scoped.applyEditor('codex', target, {
+      patches: [],
+      files: [
+        { role: agents.role, revision: agents.revision, content: changedAgents },
+        { role: rules.role, revision: rules.revision, content: changedRules },
+      ],
+    })
+
+    expect(result.changedFiles).toEqual([scoped.paths.codex.agents.path, scoped.paths.codex.rules.path])
+    expect(result.backups.map((backup) => backup.role)).toEqual(['codex-agents', 'codex-rules'])
+    expect(await readFile(scoped.paths.codex.agents.path, 'utf8')).toBe(changedAgents)
+    expect(await readFile(scoped.paths.codex.rules.path, 'utf8')).toBe(changedRules)
+
+    await scoped.restoreBackupSet('codex', result.backups[0].groupId)
+    expect(await readFile(scoped.paths.codex.agents.path, 'utf8')).toBe(originalAgents)
+    expect(await readFile(scoped.paths.codex.rules.path, 'utf8')).toBe(originalRules)
+    await expect(readFile(service.paths.codex.agents.path, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
   it('rejects a stale advanced-editor revision before writing or creating a backup', async () => {
     const original = JSON.stringify({ model: 'original', env: { TOKEN: 'original-token' } }, null, 2) + '\n'
     const externallyChanged = JSON.stringify({ model: 'external-change', env: { TOKEN: 'external-token' } }, null, 2) + '\n'

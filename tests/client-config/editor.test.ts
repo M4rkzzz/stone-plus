@@ -10,15 +10,22 @@ import { resolveClientConfigPaths } from '../../src/main/client-config/paths'
 const paths = resolveClientConfigPaths({ homeDir: '/home/tester', platform: 'linux' })
 
 describe('client configuration editor display', () => {
-  it('shows JSON, dotenv, TOML, and Codex authentication values in plaintext', () => {
+  it('shows JSON, dotenv, TOML, text, and Codex authentication values in plaintext', () => {
     const json = '{"env":{"ANTHROPIC_AUTH_TOKEN":"claude-secret"}}\n'
     const dotenv = 'GEMINI_API_KEY="gemini-secret"\r\n'
     const toml = 'api_key = "grok-secret"\n'
     const auth = '{"OPENAI_API_KEY":"codex-secret"}\n'
+    const agents = '# Personal instructions\n'
 
     expect(createClientConfigEditorFile(paths.claude.settings, json)).toMatchObject({ content: json, protectedValueCount: 0 })
     expect(createClientConfigEditorFile(paths.gemini.env, dotenv)).toMatchObject({ content: dotenv, protectedValueCount: 0 })
     expect(createClientConfigEditorFile(paths.grokbuild.config, toml)).toMatchObject({ content: toml, protectedValueCount: 0 })
+    expect(createClientConfigEditorFile(paths.codex.agents, agents)).toMatchObject({
+      content: agents,
+      editable: true,
+      format: 'text',
+      protectedValueCount: 0,
+    })
     expect(createClientConfigEditorFile(paths.codex.auth, auth)).toMatchObject({
       content: auth,
       editable: false,
@@ -30,6 +37,7 @@ describe('client configuration editor display', () => {
     const jsonSource = '{"env":{"TOKEN":"old-json-secret"}}\n'
     const tomlSource = 'api_key = "old-toml-secret"\n'
     const dotenvSource = 'API_KEY="old-dotenv-secret"\n'
+    const textSource = '# Original instructions\n'
 
     expect(restoreClientConfigEditorContent(
       paths.claude.settings,
@@ -46,6 +54,11 @@ describe('client configuration editor display', () => {
       dotenvSource.replace('old-dotenv-secret', 'new-dotenv-secret'),
       dotenvSource,
     )).toContain('new-dotenv-secret')
+    expect(restoreClientConfigEditorContent(
+      paths.codex.agents,
+      '# Updated instructions\n',
+      textSource,
+    )).toBe('# Updated instructions\n')
   })
 
   it('projects only Claude MCP servers while displaying their values in plaintext', () => {

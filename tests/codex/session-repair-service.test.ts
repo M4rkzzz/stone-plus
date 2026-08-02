@@ -308,6 +308,67 @@ describe('CodexSessionRepairService', () => {
     expect(after.sqliteCwdRowsToUpdate).toBe(0)
   })
 
+  it('repairs persisted upstream models while preserving native models during restart repair', async () => {
+    const { service, codexHome, databasePath } = await createFixture()
+    const database = new DatabaseSync(databasePath)
+    database.exec('ALTER TABLE threads ADD COLUMN model TEXT')
+    database.prepare('UPDATE threads SET model = ? WHERE id = ?').run('deepseek-v4-flash', 'thread-one')
+    database.prepare('UPDATE threads SET model = ? WHERE id = ?').run('deepseek-unmapped', 'orphan-thread')
+    database.prepare('UPDATE threads SET model = ? WHERE id = ?').run('gpt-5.6-luna', 'thread-two')
+    database.close()
+    const staleModelCache = JSON.stringify({
+      fetched_at: '2026-08-01T00:00:00Z',
+      models: [{ slug: 'deepseek-v4-flash' }, { slug: 'deepseek-v4-pro' }],
+    })
+    await writeFile(join(codexHome, 'models_cache.json'), staleModelCache)
+
+    const result = await service.analyzeAndRepair('stone', undefined, {
+      modelRepair: {
+        modelMap: { 'gpt-5.6-terra': 'deepseek-v4-flash' },
+        fallbackModel: 'gpt-5.6-sol',
+      },
+    })
+
+    const repaired = new DatabaseSync(databasePath, { readOnly: true })
+    const rows = repaired.prepare('SELECT id, model FROM threads ORDER BY id').all() as Array<Record<string, unknown>>
+    repaired.close()
+    expect(rows).toEqual([
+      { id: 'orphan-thread', model: 'gpt-5.6-sol' },
+      { id: 'thread-one', model: 'gpt-5.6-terra' },
+      { id: 'thread-two', model: 'gpt-5.6-luna' },
+    ])
+    await expect(readFile(join(codexHome, 'models_cache.json'))).rejects.toMatchObject({ code: 'ENOENT' })
+    expect(await readFile(join(result.backupPath!, 'models_cache.json'), 'utf8')).toBe(staleModelCache)
+    expect(JSON.parse(await readFile(join(result.backupPath!, 'metadata.json'), 'utf8'))).toMatchObject({
+      invalidatedModelCache: true,
+    })
+  })
+
+  it('leaves the Codex model catalog untouched during ordinary provider-only session repair', async () => {
+    const { service, codexHome } = await createFixture()
+    const cachePath = join(codexHome, 'models_cache.json')
+    const modelCache = JSON.stringify({ models: [{ slug: 'gpt-5.6-sol' }] })
+    await writeFile(cachePath, modelCache)
+
+    await service.analyzeAndRepair('stone')
+
+    expect(await readFile(cachePath, 'utf8')).toBe(modelCache)
+  })
+
+  it('refuses a stale residue preview after the model catalog changes', async () => {
+    const { service, codexHome } = await createFixture()
+    const cachePath = join(codexHome, 'models_cache.json')
+    const modelRepair = { modelMap: {}, fallbackModel: 'gpt-5.6-sol' }
+    await writeFile(cachePath, JSON.stringify({ models: [{ slug: 'deepseek-v4-flash' }] }))
+    const preview = await service.preview('stone', { modelRepair })
+    const refreshed = JSON.stringify({ models: [{ slug: 'gpt-5.6-sol' }] })
+    await writeFile(cachePath, refreshed)
+
+    await expect(service.repair('stone', preview.revision, { modelRepair }))
+      .rejects.toThrow('预览后发生变化')
+    expect(await readFile(cachePath, 'utf8')).toBe(refreshed)
+  })
+
   it('recognizes and repairs a session_meta line larger than the old 1 MiB scan prefix', async () => {
     const { service, codexHome } = await createFixture()
     const directory = join(codexHome, 'sessions', '2026', '07', '19')

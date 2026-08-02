@@ -36,8 +36,10 @@ import { DEFAULT_ACCOUNT_MAX_CONCURRENCY, supportsFastServiceTier, supportsPoolF
 import { accountMatchesPoolProtocol } from '@shared/pool-protocol'
 import { normalizeProviderHttpUrl } from '@shared/provider-url'
 import {
+  DEEPSEEK_DEFAULT_REASONING_EFFORT,
   DEEPSEEK_RESPONSES_DEFAULT_MODEL,
   isOfficialDeepSeekResponsesModel,
+  normalizeDeepSeekReasoningEffort,
 } from '@shared/deepseek'
 import { providerSourceFamily } from '@shared/source-family'
 import {
@@ -844,6 +846,9 @@ function normalizeMockApiSourceInput(input: ApiSourceInput): ApiSourceInput & { 
     responsesCompactMode: input.kind === 'deepseek' || input.kind === 'deepseek-compatible'
       ? undefined
       : input.responsesCompactMode,
+    deepSeekReasoningEffort: providerSourceFamily(input.kind) === 'deepseek'
+      ? normalizeDeepSeekReasoningEffort(input.deepSeekReasoningEffort, DEEPSEEK_DEFAULT_REASONING_EFFORT)
+      : undefined,
     proxyId: input.proxyId?.trim() || undefined,
   }
 }
@@ -873,6 +878,9 @@ const mockClientFiles: Record<RouteClient, Array<{ role: ClientConfigFileRole; p
   codex: [
     { role: 'codex-config', path: '~/.codex/config.toml', containsCredential: true },
     { role: 'codex-auth', path: '~/.codex/auth.json', containsCredential: true },
+    { role: 'codex-model-catalog', path: '~/.codex/stone-deepseek-model-catalog.json', containsCredential: false },
+    { role: 'codex-agents', path: '~/.codex/AGENTS.md', containsCredential: false },
+    { role: 'codex-rules', path: '~/.codex/rules/default.rules', containsCredential: false },
   ],
   gemini: [
     { role: 'gemini-settings', path: '~/.gemini/settings.json', containsCredential: false },
@@ -891,6 +899,9 @@ const mockEditorContent: Record<RouteClient, Partial<Record<ClientConfigFileRole
   codex: {
     'codex-config': 'model_provider = "stone"\nmodel = "gpt-5.6-sol"\nmodel_reasoning_effort = "medium"\nmodel_reasoning_summary = "auto"\nmodel_verbosity = "medium"\npersonality = "pragmatic"\napproval_policy = "on-request"\nsandbox_mode = "workspace-write"\nweb_search = "cached"\ncli_auth_credentials_store = "file"\n\n[features]\nfast_mode = true\nmulti_agent = true\n\n[agents]\nmax_threads = 6\n\n[windows]\nsandbox = "elevated"\n\n[model_providers.stone]\nname = "OpenAI"\nbase_url = "http://127.0.0.1:15720/v1"\nwire_api = "responses"\nrequires_openai_auth = true\n',
     'codex-auth': '{\n  "OPENAI_API_KEY": "stone-demo-codex-token"\n}\n',
+    'codex-model-catalog': '{\n  "models": []\n}\n',
+    'codex-agents': '# Personal Codex instructions\n\nKeep changes focused and run relevant tests.\n',
+    'codex-rules': 'prefix_rule(pattern = ["git", "status"], decision = "allow")\n',
   },
   gemini: { 'gemini-settings': '{\n  "model": { "name": "gemini-2.5-pro" },\n  "general": { "defaultApprovalMode": "default" },\n  "ui": { "theme": "Default" }\n}\n', 'gemini-env': 'GEMINI_API_KEY="stone-demo-gemini-token"\nGOOGLE_GEMINI_BASE_URL="http://127.0.0.1:15720"\n' },
   grokbuild: {
@@ -932,9 +943,10 @@ const mockEditorFields: Record<RouteClient, ClientConfigEditorState['fields']> =
   ],
 }
 
-function mockConfigFormat(role: ClientConfigFileRole): 'json' | 'toml' | 'dotenv' {
+function mockConfigFormat(role: ClientConfigFileRole): 'json' | 'toml' | 'dotenv' | 'text' {
   if (role === 'codex-config' || role === 'grok-config') return 'toml'
   if (role === 'gemini-env') return 'dotenv'
+  if (role === 'codex-agents' || role === 'codex-rules') return 'text'
   return 'json'
 }
 
@@ -1363,8 +1375,13 @@ export function createMockApi(): GatewayApi {
       if (input.kind === 'deepseek-compatible' && sourceType !== 'relay') {
         throw new Error(mockText('DeepSeek 兼容来源必须使用中转站类型', 'DeepSeek-compatible sources must use the relay type'))
       }
-      if ((input.kind === 'deepseek' || input.kind === 'deepseek-compatible') && input.protocol !== 'openai-responses') {
+      if (input.kind === 'deepseek' && input.protocol !== 'openai-responses') {
         throw new Error(mockText('DeepSeek 来源使用原生 Responses API', 'DeepSeek sources use the native Responses API'))
+      }
+      if (input.kind === 'deepseek-compatible'
+        && input.protocol !== 'openai-responses'
+        && input.protocol !== 'openai-chat') {
+        throw new Error(mockText('DeepSeek 兼容来源必须使用 Responses 或 Chat Completions', 'DeepSeek-compatible sources must use Responses or Chat Completions'))
       }
       const provider: ProviderDefinition = {
         ...input,
@@ -2199,6 +2216,12 @@ export function createMockApi(): GatewayApi {
         responsesCompactMode: input.kind === 'deepseek' || input.kind === 'deepseek-compatible'
           ? undefined
           : input.responsesCompactMode,
+        deepSeekReasoningEffort: providerSourceFamily(input.kind) === 'deepseek'
+          ? normalizeDeepSeekReasoningEffort(
+              input.deepSeekReasoningEffort ?? existing?.deepSeekReasoningEffort,
+              DEEPSEEK_DEFAULT_REASONING_EFFORT,
+            )
+          : undefined,
         models,
         capabilityProfile: evidence ? input.capabilityProfile : connectionChanged ? undefined : existing?.capabilityProfile,
         toolRoundtripVerified: connectionChanged ? false : existing?.toolRoundtripVerified,
@@ -2595,6 +2618,8 @@ export function createMockApi(): GatewayApi {
       return {
         fiveHourUsd: 12.486,
         sevenDayUsd: 184.32,
+        fiveHourUnpricedUsdTokens: 0,
+        sevenDayUnpricedUsdTokens: 0,
         fiveHourCredits: 312.15,
         sevenDayCredits: 4_608,
         fiveHourUnpricedCreditTokens: 0,
@@ -2794,7 +2819,7 @@ export function createMockApi(): GatewayApi {
         fields: clone(mockEditorFields[client]),
         files: mockClientFiles[client].map((file) => {
           const content = mockEditorContent[client][file.role]
-          const editable = file.role !== 'codex-auth'
+          const editable = file.role !== 'codex-auth' && file.role !== 'codex-model-catalog'
           return {
             role: file.role,
             path: file.path,
@@ -3021,6 +3046,7 @@ export function createMockApi(): GatewayApi {
         rolloutFilesWithoutSessionMeta: 0,
         rolloutFilesAlreadyTargetProvider: targetProvider === 'stone' ? 90 : 18,
         sqliteProviderRowsToUpdate: targetProvider === 'stone' ? 21 : 86,
+        sqliteModelRowsToUpdate: 0,
         sqliteUserEventRowsToUpdate: 2,
         sqliteCwdRowsToUpdate: 3,
         globalStateFieldsToUpdate: 2,
@@ -3057,6 +3083,7 @@ export function createMockApi(): GatewayApi {
         targetProvider,
         repairedRolloutFiles: 18,
         sqliteProviderRowsUpdated: 21,
+        sqliteModelRowsUpdated: 0,
         sqliteUserEventRowsUpdated: 2,
         sqliteCwdRowsUpdated: 3,
         globalStateFieldsUpdated: 2,

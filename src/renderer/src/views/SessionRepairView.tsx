@@ -306,7 +306,7 @@ export function SessionRepairView({ api }: { api: GatewayApi }) {
         <div className="client-config-notice session-repair-notice">
           <CheckCircle2 size={17} />
           <span>
-            {t('已同步到', 'Synchronized to')} <strong>{result.targetProvider}</strong>{t(`：修复 ${result.repairedRolloutFiles} 个会话文件、${result.sqliteProviderRowsUpdated + result.sqliteUserEventRowsUpdated + result.sqliteCwdRowsUpdated} 行索引及 ${result.globalStateFieldsUpdated} 个工作区状态字段。`, `: repaired ${result.repairedRolloutFiles} session files, ${result.sqliteProviderRowsUpdated + result.sqliteUserEventRowsUpdated + result.sqliteCwdRowsUpdated} index rows, and ${result.globalStateFieldsUpdated} workspace-state fields.`)}
+            {t('已同步到', 'Synchronized to')} <strong>{result.targetProvider}</strong>{t(`：修复 ${result.repairedRolloutFiles} 个会话文件、${result.sqliteProviderRowsUpdated + result.sqliteModelRowsUpdated + result.sqliteUserEventRowsUpdated + result.sqliteCwdRowsUpdated} 行索引及 ${result.globalStateFieldsUpdated} 个工作区状态字段。`, `: repaired ${result.repairedRolloutFiles} session files, ${result.sqliteProviderRowsUpdated + result.sqliteModelRowsUpdated + result.sqliteUserEventRowsUpdated + result.sqliteCwdRowsUpdated} index rows, and ${result.globalStateFieldsUpdated} workspace-state fields.`)}
             {result.backupPath && <small className="mono">{t('备份', 'Backup')}: {result.backupPath}</small>}
             {result.retentionWarning && <small>{localizeBackendMessage(result.retentionWarning, language, t('旧备份清理失败', 'Old backups could not be cleaned up.'))}</small>}
             {refreshWarning && <small>{refreshWarning}</small>}
@@ -397,6 +397,7 @@ export function SessionRepairView({ api }: { api: GatewayApi }) {
           <div className="session-repair-preview">
             <div><span>{t('会话文件待同步', 'Session files pending')}</span><strong>{preview.rolloutFilesToUpdate}</strong><small>{t(`${totalRollouts} 个已扫描 · ${changeSummary.parsedSessionFiles} 个已识别 · ${changeSummary.synchronizedSessionFiles} 个已同步`, `${totalRollouts} scanned · ${changeSummary.parsedSessionFiles} recognized · ${changeSummary.synchronizedSessionFiles} synchronized`)}</small></div>
             <div><span>SQLite provider</span><strong>{preview.sqliteProviderRowsToUpdate}</strong><small>{t('行线程归属', 'thread-owner rows')}</small></div>
+            <div><span>{t('模型残留', 'Model residue')}</span><strong>{preview.sqliteModelRowsToUpdate}</strong><small>{t('行第三方模型', 'third-party model rows')}</small></div>
             <div><span>{t('用户事件索引', 'User-event index')}</span><strong>{preview.sqliteUserEventRowsToUpdate}</strong><small>{t('行可见性标记', 'visibility rows')}</small></div>
             <div><span>{t('工作区索引', 'Workspace index')}</span><strong>{preview.sqliteCwdRowsToUpdate}</strong><small>{t('行 cwd 路径', 'cwd path rows')}</small></div>
             <div><span>{t('全局工作区状态', 'Global workspace state')}</span><strong>{preview.globalStateFieldsToUpdate}</strong><small>{t('个路径字段', 'path fields')}</small></div>

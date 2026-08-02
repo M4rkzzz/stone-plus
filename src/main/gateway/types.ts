@@ -152,21 +152,23 @@ export interface ProtocolRequest {
   conversionContext?: ProtocolConversionContext
 }
 
-export type ProtocolConversionDialect = 'xai-grok'
+export type ProtocolConversionDialect = 'xai-grok' | 'deepseek-chat' | 'deepseek-dsml'
 
 export interface ToolBridgeBinding {
-  sourceType: 'function' | 'custom'
+  sourceType: 'function' | 'custom' | 'tool_search'
   sourceName: string
   /** Original Codex namespace for a flattened function declaration. */
   sourceNamespace?: string
   wireName: string
+  /** Deferred Codex app tool that must execute through the declared exec runtime. */
+  deferredToolName?: string
   /** Declarations from the current request may be called by the upstream model. */
   declared?: boolean
 }
 
 export interface ToolCallBridgeBinding {
   callId: string
-  sourceType: 'function' | 'custom'
+  sourceType: 'function' | 'custom' | 'tool_search'
   sourceName?: string
   sourceNamespace?: string
   wireName?: string
@@ -177,6 +179,8 @@ export interface ToolBridgePlan {
   dialect: ProtocolConversionDialect
   tools: ToolBridgeBinding[]
   calls: ToolCallBridgeBinding[]
+  /** Declared Codex custom runtime used to execute DeepSeek's deferred tool names. */
+  deferredExecSourceName?: string
   /** Same-protocol Responses traffic must pass through the response restorer. */
   requiresResponseBridge?: boolean
   /** Preserve the originating Responses request's execution constraint. */

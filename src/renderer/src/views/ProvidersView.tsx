@@ -50,6 +50,11 @@ import { DEFAULT_ACCOUNT_MAX_CONCURRENCY } from '@shared/types'
 import { providerSourceFamily, type ProviderSourceFamily } from '@shared/source-family'
 import { accountMatchesPoolProtocol } from '@shared/pool-protocol'
 import { normalizeProviderHttpUrl } from '@shared/provider-url'
+import {
+  DEEPSEEK_DEFAULT_REASONING_EFFORT,
+  normalizeDeepSeekReasoningEffort,
+  type DeepSeekReasoningEffort,
+} from '@shared/deepseek'
 import { hasVerifiedKiroToolBridge } from '@shared/route-sources'
 import type { ActionRunner } from '../App'
 import { accountIsCooling, accountQuotaIsExhausted, accountRecoveryAt, thawCountdown } from '../account-quota'
@@ -405,6 +410,9 @@ function ApiSourceForm({
             responsesCompactMode: relayCanConfigureResponsesCompact(draft.sourceType, protocol, kind)
               ? effectiveResponsesCompactMode(draft.responsesCompactMode)
               : undefined,
+            deepSeekReasoningEffort: providerSourceFamily(kind) === 'deepseek'
+              ? normalizeDeepSeekReasoningEffort(draft.deepSeekReasoningEffort)
+              : undefined,
             ...(kind === DEEPSEEK_KIND ? {
               modelsText: draft.modelsText.trim() ? draft.modelsText : 'deepseek-v4-flash',
               defaultModel: draft.defaultModel.trim() ? draft.defaultModel : 'deepseek-v4-flash',
@@ -430,7 +438,10 @@ function ApiSourceForm({
         </select>
         {draft.kind === XAI_COMPATIBLE_KIND && <small>{t('默认使用官方当前主路径 Responses；仅当中转明确只兼容 Chat Completions 时选择高级兼容模式。', 'Responses is the current primary API path. Choose advanced Chat compatibility only when the relay explicitly requires Chat Completions.')}</small>}
         {draft.kind === KIRO_COMPATIBLE_KIND && <small>{t('仅供 Claude Code CLI、Desktop 与 VSC 使用；Stone+ 会强制启用结构化工具兼容。', 'Available only to Claude Code CLI, Desktop, and VSC. Stone+ always enables the structured tool bridge.')}</small>}
-        {(draft.kind === DEEPSEEK_KIND || draft.kind === DEEPSEEK_COMPATIBLE_KIND) && <small>{t('DeepSeek Responses 原生直通，仅供 Codex 路由选择；不经过 Chat Completions 转换。', 'Native DeepSeek Responses passthrough, available only to Codex routes; no Chat Completions conversion is used.')}</small>}
+        {draft.kind === DEEPSEEK_KIND && <small>{t('官方 DeepSeek 当前仅开放 Flash 的 Responses；仅供 Codex 路由选择。', 'The official DeepSeek API currently exposes Responses for Flash only; available only to Codex routes.')}</small>}
+        {draft.kind === DEEPSEEK_COMPATIBLE_KIND && <small>{draft.protocol === 'openai-chat'
+          ? t('供 Pro 或旧式 Chat 中转使用；Stone+ 在本地完成 Responses ↔ Chat 工具与流式转换。', 'For Pro or legacy Chat relays; Stone+ locally converts Responses ↔ Chat tools and streams.')
+          : t('供原生 Responses 中转使用；Stone+ 保留 DeepSeek 工具桥与流式终止语义。', 'For native Responses relays; Stone+ preserves the DeepSeek tool bridge and stream termination semantics.')}</small>}
       </label>
       {relayCanConfigureResponsesCompact(draft.sourceType, draft.protocol, draft.kind) && <label className="field field--full">
         <span className="field-label-with-help">{t('Responses Compact 能力', 'Responses compact capability')}<InfoTip text={t(compactCopy.helpZh, compactCopy.helpEn)} /></span>
@@ -442,6 +453,16 @@ function ApiSourceForm({
         <ShieldCheck size={16} />
         <span>{t('官方 OpenAI 自动使用完整原生 Compact', 'Official OpenAI automatically uses full native compact')}<InfoTip text={t('该能力由 Stone+ 按官方 Responses 协议自动管理，包括 compact 请求和后续 opaque 历史，无需手动配置。', 'Stone+ manages this automatically using the official Responses protocol, including compact requests and subsequent opaque history. No manual setting is needed.')} /></span>
       </div>}
+      {providerSourceFamily(draft.kind) === 'deepseek' && <label className="field field--full">
+        <span className="field-label-with-help">{t('DeepSeek 思考强度', 'DeepSeek thinking effort')}<InfoTip text={t('这是 DeepSeek 来源级策略，会覆盖 Codex 当前模型的通用推理档位，避免 xhigh 等 OpenAI 档位被 DeepSeek 映射成非预期强度。', 'This source-level DeepSeek policy overrides the current Codex model effort so OpenAI-specific tiers such as xhigh cannot be mapped unexpectedly by DeepSeek.')} /></span>
+        <select value={draft.deepSeekReasoningEffort ?? DEEPSEEK_DEFAULT_REASONING_EFFORT} onChange={(event) => setDraft({ ...draft, deepSeekReasoningEffort: event.target.value as DeepSeekReasoningEffort })}>
+          <option value="none">{t('关闭思考', 'Thinking off')}</option>
+          <option value="low">Low</option>
+          <option value="high">High</option>
+          <option value="max">Max · {t('最高（默认）', 'Maximum (default)')}</option>
+        </select>
+        <small>{t('新来源和旧版来源默认使用 Max；切换仅影响命中此 DeepSeek 来源的新请求。', 'New and legacy sources default to Max. Changes affect only new requests routed to this DeepSeek source.')}</small>
+      </label>}
       <label className="field field--full">
         <span className="field-label-with-help">{draft.kind === KIRO_COMPATIBLE_KIND ? t('完整 GenerateAssistantResponse 端点', 'Full GenerateAssistantResponse endpoint') : t('基础地址', 'Base URL')}{draft.sourceType === 'official-api' && <InfoTip text={t('官方 API 地址由 Stone+ 锁定，避免误接到第三方中转端点。', 'Stone+ locks official API URLs to prevent accidental routing through a third-party relay.')} />}</span>
         <input className="mono" disabled={draft.sourceType === 'official-api'} value={draft.baseUrl} onChange={(event) => setDraft({ ...draft, baseUrl: event.target.value })} placeholder={draft.kind === KIRO_COMPATIBLE_KIND ? '192.168.1.10:8080/generateAssistantResponse' : '192.168.1.10:8080/v1'} />
@@ -1005,6 +1026,9 @@ export function ProvidersView({
       kind: provider.kind,
       baseUrl: provider.baseUrl,
       protocol: provider.protocol,
+      deepSeekReasoningEffort: providerSourceFamily(provider.kind) === 'deepseek'
+        ? normalizeDeepSeekReasoningEffort(provider.deepSeekReasoningEffort)
+        : undefined,
       responsesCompactMode: relayCanConfigureResponsesCompact(provider.sourceType, provider.protocol, provider.kind)
         ? effectiveResponsesCompactMode(provider.responsesCompactMode)
         : undefined,
@@ -1235,6 +1259,9 @@ export function ProvidersView({
     const nextProvider = {
       kind: providerDraft.kind,
       protocol: providerDraft.protocol,
+      deepSeekReasoningEffort: providerSourceFamily(providerDraft.kind) === 'deepseek'
+        ? normalizeDeepSeekReasoningEffort(providerDraft.deepSeekReasoningEffort)
+        : undefined,
       sourceType: providerDraft.sourceType,
     }
     const incompatiblePools = sourceAccount
@@ -1308,6 +1335,9 @@ export function ProvidersView({
         kind: draft.kind,
         baseUrl: draft.kind === KIRO_COMPATIBLE_KIND ? draft.baseUrl.trim() : draft.baseUrl.replace(/\/$/, ''),
         protocol: draft.protocol,
+        deepSeekReasoningEffort: providerSourceFamily(draft.kind) === 'deepseek'
+          ? normalizeDeepSeekReasoningEffort(draft.deepSeekReasoningEffort)
+          : undefined,
         responsesCompactMode: draft.responsesCompactMode,
         credential: draft.credential?.trim() || undefined,
         model: draft.defaultModel.trim() || undefined,
@@ -1349,6 +1379,9 @@ export function ProvidersView({
         kind: provider.kind,
         baseUrl: provider.baseUrl,
         protocol: provider.protocol,
+        deepSeekReasoningEffort: providerSourceFamily(provider.kind) === 'deepseek'
+          ? normalizeDeepSeekReasoningEffort(provider.deepSeekReasoningEffort)
+          : undefined,
         responsesCompactMode: provider.responsesCompactMode,
         model: account?.availableModels[0] ?? provider.models[0],
         proxyId: account?.proxyId,

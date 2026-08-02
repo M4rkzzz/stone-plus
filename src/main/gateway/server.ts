@@ -8,6 +8,12 @@ import {
 import { supportsFastServiceTier } from '../../shared/types'
 import { providerSourceFamily } from '../../shared/source-family'
 import {
+  DEEPSEEK_DEFAULT_REASONING_EFFORT,
+  DEEPSEEK_RESPONSES_DEFAULT_MODEL,
+  DEEPSEEK_V4_FLASH_MAX_OUTPUT_TOKENS,
+  normalizeDeepSeekReasoningEffort,
+} from '../../shared/deepseek'
+import {
   createRouteSourceTopologyIndex,
   hasVerifiedKiroToolBridge,
   isRouteSourcePoolTopologyValid,
@@ -81,6 +87,8 @@ import {
   type KiroCollectedResponse,
   type KiroEventStreamDiagnostics,
 } from './kiro-event-stream'
+import { DeepSeekDsmlError } from './deepseek-dsml'
+import { createDeepSeekDsmlStreamParser } from './deepseek-dsml-stream'
 import { ResponsesWebSocketAdapter, type ResponsesWebSocketDispatchInput } from './responses-websocket'
 import { RequestReplayStore } from './request-replay'
 import type {
@@ -939,7 +947,7 @@ export class GatewayServer implements GatewayController {
       const bodyReadyAt = this.now()
       bodyReadMs = Math.max(0, bodyReadyAt - started)
       if (incoming.protocol === 'openai-responses' && isResponsesAgentClient(logRoute.client)) {
-        body = materializeStoneCompactFallbackHistory(body)
+        body = normalizeCodexCompactHistory(body)
       }
       const anthropicToolTurn = incoming.protocol === 'anthropic-messages'
         && incoming.operation === 'generate'
@@ -1437,6 +1445,7 @@ export class GatewayServer implements GatewayController {
               : codexSearch || codexCompact
                 ? { ...body, model: targetModel }
                 : convertGatewayRequest(incoming.protocol, provider.protocol, body, targetModel, conversionContext)
+            convertedBody = applyDeepSeekResponsesReasoning(convertedBody, provider)
             if (!conversionContext) convertedBodies.set(convertedBodyKey, convertedBody)
           }
           scheduleProgressLog('connecting')
@@ -2506,6 +2515,10 @@ export class GatewayServer implements GatewayController {
                   declaredTools: kiroDeclaredTools
                 })
               : undefined
+            const deepSeekParser = conversionContext?.dialect === 'deepseek-dsml'
+              && conversionContext.toolBridgePlan
+              ? createDeepSeekDsmlStreamParser(conversionContext.toolBridgePlan)
+              : undefined
             const pipeCurrentConvertedStream = async (): Promise<StreamPipeResult> => (
               await pipeConvertedUpstreamResponse(
                 upstreamResponse,
@@ -2515,10 +2528,10 @@ export class GatewayServer implements GatewayController {
                 { id: randomUUID(), model, toolBridgePlan: conversionContext?.toolBridgePlan },
                 sensitiveValues(resolvedCredential),
                 streamTiming,
-                kiroParser ? {
-                  parser: kiroParser,
-                  skipFrameGuard: true,
-                  acceptFinishTerminal: true,
+                kiroParser || deepSeekParser ? {
+                  parser: kiroParser ?? deepSeekParser,
+                  skipFrameGuard: Boolean(kiroParser),
+                  acceptFinishTerminal: Boolean(kiroParser),
                   commitOnlyOnOutputOrTerminal: true,
                 } : undefined
               )
@@ -4066,15 +4079,25 @@ function isCodexCompactV2Body(body: JsonObject): boolean {
   return body.input.some((item) => objectValue(item)?.type === 'compaction_trigger')
 }
 
-function materializeStoneCompactFallbackHistory(body: JsonObject): JsonObject {
+function normalizeCodexCompactHistory(body: JsonObject): JsonObject {
   if (!Array.isArray(body.input)) return body
   let changed = false
-  const input = body.input.map((value) => {
+  const input = body.input.flatMap((value) => {
     const item = objectValue(value)
-    if (item?.type !== 'compaction' && item?.type !== 'compaction_summary') return value
+    // `context_compaction` is a Codex app-server lifecycle/UI item. It carries
+    // no model-visible conversation state, but some Codex builds replay it in
+    // the next Responses input after local compaction. Forwarding it either
+    // trips a provider schema error or makes a portable provider look as if it
+    // had received opaque OpenAI history. The actual replacement history
+    // (summary, user messages and tool state) is already present beside it.
+    if (item?.type === 'context_compaction') {
+      changed = true
+      return []
+    }
+    if (item?.type !== 'compaction' && item?.type !== 'compaction_summary') return [value]
     const encryptedContent = item.encrypted_content
     if (typeof encryptedContent !== 'string' || !encryptedContent.startsWith(STONE_COMPACT_FALLBACK_PREFIX)) {
-      return value
+      return [value]
     }
     const summary = decodeStoneCompactFallback(encryptedContent)
     if (!summary) {
@@ -4085,14 +4108,14 @@ function materializeStoneCompactFallbackHistory(body: JsonObject): JsonObject {
       )
     }
     changed = true
-    return {
+    return [{
       type: 'message',
       role: 'user',
       content: [{
         type: 'input_text',
         text: `${COMPACT_SUMMARY_PREFIX}\n${summary}`
       }]
-    }
+    }]
   })
   return changed ? { ...body, input } : body
 }
@@ -4133,7 +4156,6 @@ function hasCodexOpaqueCompactHistory(body: JsonObject): boolean {
   return body.input.some((item) => {
     const compactItem = objectValue(item)
     const type = compactItem?.type
-    if (type === 'context_compaction') return true
     const opaqueType = type === 'compaction'
       || type === 'compaction_summary'
     return opaqueType
@@ -7932,10 +7954,204 @@ function routeConversionContext(
   provider?: ProviderDefinition,
 ): ProtocolConversionContext | undefined {
   if (client === 'grokbuild' && provider?.protocol === 'openai-responses') return undefined
+  if (client === 'codex'
+    && provider
+    && providerSourceFamily(provider.kind) === 'deepseek') {
+    if (provider?.protocol === 'openai-responses') return { dialect: 'deepseek-dsml' }
+    if (provider?.protocol === 'openai-chat') return { dialect: 'deepseek-chat' }
+  }
   const aggregateGrokRelay = pool.kind === 'relay-aggregate'
     && provider?.sourceType === 'relay'
     && providerSourceFamily(provider.kind) === 'grok'
   return pool.protocol === 'grok' || aggregateGrokRelay ? { dialect: 'xai-grok' } : undefined
+}
+
+/**
+ * DeepSeek exposes thinking as a native Responses reasoning effort. Keep the
+ * policy on the selected source so model-based routing cannot accidentally
+ * inherit an unrelated OpenAI model's effort vocabulary. Legacy sources and
+ * newly created sources both default to DeepSeek's highest native tier.
+ */
+function applyDeepSeekResponsesReasoning(
+  body: JsonObject,
+  provider: ProviderDefinition,
+): JsonObject {
+  if (providerSourceFamily(provider.kind) !== 'deepseek') return body
+  if (provider.protocol === 'openai-chat') {
+    return applyDeepSeekDeferredToolDiscovery({
+      ...body,
+      reasoning_effort: normalizeDeepSeekReasoningEffort(
+        provider.deepSeekReasoningEffort,
+        DEEPSEEK_DEFAULT_REASONING_EFFORT,
+      ),
+    })
+  }
+  if (provider.protocol !== 'openai-responses') return body
+  assertDeepSeekRequestSemantics(body)
+  const reasoning = { ...(objectValue(body.reasoning) ?? {}) }
+  // DeepSeek accepts this field for wire compatibility but documents that it
+  // never generates a reasoning summary. Do not leave Codex waiting for a
+  // capability that the selected source cannot produce.
+  delete reasoning.summary
+  const next: JsonObject = {
+    ...body,
+    reasoning: {
+      ...reasoning,
+      effort: normalizeDeepSeekReasoningEffort(
+        provider.deepSeekReasoningEffort,
+        DEEPSEEK_DEFAULT_REASONING_EFFORT,
+      ),
+    },
+  }
+  // These fields are telemetry/cache hints only and DeepSeek silently ignores
+  // them. Removing them keeps request logs honest without changing semantics.
+  for (const field of [
+    'metadata',
+    'service_tier',
+    'safety_identifier',
+    'prompt_cache_key',
+    'prompt_cache_retention',
+    'stream_options',
+  ]) delete next[field]
+  const text = objectValue(next.text)
+  if (text && Object.hasOwn(text, 'verbosity')) {
+    const normalizedText = { ...text }
+    delete normalizedText.verbosity
+    if (Object.keys(normalizedText).length > 0) next.text = normalizedText
+    else delete next.text
+  }
+  if (body.model === DEEPSEEK_RESPONSES_DEFAULT_MODEL
+    && typeof body.max_output_tokens === 'number'
+    && body.max_output_tokens > DEEPSEEK_V4_FLASH_MAX_OUTPUT_TOKENS) {
+    next.max_output_tokens = DEEPSEEK_V4_FLASH_MAX_OUTPUT_TOKENS
+  }
+  return applyDeepSeekDeferredToolDiscovery(next)
+}
+
+function assertDeepSeekRequestSemantics(body: JsonObject): void {
+  const unsupported = [
+    ['conversation', body.conversation],
+    ['prompt', body.prompt],
+    ['context_management', body.context_management],
+  ] as const
+  for (const [field, value] of unsupported) {
+    if (value !== undefined && value !== null) {
+      throw new GatewayHttpError(
+        422,
+        `DeepSeek Responses does not support ${field}; Stone+ will not silently discard it.`,
+        'unsupported_deepseek_option',
+        { error: { message: `Unsupported DeepSeek option: ${field}`, type: 'invalid_request_error', param: field } },
+      )
+    }
+  }
+  if (body.background === true) {
+    throw new GatewayHttpError(422, 'DeepSeek Responses does not support background execution.', 'unsupported_deepseek_option')
+  }
+  if (typeof body.max_tool_calls === 'number') {
+    throw new GatewayHttpError(422, 'DeepSeek Responses ignores max_tool_calls; Stone+ will not silently remove the limit.', 'unsupported_deepseek_option')
+  }
+  if (body.truncation !== undefined && body.truncation !== null && body.truncation !== 'disabled') {
+    throw new GatewayHttpError(422, 'DeepSeek Responses does not support automatic truncation.', 'unsupported_deepseek_option')
+  }
+  if (Array.isArray(body.include) && body.include.length > 0) {
+    throw new GatewayHttpError(422, 'DeepSeek Responses cannot provide the requested include fields.', 'unsupported_deepseek_option')
+  }
+}
+
+const DEEPSEEK_EXEC_TOOL_INSTRUCTIONS = [
+  '<stone_deferred_tools>',
+  'The custom tool named exec (or functions.exec) in this request is the Codex exec runtime, even when it is not shown beside ordinary function tools.',
+  'Codex exposes its complete deferred tool runtime inside exec through ALL_TOOLS and tools. Treat every ALL_TOOLS entry as available and callable; Stone+ does not apply a deferred-tool allowlist for DeepSeek.',
+  'You MUST call exec and inspect ALL_TOOLS before saying that a capability is unavailable. A short visible codex_app__ list is not the complete runtime list.',
+  'For cross-task work, search specifically for codex_app__send_message_to_thread, codex_app__read_thread and codex_app__wait_threads, then invoke the exact tools[name](args) function.',
+  'Stone+ also bridges a direct deferred-tool call through exec when its name is exact or resolves to one unique namespace suffix.',
+  'Use the exact source_thread_id/threadId supplied by the delegation, never guess a destination, never create a replacement task, and never include secrets or full environment values in the report.',
+  'If no matching deferred tool exists after that search, report the fallback honestly.',
+  '</stone_deferred_tools>',
+].join('\n')
+
+const DEEPSEEK_TOOL_SEARCH_INSTRUCTIONS = [
+  '<stone_tool_search>',
+  'The function search_tools (or stone_tool_search) is the Codex client tool registry search declared by this request.',
+  'When a requested capability is not already declared, call that function with a concise query and optional limit before claiming it is unavailable.',
+  'After its result, use the newly declared exact namespace tool. Preserve its namespace, arguments and call/result ordering.',
+  'For cross-task messaging, search for send_message_to_thread, then call the returned codex_app namespace function. Do not merely print DSML or the intended call as prose.',
+  '</stone_tool_search>',
+].join('\n')
+
+function applyDeepSeekDeferredToolDiscovery(body: JsonObject): JsonObject {
+  const runtime = codexDeferredToolRuntime(body)
+  if (!runtime.exec && !runtime.toolSearch) return body
+  const instructions = typeof body.instructions === 'string' ? body.instructions.trimEnd() : ''
+  const messages = Array.isArray(body.messages) ? body.messages : undefined
+  const existingGuidance = [
+    instructions,
+    ...(messages ?? []).flatMap((value) => {
+      const message = objectValue(value)
+      return message && message.role === 'system' && typeof message.content === 'string'
+        ? [message.content]
+        : []
+    }),
+  ].join('\n')
+  const additions = [
+    runtime.exec && !existingGuidance.includes('<stone_deferred_tools>')
+      ? DEEPSEEK_EXEC_TOOL_INSTRUCTIONS
+      : undefined,
+    runtime.toolSearch && !existingGuidance.includes('<stone_tool_search>')
+      ? DEEPSEEK_TOOL_SEARCH_INSTRUCTIONS
+      : undefined,
+  ].filter((value): value is string => Boolean(value))
+  if (additions.length === 0) return body
+  if (messages) {
+    const additionText = additions.join('\n\n')
+    const nextMessages = [...messages]
+    const systemIndex = nextMessages.findIndex((value) => {
+      const message = objectValue(value)
+      return message?.role === 'system' && typeof message.content === 'string'
+    })
+    if (systemIndex >= 0) {
+      const system = objectValue(nextMessages[systemIndex])!
+      nextMessages[systemIndex] = {
+        ...system,
+        content: `${String(system.content).trimEnd()}\n\n${additionText}`,
+      }
+    } else {
+      nextMessages.unshift({ role: 'system', content: additionText })
+    }
+    return {
+      ...body,
+      messages: nextMessages,
+    }
+  }
+  return {
+    ...body,
+    instructions: instructions
+      ? `${instructions}\n\n${additions.join('\n\n')}`
+      : additions.join('\n\n'),
+  }
+}
+
+function codexDeferredToolRuntime(body: JsonObject): { exec: boolean; toolSearch: boolean } {
+  let exec = false
+  let toolSearch = false
+  if (!Array.isArray(body.tools)) return { exec, toolSearch }
+  for (const value of body.tools) {
+    const tool = objectValue(value)
+    if (!tool) continue
+    if (tool.type === 'tool_search') {
+      toolSearch = true
+      continue
+    }
+    if (tool.type !== 'custom' && tool.type !== 'function') continue
+    const functionDefinition = objectValue(tool.function)
+    const rawName = typeof tool.name === 'string' ? tool.name : functionDefinition?.name
+    const name = typeof rawName === 'string' ? rawName.trim().toLowerCase() : ''
+    if (name === 'exec' || name === 'functions.exec') exec = true
+    if (name === 'search_tools' || name === 'stone_tool_search' || name.startsWith('sp_tool_search_')) {
+      toolSearch = true
+    }
+  }
+  return { exec, toolSearch }
 }
 
 function enabledHeader(value: string | string[] | undefined): boolean {
@@ -8142,6 +8358,11 @@ function convertGatewayRequest(
         error: { message: error.message, type: 'invalid_tool_bridge', param: error.path }
       })
     }
+    if (error instanceof DeepSeekDsmlError) {
+      throw new GatewayHttpError(422, error.message, 'invalid_tool_bridge', {
+        error: { message: error.message, type: 'invalid_tool_bridge', code: error.code }
+      })
+    }
     throw error
   }
 }
@@ -8153,6 +8374,11 @@ function normalizeError(error: unknown): GatewayHttpError {
   if (error instanceof InvalidToolBridgeError) {
     return new GatewayHttpError(502, error.message, 'upstream_invalid_tool_bridge', {
       error: { message: error.message, type: 'upstream_invalid_tool_bridge', param: error.path }
+    })
+  }
+  if (error instanceof DeepSeekDsmlError) {
+    return new GatewayHttpError(502, error.message, 'upstream_invalid_tool_bridge', {
+      error: { message: error.message, type: 'upstream_invalid_tool_bridge', code: error.code }
     })
   }
   if (error instanceof UnsupportedProtocolConversionError) return new GatewayHttpError(400, error.message, 'unsupported_conversion')

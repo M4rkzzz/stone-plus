@@ -52,6 +52,19 @@ describe('ClientConfigService', () => {
     })
   })
 
+  it('does not treat Codex instructions or rules alone as an applied connection', async () => {
+    await mkdir(service.paths.codex.directory, { recursive: true })
+    await mkdir(join(service.paths.codex.directory, 'rules'), { recursive: true })
+    await writeFile(service.paths.codex.agents.path, '# Instructions only\n')
+    await writeFile(service.paths.codex.rules.path, 'prefix_rule(pattern = ["git"], decision = "prompt")\n')
+
+    const [detected] = await service.detect('codex')
+
+    expect(detected.configured).toBe(false)
+    expect(detected.files.find((file) => file.role === 'codex-agents')?.exists).toBe(true)
+    expect(detected.files.find((file) => file.role === 'codex-rules')?.exists).toBe(true)
+  })
+
   it('backs up an existing Claude config before atomic replacement and can restore it', async () => {
     const original = '{"unknown":{"keep":true},"env":{"SHELL":"zsh"}}\n'
     const token = 'stone_claude_secret'
@@ -366,7 +379,13 @@ describe('ClientConfigService', () => {
     await writeFile(service.paths.codex.auth.path, '{"OPENAI_API_KEY":"snapshot-one"}\n')
 
     const first = await service.createBackupSet('codex')
-    expect(first.backups.map((backup) => backup.role)).toEqual(['codex-config', 'codex-auth'])
+    expect(first.backups.map((backup) => backup.role)).toEqual([
+      'codex-config',
+      'codex-auth',
+      'codex-model-catalog',
+      'codex-agents',
+      'codex-rules',
+    ])
     expect(new Set(first.backups.map((backup) => backup.groupId))).toEqual(new Set([first.groupId]))
     expect(new Set(first.backups.map((backup) => backup.createdAt))).toEqual(new Set([fixedDate.getTime()]))
 
@@ -375,7 +394,7 @@ describe('ClientConfigService', () => {
     const second = await service.createBackupSet('codex')
 
     expect(second.groupId).not.toBe(first.groupId)
-    expect(second.backups.every((backup) => backup.backupPath.endsWith('.1'))).toBe(true)
+    expect(second.backups.every((backup) => /\.1(?:\.missing)?$/.test(backup.backupPath))).toBe(true)
     await expect(service.restoreBackupSet('codex', fixedDate.getTime()))
       .rejects.toThrow('use the exact group id')
 
@@ -388,7 +407,7 @@ describe('ClientConfigService', () => {
       service.paths.codex.auth.path,
     ])
     expect(restored.sourceBackups.every((backup) => backup.groupId === first.groupId)).toBe(true)
-    expect(restored.safetyBackupSet?.backups).toHaveLength(2)
+    expect(restored.safetyBackupSet?.backups).toHaveLength(5)
     expect(new Set(restored.safetyBackupSet?.backups.map((backup) => backup.groupId)))
       .toEqual(new Set([restored.safetyBackupSet?.groupId]))
     expect(await readFile(service.paths.codex.config.path, 'utf8')).toBe('model = "snapshot-one"\n')
@@ -406,8 +425,8 @@ describe('ClientConfigService', () => {
     ])
 
     expect(first.groupId).not.toBe(second.groupId)
-    expect(first.backups).toHaveLength(2)
-    expect(second.backups).toHaveLength(2)
+    expect(first.backups).toHaveLength(5)
+    expect(second.backups).toHaveLength(5)
     expect(new Set((await service.listBackups('codex')).map((backup) => backup.groupId)).size).toBe(2)
   })
 
@@ -456,7 +475,7 @@ describe('ClientConfigService', () => {
     expect(await readFile(sabotaged.paths.codex.config.path, 'utf8')).toBe('model = "before-restore"\n')
     const safetyGroups = (await sabotaged.listBackups('codex'))
       .filter((record) => record.groupId !== backup.groupId)
-    expect(safetyGroups).toHaveLength(2)
+    expect(safetyGroups).toHaveLength(5)
     expect(new Set(safetyGroups.map((record) => record.groupId)).size).toBe(1)
   })
 

@@ -167,6 +167,9 @@ const roleLabels: Record<ClientConfigFileRole, readonly [chinese: string, englis
   'claude-mcp': ['Claude MCP', 'Claude MCP'],
   'codex-config': ['Codex 配置', 'Codex configuration'],
   'codex-auth': ['Codex 认证', 'Codex authentication'],
+  'codex-model-catalog': ['DeepSeek 模型能力目录', 'DeepSeek model capability catalog'],
+  'codex-agents': ['全局 AGENTS.md', 'Global AGENTS.md'],
+  'codex-rules': ['默认命令规则', 'Default command rules'],
   'gemini-settings': ['Gemini 设置', 'Gemini settings'],
   'gemini-env': ['Gemini 环境变量', 'Gemini environment'],
   'grok-config': ['Grok Build 配置', 'Grok Build configuration'],
@@ -1608,7 +1611,11 @@ export function ClientsView({
                         {activeDocument.error && <div className="client-preview-error"><AlertTriangle size={15} /><span>{localizeBackendMessage(activeDocument.error, language, t('无法预览配置文件', 'Unable to preview the configuration file.'))}</span></div>}
                         {previewMode === 'source' && activeDocument.editable ? (
                           <div className="client-source-mode">
-                            <div><Pencil size={14} /><span>{t('专家模式：直接编辑完整文件', 'Expert mode: edit the complete file directly')}</span></div>
+                            <div><Pencil size={14} /><span>{activeSourceFile?.role === 'codex-agents'
+                              ? t('此文件是当前 CODEX_HOME 的全局个人指令，会进入此配置目录启动的每个新会话。', 'This file contains global personal instructions for the current CODEX_HOME and applies to every new conversation started from it.')
+                              : activeSourceFile?.role === 'codex-rules'
+                                ? t('此实验性规则文件控制沙箱外命令审批；保存前请核对规则范围，语法错误可能导致 Codex 忽略规则。', 'This experimental rules file controls command approvals outside the sandbox. Review its scope before saving; invalid syntax may cause Codex to ignore the rules.')
+                                : t('专家模式：直接编辑完整文件', 'Expert mode: edit the complete file directly')}</span></div>
                             <textarea className="client-source-editor mono" spellCheck={false} value={activeSourceFile ? fileDrafts[activeSourceFile.role] ?? activeSourceFile.content ?? '' : ''} onChange={(event) => activeSourceFile && setFileDrafts((current) => ({ ...current, [activeSourceFile.role]: event.target.value }))} />
                           </div>
                         ) : activeDocument.content !== undefined ? (

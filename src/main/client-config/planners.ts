@@ -1,8 +1,9 @@
 import { mutateDotenv, validateDotenv } from './dotenv-format'
+import { normalizeCodexModelRepairPolicy } from '@shared/codex-model-repair'
 import { CLAUDE_RELAY_MODEL_ENV_KEYS, isClaudeClientModelName } from './claude-environment'
 import { planGrokBuildToml } from './grok-build-toml'
 import { mutateJsonObject, objectField, type JsonObject, type TextMutation } from './json-format'
-import { planCodexOfficialLoginToml, planCodexToml, repairCodexToml } from './toml-format'
+import { parseCodexToml, planCodexOfficialLoginToml, planCodexToml, repairCodexToml } from './toml-format'
 import type {
   ClientConfigFilePath,
   ClientConfigPlan,
@@ -14,6 +15,11 @@ import type {
   SupportedClient,
 } from './types'
 import { ClientConfigParseError, ClientConfigValidationError } from './types'
+import {
+  deepSeekCodexCatalogModels,
+  renderDeepSeekCodexModelCatalog,
+} from './codex-model-catalog'
+import { DEEPSEEK_V4_FLASH_CONTEXT_WINDOW } from '@shared/deepseek'
 
 function normalizedTarget(target: ClientConnectionTarget): ClientConnectionTarget {
   if (!target.token.trim()) throw new ClientConfigValidationError('A non-empty local access token is required')
@@ -34,7 +40,19 @@ function normalizedTarget(target: ClientConnectionTarget): ClientConnectionTarge
     throw new ClientConfigValidationError('Gateway base URL must be an HTTP(S) origin without credentials, query, or fragment')
   }
   const baseUrl = url.toString().replace(/\/$/, '')
-  return { gatewayBaseUrl: baseUrl, token: target.token.trim() }
+  const modelContextWindow = typeof target.modelContextWindow === 'number'
+    && Number.isInteger(target.modelContextWindow)
+    && target.modelContextWindow > 0
+    ? target.modelContextWindow
+    : undefined
+  return {
+    gatewayBaseUrl: baseUrl,
+    token: target.token.trim(),
+    ...(modelContextWindow ? { modelContextWindow } : {}),
+    ...(target.codexModelRepair
+      ? { codexModelRepair: normalizeCodexModelRepairPolicy(target.codexModelRepair) }
+      : {}),
+  }
 }
 
 function mutation(
@@ -96,7 +114,21 @@ export function planCodexConfig(
   const desired = normalizedTarget(target)
   const configSource = existing['codex-config']
   const authSource = existing['codex-auth']
-  const config = planCodexToml(configSource, `${desired.gatewayBaseUrl}/v1`)
+  const catalogSource = existing['codex-model-catalog']
+  const deepSeekCatalog = desired.modelContextWindow === DEEPSEEK_V4_FLASH_CONTEXT_WINDOW
+  const parsedConfig = parseCodexToml(configSource ?? '')
+  const catalogContent = deepSeekCatalog
+    ? renderDeepSeekCodexModelCatalog(deepSeekCodexCatalogModels(
+        [parsedConfig.model, parsedConfig.review_model],
+        desired.codexModelRepair,
+      ))
+    : undefined
+  const config = planCodexToml(
+    configSource,
+    `${desired.gatewayBaseUrl}/v1`,
+    desired.modelContextWindow,
+    deepSeekCatalog ? paths.modelCatalog.path : undefined,
+  )
   const auth = mutateJsonObject(authSource, 'codex-auth', (root) => {
     root.auth_mode = 'apikey'
     root.OPENAI_API_KEY = desired.token
@@ -107,10 +139,21 @@ export function planCodexConfig(
       mutation(paths.config, configSource, config, [
         'model_provider',
         'cli_auth_credentials_store',
+        'model_context_window (DeepSeek-only route)',
         'features.remote_compaction_v2',
         'model_providers.stone',
       ]),
       mutation(paths.auth, authSource, auth, ['auth_mode', 'OPENAI_API_KEY']),
+      ...(catalogContent === undefined ? [] : [mutation(
+        paths.modelCatalog,
+        catalogSource,
+        { content: catalogContent, changed: catalogContent !== catalogSource },
+        [
+          'DeepSeek Codex model capabilities',
+          'freeform apply_patch and shell tool declarations',
+          'reasoning levels and context window',
+        ],
+      )]),
     ],
   }
 }
@@ -221,7 +264,7 @@ export function planClientConfig(
 
 const repairableRoles: Readonly<Record<SupportedClient, ReadonlySet<ClientConfigFilePath['role']>>> = {
   claude: new Set(['claude-settings']),
-  codex: new Set(['codex-config', 'codex-auth']),
+  codex: new Set(['codex-config', 'codex-auth', 'codex-model-catalog']),
   gemini: new Set(['gemini-settings', 'gemini-env']),
   grokbuild: new Set(['grok-config']),
 }
@@ -269,6 +312,7 @@ export function planClientConfigRepair(
       repairInput['codex-config'] = repairCodexToml(
         repairInput['codex-config'],
         `${desired.gatewayBaseUrl}/v1`,
+        desired.codexModelRepair,
       ).content
     } catch (error) {
       if (!(error instanceof ClientConfigParseError)) throw error

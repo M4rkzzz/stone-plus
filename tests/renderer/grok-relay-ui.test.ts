@@ -47,14 +47,16 @@ describe('Grok/xAI relay renderer defaults', () => {
     expect(relayProtocolSelectLocked(XAI_COMPATIBLE_KIND)).toBe(false)
   })
 
-  it('exposes DeepSeek Responses as a locked native protocol', () => {
+  it('keeps official DeepSeek native while exposing Chat compatibility for relays', () => {
     expect(providerKindLabelsZh[DEEPSEEK_KIND]).toBe('DeepSeek')
-    expect(providerKindLabelsZh[DEEPSEEK_COMPATIBLE_KIND]).toBe('DeepSeek Responses 中转')
+    expect(providerKindLabelsZh[DEEPSEEK_COMPATIBLE_KIND]).toBe('DeepSeek 兼容中转')
     expect(protocolsByProviderKind[DEEPSEEK_KIND]).toEqual(['openai-responses'])
-    expect(protocolsByProviderKind[DEEPSEEK_COMPATIBLE_KIND]).toEqual(['openai-responses'])
     expect(protocolAfterProviderKindChange(DEEPSEEK_COMPATIBLE_KIND, 'openai-chat')).toBe('openai-responses')
     expect(protocolOptionLabel(DEEPSEEK_COMPATIBLE_KIND, 'openai-responses', protocolLabels, (zh) => zh))
-      .toBe('DeepSeek Responses')
-    expect(relayProtocolSelectLocked(DEEPSEEK_COMPATIBLE_KIND)).toBe(true)
+      .toContain('Flash')
+    expect(protocolOptionLabel(DEEPSEEK_COMPATIBLE_KIND, 'openai-chat', protocolLabels, (zh) => zh))
+      .toContain('Pro')
+    expect(relayProtocolSelectLocked(DEEPSEEK_COMPATIBLE_KIND)).toBe(false)
+    expect(protocolsByProviderKind[DEEPSEEK_COMPATIBLE_KIND]).toEqual(['openai-responses', 'openai-chat'])
   })
 })

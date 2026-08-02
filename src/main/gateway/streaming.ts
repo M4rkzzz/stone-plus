@@ -1,5 +1,10 @@
 import type { Protocol } from '../../shared/types'
 import type { ToolBridgeBinding, ToolBridgePlan } from './types'
+import {
+  deepSeekDeferredToolExecInput,
+  parseToolSearchArguments,
+  resolveDeepSeekToolBinding,
+} from './deepseek-dsml'
 
 type JsonObject = Record<string, unknown>
 
@@ -1823,6 +1828,7 @@ interface EncodedToolState {
   toolType?: 'function_call' | 'custom_tool_call'
   bridgeBinding?: ToolBridgeBinding
   customInput?: string
+  toolSearchArguments?: Record<string, unknown>
 }
 
 class ProtocolEncoder implements CanonicalStreamEncoder {
@@ -2200,7 +2206,7 @@ class ProtocolEncoder implements CanonicalStreamEncoder {
     const plan = this.toolBridgePlan
     if (!plan || this.protocol !== 'openai-responses') return true
     const tools = [...this.tools.values()]
-    if (plan.parallelToolCalls === false && tools.length > 1) {
+    if (plan.dialect !== 'deepseek-dsml' && plan.parallelToolCalls === false && tools.length > 1) {
       return this.failResponsesToolBridge(
         'Upstream returned parallel tool calls when parallel tool calls were disabled',
         'invalid_tool_bridge'
@@ -2219,7 +2225,17 @@ class ProtocolEncoder implements CanonicalStreamEncoder {
     }
     const usedCallIds = new Set(plan.calls.map((call) => call.callId))
     for (const tool of tools) {
-      const binding = aliases.get(tool.name)
+      let binding = aliases.get(tool.name)
+      if (!binding && (plan.dialect === 'deepseek-dsml' || plan.dialect === 'deepseek-chat')) {
+        try {
+          binding = resolveDeepSeekToolBinding(plan, tool.name)
+        } catch (error) {
+          return this.failResponsesToolBridge(
+            error instanceof Error ? error.message : 'DeepSeek returned an invalid deferred tool name',
+            'invalid_deferred_tool'
+          )
+        }
+      }
       if (!binding) {
         return this.failResponsesToolBridge(
           'Upstream returned a tool that was not declared by the current request',
@@ -2241,7 +2257,44 @@ class ProtocolEncoder implements CanonicalStreamEncoder {
       }
       usedCallIds.add(callId)
       tool.bridgeBinding = binding
+      if (binding.sourceType === 'tool_search') {
+        try {
+          tool.toolSearchArguments = parseToolSearchArguments(tool.arguments)
+        } catch (error) {
+          return this.failResponsesToolBridge(
+            error instanceof Error ? error.message : 'DeepSeek returned invalid tool search arguments',
+            'invalid_tool_search_arguments'
+          )
+        }
+        continue
+      }
       if (binding.sourceType !== 'custom') continue
+      if (binding.deferredToolName) {
+        const parsed = parseJsonObject(tool.arguments)
+          ?? (tool.toolType === 'custom_tool_call' ? { input: tool.arguments } : undefined)
+        if (!parsed) {
+          return this.failResponsesToolBridge(
+            'Deferred Codex tool arguments must be a JSON object',
+            'invalid_deferred_tool_arguments'
+          )
+        }
+        try {
+          tool.customInput = deepSeekDeferredToolExecInput(binding.deferredToolName, parsed)
+        } catch (error) {
+          return this.failResponsesToolBridge(
+            error instanceof Error ? error.message : 'Deferred Codex tool bridge failed',
+            'invalid_deferred_tool'
+          )
+        }
+        continue
+      }
+      // Native Responses custom_tool_call events already stream their input as
+      // the raw string expected by Codex. Only protocol bridges that represented
+      // a custom tool as a function need the temporary { input } wrapper.
+      if (tool.toolType === 'custom_tool_call') {
+        tool.customInput = tool.arguments
+        continue
+      }
       const parsed = parseJsonObject(tool.arguments)
       if (!parsed || typeof parsed.input !== 'string' || Object.keys(parsed).some((key) => key !== 'input')) {
         return this.failResponsesToolBridge(
@@ -2340,12 +2393,20 @@ class ProtocolEncoder implements CanonicalStreamEncoder {
     if (tool.started || (!force && !tool.name)) return
     tool.started = true
     this.reserveResponsesToolOutputIndex(tool)
-    tool.itemId = `${this.id}_fc_${tool.index}`
+    const toolSearch = tool.bridgeBinding?.sourceType === 'tool_search'
+    tool.itemId = `${this.id}_${toolSearch ? 'tsc' : 'fc'}_${tool.index}`
     const custom = tool.bridgeBinding?.sourceType === 'custom' || tool.toolType === 'custom_tool_call'
     this.frames.push(responsesSse('response.output_item.added', {
       response_id: this.id,
       output_index: tool.outputIndex,
-      item: custom ? {
+      item: toolSearch ? {
+        id: tool.itemId,
+        type: 'tool_search_call',
+        status: 'in_progress',
+        execution: 'client',
+        call_id: tool.id || tool.itemId,
+        arguments: tool.toolSearchArguments,
+      } : custom ? {
         id: tool.itemId,
         type: 'custom_tool_call',
         status: 'in_progress',
@@ -2404,6 +2465,7 @@ class ProtocolEncoder implements CanonicalStreamEncoder {
     }
     for (const tool of this.tools.values()) {
       this.ensureResponsesToolStarted(tool, true)
+      const toolSearch = tool.bridgeBinding?.sourceType === 'tool_search'
       const custom = tool.bridgeBinding?.sourceType === 'custom' || tool.toolType === 'custom_tool_call'
       const streamedValue = custom ? (tool.customInput ?? tool.arguments) : tool.arguments
       const deltaEvent = custom
@@ -2412,7 +2474,7 @@ class ProtocolEncoder implements CanonicalStreamEncoder {
       const doneEvent = custom
         ? 'response.custom_tool_call_input.done'
         : 'response.function_call_arguments.done'
-      if (streamedValue.length > tool.emittedArguments) {
+      if (!toolSearch && streamedValue.length > tool.emittedArguments) {
         this.frames.push(responsesSse(deltaEvent, {
           response_id: this.id,
           item_id: tool.itemId,
@@ -2421,7 +2483,14 @@ class ProtocolEncoder implements CanonicalStreamEncoder {
         }))
         tool.emittedArguments = streamedValue.length
       }
-      const item = custom ? {
+      const item = toolSearch ? {
+        id: tool.itemId,
+        type: 'tool_search_call',
+        status: tool.completed ? 'completed' : itemStatus,
+        execution: 'client',
+        call_id: tool.id || tool.itemId,
+        arguments: tool.toolSearchArguments,
+      } : custom ? {
         id: tool.itemId,
         type: 'custom_tool_call',
         status: tool.completed ? 'completed' : itemStatus,
@@ -2437,12 +2506,14 @@ class ProtocolEncoder implements CanonicalStreamEncoder {
         ...(tool.bridgeBinding?.sourceNamespace ? { namespace: tool.bridgeBinding.sourceNamespace } : {}),
         arguments: tool.arguments
       }
-      this.frames.push(responsesSse(doneEvent, {
-        response_id: this.id,
-        item_id: tool.itemId,
-        output_index: tool.outputIndex,
-        ...(custom ? { input: streamedValue } : { arguments: tool.arguments })
-      }))
+      if (!toolSearch) {
+        this.frames.push(responsesSse(doneEvent, {
+          response_id: this.id,
+          item_id: tool.itemId,
+          output_index: tool.outputIndex,
+          ...(custom ? { input: streamedValue } : { arguments: tool.arguments })
+        }))
+      }
       this.frames.push(responsesSse('response.output_item.done', {
         response_id: this.id,
         output_index: tool.outputIndex,
