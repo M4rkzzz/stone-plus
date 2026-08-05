@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest'
-import { deepSeekOnlyRouteContextWindow, DEEPSEEK_V4_FLASH_CONTEXT_WINDOW } from '../../src/shared/deepseek'
+import {
+  applyDeepSeekModelLimits,
+  deepSeekOnlyRouteContextWindow,
+  DEEPSEEK_V4_FLASH_CONTEXT_WINDOW,
+} from '../../src/shared/deepseek'
 import { codexConnectionRouteMetadata } from '../../src/shared/codex-model-repair'
 import type { Account, AppSnapshot, Pool, ProviderDefinition } from '../../src/shared/types'
 
@@ -11,7 +15,7 @@ function provider(id: string, kind: ProviderDefinition['kind']): ProviderDefinit
     name: id,
     kind,
     sourceType: 'official-api',
-    baseUrl: `https://${id}.example.test`,
+    baseUrl: kind === 'deepseek' ? 'https://api.deepseek.com' : `https://${id}.example.test`,
     protocol: 'openai-responses',
     models: ['deepseek-v4-flash'],
     createdAt: timestamp,
@@ -41,6 +45,18 @@ function account(id: string, providerId: string): Account {
 }
 
 describe('DeepSeek-only route context', () => {
+  it('applies the documented V4 limits to both official Codex models', () => {
+    expect(applyDeepSeekModelLimits([
+      { id: 'deepseek-v4-flash', displayName: 'Flash' },
+      { id: 'deepseek-v4-pro', displayName: 'Pro' },
+      { id: 'relay-model', displayName: 'Relay' },
+    ])).toEqual([
+      expect.objectContaining({ id: 'deepseek-v4-flash', contextWindow: 1_048_576 }),
+      expect.objectContaining({ id: 'deepseek-v4-pro', contextWindow: 1_048_576 }),
+      { id: 'relay-model', displayName: 'Relay' },
+    ])
+  })
+
   it('recognizes both direct provider sources and persisted pools while rejecting mixed routes', () => {
     const deepSeek = provider('deepseek-direct', 'deepseek')
     const openAi = provider('openai-direct', 'openai')
@@ -74,6 +90,31 @@ describe('DeepSeek-only route context', () => {
       poolId: deepSeek.id,
       modelSourceMap: { 'gpt-5.6-sol': openAi.id },
     })).toBeUndefined()
+  })
+
+  it('does not assign the official 1M catalog to compatible or lookalike relays', () => {
+    const relay = {
+      ...provider('deepseek-relay', 'deepseek-compatible'),
+      sourceType: 'relay' as const,
+      baseUrl: 'http://10.0.0.8:3000',
+    }
+    const lookalike = {
+      ...provider('deepseek-lookalike', 'deepseek'),
+      baseUrl: 'https://deepseek.com.evil.example',
+    }
+    const relayAccount = account('relay-account', relay.id)
+    const lookalikeAccount = account('lookalike-account', lookalike.id)
+
+    expect(deepSeekOnlyRouteContextWindow({
+      accounts: [relayAccount],
+      pools: [],
+      providers: [relay],
+    }, { poolId: relay.id })).toBeUndefined()
+    expect(deepSeekOnlyRouteContextWindow({
+      accounts: [lookalikeAccount],
+      pools: [],
+      providers: [lookalike],
+    }, { poolId: lookalike.id })).toBeUndefined()
   })
 
   it('uses one complete Codex connection policy for page and lifecycle validation', () => {

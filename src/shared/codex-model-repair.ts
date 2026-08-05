@@ -8,6 +8,8 @@ export interface CodexModelRepairPolicy {
   modelMap: Record<string, string>
   /** Safe Codex-facing model used when no exact reverse mapping exists. */
   fallbackModel: string
+  /** Optional authoritative catalog; persisted models outside it are replaced by the fallback. */
+  allowedModels?: string[]
 }
 
 export interface CodexConnectionRouteMetadata {
@@ -53,6 +55,9 @@ export function normalizeCodexModelRepairPolicy(
   return {
     modelMap: normalizeRouteModelMap(value.modelMap),
     fallbackModel,
+    ...(value.allowedModels
+      ? { allowedModels: [...new Set(value.allowedModels.map((model) => model.trim()).filter(Boolean))] }
+      : {}),
   }
 }
 
@@ -68,5 +73,6 @@ export function repairedCodexClientModel(
   for (const [clientModel, upstreamModel] of Object.entries(policy.modelMap)) {
     if (clientModel !== '*' && upstreamModel === model) return clientModel
   }
+  if (policy.allowedModels?.length && !policy.allowedModels.includes(model)) return policy.fallbackModel
   return FOREIGN_MODEL_PREFIX.test(model) ? policy.fallbackModel : model
 }

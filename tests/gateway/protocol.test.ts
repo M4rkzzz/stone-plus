@@ -247,6 +247,71 @@ describe('gateway protocol conversion', () => {
     })
   })
 
+  it('preserves URL and base64 documents in Responses and Anthropic tool results', () => {
+    const responses = {
+      model: 'gpt',
+      input: [{
+        type: 'function_call_output',
+        call_id: 'call_file',
+        output: [
+          {
+            type: 'input_file',
+            file_url: 'https://example.test/report.pdf',
+            filename: 'report.pdf',
+          },
+          {
+            type: 'input_file',
+            file_data: 'data:application/pdf;base64,JVBERi0xLjQ=',
+            filename: 'inline.pdf',
+          },
+        ],
+      }],
+    }
+
+    expect(analyzeProtocolConversion('openai-responses', 'anthropic-messages', responses))
+      .toEqual({ supported: true, issues: [] })
+    const anthropic = convertRequest(
+      'openai-responses', 'anthropic-messages', responses, 'claude',
+    ).body
+    expect(anthropic).toMatchObject({
+      messages: [{ content: [{
+        type: 'tool_result',
+        tool_use_id: 'call_file',
+        content: [
+          {
+            type: 'document',
+            source: { type: 'url', url: 'https://example.test/report.pdf' },
+            title: 'report.pdf',
+          },
+          {
+            type: 'document',
+            source: { type: 'base64', media_type: 'application/pdf', data: 'JVBERi0xLjQ=' },
+            title: 'inline.pdf',
+          },
+        ],
+      }] }],
+    })
+    expect(analyzeProtocolConversion('anthropic-messages', 'openai-responses', anthropic))
+      .toEqual({ supported: true, issues: [] })
+    expect(convertRequest('anthropic-messages', 'openai-responses', anthropic, 'gpt').body)
+      .toMatchObject({ input: [{
+        type: 'function_call_output',
+        output: responses.input[0].output,
+      }] })
+
+    expect(analyzeProtocolConversion('openai-responses', 'anthropic-messages', {
+      model: 'gpt',
+      input: [{
+        type: 'function_call_output',
+        call_id: 'call_file_id',
+        output: [{ type: 'input_file', file_id: 'file_123' }],
+      }],
+    })).toMatchObject({
+      supported: false,
+      issues: [{ path: 'input[0].output[0]', capability: 'content-part' }],
+    })
+  })
+
   it('allows strict tools only when the target conversion preserves strictness', () => {
     const body = {
       model: 'gpt', messages: [{ role: 'user', content: 'hello' }],

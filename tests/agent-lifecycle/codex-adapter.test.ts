@@ -312,6 +312,30 @@ describe('CodexLifecycleAdapter', () => {
       ['/profiles/codex-a', '/profiles/codex-b'],
     )
   })
+
+  it('forwards cancellation and adds the Codex target to repair progress', async () => {
+    const controller = new AbortController()
+    const onProgress = vi.fn()
+    const deepRepair = { run: vi.fn(async (options) => {
+      expect(options?.signal).toBe(controller.signal)
+      options?.onProgress?.({ stage: 'backup', completed: 2, total: 5 })
+    }) }
+    const adapter = new CodexLifecycleAdapter({
+      target: 'codex-desktop',
+      desktop: makeDesktop(),
+      desktopProbe: makeDesktopProbe({ installed: true, running: false }),
+      deepRepair,
+    })
+
+    await adapter.restore({ repairSessions: true }, { signal: controller.signal, onProgress })
+
+    expect(onProgress).toHaveBeenCalledWith({
+      target: 'codex-desktop',
+      stage: 'backup',
+      completed: 2,
+      total: 5,
+    })
+  })
 })
 
 function makeDesktop(): ChatGptDesktopController {

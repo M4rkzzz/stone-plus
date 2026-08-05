@@ -144,6 +144,51 @@ describe('PoolScheduler', () => {
       ['webSearch'],
     )).toBe(false)
   })
+  it('isolates and hydrates model-local cooldowns without cooling the account', () => {
+    let now = timestamp
+    const first = account('first')
+    const second = account('second')
+    const scheduler = new PoolScheduler(() => now, () => 0)
+    const persisted = scheduler.recordModelFailure('first', 'blocked-model', {
+      reason: 'permission',
+      cooldownMs: 60_000,
+      statusCode: 403,
+    })
+
+    const blocked = scheduler.selectAndAcquire({
+      pool: pool({ strategy: 'priority' }),
+      accounts: [first, second],
+      model: 'blocked-model',
+    })
+    expect(blocked.account.id).toBe('second')
+    blocked.release()
+    const otherModel = scheduler.selectAndAcquire({
+      pool: pool({ strategy: 'priority' }),
+      accounts: [first, second],
+      model: 'other-model',
+    })
+    expect(otherModel.account.id).toBe('first')
+    otherModel.release()
+
+    const restored = new PoolScheduler(() => now, () => 0)
+    restored.hydrate([{ ...first, modelCooldowns: persisted }, second])
+    const afterRestart = restored.selectAndAcquire({
+      pool: pool({ strategy: 'priority' }),
+      accounts: [{ ...first, modelCooldowns: persisted }, second],
+      model: 'blocked-model',
+    })
+    expect(afterRestart.account.id).toBe('second')
+    afterRestart.release()
+
+    now += 60_001
+    const afterExpiry = restored.selectAndAcquire({
+      pool: pool({ strategy: 'priority' }),
+      accounts: [{ ...first, modelCooldowns: persisted }, second],
+      model: 'blocked-model',
+    })
+    expect(afterExpiry.account.id).toBe('first')
+    afterExpiry.release()
+  })
   it('keeps quota reserves without changing legacy or unknown-quota behaviour by default', () => {
     expect(quotaProtectionBlocks(undefined, undefined, timestamp)).toBe(false)
     expect(quotaProtectionBlocks(undefined, {
@@ -1875,10 +1920,17 @@ describe('PoolScheduler', () => {
 
     expect(scheduler.hasUsableAlternative([selected, busy], 'model', selected.id)).toBe(true)
     expect(scheduler.hasUsableAlternative(
-      [selected, disabled, exhausted, codexExhausted, incompatible],
+      [selected, disabled, exhausted, incompatible],
       'model',
       selected.id
     )).toBe(false)
+    // A 100% Codex snapshot is display telemetry, not proof that the
+    // Responses endpoint has rejected this account.
+    expect(scheduler.hasUsableAlternative(
+      [selected, codexExhausted],
+      'model',
+      selected.id
+    )).toBe(true)
 
     scheduler.recordFailure(busy.id)
     expect(scheduler.hasUsableAlternative([selected, busy], 'model', selected.id)).toBe(false)

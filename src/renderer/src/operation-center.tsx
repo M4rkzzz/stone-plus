@@ -25,6 +25,7 @@ const operationLabels: Array<[prefix: string, zh: string, en: string]> = [
   ['rebuild-outbound', '重建低延迟出口', 'Rebuild low-latency connections'],
   ['check-all-accounts', '检测全部账号', 'Check all accounts'],
   ['refresh-account-models-', '刷新账号模型', 'Refresh account models'],
+  ['open-chatgpt-codex-app-', '切换 Codex App OAuth 账号', 'Switch Codex App OAuth account'],
   ['refresh-quota-', '刷新账号额度', 'Refresh account quota'],
   ['check-proxy-', '检测代理出口', 'Check proxy exit'],
   ['check-', '检测账号', 'Check account'],
@@ -57,7 +58,7 @@ export function operationLabelForKey(key: string, language: UiLanguage): string 
 }
 
 export function operationShouldNotify(key: string, status: OperationStatus): boolean {
-  return status === 'error' || key === 'gateway-power' || key === 'rebuild-outbound' || key.startsWith('update-')
+  return status === 'error' || key === 'gateway-power' || key === 'rebuild-outbound' || key.startsWith('open-chatgpt-codex-app-') || key.startsWith('update-')
 }
 
 function OperationStatusIcon({ status }: { status: OperationStatus }) {

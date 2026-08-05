@@ -69,14 +69,18 @@ describe('client operation preload contract', () => {
     ])
   })
 
-  it('opens the selected ChatGPT OAuth account through the dedicated web-login channel', async () => {
+  it('opens the selected ChatGPT OAuth account through distinct web and Codex App channels', async () => {
     electron.invoke.mockResolvedValue({})
     await import('../../src/preload/index')
     const stone = exposedStone()
 
     await stone.openChatGptWebLogin('account-oauth-1')
+    await stone.openChatGptCodexApp('account-oauth-1')
 
-    expect(electron.invoke).toHaveBeenCalledWith('stone:open-chatgpt-web-login', 'account-oauth-1')
+    expect(electron.invoke.mock.calls).toEqual([
+      ['stone:open-chatgpt-web-login', 'account-oauth-1'],
+      ['stone:open-chatgpt-codex-app', 'account-oauth-1'],
+    ])
   })
 
   it('subscribes and unsubscribes both renderer event streams with the same callback wrapper', async () => {
@@ -126,6 +130,40 @@ describe('client operation preload contract', () => {
     ])
     expect(listener).toHaveBeenCalledWith(progress)
     expect(electron.removeListener).toHaveBeenCalledWith('stone:codex-session-repair-progress', handler)
+  })
+
+  it('wires cancellable Agent repairs and their progress stream', async () => {
+    electron.invoke.mockResolvedValue({})
+    await import('../../src/preload/index')
+    const stone = exposedStone()
+    const listener = vi.fn()
+
+    await stone.restoreAgent('codex-cli', { repairSessions: true }, 'agent-restore-1234')
+    await stone.restartAgent('codex-desktop', 'agent-restart-1234')
+    await stone.smartRepairAgent('codex-cli', 'agent-smart-1234')
+    await stone.repairAllAffectedAgents('agent-all-1234')
+    await stone.cancelAgentLifecycleOperation('agent-all-1234')
+    const unsubscribe = stone.onAgentLifecycleProgress(listener)
+    const handler = electron.on.mock.calls.find(([channel]) => channel === 'stone:agent-lifecycle-progress')?.[1]
+    const progress = {
+      operationId: 'agent-all-1234',
+      target: 'codex-cli',
+      stage: 'backup',
+      completed: 8,
+      total: 10,
+    }
+    handler({}, progress)
+    unsubscribe()
+
+    expect(electron.invoke.mock.calls).toEqual([
+      ['stone:restore-agent', 'codex-cli', { repairSessions: true }, 'agent-restore-1234'],
+      ['stone:restart-agent', 'codex-desktop', 'agent-restart-1234'],
+      ['stone:smart-repair-agent', 'codex-cli', 'agent-smart-1234'],
+      ['stone:repair-all-affected-agents', 'agent-all-1234'],
+      ['stone:cancel-agent-lifecycle-operation', 'agent-all-1234'],
+    ])
+    expect(listener).toHaveBeenCalledWith(progress)
+    expect(electron.removeListener).toHaveBeenCalledWith('stone:agent-lifecycle-progress', handler)
   })
 })
 

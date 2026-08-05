@@ -15,6 +15,10 @@ const capabilityKeys: readonly UpstreamCapabilityRequirement[] = [
   'modelDiscovery',
   'imageInput',
   'imageGeneration',
+  'imageEdit',
+  'videoGeneration',
+  'videoEdit',
+  'live',
   'webSearch',
   'compact',
   'websocket',
@@ -39,6 +43,8 @@ export function inferUpstreamCapabilities(input: {
   const responses = input.protocol === 'openai-responses'
   const kiroClaude = input.protocol === 'kiro-claude'
   const officialResponses = responses && input.sourceType === 'official-api' && input.kind === 'openai'
+  const nativeGrok = input.kind === 'xai'
+    && (input.sourceType === 'official-api' || input.sourceType === 'oauth-system')
   const deepSeekResponses = responses && (input.kind === 'deepseek' || input.kind === 'deepseek-compatible')
   const compact = deepSeekResponses
     ? false
@@ -78,6 +84,15 @@ export function inferUpstreamCapabilities(input: {
       store: false,
       previousResponseId: false,
       parallelToolCalls: true,
+    } : {}),
+    // xAI's native API exposes the Imagine image/video family. OAuth account
+    // eligibility is still checked per account from detached billing state;
+    // these flags describe only the provider wire surface.
+    ...(nativeGrok ? {
+      imageGeneration: true,
+      imageEdit: true,
+      videoGeneration: true,
+      videoEdit: true,
     } : {}),
   }
 }

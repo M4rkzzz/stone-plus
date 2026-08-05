@@ -1,12 +1,20 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { createHash, randomUUID } from 'node:crypto'
 import {
+  brotliDecompress,
+  gunzip,
+  inflate,
+  inflateRaw,
+  zstdDecompress,
+} from 'node:zlib'
+import {
   isSafeRouteModelMapKey,
   resolveRouteModel,
   resolveRouteSourceId,
 } from '../../shared/route-models'
 import { supportsFastServiceTier } from '../../shared/types'
 import { providerSourceFamily } from '../../shared/source-family'
+import { applyReasoningEffortPolicy, normalizeReasoningEffort } from '../../shared/reasoning-policy'
 import {
   DEEPSEEK_DEFAULT_REASONING_EFFORT,
   DEEPSEEK_RESPONSES_DEFAULT_MODEL,
@@ -28,9 +36,11 @@ import {
   applyChatGptCodexSearchHeaders,
   CHATGPT_CODEX_RESPONSES_URL,
   CHATGPT_CODEX_SEARCH_URL,
+  classifyChatGptCredentialRefreshFailure,
   classifyChatGptCodexFailure,
   codexQuotaCooldownUntil,
-  codexQuotaIsExhausted,
+  MAX_RETRY_AFTER_MS,
+  parseRetryAfter,
   isChatGptCodexResponsesLiteBody,
   withChatGptCodexBody,
   type NormalizedTokenUsage,
@@ -91,6 +101,17 @@ import { DeepSeekDsmlError } from './deepseek-dsml'
 import { createDeepSeekDsmlStreamParser } from './deepseek-dsml-stream'
 import { ResponsesWebSocketAdapter, type ResponsesWebSocketDispatchInput } from './responses-websocket'
 import { RequestReplayStore } from './request-replay'
+import {
+  buildGrokMediaUpstreamUrl,
+  classifyGrokMediaRoute,
+  extractGrokVideoRequestId,
+  grokMediaEligibility,
+  prepareGrokMediaRequest,
+  rewritePreparedGrokMediaModel,
+  rewriteGrokVideoContentUrl,
+  validGrokSignedVideoUrl,
+  type GrokMediaRoute,
+} from './grok-media'
 import type {
   CredentialResolver,
   GatewayAccountState,
@@ -103,6 +124,7 @@ import type {
   ConversationTitleResolver,
   GatewayServerOptions,
   ProtocolConversionContext,
+  PersistedGrokVideoBinding,
   ResolvedGatewayCredential
 } from './types'
 
@@ -160,6 +182,10 @@ const RESPONSES_TERMINAL_IDLE_TIMEOUT_MS = 65_000
 // long enough to remove a guaranteed 401 from normal use, while periodically
 // re-probing so a backend entitlement rollout is picked up without a restart.
 const CODEX_SEARCH_CAPABILITY_TTL_MS = 6 * 60 * 60_000
+const GROK_MEDIA_REQUEST_BODY_LIMIT_BYTES = 64 * 1024 * 1024
+const GROK_MEDIA_RESPONSE_BODY_LIMIT_BYTES = 64 * 1024 * 1024
+const GROK_VIDEO_BINDING_TTL_MS = 24 * 60 * 60_000
+const MAX_GROK_VIDEO_BINDINGS = 1_024
 // A Responses connection can remain physically alive by emitting SSE comments
 // or lifecycle heartbeats after the model has stopped doing useful work. Track
 // protocol progress separately, but use the user's stream-idle setting as the
@@ -259,6 +285,11 @@ interface CodexSearchCapabilityCacheEntry {
   expiresAt: number
 }
 
+interface GrokVideoBinding extends PersistedGrokVideoBinding {
+  /** Memory-only signed asset URL; never written to the metadata journal. */
+  contentUrl?: string
+}
+
 function snapshotGatewayConfig(config: GatewayConfig): GatewayConfig {
   // Config handoffs are control-plane events, not a per-request hot path.
   // Clone once here so callers can safely keep editing their form/store object
@@ -331,6 +362,8 @@ export class GatewayServer implements GatewayController {
   private readonly loopbackFetchImplementation: typeof fetch
   private readonly outboundFetchResolver?: OutboundFetchResolver
   private readonly conversationTitleResolver?: ConversationTitleResolver
+  private readonly loadGrokVideoBindings?: GatewayServerOptions['loadGrokVideoBindings']
+  private readonly saveGrokVideoBindings?: GatewayServerOptions['saveGrokVideoBindings']
   private readonly beforeStart?: () => Promise<void>
   private readonly scheduler: PoolScheduler
   private readonly largeRequestBodies = new WeightedByteGate(LARGE_REQUEST_BODY_BUDGET_BYTES)
@@ -338,10 +371,14 @@ export class GatewayServer implements GatewayController {
   private readonly accountStateListeners = new Set<GatewayAccountStateHandler>()
   private readonly runtimeStateListeners = new Set<GatewayRuntimeStateHandler>()
   private readonly codexSearchCapabilities = new Map<string, CodexSearchCapabilityCacheEntry>()
+  private readonly grokVideoBindings = new Map<string, GrokVideoBinding>()
+  private grokVideoBindingsRestored = false
+  private grokVideoBindingPersistence: Promise<void> = Promise.resolve()
   private readonly requestReplays: RequestReplayStore
   private requestReplayCaptureEnabled: boolean
   private requestReplayGeneration = 0
   private readonly now: () => number
+  private readonly random: () => number
   private readonly responsesProgressIdleTimeoutMs: number
   private server?: Server
   private responsesWebSocket?: ResponsesWebSocketAdapter
@@ -360,15 +397,18 @@ export class GatewayServer implements GatewayController {
     this.loopbackFetchImplementation = options.loopbackFetchImplementation ?? fetch
     this.outboundFetchResolver = options.outboundFetchResolver
     this.conversationTitleResolver = options.conversationTitleResolver
+    this.loadGrokVideoBindings = options.loadGrokVideoBindings
+    this.saveGrokVideoBindings = options.saveGrokVideoBindings
     this.beforeStart = options.beforeStart
     this.now = options.now ?? (() => Date.now())
+    this.random = options.random ?? (() => Math.random())
     this.responsesProgressIdleTimeoutMs = Math.max(
       1,
       options.responsesProgressIdleTimeoutMs ?? Number.POSITIVE_INFINITY
     )
     this.requestReplays = new RequestReplayStore({ now: this.now })
     this.requestReplayCaptureEnabled = this.config.settings.logPayloads === true
-    this.scheduler = new PoolScheduler(this.now, options.random)
+    this.scheduler = new PoolScheduler(this.now, this.random)
     this.scheduler.hydrate(this.config.accounts, this.config.pools)
     this.scheduler.hydratePerformance(this.config.recentRequestLogs ?? [])
     if (options.onLog) this.logListeners.add(options.onLog)
@@ -384,6 +424,7 @@ export class GatewayServer implements GatewayController {
     if (credentialResolver) this.credentialResolver = credentialResolver
     if (this.server) return
     await this.beforeStart?.()
+    await this.restoreGrokVideoBindings()
     this.scheduler.hydrate(this.config.accounts, this.config.pools)
     this.scheduler.hydratePerformance(this.config.recentRequestLogs ?? [])
 
@@ -465,6 +506,7 @@ export class GatewayServer implements GatewayController {
     this.runtimeGeneration += 1
     this.activeRequests = 0
     this.scheduler.clear()
+    await this.grokVideoBindingPersistence.catch(() => undefined)
     this.emitRuntimeState({ gatewayStatus: true, allAccounts: true })
   }
 
@@ -501,6 +543,16 @@ export class GatewayServer implements GatewayController {
     for (const accountId of this.codexSearchCapabilities.keys()) {
       if (!accountIds.has(accountId)) this.codexSearchCapabilities.delete(accountId)
     }
+    let removedVideoBinding = false
+    for (const [requestId, binding] of this.grokVideoBindings) {
+      if (!accountIds.has(binding.accountId)
+        || !snapshot.pools.some((pool) => pool.id === binding.poolId)
+        || !snapshot.routes.some((route) => route.id === binding.routeId && route.enabled)) {
+        this.grokVideoBindings.delete(requestId)
+        removedVideoBinding = true
+      }
+    }
+    if (removedVideoBinding) void this.persistGrokVideoBindings()
     this.scheduler.hydrate(snapshot.accounts, snapshot.pools)
     this.scheduler.hydratePerformance(snapshot.recentRequestLogs ?? [])
   }
@@ -632,6 +684,15 @@ export class GatewayServer implements GatewayController {
     const requestReplayGeneration = this.requestReplayGeneration
     const requestReplayCaptureEnabled = this.requestReplayCaptureEnabled
     const pathname = requestPathname(request.url)
+    const grokMediaRoute = classifyGrokMediaRoute(request.method, pathname)
+    if (grokMediaRoute) {
+      await this.handleGrokMedia(request, response, grokMediaRoute, requestConfig, requestIndex)
+      return
+    }
+    if (request.method === 'POST' && pathname === '/v1/live') {
+      await this.handleLiveCapabilityBoundary(request, response, requestIndex)
+      return
+    }
     const modelListRoute = request.method === 'GET' ? classifyModelListRoute(pathname) : undefined
     if (modelListRoute) {
       await this.handleModelList(request, response, modelListRoute.kind, requestIndex, modelListRoute.client)
@@ -1116,7 +1177,7 @@ export class GatewayServer implements GatewayController {
           'remote_compaction_unsupported'
         )
       }
-      const sessionId = getSessionId(request, body)
+      const sessionId = getSessionId(request, body, logRoute.client)
       conversationId = sessionId
       conversationName = getConversationName(request, body)
       if (!conversationName && sessionId) {
@@ -1230,11 +1291,18 @@ export class GatewayServer implements GatewayController {
       let ordinaryRetriesUsed = 0
       let compactCompatibilityRetriesUsed = 0
       let kiroInvalidStateRetryUsed = false
+      let preferredTransientRetryAccountId: string | undefined
+      const transientSameAccountRetryCount = new Map<string, number>()
       const failedAccountIds = new Set<string>()
       const nativeCompactCapabilityFailedAccountIds = new Set<string>()
       const currentExcludedAccountIds = (): string[] => codexCompactV2 && !codexCompactV2Fallback
         ? [...new Set([...failedAccountIds, ...nativeCompactCapabilityFailedAccountIds])]
         : [...failedAccountIds]
+      const accountsForCurrentAttempt = (): Account[] => {
+        if (!preferredTransientRetryAccountId) return schedulingAccounts
+        const preferred = schedulingAccounts.find((account) => account.id === preferredTransientRetryAccountId)
+        return preferred ? [preferred] : schedulingAccounts
+      }
       for (;;) {
         if (countTokens) countTokensUpstreamResponseHeaders = undefined
         let release: (() => void) | undefined
@@ -1270,7 +1338,7 @@ export class GatewayServer implements GatewayController {
           try {
             scheduled = await this.scheduler.selectAndAcquireWhenAvailable({
               pool: schedulingPool,
-              accounts: schedulingAccounts,
+              accounts: accountsForCurrentAttempt(),
               model: targetModel,
               sessionId,
               excludedAccountIds: currentExcludedAccountIds(),
@@ -1300,7 +1368,7 @@ export class GatewayServer implements GatewayController {
               try {
                 scheduled = await this.scheduler.selectAndAcquireWhenAvailable({
                   pool: schedulingPool,
-                  accounts: schedulingAccounts,
+                  accounts: accountsForCurrentAttempt(),
                   model: targetModel,
                   sessionId,
                   excludedAccountIds: currentExcludedAccountIds(),
@@ -1341,6 +1409,7 @@ export class GatewayServer implements GatewayController {
             schedulerSelectMs = Math.max(0, this.now() - schedulerSelectStarted)
           }
           const account = scheduled.account
+          preferredTransientRetryAccountId = undefined
           selectedHealthRevision = scheduled.healthRevision
           selectedResetEpoch = scheduled.resetEpoch
           attemptedAccount = account
@@ -1436,6 +1505,7 @@ export class GatewayServer implements GatewayController {
           const upstreamStreaming = streaming || compactFallback || provider.protocol === 'kiro-claude'
           const convertedBodyKey = `${provider.id}\0${provider.kind}\0${provider.protocol}\0${targetModel}`
             + `\0${compactFallback ? 'compact-fallback' : 'native'}`
+            + `\0${JSON.stringify(pool.reasoningEffortMap ?? {})}\0${pool.reasoningEffortCap ?? ''}`
           let convertedBody = conversionContext ? undefined : convertedBodies.get(convertedBodyKey)
           if (!convertedBody) {
             convertedBody = provider.protocol === 'kiro-claude'
@@ -1445,6 +1515,7 @@ export class GatewayServer implements GatewayController {
               : codexSearch || codexCompact
                 ? { ...body, model: targetModel }
                 : convertGatewayRequest(incoming.protocol, provider.protocol, body, targetModel, conversionContext)
+            convertedBody = applyPoolReasoningPolicy(convertedBody, pool, provider)
             convertedBody = applyDeepSeekResponsesReasoning(convertedBody, provider)
             if (!conversionContext) convertedBodies.set(convertedBodyKey, convertedBody)
           }
@@ -1867,6 +1938,163 @@ export class GatewayServer implements GatewayController {
                 ? undefined
                 : await readUpstreamJson(upstreamResponse, responseBodySignal)
             }
+            if (
+              resolvedCredential.kind === 'chatgpt-oauth'
+              && resolvedCredential.recoverRejectedAccess
+              && upstreamResponse.status === 401
+              && !isChatGptSearchAccessPolicyRejection(upstreamResponse.status, errorPayload)
+            ) {
+              const rejectedAccessToken = resolvedCredential.secret
+              const rejectedAccountId = resolvedCredential.accountId
+              let recoveredCredential: ResolvedGatewayCredential
+              try {
+                recoveredCredential = await resolvedCredential.recoverRejectedAccess(rejectedAccessToken)
+              } catch (error) {
+                throw gatewayErrorFromProviderFailure(classifyChatGptCredentialRefreshFailure(error))
+              }
+              const recoveredAccountId = recoveredCredential.accountId
+              if (
+                recoveredCredential.kind !== 'chatgpt-oauth'
+                || !recoveredAccountId
+                || recoveredAccountId !== rejectedAccountId
+              ) {
+                throw new GatewayHttpError(
+                  503,
+                  'ChatGPT credential recovery returned an incompatible account identity',
+                  'account_unavailable'
+                )
+              }
+              resolvedCredential = recoveredCredential
+              // Rebuild every identity-bearing header. Patching Authorization
+              // alone could retain a workspace header from the rejected token.
+              upstreamHeaders = new Headers()
+              const recoveredBundle = {
+                accessToken: resolvedCredential.secret,
+                accountId: recoveredAccountId,
+                expiresAt: account.credentialExpiresAt ?? Number.MAX_SAFE_INTEGER,
+              }
+              if (codexSearch && !preferSearchFallback) {
+                applyChatGptCodexSearchHeaders(upstreamHeaders, recoveredBundle, request.headers)
+              } else {
+                applyChatGptCodexHeaders(upstreamHeaders, recoveredBundle, request.headers)
+              }
+              if (codexCompact) upstreamHeaders.set('accept', 'application/json')
+              if (sessionId && !upstreamHeaders.has('session-id')) upstreamHeaders.set('session-id', sessionId)
+              if ((codexCompact && !compactFallback) || compactResponsePassthrough) {
+                copyCompactRequestHeaders(request, upstreamHeaders, logRoute.client)
+              }
+              if (codexCompactV2 && compactFallback) stripCompactRequestHeaders(upstreamHeaders)
+              failureStage = 'connect'
+              scheduleProgressLog('retrying')
+              try {
+                upstreamResponse = await awaitWithAbortSignal(
+                  outboundFetch(upstreamUrl, {
+                    method: 'POST',
+                    headers: upstreamHeaders,
+                    body: serializedUpstreamBody,
+                    signal: responseBodySignal,
+                    ...redirectPolicy,
+                  }),
+                  responseBodySignal
+                )
+              } catch (error) {
+                throw gatewayErrorFromProviderFailure(adapter.classifyFailure({ error, now: this.now() }))
+              }
+              if (countTokens) countTokensUpstreamResponseHeaders = new Headers(upstreamResponse.headers)
+              headerObservedAt = this.now()
+              headerSignals = extractRateLimitSignals(
+                upstreamResponse.headers,
+                provider.protocol,
+                headerObservedAt
+              )
+              selectedHealthRevision = this.applyExhaustedQuotaHeaders(
+                account,
+                headerSignals,
+                headerObservedAt,
+                selectedHealthRevision,
+                selectedResetEpoch
+              )
+              errorPayload = upstreamResponse.ok
+                ? undefined
+                : await readUpstreamJson(upstreamResponse, responseBodySignal)
+            }
+            if (
+              resolvedCredential.kind === 'grok-oauth'
+              && resolvedCredential.recoverRejectedAccess
+              && upstreamResponse.status === 401
+              && !response.headersSent
+            ) {
+              const rejectedAccessToken = resolvedCredential.secret
+              const rejectedAccountId = resolvedCredential.accountId
+              let recoveredCredential: ResolvedGatewayCredential
+              try {
+                recoveredCredential = await resolvedCredential.recoverRejectedAccess(rejectedAccessToken)
+              } catch (error) {
+                throw normalizeError(error)
+              }
+              if (
+                recoveredCredential.kind !== 'grok-oauth'
+                || !rejectedAccountId
+                || recoveredCredential.accountId !== rejectedAccountId
+              ) {
+                throw new GatewayHttpError(
+                  503,
+                  'Grok OAuth recovery returned an incompatible account identity',
+                  'account_unavailable',
+                )
+              }
+              resolvedCredential = recoveredCredential
+              upstreamHeaders = new Headers()
+              adapter.applyRequestHeaders(upstreamHeaders, {
+                protocol: provider.protocol,
+                credential: recoveredCredential.secret,
+                sourceHeaders: request.headers,
+                stream: upstreamStreaming,
+                hasBody: true,
+              })
+              applyGrokBuildHeaders(upstreamHeaders, {
+                accessToken: recoveredCredential.secret,
+                mode: 'interactive',
+                accept: upstreamStreaming ? 'text/event-stream' : 'application/json',
+              })
+              if ((codexCompact && !compactFallback) || compactResponsePassthrough) {
+                copyCompactRequestHeaders(request, upstreamHeaders, logRoute.client)
+              }
+              if (codexCompactV2 && compactFallback) stripCompactRequestHeaders(upstreamHeaders)
+              failureStage = 'connect'
+              scheduleProgressLog('retrying')
+              try {
+                upstreamResponse = await awaitWithAbortSignal(
+                  outboundFetch(upstreamUrl, {
+                    method: 'POST',
+                    headers: upstreamHeaders,
+                    body: serializedUpstreamBody,
+                    signal: responseBodySignal,
+                    ...redirectPolicy,
+                  }),
+                  responseBodySignal,
+                )
+              } catch (error) {
+                throw gatewayErrorFromProviderFailure(adapter.classifyFailure({ error, now: this.now() }))
+              }
+              if (countTokens) countTokensUpstreamResponseHeaders = new Headers(upstreamResponse.headers)
+              headerObservedAt = this.now()
+              headerSignals = extractRateLimitSignals(
+                upstreamResponse.headers,
+                provider.protocol,
+                headerObservedAt,
+              )
+              selectedHealthRevision = this.applyExhaustedQuotaHeaders(
+                account,
+                headerSignals,
+                headerObservedAt,
+                selectedHealthRevision,
+                selectedResetEpoch,
+              )
+              errorPayload = upstreamResponse.ok
+                ? undefined
+                : await readUpstreamJson(upstreamResponse, responseBodySignal)
+            }
           }
 
           let searchAccessPolicyRejected = codexSearch
@@ -2043,9 +2271,14 @@ export class GatewayServer implements GatewayController {
           if (!upstreamResponse.ok) {
             const payload = errorPayload ?? {}
             const safePayload = sanitizeUpstreamPayload(payload, sensitiveValues(resolvedCredential))
-            const providerFailure = modelScopedProviderFailure(upstreamResponse.status, payload)
+            const providerFailure = modelScopedProviderFailure(
+              upstreamResponse.status,
+              payload,
+              upstreamResponse.headers,
+              this.now(),
+            )
               ?? (isChatGptCodexCredentialKind(resolvedCredential.kind)
-              ? classifyChatGptCodexFailure(upstreamResponse.status, upstreamResponse.headers, this.now())
+              ? classifyChatGptCodexFailure(upstreamResponse.status, upstreamResponse.headers, this.now(), payload)
               : adapter.classifyFailure({
                   statusCode: upstreamResponse.status,
                   headers: upstreamResponse.headers,
@@ -2580,12 +2813,30 @@ export class GatewayServer implements GatewayController {
               throw streamResult.failure
             }
             if (streamResult.canonicalError && canonicalErrorPayload && canonicalErrorStatus !== undefined) {
-              const classifiedFailure = modelScopedProviderFailure(canonicalErrorStatus, canonicalErrorPayload)
-                ?? adapter.classifyFailure({
-                  statusCode: canonicalErrorStatus,
-                  headers: upstreamResponse.headers,
-                  now: this.now()
-                })
+              // Responses can carry a provider failure inside an HTTP 200 SSE
+              // terminal frame.  ChatGPT's classifier needs that payload to
+              // distinguish request-scoped capacity shedding from an account
+              // health failure.  Once streaming is committed we cannot replay
+              // the turn, but we must still avoid cooling down a healthy
+              // account for server_is_overloaded / slow_down.
+              const classifiedFailure = modelScopedProviderFailure(
+                canonicalErrorStatus,
+                canonicalErrorPayload,
+                upstreamResponse.headers,
+                this.now(),
+              )
+                ?? (isChatGptCodexCredentialKind(resolvedCredential.kind)
+                  ? classifyChatGptCodexFailure(
+                      canonicalErrorStatus,
+                      upstreamResponse.headers,
+                      this.now(),
+                      canonicalErrorPayload,
+                    )
+                  : adapter.classifyFailure({
+                      statusCode: canonicalErrorStatus,
+                      headers: upstreamResponse.headers,
+                      now: this.now()
+                    }))
               const providerFailure = provider.protocol === 'kiro-claude'
                 && isKiroInvalidStateError(streamResult.canonicalError)
                 ? { ...classifiedFailure, retryable: false, accountAction: 'none' as const }
@@ -2757,7 +3008,12 @@ export class GatewayServer implements GatewayController {
             )
             const safeErrorEnvelope = providerErrorEnvelope(safePayload) ?? {}
             const semanticStatusCode = providerErrorStatusCode(successfulErrorEnvelope, payload)
-            const providerFailure = adapter.classifyFailure({
+            const providerFailure = modelScopedProviderFailure(
+              semanticStatusCode,
+              payload,
+              upstreamResponse.headers,
+              this.now(),
+            ) ?? adapter.classifyFailure({
               statusCode: semanticStatusCode,
               headers: upstreamResponse.headers,
               now: this.now()
@@ -2778,6 +3034,10 @@ export class GatewayServer implements GatewayController {
           // cannot be reflected through the local gateway.
           if (provider.protocol === 'openai-responses' && payload.status === 'failed') {
             const failure = new ResponsesResponseFailedError(payload)
+            if (isChatGptCodexCredentialKind(resolvedCredential.kind)) {
+              const providerFailure = classifyChatGptCodexFailure(503, upstreamResponse.headers, this.now(), payload)
+              if (providerFailure.scope === 'request') throw gatewayErrorFromProviderFailure(providerFailure)
+            }
             if (failure.requestLevel) throw gatewayErrorFromResponsesFailure(failure)
             throw new GatewayHttpError(502, failure.message, 'upstream_response_failed')
           }
@@ -2829,11 +3089,16 @@ export class GatewayServer implements GatewayController {
           const gatewayError = normalizeError(error)
           const retryable = isRetryable(gatewayError)
           const accountAction = gatewayError.providerFailure?.accountAction
-          const requestScopedModelFailure = isModelScopedProviderFailure(gatewayError.providerFailure)
+          const modelScopedFailure = isModelScopedProviderFailure(gatewayError.providerFailure)
+            ? gatewayError.providerFailure
+            : undefined
+          const requestScopedModelFailure = modelScopedFailure !== undefined
+          const requestScopedTransientFailure = gatewayError.providerFailure?.scope === 'request'
           const failureNow = this.now()
           const actualResetAt = quotaSignalCooldownUntil(gatewayError.quotaSignals, failureNow)
-          const quotaExhausted = codexQuotaIsExhausted(gatewayError.quotaSignals?.codexQuota, failureNow)
-            || genericQuotaExhausted(gatewayError.quotaSignals?.quota, failureNow)
+          // Codex percentage/WHAM telemetry is advisory. A real OAuth 429/402
+          // is already represented by providerFailure and remains authoritative.
+          const quotaExhausted = genericQuotaExhausted(gatewayError.quotaSignals?.quota, failureNow)
           const hardAccountFailure = accountAction === 'disable'
             || gatewayError.providerFailure?.category === 'rate_limit'
             || quotaExhausted
@@ -2865,7 +3130,7 @@ export class GatewayServer implements GatewayController {
               fallbackRequirements,
               [...failedAccountIds]
             )
-          const provenAccountFailure = gatewayError.type !== 'kiro_invalid_state' && (
+          const provenAccountFailure = !requestScopedTransientFailure && gatewayError.type !== 'kiro_invalid_state' && (
             retryable
               || accountAction === 'disable'
               || accountAction === 'cooldown'
@@ -2879,13 +3144,65 @@ export class GatewayServer implements GatewayController {
             && accountAction !== 'disable'
             && gatewayError.providerFailure?.category !== 'rate_limit'
             && !quotaExhausted
-          if (attemptedAccount && requestScopedModelFailure && hasCurrentModeAlternative) {
-            // A model-scoped denial says nothing about the account's other
-            // models or overall credential health. Exclude it only from this
-            // request and let a peer try the same model without opening a
-            // global circuit or persisting a disabled/cooldown state.
-            failedAccountIds.add(attemptedAccount.id)
-            this.scheduler.recordStickyFailure(schedulingPool.id, sessionId, attemptedAccount.id)
+          if (attemptedAccount && modelScopedFailure) {
+            // Remember the exact account/model pair across requests. This is
+            // deliberately detached from account-wide health: every other
+            // model remains schedulable, while this model is not hammered on
+            // each new request until its bounded probe window expires.
+            const modelCooldowns = this.scheduler.recordModelFailure(
+              attemptedAccount.id,
+              targetModel,
+              {
+                reason: modelScopedFailure.modelCooldownReason,
+                cooldownMs: modelScopedFailure.modelCooldownMs,
+                statusCode: modelScopedFailure.statusCode,
+              },
+            )
+            const currentHealth = this.scheduler.getHealth(attemptedAccount.id)
+            this.emitAccountState({
+              accountId: attemptedAccount.id,
+              status: attemptedAccount.status,
+              circuitState: currentHealth.circuitState,
+              consecutiveFailures: currentHealth.consecutiveFailures,
+              cooldownUntil: currentHealth.cooldownUntil ?? attemptedAccount.cooldownUntil,
+              cooldownReason: attemptedAccount.cooldownReason,
+              latencyMs: attemptedAccount.latencyMs,
+              lastError: attemptedAccount.lastError,
+              lastUsedAt: failureNow,
+              quota: attemptedAccount.quota,
+              codexQuota: attemptedAccount.codexQuota,
+              modelCooldowns,
+            })
+            if (hasCurrentModeAlternative) {
+              failedAccountIds.add(attemptedAccount.id)
+              this.scheduler.recordStickyFailure(schedulingPool.id, sessionId, attemptedAccount.id)
+            }
+          }
+          if (attemptedAccount && requestScopedTransientFailure) {
+            const used = transientSameAccountRetryCount.get(attemptedAccount.id) ?? 0
+            const sameAccountRetryLimit = Math.min(2, retryLimit)
+            const retryDelayMs = Math.min(2_000, Math.max(
+              100,
+              gatewayError.providerFailure?.retryAfterMs ?? 500
+            ))
+            if (
+              used < sameAccountRetryLimit
+              && !response.headersSent
+              && this.now() + retryDelayMs < responseStartDeadlineAt
+            ) {
+              transientSameAccountRetryCount.set(attemptedAccount.id, used + 1)
+              preferredTransientRetryAccountId = attemptedAccount.id
+              lastAttemptError = gatewayError
+              release?.()
+              release = undefined
+              scheduleProgressLog('retrying')
+              await waitForRetryDelay(retryDelayMs, clientAbortController.signal)
+              continue
+            }
+            // Capacity shedding is not an account-health signal. Exclude the
+            // exhausted member only from this request so a peer may try, but
+            // keep its circuit, persisted status and future sticky sessions.
+            if (hasCurrentModeAlternative) failedAccountIds.add(attemptedAccount.id)
           }
           if (attemptedAccount && provenAccountFailure && !requestScopedModelFailure) {
             const hasUsableAlternative = hasCurrentModeAlternative || hasCompactFallbackPeer
@@ -2949,7 +3266,7 @@ export class GatewayServer implements GatewayController {
             // invalid-state recovery path and is intentionally unaffected.
             && !(anthropicToolTurn.hasToolResult && !kiroClaudeRoute)
             && this.now() < responseStartDeadlineAt
-            && (!requestScopedModelFailure || hasCurrentModeAlternative)
+            && (!(requestScopedModelFailure || requestScopedTransientFailure) || hasCurrentModeAlternative)
             && (hasCurrentModeAlternative || (!hardAccountFailure && !explicitRetryAfterAdmissionFailure))
           const attemptedProvider = attemptedAccount
             ? requestIndex.providersById.get(attemptedAccount.providerId)
@@ -3012,6 +3329,17 @@ export class GatewayServer implements GatewayController {
           lastAttemptError = gatewayError
           failoverCount += 1
           scheduleProgressLog('retrying')
+          if (!hasCurrentModeAlternative && gatewayError.statusCode >= 500) {
+            const exponentialMs = Math.min(2_000, 200 * (2 ** Math.max(0, ordinaryRetriesUsed - 1)))
+            const jitteredMs = Math.max(100, Math.floor(exponentialMs * (0.8 + this.random() * 0.4)))
+            const remainingMs = responseStartDeadlineAt - this.now()
+            if (remainingMs <= jitteredMs) throw gatewayError
+            // Do not retain the account permit while deliberately backing off;
+            // unrelated requests may continue using their own available slots.
+            release?.()
+            release = undefined
+            await waitForRetryDelay(jitteredMs, clientAbortController.signal)
+          }
         } finally {
           attemptActive = false
           upstreamDeadline?.clear()
@@ -3065,6 +3393,9 @@ export class GatewayServer implements GatewayController {
       if (incoming.operation === 'count-tokens' && countTokensUpstreamResponseHeaders) {
         copyAnthropicResponseHeaders(countTokensUpstreamResponseHeaders, response)
       }
+      if (gatewayError.statusCode === 429 || gatewayError.statusCode >= 500) {
+        setSafeRetryAfterHeader(response, gatewayError.providerFailure?.retryAfterMs)
+      }
       await this.writeJson(
         response,
         gatewayError.statusCode,
@@ -3108,6 +3439,553 @@ export class GatewayServer implements GatewayController {
         this.emitRuntimeState({ gatewayStatus: true })
       }
     }
+  }
+
+  private async handleLiveCapabilityBoundary(
+    request: IncomingMessage,
+    response: ServerResponse,
+    index: GatewayConfigIndex,
+  ): Promise<void> {
+    try {
+      const route = this.authenticateModelList(request, 'openai', index)
+      request.resume()
+      const pool = index.poolsById.get(route.poolId)
+      const accounts = pool ? index.accountsByPoolId.get(pool.id) ?? [] : []
+      const hasChatGptOAuth = accounts.some((account) => (
+        account.credentialType === 'chatgpt-oauth' || account.credentialType === 'chatgpt-agent-identity'
+      ))
+      throw new GatewayHttpError(
+        503,
+        hasChatGptOAuth
+          ? 'ChatGPT Live is unavailable on this platform because a native device attestation provider is not installed.'
+          : 'This route has no verified ChatGPT Live transport. Live requires call creation and an authenticated sideband WebSocket from the same source.',
+        hasChatGptOAuth ? 'live_attestation_unavailable' : 'live_transport_unverified',
+      )
+    } catch (error) {
+      const normalized = normalizeError(error)
+      await this.writeJson(
+        response,
+        normalized.statusCode,
+        normalized.responseBody ?? { error: { message: normalized.message, type: normalized.type } },
+      )
+    }
+  }
+
+  private async handleGrokMedia(
+    request: IncomingMessage,
+    response: ServerResponse,
+    mediaRoute: GrokMediaRoute,
+    requestConfig: GatewayConfig,
+    index: GatewayConfigIndex,
+  ): Promise<void> {
+    const started = this.now()
+    const runtimeGeneration = this.runtimeGeneration
+    this.totalRequests += 1
+    this.activeRequests += 1
+    this.emitRuntimeState({ gatewayStatus: true })
+    const controller = new AbortController()
+    const abortForDisconnect = (): void => {
+      if (!controller.signal.aborted && !response.writableEnded) {
+        controller.abort(new DOMException('Client disconnected', 'AbortError'))
+      }
+    }
+    request.once('aborted', abortForDisconnect)
+    response.once('close', abortForDisconnect)
+    let route: Route | undefined
+    let account: Account | undefined
+    let provider: ProviderDefinition | undefined
+    let model = ''
+    let upstreamModel: string | undefined
+    let requestLogId: string | undefined
+    let failoverCount = 0
+    let terminalLogged = false
+    let releaseMediaBody: (() => void) | undefined
+    const finishLog = (status: 'success' | 'error', statusCode: number, error?: string): void => {
+      if (!route || !requestLogId || terminalLogged) return
+      terminalLogged = true
+      this.emitLog(this.makeLog({
+        id: requestLogId,
+        requestKind: 'generation',
+        route,
+        account,
+        providerName: provider?.name,
+        model,
+        upstreamModel,
+        started,
+        finished: this.now(),
+        status,
+        statusCode,
+        error,
+        failoverCount,
+      }))
+    }
+
+    try {
+      route = this.authenticateModelList(request, 'openai', index)
+      requestLogId = randomUUID()
+      this.emitLog(this.makeLog({
+        id: requestLogId,
+        requestKind: 'generation',
+        route,
+        model: '',
+        started,
+        finished: started,
+        status: 'streaming',
+        progressStage: 'receiving-body',
+      }))
+
+      let prepared: Awaited<ReturnType<typeof prepareGrokMediaRequest>>
+      if (mediaRoute.requiresBody) {
+        const rawResult = await readRawRequestBody(request, {
+          hardLimitBytes: GROK_MEDIA_REQUEST_BODY_LIMIT_BYTES,
+          largeThresholdBytes: STANDARD_REQUEST_BODY_LIMIT_BYTES,
+          signal: controller.signal,
+          idleTimeoutMs: Math.min(
+            MAX_REQUEST_BODY_IDLE_TIMEOUT_MS,
+            Math.max(1, requestConfig.settings.requestTimeoutSeconds) * 1_000,
+          ),
+          acquireLargeBody: (byteLength) => this.largeRequestBodies.acquire(byteLength, controller.signal),
+        })
+        releaseMediaBody = rawResult.releaseLargeBody
+        try {
+          prepared = await prepareGrokMediaRequest(
+            mediaRoute,
+            firstIncomingHeader(request.headers['content-type']),
+            rawResult.value,
+          )
+        } catch (error) {
+          throw new GatewayHttpError(
+            400,
+            error instanceof Error ? error.message : 'Invalid Grok media request.',
+            'invalid_request_error',
+          )
+        }
+      } else {
+        prepared = { model: '' }
+      }
+
+      let pool: Pool
+      let candidateAccounts: Account[]
+      let binding: GrokVideoBinding | undefined
+      if (mediaRoute.requestId) {
+        this.cleanupGrokVideoBindings()
+        binding = this.grokVideoBindings.get(grokVideoBindingKey(route.id, mediaRoute.requestId))
+        if (!binding) {
+          throw new GatewayHttpError(404, 'Video request not found.', 'not_found_error')
+        }
+        pool = index.poolsById.get(binding.poolId)!
+        const bound = index.accountsById.get(binding.accountId)
+        if (!pool || !bound) throw new GatewayHttpError(404, 'Video request not found.', 'not_found_error')
+        candidateAccounts = [bound]
+        model = binding.model
+        upstreamModel = binding.model
+      } else {
+        model = prepared.model
+        if (!model) throw new GatewayHttpError(400, 'A media model is required.', 'invalid_request_error')
+        upstreamModel = resolveRouteModel(route.modelMap, model)
+        try {
+          prepared = await rewritePreparedGrokMediaModel(prepared, upstreamModel)
+        } catch (error) {
+          throw new GatewayHttpError(
+            400,
+            error instanceof Error ? error.message : 'Unable to apply the media model mapping.',
+            'invalid_request_error',
+          )
+        }
+        const sourceId = resolveRouteSourceId(route.poolId, route.modelSourceMap, model)
+        const selectedPool = index.poolsById.get(sourceId)
+        if (!selectedPool) throw new GatewayHttpError(503, 'The matched route has no available media pool.')
+        pool = selectedPool
+        candidateAccounts = index.accountsByPoolId.get(pool.id) ?? []
+      }
+
+      let sawUnverifiedOAuth = false
+      let sawFreeOAuth = false
+      candidateAccounts = candidateAccounts.filter((candidate) => {
+        const candidateProvider = index.providersById.get(candidate.providerId)
+        if (!candidateProvider) return false
+        const eligibility = grokMediaEligibility(candidate, candidateProvider, mediaRoute.capability, {
+          lookup: Boolean(mediaRoute.requestId),
+        })
+        if (eligibility.reason === 'oauth-unverified') sawUnverifiedOAuth = true
+        if (eligibility.reason === 'oauth-free') sawFreeOAuth = true
+        return eligibility.eligible
+      })
+      if (!candidateAccounts.length) {
+        if (sawUnverifiedOAuth) {
+          throw new GatewayHttpError(
+            503,
+            'Grok OAuth media requires a recent paid-plan quota check. Refresh this account before retrying.',
+            'grok_media_eligibility_unverified',
+          )
+        }
+        if (sawFreeOAuth) {
+          throw new GatewayHttpError(
+            403,
+            'This Grok OAuth account is on a free plan and cannot create image or video media.',
+            'grok_media_not_entitled',
+          )
+        }
+        throw new GatewayHttpError(
+          503,
+          'No enabled Grok source has verified support for this media endpoint.',
+          'grok_media_source_unavailable',
+        )
+      }
+
+      const retryLimit = Number.isFinite(pool.maxRetries) ? Math.max(0, Math.floor(pool.maxRetries)) : 0
+      const failed = new Set<string>()
+      const mediaSessionId = mediaRoute.requestId
+        ? `grok-media:${mediaRoute.requestId}`
+        : `grok-media:${createHash('sha256').update(prepared.body ?? Buffer.alloc(0)).digest('base64url')}`
+      const deadline = createAbortDeadline(Math.max(1, requestConfig.settings.requestTimeoutSeconds) * 1_000)
+      const signal = AbortSignal.any([controller.signal, deadline.signal])
+      let lastError: GatewayHttpError | undefined
+      try {
+        for (let attempt = 0; attempt <= retryLimit; attempt += 1) {
+          let release: (() => void) | undefined
+          let selectedHealthRevision: number | undefined
+          let selectedResetEpoch: number | undefined
+          const attemptStarted = this.now()
+          try {
+            const scheduled = await this.scheduler.selectAndAcquireWhenAvailable({
+              pool: { ...pool, stickySessions: true },
+              accounts: candidateAccounts,
+              model: upstreamModel ?? model,
+              skipAccountModelCatalog: true,
+              sessionId: mediaSessionId,
+              excludedAccountIds: [...failed],
+              providers: requestConfig.providers,
+              requiredCapabilities: mediaRoute.capability ? [mediaRoute.capability] : undefined,
+            }, signal, started + Math.max(1, requestConfig.settings.requestTimeoutSeconds) * 1_000)
+            account = scheduled.account
+            selectedHealthRevision = scheduled.healthRevision
+            selectedResetEpoch = scheduled.resetEpoch
+            release = this.runtimeTrackedRelease(scheduled.release, runtimeGeneration, account.id)
+            this.emitRuntimeState({ accountIds: [account.id] })
+            provider = index.providersById.get(account.providerId)
+            if (!provider) throw new GatewayHttpError(503, 'The selected media account has no provider.')
+            const outboundFetch = this.outboundFetchResolver?.(account, pool, requestConfig.proxies ?? [])
+              ?? this.fetchImplementation
+            const adapter = getProviderAdapter(provider.kind)
+            const range = firstIncomingHeader(request.headers.range)
+            let upstreamResponse: Response
+            if (mediaRoute.endpoint === 'video-content') {
+              const signed = validGrokSignedVideoUrl(binding?.contentUrl ?? null)
+              if (!signed) {
+                throw new GatewayHttpError(
+                  409,
+                  'The generated video is not ready for download yet.',
+                  'video_not_ready',
+                )
+              }
+              const headers = new Headers({ accept: '*/*' })
+              if (range) headers.set('range', range)
+              try {
+                upstreamResponse = await awaitWithAbortSignal(outboundFetch(signed, {
+                  method: 'GET', headers, signal, redirect: 'error',
+                }), signal)
+              } catch (error) {
+                throw new GatewayHttpError(
+                  502,
+                  error instanceof Error && error.name === 'TimeoutError'
+                    ? 'The generated video download timed out.'
+                    : 'The generated video could not be downloaded.',
+                  'video_content_unavailable',
+                )
+              }
+            } else {
+              const resolvedValue = await awaitWithAbortSignal(
+                Promise.resolve(this.credentialResolver(account, outboundFetch, signal)),
+                signal,
+              )
+              if (!resolvedValue) throw new GatewayHttpError(503, 'The selected media credential is unavailable.')
+              const credential = typeof resolvedValue === 'string'
+                ? { secret: resolvedValue, kind: 'api-key' as const }
+                : resolvedValue
+              if (credential.kind !== 'api-key' && credential.kind !== 'grok-oauth') {
+                throw new GatewayHttpError(503, 'Only xAI API keys and Grok OAuth credentials can serve Grok media.')
+              }
+              const headers = new Headers()
+              adapter.applyRequestHeaders(headers, {
+                protocol: provider.protocol,
+                credential: credential.secret,
+                sourceHeaders: request.headers,
+                stream: false,
+                hasBody: mediaRoute.requiresBody,
+              })
+              headers.set('accept', 'application/json')
+              if (prepared.contentType) headers.set('content-type', prepared.contentType)
+              headers.delete('content-length')
+              const upstreamUrl = buildGrokMediaUpstreamUrl(provider, credential.kind, mediaRoute)
+              try {
+                upstreamResponse = await awaitWithAbortSignal(outboundFetch(upstreamUrl, {
+                  method: mediaRoute.method,
+                  headers,
+                  body: mediaRoute.requiresBody && prepared.body ? new Uint8Array(prepared.body) : undefined,
+                  signal,
+                  redirect: 'error',
+                }), signal)
+              } catch (error) {
+                throw gatewayErrorFromProviderFailure(adapter.classifyFailure({ error, now: this.now() }))
+              }
+            }
+            if (!upstreamResponse.ok) {
+              await upstreamResponse.body?.cancel().catch(() => undefined)
+              if (mediaRoute.endpoint === 'video-content') {
+                throw new GatewayHttpError(
+                  upstreamResponse.status === 403 || upstreamResponse.status === 404 ? 410 : 502,
+                  upstreamResponse.status === 403 || upstreamResponse.status === 404
+                    ? 'The generated video download URL has expired.'
+                    : `The generated video download failed (${upstreamResponse.status}).`,
+                  'video_content_unavailable',
+                )
+              }
+              const failure = adapter.classifyFailure({
+                statusCode: upstreamResponse.status,
+                headers: upstreamResponse.headers,
+                now: this.now(),
+              })
+              throw new GatewayHttpError(
+                upstreamResponse.status,
+                `Grok media upstream rejected the request (${upstreamResponse.status}).`,
+                `provider_${failure.category}`,
+                undefined,
+                failure,
+              )
+            }
+
+            if (mediaRoute.endpoint === 'video-content') {
+              copyGrokMediaResponseHeaders(upstreamResponse.headers, response, true)
+              response.statusCode = upstreamResponse.status
+              this.reportAccountSuccess(
+                account, attemptStarted, undefined, selectedHealthRevision, selectedResetEpoch,
+              )
+              release()
+              release = undefined
+              const written = await pipeRawUpstreamResponse(upstreamResponse, response, signal)
+              if (!written) throw new GatewayHttpError(499, 'Client closed the request.', 'client_closed')
+              this.successRequests += 1
+              finishLog('success', upstreamResponse.status)
+              return
+            }
+
+            const rawResponse = await readLimitedResponseBuffer(
+              upstreamResponse,
+              GROK_MEDIA_RESPONSE_BODY_LIMIT_BYTES,
+              signal,
+            )
+            let payload: JsonObject
+            try {
+              const parsed: unknown = JSON.parse(new TextDecoder().decode(rawResponse))
+              if (!objectValue(parsed)) throw new Error('not an object')
+              payload = parsed as JsonObject
+            } catch {
+              throw new GatewayHttpError(502, 'Grok media upstream returned invalid JSON.', 'upstream_invalid_response')
+            }
+            if ((mediaRoute.endpoint === 'images-generations' || mediaRoute.endpoint === 'images-edits')
+              && (!Array.isArray(payload.data) || payload.data.length === 0)) {
+              throw new GatewayHttpError(502, 'Grok media upstream returned no image output.', 'upstream_invalid_response')
+            }
+            if (mediaRoute.endpoint.startsWith('videos-')) {
+              const requestId = extractGrokVideoRequestId(payload)
+              if (!requestId) {
+                throw new GatewayHttpError(502, 'Grok video upstream returned no request id.', 'upstream_invalid_response')
+              }
+              this.grokVideoBindings.set(grokVideoBindingKey(route.id, requestId), {
+                requestId,
+                accountId: account.id,
+                poolId: pool.id,
+                routeId: route.id,
+                model: upstreamModel ?? model,
+                expiresAt: this.now() + GROK_VIDEO_BINDING_TTL_MS,
+              })
+              this.cleanupGrokVideoBindings(false)
+              await this.persistGrokVideoBindings()
+            }
+            if (mediaRoute.endpoint === 'video-status' && mediaRoute.requestId) {
+              const video = objectValue(payload.video)
+              const signedContentUrl = validGrokSignedVideoUrl(
+                typeof video?.url === 'string' ? video.url : null,
+              )
+              if (signedContentUrl && binding) {
+                binding.contentUrl = signedContentUrl
+                binding.expiresAt = this.now() + GROK_VIDEO_BINDING_TTL_MS
+                await this.persistGrokVideoBindings()
+                const localOrigin = gatewayRequestOrigin(request, requestConfig.settings.port)
+                payload = rewriteGrokVideoContentUrl(
+                  payload,
+                  mediaRoute.requestId,
+                  `${localOrigin}/v1/videos/${encodeURIComponent(mediaRoute.requestId)}/content`,
+                )
+              } else if (provider.kind === 'xai' && payload.status === 'done') {
+                throw new GatewayHttpError(
+                  502,
+                  'xAI reported a completed video without a valid signed content URL.',
+                  'upstream_invalid_response',
+                )
+              }
+            }
+            copyGrokMediaResponseHeaders(upstreamResponse.headers, response, false)
+            this.reportAccountSuccess(
+              account, attemptStarted, undefined, selectedHealthRevision, selectedResetEpoch,
+            )
+            release()
+            release = undefined
+            const written = await this.writeJson(response, upstreamResponse.status, payload)
+            if (!written) throw new GatewayHttpError(499, 'Client closed the request.', 'client_closed')
+            this.successRequests += 1
+            finishLog('success', upstreamResponse.status)
+            return
+          } catch (error) {
+            const normalized = normalizeError(error)
+            lastError = normalized
+            if (controller.signal.aborted) throw normalized
+            if (account && mediaRoute.endpoint !== 'video-content') {
+              const required = mediaRoute.capability ? [mediaRoute.capability] : []
+              // Media ids do not belong to the language-model catalog, so an
+              // empty model intentionally asks the shared helper to evaluate
+              // provider capability and runtime health without that catalog.
+              const hasAlternative = this.scheduler.hasUsableAlternative(
+                candidateAccounts,
+                '',
+                account.id,
+                pool,
+                requestConfig.providers,
+                required,
+                [...failed],
+              )
+              const failure = normalized.providerFailure
+              const accountAction = failure?.accountAction
+              const hardFailure = accountAction === 'disable' || failure?.category === 'rate_limit'
+              const explicitRetryAfter = normalized.statusCode >= 500 && (failure?.retryAfterMs ?? 0) > 0
+              const retryable = isRetryable(normalized)
+              const shouldRecordFailure = hardFailure || explicitRetryAfter || (retryable && hasAlternative)
+              const cooldownDisabled = requestConfig.settings.disableCooldown === true
+                && accountAction !== 'disable'
+                && failure?.category !== 'rate_limit'
+              if (shouldRecordFailure && !cooldownDisabled) {
+                this.scheduler.recordStickyFailure(pool.id, mediaSessionId, account.id)
+                const health = this.scheduler.recordFailure(account.id, {
+                  retryAfterMs: failure?.retryAfterMs,
+                  maxConcurrency: account.maxConcurrency,
+                  expectedRevision: selectedHealthRevision,
+                  expectedResetEpoch: selectedResetEpoch,
+                  reason: failure?.category === 'rate_limit' ? 'quota' : 'failure',
+                })
+                if (health.applied) {
+                  this.emitAccountState({
+                    accountId: account.id,
+                    status: accountAction === 'disable' ? 'disabled' : 'cooldown',
+                    circuitState: health.circuitState,
+                    consecutiveFailures: health.consecutiveFailures,
+                    cooldownUntil: accountAction === 'disable' ? undefined : health.cooldownUntil,
+                    cooldownReason: accountAction === 'disable'
+                      ? undefined
+                      : failure?.category === 'rate_limit' ? 'quota' : 'failure',
+                    lastError: normalized.message,
+                    lastUsedAt: this.now(),
+                  })
+                }
+              }
+              if (retryable && hasAlternative && attempt < retryLimit) {
+                failed.add(account.id)
+                failoverCount += 1
+                continue
+              }
+            }
+            throw normalized
+          } finally {
+            release?.()
+          }
+        }
+      } finally {
+        deadline.clear()
+      }
+      throw lastError ?? new GatewayHttpError(502, 'Grok media request failed.')
+    } catch (error) {
+      const normalized = controller.signal.aborted
+        ? new GatewayHttpError(499, 'Client closed the request.', 'client_closed')
+        : normalizeError(error)
+      if (normalized.statusCode === 429 || normalized.statusCode >= 500) {
+        setSafeRetryAfterHeader(response, normalized.providerFailure?.retryAfterMs)
+      }
+      await this.writeJson(
+        response,
+        normalized.statusCode,
+        normalized.responseBody ?? { error: { message: normalized.message, type: normalized.type } },
+      )
+      finishLog(controller.signal.aborted ? 'success' : 'error', normalized.statusCode, normalized.message)
+      if (controller.signal.aborted) this.successRequests += 1
+    } finally {
+      request.off('aborted', abortForDisconnect)
+      response.off('close', abortForDisconnect)
+      releaseMediaBody?.()
+      releaseMediaBody = undefined
+      if (runtimeGeneration === this.runtimeGeneration) {
+        this.activeRequests = Math.max(0, this.activeRequests - 1)
+        this.emitRuntimeState({ gatewayStatus: true })
+      }
+    }
+  }
+
+  private cleanupGrokVideoBindings(persist = true): void {
+    const now = this.now()
+    let removed = false
+    for (const [requestId, binding] of this.grokVideoBindings) {
+      if (binding.expiresAt <= now) {
+        this.grokVideoBindings.delete(requestId)
+        removed = true
+      }
+    }
+    if (this.grokVideoBindings.size > MAX_GROK_VIDEO_BINDINGS) {
+      const overflow = [...this.grokVideoBindings.entries()]
+        .sort((left, right) => left[1].expiresAt - right[1].expiresAt)
+        .slice(0, this.grokVideoBindings.size - MAX_GROK_VIDEO_BINDINGS)
+      for (const [key] of overflow) this.grokVideoBindings.delete(key)
+      removed = overflow.length > 0 || removed
+    }
+    if (removed && persist) void this.persistGrokVideoBindings()
+  }
+
+  private async restoreGrokVideoBindings(): Promise<void> {
+    if (this.grokVideoBindingsRestored) return
+    this.grokVideoBindingsRestored = true
+    if (!this.loadGrokVideoBindings) return
+    let persisted: readonly PersistedGrokVideoBinding[]
+    try {
+      persisted = await this.loadGrokVideoBindings()
+    } catch (error) {
+      this.grokVideoBindingsRestored = false
+      console.warn('Stone+ could not restore Grok video task bindings', error)
+      return
+    }
+    const now = this.now()
+    for (const candidate of persisted.slice(0, MAX_GROK_VIDEO_BINDINGS)) {
+      const binding = validPersistedGrokVideoBinding(candidate, this.config, now)
+      if (!binding) continue
+      const key = grokVideoBindingKey(binding.routeId, binding.requestId)
+      const current = this.grokVideoBindings.get(key)
+      if (!current || current.expiresAt < binding.expiresAt) this.grokVideoBindings.set(key, binding)
+    }
+    this.cleanupGrokVideoBindings(false)
+    // Rewrites malformed/expired rows out of the metadata journal.
+    await this.persistGrokVideoBindings()
+  }
+
+  private persistGrokVideoBindings(): Promise<void> {
+    if (!this.saveGrokVideoBindings) return Promise.resolve()
+    const snapshot = [...this.grokVideoBindings.values()]
+      .filter((binding) => binding.expiresAt > this.now())
+      .map(({ contentUrl: _signedAssetUrl, ...binding }) => ({ ...binding }))
+    const operation = this.grokVideoBindingPersistence
+      .catch(() => undefined)
+      .then(() => this.saveGrokVideoBindings!(snapshot))
+      .catch((error: unknown) => {
+        console.warn('Stone+ could not persist Grok video task bindings', error)
+      })
+    this.grokVideoBindingPersistence = operation
+    return operation
   }
 
   private dispatchResponsesWebSocket(input: ResponsesWebSocketDispatchInput): Promise<Response> {
@@ -3433,8 +4311,7 @@ export class GatewayServer implements GatewayController {
   ): number | undefined {
     const quota = observedQuotaSignals(signals, observedAt)
     if (
-      !codexQuotaIsExhausted(quota.codexQuota, observedAt)
-      && !genericQuotaExhausted(quota.quota, observedAt)
+      !genericQuotaExhausted(quota.quota, observedAt)
     ) return selectedHealthRevision
 
     const cooldownUntil = quotaSignalCooldownUntil(quota, observedAt)
@@ -3473,8 +4350,7 @@ export class GatewayServer implements GatewayController {
   ): number | undefined {
     const now = this.now()
     const quota = observedQuotaSignals(signals, now)
-    const quotaExhausted = codexQuotaIsExhausted(quota.codexQuota, now)
-      || genericQuotaExhausted(quota.quota, now)
+    const quotaExhausted = genericQuotaExhausted(quota.quota, now)
     // Exhausted headers were already committed synchronously when received.
     // Do not turn a successfully delivered body into an "active" transition.
     if (quotaExhausted) return undefined
@@ -3612,6 +4488,69 @@ function responsesWebSocketForwardHeaders(source: IncomingMessage['headers']): H
 
 function formatUrlHost(host: string): string {
   return host.includes(':') && !host.startsWith('[') ? `[${host}]` : host
+}
+
+function gatewayRequestOrigin(request: IncomingMessage, configuredPort: number): string {
+  const socketAddress = request.socket.localAddress?.replace(/^::ffff:/, '').trim()
+  const host = !socketAddress || socketAddress === '::' || socketAddress === '0.0.0.0'
+    ? '127.0.0.1'
+    : socketAddress
+  const socketPort = request.socket.localPort
+  const port = typeof socketPort === 'number' && socketPort > 0 ? socketPort : configuredPort
+  return `http://${formatUrlHost(host)}:${port}`
+}
+
+function grokVideoBindingKey(routeId: string, requestId: string): string {
+  return `${routeId}\0${requestId}`
+}
+
+function validPersistedGrokVideoBinding(
+  value: unknown,
+  config: GatewayConfig,
+  now: number,
+): GrokVideoBinding | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const candidate = value as Partial<PersistedGrokVideoBinding>
+  const requestId = boundedBindingText(candidate.requestId, 512)
+  const accountId = boundedBindingText(candidate.accountId, 256)
+  const poolId = boundedBindingText(candidate.poolId, 256)
+  const routeId = boundedBindingText(candidate.routeId, 256)
+  const model = boundedBindingText(candidate.model, 256)
+  if (!requestId || !accountId || !poolId || !routeId || !model) return undefined
+  if (typeof candidate.expiresAt !== 'number'
+    || !Number.isFinite(candidate.expiresAt)
+    || candidate.expiresAt <= now) return undefined
+  const account = config.accounts.find((entry) => entry.id === accountId)
+  const pool = config.pools.find((entry) => entry.id === poolId)
+  const route = config.routes.find((entry) => entry.id === routeId && entry.enabled && entry.poolId === poolId)
+  if (!account || !pool || !route || !pool.members.some((member) => member.enabled && member.accountId === accountId)) {
+    return undefined
+  }
+  return {
+    requestId,
+    accountId,
+    poolId,
+    routeId,
+    model,
+    expiresAt: Math.min(candidate.expiresAt, now + GROK_VIDEO_BINDING_TTL_MS),
+  }
+}
+
+function boundedBindingText(value: unknown, maximumLength: number): string | undefined {
+  if (typeof value !== 'string') return undefined
+  const normalized = value.trim()
+  if (!normalized || normalized.length > maximumLength || hasAsciiControlCharacter(normalized)) {
+    return undefined
+  }
+  return normalized
+}
+
+function hasAsciiControlCharacter(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index)
+    if (code < 32 || code === 127) return true
+  }
+  return false
 }
 
 class GatewayHttpError extends Error {
@@ -3782,6 +4721,17 @@ interface ReadJsonBodyResult {
   releaseLargeBody?: () => void
 }
 
+interface ReadRawBodyOptions extends RequestBodyPolicy {
+  signal: AbortSignal
+  idleTimeoutMs: number
+  acquireLargeBody?: (byteLength: number) => Promise<() => void>
+}
+
+interface ReadRawBodyResult {
+  value: Buffer
+  releaseLargeBody?: () => void
+}
+
 function requestBodyPolicy(route: Route, incoming: IncomingRoute): RequestBodyPolicy {
   const largeCodexBody = isResponsesAgentClient(route.client)
     && incoming.protocol === 'openai-responses'
@@ -3802,6 +4752,7 @@ async function readJsonBody(
   request: IncomingMessage,
   options: ReadJsonBodyOptions
 ): Promise<ReadJsonBodyResult> {
+  const contentEncodings = requestContentEncodings(request)
   const declaredLength = requestContentLength(request)
   if (declaredLength !== undefined && declaredLength > options.hardLimitBytes) {
     // Let Node discard the remaining request in the background. This permits
@@ -3812,8 +4763,19 @@ async function readJsonBody(
   }
 
   let releaseLargeBody: (() => void) | undefined
+  let compressionReservation = false
   try {
     if (
+      options.acquireLargeBody
+      && options.largeThresholdBytes !== undefined
+      && contentEncodings.length > 0
+    ) {
+      // The compressed length says nothing useful about the expanded body.
+      // Reserve the full bounded output before allocating it so several tiny
+      // compression bombs cannot bypass the shared large-request byte gate.
+      releaseLargeBody = await options.acquireLargeBody(options.hardLimitBytes)
+      compressionReservation = true
+    } else if (
       options.acquireLargeBody
       && options.largeThresholdBytes !== undefined
       && declaredLength !== undefined
@@ -3872,9 +4834,10 @@ async function readJsonBody(
       }
     }
 
-    const rawBuffer = declaredBuffer
+    const encodedBuffer = declaredBuffer
       ? declaredBuffer.subarray(0, size)
       : Buffer.concat(chunks, size)
+    const rawBuffer = await decodeRequestBody(encodedBuffer, contentEncodings, options.hardLimitBytes)
     const raw = rawBuffer.toString('utf8')
     if (!raw) throw new GatewayHttpError(400, 'A JSON request body is required')
     let parsed: unknown
@@ -3884,7 +4847,148 @@ async function readJsonBody(
       throw new GatewayHttpError(400, 'Invalid JSON request body')
     }
     if (!objectValue(parsed)) throw new GatewayHttpError(400, 'Invalid JSON request body')
-    return { value: parsed as JsonObject, byteLength: size, releaseLargeBody }
+    if (
+      compressionReservation
+      && options.largeThresholdBytes !== undefined
+      && rawBuffer.byteLength <= options.largeThresholdBytes
+    ) {
+      releaseLargeBody?.()
+      releaseLargeBody = undefined
+    }
+    return { value: parsed as JsonObject, byteLength: rawBuffer.byteLength, releaseLargeBody }
+  } catch (error) {
+    releaseLargeBody?.()
+    throw error
+  }
+}
+
+const MAX_REQUEST_CONTENT_ENCODINGS = 4
+
+function requestContentEncodings(request: IncomingMessage): string[] {
+  const header = request.headers['content-encoding']
+  if (header === undefined) return []
+  const serialized = Array.isArray(header) ? header.join(',') : header
+  const encodings = serialized
+    .split(',')
+    .map((coding) => coding.trim().toLowerCase())
+    .filter((coding) => coding && coding !== 'identity')
+  if (encodings.length > MAX_REQUEST_CONTENT_ENCODINGS) {
+    throw new GatewayHttpError(
+      415,
+      `Request uses more than ${MAX_REQUEST_CONTENT_ENCODINGS} content encodings`,
+      'unsupported_content_encoding'
+    )
+  }
+  const unsupported = encodings.find((coding) => !['gzip', 'x-gzip', 'deflate', 'br', 'zstd'].includes(coding))
+  if (unsupported) {
+    throw new GatewayHttpError(
+      415,
+      `Unsupported request content encoding: ${unsupported}`,
+      'unsupported_content_encoding'
+    )
+  }
+  return encodings
+}
+
+async function decodeRequestBody(
+  encoded: Buffer,
+  encodings: readonly string[],
+  maximumBytes: number
+): Promise<Buffer> {
+  let decoded = encoded
+  for (const encoding of [...encodings].reverse()) {
+    decoded = await decompressRequestBodyLayer(decoded, encoding, maximumBytes)
+  }
+  return decoded
+}
+
+async function decompressRequestBodyLayer(
+  input: Buffer,
+  encoding: string,
+  maximumBytes: number
+): Promise<Buffer> {
+  const decode = (
+    operation: (
+      source: Buffer,
+      options: { maxOutputLength: number },
+      callback: (error: Error | null, result: Buffer) => void
+    ) => void
+  ): Promise<Buffer> => new Promise((resolve, reject) => {
+    operation(input, { maxOutputLength: maximumBytes }, (error, result) => {
+      if (error) reject(error)
+      else resolve(result)
+    })
+  })
+
+  try {
+    if (encoding === 'gzip' || encoding === 'x-gzip') return await decode(gunzip)
+    if (encoding === 'br') return await decode(brotliDecompress)
+    if (encoding === 'zstd') return await decode(zstdDecompress)
+    try {
+      return await decode(inflate)
+    } catch (error) {
+      // A few older clients send raw DEFLATE while labeling it "deflate".
+      // Accept that established ambiguity, but keep both paths bounded.
+      if ((error as NodeJS.ErrnoException).code !== 'Z_DATA_ERROR') throw error
+      return await decode(inflateRaw)
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ERR_BUFFER_TOO_LARGE') {
+      throw requestBodyTooLarge(maximumBytes)
+    }
+    throw new GatewayHttpError(
+      400,
+      `Invalid ${encoding}-encoded JSON request body`,
+      'invalid_content_encoding'
+    )
+  }
+}
+
+async function readRawRequestBody(
+  request: IncomingMessage,
+  options: ReadRawBodyOptions,
+): Promise<ReadRawBodyResult> {
+  const declaredLength = requestContentLength(request)
+  if (declaredLength !== undefined && declaredLength > options.hardLimitBytes) {
+    request.resume()
+    throw requestBodyTooLarge(options.hardLimitBytes)
+  }
+  let releaseLargeBody: (() => void) | undefined
+  try {
+    if (options.acquireLargeBody && options.largeThresholdBytes !== undefined
+      && declaredLength !== undefined && declaredLength > options.largeThresholdBytes) {
+      releaseLargeBody = await options.acquireLargeBody(declaredLength)
+    }
+    const chunks: Buffer[] = []
+    let byteLength = 0
+    const iterator = request.iterator({ destroyOnReturn: false })
+    for (;;) {
+      let result: IteratorResult<Buffer>
+      try {
+        result = await awaitRequestBodyChunk(iterator.next(), options.signal, options.idleTimeoutMs)
+      } catch (error) {
+        void iterator.return?.().catch(() => undefined)
+        request.resume()
+        throw error
+      }
+      if (result.done) break
+      const chunk = Buffer.isBuffer(result.value) ? result.value : Buffer.from(result.value)
+      byteLength += chunk.byteLength
+      if (byteLength > options.hardLimitBytes) {
+        request.resume()
+        throw requestBodyTooLarge(options.hardLimitBytes)
+      }
+      if (!releaseLargeBody && options.acquireLargeBody && options.largeThresholdBytes !== undefined
+        && byteLength > options.largeThresholdBytes) {
+        releaseLargeBody = await options.acquireLargeBody(options.hardLimitBytes)
+      }
+      chunks.push(chunk)
+    }
+    if (byteLength === 0) throw new GatewayHttpError(400, 'A request body is required.')
+    return {
+      value: chunks.length === 1 ? chunks[0] : Buffer.concat(chunks, byteLength),
+      releaseLargeBody,
+    }
   } catch (error) {
     releaseLargeBody?.()
     throw error
@@ -5034,12 +6138,42 @@ function copyResponsesResponseHeaders(source: Headers, target: ServerResponse, c
 function copyAnthropicResponseHeaders(source: Headers, target: ServerResponse): void {
   if (target.headersSent || target.writableEnded || target.destroyed) return
   for (const name of ANTHROPIC_RESPONSE_PASSTHROUGH_HEADERS) {
+    if (name === 'retry-after') continue
     const value = source.get(name)
     if (value) target.setHeader(name, value)
   }
+  setSafeRetryAfterHeader(target, parseRetryAfter(source))
   source.forEach((value, name) => {
     if (name.startsWith('anthropic-ratelimit-')) target.setHeader(name, value)
   })
+}
+
+function copyGrokMediaResponseHeaders(source: Headers, target: ServerResponse, binary: boolean): void {
+  const allowed = binary
+    ? ['content-type', 'content-length', 'content-range', 'accept-ranges', 'etag', 'last-modified', 'cache-control', 'content-disposition']
+    : ['content-type', 'cache-control', 'retry-after']
+  for (const name of allowed) {
+    if (name === 'retry-after') continue
+    const value = source.get(name)
+    if (value) target.setHeader(name, value)
+  }
+  if (!binary) setSafeRetryAfterHeader(target, parseRetryAfter(source))
+  for (const name of ['x-request-id', 'xai-request-id']) {
+    const value = source.get(name)
+    if (value) target.setHeader(name, value)
+  }
+}
+
+function setSafeRetryAfterHeader(target: ServerResponse, retryAfterMs: number | undefined): void {
+  if (target.headersSent || target.writableEnded || target.destroyed) return
+  if (typeof retryAfterMs !== 'number' || !Number.isFinite(retryAfterMs) || retryAfterMs <= 0) return
+  const boundedMs = Math.min(MAX_RETRY_AFTER_MS, Math.max(0, retryAfterMs))
+  target.setHeader('retry-after', String(Math.ceil(boundedMs / 1000)))
+}
+
+function firstIncomingHeader(value: string | string[] | undefined): string | undefined {
+  const selected = Array.isArray(value) ? value[0] : value
+  return typeof selected === 'string' && selected.trim() ? selected.trim() : undefined
 }
 
 function copyCompactRequestHeaders(source: IncomingMessage, target: Headers, client: RouteClient): void {
@@ -5182,6 +6316,74 @@ async function readUpstreamJsonWithBytes(
     )
   }
   return { payload: { error: { message: 'Upstream returned a non-object JSON response' } } }
+}
+
+async function readLimitedResponseBuffer(
+  upstream: Response,
+  maximumBytes: number,
+  signal?: AbortSignal,
+): Promise<Buffer> {
+  if (!upstream.body) throw new GatewayHttpError(502, 'Upstream returned an empty response.', 'upstream_invalid_response')
+  const declared = upstream.headers.get('content-length')?.trim()
+  if (declared && /^\d+$/.test(declared) && Number(declared) > maximumBytes) {
+    await upstream.body.cancel().catch(() => undefined)
+    throw new GatewayHttpError(502, 'Upstream media response is too large.', 'upstream_response_too_large')
+  }
+  const reader = upstream.body.getReader()
+  const chunks: Buffer[] = []
+  let byteLength = 0
+  let reachedEof = false
+  try {
+    for (;;) {
+      const result = signal
+        ? await awaitWithAbortSignal(reader.read(), signal)
+        : await reader.read()
+      if (result.done) {
+        reachedEof = true
+        break
+      }
+      if (!result.value?.byteLength) continue
+      byteLength += result.value.byteLength
+      if (byteLength > maximumBytes) {
+        throw new GatewayHttpError(502, 'Upstream media response is too large.', 'upstream_response_too_large')
+      }
+      chunks.push(Buffer.from(result.value.buffer, result.value.byteOffset, result.value.byteLength))
+    }
+  } finally {
+    if (!reachedEof) cancelStreamReader(reader)
+    else reader.releaseLock()
+  }
+  if (signal?.aborted) throw abortSignalReason(signal)
+  if (!byteLength) throw new GatewayHttpError(502, 'Upstream returned an empty response.', 'upstream_invalid_response')
+  return chunks.length === 1 ? chunks[0] : Buffer.concat(chunks, byteLength)
+}
+
+async function pipeRawUpstreamResponse(
+  upstream: Response,
+  response: ServerResponse,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  if (!upstream.body) throw new GatewayHttpError(502, 'Upstream returned an empty media body.', 'upstream_invalid_response')
+  const reader = upstream.body.getReader()
+  let reachedEof = false
+  try {
+    for (;;) {
+      const result = signal
+        ? await awaitWithAbortSignal(reader.read(), signal)
+        : await reader.read()
+      if (result.done) {
+        reachedEof = true
+        break
+      }
+      if (!result.value?.byteLength) continue
+      if (response.destroyed || response.writableEnded) return false
+      if (!response.write(result.value)) await waitForDrain(response)
+    }
+    return await endAndWaitForFinish(response)
+  } finally {
+    if (!reachedEof) cancelStreamReader(reader)
+    else reader.releaseLock()
+  }
 }
 
 async function readUpstreamJson(response: Response, signal?: AbortSignal): Promise<JsonObject> {
@@ -6562,6 +7764,22 @@ async function awaitWithAbortSignal<T>(promise: Promise<T>, signal: AbortSignal)
   }
 }
 
+async function waitForRetryDelay(delayMs: number, signal: AbortSignal): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let abortListener: (() => void) | undefined
+  try {
+    if (signal.aborted) throw abortSignalReason(signal)
+    await new Promise<void>((resolve, reject) => {
+      timer = setTimeout(resolve, Math.max(0, delayMs))
+      abortListener = () => reject(abortSignalReason(signal))
+      signal.addEventListener('abort', abortListener, { once: true })
+    })
+  } finally {
+    if (timer) clearTimeout(timer)
+    if (abortListener) signal.removeEventListener('abort', abortListener)
+  }
+}
+
 async function pipeUpstreamResponse(
   upstream: Response,
   response: ServerResponse,
@@ -7847,14 +9065,19 @@ async function endAndWaitForFinish(
   })
 }
 
-function getSessionId(request: IncomingMessage, body: JsonObject): string | undefined {
+function getSessionId(
+  request: IncomingMessage,
+  body: JsonObject,
+  client?: RouteClient,
+): string | undefined {
   const headerNames = [
+    ...(client === 'grokbuild' ? ['x-grok-conv-id', 'x-grok-session-id'] : []),
     'x-claude-code-session-id',
     'x-stone-session-id',
     'session-id',
     'session_id',
     'thread-id',
-  ] as const
+  ]
   for (const name of headerNames) {
     const value = request.headers[name]
     const first = Array.isArray(value) ? value[0] : value
@@ -7869,7 +9092,70 @@ function getSessionId(request: IncomingMessage, body: JsonObject): string | unde
     metadata?.sessionId,
     body.id
   ]
-  return candidates.find((value): value is string => typeof value === 'string' && Boolean(value.trim()))?.trim()
+  const explicit = candidates.find((value): value is string => typeof value === 'string' && Boolean(value.trim()))?.trim()
+  if (explicit) return explicit
+
+  const affinityKey = [body.prompt_cache_key, body.safety_identifier]
+    .find((value): value is string => typeof value === 'string' && Boolean(value.trim()))
+  if (affinityKey) return `affinity:${affinityKey.trim()}`
+
+  // Some compatible clients omit every session header while replaying full
+  // history. Use only the stable beginning of a multi-message conversation;
+  // a single first-turn prompt is deliberately not hashed because unrelated
+  // chats often start with identical text and must not share stickiness.
+  const history = [body.input, body.messages, body.contents]
+    .filter((value): value is unknown[] => Array.isArray(value))
+    .map((items) => items.filter(isConversationAffinityItem))
+    .find((items) => items.length >= 2)
+  if (!history) return undefined
+  const seed = boundedSessionAffinitySeed({
+    instructions: typeof body.instructions === 'string' ? body.instructions : undefined,
+    system: body.system,
+    history: history.slice(0, 2),
+  })
+  return `content:${createHash('sha256').update(seed).digest('hex')}`
+}
+
+function isConversationAffinityItem(value: unknown): boolean {
+  const item = objectValue(value)
+  if (!item) return false
+  if (item.type === 'message') return true
+  return item.role === 'user'
+    || item.role === 'assistant'
+    || item.role === 'model'
+    || item.role === 'system'
+}
+
+function boundedSessionAffinitySeed(value: unknown): string {
+  const state = { nodes: 0 }
+  const sanitize = (candidate: unknown, depth: number): unknown => {
+    state.nodes += 1
+    if (state.nodes > 512) return '[node-budget-exhausted]'
+    if (candidate === null || typeof candidate === 'boolean' || typeof candidate === 'number') return candidate
+    if (typeof candidate === 'string') {
+      if (candidate.length <= 2_048) return candidate
+      return {
+        type: 'long-string',
+        length: candidate.length,
+        sha256: createHash('sha256').update(candidate).digest('base64url'),
+      }
+    }
+    if (depth >= 8) return '[depth-limit]'
+    if (Array.isArray(candidate)) {
+      return {
+        length: candidate.length,
+        items: candidate.slice(0, 32).map((item) => sanitize(item, depth + 1)),
+      }
+    }
+    if (!candidate || typeof candidate !== 'object') return undefined
+    const result: JsonObject = {}
+    for (const key of Object.keys(candidate).sort().slice(0, 32)) {
+      const sanitized = sanitize((candidate as JsonObject)[key], depth + 1)
+      if (sanitized !== undefined) result[key] = sanitized
+    }
+    return result
+  }
+  return JSON.stringify(sanitize(value, 0))
 }
 
 /**
@@ -7964,6 +9250,32 @@ function routeConversionContext(
     && provider?.sourceType === 'relay'
     && providerSourceFamily(provider.kind) === 'grok'
   return pool.protocol === 'grok' || aggregateGrokRelay ? { dialect: 'xai-grok' } : undefined
+}
+
+function applyPoolReasoningPolicy(
+  body: JsonObject,
+  pool: Pool,
+  provider: ProviderDefinition,
+): JsonObject {
+  // DeepSeek owns a provider-specific native policy below. Applying two
+  // independent caps would make its advertised Max setting misleading.
+  if (providerSourceFamily(provider.kind) === 'deepseek') return body
+  const cap = normalizeReasoningEffort(pool.reasoningEffortCap)
+  const mapping = pool.reasoningEffortMap
+  if (!cap && !mapping) return body
+
+  const reasoning = objectValue(body.reasoning)
+  const responsesEffort = applyReasoningEffortPolicy(reasoning?.effort, cap, mapping)
+  if (responsesEffort) return { ...body, reasoning: { ...reasoning, effort: responsesEffort } }
+
+  const chatEffort = applyReasoningEffortPolicy(body.reasoning_effort, cap, mapping)
+  if (chatEffort) return { ...body, reasoning_effort: chatEffort }
+
+  const outputConfig = objectValue(body.output_config)
+  const anthropicEffort = applyReasoningEffortPolicy(outputConfig?.effort, cap, mapping)
+  return anthropicEffort
+    ? { ...body, output_config: { ...outputConfig, effort: anthropicEffort } }
+    : body
 }
 
 /**
@@ -8525,25 +9837,74 @@ const MODEL_SCOPED_PROVIDER_ERROR_CODES = new Set([
   'unsupported_model'
 ])
 
+const MODEL_SCOPED_PLAN_ERROR_CODES = new Set([
+  'model_not_in_plan',
+  'model_plan_restricted',
+  'plan_model_not_available',
+  'model_subscription_required',
+  'model_upgrade_required',
+])
+
+const MODEL_SCOPED_RATE_LIMIT_ERROR_CODES = new Set([
+  'model_capacity_exceeded',
+  'model_concurrency_limit_exceeded',
+  'model_overloaded',
+  'model_quota_exceeded',
+  'model_rate_limit_exceeded',
+])
+
 interface ModelScopedProviderFailure extends ProviderFailure {
   readonly scope: 'model'
+  readonly modelCooldownReason: 'not-found' | 'permission' | 'plan-restricted' | 'rate-limit'
+  readonly modelCooldownMs: number
 }
 
-function modelScopedProviderFailure(statusCode: number, payload: JsonObject): ModelScopedProviderFailure | undefined {
-  if (statusCode !== 403) return undefined
+function modelScopedProviderFailure(
+  statusCode: number,
+  payload: JsonObject,
+  headers?: HeadersInit,
+  now = Date.now(),
+): ModelScopedProviderFailure | undefined {
+  if (statusCode !== 400 && statusCode !== 403 && statusCode !== 404 && statusCode !== 429) return undefined
   const error = providerErrorEnvelope(payload)
   const code = error ? providerErrorCode(error) : ''
-  if (!MODEL_SCOPED_PROVIDER_ERROR_CODES.has(code)) return undefined
+  const parameter = error ? normalizedProviderErrorField(error.param) : ''
+  const declaredScope = error ? normalizedProviderErrorField(error.scope) : ''
+  const rateLimited = MODEL_SCOPED_RATE_LIMIT_ERROR_CODES.has(code)
+    || (statusCode === 429 && (parameter === 'model' || declaredScope === 'model'))
+  const planRestricted = MODEL_SCOPED_PLAN_ERROR_CODES.has(code)
+  const accessDenied = MODEL_SCOPED_PROVIDER_ERROR_CODES.has(code)
+    || ((statusCode === 403 || statusCode === 404) && parameter === 'model')
+  if (!rateLimited && !planRestricted && !accessDenied) return undefined
+  const notFound = code === 'model_not_found' || code === 'unsupported_model'
+  const retryAfterMs = rateLimited ? (parseRetryAfter(headers, now) ?? 5 * 60_000) : undefined
+  const modelCooldownReason = rateLimited
+    ? 'rate-limit' as const
+    : planRestricted
+      ? 'plan-restricted' as const
+      : notFound
+        ? 'not-found' as const
+        : 'permission' as const
+  const message = rateLimited
+    ? 'Provider rate-limited the requested model.'
+    : planRestricted
+      ? 'The requested model is not included in this account plan.'
+      : notFound
+        ? 'The requested model is unavailable on this account.'
+        : 'Provider denied this account access to the requested model.'
   return {
-    category: code === 'model_not_found' ? 'not_found' : 'permission',
-    message: 'Provider denied access to the requested model.',
+    category: rateLimited ? 'rate_limit' : notFound ? 'not_found' : 'permission',
+    message,
     // Retryable means another pool member may satisfy this request. The scope
     // marker below prevents the ordinary retry path from mutating account-wide
     // health for a denial tied only to one model.
     retryable: true,
     accountAction: 'none',
     statusCode,
-    scope: 'model'
+    scope: 'model',
+    modelCooldownReason,
+    modelCooldownMs: retryAfterMs ?? (planRestricted ? 60 * 60_000 : 30 * 60_000),
+    ...(retryAfterMs === undefined ? {} : { retryAfterMs, retryAt: now + retryAfterMs }),
   }
 }
 

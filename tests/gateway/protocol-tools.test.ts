@@ -12,6 +12,36 @@ const weatherSchema = {
 }
 
 describe('non-streaming tool protocol conversion', () => {
+  it('normalizes every tool schema root to an object without dropping unions or constraints', () => {
+    const union = {
+      type: null,
+      oneOf: [
+        { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] },
+        { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] },
+      ],
+      additionalProperties: false,
+    }
+    const converted = convertRequest('openai-responses', 'anthropic-messages', {
+      model: 'gpt-source',
+      input: 'inspect',
+      tools: [
+        { type: 'function', name: 'union_tool', parameters: union },
+        { type: 'function', name: 'missing_schema', parameters: null },
+      ],
+    }, 'claude-target')
+
+    expect(converted.body.tools).toEqual([
+      {
+        name: 'union_tool',
+        input_schema: { ...union, type: 'object' },
+      },
+      {
+        name: 'missing_schema',
+        input_schema: { type: 'object', properties: {} },
+      },
+    ])
+  })
+
   it('keeps direct Responses/Anthropic conversion compatible while preserving Anthropic block order', () => {
     const responsesSource = {
       instructions: [{ type: 'input_text', text: 'System' }],

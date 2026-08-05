@@ -1516,6 +1516,9 @@ export function createMockApi(): GatewayApi {
     async openChatGptWebLogin() {
       return structuredClone(snapshot)
     },
+    async openChatGptCodexApp() {
+      return structuredClone(snapshot)
+    },
     async testAccountModel(accountId: string, model: string) {
       const account = snapshot.accounts.find((candidate) => candidate.id === accountId)
       if (!account) throw new Error(mockText('账号不存在', 'Account not found'))
@@ -2115,6 +2118,8 @@ export function createMockApi(): GatewayApi {
         stickySessions: input.stickySessions,
         stickyTtlMinutes: input.stickyTtlMinutes,
         maxRetries: input.maxRetries,
+        reasoningEffortMap: input.reasoningEffortMap,
+        reasoningEffortCap: input.reasoningEffortCap,
         forceFastMode: supportsPoolFastServiceTier(input.protocol)
           && (input.forceFastMode ?? existing?.forceFastMode) === true,
         hedgedRequests: input.protocol === 'openai-responses'
@@ -2882,12 +2887,14 @@ export function createMockApi(): GatewayApi {
     async startAgent(target) { return mockAgentOperation('start', [target], true) },
     async smartRepairAgent(target) { return mockAgentOperation('smart-repair', target ? [target] : [...AGENT_TARGETS], true) },
     async repairAllAffectedAgents() { return mockAgentOperation('repair-all-affected', [...AGENT_TARGETS], true) },
+    async cancelAgentLifecycleOperation() { return false },
     async closeAllManagedAgents() { return mockAgentOperation('close-all-managed', [...AGENT_TARGETS], false) },
     async restoreClaudeDesktopOfficialMode() { return { changed: false } },
     onAgentLifecycleChanged(listener) {
       agentLifecycleListeners.add(listener)
       return () => agentLifecycleListeners.delete(listener)
     },
+    onAgentLifecycleProgress() { return () => undefined },
     async listPersistentTasks() { return [] },
     async pausePersistentTask() { throw new Error('Persistent task not found.') },
     async resumePersistentTask() { throw new Error('Persistent task not found.') },

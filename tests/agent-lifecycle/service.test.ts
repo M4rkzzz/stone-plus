@@ -733,6 +733,43 @@ describe('AgentLifecycleService', () => {
     expect(start).not.toHaveBeenCalled()
   })
 
+  it('propagates cancellation to the adapter and reports a safe non-sticky cancellation', async () => {
+    const controller = new AbortController()
+    const progress = vi.fn()
+    const restore = vi.fn(async (_options, execution) => {
+      execution?.onProgress?.({
+        target: 'codex-desktop',
+        stage: 'scan',
+        completed: 1,
+        total: 4,
+      })
+      await new Promise<void>((_resolve, reject) => execution?.signal?.addEventListener('abort', () => {
+        const error = new Error('会话修复已取消。')
+        error.name = 'AbortError'
+        reject(error)
+      }, { once: true }))
+      return { changed: true }
+    }) as AgentLifecycleAdapterPort['restore']
+    const service = createService(adaptersWith({ 'codex-desktop': { restore } }))
+
+    const operation = service.restore('codex-desktop', { repairSessions: true }, {
+      signal: controller.signal,
+      onProgress: progress,
+    })
+    await vi.waitFor(() => expect(progress).toHaveBeenCalledWith({
+      target: 'codex-desktop',
+      stage: 'scan',
+      completed: 1,
+      total: 4,
+    }))
+    controller.abort()
+    const result = await operation
+
+    expect(result.status).toBe('failed')
+    expect(result.results[0].error).toMatchObject({ code: 'cancelled' })
+    expect(result.snapshot.agents['codex-desktop'].error).toBeUndefined()
+  })
+
   it('re-inspects the Agent after installation and returns the refreshed snapshot', async () => {
     let installed = false
     const inspect = vi.fn(async () => ({ ...healthySnapshot(), installed }))

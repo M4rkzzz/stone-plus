@@ -2,15 +2,25 @@ import { app, BrowserWindow, Menu, nativeImage, nativeTheme, net, powerMonitor, 
 import electronUpdater from 'electron-updater'
 import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { GatewayServer, type GatewayConfig, type ResolvedGatewayCredential } from './gateway'
+import {
+  GatewayServer,
+  type GatewayConfig,
+  type PersistedGrokVideoBinding,
+  type ResolvedGatewayCredential,
+} from './gateway'
 import { ClientConfigService } from './client-config'
 import { rebuildGatewayConnections, registerGatewayApi, warmGatewayConnections } from './ipc/gateway-api'
 import { registerUpdateApi } from './ipc/update-api'
 import { TITLE_BAR_HEIGHT, windowChromePalette } from './window-chrome'
 import { AppStore } from './store/app-store'
 import { DatabaseBackupService, WebDavBackupService } from './backup'
-import { resolveChatGptCredential } from './providers'
-import { resolveChatGptAgentIdentity, resolveGrokOAuthCredential } from './auth'
+import { CodexClientVersionSyncService, resolveChatGptCredential } from './providers'
+import {
+  deserializeChatGptCredential,
+  deserializeGrokOAuthCredential,
+  resolveChatGptAgentIdentity,
+  resolveGrokOAuthCredential,
+} from './auth'
 import {
   collectEnabledOutboundTargets,
   createOutboundReloadCoordinator,
@@ -59,10 +69,15 @@ import { TunController } from './proxy/built-in/tun-controller'
 import { RequestMonitorWindowController } from './request-monitor-window'
 import { FileRequestMonitorWindowStateStore } from './request-monitor-window-state'
 import { ChatGptWebLoginService } from './chatgpt-web-login'
+import { ChatGptCodexAppLoginService } from './chatgpt-codex-app-login'
+import { CodexOfficialAuthBridge } from './codex-official-auth'
+import { PersistentDiagnosticLog } from './diagnostics/persistent-diagnostic-log'
 
 const { autoUpdater } = electronUpdater
 const WINDOWS_APP_USER_MODEL_ID = 'io.github.m4rkzzz.stoneplus'
 const WINDOWS_DEV_APP_USER_MODEL_ID = `${WINDOWS_APP_USER_MODEL_ID}.dev`
+const GROK_VIDEO_BINDINGS_METADATA_KEY = 'grok_video_bindings_v1'
+const GROK_VIDEO_BINDINGS_METADATA_MAX_CHARS = 1024 * 1024
 
 let mainWindow: BrowserWindow | undefined
 let tray: Tray | undefined
@@ -75,6 +90,7 @@ let outboundReloadCoordinator: OutboundReloadCoordinator
 let builtInProxy: BuiltInProxyOrchestrator
 let singBoxService: SingBoxService
 let updateService: UpdateService
+let codexClientVersionSync: CodexClientVersionSyncService
 let tunnelService: FrpTunnelService
 let codexConversationTitles: CodexConversationTitleResolver
 let codexSessionRepair: CodexSessionRepairService
@@ -113,6 +129,30 @@ if (process.env.STONE_USER_DATA_DIR) {
   app.setPath('userData', resolve(process.env.STONE_USER_DATA_DIR))
 }
 
+const diagnosticLog = new PersistentDiagnosticLog(join(app.getPath('userData'), 'logs'))
+diagnosticLog.installProcessHandlers()
+diagnosticLog.record('main-process-start', 'Stone+ main process started', {
+  appVersion: app.getVersion(),
+  platform: process.platform,
+  arch: process.arch,
+})
+app.on('render-process-gone', (_event, webContents, details) => {
+  diagnosticLog.record('render-process-gone', details.reason, {
+    webContentsId: webContents.id,
+    reason: details.reason,
+    exitCode: details.exitCode,
+  })
+})
+app.on('child-process-gone', (_event, details) => {
+  diagnosticLog.record('child-process-gone', details.reason, {
+    processType: details.type,
+    reason: details.reason,
+    exitCode: details.exitCode,
+    serviceName: details.serviceName,
+    name: details.name,
+  })
+})
+
 if (process.platform === 'win32') app.setAppUserModelId(windowsAppUserModelId())
 const ownsSingleInstanceLock = app.requestSingleInstanceLock()
 if (ownsSingleInstanceLock) {
@@ -133,10 +173,31 @@ async function bootstrap(): Promise<void> {
   store = new AppStore(app.getPath('userData'))
   await store.initialize()
   if (bootstrapShouldStop()) return
+  codexClientVersionSync = new CodexClientVersionSyncService({
+    userDataPath: app.getPath('userData'),
+    fetchImplementation: (url, init) => net.fetch(url, init),
+  })
+  await codexClientVersionSync.initialize()
+  codexClientVersionSync.start()
   const gatewaySettings = store.getSnapshot().gateway
   const clientConfigHome = process.env.STONE_CLIENT_CONFIG_HOME?.trim()
   const resolvedClientConfigHome = clientConfigHome ? resolve(clientConfigHome) : app.getPath('home')
-  const defaultCodexHome = join(resolvedClientConfigHome, '.codex')
+  const configuredCodexHome = clientConfigHome ? undefined : process.env.CODEX_HOME?.trim()
+  const defaultCodexHome = configuredCodexHome
+    ? resolve(configuredCodexHome)
+    : join(resolvedClientConfigHome, '.codex')
+  const grokBuildHome = process.env.GROK_HOME?.trim()
+  const clientConfig = new ClientConfigService({
+    homeDir: resolvedClientConfigHome,
+    platform: process.platform,
+    ...((configuredCodexHome || grokBuildHome) ? {
+      overrides: {
+        ...(configuredCodexHome ? { codexDirectory: defaultCodexHome } : {}),
+        ...(grokBuildHome ? { grokbuildDirectory: resolve(grokBuildHome) } : {}),
+      },
+    } : {}),
+  })
+  const codexOfficialAuthBridge = new CodexOfficialAuthBridge(clientConfig, store)
   const singBoxRuntimeRoot = app.isPackaged
     ? join(process.resourcesPath, 'sing-box')
     : resolve('build', 'sing-box')
@@ -241,7 +302,7 @@ async function bootstrap(): Promise<void> {
     scheduleBuiltInRouteChange: (detector) => outboundReloadCoordinator.scheduleBuiltInRouteChange(detector),
     platformCapabilities: builtInProxyPlatformCapabilities(),
   })
-  codexConversationTitles = new CodexConversationTitleResolver(resolvedClientConfigHome)
+  codexConversationTitles = new CodexConversationTitleResolver(defaultCodexHome)
   codexSessionRepair = new CodexSessionRepairService({ codexHome: defaultCodexHome })
   codexSessionIndexCleanup = new CodexSessionIndexCleanupService({ codexHome: defaultCodexHome })
   codexSessionManager = new CodexSessionManager({ codexHome: defaultCodexHome })
@@ -333,31 +394,117 @@ async function bootstrap(): Promise<void> {
         return await resolve(serialized)
       }
       if (account.credentialType === 'chatgpt-oauth') {
+        const codexOwned = await codexOfficialAuthBridge.gatewayCredential(account)
+        if (codexOwned.owned) {
+          return codexOwned.accessToken && codexOwned.accountId
+            ? {
+                secret: codexOwned.accessToken,
+                kind: 'chatgpt-oauth' as const,
+                accountId: codexOwned.accountId,
+              }
+            : undefined
+        }
         const serialized = store.getCredential(account.credentialId)
         if (!serialized) return undefined
-        const resolved = await resolveChatGptCredential(
-          serialized,
-          (rotated, expectedSource) => store.persistRotatedChatGptCredential(account.id, rotated, expectedSource),
-          fetchImplementation,
-          Date.now(),
-          { refreshKey: account.id, signal }
-        )
-        return { secret: resolved.bundle.accessToken, kind: 'chatgpt-oauth' as const, accountId: resolved.bundle.accountId }
+        const resolve = async (
+          source: string,
+          forceRefresh = false,
+          includeRecovery = true,
+        ): Promise<ResolvedGatewayCredential> => {
+          const resolved = await resolveChatGptCredential(
+            source,
+            (rotated, expectedSource) => store.persistRotatedChatGptCredential(account.id, rotated, expectedSource),
+            fetchImplementation,
+            Date.now(),
+            {
+              refreshKey: account.id,
+              signal,
+              forceRefresh,
+            }
+          )
+          if (account.chatgptAccountId && resolved.bundle.accountId !== account.chatgptAccountId) {
+            throw new Error('ChatGPT credential account identity does not match the selected account.')
+          }
+          return {
+            secret: resolved.bundle.accessToken,
+            kind: 'chatgpt-oauth' as const,
+            accountId: resolved.bundle.accountId,
+            ...(includeRecovery ? {
+              recoverRejectedAccess: async (rejectedAccessToken = resolved.bundle.accessToken) => {
+                // Re-read after the 401. Another request may already have
+                // rotated the refresh token; never overwrite or refresh that
+                // newer credential merely because this request used the old
+                // access token.
+                const latest = store.getCredential(account.credentialId)
+                if (!latest) throw new Error('ChatGPT credential is unavailable.')
+                const latestBundle = deserializeChatGptCredential(latest)
+                if (!latestBundle) throw new Error('ChatGPT account credential is invalid.')
+                return await resolve(latest, latestBundle.accessToken === rejectedAccessToken, false)
+              },
+            } : {}),
+          }
+        }
+        return await resolve(serialized)
       }
       if (account.credentialType === 'grok-oauth') {
         const serialized = store.getCredential(account.credentialId)
         if (!serialized) return undefined
-        const resolved = await resolveGrokOAuthCredential(
-          serialized,
-          (rotated, expectedSource) => store.persistRotatedGrokOAuthCredential(account.id, rotated, expectedSource),
-          fetchImplementation,
-          Date.now(),
-          { refreshKey: account.id, signal }
-        )
-        return { secret: resolved.bundle.accessToken, kind: 'grok-oauth' as const }
+        const resolve = async (
+          source: string,
+          forceRefresh = false,
+          includeRecovery = true,
+        ): Promise<ResolvedGatewayCredential> => {
+          const resolved = await resolveGrokOAuthCredential(
+            source,
+            (rotated, expectedSource) => store.persistRotatedGrokOAuthCredential(account.id, rotated, expectedSource),
+            fetchImplementation,
+            Date.now(),
+            { refreshKey: account.id, signal, forceRefresh },
+          )
+          return {
+            secret: resolved.bundle.accessToken,
+            kind: 'grok-oauth' as const,
+            accountId: resolved.bundle.subjectId,
+            ...(includeRecovery ? {
+              recoverRejectedAccess: async (rejectedAccessToken = resolved.bundle.accessToken) => {
+                // Refresh tokens rotate. Re-read the encrypted credential after
+                // a 401 so this request can reuse a newer rotation instead of
+                // revoking or overwriting it with stale state.
+                const latest = store.getCredential(account.credentialId)
+                if (!latest) throw new Error('Grok OAuth credential is unavailable.')
+                const latestBundle = deserializeGrokOAuthCredential(latest)
+                if (!latestBundle) throw new Error('Grok OAuth account credential is invalid.')
+                if (latestBundle.subjectId !== resolved.bundle.subjectId) {
+                  throw new Error('Grok OAuth credential account identity changed unexpectedly.')
+                }
+                return await resolve(latest, latestBundle.accessToken === rejectedAccessToken, false)
+              },
+            } : {}),
+          }
+        }
+        return await resolve(serialized)
       }
       const secret = store.getCredential(account.credentialId)
       return secret ? { secret, kind: 'api-key' as const } : undefined
+    },
+    loadGrokVideoBindings: () => {
+      const serialized = store.getStateRepository().readAppMetadata(GROK_VIDEO_BINDINGS_METADATA_KEY)
+      if (!serialized) return []
+      if (serialized.length > GROK_VIDEO_BINDINGS_METADATA_MAX_CHARS) return []
+      try {
+        const parsed: unknown = JSON.parse(serialized)
+        return Array.isArray(parsed) ? parsed as PersistedGrokVideoBinding[] : []
+      } catch {
+        return []
+      }
+    },
+    saveGrokVideoBindings: async (bindings) => {
+      const repository = store.getStateRepository()
+      if (bindings.length === 0) {
+        await repository.removeAppMetadata(GROK_VIDEO_BINDINGS_METADATA_KEY)
+        return
+      }
+      await repository.writeAppMetadata(GROK_VIDEO_BINDINGS_METADATA_KEY, JSON.stringify(bindings))
     },
     outboundFetchResolver: (account, pool, proxies) => {
       const proxy = resolveEffectiveProxy(account, pool, proxies)
@@ -383,12 +530,6 @@ async function bootstrap(): Promise<void> {
     // filesystem failure must never prevent the gateway itself from starting.
     console.warn('Stone+ local event stream is unavailable', eventServerStart.error)
   }
-  const grokBuildHome = process.env.GROK_HOME?.trim()
-  const clientConfig = new ClientConfigService({
-    homeDir: resolvedClientConfigHome,
-    platform: process.platform,
-    ...(grokBuildHome ? { overrides: { grokbuildDirectory: resolve(grokBuildHome) } } : {}),
-  })
   // Claude Desktop lifecycle setup and its dedicated recovery IPC must share
   // one serialized configuration owner so repair/rollback operations cannot
   // race through separate in-memory queues.
@@ -447,6 +588,7 @@ async function bootstrap(): Promise<void> {
     installer: agentInstaller,
     openExternal: (url) => shell.openExternal(url),
     claudeDesktopCoordinator,
+    beforeDefaultCodexConnectionRepair: () => codexOfficialAuthBridge.reclaimCurrent(),
   })
   clientInstanceManager.initialize()
   const initializedInstances = await clientInstanceManager.recoverOrphanedProcesses()
@@ -543,6 +685,14 @@ async function bootstrap(): Promise<void> {
     outboundTransport,
     iconPath: stoneIconPath(),
   })
+  const chatGptCodexAppLogin = new ChatGptCodexAppLoginService({
+    store,
+    outboundTransport,
+    clientConfig,
+    repairAndRestart: codexRepairAndRestart,
+    officialAuthBridge: codexOfficialAuthBridge,
+    backupRetention: () => store.getSnapshot().gateway.backupRetention ?? 10,
+  })
 
   flushGatewayApiState = registerGatewayApi(
     store, gateway, clientConfig, outboundTransport, backups,
@@ -555,6 +705,7 @@ async function bootstrap(): Promise<void> {
       revealMainWindowIfReady()
     },
     chatGptWebLogin,
+    chatGptCodexAppLogin,
   )
   disposeBuiltInProxyApi = registerBuiltInProxyApi(builtInProxy, builtInProxy)
   systemLifecycle = new SystemLifecycleCoordinator({
@@ -938,6 +1089,9 @@ function shutdownServices(): Promise<void> {
     // have state to checkpoint while they are closing.
     await shutdownStep('update service', () => {
       if (!shutdownForUpdate && updateService) updateService.close()
+    })
+    await shutdownStep('Codex client version sync', () => {
+      if (codexClientVersionSync) codexClientVersionSync.close()
     })
     await shutdownStep('request monitor', () => {
       disposeRequestMonitorApi?.()

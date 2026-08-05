@@ -146,6 +146,55 @@ describe('Codex Responses over xAI-compatible relays', () => {
     expect(upstreamFetch).toHaveBeenCalledOnce()
   })
 
+  it('refreshes a rejected Grok OAuth access token once and preserves account identity', async () => {
+    const port = await freePort()
+    const oauthConfig = config(port, 'openai-responses')
+    oauthConfig.providers[0] = {
+      ...oauthConfig.providers[0],
+      sourceType: 'oauth-system',
+      kind: 'xai',
+      baseUrl: 'https://cli-chat-proxy.grok.com/v1',
+    }
+    oauthConfig.accounts[0] = { ...oauthConfig.accounts[0], credentialType: 'grok-oauth' }
+    const recoverRejectedAccess = vi.fn(async () => ({
+      secret: 'rotated-access-token',
+      kind: 'grok-oauth' as const,
+      accountId: 'grok-subject',
+    }))
+    const upstreamFetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      const authorization = new Headers(init?.headers).get('authorization')
+      if (authorization === 'Bearer stale-access-token') {
+        return new Response(JSON.stringify({ error: { message: 'expired' } }), {
+          status: 401,
+          headers: { 'content-type': 'application/json' },
+        })
+      }
+      expect(authorization).toBe('Bearer rotated-access-token')
+      return new Response('event: response.completed\ndata: {"type":"response.completed","sequence_number":0,"response":{"id":"resp_recovered","object":"response","model":"grok-4.20","status":"completed","output":[]}}\n\n', {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' },
+      })
+    })
+    const gateway = new GatewayServer({
+      config: oauthConfig,
+      credentialResolver: () => ({
+        secret: 'stale-access-token',
+        kind: 'grok-oauth',
+        accountId: 'grok-subject',
+        recoverRejectedAccess,
+      }),
+      fetchImplementation: upstreamFetch as typeof fetch,
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await postResponses(port, { input: 'Hello', stream: true })
+    expect(response.status).toBe(200)
+    await response.text()
+    expect(recoverRejectedAccess).toHaveBeenCalledOnce()
+    expect(upstreamFetch).toHaveBeenCalledTimes(2)
+  })
+
   it('never sends a Grok OAuth bearer to a noncanonical provider', async () => {
     const port = await freePort()
     const unsafeConfig = config(port, 'openai-responses')

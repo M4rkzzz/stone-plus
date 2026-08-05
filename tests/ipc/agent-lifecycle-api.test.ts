@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import type { AgentLifecycleOperationResult } from '../../src/shared/agent-lifecycle'
 import {
   registerAgentLifecycleApi,
   type AgentLifecycleIpcService,
@@ -73,6 +74,7 @@ describe('Agent lifecycle IPC', () => {
       'stone:start-agent',
       'stone:smart-repair-agent',
       'stone:repair-all-affected-agents',
+      'stone:cancel-agent-lifecycle-operation',
       'stone:close-all-managed-agents',
     ])
     expect(service.getSnapshot).toHaveBeenCalledOnce()
@@ -152,6 +154,69 @@ describe('Agent lifecycle IPC', () => {
       workingDirectory: 'D:\\work tree',
       profileId: 'profile-1',
     })
+  })
+
+  it('streams real repair progress and safely cancels the matching operation', async () => {
+    const service = createService()
+    let release!: () => void
+    const pending = new Promise<void>((resolve) => { release = resolve })
+    service.restore = vi.fn(async (_target, _options, _execution) => {
+      await pending
+      return { status: 'cancelled' } as unknown as AgentLifecycleOperationResult
+    })
+    registerAgentLifecycleApi(service)
+    const operationId = 'agent-repair-1234'
+    const operation = invoke(
+      'stone:restore-agent',
+      trustedEvent(),
+      'codex-cli',
+      { repairSessions: true },
+      operationId,
+    )
+    await vi.waitFor(() => expect(service.restore).toHaveBeenCalledOnce())
+    const execution = vi.mocked(service.restore).mock.calls[0][2]
+    expect(execution?.signal.aborted).toBe(false)
+
+    execution?.onProgress?.({
+      target: 'codex-cli',
+      stage: 'scan',
+      completed: 4,
+      total: 12,
+    })
+    expect(electron.send).toHaveBeenCalledWith('stone:agent-lifecycle-progress', {
+      operationId,
+      target: 'codex-cli',
+      stage: 'scan',
+      completed: 4,
+      total: 12,
+    })
+
+    await expect(invoke('stone:cancel-agent-lifecycle-operation', trustedEvent(), operationId)).resolves.toBe(true)
+    expect(execution?.signal.aborted).toBe(true)
+    await expect(invoke('stone:cancel-agent-lifecycle-operation', trustedEvent(), operationId)).resolves.toBe(false)
+    release()
+    await operation
+    await expect(invoke('stone:cancel-agent-lifecycle-operation', trustedEvent(), operationId)).resolves.toBe(false)
+  })
+
+  it('rejects malformed or duplicate cancellable operation identifiers', async () => {
+    const service = createService()
+    let release!: () => void
+    service.restart = vi.fn(() => new Promise((resolve) => {
+      release = () => resolve({ status: 'done' } as unknown as AgentLifecycleOperationResult)
+    }))
+    registerAgentLifecycleApi(service)
+
+    await expect(invoke('stone:restart-agent', trustedEvent(), 'codex-cli', '../bad')).rejects.toThrow(
+      'Invalid Agent lifecycle operation identifier',
+    )
+    const first = invoke('stone:restart-agent', trustedEvent(), 'codex-cli', 'restart-operation-1234')
+    await vi.waitFor(() => expect(service.restart).toHaveBeenCalledOnce())
+    await expect(invoke('stone:restart-agent', trustedEvent(), 'codex-cli', 'restart-operation-1234')).rejects.toThrow(
+      'already running',
+    )
+    release()
+    await first
   })
 
   it('forwards change events and disposal removes handlers while draining accepted work', async () => {

@@ -12,6 +12,33 @@ import type { ToolBridgePlan } from '../../src/main/gateway/types'
 const encoder = new TextEncoder()
 
 describe('DeepSeek DSML Responses bridge', () => {
+  it('normalizes malformed function schema roots without discarding union branches', () => {
+    const converted = convertRequest('openai-responses', 'openai-responses', {
+      model: 'gpt-5.6-terra',
+      input: 'inspect',
+      tools: [{
+        type: 'function',
+        name: 'inspect_target',
+        parameters: {
+          type: null,
+          oneOf: [
+            { type: 'object', properties: { path: { type: 'string' } } },
+            { type: 'object', properties: { pid: { type: 'number' } } },
+          ],
+        },
+      }],
+    }, 'deepseek-v4-flash', { dialect: 'deepseek-dsml' })
+
+    expect(converted.body).toMatchObject({ tools: [{
+      type: 'function',
+      name: 'inspect_target',
+      parameters: {
+        type: 'object',
+        oneOf: expect.any(Array),
+      },
+    }] })
+  })
+
   it('normalizes the supported web search alias and rejects silently ignored hosted tools', () => {
     const converted = convertRequest('openai-responses', 'openai-responses', {
       model: 'gpt-5.6-terra', input: 'search', tools: [{ type: 'web_search_preview' }],

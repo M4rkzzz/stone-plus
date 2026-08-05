@@ -70,16 +70,20 @@ describe('account quota summary', () => {
 describe('account quota availability', () => {
   const now = Date.UTC(2026, 6, 26, 8, 0, 0)
 
-  it('treats explicit exhaustion signals and active zero-remaining windows as exhausted', () => {
+  it('treats confirmed quota cooldowns and active zero-remaining windows as exhausted', () => {
     expect(accountQuotaIsExhausted({ ...baseAccount, quotaRemaining: 0 }, now)).toBe(true)
     expect(accountQuotaIsExhausted({
       ...baseAccount,
+      status: 'cooldown',
+      cooldownReason: 'quota',
       codexQuota: { limitReached: true, observedAt: now, source: 'usage-endpoint' },
     }, now)).toBe(true)
+    // WHAM flags remain useful telemetry, but do not hide an OAuth account
+    // until a real Responses request has put it in quota cooldown.
     expect(accountQuotaIsExhausted({
       ...baseAccount,
       codexQuota: { allowed: false, observedAt: now, source: 'usage-endpoint' },
-    }, now)).toBe(true)
+    }, now)).toBe(false)
     expect(accountQuotaIsExhausted({
       ...baseAccount,
       quota: {
@@ -174,6 +178,8 @@ describe('account cooldown and recovery timing', () => {
     const sevenDayReset = now + 3 * 60 * 60_000
     expect(accountRecoveryAt({
       ...baseAccount,
+      status: 'cooldown',
+      cooldownReason: 'quota',
       codexQuota: {
         fiveHour: { usedPercent: 100, resetAt: fiveHourReset },
         sevenDay: { usedPercent: 100, resetAt: sevenDayReset },

@@ -40,7 +40,7 @@ import type {
 } from '@shared/types'
 import { applyWindowChromeTheme } from '../window-chrome'
 import type { GatewayAccountState, GatewayConfig, GatewayRuntimeStateUpdate } from '../gateway'
-import { applyGrokBuildHeaders, checkChatGptAccountAuthorized, codexQuotaCooldownUntil, codexQuotaIsExhausted, getProviderAdapter, probeChatGptAccountAuthorized, probeChatGptCodexModel, probeProviderModel, queryChatGptCodexModels, queryChatGptCodexModelsAuthorized, queryChatGptCodexQuota, queryChatGptCodexQuotaAuthorized, queryGrokBuildQuota, resolveChatGptCredential, type GrokBuildQuotaResult, type GrokBuildQuotaSnapshot, type ProviderFailure } from '../providers'
+import { AccountModelProbeError, applyGrokBuildHeaders, ChatGptCodexEndpointError, checkChatGptAccountAuthorized, classifyChatGptCredentialRefreshFailure, codexQuotaCooldownUntil, codexQuotaIsExhausted, getProviderAdapter, probeChatGptAccountAuthorized, probeChatGptCodexModel, probeProviderModel, queryChatGptCodexModels, queryChatGptCodexModelsAuthorized, queryChatGptCodexQuota, queryChatGptCodexQuotaAuthorized, queryGrokBuildQuota, resolveChatGptCredential, type GrokBuildQuotaResult, type GrokBuildQuotaSnapshot, type ProviderFailure } from '../providers'
 import { validateAccountImportProxySelection, type AppStore } from '../store/app-store'
 import { clientFiles, type ClientConfigService, type ClientConnectionTarget } from '../client-config'
 import { WebDavBackupService, type DatabaseBackupService } from '../backup'
@@ -62,9 +62,10 @@ import {
   requiresApiSourceToolRoundtripEvidence,
 } from '../sources/source-state'
 import { ChatGptOAuthFlowManager, type ChatGptOAuthSessionController } from '../auth/chatgpt-oauth-flow'
-import { GROK_OAUTH_BASE_URL, resolveChatGptAgentIdentity, resolveGrokOAuthCredential, serializeChatGptCredential } from '../auth'
+import { deserializeChatGptCredential, GROK_OAUTH_BASE_URL, resolveChatGptAgentIdentity, resolveGrokOAuthCredential, serializeChatGptCredential } from '../auth'
 import type { LocalEventServer } from '../events'
 import type { ChatGptWebLoginController } from '../chatgpt-web-login'
+import type { ChatGptCodexAppLoginController } from '../chatgpt-codex-app-login'
 
 export interface GatewayController {
   start(settings?: GatewaySettings): Promise<void>
@@ -100,6 +101,7 @@ export function registerGatewayApi(
   sharedWebDavBackups?: WebDavBackupService,
   onUiThemeApplied?: (theme: UiTheme, preference: UiThemePreference) => void,
   chatGptWebLogin?: ChatGptWebLoginController,
+  chatGptCodexAppLogin?: ChatGptCodexAppLoginController,
 ): () => Promise<void> {
   const webDavBackups = sharedWebDavBackups ?? (backups ? new WebDavBackupService({
     metadata: store.getStateRepository(),
@@ -535,20 +537,17 @@ export function registerGatewayApi(
     quotaProbeFlights.add(accountId)
     lastQuotaProbeAt.set(accountId, Date.now())
     try {
-      const quota = await refreshAccountCodexQuota(store, outboundTransport, accountId)
+      let quota: Awaited<ReturnType<typeof refreshAccountCodexQuota>> | undefined
+      try {
+        quota = await refreshAccountCodexQuota(store, outboundTransport, accountId)
+      } catch (error) {
+        // The usage endpoint is auxiliary. Once the real request cooldown has
+        // elapsed, an unavailable/stale WHAM probe must not extend it.
+        console.error('Stone+ could not refresh ChatGPT quota before a real admission retry', error)
+      }
       if (closed) return
-      const now = Date.now()
-      const exhausted = codexQuotaIsExhausted(quota, now)
-      const cooldownUntil = exhausted ? codexQuotaCooldownUntil(quota, now) ?? now + 60_000 : undefined
-      await store.setAccountCheckResult(accountId, exhausted ? {
-        codexQuota: quota,
-        status: 'cooldown',
-        circuitState: 'open',
-        cooldownReason: 'quota',
-        cooldownUntil,
-        lastError: 'ChatGPT Codex 额度已耗尽。'
-      } : {
-        codexQuota: quota,
+      await store.setAccountCheckResult(accountId, {
+        ...(quota ? { codexQuota: quota } : {}),
         status: 'active',
         circuitState: 'closed',
         consecutiveFailures: 0,
@@ -556,11 +555,12 @@ export function registerGatewayApi(
         cooldownUntil: undefined,
         lastError: undefined
       })
-      if (exhausted && cooldownUntil !== undefined) scheduleQuotaProbe(accountId, cooldownUntil + 1_000)
-      else gateway.resetAccountHealth(accountId)
+      // A completed cooldown gets one real Responses attempt. WHAM usage
+      // telemetry remains visible, but cannot extend the scheduling ban by itself.
+      gateway.resetAccountHealth(accountId)
       publish(refreshRuntime())
     } catch (error) {
-      console.error('Stone+ could not probe an exhausted ChatGPT account quota', error)
+      console.error('Stone+ could not release an elapsed ChatGPT quota cooldown', error)
       scheduleQuotaProbe(accountId, Date.now() + 60_000)
     } finally {
       quotaProbeFlights.delete(accountId)
@@ -609,31 +609,27 @@ export function registerGatewayApi(
       const result = await checkAccount(store, outboundTransport, id, signal)
       signal?.throwIfAborted()
       const now = Date.now()
-      const exhausted = codexQuotaIsExhausted(result.codexQuota, now)
-      const cooldownUntil = exhausted
-        ? codexQuotaCooldownUntil(result.codexQuota, now) ?? now + 60_000
-        : undefined
       // Only the newest probe for an account may publish health. This check is
       // deliberately immediately before the durable write so a slow response
       // cannot overwrite a newer probe's result.
       if (accountProbeOwners.get(id)?.token !== token) {
         return {
           snapshot: store.getSnapshot(),
-          ok: !exhausted,
+          ok: true,
           credentialAccepted: true,
           latencyMs: result.latencyMs,
-          ...(exhausted ? { error: 'ChatGPT Codex 额度已耗尽。' } : {}),
         }
       }
       const persisted = await store.setAccountCheckResultIf(id, {
-        status: exhausted ? 'cooldown' : 'active',
-        circuitState: exhausted ? 'open' : 'closed',
+        status: 'active',
+        circuitState: 'closed',
         consecutiveFailures: 0,
         latencyMs: result.latencyMs,
-        lastError: exhausted ? 'ChatGPT Codex 额度已耗尽。' : undefined,
+        lastError: undefined,
         lastUsedAt: now,
-        cooldownUntil,
-        cooldownReason: exhausted ? 'quota' : undefined,
+        cooldownUntil: undefined,
+        cooldownReason: undefined,
+        modelCooldowns: {},
         ...(result.codexQuota ? { codexQuota: result.codexQuota } : {}),
         ...(result.grokQuota ? {
           grokQuota: result.grokQuota,
@@ -646,18 +642,15 @@ export function registerGatewayApi(
       if (!persisted.applied || accountProbeOwners.get(id)?.token !== token) {
         return {
           snapshot: persisted.snapshot,
-          ok: !exhausted,
+          ok: true,
           credentialAccepted: true,
           latencyMs: result.latencyMs,
-          ...(exhausted ? { error: 'ChatGPT Codex 额度已耗尽。' } : {}),
         }
       }
-      if (exhausted && cooldownUntil !== undefined) scheduleQuotaProbe(id, cooldownUntil + 1_000)
-      else gateway.resetAccountHealth(id)
+      gateway.resetAccountHealth(id)
       const snapshot = publishRuntimeAccount(id)
       evaluateAutomaticCooldownRefresh()
-      return { snapshot, ok: !exhausted, credentialAccepted: true, latencyMs: result.latencyMs,
-        ...(exhausted ? { error: 'ChatGPT Codex 额度已耗尽。' } : {}) }
+      return { snapshot, ok: true, credentialAccepted: true, latencyMs: result.latencyMs }
     } catch (error: unknown) {
       if (signal?.aborted) {
         if (accountProbeOwners.get(id)?.token === token
@@ -680,17 +673,26 @@ export function registerGatewayApi(
       const failure = error instanceof AccountProbeError ? error.failure : undefined
       const shouldDisable = failure?.accountAction === 'disable'
       const shouldCooldown = failure?.accountAction === 'cooldown'
+      const quotaCooldown = shouldCooldown && failure?.category === 'rate_limit'
+      const failureCooldownUntil = shouldCooldown
+        ? Date.now() + (failure?.retryAfterMs ?? 30_000)
+        : undefined
       const errorMessage = error instanceof Error ? error.message : 'Account check failed.'
       const persisted = await store.setAccountCheckResultIf(id, {
         status: shouldDisable ? 'disabled' : shouldCooldown ? 'cooldown' : owner.previousState?.status ?? 'disabled',
         circuitState: shouldDisable || shouldCooldown ? 'open' : owner.previousState?.circuitState,
         consecutiveFailures: (store.getSnapshot().accounts.find((account) => account.id === id)?.consecutiveFailures ?? 0) + 1,
-        cooldownUntil: shouldCooldown ? Date.now() + (failure?.retryAfterMs ?? 30_000) : owner.previousState?.cooldownUntil,
-        cooldownReason: shouldCooldown ? 'failure' : owner.previousState?.cooldownReason,
+        cooldownUntil: failureCooldownUntil ?? owner.previousState?.cooldownUntil,
+        cooldownReason: shouldCooldown
+          ? quotaCooldown ? 'quota' : 'failure'
+          : owner.previousState?.cooldownReason,
         lastError: errorMessage
       }, () => accountProbeOwners.get(id)?.token === token)
       if (!persisted.applied || accountProbeOwners.get(id)?.token !== token) {
         return { snapshot: persisted.snapshot, ok: false, credentialAccepted: false, error: errorMessage }
+      }
+      if (quotaCooldown && failureCooldownUntil !== undefined) {
+        scheduleQuotaProbe(id, failureCooldownUntil + 1_000)
       }
       const snapshot = publishRuntimeAccount(id)
       evaluateAutomaticCooldownRefresh()
@@ -1194,6 +1196,7 @@ export function registerGatewayApi(
       status: state.status,
       circuitState: state.circuitState,
       consecutiveFailures: state.consecutiveFailures,
+      ...(state.modelCooldowns !== undefined ? { modelCooldowns: state.modelCooldowns } : {}),
       cooldownUntil: state.cooldownUntil,
       cooldownReason: state.cooldownReason,
       latencyMs: state.latencyMs,
@@ -1344,6 +1347,7 @@ export function registerGatewayApi(
     }
     latestObservedAccountStates.set(state.accountId, state)
     const routingTransition = state.status !== 'active'
+      || state.modelCooldowns !== undefined
       || before.status !== 'active'
       || before.circuitState === 'open'
       || before.circuitState === 'half-open'
@@ -1443,6 +1447,13 @@ export function registerGatewayApi(
     if (typeof id !== 'string' || !id.trim()) throw new Error('ChatGPT 网页登录账号参数无效。')
     if (!chatGptWebLogin) throw new Error('ChatGPT 网页登录能力不可用。')
     await chatGptWebLogin.open(id.trim())
+    return withRuntimeMetrics(store.getSnapshot())
+  })
+  ipcMain.handle('stone:open-chatgpt-codex-app', async (event, id: string) => {
+    assertTrustedSender(event)
+    if (typeof id !== 'string' || !id.trim()) throw new Error('ChatGPT OAuth 账号参数无效。')
+    if (!chatGptCodexAppLogin) throw new Error('ChatGPT OAuth 转 Codex App 能力不可用。')
+    await chatGptCodexAppLogin.open(id.trim())
     return withRuntimeMetrics(store.getSnapshot())
   })
   ipcMain.handle('stone:test-account-model', async (event, accountId: string, model: string) => {
@@ -2397,9 +2408,12 @@ export function registerGatewayApi(
     const quota = await refreshAccountCodexQuota(store, outboundTransport, id)
     const account = store.getRuntimeAccount(id)
     const now = Date.now()
-    const exhausted = codexQuotaIsExhausted(quota, now)
-    const cooldownUntil = exhausted ? codexQuotaCooldownUntil(quota, now) ?? now + 60_000 : undefined
-    await store.setAccountCheckResult(id, exhausted ? {
+    const keepExistingQuotaCooldown = account?.cooldownReason === 'quota'
+      && codexQuotaIsExhausted(quota, now)
+    const cooldownUntil = keepExistingQuotaCooldown
+      ? codexQuotaCooldownUntil(quota, now) ?? account?.cooldownUntil ?? now + 60_000
+      : undefined
+    await store.setAccountCheckResult(id, keepExistingQuotaCooldown ? {
       codexQuota: quota,
       status: 'cooldown',
       circuitState: 'open',
@@ -2417,7 +2431,7 @@ export function registerGatewayApi(
         lastError: undefined
       } : {})
     })
-    if (exhausted && cooldownUntil !== undefined) scheduleQuotaProbe(id, cooldownUntil + 1_000)
+    if (keepExistingQuotaCooldown && cooldownUntil !== undefined) scheduleQuotaProbe(id, cooldownUntil + 1_000)
     else if (account?.cooldownReason === 'quota') gateway.resetAccountHealth(id)
     return publish(refreshRuntime())
   })
@@ -3185,17 +3199,29 @@ async function checkAccount(
   if (account.credentialType === 'chatgpt-oauth') {
     const serialized = store.getCredential(account.credentialId)
     if (!serialized) throw new Error('This ChatGPT account has no readable credential.')
-    const resolved = await resolveChatGptCredential(
+    let resolved = await resolveChatGptCredential(
       serialized,
       (rotated, expectedSource) => store.persistRotatedChatGptCredential(account.id, rotated, expectedSource),
       fetchImplementation,
       Date.now(),
-      { refreshKey: account.id, signal }
+      {
+        refreshKey: account.id,
+        signal,
+      }
     )
-    const result = await checkChatGptAccountAuthorized(account, {
+    let result = await checkChatGptAccountAuthorized(account, {
       authorization: `Bearer ${resolved.bundle.accessToken}`,
       accountId: resolved.bundle.accountId
     }, fetchImplementation, boundedAbortSignal(signal, 30_000))
+    if (!result.ok && result.statusCode === 401) {
+      resolved = await recoverRejectedChatGptCredential(
+        store, account, fetchImplementation, resolved.bundle.accessToken, signal
+      )
+      result = await checkChatGptAccountAuthorized(account, {
+        authorization: `Bearer ${resolved.bundle.accessToken}`,
+        accountId: resolved.bundle.accountId
+      }, fetchImplementation, boundedAbortSignal(signal, 30_000))
+    }
     if (!result.ok) throw new AccountProbeError(result.failure)
     return { latencyMs: result.latencyMs, ...(result.quota ? { codexQuota: result.quota } : {}) }
   }
@@ -3247,6 +3273,7 @@ function accountCheckState(account: Account): Parameters<AppStore['setAccountChe
     quota: account.quota,
     codexQuota: account.codexQuota,
     grokQuota: account.grokQuota,
+    modelCooldowns: account.modelCooldowns,
   }
 }
 
@@ -3305,18 +3332,32 @@ export async function discoverAccountModels(
 
   const serialized = store.getCredential(account.credentialId)
   if (!serialized) throw new Error('The selected ChatGPT account has no readable credential.')
-  const resolved = await resolveChatGptCredential(
+  let resolved = await resolveChatGptCredential(
     serialized,
     (rotated, expectedSource) => store.persistRotatedChatGptCredential(account.id, rotated, expectedSource),
     fetchImplementation,
     Date.now(),
-    { refreshKey: account.id }
+    {
+      refreshKey: account.id,
+    }
   )
-  return queryChatGptCodexModels(
-    resolved.bundle,
-    fetchImplementation,
-    AbortSignal.timeout(15_000)
-  )
+  try {
+    return await queryChatGptCodexModels(
+      resolved.bundle,
+      fetchImplementation,
+      AbortSignal.timeout(15_000)
+    )
+  } catch (error) {
+    if (!(error instanceof ChatGptCodexEndpointError) || error.statusCode !== 401) throw error
+    resolved = await recoverRejectedChatGptCredential(
+      store, account, fetchImplementation, resolved.bundle.accessToken
+    )
+    return await queryChatGptCodexModels(
+      resolved.bundle,
+      fetchImplementation,
+      AbortSignal.timeout(15_000)
+    )
+  }
 }
 
 export async function testAccountModel(
@@ -3355,19 +3396,35 @@ export async function testAccountModel(
     }
     const serialized = store.getCredential(account.credentialId)
     if (!serialized) throw new Error('The selected ChatGPT account has no readable credential.')
-    const resolved = await resolveChatGptCredential(
+    let resolved = await resolveChatGptCredential(
       serialized,
       (rotated, expectedSource) => store.persistRotatedChatGptCredential(account.id, rotated, expectedSource),
       fetchImplementation,
       Date.now(),
-      { refreshKey: account.id, signal }
+      {
+        refreshKey: account.id,
+        signal,
+      }
     )
-    return probeChatGptCodexModel({
-      bundle: resolved.bundle,
-      model,
-      fetchImplementation,
-      signal
-    })
+    try {
+      return await probeChatGptCodexModel({
+        bundle: resolved.bundle,
+        model,
+        fetchImplementation,
+        signal
+      })
+    } catch (error) {
+      if (!(error instanceof AccountModelProbeError) || error.statusCode !== 401) throw error
+      resolved = await recoverRejectedChatGptCredential(
+        store, account, fetchImplementation, resolved.bundle.accessToken, signal
+      )
+      return await probeChatGptCodexModel({
+        bundle: resolved.bundle,
+        model,
+        fetchImplementation,
+        signal
+      })
+    }
   }
 
   if (account.credentialType === 'grok-oauth') {
@@ -3534,18 +3591,71 @@ async function refreshAccountCodexQuota(
   const serialized = store.getCredential(account.credentialId)
   if (!serialized) throw new Error('This ChatGPT account has no readable credential.')
   const fetchImplementation = accountFetchImplementation(store, outboundTransport, account)
-  const resolved = await resolveChatGptCredential(
+  let resolved = await resolveChatGptCredential(
     serialized,
     (rotated, expectedSource) => store.persistRotatedChatGptCredential(account.id, rotated, expectedSource),
     fetchImplementation,
     Date.now(),
-    { refreshKey: account.id }
+    {
+      refreshKey: account.id,
+    }
   )
-  return (await queryChatGptCodexQuota(
-    resolved.bundle,
-    fetchImplementation,
-    AbortSignal.timeout(30_000)
-  )).quota
+  try {
+    return (await queryChatGptCodexQuota(
+      resolved.bundle,
+      fetchImplementation,
+      AbortSignal.timeout(30_000)
+    )).quota
+  } catch (error) {
+    if (!(error instanceof ChatGptCodexEndpointError) || error.statusCode !== 401) throw error
+    resolved = await recoverRejectedChatGptCredential(
+      store, account, fetchImplementation, resolved.bundle.accessToken
+    )
+    return (await queryChatGptCodexQuota(
+      resolved.bundle,
+      fetchImplementation,
+      AbortSignal.timeout(30_000)
+    )).quota
+  }
+}
+
+async function recoverRejectedChatGptCredential(
+  store: AppStore,
+  account: Account,
+  fetchImplementation: typeof fetch,
+  rejectedAccessToken: string,
+  signal?: AbortSignal,
+): Promise<Awaited<ReturnType<typeof resolveChatGptCredential>>> {
+  const latestSerialized = store.getCredential(account.credentialId)
+  if (!latestSerialized) throw new Error('This ChatGPT account has no readable credential.')
+  const latestBundle = deserializeChatGptCredential(latestSerialized)
+  if (!latestBundle) throw new Error('This ChatGPT account credential is invalid.')
+  let resolved: Awaited<ReturnType<typeof resolveChatGptCredential>>
+  try {
+    resolved = await resolveChatGptCredential(
+      latestSerialized,
+      (rotated, expectedSource) => store.persistRotatedChatGptCredential(account.id, rotated, expectedSource),
+      fetchImplementation,
+      Date.now(),
+      {
+        refreshKey: account.id,
+        signal,
+        forceRefresh: latestBundle.accessToken === rejectedAccessToken,
+      }
+    )
+  } catch (error) {
+    throw new AccountProbeError(classifyChatGptCredentialRefreshFailure(error))
+  }
+  if (account.chatgptAccountId && resolved.bundle.accountId !== account.chatgptAccountId) {
+    throw new AccountProbeError({
+      category: 'authentication',
+      message: 'ChatGPT credential recovery returned a different account identity.',
+      retryable: false,
+      accountAction: 'disable',
+      statusCode: 401,
+    })
+  }
+  return resolved
 }
 
 function accountFetchImplementation(
@@ -3603,8 +3713,8 @@ function healthEventForTransition(
 function quotaExhausted(account: AppSnapshot['accounts'][number] | undefined): boolean {
   if (!account) return false
   const now = Date.now()
+  if (account.cooldownReason === 'quota') return true
   if (account.quotaRemaining !== undefined && account.quotaRemaining <= 0) return true
-  if (codexQuotaIsExhausted(account.codexQuota, now)) return true
   if (!account.quota) return false
   return [account.quota.requests, account.quota.tokens, account.quota.inputTokens, account.quota.outputTokens]
     .some((window) => window?.remaining === 0 && (window.resetAt === undefined || window.resetAt > now))

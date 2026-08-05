@@ -208,9 +208,10 @@ describe('API source state changes', () => {
     })
   })
 
-  it('rejects unsupported models only for the official DeepSeek Responses source', () => {
+  it('accepts the documented official DeepSeek models and rejects unknown direct models', () => {
     const encrypt = (value: string) => `encrypted:${value}`
-    expect(() => saveApiSourceDraft(emptyState(), sourceInput({
+    const officialState = emptyState()
+    saveApiSourceDraft(officialState, sourceInput({
       name: 'DeepSeek API',
       sourceType: 'official-api',
       kind: 'deepseek',
@@ -218,7 +219,18 @@ describe('API source state changes', () => {
       credential: 'deepseek-key',
       models: ['deepseek-v4-flash', 'deepseek-v4-pro'],
       defaultModel: 'deepseek-v4-pro',
-    }), encrypt, NOW)).toThrow(/currently supports only deepseek-v4-flash/)
+    }), encrypt, NOW)
+    expect(officialState.providers[0].models).toEqual(['deepseek-v4-pro', 'deepseek-v4-flash'])
+
+    expect(() => saveApiSourceDraft(emptyState(), sourceInput({
+      name: 'Unknown DeepSeek API',
+      sourceType: 'official-api',
+      kind: 'deepseek',
+      protocol: 'openai-responses',
+      credential: 'deepseek-key',
+      models: ['deepseek-v5-preview'],
+      defaultModel: 'deepseek-v5-preview',
+    }), encrypt, NOW)).toThrow(/deepseek-v4-flash or deepseek-v4-pro/)
 
     const relayState = emptyState()
     saveApiSourceDraft(relayState, relayInput({
@@ -971,6 +983,44 @@ describe('aggregate relay state changes', () => {
       poolId: aggregate.poolId,
       localToken: 'preserved-token',
       updatedAt: NOW + 5,
+    })
+  })
+
+  it('preserves omitted aggregate reasoning policy and clears explicit empty values', () => {
+    const state = emptyState()
+    const encrypt = (value: string) => `encrypted:${value}`
+    const first = saveApiSourceDraft(state, relayInput({
+      name: 'Reasoning relay one', credential: 'relay-one',
+    }), encrypt, NOW)
+    const second = saveApiSourceDraft(state, relayInput({
+      name: 'Reasoning relay two', credential: 'relay-two',
+      baseUrl: 'https://relay-two.example.test/v1',
+    }), encrypt, NOW + 1)
+    const base = aggregateInput([
+      { accountId: first.accountId, order: 0, weight: 10 },
+      { accountId: second.accountId, order: 1, weight: 10 },
+    ])
+    const created = saveAggregateRelayDraft(state, {
+      ...base,
+      reasoningEffortMap: { medium: 'high' },
+      reasoningEffortCap: 'xhigh',
+    }, NOW + 2)
+
+    saveAggregateRelayDraft(state, { ...base, id: created.poolId }, NOW + 3)
+    expect(state.pools.find((pool) => pool.id === created.poolId)).toMatchObject({
+      reasoningEffortMap: { medium: 'high' },
+      reasoningEffortCap: 'xhigh',
+    })
+
+    saveAggregateRelayDraft(state, {
+      ...base,
+      id: created.poolId,
+      reasoningEffortMap: undefined,
+      reasoningEffortCap: undefined,
+    }, NOW + 4)
+    expect(state.pools.find((pool) => pool.id === created.poolId)).toMatchObject({
+      reasoningEffortMap: undefined,
+      reasoningEffortCap: undefined,
     })
   })
 

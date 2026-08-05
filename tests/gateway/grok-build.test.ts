@@ -180,6 +180,38 @@ afterEach(async () => {
 })
 
 describe('Grok Build reverse proxy', () => {
+  it('uses stable Grok conversation headers for affinity and ignores request ids', async () => {
+    const port = await freePort()
+    const logs: RequestLog[] = []
+    const gateway = new GatewayServer({
+      config: config(port),
+      credentialResolver: () => 'upstream-secret',
+      fetchImplementation: vi.fn(async () => completedResponse('grok-upstream')) as typeof fetch,
+      onLog: (log) => upsertLog(logs, log),
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/grokbuild/v1/responses`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer grokbuild-local-token',
+        'content-type': 'application/json',
+        'x-grok-conv-id': 'conversation-stable',
+        'x-grok-session-id': 'session-fallback',
+        'x-grok-req-id': 'request-ephemeral',
+      },
+      body: JSON.stringify({ model: 'grok-4.5', input: 'Hello', stream: false }),
+    })
+
+    expect(response.status, await response.clone().text()).toBe(200)
+    await response.text()
+    expect(logs.find((log) => log.status === 'success')).toMatchObject({
+      client: 'grokbuild',
+      conversationId: 'conversation-stable',
+    })
+  })
+
   it('isolates the Grok Build and Codex namespaces by both path and local token', async () => {
     const port = await freePort()
     const gatewayConfig = config(port)

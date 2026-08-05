@@ -26,7 +26,12 @@ import {
   X,
 } from 'lucide-react'
 import type { AppSnapshot, AppUpdateState, GatewayApi } from '@shared/types'
-import type { AgentLifecycleOperationResult, AgentLifecycleSnapshot, AgentTarget } from '@shared/agent-lifecycle'
+import type {
+  AgentLifecycleOperationResult,
+  AgentLifecycleProgressEvent,
+  AgentLifecycleSnapshot,
+  AgentTarget,
+} from '@shared/agent-lifecycle'
 import { listRouteSources } from '@shared/route-sources'
 import { getGatewayApi } from './api'
 import { OverviewView } from './views/OverviewView'
@@ -108,6 +113,20 @@ function preloadAppPage(page: PageId): void {
 function localizedError(cause: unknown, fallback: string, language: 'zh-CN' | 'en'): string {
   if (!(cause instanceof Error)) return fallback
   return language === 'en' && /[\u3400-\u9fff]/u.test(cause.message) ? fallback : cause.message
+}
+
+function agentLifecycleProgressStageLabel(
+  stage: AgentLifecycleProgressEvent['stage'],
+  language: 'zh-CN' | 'en',
+): string {
+  const labels: Record<AgentLifecycleProgressEvent['stage'], readonly [string, string]> = {
+    discover: ['发现会话文件', 'Discovering session files'],
+    scan: ['扫描会话', 'Scanning sessions'],
+    verify: ['复核变更', 'Verifying changes'],
+    backup: ['创建恢复点', 'Creating restore point'],
+    apply: ['安全写入', 'Applying safely'],
+  }
+  return labels[stage][language === 'zh-CN' ? 0 : 1]
 }
 
 const desktopTunnelSupported = !window.stone || window.stonePlatform === 'win32'
@@ -287,11 +306,15 @@ export default function App() {
   const [agentLifecycleSnapshot, setAgentLifecycleSnapshot] = useState<AgentLifecycleSnapshot | null>(null)
   const [lastAgentOperation, setLastAgentOperation] = useState<AgentLifecycleOperationResult | undefined>()
   const [agentOperationPending, setAgentOperationPending] = useState(false)
+  const [agentProgress, setAgentProgress] = useState<AgentLifecycleProgressEvent | null>(null)
+  const [agentCancellableOperationId, setAgentCancellableOperationId] = useState<string | null>(null)
+  const [agentCancelPending, setAgentCancelPending] = useState(false)
   const updateRevision = useRef(-1)
   const runtimeRevision = useRef(-1)
   const agentLifecycleRevision = useRef(-1)
   const agentLifecycleRenderState = useRef<string | undefined>(undefined)
   const agentOperationInFlight = useRef(false)
+  const agentOperationIdRef = useRef<string | null>(null)
   const agentLifecycleRefreshInFlight = useRef<Promise<void> | null>(null)
   const activePageSnapshot = useRef<{ page: PageId; snapshot: AppSnapshot } | undefined>(undefined)
   const scrollbarHideTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
@@ -410,6 +433,18 @@ export default function App() {
       window.removeEventListener('focus', refresh)
     }
   }, [acceptAgentLifecycleSnapshot, api, refreshAgentLifecycle])
+
+  useEffect(() => api.onAgentLifecycleProgress((progress) => {
+    if (progress.operationId !== agentOperationIdRef.current) return
+    setAgentProgress(progress)
+    const stage = agentLifecycleProgressStageLabel(progress.stage, language)
+    const count = progress.total === undefined
+      ? `${progress.completed}`
+      : `${progress.completed}/${progress.total}`
+    setOperationRecords((current) => current.map((record) => record.id === progress.operationId
+      ? { ...record, message: `${stage} · ${count}` }
+      : record))
+  }), [api, language])
 
   useEffect(() => {
     const handleHashChange = () => {
@@ -574,26 +609,46 @@ export default function App() {
   }, [acceptSnapshot, beginOperation, finishOperation, language, t])
 
   const runAgentLifecycle = useCallback(async (
-    operation: () => Promise<AgentLifecycleOperationResult>,
+    operation: (operationId: string) => Promise<AgentLifecycleOperationResult>,
     operationKey = 'agent-operation',
+    cancellable = false,
   ) => {
     if (agentOperationInFlight.current) return
     const operationId = beginOperation(operationKey)
     agentOperationInFlight.current = true
+    agentOperationIdRef.current = operationId
     setAgentOperationPending(true)
+    setAgentProgress(null)
+    setAgentCancelPending(false)
+    setAgentCancellableOperationId(cancellable ? operationId : null)
     setError(null)
     try {
-      const result = await operation()
+      const result = await operation(operationId)
       setLastAgentOperation(result)
       acceptAgentLifecycleSnapshot(result.snapshot)
-      finishOperation(operationId, operationKey, 'success')
+      if (result.status === 'succeeded' || result.status === 'no-op') {
+        finishOperation(operationId, operationKey, 'success')
+      } else {
+        const firstError = result.results.find((entry) => entry.error)?.error
+        const cancelled = result.results.some((entry) => entry.error?.code === 'cancelled')
+          && result.results.every((entry) => entry.status === 'skipped' || entry.error?.code === 'cancelled')
+        const message = cancelled
+          ? t('操作已安全取消，已写入内容已回滚', 'Operation safely cancelled; written changes were rolled back')
+          : firstError?.message ?? t('Agent 操作未完整完成', 'Agent operation did not complete')
+        if (!cancelled) setError(message)
+        finishOperation(operationId, operationKey, 'error', message)
+      }
     } catch (cause) {
       const message = localizedError(cause, t('Agent 操作失败', 'Agent operation failed'), language)
       setError(message)
       finishOperation(operationId, operationKey, 'error', message)
     } finally {
       agentOperationInFlight.current = false
+      if (agentOperationIdRef.current === operationId) agentOperationIdRef.current = null
       setAgentOperationPending(false)
+      setAgentProgress(null)
+      setAgentCancellableOperationId(null)
+      setAgentCancelPending(false)
     }
   }, [acceptAgentLifecycleSnapshot, beginOperation, finishOperation, language, t])
 
@@ -601,11 +656,11 @@ export default function App() {
     const operation = action === 'close'
       ? () => api.closeAgent(target)
       : action === 'restore'
-        ? () => api.restoreAgent(target, { ensureRunning: true })
+        ? (operationId: string) => api.restoreAgent(target, { ensureRunning: true }, operationId)
         : action === 'restart'
-          ? () => api.restartAgent(target)
+          ? (operationId: string) => api.restartAgent(target, operationId)
           : () => api.startAgent(target)
-    return runAgentLifecycle(operation, `agent-${action}`)
+    return runAgentLifecycle(operation, `agent-${action}`, action === 'restore' || action === 'restart')
   }, [api, runAgentLifecycle])
 
   const setActivePage = useCallback((id: PageId) => {
@@ -615,13 +670,26 @@ export default function App() {
   }, [])
 
   const repairAllAgents = useCallback(
-    () => runAgentLifecycle(() => api.repairAllAffectedAgents(), 'agent-repair-all'),
+    () => runAgentLifecycle((operationId) => api.repairAllAffectedAgents(operationId), 'agent-repair-all', true),
     [api, runAgentLifecycle],
   )
   const closeAllAgents = useCallback(
     () => runAgentLifecycle(() => api.closeAllManagedAgents(), 'agent-close-all'),
     [api, runAgentLifecycle],
   )
+  const cancelAgentLifecycle = useCallback(async () => {
+    const operationId = agentOperationIdRef.current
+    if (!operationId || operationId !== agentCancellableOperationId || agentCancelPending) return
+    setAgentCancelPending(true)
+    try {
+      const accepted = await api.cancelAgentLifecycleOperation(operationId)
+      if (!accepted && agentOperationIdRef.current === operationId) setAgentCancelPending(false)
+    } catch (cause) {
+      if (agentOperationIdRef.current !== operationId) return
+      setAgentCancelPending(false)
+      setError(localizedError(cause, t('无法取消当前操作', 'Unable to cancel the current operation'), language))
+    }
+  }, [agentCancelPending, agentCancellableOperationId, api, language, t])
   const openClientConfiguration = useCallback(
     () => setActivePage('clients'),
     [setActivePage],
@@ -1040,6 +1108,10 @@ export default function App() {
                 agents={lifecycleAgents}
                 lastOperation={lastAgentOperation}
                 operationPending={agentOperationPending}
+                progress={agentProgress ?? undefined}
+                cancellable={Boolean(agentCancellableOperationId)}
+                cancelPending={agentCancelPending}
+                onCancel={cancelAgentLifecycle}
                 onRequestRefresh={refreshAgentLifecycle}
                 onAction={runAgentAction}
                 onRepair={repairAllAgents}

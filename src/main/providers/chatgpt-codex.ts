@@ -4,12 +4,28 @@ import type { ProviderFailure } from './types'
 import { parseRetryAfter } from './failure'
 import { extractCodexQuotaFromUsagePayload } from './quota'
 import { deserializeChatGptCredential, serializeChatGptCredential, type ChatGptCredentialBundle } from '../auth'
+import { runOAuthRefreshRequest } from '../auth/oauth-refresh-gate'
+import {
+  BUNDLED_CODEX_CLIENT_VERSION,
+  getChatGptCodexModelsUrl,
+  getCodexClientVersion,
+} from './codex-client-version'
+
+export {
+  BUNDLED_CODEX_CLIENT_VERSION,
+  CodexClientVersionSyncService,
+  getChatGptCodexModelsUrl,
+  getCodexClientVersion,
+} from './codex-client-version'
 
 export const CHATGPT_CODEX_RESPONSES_URL = 'https://chatgpt.com/backend-api/codex/responses'
 export const CHATGPT_CODEX_SEARCH_URL = 'https://chatgpt.com/backend-api/codex/alpha/search'
-export const CODEX_CLIENT_VERSION = '0.144.3'
-export const CHATGPT_CODEX_MODELS_URL = `https://chatgpt.com/backend-api/codex/models?client_version=${CODEX_CLIENT_VERSION}`
+/** @deprecated Use getCodexClientVersion() for runtime requests. */
+export const CODEX_CLIENT_VERSION = BUNDLED_CODEX_CLIENT_VERSION
+/** @deprecated Use getChatGptCodexModelsUrl() for runtime requests. */
+export const CHATGPT_CODEX_MODELS_URL = getChatGptCodexModelsUrl()
 export const CHATGPT_CODEX_USAGE_URL = 'https://chatgpt.com/backend-api/wham/usage'
+export const CHATGPT_CODEX_RESET_CREDITS_URL = 'https://chatgpt.com/backend-api/wham/rate-limit-reset-credits'
 export const CODEX_OAUTH_CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann'
 const CODEX_PASSTHROUGH_HEADERS = Object.freeze([
   'accept-language',
@@ -54,6 +70,76 @@ export interface ChatGptCredentialRefreshOptions {
   backgroundRefreshWindowMs?: number
   /** Never return an access token this close to expiry while a refresh is needed. */
   blockingRefreshWindowMs?: number
+  /** Refresh even while the access token remains usable (for example, to renew an expired ID token). */
+  forceRefresh?: boolean
+}
+
+export type ChatGptCredentialRefreshErrorCode =
+  | 'reauthorization-required'
+  | 'timeout'
+  | 'unavailable'
+  | 'invalid-response'
+
+/**
+ * A bounded, secret-free refresh failure that callers can turn into account
+ * state without parsing transport-specific error strings.
+ */
+export class ChatGptCredentialRefreshError extends Error {
+  constructor(
+    readonly code: ChatGptCredentialRefreshErrorCode,
+    message: string,
+  ) {
+    super(message)
+    this.name = 'ChatGptCredentialRefreshError'
+  }
+}
+
+/** A secret-free HTTP failure from a ChatGPT Codex metadata endpoint. */
+export class ChatGptCodexEndpointError extends Error {
+  constructor(
+    readonly statusCode: number,
+    message: string,
+  ) {
+    super(message)
+    this.name = 'ChatGptCodexEndpointError'
+  }
+}
+
+export function classifyChatGptCredentialRefreshFailure(error: unknown): ProviderFailure {
+  if (error instanceof ChatGptCredentialRefreshError) {
+    if (error.code === 'reauthorization-required') {
+      return {
+        category: 'authentication',
+        message: error.message,
+        retryable: true,
+        accountAction: 'disable',
+        statusCode: 401,
+      }
+    }
+    if (error.code === 'timeout') {
+      return {
+        category: 'timeout',
+        message: error.message,
+        retryable: true,
+        accountAction: 'cooldown',
+        statusCode: 504,
+      }
+    }
+    return {
+      category: error.code === 'invalid-response' ? 'invalid_response' : 'network',
+      message: error.message,
+      retryable: true,
+      accountAction: 'cooldown',
+      statusCode: 503,
+    }
+  }
+  return {
+    category: 'upstream',
+    message: 'ChatGPT credential recovery failed.',
+    retryable: true,
+    accountAction: 'cooldown',
+    statusCode: 503,
+  }
 }
 
 const DEFAULT_REFRESH_TIMEOUT_MS = 10_000
@@ -89,6 +175,23 @@ export async function resolveChatGptCredential(
     && cached.access.bundle.expiresAt > now
   ) return cached.access
 
+  if (options.forceRefresh) {
+    if (!current.refreshToken) {
+      throw new ChatGptCredentialRefreshError(
+        'reauthorization-required',
+        'ChatGPT account has no refresh token; reauthorization is required.',
+      )
+    }
+    return await waitForSharedRefresh(getOrStartCredentialRefresh(
+      current,
+      sourceKey,
+      encryptedValue,
+      persistRotated,
+      fetchImplementation,
+      options.timeoutMs ?? DEFAULT_REFRESH_TIMEOUT_MS,
+    ), options.signal)
+  }
+
   const remainingMs = current.expiresAt - now
   const backgroundWindowMs = Math.max(0, options.backgroundRefreshWindowMs ?? DEFAULT_BACKGROUND_REFRESH_WINDOW_MS)
   const blockingWindowMs = Math.max(0, Math.min(
@@ -98,7 +201,10 @@ export async function resolveChatGptCredential(
   if (remainingMs > backgroundWindowMs) return { bundle: current, serialized: encryptedValue }
   if (!current.refreshToken) {
     if (remainingMs > 0) return { bundle: current, serialized: encryptedValue }
-    throw new Error('ChatGPT account access token expired and has no refresh token.')
+    throw new ChatGptCredentialRefreshError(
+      'reauthorization-required',
+      'ChatGPT account access token expired and has no refresh token; reauthorization is required.',
+    )
   }
 
   const refresh = getOrStartCredentialRefresh(
@@ -107,7 +213,7 @@ export async function resolveChatGptCredential(
     encryptedValue,
     persistRotated,
     fetchImplementation,
-    options.timeoutMs ?? DEFAULT_REFRESH_TIMEOUT_MS
+    options.timeoutMs ?? DEFAULT_REFRESH_TIMEOUT_MS,
   )
   if (remainingMs > blockingWindowMs) {
     // The token remains safely usable. Do not put OAuth endpoint latency on the request path.
@@ -122,7 +228,13 @@ export async function refreshChatGptCredential(
   fetchImplementation: typeof fetch = fetch,
   options: Pick<ChatGptCredentialRefreshOptions, 'signal' | 'timeoutMs'> = {}
 ): Promise<ChatGptCredentialBundle> {
-  if (!current.refreshToken) throw new Error('ChatGPT account has no refresh token.')
+  const refreshToken = current.refreshToken
+  if (!refreshToken) {
+    throw new ChatGptCredentialRefreshError(
+      'reauthorization-required',
+      'ChatGPT account has no refresh token; reauthorization is required.',
+    )
+  }
   const timeoutMs = Math.max(1, options.timeoutMs ?? DEFAULT_REFRESH_TIMEOUT_MS)
   const timeoutSignal = AbortSignal.timeout(timeoutMs)
   const signal = options.signal
@@ -130,21 +242,31 @@ export async function refreshChatGptCredential(
     : timeoutSignal
   let response: Response
   try {
-    response = await fetchImplementation('https://auth.openai.com/oauth/token', {
+    response = await runOAuthRefreshRequest('openai', signal, () => fetchImplementation('https://auth.openai.com/oauth/token', {
       method: 'POST',
-      headers: { 'content-type': 'application/x-www-form-urlencoded', 'user-agent': `codex-cli/${CODEX_CLIENT_VERSION}` },
+      headers: { 'content-type': 'application/x-www-form-urlencoded', 'user-agent': `codex-cli/${getCodexClientVersion()}` },
       signal,
       body: new URLSearchParams({
-        grant_type: 'refresh_token', refresh_token: current.refreshToken,
+        grant_type: 'refresh_token', refresh_token: refreshToken,
         client_id: CODEX_OAUTH_CLIENT_ID,
         scope: 'openid profile email'
       })
-    })
+    }))
   } catch (error) {
-    if (isAbortOrTimeout(error)) throw new Error('ChatGPT token refresh timed out.')
-    throw new Error('ChatGPT token refresh endpoint could not be reached.')
+    if (isAbortOrTimeout(error)) {
+      throw new ChatGptCredentialRefreshError('timeout', 'ChatGPT token refresh timed out.')
+    }
+    throw new ChatGptCredentialRefreshError('unavailable', 'ChatGPT token refresh endpoint could not be reached.')
   }
-  if (!response.ok) throw new Error(response.status === 400 || response.status === 401 ? 'ChatGPT refresh token was rejected.' : 'ChatGPT token refresh failed.')
+  if (!response.ok) {
+    await response.body?.cancel().catch(() => undefined)
+    throw response.status === 400 || response.status === 401
+      ? new ChatGptCredentialRefreshError(
+          'reauthorization-required',
+          'ChatGPT refresh token was rejected; reauthorization is required.',
+        )
+      : new ChatGptCredentialRefreshError('unavailable', 'ChatGPT token refresh failed.')
+  }
   const responseText = await readLimitedResponseText(
     response,
     256 * 1024,
@@ -155,11 +277,13 @@ export async function refreshChatGptCredential(
   try {
     payload = JSON.parse(responseText) as Record<string, unknown>
   } catch {
-    throw new Error('ChatGPT token refresh returned invalid JSON.')
+    throw new ChatGptCredentialRefreshError('invalid-response', 'ChatGPT token refresh returned invalid JSON.')
   }
   const accessToken = typeof payload.access_token === 'string' ? payload.access_token.trim() : ''
   const expiresIn = typeof payload.expires_in === 'number' ? payload.expires_in : 0
-  if (!accessToken || !Number.isFinite(expiresIn) || expiresIn <= 0) throw new Error('ChatGPT token refresh returned an invalid response.')
+  if (!accessToken || !Number.isFinite(expiresIn) || expiresIn <= 0) {
+    throw new ChatGptCredentialRefreshError('invalid-response', 'ChatGPT token refresh returned an invalid response.')
+  }
   return {
     ...current,
     accessToken,
@@ -175,7 +299,7 @@ function getOrStartCredentialRefresh(
   sourceSerialized: string,
   persistRotated: (serialized: string, expectedSourceSerialized?: string) => Promise<void>,
   fetchImplementation: typeof fetch,
-  timeoutMs: number
+  timeoutMs: number,
 ): Promise<ChatGptCredentialAccess> {
   const active = credentialRefreshFlights.get(key)
   if (active) return active
@@ -341,7 +465,7 @@ function resolveCodexClientVersion(sourceHeaders: ChatGptSourceHeaders | undefin
   const explicit = readSourceHeader(sourceHeaders, 'version')
   if (explicit && CODEX_VERSION.test(explicit)) return explicit
   const userAgent = readSourceHeader(sourceHeaders, 'user-agent')
-  return userAgent?.match(CODEX_USER_AGENT_VERSION)?.[1] ?? CODEX_CLIENT_VERSION
+  return userAgent?.match(CODEX_USER_AGENT_VERSION)?.[1] ?? getCodexClientVersion()
 }
 
 export async function probeChatGptAccount(
@@ -434,7 +558,7 @@ export async function queryChatGptCodexModelsAuthorized(
   if (authorization.fedramp) headers.set('x-openai-fedramp', 'true')
   let response: Response
   try {
-    response = await fetchImplementation(CHATGPT_CODEX_MODELS_URL, {
+    response = await fetchImplementation(getChatGptCodexModelsUrl(), {
       method: 'GET',
       headers,
       signal
@@ -445,9 +569,9 @@ export async function queryChatGptCodexModelsAuthorized(
   }
   if (!response.ok) {
     await response.body?.cancel().catch(() => undefined)
-    if (response.status === 401) throw new Error('ChatGPT session access token was rejected.')
-    if (response.status === 403) throw new Error('ChatGPT account is not permitted to read Codex models.')
-    throw new Error(`ChatGPT Codex model endpoint returned HTTP ${response.status}.`)
+    if (response.status === 401) throw new ChatGptCodexEndpointError(response.status, 'ChatGPT session access token was rejected.')
+    if (response.status === 403) throw new ChatGptCodexEndpointError(response.status, 'ChatGPT account is not permitted to read Codex models.')
+    throw new ChatGptCodexEndpointError(response.status, `ChatGPT Codex model endpoint returned HTTP ${response.status}.`)
   }
   const text = await readLimitedResponseText(
     response,
@@ -508,22 +632,23 @@ export async function queryChatGptCodexQuotaAuthorized(
 ): Promise<{ quota: AccountCodexQuotaSnapshot; latencyMs: number }> {
   const startedAt = Date.now()
   let response: Response
+  const usageHeaders = {
+    authorization: authorization.authorization,
+    'chatgpt-account-id': authorization.accountId,
+    ...(authorization.fedramp ? { 'x-openai-fedramp': 'true' } : {}),
+    'openai-beta': 'codex-1',
+    'oai-language': 'zh-CN',
+    originator: 'Codex Desktop',
+    accept: 'application/json',
+    'sec-fetch-site': 'none',
+    'sec-fetch-mode': 'no-cors',
+    'sec-fetch-dest': 'empty',
+    priority: 'u=4, i'
+  }
   try {
     response = await fetchImplementation(CHATGPT_CODEX_USAGE_URL, {
       method: 'GET',
-      headers: {
-        authorization: authorization.authorization,
-        'chatgpt-account-id': authorization.accountId,
-        ...(authorization.fedramp ? { 'x-openai-fedramp': 'true' } : {}),
-        'openai-beta': 'codex-1',
-        'oai-language': 'zh-CN',
-        originator: 'Codex Desktop',
-        accept: 'application/json',
-        'sec-fetch-site': 'none',
-        'sec-fetch-mode': 'no-cors',
-        'sec-fetch-dest': 'empty',
-        priority: 'u=4, i'
-      },
+      headers: usageHeaders,
       signal
     })
   } catch (error) {
@@ -532,9 +657,9 @@ export async function queryChatGptCodexQuotaAuthorized(
   }
   if (!response.ok) {
     await response.body?.cancel().catch(() => undefined)
-    if (response.status === 401) throw new Error('ChatGPT session access token was rejected.')
-    if (response.status === 403) throw new Error('ChatGPT account is not permitted to read Codex usage.')
-    throw new Error(`ChatGPT Codex usage endpoint returned HTTP ${response.status}.`)
+    if (response.status === 401) throw new ChatGptCodexEndpointError(response.status, 'ChatGPT session access token was rejected.')
+    if (response.status === 403) throw new ChatGptCodexEndpointError(response.status, 'ChatGPT account is not permitted to read Codex usage.')
+    throw new ChatGptCodexEndpointError(response.status, `ChatGPT Codex usage endpoint returned HTTP ${response.status}.`)
   }
   const text = await readLimitedResponseText(
     response,
@@ -548,8 +673,38 @@ export async function queryChatGptCodexQuotaAuthorized(
   } catch {
     throw new Error('ChatGPT Codex usage endpoint returned invalid JSON.')
   }
-  const quota = extractCodexQuotaFromUsagePayload(payload, now)
+  let quota = extractCodexQuotaFromUsagePayload(payload, now)
   if (!quota) throw new Error('ChatGPT Codex usage endpoint returned no quota windows.')
+  if ((quota.resetCredits?.availableCount ?? 0) > 0 && !quota.resetCredits?.expiresAt?.length) {
+    // The usage endpoint often exposes only a count. Expiry metadata is
+    // optional and must never make an otherwise valid quota refresh fail.
+    try {
+      const detailResponse = await fetchImplementation(CHATGPT_CODEX_RESET_CREDITS_URL, {
+        method: 'GET',
+        headers: usageHeaders,
+        signal,
+      })
+      if (detailResponse.ok) {
+        const detailText = await readLimitedResponseText(
+          detailResponse,
+          256 * 1024,
+          'ChatGPT Codex reset-credit response is too large.',
+          signal,
+        )
+        const detailPayload = JSON.parse(detailText) as unknown
+        const detailQuota = extractCodexQuotaFromUsagePayload({
+          rate_limit_reset_credits: detailPayload,
+        }, now)
+        if (detailQuota?.resetCredits) {
+          quota = { ...quota, resetCredits: detailQuota.resetCredits }
+        }
+      } else {
+        await detailResponse.body?.cancel().catch(() => undefined)
+      }
+    } catch {
+      // Optional metadata only; retain the authoritative available_count.
+    }
+  }
   return { quota, latencyMs: Math.max(0, Date.now() - startedAt) }
 }
 
@@ -589,7 +744,26 @@ function isAbortOrTimeout(error: unknown): boolean {
   return error instanceof Error && /abort|timeout/i.test(`${error.name} ${error.message}`)
 }
 
-export function classifyChatGptCodexFailure(statusCode: number, headers?: HeadersInit, now = Date.now()): ProviderFailure {
+export function classifyChatGptCodexFailure(
+  statusCode: number,
+  headers?: HeadersInit,
+  now = Date.now(),
+  payload?: unknown,
+): ProviderFailure {
+  const transientCode = chatGptCodexErrorCode(payload)
+  if (transientCode === 'server_is_overloaded' || transientCode === 'slow_down') {
+    const retryAfterMs = Math.min(2_000, parseRetryAfter(headers, now) ?? 500)
+    return {
+      category: 'upstream',
+      message: 'ChatGPT Codex is temporarily overloaded.',
+      retryable: true,
+      accountAction: 'none',
+      statusCode: statusCode >= 400 ? statusCode : 503,
+      retryAfterMs,
+      retryAt: now + retryAfterMs,
+      scope: 'request',
+    }
+  }
   if (statusCode === 401) return { category: 'authentication', message: 'ChatGPT session access token was rejected.', retryable: true, accountAction: 'disable', statusCode }
   if (statusCode === 402) return { category: 'quota', message: 'ChatGPT account quota is depleted or requires payment.', retryable: true, accountAction: 'disable', statusCode }
   if (statusCode === 403) return { category: 'permission', message: 'ChatGPT account is not permitted to use the Codex endpoint.', retryable: true, accountAction: 'disable', statusCode }
@@ -598,4 +772,19 @@ export function classifyChatGptCodexFailure(statusCode: number, headers?: Header
     return { category: 'rate_limit', message: 'ChatGPT account rate limit reached.', retryable: true, accountAction: 'cooldown', statusCode, retryAfterMs, retryAt: now + retryAfterMs }
   }
   return { category: statusCode >= 500 ? 'upstream' : 'invalid_request', message: 'ChatGPT Codex endpoint rejected the request.', retryable: statusCode >= 500, accountAction: statusCode >= 500 ? 'cooldown' : 'none', statusCode }
+}
+
+function chatGptCodexErrorCode(payload: unknown): string {
+  if (!payload || typeof payload !== 'object') return ''
+  const root = payload as Record<string, unknown>
+  const response = root.response && typeof root.response === 'object'
+    ? root.response as Record<string, unknown>
+    : undefined
+  const error = (response?.error && typeof response.error === 'object'
+    ? response.error
+    : root.error && typeof root.error === 'object'
+      ? root.error
+      : undefined) as Record<string, unknown> | undefined
+  const value = error?.code ?? error?.type
+  return typeof value === 'string' ? value.trim().toLowerCase().replace(/[\s-]+/g, '_') : ''
 }

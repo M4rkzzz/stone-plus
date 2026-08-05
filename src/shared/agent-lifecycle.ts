@@ -224,6 +224,18 @@ export interface AgentLifecycleError {
   readonly phase?: AgentLifecyclePhase
 }
 
+/** File-maintenance stages emitted while an Agent repair is running. */
+export type AgentLifecycleProgressStage = 'discover' | 'scan' | 'verify' | 'backup' | 'apply'
+
+/** Progress for one renderer-owned, cancellable Agent lifecycle operation. */
+export interface AgentLifecycleProgressEvent {
+  readonly operationId: string
+  readonly target: AgentTarget
+  readonly stage: AgentLifecycleProgressStage
+  readonly completed: number
+  readonly total?: number
+}
+
 export interface AgentStartOptions {
   readonly workingDirectory?: string
   readonly profileId?: string

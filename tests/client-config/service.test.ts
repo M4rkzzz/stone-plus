@@ -294,6 +294,97 @@ describe('ClientConfigService', () => {
     expect(new Set(backups.map((backup) => backup.groupId)).size).toBe(1)
   })
 
+  it('atomically installs a selected renewable OAuth account and can restore the exact Stone state', async () => {
+    const originalConfig = 'model_provider = "stone"\ncli_auth_credentials_store = "file"\n[model_providers.stone]\nbase_url = "http://localhost/v1"\n'
+    const originalAuth = '{"auth_mode":"apikey","OPENAI_API_KEY":"stone-token"}\n'
+    await mkdir(service.paths.codex.directory, { recursive: true })
+    await writeFile(service.paths.codex.config.path, originalConfig)
+    await writeFile(service.paths.codex.auth.path, originalAuth)
+
+    const applied = await service.activateCodexOfficialAccount({
+      accessToken: 'selected-access',
+      refreshToken: 'selected-refresh',
+      idToken: 'selected-id',
+      accountId: 'selected-account',
+      lastRefreshAt: fixedDate.getTime(),
+    })
+
+    expect(applied.changedFiles).toEqual([
+      service.paths.codex.config.path,
+      service.paths.codex.auth.path,
+    ])
+    expect(new Set(applied.backups.map((backup) => backup.groupId)).size).toBe(1)
+    expect(await readFile(service.paths.codex.config.path, 'utf8')).toContain('model_provider = "openai"')
+    expect(JSON.parse(await readFile(service.paths.codex.auth.path, 'utf8'))).toMatchObject({
+      auth_mode: 'chatgpt',
+      tokens: { account_id: 'selected-account', refresh_token: 'selected-refresh' },
+    })
+
+    await service.restoreBackupSet('codex', applied.backups[0].groupId)
+    expect(await readFile(service.paths.codex.config.path, 'utf8')).toBe(originalConfig)
+    expect(await readFile(service.paths.codex.auth.path, 'utf8')).toBe(originalAuth)
+  })
+
+  it('reads a complete Codex-managed ChatGPT generation without exposing API-key auth', async () => {
+    await mkdir(service.paths.codex.directory, { recursive: true })
+    await writeFile(service.paths.codex.auth.path, JSON.stringify({
+      auth_mode: 'chatgpt',
+      last_refresh: '2026-07-12T01:02:03.456Z',
+      tokens: {
+        access_token: 'codex-access',
+        refresh_token: 'codex-refresh',
+        id_token: 'codex-id',
+        account_id: 'codex-account',
+      },
+      unrelated: true,
+    }))
+
+    await expect(service.readCodexOfficialAccountAuth()).resolves.toEqual({
+      accessToken: 'codex-access',
+      refreshToken: 'codex-refresh',
+      idToken: 'codex-id',
+      accountId: 'codex-account',
+      lastRefreshAt: fixedDate.getTime(),
+    })
+
+    await writeFile(service.paths.codex.auth.path, JSON.stringify({
+      auth_mode: 'apikey',
+      OPENAI_API_KEY: 'stone-token',
+    }))
+    await expect(service.readCodexOfficialAccountAuth()).resolves.toBeUndefined()
+  })
+
+  it('only enables the account-switch fast path for a clean existing official config', async () => {
+    const credential = {
+      accessToken: 'selected-access',
+      refreshToken: 'selected-refresh',
+      idToken: 'selected-id',
+      accountId: 'selected-account',
+      lastRefreshAt: fixedDate.getTime(),
+    }
+
+    await expect(service.validateCodexOfficialAccountActivation(credential))
+      .resolves.toEqual({ requiresSessionRepair: true })
+
+    await mkdir(service.paths.codex.directory, { recursive: true })
+    await writeFile(service.paths.codex.config.path, 'model_provider = "openai"\nmodel = "gpt-5.6"\n')
+    await expect(service.validateCodexOfficialAccountActivation(credential))
+      .resolves.toEqual({ requiresSessionRepair: false })
+
+    await writeFile(service.paths.codex.config.path, [
+      'model_provider = "openai"',
+      '[model_providers.stone]',
+      'base_url = "http://127.0.0.1:15721/v1"',
+      '',
+    ].join('\n'))
+    await expect(service.validateCodexOfficialAccountActivation(credential))
+      .resolves.toEqual({ requiresSessionRepair: true })
+
+    await writeFile(service.paths.codex.config.path, 'model_provider = "stone"\n')
+    await expect(service.validateCodexOfficialAccountActivation(credential))
+      .resolves.toEqual({ requiresSessionRepair: true })
+  })
+
   it('scopes a profile to a custom directory without touching the default client path', async () => {
     const customDirectory = join(homeDir, 'profiles', 'work-claude')
     const scoped = service.withOverrides({ claudeDirectory: customDirectory })

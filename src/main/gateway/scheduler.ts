@@ -2,6 +2,8 @@ import type {
   Account,
   AccountCircuitState,
   AccountFitnessSnapshot,
+  AccountModelCooldown,
+  AccountModelCooldownReason,
   Pool,
   PoolStrategy,
   ProviderDefinition,
@@ -9,7 +11,6 @@ import type {
   RequestLog,
   UpstreamCapabilityRequirement
 } from '../../shared/types'
-import { codexQuotaIsExhausted } from '../providers/quota'
 import {
   evaluateSourceEligibility,
   hasRouteAccountCapacity,
@@ -128,6 +129,12 @@ export interface AccountFailureResult extends AccountRuntimeHealth {
   revision: number
 }
 
+export interface AccountModelFailureOptions {
+  reason: AccountModelCooldownReason
+  cooldownMs: number
+  statusCode?: number
+}
+
 export interface AccountPerformanceSample {
   /** Transport latency until the first upstream response body byte. */
   transportFirstBodyMs?: number
@@ -168,6 +175,8 @@ const FITNESS_STALE_AFTER_MS = 24 * 60 * 60_000
 const PERFORMANCE_HYDRATION_WINDOW_MS = 30 * 24 * 60 * 60_000
 const PERFORMANCE_HYDRATION_SAMPLES_PER_ACCOUNT = 400
 const FITNESS_HISTORY_HALF_LIFE_MS = 7 * 24 * 60 * 60_000
+const MAX_MODEL_COOLDOWNS_PER_ACCOUNT = 256
+const MAX_MODEL_KEY_LENGTH = 256
 const FITNESS_NEUTRAL_PRIOR = 72
 const FITNESS_CONFIDENCE_SAMPLES = 12
 const STICKY_ESCAPE_MINIMUM_SAMPLES = 3
@@ -265,6 +274,8 @@ export class PoolScheduler {
   /** Explicit reset generation prevents ABA after health/performance clears. */
   private readonly resetEpochs = new Map<string, number>()
   private readonly healthReasons = new Map<string, 'quota' | 'failure'>()
+  /** Runtime and persisted model-local exclusions, keyed by account then exact upstream model. */
+  private readonly modelCooldowns = new Map<string, Map<string, AccountModelCooldown>>()
   private readonly performance = new Map<string, AccountPerformanceState>()
   /** Persisted logs at or before this boundary must not undo an explicit clear. */
   private readonly performanceResetAt = new Map<string, number>()
@@ -321,6 +332,9 @@ export class PoolScheduler {
         this.healthReasons.delete(accountId)
       }
     }
+    for (const accountId of this.modelCooldowns.keys()) {
+      if (!accountIds.has(accountId)) this.modelCooldowns.delete(accountId)
+    }
     for (const accountId of this.performance.keys()) {
       if (!accountIds.has(accountId)) this.performance.delete(accountId)
     }
@@ -328,6 +342,7 @@ export class PoolScheduler {
       if (!accountIds.has(accountId)) this.quotaHalfOpenObservations.delete(accountId)
     }
     for (const account of accounts) {
+      this.hydrateModelCooldowns(account)
       const liveHealth = this.health.get(account.id)
       if (liveHealth) {
         const explicitlyRecovered = account.status === 'active'
@@ -465,7 +480,7 @@ export class PoolScheduler {
     const sourceEligibility = evaluateSourceEligibility({
       accounts,
       providers: input.providers ?? [],
-      model,
+      model: input.skipAccountModelCatalog ? undefined : model,
       poolModelPolicy: pool.modelPolicy,
       poolModelAllowlist: pool.modelAllowlist,
       requiredCapabilities: input.requiredCapabilities,
@@ -479,7 +494,7 @@ export class PoolScheduler {
     // member and turn a compatible pool into a false 503.
     const runtimeEligible = (account: Account): boolean => (
       !excludedAccountIds?.has(account.id)
-      && this.isEligible(account, pool, adaptiveConcurrency, now)
+      && this.isEligible(account, pool, adaptiveConcurrency, now, model)
     )
     const verifiedCandidates = sourceEligibility.verified.filter(runtimeEligible)
     const candidates = verifiedCandidates.length > 0
@@ -591,14 +606,14 @@ export class PoolScheduler {
     const eligibility = evaluateSourceEligibility({
       accounts: input.accounts,
       providers: input.providers ?? [],
-      model: input.model,
+      model: input.skipAccountModelCatalog ? undefined : input.model,
       poolModelPolicy: input.pool.modelPolicy,
       poolModelAllowlist: input.pool.modelAllowlist,
       requiredCapabilities: input.requiredCapabilities,
       requireProvider: input.providers !== undefined,
     })
     const available = (account: Account): boolean => (
-      !excluded?.has(account.id) && this.isAvailable(account, input.pool, this.now())
+      !excluded?.has(account.id) && this.isAvailable(account, input.pool, this.now(), input.model)
     )
     const verified = eligibility.verified.filter(available)
     const tier = verified.length > 0 ? verified : eligibility.unknown.filter(available)
@@ -738,9 +753,9 @@ export class PoolScheduler {
       requiredCapabilities,
       requireProvider: providers !== undefined,
     })
-    const verifiedAvailable = eligibility.verified.some((account) => this.isAvailable(account, pool))
+    const verifiedAvailable = eligibility.verified.some((account) => this.isAvailable(account, pool, this.now(), model))
     if (verifiedAvailable) return true
-    return eligibility.unknown.some((account) => this.isAvailable(account, pool))
+    return eligibility.unknown.some((account) => this.isAvailable(account, pool, this.now(), model))
   }
 
   /**
@@ -918,6 +933,7 @@ export class PoolScheduler {
   resetHealth(accountId: string, options: { clearPerformance?: boolean } = {}): AccountRuntimeHealth {
     this.health.delete(accountId)
     this.healthReasons.delete(accountId)
+    this.modelCooldowns.delete(accountId)
     this.quotaHalfOpenObservations.delete(accountId)
     if (options.clearPerformance) {
       this.performance.delete(accountId)
@@ -1038,6 +1054,50 @@ export class PoolScheduler {
     return { ...state }
   }
 
+  recordModelFailure(
+    accountId: string,
+    model: string,
+    options: AccountModelFailureOptions,
+  ): Record<string, AccountModelCooldown> {
+    const key = normalizedModelCooldownKey(model)
+    if (!key) return this.getModelCooldowns(accountId)
+    const now = this.now()
+    const cooldownMs = Math.max(1_000, Math.floor(options.cooldownMs))
+    const accountCooldowns = this.modelCooldowns.get(accountId) ?? new Map<string, AccountModelCooldown>()
+    this.pruneModelCooldownMap(accountId, accountCooldowns, now)
+    const next: AccountModelCooldown = {
+      until: now + cooldownMs,
+      reason: options.reason,
+      ...(options.statusCode === undefined ? {} : { statusCode: options.statusCode }),
+      updatedAt: now,
+    }
+    const existing = accountCooldowns.get(key)
+    if (!existing || existing.updatedAt <= next.updatedAt || existing.until < next.until) {
+      accountCooldowns.set(key, next)
+    }
+    while (accountCooldowns.size > MAX_MODEL_COOLDOWNS_PER_ACCOUNT) {
+      let oldestKey: string | undefined
+      let oldestUpdatedAt = Number.POSITIVE_INFINITY
+      for (const [candidateKey, candidate] of accountCooldowns) {
+        if (candidate.updatedAt < oldestUpdatedAt) {
+          oldestKey = candidateKey
+          oldestUpdatedAt = candidate.updatedAt
+        }
+      }
+      if (!oldestKey) break
+      accountCooldowns.delete(oldestKey)
+    }
+    if (accountCooldowns.size > 0) this.modelCooldowns.set(accountId, accountCooldowns)
+    return this.getModelCooldowns(accountId)
+  }
+
+  getModelCooldowns(accountId: string): Record<string, AccountModelCooldown> {
+    const accountCooldowns = this.modelCooldowns.get(accountId)
+    if (!accountCooldowns) return {}
+    this.pruneModelCooldownMap(accountId, accountCooldowns, this.now())
+    return Object.fromEntries([...accountCooldowns].map(([model, cooldown]) => [model, { ...cooldown }]))
+  }
+
   getInFlight(account: Account): number {
     return this.inFlight(account)
   }
@@ -1131,6 +1191,7 @@ export class PoolScheduler {
     this.accountModelIndexes = new WeakMap()
     this.health.clear()
     this.healthReasons.clear()
+    this.modelCooldowns.clear()
     this.performance.clear()
     this.quotaHalfOpenObservations.clear()
     for (const accountId of invalidatedAccountIds) this.bumpHealthRevision(accountId)
@@ -1169,8 +1230,14 @@ export class PoolScheduler {
     return { ...state, applied: true, revision: this.bumpHealthRevision(accountId) }
   }
 
-  private isEligible(account: Account, pool: Pool, adaptiveConcurrency: boolean, now = this.now()): boolean {
-    if (!this.isAvailable(account, pool, now)) return false
+  private isEligible(
+    account: Account,
+    pool: Pool,
+    adaptiveConcurrency: boolean,
+    now = this.now(),
+    model?: string,
+  ): boolean {
+    if (!this.isAvailable(account, pool, now, model)) return false
     return hasRouteAccountCapacity(
       account,
       this.inFlight(account),
@@ -1178,7 +1245,8 @@ export class PoolScheduler {
     )
   }
 
-  private isAvailable(account: Account, pool?: Pool, now = this.now()): boolean {
+  private isAvailable(account: Account, pool?: Pool, now = this.now(), model?: string): boolean {
+    if (model && !this.isModelAvailable(account.id, model, now)) return false
     let health = this.health.get(account.id)
     if (health?.circuitState === 'open' && (health.cooldownUntil ?? 0) <= now) {
       health.circuitState = 'half-open'
@@ -1208,6 +1276,46 @@ export class PoolScheduler {
     if (quotaProtectionBlocks(account.codexQuota, pool?.quotaProtection, now)) return false
     if (cooldownUntil > now || (health?.circuitState === 'half-open' && this.inFlight(account) > 0)) return false
     return true
+  }
+
+  private hydrateModelCooldowns(account: Account): void {
+    const now = this.now()
+    const existing = this.modelCooldowns.get(account.id) ?? new Map<string, AccountModelCooldown>()
+    const persisted = account.modelCooldowns
+    if (persisted && typeof persisted === 'object') {
+      for (const [rawModel, cooldown] of Object.entries(persisted)) {
+        const model = normalizedModelCooldownKey(rawModel)
+        if (!model || !validModelCooldown(cooldown, now)) continue
+        const live = existing.get(model)
+        if (!live || cooldown.updatedAt >= live.updatedAt) existing.set(model, { ...cooldown })
+      }
+    }
+    this.pruneModelCooldownMap(account.id, existing, now)
+    if (existing.size > 0) this.modelCooldowns.set(account.id, existing)
+  }
+
+  private isModelAvailable(accountId: string, model: string, now: number): boolean {
+    const key = normalizedModelCooldownKey(model)
+    if (!key) return true
+    const accountCooldowns = this.modelCooldowns.get(accountId)
+    if (!accountCooldowns) return true
+    const cooldown = accountCooldowns.get(key)
+    if (!cooldown) return true
+    if (cooldown.until > now) return false
+    accountCooldowns.delete(key)
+    if (accountCooldowns.size === 0) this.modelCooldowns.delete(accountId)
+    return true
+  }
+
+  private pruneModelCooldownMap(
+    accountId: string,
+    accountCooldowns: Map<string, AccountModelCooldown>,
+    now: number,
+  ): void {
+    for (const [model, cooldown] of accountCooldowns) {
+      if (!validModelCooldown(cooldown, now)) accountCooldowns.delete(model)
+    }
+    if (accountCooldowns.size === 0) this.modelCooldowns.delete(accountId)
   }
 
   private pick(pool: Pool, candidates: Account[], configuredAccounts: readonly Account[], stickyKey?: string): Account {
@@ -1831,8 +1939,7 @@ function quotaWindows(account: Account) {
 }
 
 function quotaExhausted(account: Account, now: number): boolean {
-  return codexQuotaIsExhausted(account.codexQuota, now)
-    || grokQuotaExhausted(account, now)
+  return grokQuotaExhausted(account, now)
     || quotaWindows(account).some((window) =>
       window?.remaining === 0 && (
         window.resetAt !== undefined
@@ -2042,6 +2149,32 @@ function containsControlCharacter(value: string): boolean {
     if (code <= 0x1f || code === 0x7f) return true
   }
   return false
+}
+
+function normalizedModelCooldownKey(value: string): string | undefined {
+  const normalized = value.trim()
+  if (!normalized || normalized.length > MAX_MODEL_KEY_LENGTH || containsControlCharacter(normalized)) {
+    return undefined
+  }
+  return normalized
+}
+
+function validModelCooldown(value: unknown, now: number): value is AccountModelCooldown {
+  if (!value || typeof value !== 'object') return false
+  const candidate = value as Partial<AccountModelCooldown>
+  return typeof candidate.until === 'number'
+    && Number.isFinite(candidate.until)
+    && candidate.until > now
+    && typeof candidate.updatedAt === 'number'
+    && Number.isFinite(candidate.updatedAt)
+    && (
+      candidate.reason === 'not-found'
+      || candidate.reason === 'permission'
+      || candidate.reason === 'plan-restricted'
+      || candidate.reason === 'rate-limit'
+    )
+    && (candidate.statusCode === undefined
+      || (Number.isInteger(candidate.statusCode) && candidate.statusCode >= 400 && candidate.statusCode <= 599))
 }
 
 function throwIfAborted(signal: AbortSignal | undefined): void {

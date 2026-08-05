@@ -38,6 +38,14 @@ export interface CodexRepairAndRestartOptions {
   expectedRevision?: string
   /** Runs only after Codex is closed and before any session file is inspected. */
   beforeRepair?: () => Promise<void>
+  /** Reverts a completed preparation step when session repair itself fails. */
+  rollbackBeforeRepair?: () => Promise<void>
+  /** Reconcile state after session repair and immediately before desktop startup. */
+  beforeRelaunch?: () => Promise<void>
+  /** Skip the expensive history scan when sessions are already on targetProvider. */
+  skipSessionRepair?: boolean
+  /** Bound provider activation to the startup-critical SQLite index when requested. */
+  sessionRepairScope?: CodexSessionRepairOperationOptions['scope']
   /** Preserve the pre-maintenance running state instead of opening an app that was already closed. */
   preserveRunningState?: boolean
   /** Cancels scanning or mutation at the next safe service checkpoint. */
@@ -352,10 +360,19 @@ export class CodexRepairAndRestartService {
     let relaunched = false
     let relaunchAttempted = false
     let repair: CodexSessionRepairRestartResult['repair'] | undefined
-    const operationOptions = options.signal || options.onProgress || options.modelRepair
-      ? { signal: options.signal, onProgress: options.onProgress, modelRepair: options.modelRepair }
+    let beforeRepairCompleted = false
+    const operationOptions = options.signal || options.onProgress || options.modelRepair || options.sessionRepairScope
+      ? {
+          signal: options.signal,
+          onProgress: options.onProgress,
+          modelRepair: options.modelRepair,
+          scope: options.sessionRepairScope,
+        }
       : undefined
     try {
+      if (options.skipSessionRepair && !options.targetProvider) {
+        throw new Error('Skipping Codex session repair requires an explicit target provider.')
+      }
       if (options.targetProvider && options.expectedRevision) {
         const reviewed = operationOptions
           ? await this.repairService.analyze(options.targetProvider, operationOptions)
@@ -366,12 +383,17 @@ export class CodexRepairAndRestartService {
       }
       restartState = await this.desktop.shutdownForRepair()
       await options.beforeRepair?.()
+      beforeRepairCompleted = Boolean(options.beforeRepair)
       // A normal Codex shutdown can flush global state and SQLite. Bind the
       // repair transaction to one stable post-shutdown plan rather than doing
       // inspect + preview + repair scans over every rollout.
-      repair = operationOptions
-        ? await this.repairService.analyzeAndRepair(options.targetProvider, undefined, operationOptions)
-        : await this.repairService.analyzeAndRepair(options.targetProvider)
+      if (!options.skipSessionRepair) {
+        repair = operationOptions
+          ? await this.repairService.analyzeAndRepair(options.targetProvider, undefined, operationOptions)
+          : await this.repairService.analyzeAndRepair(options.targetProvider)
+      }
+      await options.beforeRelaunch?.()
+      repair ??= emptySessionRepairResult(options.targetProvider!)
       if (!options.preserveRunningState || restartState.wasRunning) {
         relaunchAttempted = true
         await this.desktop.relaunch(restartState)
@@ -383,24 +405,32 @@ export class CodexRepairAndRestartService {
         chatGptRestarted: relaunched,
       }
     } catch (cause) {
+      let rollbackCause: unknown
+      if (beforeRepairCompleted && !repair && options.rollbackBeforeRepair) {
+        try {
+          await options.rollbackBeforeRepair()
+        } catch (error) {
+          rollbackCause = error
+        }
+      }
       if (restartState && !relaunched && !relaunchAttempted
         && (!options.preserveRunningState || restartState.wasRunning)) {
         try {
           await this.desktop.relaunch(restartState)
           relaunched = true
         } catch (restartCause) {
-          throw new Error(messageOf(cause) + '；ChatGPT 重新启动失败：' + messageOf(restartCause))
-        }
-      }
-      if (repair && relaunched && restartState) {
-        return {
-          repair,
-          chatGptWasRunning: restartState.wasRunning,
-          chatGptRestarted: true,
+          throw new Error(
+            messageOf(cause)
+            + (rollbackCause ? '；切换配置回滚失败：' + messageOf(rollbackCause) : '')
+            + '；ChatGPT 重新启动失败：' + messageOf(restartCause),
+          )
         }
       }
       if (repair && relaunchAttempted && !relaunched) {
         throw new Error(`Codex 会话修复已完成，但桌面端未能重新启动：${messageOf(cause)}`)
+      }
+      if (rollbackCause) {
+        throw new Error(`${messageOf(cause)}；切换配置回滚失败：${messageOf(rollbackCause)}`)
       }
       throw cause
     }
@@ -459,6 +489,22 @@ export class CodexRepairAndRestartService {
       }
       throw cause
     }
+  }
+}
+
+function emptySessionRepairResult(targetProvider: string): CodexSessionRepairRestartResult['repair'] {
+  return {
+    targetProvider,
+    repairedRolloutFiles: 0,
+    sqliteProviderRowsUpdated: 0,
+    sqliteModelRowsUpdated: 0,
+    sqliteUserEventRowsUpdated: 0,
+    sqliteCwdRowsUpdated: 0,
+    globalStateFieldsUpdated: 0,
+    globalStateConflictingFields: [],
+    skippedFiles: [],
+    encryptedSessionFiles: 0,
+    encryptedSourceProviders: [],
   }
 }
 

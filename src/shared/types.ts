@@ -1,6 +1,7 @@
 import type {
   AgentLifecycleChangedEvent,
   AgentLifecycleOperationResult,
+  AgentLifecycleProgressEvent,
   AgentLifecycleSnapshot,
   AgentRestoreOptions,
   AgentStartOptions,
@@ -554,6 +555,11 @@ export interface UpstreamCapabilityProfile {
   modelDiscovery?: boolean
   imageInput?: boolean
   imageGeneration?: boolean
+  imageEdit?: boolean
+  videoGeneration?: boolean
+  videoEdit?: boolean
+  /** ChatGPT Live call creation plus its authenticated sideband transport. */
+  live?: boolean
   webSearch?: boolean
   compact?: boolean
   websocket?: boolean
@@ -612,6 +618,20 @@ export interface AccountTagDefinition {
   updatedAt: number
 }
 
+export type AccountModelCooldownReason =
+  | 'not-found'
+  | 'permission'
+  | 'plan-restricted'
+  | 'rate-limit'
+
+export interface AccountModelCooldown {
+  /** Absolute epoch-millisecond boundary after which this model may be probed again. */
+  until: number
+  reason: AccountModelCooldownReason
+  statusCode?: number
+  updatedAt: number
+}
+
 export interface Account {
   id: string
   providerId: string
@@ -644,6 +664,8 @@ export interface Account {
   cooldownReason?: 'quota' | 'failure'
   circuitState?: AccountCircuitState
   consecutiveFailures?: number
+  /** Model-local failures; these never disable or cool the whole account. */
+  modelCooldowns?: Record<string, AccountModelCooldown>
   latencyMs?: number
   lastUsedAt?: number
   lastError?: string
@@ -687,7 +709,7 @@ export interface AccountFitnessSnapshot {
   dynamicConcurrency?: number
 }
 
-export type PublicAccount = Omit<Account, 'chatgptAccountId' | 'credentialId'> & {
+export type PublicAccount = Omit<Account, 'chatgptAccountId' | 'credentialId' | 'modelCooldowns'> & {
   fitness?: AccountFitnessSnapshot
 }
 
@@ -738,6 +760,11 @@ export interface AccountCodexQuotaSnapshot {
   sevenDay?: CodexQuotaWindow
   allowed?: boolean
   limitReached?: boolean
+  resetCredits?: {
+    availableCount: number
+    /** Sanitized expiry timestamps only; upstream credit ids are never persisted. */
+    expiresAt?: number[]
+  }
   observedAt: number
   source: CodexQuotaSource
 }
@@ -788,6 +815,9 @@ export type PoolKind = 'standard' | 'relay-aggregate'
 
 export type PoolStrategy = 'balanced' | 'autobalanced' | 'priority' | 'round-robin' | 'weighted-random' | 'weighted-round-robin'
 
+export type ReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+export type ReasoningEffortMap = Partial<Record<ReasoningEffort, ReasoningEffort>>
+
 export interface Pool {
   id: string
   name: string
@@ -800,6 +830,9 @@ export interface Pool {
   stickySessions: boolean
   stickyTtlMinutes: number
   maxRetries: number
+  /** Optional exact remapping followed by a hard upper bound for requested effort. */
+  reasoningEffortMap?: ReasoningEffortMap
+  reasoningEffortCap?: ReasoningEffort
   forceFastMode?: boolean
   /** Pool-wide reserve guard, combined with each member's account policy. */
   quotaProtection?: QuotaProtectionPolicy
@@ -1435,6 +1468,8 @@ export interface PoolInput {
   stickySessions: boolean
   stickyTtlMinutes: number
   maxRetries: number
+  reasoningEffortMap?: ReasoningEffortMap
+  reasoningEffortCap?: ReasoningEffort
   forceFastMode?: boolean
   quotaProtection?: QuotaProtectionPolicy
   hedgedRequests?: boolean
@@ -1576,6 +1611,8 @@ export interface AggregateRelayInput {
   stickySessions: boolean
   stickyTtlMinutes: number
   maxRetries: number
+  reasoningEffortMap?: ReasoningEffortMap
+  reasoningEffortCap?: ReasoningEffort
   quotaProtection?: QuotaProtectionPolicy
   proxyId?: string
 }
@@ -1998,6 +2035,7 @@ export interface GatewayApi {
   setAccountTags(input: AccountTagAssignmentInput): Promise<AppSnapshot>
   refreshAccountModels(id: string): Promise<AppSnapshot>
   openChatGptWebLogin(id: string): Promise<AppSnapshot>
+  openChatGptCodexApp(id: string): Promise<AppSnapshot>
   testAccountModel(accountId: string, model: string): Promise<AccountModelTestResult>
   importChatGptAccounts(input: ChatGptAccountImportInput): Promise<ChatGptAccountImportResult>
   importGrokAccounts(input: GrokAccountImportInput): Promise<GrokAccountImportResult>
@@ -2146,11 +2184,13 @@ export interface GatewayApi {
   getAgentLifecycleSnapshot(): Promise<AgentLifecycleSnapshot>
   installAgent(target: AgentTarget, channel?: AgentInstallChannel): Promise<AgentLifecycleOperationResult>
   closeAgent(target: AgentTarget): Promise<AgentLifecycleOperationResult>
-  restoreAgent(target: AgentTarget, options?: AgentRestoreOptions): Promise<AgentLifecycleOperationResult>
-  restartAgent(target: AgentTarget): Promise<AgentLifecycleOperationResult>
+  restoreAgent(target: AgentTarget, options?: AgentRestoreOptions, operationId?: string): Promise<AgentLifecycleOperationResult>
+  restartAgent(target: AgentTarget, operationId?: string): Promise<AgentLifecycleOperationResult>
   startAgent(target: AgentTarget, options?: AgentStartOptions): Promise<AgentLifecycleOperationResult>
-  smartRepairAgent(target?: AgentTarget): Promise<AgentLifecycleOperationResult>
-  repairAllAffectedAgents(): Promise<AgentLifecycleOperationResult>
+  smartRepairAgent(target?: AgentTarget, operationId?: string): Promise<AgentLifecycleOperationResult>
+  repairAllAffectedAgents(operationId?: string): Promise<AgentLifecycleOperationResult>
+  cancelAgentLifecycleOperation(operationId: string): Promise<boolean>
+  onAgentLifecycleProgress(listener: (event: AgentLifecycleProgressEvent) => void): () => void
   closeAllManagedAgents(): Promise<AgentLifecycleOperationResult>
   restoreClaudeDesktopOfficialMode(): Promise<ClaudeDesktopOfficialModeRestoreResult>
   previewCodexSessionIndexCleanup(): Promise<CodexSessionIndexCleanupPreview>

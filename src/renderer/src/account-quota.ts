@@ -60,11 +60,8 @@ export function summarizeAccountQuota(accounts: AppSnapshot['accounts']): Accoun
  * be derived from the other; keep both here so the two answers stay adjacent.
  */
 export function accountQuotaIsExhausted(account: PublicAccount, now = Date.now()): boolean {
+  if (account.cooldownReason === 'quota') return true
   if (account.quotaRemaining !== undefined && account.quotaRemaining <= 0) return true
-  if (account.codexQuota?.limitReached || account.codexQuota?.allowed === false) return true
-  if ([account.codexQuota?.fiveHour, account.codexQuota?.sevenDay].some((window) =>
-    window !== undefined && window.usedPercent >= 100 && (window.resetAt === undefined || window.resetAt > now)
-  )) return true
   return [account.quota?.requests, account.quota?.tokens, account.quota?.inputTokens, account.quota?.outputTokens]
     .some((window) => window?.remaining === 0 && (window.resetAt === undefined || window.resetAt > now))
 }

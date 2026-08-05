@@ -689,6 +689,12 @@ export function planCodexOfficialLoginToml(content: string | undefined): TextMut
   ) {
     removePath(lines, ['model_catalog_json'])
   }
+  if (root.model_context_window === DEEPSEEK_V4_FLASH_CONTEXT_WINDOW) {
+    // This exact value is installed only for Stone+'s DeepSeek route. Keeping
+    // it after switching back to OpenAI can make the official client reject an
+    // otherwise valid model. Preserve every other user-defined override.
+    removePath(lines, ['model_context_window'])
+  }
   if (features?.remote_compaction_v2 === false) {
     removePath(lines, ['features', 'remote_compaction_v2'])
   }

@@ -3,8 +3,9 @@ import { createHash, randomBytes } from 'node:crypto'
 import { writeFile } from 'node:fs/promises'
 import { extname, join } from 'node:path'
 import type { Account, PublicProxyDefinition } from '@shared/types'
-import { deserializeChatGptCredential, serializeChatGptCredential, type ChatGptCredentialBundle } from './auth'
-import { refreshChatGptCredential, resolveChatGptCredential } from './providers/chatgpt-codex'
+import { deserializeChatGptCredential, type ChatGptCredentialBundle } from './auth'
+import { readBoundedResponseBuffer } from './auth/bounded-response'
+import { ChatGptCredentialRefreshError, resolveChatGptCredential } from './providers/chatgpt-codex'
 import { resolveEffectiveProxy, type OutboundTransportManager } from './proxy'
 import type { AppStore } from './store/app-store'
 
@@ -257,6 +258,7 @@ export class ChatGptWebLoginService implements ChatGptWebLoginController {
             blockingRefreshWindowMs: 0,
           },
         )
+        assertSelectedChatGptAccount(account, resolved.bundle)
         context.credential = resolved.bundle
     } catch (error) {
       throw webCredentialError(error)
@@ -274,21 +276,38 @@ export class ChatGptWebLoginService implements ChatGptWebLoginController {
     this.installProxyAuthentication(context)
     this.installAuthorizationHeader(context)
     let { accountBootstrap, probe } = await this.loadWebProbeWithRecovery(context)
-    if (probeNeedsRefresh(probe) && context.credential.refreshToken) {
+    if (probeNeedsRefresh(probe)) {
       try {
-        const refreshed = await refreshChatGptCredential(context.credential, fetchImplementation, {
-          timeoutMs: WEB_PROBE_TIMEOUT_MS,
-        })
-        const rotated = serializeChatGptCredential(refreshed)
-        await this.options.store.persistRotatedChatGptCredential(account.id, rotated, resolved.serialized)
-        context.credential = refreshed
-        resolved = { bundle: refreshed, serialized: rotated }
+        // Re-read before recovery. A concurrent gateway request may already
+        // have rotated the refresh token after this web probe used the old
+        // access token.
+        const latestSerialized = this.options.store.getCredential(account.credentialId) ?? resolved.serialized
+        const latestCredential = deserializeChatGptCredential(latestSerialized)
+        if (!latestCredential) throw new Error('ChatGPT account credential is invalid.')
+        resolved = await resolveChatGptCredential(
+          latestSerialized,
+          (rotated, expectedSource) => this.options.store.persistRotatedChatGptCredential(account.id, rotated, expectedSource),
+          fetchImplementation,
+          Date.now(),
+          {
+            refreshKey: account.id,
+            timeoutMs: WEB_PROBE_TIMEOUT_MS,
+            backgroundRefreshWindowMs: 0,
+            blockingRefreshWindowMs: 0,
+            forceRefresh: latestCredential.accessToken === context.credential.accessToken,
+          },
+        )
+        assertSelectedChatGptAccount(account, resolved.bundle)
+        context.credential = resolved.bundle
         ;({ accountBootstrap, probe } = await this.loadWebProbeWithRecovery(context))
       } catch (error) {
         throw webCredentialError(error)
       }
     }
     assertUsableWebProbe(probe, context.networkRoute)
+    if (!accountBootstrap.lightAccount) {
+      throw new Error('当前 OAuth 凭据中找不到所选 ChatGPT 账号或工作区，请重新授权该账号。')
+    }
     context.lightAccount = accountBootstrap.lightAccount
     await this.installAccountSelectionCookies(electronSession, context.credential, context.lightAccount)
     const bridge = this.installAuthenticatedBridge(context)
@@ -445,7 +464,7 @@ export class ChatGptWebLoginService implements ChatGptWebLoginController {
       const value = await response.json().catch(() => undefined)
       return {
         status: response.status,
-        lightAccount: parseChatGptLightAccount(value, context.credential.accountId),
+        lightAccount: parseChatGptLightAccount(value, context.credential.accountId, { requireExact: true }),
       }
     } catch (error) {
       return {
@@ -1019,8 +1038,12 @@ export class ChatGptWebLoginService implements ChatGptWebLoginController {
         await response.body?.cancel().catch(() => undefined)
         throw new Error('图片超过 64 MiB，Stone+ 已停止保存。')
       }
-      const buffer = Buffer.from(await response.arrayBuffer())
-      if (buffer.length > MAX_IMAGE_DOWNLOAD_BYTES) throw new Error('图片超过 64 MiB，Stone+ 已停止保存。')
+      const buffer = await readBoundedResponseBuffer(
+        response,
+        MAX_IMAGE_DOWNLOAD_BYTES,
+        '图片超过 64 MiB，Stone+ 已停止保存。',
+        controller.signal,
+      )
       const mimeType = normalizedImageMimeType(response.headers.get('content-type'))
       if (mimeType === undefined && buffer.length === 0) throw new Error('下载结果不是有效图片。')
       return { buffer, mimeType }
@@ -1852,6 +1875,7 @@ export function isChatGptUnauthenticatedApp(source: string): boolean {
 export function parseChatGptLightAccount(
   value: unknown,
   preferredAccountId: string,
+  options: { requireExact?: boolean } = {},
 ): ChatGptLightAccount | undefined {
   const root = objectClaim(value)
   const accounts = objectClaim(root.accounts)
@@ -1873,8 +1897,10 @@ export function parseChatGptLightAccount(
   // account id. In that case the API's explicit default (or first active
   // ordered account) is the authoritative selection.
   const entry = exact
-    ?? (stringClaim(objectClaim(defaultEntry.account).account_id) ? defaultEntry : undefined)
-    ?? orderedEntry
+    ?? (options.requireExact
+      ? undefined
+      : (stringClaim(objectClaim(defaultEntry.account).account_id) ? defaultEntry : undefined)
+        ?? orderedEntry)
   if (!entry) return undefined
 
   const account = objectClaim(entry.account)
@@ -2089,7 +2115,7 @@ function sameProxyEndpoint(host: string, port: number, configured: ProxyAuthenti
 }
 
 function probeNeedsRefresh(result: WebProbeResult): boolean {
-  return result.me === 401 || result.me === 403 || result.accounts === 401 || result.accounts === 403
+  return result.me === 401 || result.accounts === 401
 }
 
 export function probeNeedsTransientRetry(result: WebProbeResult): boolean {
@@ -2113,6 +2139,9 @@ export function classifyChatGptNavigationError(error: unknown): 'aborted' | 'tra
 function assertUsableWebProbe(result: WebProbeResult, networkRoute: string): void {
   if (result.me === 200 && result.accounts === 200) return
   if (probeNeedsRefresh(result)) throw new Error('ChatGPT OAuth 已失效，请重新授权该账号。')
+  if (result.me === 403 || result.accounts === 403) {
+    throw new Error('该 ChatGPT OAuth 凭据无权访问所选账号或工作区（HTTP 403）。')
+  }
   if (result.me === 402 || result.accounts === 402) throw new Error('该 ChatGPT 账号或工作区当前不可用。')
   const diagnostic = `me=${String(result.me)}, accounts=${String(result.accounts)}, route=${networkRoute}`
   if (result.me === 'timeout' || result.accounts === 'timeout') throw new Error(`ChatGPT OAuth 验活超时（${diagnostic}）。`)
@@ -2131,11 +2160,25 @@ function isSafeExternalUrl(value: string): boolean {
 }
 
 function webCredentialError(error: unknown): Error {
+  if (error instanceof ChatGptCredentialRefreshError) {
+    if (error.code === 'reauthorization-required') return new Error('ChatGPT OAuth 已失效，请重新授权该账号。')
+    if (error.code === 'timeout') return new Error('刷新 ChatGPT OAuth 凭据超时。')
+    return new Error('无法连接 OpenAI OAuth 服务刷新凭据。')
+  }
   const message = error instanceof Error ? error.message : ''
   if (/rejected|expired|invalid/i.test(message)) return new Error('ChatGPT OAuth 已失效，请重新授权该账号。')
   if (/timed out/i.test(message)) return new Error('刷新 ChatGPT OAuth 凭据超时。')
   if (/could not be reached|network/i.test(message)) return new Error('无法连接 OpenAI OAuth 服务刷新凭据。')
   return error instanceof Error ? error : new Error('无法准备 ChatGPT OAuth 凭据。')
+}
+
+function assertSelectedChatGptAccount(
+  account: Pick<Account, 'chatgptAccountId'>,
+  credential: ChatGptCredentialBundle,
+): void {
+  if (account.chatgptAccountId && account.chatgptAccountId !== credential.accountId) {
+    throw new Error('ChatGPT OAuth 凭据与所选账号或工作区不匹配，请重新授权。')
+  }
 }
 
 async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {

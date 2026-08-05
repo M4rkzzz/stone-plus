@@ -15,6 +15,7 @@ import {
   KeyRound,
   Link2,
   LoaderCircle,
+  Monitor,
   Plus,
   RefreshCw,
   Server,
@@ -643,6 +644,7 @@ export function ProvidersView({
   const [accountDraft, setAccountDraft] = useState<AccountDraft>(makeAccountDraft(snapshot.providers[0]?.id))
   const [errors, setErrors] = useState<Record<string, string>>({})
   const [deleteTarget, setDeleteTarget] = useState<{ kind: 'provider' | 'account'; id: string; name: string } | null>(null)
+  const [codexAppTarget, setCodexAppTarget] = useState<{ id: string; name: string } | null>(null)
   const [menuOpen, setMenuOpen] = useState<string | null>(null)
   const [chatGptImportOpen, setChatGptImportOpen] = useState(false)
   const [grokImportOpen, setGrokImportOpen] = useState(false)
@@ -1464,6 +1466,15 @@ export function ProvidersView({
     if (success) setDeleteTarget(null)
   }
 
+  const confirmCodexAppSwitch = async () => {
+    if (!codexAppTarget) return
+    const success = await runAction(
+      `open-chatgpt-codex-app-${codexAppTarget.id}`,
+      () => api.openChatGptCodexApp(codexAppTarget.id),
+    )
+    if (success) setCodexAppTarget(null)
+  }
+
   const clearOAuthUi = () => {
     setOauthStage('idle')
     setOauthSession(null)
@@ -1871,6 +1882,7 @@ export function ProvidersView({
   const selectedVisibleIds = new Set(visibleAccounts.map((account) => account.id))
   const selectedAccountSummary = accountSelectionSummary(selectedAccounts, selectedVisibleIds)
   const cooldownToggleBusy = busyKeys.has('toggle-disable-cooldown')
+  const codexAppSwitchBusy = [...busyKeys].some((key) => key.startsWith('open-chatgpt-codex-app-'))
   const toggleDisableCooldown = async (enabled: boolean) => {
     await runAction('toggle-disable-cooldown', () => api.updateGateway({
       ...snapshot.gateway,
@@ -1958,7 +1970,9 @@ export function ProvidersView({
                     const checking = checkingAllAccounts || busyKeys.has(`check-${account.id}`) || account.status === 'checking'
                     const refreshingModels = busyKeys.has(`refresh-account-models-${account.id}`)
                     const openingWebLogin = busyKeys.has(`open-chatgpt-web-${account.id}`)
+                    const openingCodexApp = busyKeys.has(`open-chatgpt-codex-app-${account.id}`)
                     const supportsWebLogin = account.credentialType === 'chatgpt-oauth'
+                    const supportsCodexApp = account.credentialType === 'chatgpt-oauth' && account.renewable !== false
                     const openModels = effectiveAccountModels(account, provider?.models)
                     const modelSummary = isAccountModelWildcard(account)
                       ? t('待刷新 · 兼容通配', 'Refresh pending · Compatible wildcard')
@@ -1991,6 +2005,7 @@ export function ProvidersView({
                           <button className="icon-button" type="button" title={account.credentialType === 'grok-oauth' ? t('Grok OAuth 使用内置模型目录', 'Grok OAuth uses the built-in model catalog') : t('刷新此账号的可用模型', 'Refresh available models for this account')} disabled={refreshingModels || account.credentialType === 'grok-oauth'} onClick={() => void runAction(`refresh-account-models-${account.id}`, () => api.refreshAccountModels(account.id))}>{refreshingModels ? <LoaderCircle size={16} className="spin" /> : <Boxes size={16} />}</button>
                           <button className="icon-button" type="button" title={account.credentialType === 'grok-oauth' ? t('检测账号并刷新额度', 'Check account and refresh quota') : t('检测账号', 'Check account')} disabled={checking} onClick={() => void runAction(`check-${account.id}`, () => api.checkAccount(account.id))}>{checking ? <LoaderCircle size={16} className="spin" /> : <RefreshCw size={16} />}</button>
                           <button className="icon-button" type="button" title={supportsWebLogin ? t('以此账号打开 ChatGPT 网页', 'Open ChatGPT web with this account') : t('仅 ChatGPT OAuth 账号支持网页登录', 'Web login is available only for ChatGPT OAuth accounts')} aria-label={supportsWebLogin ? t(`以账号 ${account.name} 打开 ChatGPT 网页`, `Open ChatGPT web with account ${account.name}`) : undefined} disabled={!supportsWebLogin || openingWebLogin} onClick={() => void runAction(`open-chatgpt-web-${account.id}`, () => api.openChatGptWebLogin(account.id))}>{openingWebLogin ? <LoaderCircle size={16} className="spin" /> : <Globe2 size={16} />}</button>
+                          <button className="icon-button" type="button" title={supportsCodexApp ? t('切换 Codex App 到此 OAuth 账号，并同步官方源会话', 'Switch Codex App to this OAuth account and sync sessions to the official source') : t('需要包含 refresh_token 的完整 ChatGPT OAuth 账号', 'A complete ChatGPT OAuth account with refresh_token is required')} aria-label={supportsCodexApp ? t(`将账号 ${account.name} 转入 Codex App`, `Open account ${account.name} in Codex App`) : undefined} disabled={!supportsCodexApp || codexAppSwitchBusy} onClick={() => setCodexAppTarget({ id: account.id, name: account.name })}>{openingCodexApp ? <LoaderCircle size={16} className="spin" /> : <Monitor size={16} />}</button>
                           <OverflowMenu open={menuOpen === account.id} onOpenChange={(open) => setMenuOpen(open ? account.id : null)} label={t('更多操作', 'More actions')}><button type="button" onClick={() => provider?.kind === 'xai' && account.credentialType !== 'grok-oauth' ? openProvider('official-api', provider) : openAccount(account)}><Edit3 size={15} />{t('编辑', 'Edit')}</button><button className="danger" type="button" onClick={() => { setDeleteTarget(provider?.kind === 'xai' && account.credentialType !== 'grok-oauth' ? { kind: 'provider', id: provider.id, name: provider.name } : { kind: 'account', id: account.id, name: account.name }); setMenuOpen(null) }}><Trash2 size={15} />{t('删除', 'Delete')}</button></OverflowMenu>
                         </td>
                       </tr>
@@ -2379,6 +2394,18 @@ export function ProvidersView({
       </Modal>
 
       <CodexQuotaModal account={quotaAccount} api={api} runAction={runAction} busyKeys={busyKeys} onClose={() => setQuotaAccountId(null)} />
+
+      <ConfirmDialog
+        open={Boolean(codexAppTarget)}
+        title={t('切换 Codex App 账号', 'Switch Codex App account')}
+        message={t(
+          `将 Codex App 切换到“${codexAppTarget?.name ?? ''}”。Stone+ 会先验活 OAuth 和官方模型目录，再关闭 Codex、备份配置，只同步启动所需索引后立即重启；完整历史修复不会阻塞本次登录。任一步失败都会保留或恢复最近一次可用配置。是否继续？`,
+          `Switch Codex App to “${codexAppTarget?.name ?? ''}”? Stone+ will validate OAuth and the official model catalog first, then close Codex, back up configuration, synchronize only the startup-critical index, and relaunch immediately. Complete history repair will not block this login. If any step fails, the most recent usable configuration is kept or restored. Continue?`,
+        )}
+        busy={Boolean(codexAppTarget && busyKeys.has(`open-chatgpt-codex-app-${codexAppTarget.id}`))}
+        onCancel={() => setCodexAppTarget(null)}
+        onConfirm={() => void confirmCodexAppSwitch()}
+      />
 
       <ConfirmDialog
         open={Boolean(tagDeleteTarget)}

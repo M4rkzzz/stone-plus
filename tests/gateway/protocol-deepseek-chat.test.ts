@@ -10,6 +10,7 @@ describe('DeepSeek Chat Responses bridge', () => {
     const body = {
       model: 'gpt-5.6-terra',
       input: 'Use the available tools.',
+      include: ['reasoning.encrypted_content'],
       parallel_tool_calls: false,
       tools: [
         { type: 'custom', name: 'exec', description: 'Codex runtime' },
@@ -58,6 +59,7 @@ describe('DeepSeek Chat Responses bridge', () => {
       'search_tools',
     ])
     expect(request.body.parallel_tool_calls).toBe(true)
+    expect(request.body.include).toBeUndefined()
     expect(context.toolBridgePlan?.dialect).toBe('deepseek-chat')
     expect(context.toolBridgePlan?.deferredExecSourceName).toBe('exec')
 
@@ -113,6 +115,18 @@ describe('DeepSeek Chat Responses bridge', () => {
     expect(analysis).toMatchObject({
       supported: false,
       issues: [{ path: 'tools', capability: 'builtin-tool' }],
+    })
+  })
+
+  it('rejects unknown include fields while ignoring Codex opaque reasoning state', () => {
+    const analysis = analyzeProtocolConversion('openai-responses', 'openai-chat', {
+      model: 'gpt-5.6-terra',
+      input: 'Continue.',
+      include: ['reasoning.encrypted_content', 'file_search_call.results'],
+    }, { dialect: 'deepseek-chat' })
+    expect(analysis).toMatchObject({
+      supported: false,
+      issues: [{ path: 'include', capability: 'request-option' }],
     })
   })
 })

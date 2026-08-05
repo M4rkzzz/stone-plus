@@ -8,6 +8,7 @@ import {
   type AgentLifecycleError,
   type AgentLifecycleOperationResult,
   type AgentLifecyclePhase,
+  type AgentLifecycleProgressEvent,
   type AgentLifecycleSnapshot,
   type AgentLifecycleState,
   type AgentInstallChannel,
@@ -41,8 +42,14 @@ export interface AgentLifecycleAdapterPort {
   readonly target: AgentTarget
   inspect(): Promise<AgentAdapterSnapshot>
   close(): Promise<AgentAdapterCloseResult | void>
-  restore(options?: AgentRestoreOptions): Promise<AgentAdapterRestoreResult | void>
+  restore(options?: AgentRestoreOptions, execution?: AgentLifecycleExecutionOptions): Promise<AgentAdapterRestoreResult | void>
   start(options?: AgentStartOptions): Promise<void>
+}
+
+/** Runtime-only control plane for one renderer-owned lifecycle operation. */
+export interface AgentLifecycleExecutionOptions {
+  signal?: AbortSignal
+  onProgress?: (progress: Omit<AgentLifecycleProgressEvent, 'operationId'>) => void
 }
 
 export interface AgentRouteState {
@@ -59,6 +66,8 @@ export interface AgentLifecycleServiceOptions {
   now?: () => number
   id?: () => string
   operationTimeoutMs?: number
+  /** Longer soft boundary for Codex operations that include full session repair. */
+  codexRepairTimeoutMs?: number
   /** Bounds expensive renderer polling while lifecycle operations still force fresh snapshots. */
   snapshotCacheTtlMs?: number
 }
@@ -94,6 +103,7 @@ export class AgentLifecycleService {
   private readonly now: () => number
   private readonly id: () => string
   private readonly operationTimeoutMs: number
+  private readonly codexRepairTimeoutMs: number
   private readonly snapshotCacheTtlMs: number
   private readonly groupTails = new Map<string, Promise<void>>()
   /** A soft-timed-out physical operation keeps its state group reserved until it really settles. */
@@ -117,6 +127,9 @@ export class AgentLifecycleService {
     this.now = options.now ?? (() => Date.now())
     this.id = options.id ?? randomUUID
     this.operationTimeoutMs = options.operationTimeoutMs ?? 90_000
+    this.codexRepairTimeoutMs = options.codexRepairTimeoutMs
+      ?? options.operationTimeoutMs
+      ?? 10 * 60_000
     this.snapshotCacheTtlMs = Math.max(0, Math.min(30_000, options.snapshotCacheTtlMs ?? 4_000))
   }
 
@@ -213,11 +226,19 @@ export class AgentLifecycleService {
     })
   }
 
-  restore(target: AgentTarget, options?: AgentRestoreOptions): Promise<AgentLifecycleOperationResult> {
+  restore(
+    target: AgentTarget,
+    options?: AgentRestoreOptions,
+    execution: AgentLifecycleExecutionOptions = {},
+  ): Promise<AgentLifecycleOperationResult> {
     return this.runSingle('restore', target, 'restore', async (adapter) => {
+      throwIfLifecycleCancelled(execution.signal)
       const before = await adapter.inspect()
       assertRestoreOptions(options)
-      const result = await adapter.restore({ preserveRunningState: true, ...options })
+      const restoreOptions = { preserveRunningState: true, ...options }
+      const result = hasLifecycleExecution(execution)
+        ? await adapter.restore(restoreOptions, execution)
+        : await adapter.restore(restoreOptions)
       const phases: AgentLifecyclePhase[] = ['inspect', 'close', 'restore-connection']
       if (target === 'codex-desktop' || target === 'codex-cli') phases.push('repair-residue')
       if (AGENT_CAPABILITIES[target].canRepairSessions && options?.repairSessions !== false) phases.push('repair-sessions')
@@ -244,8 +265,9 @@ export class AgentLifecycleService {
    * profile, working directory and launch mode. A stopped target remains a
    * plain start operation; there is no previous running instance to restore.
    */
-  restart(target: AgentTarget): Promise<AgentLifecycleOperationResult> {
+  restart(target: AgentTarget, execution: AgentLifecycleExecutionOptions = {}): Promise<AgentLifecycleOperationResult> {
     return this.runSingle('restart', target, 'restart', async (adapter) => {
+      throwIfLifecycleCancelled(execution.signal)
       const before = await adapter.inspect()
       if (!AGENT_CAPABILITIES[target].canRestart) {
         throw taggedError('process-start-failed', `${target} cannot be restarted safely; open it instead.`, 'start')
@@ -270,7 +292,9 @@ export class AgentLifecycleService {
         // restore() already relaunches the exact instances that it closed.
         // Calling start() again here would lose launch metadata or create a
         // duplicate process, particularly for Codex Desktop.
-        result = await adapter.restore(restoreOptions)
+        result = hasLifecycleExecution(execution)
+          ? await adapter.restore(restoreOptions, execution)
+          : await adapter.restore(restoreOptions)
       } catch (cause) {
         throw withDefaultLifecyclePhase(cause, 'restore-connection')
       }
@@ -302,14 +326,14 @@ export class AgentLifecycleService {
     })
   }
 
-  smartRepair(target?: AgentTarget): Promise<AgentLifecycleOperationResult> {
+  smartRepair(target?: AgentTarget, execution: AgentLifecycleExecutionOptions = {}): Promise<AgentLifecycleOperationResult> {
     return target
-      ? this.restore(target, { repairSessions: true, repairWorkspaceIndex: true })
-      : this.runRepairAggregate('smart-repair')
+      ? this.restore(target, { repairSessions: true, repairWorkspaceIndex: true }, execution)
+      : this.runRepairAggregate('smart-repair', execution)
   }
 
-  repairAllAffected(): Promise<AgentLifecycleOperationResult> {
-    return this.runRepairAggregate('repair-all-affected')
+  repairAllAffected(execution: AgentLifecycleExecutionOptions = {}): Promise<AgentLifecycleOperationResult> {
+    return this.runRepairAggregate('repair-all-affected', execution)
   }
 
   async closeAllManaged(): Promise<AgentLifecycleOperationResult> {
@@ -365,10 +389,13 @@ export class AgentLifecycleService {
     )
   }
 
-  private runRepairAggregate(action: 'smart-repair' | 'repair-all-affected'): Promise<AgentLifecycleOperationResult> {
+  private runRepairAggregate(
+    action: 'smart-repair' | 'repair-all-affected',
+    execution: AgentLifecycleExecutionOptions,
+  ): Promise<AgentLifecycleOperationResult> {
     if (this.aggregateRepairInFlight) return this.aggregateRepairInFlight
     if (this.closing) return Promise.reject(taggedError('operation-conflict', 'Stone+ is closing.'))
-    const operation = this.runAggregate(action, this.affectedTargets())
+    const operation = this.runAggregate(action, this.affectedTargets(), 'restore', execution)
     const tracked = operation.finally(() => {
       if (this.aggregateRepairInFlight === tracked) this.aggregateRepairInFlight = undefined
       this.inFlight.delete(tracked)
@@ -382,6 +409,7 @@ export class AgentLifecycleService {
     action: AgentLifecycleAction,
     targetsPromise: Promise<AgentTarget[]>,
     mode: 'restore' | 'close' = 'restore',
+    execution: AgentLifecycleExecutionOptions = {},
   ): Promise<AgentLifecycleOperationResult> {
     const startedAt = this.now()
     const operationId = this.id()
@@ -408,7 +436,7 @@ export class AgentLifecycleService {
         ensureRunning: AGENT_CAPABILITIES[target].canDetectRunning,
         repairSessions: true,
         repairWorkspaceIndex: true,
-      })
+      }, execution)
       return [result, ...aliases.map(({ target: alias, snapshot }): AgentTargetLifecycleResult => ({
         target: alias,
         status: result.status === 'failed' ? 'failed' : 'skipped',
@@ -486,8 +514,10 @@ export class AgentLifecycleService {
     mode: 'restore' | 'close',
     busyAction: AgentLifecycleBusyAction,
     options?: AgentRestoreOptions,
+    execution: AgentLifecycleExecutionOptions = {},
   ): Promise<AgentTargetLifecycleResult> {
     return this.runTargetOperation(target, busyAction, async (adapter) => {
+      throwIfLifecycleCancelled(execution.signal)
       const before = await adapter.inspect()
       if (mode === 'close') {
         if (!before.running) {
@@ -497,7 +527,9 @@ export class AgentLifecycleService {
         return { before, result, phases: ['inspect', 'close'], changed: before.running, expectedRunningAfter: false }
       }
       assertRestoreOptions(options)
-      const result = await adapter.restore(options)
+      const result = hasLifecycleExecution(execution)
+        ? await adapter.restore(options, execution)
+        : await adapter.restore(options)
       const phases: AgentLifecyclePhase[] = ['inspect', 'close', 'restore-connection']
       if (target === 'codex-desktop' || target === 'codex-cli') phases.push('repair-residue')
       if (AGENT_CAPABILITIES[target].canRepairSessions && options?.repairSessions !== false) phases.push('repair-sessions')
@@ -550,9 +582,12 @@ export class AgentLifecycleService {
         const pending = operation(this.adapters[target])
         let completed: Awaited<typeof pending>
         try {
+          const timeoutMs = isCodexSessionRepairOperation(target, busyAction)
+            ? this.codexRepairTimeoutMs
+            : this.operationTimeoutMs
           completed = await (busyAction === 'install'
             ? pending
-            : withTimeout(pending, this.operationTimeoutMs, target))
+            : withTimeout(pending, timeoutMs, target))
         } catch (cause) {
           if (!isOperationTimeout(cause)) throw cause
           timedOut = true
@@ -588,7 +623,8 @@ export class AgentLifecycleService {
         }
       } catch (cause) {
         const error = lifecycleError(cause, phaseForBusyAction(busyAction))
-        this.errors.set(target, error)
+        if (error.code === 'cancelled') this.errors.delete(target)
+        else this.errors.set(target, error)
         const after = await this.adapters[target].inspect().catch(() => undefined)
         visibleResult = failedTargetResult(target, error, after)
       } finally {
@@ -811,12 +847,32 @@ function lifecycleError(cause: unknown, phase?: AgentLifecyclePhase): AgentLifec
     phase?: AgentLifecyclePhase
     retryable?: boolean
   } | undefined
+  const cancelled = isAbortCause(cause)
   return {
-    code: value?.lifecycleCode ?? mapPhaseCode(value?.phase ?? phase),
+    code: cancelled ? 'cancelled' : value?.lifecycleCode ?? mapPhaseCode(value?.phase ?? phase),
     message: cause instanceof Error ? cause.message : String(cause),
     retryable: value?.retryable ?? true,
     ...(value?.phase ?? phase ? { phase: value?.phase ?? phase } : {}),
   }
+}
+
+function throwIfLifecycleCancelled(signal?: AbortSignal): void {
+  if (!signal?.aborted) return
+  if (signal.reason instanceof Error) throw signal.reason
+  const error = new Error('操作已安全取消。')
+  error.name = 'AbortError'
+  throw error
+}
+
+function hasLifecycleExecution(execution: AgentLifecycleExecutionOptions): boolean {
+  return Boolean(execution.signal || execution.onProgress)
+}
+
+function isAbortCause(cause: unknown, depth = 0): boolean {
+  if (!cause || depth > 4) return false
+  const value = cause as { name?: unknown; code?: unknown; cause?: unknown }
+  if (value.name === 'AbortError' || value.code === 'ABORT_ERR') return true
+  return value.cause !== undefined && isAbortCause(value.cause, depth + 1)
 }
 
 function installFailure(result: AgentInstallResult): Error {
@@ -851,6 +907,11 @@ function phaseForBusyAction(action: AgentLifecycleBusyAction): AgentLifecyclePha
   if (action === 'start' || action === 'restart') return 'start'
   if (action === 'restore' || action === 'smart-repair') return 'restore-connection'
   return undefined
+}
+
+function isCodexSessionRepairOperation(target: AgentTarget, action: AgentLifecycleBusyAction): boolean {
+  return (target === 'codex-desktop' || target === 'codex-cli')
+    && (action === 'restore' || action === 'restart' || action === 'smart-repair')
 }
 
 function mapPhaseCode(phase?: AgentLifecyclePhase): AgentLifecycleError['code'] {

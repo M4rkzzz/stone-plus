@@ -9,10 +9,11 @@ import {
 import { providerSourceFamily, type ProviderSourceFamily } from '@shared/source-family'
 import { accountMatchesPoolProtocol } from '@shared/pool-protocol'
 import { normalizeProviderHttpUrl } from '@shared/provider-url'
+import { normalizeReasoningEffort, normalizeReasoningEffortMap } from '@shared/reasoning-policy'
 import {
   applyDeepSeekModelLimits,
   DEEPSEEK_DEFAULT_REASONING_EFFORT,
-  DEEPSEEK_RESPONSES_DEFAULT_MODEL,
+  DEEPSEEK_RESPONSES_OFFICIAL_MODELS,
   isOfficialDeepSeekResponsesModel,
   normalizeDeepSeekReasoningEffort,
 } from '@shared/deepseek'
@@ -148,10 +149,10 @@ export function saveApiSourceDraft(
   if (sourceConfiguration.kind === 'deepseek') {
     const unsupportedModels = models.filter((model) => !isOfficialDeepSeekResponsesModel(model))
     if (unsupportedModels.length > 0) {
-      throw new Error(`Official DeepSeek Responses currently supports only ${DEEPSEEK_RESPONSES_DEFAULT_MODEL}.`)
+      throw new Error(`Official DeepSeek Responses supports only ${DEEPSEEK_RESPONSES_OFFICIAL_MODELS.join(' or ')}.`)
     }
     if (defaultModel && !isOfficialDeepSeekResponsesModel(defaultModel)) {
-      throw new Error(`Official DeepSeek Responses currently supports only ${DEEPSEEK_RESPONSES_DEFAULT_MODEL}.`)
+      throw new Error(`Official DeepSeek Responses supports only ${DEEPSEEK_RESPONSES_OFFICIAL_MODELS.join(' or ')}.`)
     }
   }
   if (defaultModel) moveModelToFront(models, defaultModel)
@@ -534,6 +535,16 @@ export function saveAggregateRelayDraft(
     stickySessions: input.protocol === 'kiro-claude' || Boolean(input.stickySessions),
     stickyTtlMinutes,
     maxRetries,
+    reasoningEffortMap: normalizeReasoningEffortMap(
+      Object.prototype.hasOwnProperty.call(input, 'reasoningEffortMap')
+        ? input.reasoningEffortMap
+        : existing?.reasoningEffortMap,
+    ),
+    reasoningEffortCap: normalizeReasoningEffort(
+      Object.prototype.hasOwnProperty.call(input, 'reasoningEffortCap')
+        ? input.reasoningEffortCap
+        : existing?.reasoningEffortCap,
+    ),
     forceFastMode: !aggregateUsesDeepSeek
       && supportsFastServiceTier(input.protocol)
       && existing?.forceFastMode === true,

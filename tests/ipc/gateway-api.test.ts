@@ -16,6 +16,7 @@ import { PersistentTaskRunner } from '../../src/main/tasks'
 import type { DatabaseBackupService, WebDavBackupService } from '../../src/main/backup'
 import type { PersistedState } from '../../src/main/store/types'
 import type { ChatGptWebLoginController } from '../../src/main/chatgpt-web-login'
+import type { ChatGptCodexAppLoginController } from '../../src/main/chatgpt-codex-app-login'
 
 type InvokeHandler = (event: unknown, ...args: unknown[]) => unknown
 
@@ -2392,7 +2393,7 @@ describe('refresh provider models IPC', () => {
     expect(harness.store.setAccountCheckResult).not.toHaveBeenCalled()
   })
 
-  it('cools an exhausted OAuth account until the reset reported by the usage probe', async () => {
+  it('records a reported 100% OAuth snapshot without cooling an active account', async () => {
     const oauth = oauthAccount()
     const resetAfterSeconds = 3_600
     const upstreamFetch = vi.fn(async () => new Response(JSON.stringify({
@@ -2407,21 +2408,22 @@ describe('refresh provider models IPC', () => {
     void harness
     const handler = electron.handlers.get('stone:refresh-account-codex-quota')
     if (!handler) throw new Error('refresh-account-codex-quota handler was not registered')
-    const before = Date.now()
     const mainFrame = { url: 'http://127.0.0.1:5173/index.html' }
 
     await handler({ senderFrame: mainFrame, sender: { mainFrame } }, oauth.id)
 
     expect(oauth).toMatchObject({
-      status: 'cooldown',
-      circuitState: 'open',
-      cooldownReason: 'quota'
+      status: 'active',
+      codexQuota: {
+        fiveHour: { usedPercent: 100 },
+        source: 'usage-endpoint',
+      },
     })
-    expect(oauth.cooldownUntil).toBeGreaterThanOrEqual(before + resetAfterSeconds * 1_000)
-    expect(oauth.cooldownUntil).toBeLessThanOrEqual(Date.now() + resetAfterSeconds * 1_000)
+    expect(oauth.cooldownReason).toBeUndefined()
+    expect(oauth.cooldownUntil).toBeUndefined()
   })
 
-  it('automatically retries an ambiguous five-hour reset boundary instead of sleeping until seven days', async () => {
+  it('releases a confirmed quota cooldown at its boundary even when WHAM still reports 100%', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(new Date('2026-07-25T10:36:52.000Z'))
     const boundary = Date.now()
@@ -2440,19 +2442,12 @@ describe('refresh provider models IPC', () => {
         source: 'usage-endpoint' as const
       }
     }
-    let attempt = 0
     const upstreamFetch = vi.fn(async () => {
-      attempt += 1
       return new Response(JSON.stringify({
-        rate_limit: attempt === 1 ? {
+        rate_limit: {
           allowed: false,
           limit_reached: true,
           primary_window: { used_percent: 100, limit_window_seconds: 18_000, reset_after_seconds: 0 },
-          secondary_window: { used_percent: 16, limit_window_seconds: 604_800, reset_after_seconds: 604_800 }
-        } : {
-          allowed: true,
-          limit_reached: false,
-          primary_window: { used_percent: 0, limit_window_seconds: 18_000, reset_after_seconds: 18_000 },
           secondary_window: { used_percent: 16, limit_window_seconds: 604_800, reset_after_seconds: 604_800 }
         }
       }), { status: 200, headers: { 'content-type': 'application/json' } })
@@ -2463,19 +2458,47 @@ describe('refresh provider models IPC', () => {
       await vi.advanceTimersByTimeAsync(1_000)
       expect(upstreamFetch).toHaveBeenCalledTimes(1)
       expect(oauth).toMatchObject({
-        status: 'cooldown',
-        cooldownReason: 'quota',
-        cooldownUntil: boundary + 61_000
+        status: 'active',
+        circuitState: 'closed',
+        codexQuota: {
+          fiveHour: { usedPercent: 100 },
+          source: 'usage-endpoint',
+        },
       })
+      expect(oauth.cooldownReason).toBeUndefined()
+      expect(oauth.cooldownUntil).toBeUndefined()
+      expect(harness.gateway.resetAccountHealth).toHaveBeenCalledWith(oauth.id)
+    } finally {
+      await harness.dispose()
+      vi.useRealTimers()
+    }
+  })
 
-      await vi.advanceTimersByTimeAsync(61_000)
-      expect(upstreamFetch).toHaveBeenCalledTimes(2)
+  it('does not let an unavailable WHAM endpoint extend an elapsed quota cooldown', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-07-25T11:00:00.000Z'))
+    const boundary = Date.now()
+    const oauth = {
+      ...oauthAccount(),
+      status: 'cooldown' as const,
+      circuitState: 'open' as const,
+      cooldownReason: 'quota' as const,
+      cooldownUntil: boundary,
+    }
+    const upstreamFetch = vi.fn(async () => new Response(null, { status: 503 }))
+    const errorLog = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    const harness = createHarness([oauth], { [oauth.credentialId]: oauthCredential() }, upstreamFetch)
+
+    try {
+      await vi.advanceTimersByTimeAsync(1_000)
+      expect(upstreamFetch).toHaveBeenCalledOnce()
       expect(oauth).toMatchObject({ status: 'active', circuitState: 'closed' })
       expect(oauth.cooldownReason).toBeUndefined()
       expect(oauth.cooldownUntil).toBeUndefined()
       expect(harness.gateway.resetAccountHealth).toHaveBeenCalledWith(oauth.id)
     } finally {
       await harness.dispose()
+      errorLog.mockRestore()
       vi.useRealTimers()
     }
   })
@@ -2596,7 +2619,7 @@ describe('refresh provider models IPC', () => {
 
     expect(harness.taskRunner.get(started.id)).toMatchObject({
       payload: { accountIds: [exhausted.id] },
-      result: { checked: 1, succeeded: 0, failed: 1, skipped: 0 },
+      result: { checked: 1, succeeded: 1, failed: 0, skipped: 0 },
     })
     expect(upstreamFetch).toHaveBeenCalledOnce()
   })
@@ -2891,7 +2914,7 @@ describe('refresh provider models IPC', () => {
     expect(JSON.stringify(init)).not.toContain('oauth-access-private')
   })
 
-  it('preserves a ChatGPT authentication failure for a 401 model response', async () => {
+  it('refreshes once after a 401 model response and requires reauthorization when refresh is rejected', async () => {
     const oauth = oauthAccount()
     const upstreamFetch = vi.fn(async () => new Response(JSON.stringify({
       error: 'Bearer oauth-access-private for acct-team-private'
@@ -2901,7 +2924,10 @@ describe('refresh provider models IPC', () => {
     const error = await invokeRefresh(harness).catch((caught: unknown) => caught)
 
     expect(error).toBeInstanceOf(Error)
-    expect((error as Error).message).toBe('ChatGPT session access token was rejected.')
+    expect((error as Error).message).toBe('ChatGPT refresh token was rejected; reauthorization is required.')
+    expect(upstreamFetch).toHaveBeenCalledTimes(2)
+    expect(String(upstreamFetch.mock.calls[0][0])).toContain('/backend-api/codex/models')
+    expect(String(upstreamFetch.mock.calls[1][0])).toBe('https://auth.openai.com/oauth/token')
     expect((error as Error).message).not.toContain('Provider rejected the account credential')
     expect((error as Error).message).not.toContain('oauth-access-private')
     expect((error as Error).message).not.toContain('acct-team-private')
@@ -3113,6 +3139,7 @@ function createHarness(
     webDavBackups: WebDavBackupService
   },
   chatGptWebLogin?: ChatGptWebLoginController,
+  chatGptCodexAppLogin?: ChatGptCodexAppLoginController,
 ): {
   store: AppStore
   gateway: GatewayController
@@ -3425,6 +3452,7 @@ function createHarness(
     backupServices?.webDavBackups,
     undefined,
     chatGptWebLogin,
+    chatGptCodexAppLogin,
   )
   return {
     store,
@@ -3492,6 +3520,32 @@ describe('ChatGPT web login IPC', () => {
     expect(snapshot.accounts.some((account) => account.id === 'account-oauth')).toBe(true)
     await harness.dispose()
     expect(webLogin.dispose).toHaveBeenCalledOnce()
+  })
+
+  it('switches the exact selected OAuth account into the default Codex App', async () => {
+    const appLogin = {
+      open: vi.fn(async () => undefined),
+    } satisfies ChatGptCodexAppLoginController
+    createHarness(
+      [oauthAccount()],
+      { 'credential-oauth': oauthCredential() },
+      vi.fn(),
+      [],
+      { current: 'codex-app-login-fingerprint' },
+      {} as ClientConfigService,
+      undefined,
+      undefined,
+      undefined,
+      appLogin,
+    )
+    const handler = electron.handlers.get('stone:open-chatgpt-codex-app')
+    if (!handler) throw new Error('open-chatgpt-codex-app handler was not registered')
+    const mainFrame = { url: 'http://127.0.0.1:5173/index.html' }
+
+    const snapshot = await handler({ senderFrame: mainFrame, sender: { mainFrame } }, 'account-oauth') as AppSnapshot
+
+    expect(appLogin.open).toHaveBeenCalledWith('account-oauth')
+    expect(snapshot.accounts.some((account) => account.id === 'account-oauth')).toBe(true)
   })
 })
 

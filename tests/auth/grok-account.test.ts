@@ -73,10 +73,15 @@ describe('Grok OAuth account import', () => {
 
   it('classifies a rejected refresh token as a revoked credential', async () => {
     const current = parseGrokOAuthImport(exportJson()).accounts[0].bundle
+    let cancelled = false
     await expect(refreshGrokOAuthCredential(
       current,
-      vi.fn(async () => new Response('{}', { status: 401 })) as typeof fetch,
+      vi.fn(async () => new Response(new ReadableStream({
+        start(controller) { controller.enqueue(new TextEncoder().encode('{}')) },
+        cancel() { cancelled = true },
+      }), { status: 401 })) as typeof fetch,
     )).rejects.toMatchObject({ name: 'GrokOAuthCredentialError', code: 'revoked' })
+    expect(cancelled).toBe(true)
   })
 
   it('does not cancel a shared refresh when one waiter is aborted', async () => {

@@ -15,6 +15,7 @@ import {
   applyDeepSeekModelLimits,
   DEEPSEEK_DEFAULT_REASONING_EFFORT,
   DEEPSEEK_RESPONSES_DEFAULT_MODEL,
+  DEEPSEEK_RESPONSES_OFFICIAL_MODELS,
   filterOfficialDeepSeekResponsesModels,
   isOfficialDeepSeekResponsesModel,
   normalizeDeepSeekReasoningEffort,
@@ -44,6 +45,7 @@ import {
   routeReferencesSource,
 } from '@shared/route-models'
 import { providerSourceFamily } from '@shared/source-family'
+import { normalizeReasoningEffort, normalizeReasoningEffortMap } from '@shared/reasoning-policy'
 import {
   buildModelCatalog,
   inferUpstreamCapabilities,
@@ -54,6 +56,7 @@ import type {
   Account,
   AccountCodexQuotaSnapshot,
   AccountGrokQuotaSnapshot,
+  AccountModelCooldown,
   AccountInput,
   AccountQuotaSnapshot,
   AccountTagAssignmentInput,
@@ -208,6 +211,8 @@ const MAX_LIVE_REQUEST_LOGS = MAX_RENDERER_REQUEST_LOGS
 const MAX_CLEARED_REQUEST_LOG_TOMBSTONES = MAX_PERSISTED_REQUEST_LOGS * 2
 const FITNESS_HISTORY_WINDOW_MS = 30 * 24 * 60 * 60_000
 const FITNESS_HISTORY_ROWS_PER_ACCOUNT = 400
+const MAX_PERSISTED_MODEL_COOLDOWNS = 256
+const MAX_PERSISTED_MODEL_COOLDOWN_MS = 7 * 24 * 60 * 60_000
 const IGNORED_UPDATE_VERSION_KEY = 'ignored_update_version'
 const CREDENTIAL_IMPORT_JOURNAL_KEY = 'credential_import_rollback_v1'
 const CREDENTIAL_ROTATION_JOURNAL_KEY = 'credential_rotation_recovery_v1'
@@ -227,6 +232,7 @@ type AccountCheckPatch = Partial<Pick<Account,
   'cooldownReason' |
   'circuitState' |
   'consecutiveFailures' |
+  'modelCooldowns' |
   'quotaRemaining' |
   'quotaUnit' |
   'quota' |
@@ -742,7 +748,12 @@ export class AppStore {
   public getPublicRuntimeAccounts(ids?: ReadonlySet<string>): AppSnapshot['accounts'] {
     return this.store.select((state) => state.accounts
       .filter((account) => !ids || ids.has(account.id))
-      .map(({ chatgptAccountId: _chatgptAccountId, credentialId: _credentialId, ...account }) => account))
+      .map(({
+        chatgptAccountId: _chatgptAccountId,
+        credentialId: _credentialId,
+        modelCooldowns: _modelCooldowns,
+        ...account
+      }) => account))
   }
 
   public getRuntimeGatewaySettings(): GatewaySettings {
@@ -826,7 +837,7 @@ export class AppStore {
       }
       if (input.kind === 'deepseek'
         && normalizeModels(input.models).some((model) => !isOfficialDeepSeekResponsesModel(model))) {
-        throw new Error(`Official DeepSeek Responses currently supports only ${DEEPSEEK_RESPONSES_DEFAULT_MODEL}.`)
+        throw new Error(`Official DeepSeek Responses supports only ${DEEPSEEK_RESPONSES_OFFICIAL_MODELS.join(' or ')}.`)
       }
       if (input.kind === 'xai' && sourceType !== 'official-api') {
         throw new Error('Official xAI providers must use the official API source type.')
@@ -1083,7 +1094,7 @@ export class AppStore {
       const normalizedModels = normalizeModels(models)
       if (provider.kind === 'deepseek'
         && normalizedModels.some((model) => !isOfficialDeepSeekResponsesModel(model))) {
-        throw new Error(`Official DeepSeek Responses currently supports only ${DEEPSEEK_RESPONSES_DEFAULT_MODEL}.`)
+        throw new Error(`Official DeepSeek Responses supports only ${DEEPSEEK_RESPONSES_OFFICIAL_MODELS.join(' or ')}.`)
       }
       provider.models = provider.kind === 'deepseek'
         ? filterOfficialDeepSeekResponsesModels(normalizedModels)
@@ -2294,6 +2305,16 @@ export class AppStore {
         stickySessions: input.stickySessions,
         stickyTtlMinutes,
         maxRetries,
+        reasoningEffortMap: normalizeReasoningEffortMap(
+          Object.prototype.hasOwnProperty.call(input, 'reasoningEffortMap')
+            ? input.reasoningEffortMap
+            : existing?.reasoningEffortMap,
+        ),
+        reasoningEffortCap: normalizeReasoningEffort(
+          Object.prototype.hasOwnProperty.call(input, 'reasoningEffortCap')
+            ? input.reasoningEffortCap
+            : existing?.reasoningEffortCap,
+        ),
         forceFastMode: !finalFamilies.has('deepseek')
           && supportsPoolFastServiceTier(protocol)
           && (input.forceFastMode ?? existing?.forceFastMode) === true,
@@ -3768,6 +3789,7 @@ function normalizePersistedState(
       modelsRefreshedAt,
       modelPolicy,
       modelAllowlist,
+      modelCooldowns: normalizePersistedModelCooldowns(account.modelCooldowns, timestamp),
       grokQuota: credentialType === 'grok-oauth' ? normalizePersistedGrokQuota(account.grokQuota) : undefined,
       quotaProtection: credentialType === 'grok-oauth'
         ? undefined
@@ -3792,6 +3814,8 @@ function normalizePersistedState(
       stickySessions: pool.stickySessions === true,
       stickyTtlMinutes: boundedInteger(pool.stickyTtlMinutes, 1, 1_440, 60),
       maxRetries: boundedInteger(pool.maxRetries, 0, 10, 0),
+      reasoningEffortMap: normalizeReasoningEffortMap(pool.reasoningEffortMap),
+      reasoningEffortCap: normalizeReasoningEffort(pool.reasoningEffortCap),
       forceFastMode: supportsPoolFastServiceTier(pool.protocol) && pool.forceFastMode === true,
       members: pool.members.map((member, index) => ({
         accountId: member.accountId,
@@ -3991,6 +4015,7 @@ function toSnapshot(
     accounts: accounts.map(({
       chatgptAccountId: _chatgptAccountId,
       credentialId: _credentialId,
+      modelCooldowns: _modelCooldowns,
       ...account
     }) => account),
     proxies: proxies.map(({ credentialId: _credentialId, ...proxy }) => ({
@@ -4298,6 +4323,7 @@ function mergeAccountCodexQuota(
     source: later.source,
     allowed: later.allowed ?? earlier?.allowed,
     limitReached: later.limitReached ?? earlier?.limitReached,
+    resetCredits: later.resetCredits ?? earlier?.resetCredits,
     fiveHour: later.fiveHour ? { ...earlier?.fiveHour, ...later.fiveHour } : earlier?.fiveHour,
     sevenDay: later.sevenDay ? { ...earlier?.sevenDay, ...later.sevenDay } : earlier?.sevenDay
   }
@@ -4717,6 +4743,45 @@ function intersectModels(models: unknown, availableModels: unknown): string[] {
 
 function normalizeTimestamp(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined
+}
+
+function normalizePersistedModelCooldowns(
+  value: unknown,
+  now: number,
+): Record<string, AccountModelCooldown> | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const result: Record<string, AccountModelCooldown> = {}
+  const entries = Object.entries(value as Record<string, unknown>)
+    .slice(0, MAX_PERSISTED_MODEL_COOLDOWNS * 2)
+  for (const [rawModel, rawCooldown] of entries) {
+    const model = rawModel.trim()
+    if (!model || model.length > 256 || hasAsciiControlCharacter(model)) continue
+    if (!rawCooldown || typeof rawCooldown !== 'object' || Array.isArray(rawCooldown)) continue
+    const cooldown = rawCooldown as Record<string, unknown>
+    const until = normalizeTimestamp(cooldown.until)
+    const updatedAt = normalizeTimestamp(cooldown.updatedAt)
+    const reason = cooldown.reason === 'not-found'
+      || cooldown.reason === 'permission'
+      || cooldown.reason === 'plan-restricted'
+      || cooldown.reason === 'rate-limit'
+      ? cooldown.reason
+      : undefined
+    if (!until || until <= now || !updatedAt || !reason) continue
+    const statusCode = typeof cooldown.statusCode === 'number'
+      && Number.isInteger(cooldown.statusCode)
+      && cooldown.statusCode >= 400
+      && cooldown.statusCode <= 599
+      ? cooldown.statusCode
+      : undefined
+    result[model] = {
+      until: Math.min(until, now + MAX_PERSISTED_MODEL_COOLDOWN_MS),
+      reason,
+      ...(statusCode === undefined ? {} : { statusCode }),
+      updatedAt,
+    }
+    if (Object.keys(result).length >= MAX_PERSISTED_MODEL_COOLDOWNS) break
+  }
+  return Object.keys(result).length > 0 ? result : undefined
 }
 
 function normalizePersistedGrokQuota(value: unknown): AccountGrokQuotaSnapshot | undefined {

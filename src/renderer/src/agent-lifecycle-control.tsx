@@ -8,6 +8,7 @@ import {
   RotateCcw,
   Square,
   TriangleAlert,
+  XCircle,
 } from 'lucide-react'
 import {
   useEffect,
@@ -22,6 +23,7 @@ import {
   type AgentLifecycleBusyAction,
   type AgentLifecycleError,
   type AgentLifecycleOperationResult,
+  type AgentLifecycleProgressEvent,
   type AgentLifecycleState,
   type AgentTarget,
   type AgentTargetLifecycleResult,
@@ -47,6 +49,12 @@ export interface AgentLifecycleControlProps {
   disabled?: boolean
   /** Covers renderer-to-main IPC latency before the lifecycle busy snapshot arrives. */
   operationPending?: boolean
+  /** Real file-maintenance progress for the active repair transaction. */
+  progress?: AgentLifecycleProgressEvent
+  /** The active operation owns an AbortController in the main process. */
+  cancellable?: boolean
+  cancelPending?: boolean
+  onCancel?: () => void | Promise<void>
   /** Refreshes externally launched/stopped processes while the panel is visible. */
   onRequestRefresh?: () => void | Promise<void>
   onAction: (target: AgentTarget, action: AgentLifecycleControlAction) => void | Promise<void>
@@ -98,8 +106,10 @@ export function summarizeAgentLifecycle(
   agents: readonly AgentLifecycleState[],
   operation?: AgentLifecycleOperationResult,
 ): AgentLifecycleDisplayState {
-  if (operation?.status === 'partial') return 'partial'
-  if (operation?.status === 'failed') return 'failed'
+  const safelyCancelled = Boolean(operation?.results.length)
+    && operation!.results.every((result) => result.status === 'skipped' || result.error?.code === 'cancelled')
+  if (!safelyCancelled && operation?.status === 'partial') return 'partial'
+  if (!safelyCancelled && operation?.status === 'failed') return 'failed'
   const states = agents.map(displayStateForAgent)
   if (states.includes('failed')) {
     const completed = operation?.results.some((outcome) => outcome.status === 'succeeded')
@@ -153,6 +163,10 @@ export function AgentLifecycleControl({
   lastOperation,
   disabled = false,
   operationPending = false,
+  progress,
+  cancellable = false,
+  cancelPending = false,
+  onCancel,
   onRequestRefresh,
   onAction,
   onRepair,
@@ -255,7 +269,15 @@ export function AgentLifecycleControl({
             )}
           </div>
 
-          {lastOperation && lastOperation.results.length > 0 && (
+          {cancellable && onCancel && (
+            <AgentRepairProgress
+              progress={progress}
+              cancelPending={cancelPending}
+              onCancel={onCancel}
+            />
+          )}
+
+          {!cancellable && lastOperation && lastOperation.results.length > 0 && (
             <div className="agent-lifecycle__outcomes" aria-label={t('最近操作结果', 'Recent operation results')}>
               {lastOperation.results.map((outcome) => (
                 <div className={`agent-lifecycle__outcome agent-lifecycle__outcome--${outcome.status}`} key={`${lastOperation.operationId}-${outcome.target}`}>
@@ -294,6 +316,64 @@ export function AgentLifecycleControl({
       )}
     </div>
   )
+}
+
+function AgentRepairProgress({
+  progress,
+  cancelPending,
+  onCancel,
+}: {
+  progress?: AgentLifecycleProgressEvent
+  cancelPending: boolean
+  onCancel: () => void | Promise<void>
+}) {
+  const { t } = useI18n()
+  const stageLabel = progress ? lifecycleProgressStageLabel(progress.stage, t) : t('准备安全修复', 'Preparing safe repair')
+  const detail = progress
+    ? progress.total === undefined
+      ? t(`已处理 ${progress.completed}`, `${progress.completed} processed`)
+      : t(`已处理 ${progress.completed} / ${progress.total}`, `${progress.completed} of ${progress.total} processed`)
+    : t('正在关闭客户端并建立修复事务', 'Closing the client and preparing the repair transaction')
+  const percent = progress?.total && progress.total > 0
+    ? Math.max(0, Math.min(100, Math.round((progress.completed / progress.total) * 100)))
+    : undefined
+  const finishing = progress?.stage === 'apply'
+    && progress.total !== undefined
+    && progress.completed >= progress.total
+
+  return (
+    <div className="agent-lifecycle__progress" aria-live="polite" aria-busy="true">
+      <div className="agent-lifecycle__progress-heading">
+        <RefreshCw className="spin" size={13} aria-hidden="true" />
+        <span><strong>{stageLabel}</strong><small>{detail}</small></span>
+        <button type="button" disabled={cancelPending || finishing} onClick={() => void onCancel()}>
+          {cancelPending ? <RefreshCw className="spin" size={12} /> : <XCircle size={12} />}
+          {cancelPending ? t('正在安全取消…', 'Cancelling safely…') : finishing ? t('正在完成', 'Finishing') : t('安全取消', 'Cancel safely')}
+        </button>
+      </div>
+      <div
+        className="agent-lifecycle__progress-track"
+        role="progressbar"
+        aria-label={t('会话修复进度', 'Session repair progress')}
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={percent}
+      >
+        <span className={percent === undefined ? 'is-indeterminate' : ''} style={percent === undefined ? undefined : { width: `${percent}%` }} />
+      </div>
+    </div>
+  )
+}
+
+function lifecycleProgressStageLabel(
+  stage: AgentLifecycleProgressEvent['stage'],
+  t: Translator,
+): string {
+  if (stage === 'discover') return t('发现会话文件', 'Discovering session files')
+  if (stage === 'scan') return t('扫描会话', 'Scanning sessions')
+  if (stage === 'verify') return t('复核变更', 'Verifying changes')
+  if (stage === 'backup') return t('创建恢复点', 'Creating restore point')
+  return t('安全写入', 'Applying safely')
 }
 
 function AgentRow({
@@ -503,6 +583,7 @@ export function agentOutcomeLabel(
   action: AgentLifecycleOperationResult['action'],
   t: Translator,
 ): string {
+  if (outcome.error?.code === 'cancelled') return t('已安全取消并回滚', 'Safely cancelled and rolled back')
   if (outcome.error) return localizedLifecycleError(outcome.error, t)
   if (outcome.status === 'succeeded') {
     if (action === 'install') return t('已打开官方安装指引', 'Official installation guide opened')

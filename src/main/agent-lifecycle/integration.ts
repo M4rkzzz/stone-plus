@@ -57,6 +57,8 @@ export interface CreateAgentLifecycleServiceOptions {
   installer: AgentInstallationService
   openExternal(url: string): Promise<unknown>
   claudeDesktopCoordinator: ClaudeDesktopOperationCoordinatorPort
+  /** Reclaims a Codex-owned OAuth generation after shutdown and before Stone rewrites auth.json. */
+  beforeDefaultCodexConnectionRepair?: () => Promise<void>
 }
 
 export function createAgentLifecycleService(options: CreateAgentLifecycleServiceOptions): AgentLifecycleService {
@@ -97,6 +99,7 @@ export function createAgentLifecycleService(options: CreateAgentLifecycleService
         return options.codexRepair.run({
           ...effectiveRepairOptions,
           beforeRepair: async () => {
+            await options.beforeDefaultCodexConnectionRepair?.()
             await prepareDefaultCodexConnection()
             await effectiveRepairOptions.beforeRepair?.()
           },
@@ -108,6 +111,7 @@ export function createAgentLifecycleService(options: CreateAgentLifecycleService
           results.push(await options.codexRepair.run({
             ...effectiveRepairOptions,
             beforeRepair: async () => {
+              await options.beforeDefaultCodexConnectionRepair?.()
               await prepareDefaultCodexConnection()
               await effectiveRepairOptions.beforeRepair?.()
             },
@@ -207,14 +211,14 @@ export function createAgentLifecycleService(options: CreateAgentLifecycleService
         return adapterSnapshot(state, configured)
       },
       close: () => codexDesktopAdapter.close(),
-      restore: (restoreOptions) => codexDesktopAdapter.restore(restoreOptions),
+      restore: (restoreOptions, execution) => codexDesktopAdapter.restore(restoreOptions, execution),
       start: (startOptions) => codexDesktopAdapter.start(startOptions),
     },
     'codex-cli': {
       target: 'codex-cli',
       inspect: async () => adapterSnapshot(await codexCliAdapter.getSnapshot()),
       close: () => codexCliAdapter.close(),
-      restore: (restoreOptions) => codexCliAdapter.restore(restoreOptions),
+      restore: (restoreOptions, execution) => codexCliAdapter.restore(restoreOptions, execution),
       start: (startOptions) => codexCliAdapter.start(startOptions),
     },
     'claude-code': connectionOnlyPort(

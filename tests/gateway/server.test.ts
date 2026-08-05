@@ -2,6 +2,12 @@ import { createServer as createNodeServer } from 'node:net'
 import { request as createHttpRequest, ServerResponse } from 'node:http'
 import { readFileSync } from 'node:fs'
 import { EventEmitter } from 'node:events'
+import {
+  brotliCompressSync,
+  deflateSync,
+  gzipSync,
+  zstdCompressSync,
+} from 'node:zlib'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { Account, GatewaySettings, Pool, ProviderDefinition, RequestLog, Route } from '../../src/shared/types'
 import { createCanonicalStreamParser, GatewayServer } from '../../src/main/gateway'
@@ -103,6 +109,36 @@ async function post(port: number, token = 'local-secret', body: Record<string, u
     method: 'POST',
     headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
     body: JSON.stringify({ model: 'source-model', messages: [{ role: 'user', content: 'Hello' }], ...body })
+  })
+}
+
+async function postEncoded(
+  port: number,
+  wireBody: Buffer,
+  contentEncoding: string
+): Promise<{ statusCode?: number; body: string }> {
+  return new Promise((resolve, reject) => {
+    const request = createHttpRequest({
+      host: '127.0.0.1',
+      port,
+      path: '/v1/chat/completions',
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer local-secret',
+        'content-type': 'application/json',
+        'content-encoding': contentEncoding,
+        'content-length': wireBody.byteLength,
+      },
+    }, (response) => {
+      const chunks: Buffer[] = []
+      response.on('data', (chunk) => chunks.push(Buffer.from(chunk)))
+      response.on('end', () => resolve({
+        statusCode: response.statusCode,
+        body: Buffer.concat(chunks).toString('utf8'),
+      }))
+    })
+    request.on('error', reject)
+    request.end(wireBody)
   })
 }
 
@@ -1562,6 +1598,84 @@ describe('GatewayServer', () => {
     expect(upstreamFetch).not.toHaveBeenCalled()
   })
 
+  it('accepts bounded compressed Codex JSON bodies including stacked zstd', async () => {
+    const port = await freePort()
+    const capturedBodies: Array<Record<string, unknown>> = []
+    const upstreamFetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      capturedBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>)
+      return new Response(JSON.stringify({
+        id: 'chatcmpl-compressed',
+        object: 'chat.completion',
+        model: 'source-model',
+        choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    })
+    const gateway = new GatewayServer({
+      config: config(port),
+      credentialResolver: () => 'credential',
+      fetchImplementation: upstreamFetch as typeof fetch,
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const json = Buffer.from(JSON.stringify({
+      model: 'source-model',
+      messages: [{ role: 'user', content: 'compressed hello' }],
+    }))
+    const gzip = gzipSync(json)
+    const variants: Array<[string, Buffer]> = [
+      ['gzip', gzip],
+      ['br', brotliCompressSync(json)],
+      ['deflate', deflateSync(json)],
+      ['zstd', zstdCompressSync(json)],
+      ['gzip, zstd', zstdCompressSync(gzip)],
+    ]
+
+    for (const [encoding, encoded] of variants) {
+      const response = await postEncoded(port, encoded, encoding)
+      expect(response.statusCode, encoding).toBe(200)
+    }
+    expect(capturedBodies).toHaveLength(variants.length)
+    expect(capturedBodies.every((body) => (
+      (body.messages as Array<Record<string, unknown>>)[0]?.content === 'compressed hello'
+    ))).toBe(true)
+  })
+
+  it('rejects unsupported, malformed, and over-expanded encoded JSON before upstream access', async () => {
+    const port = await freePort()
+    const upstreamFetch = vi.fn()
+    const gateway = new GatewayServer({
+      config: config(port),
+      credentialResolver: () => 'credential',
+      fetchImplementation: upstreamFetch as typeof fetch,
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const unsupported = await postEncoded(port, Buffer.from('{}'), 'snappy')
+    expect(unsupported.statusCode).toBe(415)
+    expect(JSON.parse(unsupported.body)).toMatchObject({
+      error: { type: 'unsupported_content_encoding' },
+    })
+
+    const malformed = await postEncoded(port, Buffer.from('not-gzip'), 'gzip')
+    expect(malformed.statusCode).toBe(400)
+    expect(JSON.parse(malformed.body)).toMatchObject({
+      error: { type: 'invalid_content_encoding' },
+    })
+
+    const expanded = gzipSync(Buffer.from(JSON.stringify({
+      model: 'source-model',
+      messages: [{ role: 'user', content: 'x'.repeat(10 * 1024 * 1024) }],
+    })))
+    const oversized = await postEncoded(port, expanded, 'gzip')
+    expect(oversized.statusCode).toBe(413)
+    expect(JSON.parse(oversized.body)).toMatchObject({
+      error: { message: 'Request body exceeds 10 MiB' },
+    })
+    expect(upstreamFetch).not.toHaveBeenCalled()
+  })
+
   it('gives a slow chunked large body a fresh upstream response deadline', async () => {
     const port = await freePort()
     const gatewayConfig = config(port, { requestTimeoutSeconds: 1 })
@@ -2565,6 +2679,18 @@ describe('GatewayServer', () => {
     expect(await unsupportedConversation.text()).toContain('conversation')
     expect(upstreamFetch).not.toHaveBeenCalled()
 
+    const unsupportedInclude = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'deepseek-v4-flash', input: 'Continue', stream: true,
+        include: ['reasoning.encrypted_content', 'file_search_call.results'],
+      }),
+    })
+    expect(unsupportedInclude.status).toBe(422)
+    expect(await unsupportedInclude.text()).toContain('include')
+    expect(upstreamFetch).not.toHaveBeenCalled()
+
     const tools = [{
       type: 'function',
       name: 'memory_lookup',
@@ -2586,6 +2712,7 @@ describe('GatewayServer', () => {
         metadata: { trace: 'ignored-by-deepseek' },
         service_tier: 'auto',
         stream_options: { include_usage: true },
+        include: ['reasoning.encrypted_content'],
         text: { verbosity: 'high' },
         stream: true,
       }),
@@ -2613,6 +2740,7 @@ describe('GatewayServer', () => {
     expect(forwardedBody.metadata).toBeUndefined()
     expect(forwardedBody.service_tier).toBeUndefined()
     expect(forwardedBody.stream_options).toBeUndefined()
+    expect(forwardedBody.include).toBeUndefined()
     expect(forwardedBody.text).toBeUndefined()
     expect(forwardedBody.tools).toEqual([
       tools[0],
@@ -2937,6 +3065,81 @@ describe('GatewayServer', () => {
     expect(seenHeaders[1].get('authorization')).toBe('AgentAssertion recovered')
     expect(seenHeaders[1].get('chatgpt-account-id')).toBe('account-new')
     expect(seenHeaders[1].get('x-openai-fedramp')).toBeNull()
+  })
+
+  it('refreshes one rejected OAuth access token and replays the same account once', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers[0] = {
+      ...gatewayConfig.providers[0],
+      name: 'ChatGPT OAuth',
+      protocol: 'openai-responses'
+    }
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    gatewayConfig.pools[0].maxRetries = 0
+    gatewayConfig.accounts[0] = {
+      ...gatewayConfig.accounts[0],
+      credentialType: 'chatgpt-oauth'
+    }
+    gatewayConfig.accounts[1].status = 'disabled'
+    const seenHeaders: Headers[] = []
+    const seenBodies: string[] = []
+    const completedWire = [
+      'event: response.completed',
+      'data: {"type":"response.completed","response":{"id":"resp_recovered_oauth","status":"completed","output":[]}}',
+      '', ''
+    ].join('\n')
+    const upstreamFetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      seenHeaders.push(new Headers(init?.headers))
+      seenBodies.push(String(init?.body))
+      if (seenHeaders.length === 1) {
+        return new Response(JSON.stringify({ error: { message: 'expired access token' } }), {
+          status: 401,
+          headers: { 'content-type': 'application/json' }
+        })
+      }
+      return new Response(completedWire, {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' }
+      })
+    })
+    const recoverRejectedAccess = vi.fn(async () => ({
+      secret: 'oauth-access-recovered',
+      kind: 'chatgpt-oauth' as const,
+      accountId: 'account-stable'
+    }))
+    const states: Array<{ accountId: string; status: string }> = []
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => ({
+        secret: 'oauth-access-stale',
+        kind: 'chatgpt-oauth',
+        accountId: 'account-stable',
+        recoverRejectedAccess
+      }),
+      fetchImplementation: upstreamFetch as typeof fetch,
+      onAccountState: (state) => states.push(state)
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'source-model', input: 'hello', stream: true })
+    })
+    expect(response.status).toBe(200)
+    await response.text()
+    expect(recoverRejectedAccess).toHaveBeenCalledOnce()
+    expect(recoverRejectedAccess).toHaveBeenCalledWith('oauth-access-stale')
+    expect(seenHeaders).toHaveLength(2)
+    expect(seenHeaders[0].get('authorization')).toBe('Bearer oauth-access-stale')
+    expect(seenHeaders[1].get('authorization')).toBe('Bearer oauth-access-recovered')
+    expect(seenHeaders[0].get('chatgpt-account-id')).toBe('account-stable')
+    expect(seenHeaders[1].get('chatgpt-account-id')).toBe('account-stable')
+    expect(seenBodies[1]).toBe(seenBodies[0])
+    expect(states.some((state) => state.status === 'disabled')).toBe(false)
   })
 
   it('retains Agent Identity as non-sensitive request-log metadata', async () => {
@@ -7746,9 +7949,12 @@ describe('GatewayServer', () => {
         headers: { 'content-type': 'application/json' }
       }))
     let now = Date.now()
+    const recoverRejectedAccess = vi.fn()
     const gateway = new GatewayServer({
       config: gatewayConfig,
-      credentialResolver: () => ({ secret: 'oauth-private', kind: 'chatgpt-oauth', accountId: 'acct-team' }),
+      credentialResolver: () => ({
+        secret: 'oauth-private', kind: 'chatgpt-oauth', accountId: 'acct-team', recoverRejectedAccess
+      }),
       fetchImplementation: upstreamFetch as typeof fetch,
       onAccountState: (state) => states.push(state),
       now: () => now
@@ -7825,6 +8031,7 @@ describe('GatewayServer', () => {
       expect.objectContaining({ type: 'additional_tools' })
     )
     expect(states).not.toContainEqual(expect.objectContaining({ status: 'disabled' }))
+    expect(recoverRejectedAccess).not.toHaveBeenCalled()
     expect(gateway.getStatus()).toMatchObject({ activeRequests: 0, successRequests: 3 })
   })
 
@@ -8360,6 +8567,74 @@ describe('GatewayServer', () => {
       tokenAccountingVersion: 2,
       cachedInputTokens: 30,
       cacheWriteInputTokens: 40
+    })
+  })
+
+  it('keeps scheduling an OpenAI OAuth account after successful responses report 100% usage', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers[0] = {
+      ...gatewayConfig.providers[0], sourceType: 'oauth-system', kind: 'openai', protocol: 'openai-responses'
+    }
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    gatewayConfig.pools[0].maxRetries = 0
+    gatewayConfig.accounts[0] = {
+      ...gatewayConfig.accounts[0], credentialType: 'chatgpt-oauth', chatgptAccountId: 'acct-last-value'
+    }
+    gatewayConfig.accounts[1].status = 'disabled'
+    const states: Array<{ status: string; cooldownReason?: string; codexQuota?: unknown }> = []
+    const completedWire = [
+      'event: response.completed',
+      'data: {"type":"response.completed","response":{"id":"resp_last_value","status":"completed","output":[]}}',
+      '', ''
+    ].join('\n')
+    const upstreamFetch = vi.fn(async () => new Response(completedWire, {
+      status: 200,
+      headers: {
+        'content-type': 'text/event-stream',
+        'x-codex-primary-used-percent': '100',
+        'x-codex-primary-window-minutes': '10080',
+        'x-codex-primary-reset-after-seconds': '604800',
+        'x-codex-secondary-used-percent': '100',
+        'x-codex-secondary-window-minutes': '300',
+        'x-codex-secondary-reset-after-seconds': '18000',
+      },
+    }))
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => ({
+        secret: 'oauth-last-value', kind: 'chatgpt-oauth' as const, accountId: 'acct-last-value'
+      }),
+      fetchImplementation: upstreamFetch as typeof fetch,
+      now: () => timestamp,
+      onAccountState: (state) => states.push(state),
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const request = () => fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'source-model', input: 'Continue', stream: true }),
+    })
+    const first = await request()
+    expect(first.status).toBe(200)
+    await first.text()
+    const second = await request()
+    expect(second.status).toBe(200)
+    await second.text()
+
+    expect(upstreamFetch).toHaveBeenCalledTimes(2)
+    expect(states.some((state) => state.status === 'cooldown')).toBe(false)
+    expect(states.at(-1)).toMatchObject({
+      status: 'active',
+      cooldownReason: undefined,
+      codexQuota: {
+        fiveHour: { usedPercent: 100 },
+        sevenDay: { usedPercent: 100 },
+        source: 'response-headers',
+      },
     })
   })
 
@@ -12255,7 +12530,7 @@ describe('GatewayServer', () => {
     expect(gateway.getStatus().successRequests).toBe(0)
   })
 
-  it('fails over a model-scoped 403 within the request without changing global account health', async () => {
+  it('persists a model-scoped 403 across requests without changing global account health', async () => {
     const port = await freePort()
     const gatewayConfig = config(port)
     gatewayConfig.pools[0].maxRetries = 1
@@ -12293,7 +12568,14 @@ describe('GatewayServer', () => {
     expect(secondResponse.status).toBe(200)
     await secondResponse.text()
 
-    expect(selectedAccounts).toEqual(['first', 'second', 'first', 'second'])
+    expect(selectedAccounts).toEqual(['first', 'second', 'second'])
+    expect(states).toContainEqual(expect.objectContaining({
+      accountId: 'first',
+      status: 'active',
+      modelCooldowns: expect.objectContaining({
+        'source-model': expect.objectContaining({ reason: 'permission', statusCode: 403 }),
+      }),
+    }))
     expect(states).not.toContainEqual(expect.objectContaining({ accountId: 'first', status: 'disabled' }))
     expect(states).not.toContainEqual(expect.objectContaining({ accountId: 'first', status: 'cooldown' }))
   })

@@ -58,6 +58,8 @@ export interface ProviderFailure {
   statusCode?: number
   retryAfterMs?: number
   retryAt?: number
+  /** Limits a failure to this request/model instead of mutating account health. */
+  scope?: 'request' | 'model'
 }
 
 export interface ProviderFailureInput {

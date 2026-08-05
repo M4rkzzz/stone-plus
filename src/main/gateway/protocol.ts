@@ -467,8 +467,32 @@ function validateToolResultContent(
       continue
     }
 
+    const file = from === 'openai-responses'
+      ? type === 'input_file' ? responsesFileToAnthropic(part) : undefined
+      : from === 'anthropic-messages' && type === 'document'
+        ? anthropicDocumentToResponses(part)
+        : undefined
+    if (file) {
+      const targetSupportsFile = (from === 'openai-responses' && to === 'anthropic-messages')
+        || (from === 'anthropic-messages' && to === 'openai-responses')
+      if (!targetSupportsFile) {
+        add(
+          `${path}[${index}]`,
+          'content-part',
+          `Tool-result files have no verified lossless ${to} mapping`
+        )
+      }
+      continue
+    }
+
     if (type === 'input_image' || type === 'image_url' || type === 'image') {
       add(`${path}[${index}]`, 'image-input', 'Tool-result image is missing a usable URL or base64 source')
+    } else if (type === 'input_file' || type === 'document') {
+      add(
+        `${path}[${index}]`,
+        'content-part',
+        'Tool-result file is missing a usable HTTPS/HTTP URL or base64 data URL'
+      )
     } else {
       add(
         `${path}[${index}]`,
@@ -782,6 +806,7 @@ function prepareDeepSeekResponsesSource(
   context: ProtocolConversionContext,
 ): JsonObject {
   const prepared = structuredClone(body)
+  stripDeepSeekOpaqueReasoningInclude(prepared)
   promoteXaiAdditionalTools(prepared)
   promoteDeepSeekToolSearchResults(prepared)
   const namespaces = flattenXaiNamespaceTools(prepared)
@@ -828,15 +853,17 @@ function prepareDeepSeekResponsesSource(
         name: toolSearchWireName,
         description: optionalString(tool.description)
           ?? 'Search the Codex client tool registry. Call this before claiming a requested capability is unavailable.',
-        parameters: objectValue(tool.parameters) ?? {
-          type: 'object',
-          properties: {
-            query: { type: 'string', description: 'Tool name or capability to search for.' },
-            limit: { type: 'number', description: 'Maximum number of matching tools.' },
-          },
-          required: ['query'],
-          additionalProperties: false,
-        },
+        parameters: tool.parameters === undefined
+          ? {
+              type: 'object',
+              properties: {
+                query: { type: 'string', description: 'Tool name or capability to search for.' },
+                limit: { type: 'number', description: 'Maximum number of matching tools.' },
+              },
+              required: ['query'],
+              additionalProperties: false,
+            }
+          : normalizeToolSchema(tool.parameters),
       }
     }
     if (type !== 'function' && type !== 'custom') {
@@ -860,7 +887,12 @@ function prepareDeepSeekResponsesSource(
       wireName: name,
       declared: true,
     })
-    if (type !== 'custom') return tool
+    if (type !== 'custom') {
+      const parameters = normalizeToolSchema(tool.parameters)
+      if (tool.parameters === parameters) return tool
+      rewroteTools = true
+      return { ...tool, parameters }
+    }
     rewroteTools = true
     const description = optionalString(tool.description)
     return {
@@ -890,6 +922,16 @@ function prepareDeepSeekResponsesSource(
   plan.requiresResponseBridge = plan.tools.length > 0
   context.toolBridgePlan = plan
   return rewroteTools || prepared !== body ? { ...prepared, tools } : prepared
+}
+
+function stripDeepSeekOpaqueReasoningInclude(body: JsonObject): void {
+  if (!Array.isArray(body.include)) return
+  // Codex asks OpenAI sources for opaque reasoning continuation state. DeepSeek
+  // has no equivalent, and omitting this output hint does not discard history.
+  const retained = body.include.filter((value) => value !== 'reasoning.encrypted_content')
+  if (retained.length === body.include.length) return
+  if (retained.length > 0) body.include = retained
+  else delete body.include
 }
 
 function promoteDeepSeekToolSearchResults(body: JsonObject): void {
@@ -2666,7 +2708,7 @@ function chatRequestToGemini(body: JsonObject): JsonObject {
     functionDeclarations.push({
       name: stringValue(definition.name),
       description: stringValue(definition.description),
-      parameters: objectValue(definition.parameters) ?? { type: 'object', properties: {} }
+      parameters: normalizeToolSchema(definition.parameters)
     })
   }
   if (functionDeclarations.length > 0) output.tools = [{ functionDeclarations }]
@@ -3394,6 +3436,9 @@ function responsesFunctionOutputToAnthropic(value: unknown): unknown {
         const url = imageUrlValue(item)
         const image = url ? imageUrlToAnthropic(url) : undefined
         if (image) content.push(image)
+      } else if (stringValue(item.type) === 'input_file') {
+        const document = responsesFileToAnthropic(item)
+        if (document) content.push(document)
       } else {
         const text = stringValue(item.text)
         if (text) content.push({ type: 'text', text })
@@ -3412,6 +3457,9 @@ function anthropicToolResultToResponses(value: unknown): unknown {
       if (stringValue(part.type) === 'image') {
         const url = anthropicImageUrl(part)
         if (url) output.push({ type: 'input_image', image_url: url })
+      } else if (stringValue(part.type) === 'document') {
+        const file = anthropicDocumentToResponses(part)
+        if (file) output.push(file)
       } else {
         const text = stringValue(part.text)
         if (text) output.push({ type: 'input_text', text })
@@ -3591,7 +3639,7 @@ function anthropicToolsToChat(value: unknown): JsonObject[] {
       function: omitUndefined({
         name,
         description: optionalString(tool.description),
-        parameters: objectValue(tool.input_schema) ?? { type: 'object', properties: {} },
+        parameters: normalizeToolSchema(tool.input_schema),
         strict: booleanValue(tool.strict)
       })
     })
@@ -3610,7 +3658,7 @@ function responsesToolsToChat(value: unknown): JsonObject[] {
       function: omitUndefined({
         name,
         description: optionalString(tool.description),
-        parameters: objectValue(tool.parameters) ?? { type: 'object', properties: {} },
+        parameters: normalizeToolSchema(tool.parameters),
         strict: booleanValue(tool.strict)
       })
     })
@@ -3631,7 +3679,7 @@ function xaiResponsesToolsToChat(value: unknown, context: ProtocolConversionCont
       tools.push({ type: 'function', function: omitUndefined({
         name: binding.wireName,
         description: optionalString(definition.description),
-        parameters: objectValue(definition.parameters) ?? { type: 'object', properties: {} },
+        parameters: normalizeToolSchema(definition.parameters),
         strict: booleanValue(definition.strict)
       }) })
       continue
@@ -3663,7 +3711,7 @@ function responsesToolsToAnthropic(value: unknown): JsonObject[] {
     tools.push(omitUndefined({
       name,
       description: optionalString(tool.description),
-      input_schema: objectValue(tool.parameters) ?? { type: 'object', properties: {} },
+      input_schema: normalizeToolSchema(tool.parameters),
       strict: booleanValue(tool.strict)
     }))
   }
@@ -3679,7 +3727,7 @@ function anthropicToolsToResponses(value: unknown): JsonObject[] {
       type: 'function',
       name,
       description: optionalString(tool.description),
-      parameters: objectValue(tool.input_schema) ?? { type: 'object', properties: {} },
+      parameters: normalizeToolSchema(tool.input_schema),
       strict: booleanValue(tool.strict)
     }))
   }
@@ -3695,7 +3743,7 @@ function responsesToolsToGeminiDeclarations(value: unknown): JsonObject[] {
     declarations.push({
       name,
       description: stringValue(tool.description),
-      parameters: objectValue(tool.parameters) ?? { type: 'object', properties: {} }
+      parameters: normalizeToolSchema(tool.parameters)
     })
   }
   return declarations
@@ -3711,7 +3759,7 @@ function geminiToolsToResponses(value: unknown): JsonObject[] {
         type: 'function',
         name,
         description: optionalString(declaration.description),
-        parameters: objectValue(declaration.parameters) ?? { type: 'object', properties: {} }
+        parameters: normalizeToolSchema(declaration.parameters)
       }))
     }
   }
@@ -3726,7 +3774,7 @@ function anthropicToolsToGeminiDeclarations(value: unknown): JsonObject[] {
     declarations.push({
       name,
       description: stringValue(tool.description),
-      parameters: objectValue(tool.input_schema) ?? { type: 'object', properties: {} }
+      parameters: normalizeToolSchema(tool.input_schema)
     })
   }
   return declarations
@@ -3741,7 +3789,7 @@ function geminiToolsToAnthropic(value: unknown): JsonObject[] {
       tools.push(omitUndefined({
         name,
         description: optionalString(declaration.description),
-        input_schema: objectValue(declaration.parameters) ?? { type: 'object', properties: {} }
+        input_schema: normalizeToolSchema(declaration.parameters)
       }))
     }
   }
@@ -3758,7 +3806,7 @@ function chatToolsToAnthropic(value: unknown): JsonObject[] {
     tools.push(omitUndefined({
       name,
       description: optionalString(definition.description),
-      input_schema: objectValue(definition.parameters) ?? { type: 'object', properties: {} },
+      input_schema: normalizeToolSchema(definition.parameters),
       strict: booleanValue(definition.strict)
     }))
   }
@@ -3776,7 +3824,7 @@ function chatToolsToResponses(value: unknown): JsonObject[] {
       type: 'function',
       name,
       description: optionalString(definition.description),
-      parameters: objectValue(definition.parameters) ?? { type: 'object', properties: {} },
+      parameters: normalizeToolSchema(definition.parameters),
       strict: booleanValue(definition.strict)
     }))
   }
@@ -3800,7 +3848,7 @@ function xaiChatToolsToResponses(value: unknown, context: ProtocolConversionCont
       type: 'function',
       name: binding.sourceName,
       description: optionalString(definition.description),
-      parameters: objectValue(definition.parameters) ?? { type: 'object', properties: {} },
+      parameters: normalizeToolSchema(definition.parameters),
       strict: booleanValue(definition.strict)
     })
   })
@@ -4201,6 +4249,67 @@ function anthropicImageUrl(block: JsonObject): string | undefined {
   return optionalString(source.url)
 }
 
+function responsesFileToAnthropic(item: JsonObject): JsonObject | undefined {
+  const fileUrl = optionalString(item.file_url ?? item.fileUrl)
+  const fileData = optionalString(item.file_data ?? item.fileData)
+  const fileId = optionalString(item.file_id ?? item.fileId)
+  if (fileId || Number(Boolean(fileUrl)) + Number(Boolean(fileData)) !== 1) return undefined
+
+  const title = optionalString(item.filename)
+  if (fileUrl) {
+    if (!isHttpUrl(fileUrl)) return undefined
+    return omitUndefined({
+      type: 'document',
+      source: { type: 'url', url: fileUrl },
+      title,
+    })
+  }
+
+  const parsed = fileData ? parseBase64DataUrl(fileData) : undefined
+  if (!parsed) return undefined
+  return omitUndefined({
+    type: 'document',
+    source: { type: 'base64', media_type: parsed.mimeType, data: parsed.data },
+    title,
+  })
+}
+
+function anthropicDocumentToResponses(block: JsonObject): JsonObject | undefined {
+  const source = objectValue(block.source)
+  if (!source) return undefined
+  const filename = optionalString(block.title) ?? optionalString(block.filename) ?? 'document.pdf'
+  if (stringValue(source.type) === 'url') {
+    const url = optionalString(source.url)
+    if (!url || !isHttpUrl(url)) return undefined
+    return { type: 'input_file', file_url: url, filename }
+  }
+  if (stringValue(source.type) !== 'base64') return undefined
+  const mimeType = optionalString(source.media_type)
+  const data = optionalString(source.data)?.replace(/[\r\n]/g, '')
+  if (!mimeType || !data || !/^[a-z0-9+/]+={0,2}$/i.test(data)) return undefined
+  return {
+    type: 'input_file',
+    file_data: `data:${mimeType};base64,${data}`,
+    filename,
+  }
+}
+
+function isHttpUrl(value: string): boolean {
+  try {
+    const url = new URL(value)
+    return url.protocol === 'https:' || url.protocol === 'http:'
+  } catch {
+    return false
+  }
+}
+
+function parseBase64DataUrl(value: string): { mimeType: string; data: string } | undefined {
+  const match = /^data:([a-z0-9][a-z0-9.+-]*\/[a-z0-9][a-z0-9.+-]*);base64,([a-z0-9+/=\r\n]+)$/i.exec(value)
+  if (!match) return undefined
+  const data = match[2].replace(/[\r\n]/g, '')
+  return /^[a-z0-9+/]+={0,2}$/i.test(data) ? { mimeType: match[1], data } : undefined
+}
+
 function parseImageDataUrl(url: string): { mimeType: string; data: string } | undefined {
   const match = /^data:(image\/[a-z0-9.+-]+);base64,([a-z0-9+/=\r\n]+)$/i.exec(url)
   return match ? { mimeType: match[1], data: match[2].replace(/[\r\n]/g, '') } : undefined
@@ -4230,7 +4339,7 @@ function geminiToolsToChat(value: unknown): JsonObject[] {
       tools.push({ type: 'function', function: {
         name: stringValue(declaration.name),
         description: stringValue(declaration.description),
-        parameters: objectValue(declaration.parameters) ?? { type: 'object', properties: {} }
+        parameters: normalizeToolSchema(declaration.parameters)
       } })
     }
   }
@@ -4412,6 +4521,13 @@ function omitUndefined(value: JsonObject): JsonObject {
 
 function objectValue(value: unknown): JsonObject | undefined {
   return value !== null && typeof value === 'object' && !Array.isArray(value) ? value as JsonObject : undefined
+}
+
+function normalizeToolSchema(value: unknown): JsonObject {
+  const schema = objectValue(value)
+  if (!schema) return { type: 'object', properties: {} }
+  if (schema.type === 'object') return schema
+  return { ...schema, type: 'object' }
 }
 
 function arrayValue(value: unknown): unknown[] {

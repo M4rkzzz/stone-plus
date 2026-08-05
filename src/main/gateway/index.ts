@@ -43,6 +43,7 @@ export type {
   GatewayRuntimeStateHandler,
   GatewayRuntimeStateUpdate,
   GatewayServerOptions,
+  PersistedGrokVideoBinding,
   ProtocolRequest,
   ProtocolConversionContext,
   ProtocolConversionDialect,

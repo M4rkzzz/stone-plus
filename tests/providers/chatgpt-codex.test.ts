@@ -4,11 +4,16 @@ import {
   applyChatGptCodexSearchHeaders,
   CHATGPT_CODEX_MODELS_URL,
   CHATGPT_CODEX_RESPONSES_URL,
+  CHATGPT_CODEX_RESET_CREDITS_URL,
   CHATGPT_CODEX_SEARCH_URL,
   CHATGPT_CODEX_USAGE_URL,
   CODEX_CLIENT_VERSION,
+  ChatGptCodexEndpointError,
+  ChatGptCredentialRefreshError,
   checkChatGptAccountAuthorized,
+  classifyChatGptCredentialRefreshFailure,
   classifyChatGptCodexFailure,
+  extractCodexQuotaFromUsagePayload,
   isChatGptCodexResponsesLiteBody,
   probeChatGptAccount,
   queryChatGptCodexModels,
@@ -158,6 +163,24 @@ describe('ChatGPT Codex provider path', () => {
     expect(JSON.stringify(refreshed)).not.toContain('refresh-private')
   })
 
+  it('classifies a rejected refresh token as explicit reauthorization without leaking the response', async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+      error: `invalid ${bundle.refreshToken} for ${bundle.accountId}`,
+    }), { status: 401, headers: { 'content-type': 'application/json' } }))
+
+    const error = await refreshChatGptCredential(bundle, fetchMock as typeof fetch).catch((caught: unknown) => caught)
+
+    expect(error).toBeInstanceOf(ChatGptCredentialRefreshError)
+    expect((error as ChatGptCredentialRefreshError).code).toBe('reauthorization-required')
+    expect(classifyChatGptCredentialRefreshFailure(error)).toMatchObject({
+      category: 'authentication',
+      accountAction: 'disable',
+      statusCode: 401,
+    })
+    expect(String(error)).not.toContain(bundle.refreshToken)
+    expect(String(error)).not.toContain(bundle.accountId)
+  })
+
   it('cancels an oversized chunked OAuth refresh response before buffering it', async () => {
     let cancelled = false
     const body = new ReadableStream<Uint8Array>({
@@ -195,6 +218,35 @@ describe('ChatGPT Codex provider path', () => {
     expect(results.map((result) => result.bundle.accessToken)).toEqual(['singleflight-access', 'singleflight-access'])
     expect(persistFirst).toHaveBeenCalledOnce()
     expect(persistSecond).not.toHaveBeenCalled()
+  })
+
+  it('force-refreshes a usable access token when another OAuth artifact needs renewal', async () => {
+    const now = Date.now()
+    const usable = { ...bundle, accountId: 'acct-force-refresh', expiresAt: now + 60 * 60_000 }
+    const serialized = serializeChatGptCredential(usable)
+    const persist = vi.fn(async () => undefined)
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+      access_token: 'forced-access',
+      refresh_token: 'forced-refresh',
+      id_token: 'forced-id',
+      expires_in: 3600,
+    }), { status: 200 }))
+
+    const refreshed = await resolveChatGptCredential(
+      serialized,
+      persist,
+      fetchMock as typeof fetch,
+      now,
+      { refreshKey: 'local-account-force-refresh', forceRefresh: true },
+    )
+
+    expect(refreshed.bundle).toMatchObject({
+      accessToken: 'forced-access',
+      refreshToken: 'forced-refresh',
+      idToken: 'forced-id',
+    })
+    expect(fetchMock).toHaveBeenCalledOnce()
+    expect(persist).toHaveBeenCalledWith(refreshed.serialized, serialized)
   })
 
   it('does not join refresh flights from different source credentials on the same account', async () => {
@@ -322,6 +374,16 @@ describe('ChatGPT Codex provider path', () => {
     expect(classifyChatGptCodexFailure(429, { 'retry-after': '2' }, 1_000)).toMatchObject({
       category: 'rate_limit', accountAction: 'cooldown', retryAfterMs: 2_000, retryAt: 3_000
     })
+    expect(classifyChatGptCodexFailure(503, undefined, 1_000, {
+      error: { code: 'server_is_overloaded' }
+    })).toMatchObject({
+      category: 'upstream', accountAction: 'none', retryable: true, scope: 'request'
+    })
+    expect(classifyChatGptCodexFailure(429, undefined, 1_000, {
+      error: { type: 'slow_down' }
+    })).toMatchObject({
+      category: 'upstream', accountAction: 'none', retryable: true, scope: 'request'
+    })
   })
 
   it('queries WHAM usage with scoped OAuth headers and returns detached quota only', async () => {
@@ -383,6 +445,62 @@ describe('ChatGPT Codex provider path', () => {
     expect(JSON.stringify(result)).not.toContain('response-account-private')
   })
 
+  it('keeps detached reset-credit metadata even when no rate window is present', () => {
+    const expiresAt = '2026-07-13T00:00:00.000Z'
+    expect(extractCodexQuotaFromUsagePayload({
+      rate_limit_reset_credits: {
+        available_count: 2,
+        credits: [
+          { id: 'private-credit-id', status: 'available', reset_type: 'codex_rate_limits', expires_at: expiresAt },
+          { id: 'used-credit-id', status: 'used', reset_type: 'codex_rate_limits' },
+        ],
+      },
+    }, quotaNow)).toEqual({
+      resetCredits: { availableCount: 2, expiresAt: [Date.parse(expiresAt)] },
+      observedAt: quotaNow,
+      source: 'usage-endpoint',
+    })
+  })
+
+  it('accepts the supported app-server reset-credit casing and Unix timestamps', () => {
+    const expirySeconds = Math.floor(Date.parse('2026-07-14T00:00:00.000Z') / 1_000)
+    expect(extractCodexQuotaFromUsagePayload({
+      rateLimitResetCredits: {
+        availableCount: 3,
+        credits: [
+          { status: 'available', resetType: 'codexRateLimits', expiresAt: expirySeconds },
+        ],
+      },
+    }, quotaNow)?.resetCredits).toEqual({
+      availableCount: 3,
+      expiresAt: [expirySeconds * 1_000],
+    })
+  })
+
+  it('fetches reset-credit expiry details only when the usage summary reports available credits', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        rate_limit: {
+          primary_window: { used_percent: 1, limit_window_seconds: 18_000 },
+        },
+        rate_limit_reset_credits: { available_count: 1 },
+      }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        data: [{ status: 'available', reset_type: 'codex_rate_limits', expires_at: '2026-07-13T00:00:00.000Z' }],
+      }), { status: 200 }))
+
+    const result = await queryChatGptCodexQuota(bundle, fetchMock as typeof fetch, undefined, quotaNow)
+
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      CHATGPT_CODEX_USAGE_URL,
+      CHATGPT_CODEX_RESET_CREDITS_URL,
+    ])
+    expect(result.quota.resetCredits).toEqual({
+      availableCount: 1,
+      expiresAt: [Date.parse('2026-07-13T00:00:00.000Z')],
+    })
+  })
+
   it.each([
     [401, 'ChatGPT session access token was rejected.'],
     [403, 'ChatGPT account is not permitted to read Codex usage.'],
@@ -397,7 +515,8 @@ describe('ChatGPT Codex provider path', () => {
     const error = await queryChatGptCodexQuota(bundle, fetchMock as typeof fetch, undefined, quotaNow)
       .catch((caught: unknown) => caught)
 
-    expect(error).toBeInstanceOf(Error)
+    expect(error).toBeInstanceOf(ChatGptCodexEndpointError)
+    expect((error as ChatGptCodexEndpointError).statusCode).toBe(status)
     expect((error as Error).message).toBe(expectedMessage)
     expect((error as Error).message).not.toContain(bundle.accessToken)
     expect((error as Error).message).not.toContain(bundle.refreshToken)

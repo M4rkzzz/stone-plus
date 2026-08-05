@@ -438,7 +438,7 @@ describe('provider discovery and health probes', () => {
       fetchImplementation: vi.fn(async () => new Response(payload, { status: 200 })) as typeof fetch,
     })
 
-    expect(official).toMatchObject({ ok: true, models: ['deepseek-v4-flash'] })
+    expect(official).toMatchObject({ ok: true, models: ['deepseek-v4-flash', 'deepseek-v4-pro'] })
     expect(relay).toMatchObject({ ok: true, models: ['deepseek-v4-flash', 'deepseek-v4-pro'] })
   })
 
@@ -814,6 +814,18 @@ describe('provider failure classification', () => {
       now
     })
     expect(failure).toMatchObject({ retryAfterMs: 7_000, retryAt: now + 7_000 })
+  })
+
+  it('caps hostile far-future Retry-After values', () => {
+    const now = Date.parse('2026-07-12T00:00:00.000Z')
+    expect(openAIAdapter.classifyFailure({
+      statusCode: 429,
+      headers: { 'retry-after': '999999999' },
+      now,
+    })).toMatchObject({
+      retryAfterMs: 7 * 24 * 60 * 60_000,
+      retryAt: now + 7 * 24 * 60 * 60_000,
+    })
   })
 
   it('disables accounts after 401 responses', () => {

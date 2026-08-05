@@ -816,6 +816,53 @@ describe('AppStore', () => {
     expect(restarted.getSnapshot().pools[0].strategy).toBe('autobalanced')
   })
 
+  it('preserves omitted reasoning policy fields and clears explicitly empty ones', async () => {
+    const store = createStore()
+    await store.initialize()
+    const withAccount = await store.saveAccount({
+      providerId: 'provider-openai',
+      name: 'Reasoning policy key',
+      credential: 'sk-reasoning-policy',
+      priority: 1,
+      weight: 1,
+      maxConcurrency: 1,
+      modelAllowlist: [],
+    })
+    const base = {
+      name: 'Reasoning policy pool',
+      protocol: 'openai-responses' as const,
+      strategy: 'priority' as const,
+      accountIds: [withAccount.accounts[0].id],
+      stickySessions: true,
+      stickyTtlMinutes: 30,
+      maxRetries: 1,
+    }
+    const created = await store.savePool({
+      ...base,
+      reasoningEffortMap: { medium: 'high' },
+      reasoningEffortCap: 'xhigh',
+    })
+    const pool = created.pools.find((candidate) => candidate.name === base.name)!
+
+    const preserved = await store.savePool({ ...base, id: pool.id, name: 'Reasoning policy preserved' })
+    expect(preserved.pools.find((candidate) => candidate.id === pool.id)).toMatchObject({
+      reasoningEffortMap: { medium: 'high' },
+      reasoningEffortCap: 'xhigh',
+    })
+
+    const cleared = await store.savePool({
+      ...base,
+      id: pool.id,
+      name: 'Reasoning policy cleared',
+      reasoningEffortMap: undefined,
+      reasoningEffortCap: undefined,
+    })
+    expect(cleared.pools.find((candidate) => candidate.id === pool.id)).toMatchObject({
+      reasoningEffortMap: undefined,
+      reasoningEffortCap: undefined,
+    })
+  })
+
   it('enforces standard pool strategy, sticky TTL, and retry bounds at the write boundary', async () => {
     const store = createStore()
     await store.initialize()
@@ -1412,13 +1459,13 @@ describe('AppStore', () => {
 
     await store.getStateRepository().mutate((state) => {
       const provider = state.providers.find((candidate) => candidate.id === saved.source.providerId)!
-      provider.models = ['deepseek-v4-pro']
-      provider.modelCatalog = [{ id: 'deepseek-v4-pro' }]
+      provider.models = ['deepseek-v5-preview']
+      provider.modelCatalog = [{ id: 'deepseek-v5-preview' }]
       const account = state.accounts.find((candidate) => candidate.id === saved.source.accountId)!
-      account.availableModels = ['deepseek-v4-pro']
+      account.availableModels = ['deepseek-v5-preview']
       account.modelsRefreshedAt = Date.now()
       account.modelPolicy = 'selected'
-      account.modelAllowlist = ['deepseek-v4-pro']
+      account.modelAllowlist = ['deepseek-v5-preview']
     }, ['providers', 'accounts'])
 
     const snapshot = store.getSnapshot()

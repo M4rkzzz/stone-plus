@@ -156,6 +156,48 @@ describe('ClientInstanceManager', () => {
     await manager.stop(instance.id)
   })
 
+  it('does not let ambient xAI credentials or model overrides bypass a managed Grok Build route', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'stone-client-instance-grok-env-'))
+    directories.push(root)
+    const executable = join(root, 'grok.exe')
+    const configDirectory = join(root, 'config')
+    await writeFile(executable, '')
+    const spawn = vi.fn(() => new FakeProcess())
+    const manager = new ClientInstanceManager({
+      store: new MemoryMetadata(),
+      processAdapter: { spawn },
+      inspectProcess: async () => undefined,
+      baseEnvironment: {
+        KEEP_ME: 'yes',
+        XAI_API_KEY: 'ambient-secret',
+        grok_default_model: 'ambient-model',
+        GROK_HOME: 'ambient-home',
+        GROK_BIN_DIR: 'C:\\tools\\grok',
+      },
+      resolveBinding: () => ({
+        env: { OPENAI_BASE_URL: 'http://127.0.0.1:15721/grokbuild/v1', OPENAI_API_KEY: 'stone-token' },
+      }),
+    })
+    manager.initialize()
+    const [instance] = await manager.save({
+      name: 'Grok Build', client: 'grokbuild', configDirectory, executablePath: executable,
+    })
+
+    await manager.start(instance.id)
+
+    const environment = spawn.mock.calls[0][2].env
+    expect(environment).toMatchObject({
+      KEEP_ME: 'yes',
+      GROK_HOME: configDirectory,
+      GROK_BIN_DIR: 'C:\\tools\\grok',
+      OPENAI_BASE_URL: 'http://127.0.0.1:15721/grokbuild/v1',
+      OPENAI_API_KEY: 'stone-token',
+    })
+    expect(environment).not.toHaveProperty('XAI_API_KEY')
+    expect(environment).not.toHaveProperty('grok_default_model')
+    await manager.stop(instance.id)
+  })
+
   it('sanitizes stale non-Claude model arguments at the managed process boundary', async () => {
     const root = await mkdtemp(join(tmpdir(), 'stone-client-instance-claude-args-'))
     directories.push(root)

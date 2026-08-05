@@ -126,7 +126,7 @@ describe('agent lifecycle control summary', () => {
 
   it('explicitly starts a stopped client after the user chooses repair and start', () => {
     const appSource = readFileSync(new URL('../../src/renderer/src/App.tsx', import.meta.url), 'utf8')
-    expect(appSource).toContain('api.restoreAgent(target, { ensureRunning: true })')
+    expect(appSource).toContain('api.restoreAgent(target, { ensureRunning: true }, operationId)')
     expect(appSource).not.toContain('api.restoreAgent(target, { preserveRunningState: false })')
   })
 
@@ -140,6 +140,18 @@ describe('agent lifecycle control summary', () => {
     expect(appSource).toContain('onRequestRefresh={refreshAgentLifecycle}')
     expect(clientsSource).toContain('shouldAcceptSnapshotRevision(agentLifecycleRevision.current, next.revision)')
     expect(clientsSource).toContain('operationGate.current.run')
+  })
+
+  it('shows real repair progress and exposes safe cancellation', () => {
+    const appSource = readFileSync(new URL('../../src/renderer/src/App.tsx', import.meta.url), 'utf8')
+    const controlSource = readFileSync(new URL('../../src/renderer/src/agent-lifecycle-control.tsx', import.meta.url), 'utf8')
+    const styles = readFileSync(new URL('../../src/renderer/src/agent-lifecycle-control.css', import.meta.url), 'utf8')
+
+    expect(appSource).toContain('api.onAgentLifecycleProgress')
+    expect(appSource).toContain('api.cancelAgentLifecycleOperation(operationId)')
+    expect(controlSource).toContain('<AgentRepairProgress')
+    expect(controlSource).toContain("t('安全取消', 'Cancel safely')")
+    expect(styles).toContain('.agent-lifecycle__progress-track')
   })
 
   it('surfaces the most actionable state across agents', () => {
@@ -156,6 +168,22 @@ describe('agent lifecycle control summary', () => {
 
   it('does not disguise a sole failure as partial success', () => {
     expect(summarizeAgentLifecycle([agent()], operation('failed'))).toBe('failed')
+  })
+
+  it('does not leave the control in an error state after a safely cancelled repair', () => {
+    const cancelled = operation('failed')
+    const result = {
+      target: 'codex-desktop',
+      status: 'failed',
+      phases: ['repair-sessions'],
+      wasRunning: true,
+      runningAfter: true,
+      changed: false,
+      pendingNewSession: false,
+      error: { code: 'cancelled', message: 'cancelled', retryable: true, phase: 'repair-sessions' },
+    } as const
+    expect(summarizeAgentLifecycle([agent()], { ...cancelled, results: [result] })).toBe('ready')
+    expect(agentOutcomeLabel(result, 'restore', zh)).toBe('已安全取消并回滚')
   })
 
   it('keeps an active repair visible until it completes', () => {

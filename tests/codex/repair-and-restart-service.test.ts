@@ -397,15 +397,69 @@ describe('CodexRepairAndRestartService', () => {
     const repair = repairService()
     const desktop = desktopController()
     const beforeRepair = vi.fn(async () => undefined)
+    const beforeRelaunch = vi.fn(async () => undefined)
     const service = new CodexRepairAndRestartService(repair.value, desktop.value)
 
-    const result = await service.run({ targetProvider: 'openai', beforeRepair })
+    const result = await service.run({ targetProvider: 'openai', beforeRepair, beforeRelaunch })
 
     expect(repair.analyzeAndRepair).toHaveBeenCalledWith('openai')
     expect(result.repair.targetProvider).toBe('openai')
     expect(desktop.shutdown.mock.invocationCallOrder[0]).toBeLessThan(beforeRepair.mock.invocationCallOrder[0])
     expect(beforeRepair.mock.invocationCallOrder[0]).toBeLessThan(repair.analyzeAndRepair.mock.invocationCallOrder[0])
-    expect(repair.analyzeAndRepair.mock.invocationCallOrder[0]).toBeLessThan(desktop.relaunch.mock.invocationCallOrder[0])
+    expect(repair.analyzeAndRepair.mock.invocationCallOrder[0]).toBeLessThan(beforeRelaunch.mock.invocationCallOrder[0])
+    expect(beforeRelaunch.mock.invocationCallOrder[0]).toBeLessThan(desktop.relaunch.mock.invocationCallOrder[0])
+  })
+
+  it('skips the history scan when the caller proves sessions are already on the target provider', async () => {
+    const repair = repairService()
+    const desktop = desktopController()
+    const beforeRepair = vi.fn(async () => undefined)
+    const beforeRelaunch = vi.fn(async () => undefined)
+    const service = new CodexRepairAndRestartService(repair.value, desktop.value)
+
+    const result = await service.run({
+      targetProvider: 'openai',
+      skipSessionRepair: true,
+      beforeRepair,
+      beforeRelaunch,
+    })
+
+    expect(repair.analyze).not.toHaveBeenCalled()
+    expect(repair.analyzeAndRepair).not.toHaveBeenCalled()
+    expect(result.repair).toMatchObject({
+      targetProvider: 'openai',
+      repairedRolloutFiles: 0,
+      sqliteProviderRowsUpdated: 0,
+    })
+    expect(desktop.shutdown.mock.invocationCallOrder[0]).toBeLessThan(beforeRepair.mock.invocationCallOrder[0])
+    expect(beforeRepair.mock.invocationCallOrder[0]).toBeLessThan(beforeRelaunch.mock.invocationCallOrder[0])
+    expect(beforeRelaunch.mock.invocationCallOrder[0]).toBeLessThan(desktop.relaunch.mock.invocationCallOrder[0])
+  })
+
+  it('passes the startup-index scope to the provider repair transaction', async () => {
+    const repair = repairService()
+    const desktop = desktopController()
+    const service = new CodexRepairAndRestartService(repair.value, desktop.value)
+
+    await service.run({
+      targetProvider: 'openai',
+      sessionRepairScope: 'startup-index',
+    })
+
+    expect(repair.analyzeAndRepair).toHaveBeenCalledWith('openai', undefined, expect.objectContaining({
+      scope: 'startup-index',
+    }))
+  })
+
+  it('rejects a scan skip without an explicit target before closing Codex', async () => {
+    const repair = repairService()
+    const desktop = desktopController()
+    const service = new CodexRepairAndRestartService(repair.value, desktop.value)
+
+    await expect(service.run({ skipSessionRepair: true })).rejects.toThrow('explicit target provider')
+
+    expect(desktop.shutdown).not.toHaveBeenCalled()
+    expect(repair.analyzeAndRepair).not.toHaveBeenCalled()
   })
 
   it('validates the reviewed revision before shutdown and repairs the stable post-shutdown revision', async () => {
@@ -467,6 +521,52 @@ describe('CodexRepairAndRestartService', () => {
 
     await expect(service.run()).rejects.toThrow('repair failed')
     expect(desktop.relaunch).toHaveBeenCalledOnce()
+  })
+
+  it('rolls back completed preparation before reopening when session synchronization fails', async () => {
+    const repair = repairService()
+    repair.repair.mockRejectedValueOnce(new Error('session sync failed'))
+    const desktop = desktopController()
+    const beforeRepair = vi.fn(async () => undefined)
+    const rollbackBeforeRepair = vi.fn(async () => undefined)
+    const service = new CodexRepairAndRestartService(repair.value, desktop.value)
+
+    await expect(service.run({ beforeRepair, rollbackBeforeRepair })).rejects.toThrow('session sync failed')
+
+    expect(beforeRepair).toHaveBeenCalledOnce()
+    expect(rollbackBeforeRepair).toHaveBeenCalledOnce()
+    expect(rollbackBeforeRepair.mock.invocationCallOrder[0]).toBeLessThan(desktop.relaunch.mock.invocationCallOrder[0])
+  })
+
+  it('keeps a completed provider sync when only the verified relaunch fails', async () => {
+    const repair = repairService()
+    const desktop = desktopController()
+    desktop.relaunch.mockRejectedValueOnce(new Error('launch failed'))
+    const rollbackBeforeRepair = vi.fn(async () => undefined)
+    const service = new CodexRepairAndRestartService(repair.value, desktop.value)
+
+    await expect(service.run({
+      beforeRepair: async () => undefined,
+      rollbackBeforeRepair,
+    })).rejects.toThrow('会话修复已完成，但桌面端未能重新启动')
+
+    expect(rollbackBeforeRepair).not.toHaveBeenCalled()
+  })
+
+  it('reopens the last usable configuration but still reports a pre-relaunch reconciliation failure', async () => {
+    const repair = repairService()
+    const desktop = desktopController()
+    const rollbackBeforeRepair = vi.fn(async () => undefined)
+    const service = new CodexRepairAndRestartService(repair.value, desktop.value)
+
+    await expect(service.run({
+      beforeRepair: async () => undefined,
+      rollbackBeforeRepair,
+      beforeRelaunch: async () => { throw new Error('final token synchronization failed') },
+    })).rejects.toThrow('final token synchronization failed')
+
+    expect(desktop.relaunch).toHaveBeenCalledOnce()
+    expect(rollbackBeforeRepair).not.toHaveBeenCalled()
   })
 
   it('does not duplicate a desktop launch after repair when the verified relaunch already failed', async () => {

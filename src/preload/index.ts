@@ -34,6 +34,7 @@ const stone: GatewayApi = {
   setAccountTags: (input) => ipcRenderer.invoke('stone:set-account-tags', input),
   refreshAccountModels: (id) => ipcRenderer.invoke('stone:refresh-account-models', id),
   openChatGptWebLogin: (id) => ipcRenderer.invoke('stone:open-chatgpt-web-login', id),
+  openChatGptCodexApp: (id) => ipcRenderer.invoke('stone:open-chatgpt-codex-app', id),
   testAccountModel: (accountId, model) => ipcRenderer.invoke('stone:test-account-model', accountId, model),
   importChatGptAccounts: (input) => ipcRenderer.invoke('stone:import-chatgpt-accounts', input),
   importGrokAccounts: (input) => ipcRenderer.invoke('stone:import-grok-accounts', input),
@@ -178,11 +179,20 @@ const stone: GatewayApi = {
   getAgentLifecycleSnapshot: () => ipcRenderer.invoke('stone:get-agent-lifecycle-snapshot'),
   installAgent: (target, channel) => ipcRenderer.invoke('stone:install-agent', target, channel),
   closeAgent: (target) => ipcRenderer.invoke('stone:close-agent', target),
-  restoreAgent: (target, options) => ipcRenderer.invoke('stone:restore-agent', target, options),
-  restartAgent: (target) => ipcRenderer.invoke('stone:restart-agent', target),
+  restoreAgent: (target, options, operationId) => operationId === undefined
+    ? ipcRenderer.invoke('stone:restore-agent', target, options)
+    : ipcRenderer.invoke('stone:restore-agent', target, options, operationId),
+  restartAgent: (target, operationId) => operationId === undefined
+    ? ipcRenderer.invoke('stone:restart-agent', target)
+    : ipcRenderer.invoke('stone:restart-agent', target, operationId),
   startAgent: (target, options) => ipcRenderer.invoke('stone:start-agent', target, options),
-  smartRepairAgent: (target) => ipcRenderer.invoke('stone:smart-repair-agent', target),
-  repairAllAffectedAgents: () => ipcRenderer.invoke('stone:repair-all-affected-agents'),
+  smartRepairAgent: (target, operationId) => operationId === undefined
+    ? ipcRenderer.invoke('stone:smart-repair-agent', target)
+    : ipcRenderer.invoke('stone:smart-repair-agent', target, operationId),
+  repairAllAffectedAgents: (operationId) => operationId === undefined
+    ? ipcRenderer.invoke('stone:repair-all-affected-agents')
+    : ipcRenderer.invoke('stone:repair-all-affected-agents', operationId),
+  cancelAgentLifecycleOperation: (operationId) => ipcRenderer.invoke('stone:cancel-agent-lifecycle-operation', operationId),
   closeAllManagedAgents: () => ipcRenderer.invoke('stone:close-all-managed-agents'),
   restoreClaudeDesktopOfficialMode: () => ipcRenderer.invoke('stone:restore-claude-desktop-official-mode'),
   previewCodexSessionIndexCleanup: () => ipcRenderer.invoke('stone:preview-codex-session-index-cleanup'),
@@ -224,6 +234,11 @@ const stone: GatewayApi = {
     const handler = (_event: Electron.IpcRendererEvent, update: Parameters<typeof listener>[0]) => listener(update)
     ipcRenderer.on('stone:agent-lifecycle-changed', handler)
     return () => ipcRenderer.removeListener('stone:agent-lifecycle-changed', handler)
+  },
+  onAgentLifecycleProgress: (listener) => {
+    const handler = (_event: Electron.IpcRendererEvent, progress: Parameters<typeof listener>[0]) => listener(progress)
+    ipcRenderer.on('stone:agent-lifecycle-progress', handler)
+    return () => ipcRenderer.removeListener('stone:agent-lifecycle-progress', handler)
   },
   onCodexSessionRepairProgress: (listener) => {
     const handler = (_event: Electron.IpcRendererEvent, progress: Parameters<typeof listener>[0]) => listener(progress)

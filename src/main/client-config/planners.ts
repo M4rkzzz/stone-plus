@@ -3,12 +3,13 @@ import { normalizeCodexModelRepairPolicy } from '@shared/codex-model-repair'
 import { CLAUDE_RELAY_MODEL_ENV_KEYS, isClaudeClientModelName } from './claude-environment'
 import { planGrokBuildToml } from './grok-build-toml'
 import { mutateJsonObject, objectField, type JsonObject, type TextMutation } from './json-format'
-import { parseCodexToml, planCodexOfficialLoginToml, planCodexToml, repairCodexToml } from './toml-format'
+import { parseCodexToml, patchCodexTomlTopLevel, planCodexOfficialLoginToml, planCodexToml, repairCodexToml } from './toml-format'
 import type {
   ClientConfigFilePath,
   ClientConfigPlan,
   ClientConfigRepairPlan,
   ClientConnectionTarget,
+  CodexOfficialAccountCredential,
   ExistingClientConfig,
   PlannedFileMutation,
   ResolvedClientConfigPaths,
@@ -130,6 +131,19 @@ export function planCodexConfig(
     deepSeekCatalog ? paths.modelCatalog.path : undefined,
   )
   const auth = mutateJsonObject(authSource, 'codex-auth', (root) => {
+    // Codex Desktop can inspect the cached ChatGPT token bundle even when
+    // auth_mode is switched back to API-key mode. Leaving both credential
+    // families in auth.json makes the selected identity startup-order
+    // dependent and can keep a previous official/third-party login alive.
+    // Stone+ owns these authentication fields while connected, so converge to
+    // one unambiguous API-key state. The transaction layer backs up the exact
+    // original auth.json before this mutation, and unrelated extension fields
+    // remain untouched.
+    delete root.tokens
+    delete root.last_refresh
+    delete root.agent_identity
+    delete root.personal_access_token
+    delete root.bedrock_api_key
     root.auth_mode = 'apikey'
     root.OPENAI_API_KEY = desired.token
   })
@@ -143,7 +157,15 @@ export function planCodexConfig(
         'features.remote_compaction_v2',
         'model_providers.stone',
       ]),
-      mutation(paths.auth, authSource, auth, ['auth_mode', 'OPENAI_API_KEY']),
+      mutation(paths.auth, authSource, auth, [
+        'auth_mode',
+        'OPENAI_API_KEY',
+        'tokens',
+        'last_refresh',
+        'agent_identity',
+        'personal_access_token',
+        'bedrock_api_key',
+      ]),
       ...(catalogContent === undefined ? [] : [mutation(
         paths.modelCatalog,
         catalogSource,
@@ -172,6 +194,7 @@ export function planCodexOfficialLoginConfig(
   const files: PlannedFileMutation[] = [mutation(paths.config, configSource, config, [
     'model_provider',
     'cli_auth_credentials_store',
+    'model_context_window (Stone-managed DeepSeek value only)',
     'features.remote_compaction_v2',
     'model_providers.stone',
   ])]
@@ -193,6 +216,91 @@ export function planCodexOfficialLoginConfig(
   }
 
   return { client: 'codex', files }
+}
+
+/**
+ * Switch the default Codex installation to one exact Stone+ ChatGPT OAuth
+ * account. File-backed auth is pinned deliberately: otherwise an OS keyring
+ * entry can silently win over the selected auth.json account.
+ */
+export function planCodexOfficialAccountConfig(
+  paths: ResolvedClientConfigPaths['codex'],
+  existing: ExistingClientConfig,
+  credential: CodexOfficialAccountCredential,
+): ClientConfigPlan {
+  const accessToken = credential.accessToken.trim()
+  const refreshToken = credential.refreshToken.trim()
+  const idToken = credential.idToken.trim()
+  const accountId = credential.accountId.trim()
+  if (!accessToken || !refreshToken || !idToken || !accountId) {
+    throw new ClientConfigValidationError('A complete renewable ChatGPT OAuth credential is required')
+  }
+  if (!Number.isFinite(credential.lastRefreshAt) || credential.lastRefreshAt <= 0) {
+    throw new ClientConfigValidationError('The ChatGPT OAuth refresh timestamp is invalid')
+  }
+  const availableModels = credential.availableModels === undefined
+    ? undefined
+    : [...new Set(credential.availableModels.map((model) => model.trim()).filter(Boolean))]
+  if (credential.availableModels !== undefined && !availableModels?.length) {
+    throw new ClientConfigValidationError('The official Codex model catalog is empty')
+  }
+
+  const configSource = existing['codex-config']
+  const authSource = existing['codex-auth']
+  const officialConfig = planCodexOfficialLoginToml(configSource)
+  const officialRoot = parseCodexToml(officialConfig.content)
+  const configPatches: Record<string, string | null> = {
+    cli_auth_credentials_store: 'file',
+  }
+  if (availableModels) {
+    const allowed = new Set(availableModels)
+    for (const key of ['model', 'review_model'] as const) {
+      const selected = typeof officialRoot[key] === 'string' ? officialRoot[key].trim() : ''
+      if (selected && !allowed.has(selected)) configPatches[key] = null
+    }
+  }
+  const pinnedConfig = patchCodexTomlTopLevel(officialConfig.content, configPatches)
+  const config = {
+    content: pinnedConfig.content,
+    changed: pinnedConfig.content !== configSource,
+  }
+  const auth = mutateJsonObject(authSource, 'codex-auth', (root) => {
+    delete root.OPENAI_API_KEY
+    delete root.agent_identity
+    delete root.personal_access_token
+    delete root.bedrock_api_key
+    root.auth_mode = 'chatgpt'
+    root.last_refresh = new Date(credential.lastRefreshAt).toISOString()
+    root.tokens = {
+      id_token: idToken,
+      access_token: accessToken,
+      refresh_token: refreshToken,
+      account_id: accountId,
+    }
+  })
+
+  return {
+    client: 'codex',
+    files: [
+      mutation(paths.config, configSource, config, [
+        'model_provider',
+        'cli_auth_credentials_store',
+        'model/review_model (only when absent from the selected account catalog)',
+        'model_context_window (Stone-managed DeepSeek value only)',
+        'features.remote_compaction_v2',
+        'model_providers.stone',
+      ]),
+      mutation(paths.auth, authSource, auth, [
+        'auth_mode',
+        'last_refresh',
+        'tokens',
+        'OPENAI_API_KEY',
+        'agent_identity',
+        'personal_access_token',
+        'bedrock_api_key',
+      ]),
+    ],
+  }
 }
 
 export function planGeminiConfig(

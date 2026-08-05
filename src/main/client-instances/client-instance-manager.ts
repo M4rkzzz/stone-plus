@@ -1051,7 +1051,18 @@ function configDirectoryEnvironment(client: RouteClient, directory: string): Nod
 }
 
 function clientBaseEnvironment(client: RouteClient, environment: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  return client === 'claude' ? withoutClaudeRelayModelEnvironment(environment) : { ...environment }
+  if (client === 'claude') return withoutClaudeRelayModelEnvironment(environment)
+  if (client === 'grokbuild') return withoutGrokOverrideEnvironment(environment)
+  return { ...environment }
+}
+
+function withoutGrokOverrideEnvironment(environment: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const sanitized = { ...environment }
+  for (const key of Object.keys(sanitized)) {
+    const normalized = key.toUpperCase()
+    if (normalized === 'XAI_API_KEY' || normalized === 'GROK_DEFAULT_MODEL') delete sanitized[key]
+  }
+  return sanitized
 }
 
 async function assertDirectory(path: string, label: string): Promise<void> {

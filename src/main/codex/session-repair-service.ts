@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { copyFile, mkdir, open, readFile, readdir, rm, stat, utimes, writeFile } from 'node:fs/promises'
+import { chmod, copyFile, link, mkdir, open, readFile, readdir, rename, rm, stat, statfs, utimes, writeFile, type FileHandle } from 'node:fs/promises'
 import { basename, dirname, extname, join, relative, resolve, sep } from 'node:path'
 import { backup, DatabaseSync } from 'node:sqlite'
 import { parse } from 'smol-toml'
@@ -16,6 +16,7 @@ import {
 } from '@shared/codex-model-repair'
 import { atomicWriteFile } from '../client-config/filesystem'
 import { acquireCodexSessionMaintenanceLock } from './session-maintenance-lock'
+import { codexStateDatabasePaths } from './state-database-paths'
 
 const DEFAULT_PROVIDER = 'openai'
 const BACKUP_KEEP_COUNT = 5
@@ -29,12 +30,23 @@ const GLOBAL_STATE_FILE = '.codex-global-state.json'
 const MODEL_CACHE_FILE = 'models_cache.json'
 const DEFAULT_SCAN_CONCURRENCY = 8
 const DEFAULT_MAX_ROLLOUT_FILES = 20_000
+const BACKUP_STAGING_PREFIX = '.stone-session-repair-'
+const BACKUP_STAGING_SUFFIX = '.partial'
+const MINIMUM_REWRITE_SPACE_MARGIN_BYTES = 512 * 1024 * 1024
+const HARD_LINK_FALLBACK_CODES = new Set(['EPERM', 'EACCES', 'EXDEV', 'EMLINK', 'ENOSYS', 'ENOTSUP', 'EOPNOTSUPP', 'EINVAL'])
 
 export interface CodexSessionRepairOperationOptions {
   signal?: AbortSignal
   onProgress?: (progress: { stage: 'discover' | 'scan' | 'verify' | 'backup' | 'apply'; completed: number; total?: number }) => void
   /** Repairs only clearly foreign/upstream models persisted by another switcher. */
   modelRepair?: CodexModelRepairPolicy
+  /**
+   * `startup-index` updates the small SQLite runtime index and model cache but
+   * deliberately leaves rollout history and global workspace state untouched.
+   * It is intended for latency-sensitive provider activation; complete
+   * history convergence remains the default/manual maintenance operation.
+   */
+  scope?: 'complete' | 'startup-index'
 }
 
 interface RolloutReadHandle {
@@ -57,6 +69,8 @@ interface RolloutPlan {
   path: string
   relativePath: string
   archived: boolean
+  originalSize: number
+  originalMode: number
   originalHash: string
   nextHash?: string
   originalAtimeMs: number
@@ -68,6 +82,19 @@ interface RolloutPlan {
   encryptedContent: boolean
   sessionMetaCount: number
   rewriteNeeded: boolean
+  rewrites: RolloutRewrite[]
+  writeMode?: 'in-place' | 'replace'
+}
+
+interface RolloutRewrite {
+  /** Inclusive byte offset in the original rollout. */
+  start: number
+  /** Exclusive byte offset in the original rollout. */
+  end: number
+  /** Exact bytes replaced by this patch, used for rollback and durable journal recovery. */
+  original: Buffer
+  /** Complete replacement bytes, including the original line ending. */
+  replacement: Buffer
 }
 
 interface DatabaseThreadChange {
@@ -118,6 +145,12 @@ interface RepairPlan {
   modelCache?: ModelCachePlan
   skippedFiles: string[]
   revision: string
+}
+
+interface BackupCreationResult {
+  path: string
+  copiedRollouts: Set<string>
+  patchRollouts: Set<string>
 }
 
 export class CodexSessionRepairService {
@@ -219,7 +252,8 @@ export class CodexSessionRepairService {
       if (changedGlobalState) await this.assertGlobalStateUnchanged(changedGlobalState)
       if (changedModelCache) await this.assertModelCacheUnchanged(changedModelCache)
       throwIfCancelled(options.signal)
-      const backupPath = await this.createBackup(plan, changedRollouts, changedDatabases, changedGlobalState, changedModelCache, options)
+      const backup = await this.createBackup(plan, changedRollouts, changedDatabases, changedGlobalState, changedModelCache, options)
+      const backupPath = backup.path
       const writtenRollouts: RolloutPlan[] = []
       const writtenDatabases: DatabasePlan[] = []
       let writtenGlobalState: GlobalStatePlan | undefined
@@ -228,18 +262,35 @@ export class CodexSessionRepairService {
         const totalChanges = changedRollouts.length + changedDatabases.length + (changedGlobalState ? 1 : 0) + (changedModelCache ? 1 : 0)
         for (const rollout of changedRollouts) {
           throwIfCancelled(options.signal)
-          const backupBytes = await readFile(join(backupPath, 'rollouts', rollout.relativePath))
-          const currentBytes = await readFile(rollout.path)
-          if (!currentBytes.equals(backupBytes)) {
+          if (await fastRolloutFingerprint(rollout.path) !== rollout.originalHash) {
             throw new Error(`会话文件在备份后发生变化，未覆盖新内容：${rollout.relativePath}`)
           }
-          const rewritten = rewriteRollout(decodeUtf8(currentBytes, rollout.relativePath), plan.targetProvider)
-          rollout.nextHash = rewritten.nextHash
-          await atomicWriteFile(rollout.path, rewritten.nextText, this.randomId)
-          // Register the completed content replacement before restoring metadata.
-          // If utimes fails, rollback must still restore the bytes that were
-          // already committed by atomicWriteFile.
-          writtenRollouts.push(rollout)
+          if (backup.patchRollouts.has(rollout.relativePath)) {
+            // The durable journal is already fsynced inside the published backup.
+            // Register before the first in-place byte so any partial write is
+            // included in the normal rollback path.
+            rollout.writeMode = 'in-place'
+            writtenRollouts.push(rollout)
+            await applyRolloutPatchesInPlace(rollout, options.signal)
+          } else {
+            // Hard-link snapshots share the verified old inode until the atomic
+            // replacement below. A copy fallback is independent and therefore
+            // receives one final byte-for-byte race check.
+            if (backup.copiedRollouts.has(rollout.relativePath)
+              && !await filesEqual(rollout.path, join(backupPath, 'rollouts', rollout.relativePath))) {
+              throw new Error(`会话文件在备份后发生变化，未覆盖新内容：${rollout.relativePath}`)
+            }
+            rollout.nextHash = await rewriteRolloutAtomically(
+              join(backupPath, 'rollouts', rollout.relativePath),
+              rollout,
+              this.randomId,
+              options.signal,
+            )
+            rollout.writeMode = 'replace'
+            // Register the completed content replacement before restoring
+            // metadata. If utimes fails, rollback must restore the old inode.
+            writtenRollouts.push(rollout)
+          }
           await this.preserveMtime(rollout)
           options.onProgress?.({ stage: 'apply', completed: writtenRollouts.length, total: totalChanges })
         }
@@ -267,11 +318,18 @@ export class CodexSessionRepairService {
           writtenGlobalState = changedGlobalState
           options.onProgress?.({ stage: 'apply', completed: totalChanges, total: totalChanges })
         }
+        await this.markBackupComplete(backupPath)
       } catch (error) {
         const rollbackFailures = await this.rollback(writtenRollouts, writtenDatabases, writtenGlobalState, invalidatedModelCache, backupPath)
-        const suffix = rollbackFailures.length
-          ? `；部分自动回滚失败，请从备份目录恢复：${backupPath}`
-          : `；已自动回滚，备份保留在：${backupPath}`
+        let suffix: string
+        if (rollbackFailures.length) {
+          suffix = `；部分自动回滚失败，请从备份目录恢复：${backupPath}`
+        } else {
+          const removed = await rm(backupPath, { recursive: true, force: true }).then(() => true, () => false)
+          suffix = removed
+            ? '；已自动回滚，失败操作的临时备份已清理。'
+            : `；已自动回滚，但临时备份清理失败，可手动删除：${backupPath}`
+        }
         throw new Error(`会话修复未完成：${messageOf(error)}${suffix}`)
       }
       let retentionWarning: string | undefined
@@ -292,7 +350,9 @@ export class CodexSessionRepairService {
     const currentProvider = knownCurrentProvider ?? await this.readCurrentProvider()
     const skippedFiles: string[] = []
     options.onProgress?.({ stage: 'discover', completed: 0 })
-    const rolloutPaths = await this.findRolloutFiles(options.signal)
+    const rolloutPaths = options.scope === 'startup-index'
+      ? []
+      : await this.findRolloutFiles(options.signal)
     options.onProgress?.({ stage: 'discover', completed: rolloutPaths.length, total: rolloutPaths.length })
     let scanned = 0
     const rollouts = (await mapConcurrent(rolloutPaths, this.scanConcurrency, async (path) => {
@@ -312,7 +372,9 @@ export class CodexSessionRepairService {
     }, options.signal)).filter((item): item is RolloutPlan => item !== undefined)
 
     throwIfCancelled(options.signal)
-    const globalState = await this.readGlobalStatePlan()
+    const globalState = options.scope === 'startup-index'
+      ? undefined
+      : await this.readGlobalStatePlan()
     const modelCache = options.modelRepair ? await this.readModelCachePlan() : undefined
     const projectlessThreadIds = this.projectlessThreadIds(globalState)
     const userEventThreadIds = new Set(rollouts
@@ -403,14 +465,15 @@ export class CodexSessionRepairService {
     let hasUserEvent = false
     let encryptedContent = false
     let sessionMetaCount = 0
-    let rewriteNeeded = false
+    const rewrites: RolloutRewrite[] = []
     const providers: string[] = []
     let metadataEnd: number | undefined
     let firstLine = true
-    const inspectLine = (bytes: Buffer, lineEnd: number) => {
+    const inspectLine = (bytes: Buffer, lineStart: number, lineEnd: number, lineEnding: '\r\n' | '\n' | '') => {
       const withoutCr = bytes.at(-1) === 0x0d ? bytes.subarray(0, -1) : bytes
       const rawLine = withoutCr.toString('utf8')
       const line = firstLine && rawLine.charCodeAt(0) === 0xfeff ? rawLine.slice(1) : rawLine
+      const bom = firstLine && rawLine.charCodeAt(0) === 0xfeff ? '\ufeff' : ''
       firstLine = false
       if (line.includes('"user_message"') || line.includes('"user_input"')) hasUserEvent = true
       if (line.includes('"encrypted_content"')) encryptedContent = true
@@ -424,7 +487,36 @@ export class CodexSessionRepairService {
         if (!cwd && typeof payload.cwd === 'string') cwd = normalizeWorkspacePath(payload.cwd)
         const originalProvider = typeof payload.model_provider === 'string' ? payload.model_provider : ''
         if (originalProvider) providers.push(originalProvider)
-        if (originalProvider !== targetProvider) rewriteNeeded = true
+        if (originalProvider !== targetProvider) {
+          payload.model_provider = targetProvider
+          const original = lineEnding
+            ? Buffer.concat([bytes, Buffer.from('\n')], bytes.length + 1)
+            : Buffer.from(bytes)
+          let replacement = Buffer.from(bom + JSON.stringify(record) + lineEnding)
+          // A Windows path is semantically identical with forward slashes, but
+          // needs half as many JSON escape bytes. Use that harmless canonical
+          // form only when it lets the provider patch remain exactly the same
+          // byte length and avoid rewriting the multi-gigabyte rollout tail.
+          if (replacement.length > original.length && typeof payload.cwd === 'string' && isWindowsWorkspacePath(payload.cwd)) {
+            payload.cwd = payload.cwd.replaceAll('\\', '/')
+            replacement = Buffer.from(bom + JSON.stringify(record) + lineEnding)
+          }
+          if (replacement.length <= original.length) {
+            const lineEndingBytes = Buffer.from(lineEnding)
+            const jsonBytes = Buffer.from(bom + JSON.stringify(record))
+            replacement = Buffer.concat([
+              jsonBytes,
+              Buffer.alloc(original.length - jsonBytes.length - lineEndingBytes.length, 0x20),
+              lineEndingBytes,
+            ], original.length)
+          }
+          rewrites.push({
+            start: lineStart,
+            end: lineEnd,
+            original,
+            replacement,
+          })
+        }
         metadataEnd ??= lineEnd
       } catch {
         // Non-JSON diagnostic lines remain untouched and do not extend the scan.
@@ -464,7 +556,13 @@ export class CodexSessionRepairService {
           const line = pendingParts.length
             ? Buffer.concat([...pendingParts, segment], pendingBytes + segment.length)
             : segment
-          inspectLine(line, position + offset + 1)
+          const lineEnd = position + offset + 1
+          inspectLine(
+            line,
+            lineEnd - line.length - 1,
+            lineEnd,
+            line.at(-1) === 0x0d ? '\r\n' : '\n',
+          )
           pendingParts = []
           pendingBytes = 0
           segmentStart = offset + 1
@@ -479,7 +577,7 @@ export class CodexSessionRepairService {
       // Parse an unterminated final line only at physical EOF. A line cut by the
       // hard byte budget is deliberately classified as unrecognized metadata.
       if (position >= info.size && pendingBytes > 0) {
-        inspectLine(Buffer.concat(pendingParts, pendingBytes), position)
+        inspectLine(Buffer.concat(pendingParts, pendingBytes), position - pendingBytes, position, '')
       }
     } finally {
       await handle.close()
@@ -489,6 +587,8 @@ export class CodexSessionRepairService {
       path,
       relativePath,
       archived: relativePath.startsWith(`archived_sessions${sep}`),
+      originalSize: info.size,
+      originalMode: info.mode,
       originalHash: rolloutFingerprint(info.size, info.mtimeMs, prefix.subarray(0, prefixBytes)),
       originalAtimeMs: info.atimeMs,
       originalMtimeMs: info.mtimeMs,
@@ -498,12 +598,19 @@ export class CodexSessionRepairService {
       hasUserEvent,
       encryptedContent,
       sessionMetaCount,
-      rewriteNeeded,
+      rewriteNeeded: rewrites.length > 0,
+      rewrites,
     }
   }
 
   private async findSessionDatabases(): Promise<string[]> {
-    const candidates = [join(this.codexHome, 'state_5.sqlite')]
+    let configText = ''
+    try {
+      configText = await readFile(join(this.codexHome, 'config.toml'), 'utf8')
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    }
+    const candidates = codexStateDatabasePaths(this.codexHome, configText)
     try {
       for (const entry of await readdir(join(this.codexHome, 'sqlite'), { withFileTypes: true })) {
         if (entry.isFile() && SQLITE_EXTENSIONS.has(extname(entry.name).toLowerCase())) {
@@ -534,7 +641,7 @@ export class CodexSessionRepairService {
       if (!database.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'threads' LIMIT 1").get()) return undefined
       const columns = tableColumns(database, 'threads')
       if (!columns.has('id') || !columns.has('model_provider')) {
-        return { path, relativePath: safeRelative(this.codexHome, path), threadCount: 0, providerIds: [], columns, changes: [] }
+        return { path, relativePath: databaseBackupRelativePath(this.codexHome, path), threadCount: 0, providerIds: [], columns, changes: [] }
       }
       const hasUserColumn = columns.has('has_user_event')
       const hasCwdColumn = columns.has('cwd')
@@ -575,7 +682,7 @@ export class CodexSessionRepairService {
       }
       return {
         path,
-        relativePath: safeRelative(this.codexHome, path),
+        relativePath: databaseBackupRelativePath(this.codexHome, path),
         threadCount: rows.length,
         providerIds: [...providerIds].sort(),
         columns,
@@ -679,27 +786,70 @@ export class CodexSessionRepairService {
     globalState?: GlobalStatePlan,
     modelCache?: ModelCachePlan,
     options: CodexSessionRepairOperationOptions = {},
-  ): Promise<string> {
+  ): Promise<BackupCreationResult> {
     const backupRoot = join(this.codexHome, 'backups_state', 'stone-session-repair')
-    const backupPath = join(backupRoot, `${timestampName(this.now())}-${this.randomId()}`)
+    const backupName = `${timestampName(this.now())}-${this.randomId()}`
+    const backupPath = join(backupRoot, backupName)
+    const stagingPath = join(backupRoot, `${BACKUP_STAGING_PREFIX}${backupName}${BACKUP_STAGING_SUFFIX}`)
     const total = rollouts.length + databases.length + (globalState ? 1 : 0) + (modelCache ? 1 : 0)
+    const copiedRollouts = new Set<string>()
+    const patchRollouts = new Set<string>()
+    let hardLinkedRollouts = 0
     let completed = 0
     options.onProgress?.({ stage: 'backup', completed, total })
     try {
       throwIfCancelled(options.signal)
       await mkdir(backupRoot, { recursive: true })
-      await mkdir(backupPath, { recursive: false })
-      await mapConcurrent(rollouts, this.scanConcurrency, async (rollout) => {
+      await this.cleanupAbandonedBackupStaging(backupRoot)
+      await this.ensureRewriteCapacity(backupRoot, rollouts, databases, globalState, modelCache)
+      await mkdir(stagingPath, { recursive: false })
+      const journalledRollouts = rollouts.filter(canPatchRolloutInPlace)
+      if (journalledRollouts.length) {
+        const journalPath = join(stagingPath, 'rollout-patches.jsonl')
+        const journal = await open(journalPath, 'wx', 0o600)
+        let closed = false
+        try {
+          for (const rollout of journalledRollouts) {
+            throwIfCancelled(options.signal)
+            await journal.writeFile(JSON.stringify({
+              version: 1,
+              relativePath: rollout.relativePath,
+              originalSize: rollout.originalSize,
+              originalHash: rollout.originalHash,
+              originalAtimeMs: rollout.originalAtimeMs,
+              originalMtimeMs: rollout.originalMtimeMs,
+              rewrites: rollout.rewrites.map((rewrite) => ({
+                start: rewrite.start,
+                end: rewrite.end,
+                originalBase64: rewrite.original.toString('base64'),
+                replacementSha256: sha256(rewrite.replacement),
+              })),
+            }) + '\n', 'utf8')
+            patchRollouts.add(rollout.relativePath)
+            completed += 1
+            options.onProgress?.({ stage: 'backup', completed, total })
+          }
+          await journal.sync()
+          await journal.close()
+          closed = true
+        } catch (error) {
+          if (!closed) await journal.close().catch(() => undefined)
+          throw error
+        }
+      }
+      await mapConcurrent(rollouts.filter((rollout) => !canPatchRolloutInPlace(rollout)), this.scanConcurrency, async (rollout) => {
         throwIfCancelled(options.signal)
-        const destination = join(backupPath, 'rollouts', rollout.relativePath)
+        const destination = join(stagingPath, 'rollouts', rollout.relativePath)
         await mkdir(dirname(destination), { recursive: true })
-        await copyFile(rollout.path, destination)
+        const mode = await snapshotRolloutFile(rollout.path, destination)
+        if (mode === 'hardlink') hardLinkedRollouts += 1
+        else copiedRollouts.add(rollout.relativePath)
         completed += 1
         options.onProgress?.({ stage: 'backup', completed, total })
       }, options.signal)
       for (const databasePlan of databases) {
         throwIfCancelled(options.signal)
-        const destination = join(backupPath, 'db', databasePlan.relativePath)
+        const destination = join(stagingPath, 'db', databasePlan.relativePath)
         await mkdir(dirname(destination), { recursive: true })
         const database = new DatabaseSync(databasePlan.path, { readOnly: true })
         try {
@@ -712,32 +862,33 @@ export class CodexSessionRepairService {
       }
       for (const name of ['config.toml']) {
         try {
-          await copyFile(join(this.codexHome, name), join(backupPath, name))
+          await copyFile(join(this.codexHome, name), join(stagingPath, name))
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
         }
       }
       if (globalState) {
         throwIfCancelled(options.signal)
-        await writeFile(join(backupPath, GLOBAL_STATE_FILE), globalState.originalBytes, { mode: 0o600 })
+        await writeFile(join(stagingPath, GLOBAL_STATE_FILE), globalState.originalBytes, { mode: 0o600 })
         completed += 1
         options.onProgress?.({ stage: 'backup', completed, total })
       } else {
         try {
-          await copyFile(join(this.codexHome, GLOBAL_STATE_FILE), join(backupPath, GLOBAL_STATE_FILE))
+          await copyFile(join(this.codexHome, GLOBAL_STATE_FILE), join(stagingPath, GLOBAL_STATE_FILE))
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
         }
       }
       if (modelCache) {
         throwIfCancelled(options.signal)
-        await writeFile(join(backupPath, MODEL_CACHE_FILE), modelCache.originalBytes, { mode: 0o600 })
+        await writeFile(join(stagingPath, MODEL_CACHE_FILE), modelCache.originalBytes, { mode: 0o600 })
         completed += 1
         options.onProgress?.({ stage: 'backup', completed, total })
       }
-      await writeFile(join(backupPath, 'metadata.json'), JSON.stringify({
-        version: 1,
+      await writeFileDurable(join(stagingPath, 'metadata.json'), JSON.stringify({
+        version: 3,
         managedBy: BACKUP_MARKER,
+        status: 'prepared',
         createdAt: this.now().toISOString(),
         codexHome: this.codexHome,
         targetProvider: plan.targetProvider,
@@ -747,12 +898,67 @@ export class CodexSessionRepairService {
         changedGlobalStateFields: globalState?.changedFields ?? [],
         conflictingGlobalStateFields: globalState?.conflictingFields ?? [],
         invalidatedModelCache: Boolean(modelCache),
-      }, null, 2), { encoding: 'utf8', mode: 0o600 })
-      return backupPath
+        rolloutBackupStrategy: {
+          patchJournalFiles: patchRollouts.size,
+          hardLinkedFiles: hardLinkedRollouts,
+          copiedFiles: copiedRollouts.size,
+        },
+      }, null, 2))
+      await rename(stagingPath, backupPath)
+      return { path: backupPath, copiedRollouts, patchRollouts }
     } catch (error) {
-      await rm(backupPath, { recursive: true, force: true }).catch(() => undefined)
+      await rm(stagingPath, { recursive: true, force: true }).catch(() => undefined)
       throw error
     }
+  }
+
+  private async cleanupAbandonedBackupStaging(backupRoot: string): Promise<void> {
+    for (const entry of await readdir(backupRoot, { withFileTypes: true })) {
+      if (!entry.isDirectory()
+        || !entry.name.startsWith(BACKUP_STAGING_PREFIX)
+        || !entry.name.endsWith(BACKUP_STAGING_SUFFIX)) continue
+      await rm(join(backupRoot, entry.name), { recursive: true, force: true })
+    }
+  }
+
+  private async ensureRewriteCapacity(
+    backupRoot: string,
+    rollouts: RolloutPlan[],
+    databases: DatabasePlan[],
+    globalState?: GlobalStatePlan,
+    modelCache?: ModelCachePlan,
+  ): Promise<void> {
+    const rewriteBytes = rollouts
+      .filter((rollout) => !canPatchRolloutInPlace(rollout))
+      .reduce((sum, rollout) => sum + rollout.originalSize, 0)
+    const patchJournalBytes = rollouts
+      .filter(canPatchRolloutInPlace)
+      .reduce((sum, rollout) => sum + rollout.rewrites.reduce((patchSum, rewrite) => patchSum + rewrite.original.length, 0), 0)
+    const databaseBytes = (await Promise.all(databases.map(async (database) => (await stat(database.path)).size)))
+      .reduce((sum, size) => sum + size, 0)
+    // Patch journals are base64 JSON, so reserve a conservative 2x envelope.
+    const requiredBytes = rewriteBytes + patchJournalBytes * 2 + databaseBytes
+      + (globalState?.originalBytes.length ?? 0)
+      + (modelCache?.originalBytes.length ?? 0)
+    if (!requiredBytes) return
+    const margin = Math.max(MINIMUM_REWRITE_SPACE_MARGIN_BYTES, Math.ceil(requiredBytes * 0.05))
+    let available = await availableFilesystemBytes(backupRoot)
+    if (available === undefined || available >= requiredBytes + margin) return
+
+    const managed = await this.managedBackups(backupRoot)
+    managed.sort((left, right) => right.createdAt - left.createdAt || right.path.localeCompare(left.path))
+    // Always retain the newest complete restore point. Older managed backups
+    // may be reclaimed before any live session bytes are changed.
+    const reclaimable = managed.slice(1).sort((left, right) => left.createdAt - right.createdAt || left.path.localeCompare(right.path))
+    for (const backup of reclaimable) {
+      await rm(backup.path, { recursive: true, force: true })
+      available = await availableFilesystemBytes(backupRoot)
+      if (available === undefined || available >= requiredBytes + margin) return
+    }
+    throw new Error(
+      `Codex 会话修复所需磁盘空间不足：至少需要 ${formatBytes(requiredBytes + margin)}，当前可用 ${formatBytes(available)}。`
+      + ' Stone+ 已保留最近一次完整恢复点，请释放系统盘空间后重试。',
+    )
   }
 
   private applyDatabasePlan(plan: DatabasePlan): void {
@@ -860,6 +1066,11 @@ export class CodexSessionRepairService {
     }
     for (const rollout of [...rollouts].reverse()) {
       try {
+        if (rollout.writeMode === 'in-place') {
+          await rollbackRolloutPatchesInPlace(rollout)
+          await this.preserveMtime(rollout)
+          continue
+        }
         const currentHash = await sha256File(rollout.path)
         if (!rollout.nextHash || currentHash !== rollout.nextHash) {
           failures.push(rollout.path)
@@ -874,6 +1085,22 @@ export class CodexSessionRepairService {
 
   private async pruneBackups(preservePath: string): Promise<void> {
     const root = dirname(preservePath)
+    const managed = await this.managedBackups(root)
+    managed.sort((left, right) => (
+      left.path === preservePath ? -1
+        : right.path === preservePath ? 1
+          : right.createdAt - left.createdAt || right.path.localeCompare(left.path)
+    ))
+    for (const item of managed.slice(BACKUP_KEEP_COUNT)) await rm(item.path, { recursive: true, force: true })
+  }
+
+  private async markBackupComplete(backupPath: string): Promise<void> {
+    const metadataPath = join(backupPath, 'metadata.json')
+    const metadata = JSON.parse(await readFile(metadataPath, 'utf8')) as Record<string, unknown>
+    await atomicWriteFile(metadataPath, JSON.stringify({ ...metadata, status: 'complete' }, null, 2), this.randomId)
+  }
+
+  private async managedBackups(root: string): Promise<Array<{ path: string; createdAt: number }>> {
     const managed: Array<{ path: string; createdAt: number }> = []
     for (const entry of await readdir(root, { withFileTypes: true })) {
       if (!entry.isDirectory()) continue
@@ -881,15 +1108,11 @@ export class CodexSessionRepairService {
       try {
         const metadata = JSON.parse(await readFile(join(path, 'metadata.json'), 'utf8')) as Record<string, unknown>
         if (metadata.managedBy !== BACKUP_MARKER) continue
+        if (metadata.status !== undefined && metadata.status !== 'complete') continue
         managed.push({ path, createdAt: Date.parse(String(metadata.createdAt)) || 0 })
       } catch { /* Unrecognized directories are never removed. */ }
     }
-    managed.sort((left, right) => (
-      left.path === preservePath ? -1
-        : right.path === preservePath ? 1
-          : right.createdAt - left.createdAt || right.path.localeCompare(left.path)
-    ))
-    for (const item of managed.slice(BACKUP_KEEP_COUNT)) await rm(item.path, { recursive: true, force: true })
+    return managed
   }
 
   private preserveMtime(rollout: RolloutPlan): Promise<void> {
@@ -994,37 +1217,241 @@ function revisionFor(
   }))
 }
 
-function rewriteRollout(originalText: string, targetProvider: string): { nextText: string; nextHash: string } {
-  const output: string[] = []
-  let offset = 0
-  while (offset < originalText.length) {
-    const newlineAt = originalText.indexOf('\n', offset)
-    const end = newlineAt >= 0 ? newlineAt + 1 : originalText.length
-    const segment = originalText.slice(offset, end)
-    const lineEnding = segment.endsWith('\r\n') ? '\r\n' : segment.endsWith('\n') ? '\n' : ''
-    const line = lineEnding ? segment.slice(0, -lineEnding.length) : segment
-    const bom = offset === 0 && line.charCodeAt(0) === 0xfeff ? '\ufeff' : ''
-    const jsonLine = bom ? line.slice(1) : line
-    let nextLine = line
-    if (jsonLine.includes('"session_meta"')) {
-      try {
-        const record = JSON.parse(jsonLine) as Record<string, unknown>
-        if (record.type === 'session_meta' && record.payload && typeof record.payload === 'object' && !Array.isArray(record.payload)) {
-          const payload = record.payload as Record<string, unknown>
-          if (payload.model_provider !== targetProvider) {
-            payload.model_provider = targetProvider
-            nextLine = bom + JSON.stringify(record)
-          }
-        }
-      } catch {
-        // Preserve non-JSON diagnostic lines byte-for-byte.
+function canPatchRolloutInPlace(rollout: RolloutPlan): boolean {
+  return rollout.rewrites.length > 0 && rollout.rewrites.every((rewrite) => (
+    rewrite.start >= 0
+    && rewrite.end > rewrite.start
+    && rewrite.end - rewrite.start === rewrite.original.length
+    && rewrite.replacement.length === rewrite.original.length
+  ))
+}
+
+async function applyRolloutPatchesInPlace(rollout: RolloutPlan, signal?: AbortSignal): Promise<void> {
+  assertValidRolloutRewrites(rollout)
+  const handle = await open(rollout.path, 'r+')
+  try {
+    const info = await handle.stat()
+    if (info.size !== rollout.originalSize) {
+      throw new Error(`会话文件大小已发生变化，未覆盖新内容：${rollout.relativePath}`)
+    }
+    // Verify every range before making the first write. A failure therefore
+    // never leaves an avoidable partially patched file.
+    for (const rewrite of rollout.rewrites) {
+      throwIfCancelled(signal)
+      const current = await readExact(handle, rewrite.start, rewrite.original.length)
+      if (!current.equals(rewrite.original)) {
+        throw new Error(`会话元数据在修复前发生变化，未覆盖新内容：${rollout.relativePath}`)
       }
     }
-    output.push(nextLine, lineEnding)
-    offset = end
+    for (const rewrite of rollout.rewrites) {
+      throwIfCancelled(signal)
+      await writeAt(handle, rewrite.replacement, rewrite.start)
+    }
+    await handle.sync()
+  } finally {
+    await handle.close()
   }
-  const nextText = output.join('')
-  return { nextText, nextHash: sha256(nextText) }
+}
+
+async function rollbackRolloutPatchesInPlace(rollout: RolloutPlan): Promise<void> {
+  assertValidRolloutRewrites(rollout)
+  const handle = await open(rollout.path, 'r+')
+  let changed = false
+  try {
+    const info = await handle.stat()
+    if (info.size !== rollout.originalSize) throw new Error('rollout size changed during rollback')
+    for (const rewrite of rollout.rewrites) {
+      const current = await readExact(handle, rewrite.start, rewrite.original.length)
+      if (current.equals(rewrite.original)) continue
+      if (!current.equals(rewrite.replacement)) throw new Error('rollout patch changed after repair')
+      await writeAt(handle, rewrite.original, rewrite.start)
+      changed = true
+    }
+    if (changed) await handle.sync()
+  } finally {
+    await handle.close()
+  }
+}
+
+async function rewriteRolloutAtomically(
+  sourcePath: string,
+  rollout: RolloutPlan,
+  randomId: () => string,
+  signal?: AbortSignal,
+): Promise<string> {
+  assertValidRolloutRewrites(rollout)
+  const directory = dirname(rollout.path)
+  const temporaryPath = join(directory, `.${basename(rollout.path)}.${process.pid}.${randomId()}.tmp`)
+  const source = await open(sourcePath, 'r')
+  let destination: FileHandle | undefined
+  let sourceClosed = false
+  let destinationClosed = false
+  try {
+    const info = await source.stat()
+    if (info.size !== rollout.originalSize) throw new Error(`会话备份大小不匹配：${rollout.relativePath}`)
+    destination = await open(temporaryPath, 'wx', 0o600)
+    const hash = createHash('sha256')
+    const buffer = Buffer.allocUnsafe(1024 * 1024)
+    let sourcePosition = 0
+    let destinationPosition = 0
+    for (const rewrite of rollout.rewrites) {
+      throwIfCancelled(signal)
+      destinationPosition = await copyRange(
+        source,
+        destination,
+        sourcePosition,
+        rewrite.start,
+        destinationPosition,
+        hash,
+        buffer,
+        signal,
+      )
+      const original = await readExact(source, rewrite.start, rewrite.original.length)
+      if (!original.equals(rewrite.original)) throw new Error(`会话备份内容不匹配：${rollout.relativePath}`)
+      await writeAt(destination, rewrite.replacement, destinationPosition)
+      hash.update(rewrite.replacement)
+      destinationPosition += rewrite.replacement.length
+      sourcePosition = rewrite.end
+    }
+    await copyRange(
+      source,
+      destination,
+      sourcePosition,
+      rollout.originalSize,
+      destinationPosition,
+      hash,
+      buffer,
+      signal,
+    )
+    const nextHash = hash.digest('hex')
+    await destination.sync()
+    await destination.close()
+    destinationClosed = true
+    await source.close()
+    sourceClosed = true
+    if (process.platform !== 'win32') await chmod(temporaryPath, rollout.originalMode & 0o777)
+    throwIfCancelled(signal)
+    if (await fastRolloutFingerprint(rollout.path) !== rollout.originalHash) {
+      throw new Error(`会话文件在生成替换内容期间发生变化，未覆盖新内容：${rollout.relativePath}`)
+    }
+    await rename(temporaryPath, rollout.path)
+    return nextHash
+  } catch (error) {
+    if (!destinationClosed) await destination?.close().catch(() => undefined)
+    if (!sourceClosed) await source.close().catch(() => undefined)
+    await rm(temporaryPath, { force: true }).catch(() => undefined)
+    throw error
+  }
+}
+
+function assertValidRolloutRewrites(rollout: RolloutPlan): void {
+  let previousEnd = 0
+  for (const rewrite of rollout.rewrites) {
+    if (rewrite.start < previousEnd
+      || rewrite.start < 0
+      || rewrite.end <= rewrite.start
+      || rewrite.end > rollout.originalSize
+      || rewrite.end - rewrite.start !== rewrite.original.length) {
+      throw new Error(`会话修复补丁范围无效：${rollout.relativePath}`)
+    }
+    previousEnd = rewrite.end
+  }
+}
+
+async function copyRange(
+  source: FileHandle,
+  destination: FileHandle,
+  start: number,
+  end: number,
+  destinationStart: number,
+  hash: ReturnType<typeof createHash>,
+  buffer: Buffer,
+  signal?: AbortSignal,
+): Promise<number> {
+  let sourcePosition = start
+  let destinationPosition = destinationStart
+  while (sourcePosition < end) {
+    throwIfCancelled(signal)
+    const length = Math.min(buffer.length, end - sourcePosition)
+    const { bytesRead } = await source.read(buffer, 0, length, sourcePosition)
+    if (!bytesRead) throw new Error('会话备份在流式重写期间提前结束。')
+    const bytes = buffer.subarray(0, bytesRead)
+    await writeAt(destination, bytes, destinationPosition)
+    hash.update(bytes)
+    sourcePosition += bytesRead
+    destinationPosition += bytesRead
+  }
+  return destinationPosition
+}
+
+async function readExact(handle: FileHandle, position: number, length: number): Promise<Buffer> {
+  const result = Buffer.allocUnsafe(length)
+  let offset = 0
+  while (offset < length) {
+    const { bytesRead } = await handle.read(result, offset, length - offset, position + offset)
+    if (!bytesRead) throw new Error('会话文件在读取元数据时提前结束。')
+    offset += bytesRead
+  }
+  return result
+}
+
+async function writeAt(handle: FileHandle, bytes: Uint8Array, position: number): Promise<void> {
+  let offset = 0
+  while (offset < bytes.length) {
+    const { bytesWritten } = await handle.write(bytes, offset, bytes.length - offset, position + offset)
+    if (!bytesWritten) throw new Error('会话文件写入未取得进展。')
+    offset += bytesWritten
+  }
+}
+
+async function filesEqual(left: string, right: string): Promise<boolean> {
+  const [leftInfo, rightInfo] = await Promise.all([stat(left), stat(right)])
+  if (leftInfo.size !== rightInfo.size) return false
+  const [leftHash, rightHash] = await Promise.all([sha256File(left), sha256File(right)])
+  return leftHash === rightHash
+}
+
+async function writeFileDurable(path: string, content: string): Promise<void> {
+  const handle = await open(path, 'wx', 0o600)
+  let closed = false
+  try {
+    await handle.writeFile(content, 'utf8')
+    await handle.sync()
+    await handle.close()
+    closed = true
+  } catch (error) {
+    if (!closed) await handle.close().catch(() => undefined)
+    await rm(path, { force: true }).catch(() => undefined)
+    throw error
+  }
+}
+
+async function snapshotRolloutFile(source: string, destination: string): Promise<'hardlink' | 'copy'> {
+  try {
+    await link(source, destination)
+    return 'hardlink'
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    if (!code || !HARD_LINK_FALLBACK_CODES.has(code)) throw error
+    await copyFile(source, destination)
+    return 'copy'
+  }
+}
+
+async function availableFilesystemBytes(path: string): Promise<number | undefined> {
+  try {
+    const info = await statfs(path)
+    return info.bavail * info.bsize
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    if (code === 'ENOSYS' || code === 'ENOTSUP' || code === 'EOPNOTSUPP') return undefined
+    throw error
+  }
+}
+
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 GiB'
+  return `${(bytes / (1024 ** 3)).toFixed(1)} GiB`
 }
 
 async function fastRolloutFingerprint(path: string): Promise<string> {
@@ -1148,6 +1575,10 @@ function normalizeWorkspacePath(value: string): string | undefined {
   if (path.toLowerCase().startsWith('\\\\?\\unc\\')) return `\\\\${path.slice(8).replaceAll('/', '\\')}`
   if (path.startsWith('\\\\?\\')) return path.slice(4).replaceAll('\\', '/')
   return path
+}
+
+function isWindowsWorkspacePath(value: string): boolean {
+  return /^[A-Za-z]:[\\/]/.test(value) || value.startsWith('\\\\')
 }
 
 function normalizeGlobalWorkspaceState(value: Record<string, unknown>): {
@@ -1284,6 +1715,16 @@ function safeRelative(root: string, path: string): string {
     throw new Error(`Codex 文件不在受管目录中：${basename(path)}`)
   }
   return value
+}
+
+function databaseBackupRelativePath(root: string, path: string): string {
+  const normalizedRoot = resolve(root)
+  const normalizedPath = resolve(path)
+  const value = relative(normalizedRoot, normalizedPath)
+  if (value && value !== '..' && !value.startsWith(`..${sep}`)) return value
+  // An external sqlite_home is still explicitly owned by Codex, but its
+  // absolute path must never become a join operand inside the backup tree.
+  return join('external-databases', sha256(normalizedPath).slice(0, 16), basename(normalizedPath))
 }
 
 function assertProvider(value: string): string {

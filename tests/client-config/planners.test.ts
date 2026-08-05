@@ -4,6 +4,7 @@ import {
   ClientConfigValidationError,
   planClaudeConfig,
   planCodexConfig,
+  planCodexOfficialAccountConfig,
   planClientConfigRepair,
   planCodexOfficialLoginConfig,
   planCodexOfficialLoginToml,
@@ -226,20 +227,38 @@ describe('Codex planning', () => {
     expect(result.content).not.toContain('env_key =')
   })
 
-  it('updates config.toml and auth.json while retaining unrelated auth data', () => {
+  it('updates config.toml and repairs auth.json to one Stone API-key identity', () => {
     const plan = planCodexConfig(paths.codex, {
       'codex-config': 'model = "gpt-5"\n',
-      'codex-auth': '{"tokens":{"access_token":"existing"},"OPENAI_API_KEY":"old"}\n',
+      'codex-auth': JSON.stringify({
+        auth_mode: 'chatgpt',
+        tokens: { access_token: 'existing' },
+        last_refresh: '2026-08-04T06:00:00.000Z',
+        agent_identity: { id: 'stale-agent' },
+        personal_access_token: 'stale-pat',
+        bedrock_api_key: 'stale-bedrock-key',
+        OPENAI_API_KEY: 'old',
+        custom: { keep: true },
+      }) + '\n',
     }, target)
     const config = plan.files.find((file) => file.role === 'codex-config')!
     const auth = plan.files.find((file) => file.role === 'codex-auth')!
 
     expect(config.content).toContain('base_url = "http://127.0.0.1:15721/v1"')
     expect(JSON.parse(auth.content)).toEqual({
-      tokens: { access_token: 'existing' },
       auth_mode: 'apikey',
       OPENAI_API_KEY: target.token,
+      custom: { keep: true },
     })
+    expect(auth.managedFields).toEqual([
+      'auth_mode',
+      'OPENAI_API_KEY',
+      'tokens',
+      'last_refresh',
+      'agent_identity',
+      'personal_access_token',
+      'bedrock_api_key',
+    ])
   })
 
   it('sets and safely clears the Stone-managed DeepSeek context window', () => {
@@ -250,7 +269,8 @@ describe('Codex planning', () => {
     expect(configured).toContain('model_context_window = 1048576')
     expect(configured).toContain(`model_catalog_json = "${paths.codex.modelCatalog.path}"`)
     const catalog = JSON.parse(deepSeek.files.find((file) => file.role === 'codex-model-catalog')!.content)
-    expect(catalog.models.map((model: { slug: string }) => model.slug)).toContain('deepseek-v4-flash')
+    expect(catalog.models.map((model: { slug: string }) => model.slug))
+      .toEqual(expect.arrayContaining(['deepseek-v4-flash', 'deepseek-v4-pro']))
     expect(catalog.models[0]).toMatchObject({
       apply_patch_tool_type: 'freeform',
       shell_type: 'shell_command',
@@ -259,6 +279,8 @@ describe('Codex planning', () => {
       max_context_window: 1_048_576,
       input_modalities: ['text'],
     })
+    expect(catalog.models[0].base_instructions).toContain('freeform tools')
+    expect(catalog.models[0].base_instructions).toContain('apply_patch tool accepts patch text directly')
 
     const switched = planCodexConfig(paths.codex, { 'codex-config': configured }, target)
     const switchedConfig = switched.files.find((file) => file.role === 'codex-config')!.content
@@ -342,6 +364,73 @@ describe('Codex planning', () => {
     expect(result.content).toContain('model_providers = { custom = { base_url = "https://keep.example" } }')
     expect(result.content).not.toContain('stone =')
     expect(plan.files.map((file) => file.role)).toEqual(['codex-config'])
+  })
+
+  it('selects one exact OAuth account for official Codex with file-backed auth', () => {
+    const lastRefreshAt = Date.parse('2026-08-04T06:00:00.000Z')
+    const plan = planCodexOfficialAccountConfig(paths.codex, {
+      'codex-config': [
+        'model = "relay-only-model"',
+        'review_model = "gpt-5.6"',
+        'model_provider = "stone"',
+        'model_context_window = 1048576',
+        'model_catalog_json = "C:/Users/Alice/.codex/stone-deepseek-model-catalog.json"',
+        '[model_providers.stone]',
+        'base_url = "http://127.0.0.1:15721/v1"',
+        '',
+      ].join('\n'),
+      'codex-auth': JSON.stringify({
+        auth_mode: 'apikey',
+        OPENAI_API_KEY: 'stone-token',
+        tokens: { access_token: 'old-account' },
+        agent_identity: { id: 'stale-agent' },
+        personal_access_token: 'stale-pat',
+        bedrock_api_key: 'stale-bedrock-key',
+        unrelated: { keep: true },
+      }, null, 2) + '\n',
+    }, {
+      accessToken: 'selected-access',
+      refreshToken: 'selected-refresh',
+      idToken: 'selected-id',
+      accountId: 'account-selected',
+      lastRefreshAt,
+      availableModels: ['gpt-5.6', 'gpt-5.5-codex'],
+    })
+
+    const config = plan.files.find((file) => file.role === 'codex-config')!
+    const auth = plan.files.find((file) => file.role === 'codex-auth')!
+    expect(config.content).toContain('model_provider = "openai"')
+    expect(config.content).toContain('cli_auth_credentials_store = "file"')
+    expect(config.content).not.toMatch(/^model =/m)
+    expect(config.content).toContain('review_model = "gpt-5.6"')
+    expect(config.content).not.toContain('model_context_window')
+    expect(config.content).not.toContain('model_catalog_json')
+    expect(config.content).not.toContain('model_providers.stone')
+    expect(JSON.parse(auth.content)).toEqual({
+      auth_mode: 'chatgpt',
+      tokens: {
+        id_token: 'selected-id',
+        access_token: 'selected-access',
+        refresh_token: 'selected-refresh',
+        account_id: 'account-selected',
+      },
+      unrelated: { keep: true },
+      last_refresh: '2026-08-04T06:00:00.000Z',
+    })
+    expect(auth.content).not.toContain('stone-token')
+
+    const repeated = planCodexOfficialAccountConfig(paths.codex, {
+      'codex-config': config.content,
+      'codex-auth': auth.content,
+    }, {
+      accessToken: 'selected-access',
+      refreshToken: 'selected-refresh',
+      idToken: 'selected-id',
+      accountId: 'account-selected',
+      lastRefreshAt,
+      availableModels: ['gpt-5.6', 'gpt-5.5-codex'],
+    })
+    expect(repeated.files.every((file) => !file.changed)).toBe(true)
   })
 })
 

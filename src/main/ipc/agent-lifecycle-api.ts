@@ -4,12 +4,14 @@ import {
   AGENT_INSTALL_CHANNELS,
   type AgentInstallChannel,
   type AgentLifecycleOperationResult,
+  type AgentLifecycleProgressEvent,
   type AgentLifecycleSnapshot,
   type AgentLifecycleChangedEvent,
   type AgentRestoreOptions,
   type AgentStartOptions,
   type AgentTarget,
 } from '@shared/agent-lifecycle'
+import type { AgentLifecycleExecutionOptions } from '../agent-lifecycle/service'
 import { assertTrustedSender } from './trusted-sender'
 
 /**
@@ -21,11 +23,11 @@ export interface AgentLifecycleIpcService {
   getSnapshot(): AgentLifecycleSnapshot | Promise<AgentLifecycleSnapshot>
   install(target: AgentTarget, channel?: AgentInstallChannel): AgentLifecycleOperationResult | Promise<AgentLifecycleOperationResult>
   close(target: AgentTarget): AgentLifecycleOperationResult | Promise<AgentLifecycleOperationResult>
-  restore(target: AgentTarget, options?: AgentRestoreOptions): AgentLifecycleOperationResult | Promise<AgentLifecycleOperationResult>
-  restart(target: AgentTarget): AgentLifecycleOperationResult | Promise<AgentLifecycleOperationResult>
+  restore(target: AgentTarget, options?: AgentRestoreOptions, execution?: AgentLifecycleExecutionOptions): AgentLifecycleOperationResult | Promise<AgentLifecycleOperationResult>
+  restart(target: AgentTarget, execution?: AgentLifecycleExecutionOptions): AgentLifecycleOperationResult | Promise<AgentLifecycleOperationResult>
   start(target: AgentTarget, options?: AgentStartOptions): AgentLifecycleOperationResult | Promise<AgentLifecycleOperationResult>
-  smartRepair(target?: AgentTarget): AgentLifecycleOperationResult | Promise<AgentLifecycleOperationResult>
-  repairAllAffected(): AgentLifecycleOperationResult | Promise<AgentLifecycleOperationResult>
+  smartRepair(target?: AgentTarget, execution?: AgentLifecycleExecutionOptions): AgentLifecycleOperationResult | Promise<AgentLifecycleOperationResult>
+  repairAllAffected(execution?: AgentLifecycleExecutionOptions): AgentLifecycleOperationResult | Promise<AgentLifecycleOperationResult>
   closeAllManaged(): AgentLifecycleOperationResult | Promise<AgentLifecycleOperationResult>
   onChange?(listener: (event: AgentLifecycleChangedEvent) => void): () => void
 }
@@ -39,6 +41,7 @@ const agentLifecycleChannels = [
   'stone:start-agent',
   'stone:smart-repair-agent',
   'stone:repair-all-affected-agents',
+  'stone:cancel-agent-lifecycle-operation',
   'stone:close-all-managed-agents',
 ] as const
 
@@ -46,6 +49,7 @@ export function registerAgentLifecycleApi(service: AgentLifecycleIpcService): ()
   let disposed = false
   let disposeFlight: Promise<void> | undefined
   const acceptedOperations = new Set<Promise<unknown>>()
+  const cancellableOperations = new Map<string, AbortController>()
   const unsubscribe = service.onChange?.((update) => {
     if (disposed) return
     for (const window of BrowserWindow.getAllWindows()) {
@@ -64,25 +68,44 @@ export function registerAgentLifecycleApi(service: AgentLifecycleIpcService): ()
     assertTrustedSender(event)
     return trackOperation(() => service.close(parseTarget(target)))
   })
-  ipcMain.handle('stone:restore-agent', (event, target: unknown, options?: unknown) => {
+  ipcMain.handle('stone:restore-agent', (event, target: unknown, options?: unknown, operationId?: unknown) => {
     assertTrustedSender(event)
-    return trackOperation(() => service.restore(parseTarget(target), parseRestoreOptions(options)))
+    const parsedTarget = parseTarget(target)
+    const parsedOptions = parseRestoreOptions(options)
+    return runCancellableOperation(operationId, (execution) => execution
+      ? service.restore(parsedTarget, parsedOptions, execution)
+      : service.restore(parsedTarget, parsedOptions))
   })
-  ipcMain.handle('stone:restart-agent', (event, target: unknown) => {
+  ipcMain.handle('stone:restart-agent', (event, target: unknown, operationId?: unknown) => {
     assertTrustedSender(event)
-    return trackOperation(() => service.restart(parseTarget(target)))
+    const parsedTarget = parseTarget(target)
+    return runCancellableOperation(operationId, (execution) => execution
+      ? service.restart(parsedTarget, execution)
+      : service.restart(parsedTarget))
   })
   ipcMain.handle('stone:start-agent', (event, target: unknown, options?: unknown) => {
     assertTrustedSender(event)
     return trackOperation(() => service.start(parseTarget(target), parseStartOptions(options)))
   })
-  ipcMain.handle('stone:smart-repair-agent', (event, target?: unknown) => {
+  ipcMain.handle('stone:smart-repair-agent', (event, target?: unknown, operationId?: unknown) => {
     assertTrustedSender(event)
-    return trackOperation(() => service.smartRepair(target === undefined ? undefined : parseTarget(target)))
+    const parsedTarget = target === undefined ? undefined : parseTarget(target)
+    return runCancellableOperation(operationId, (execution) => execution
+      ? service.smartRepair(parsedTarget, execution)
+      : service.smartRepair(parsedTarget))
   })
-  ipcMain.handle('stone:repair-all-affected-agents', (event) => {
+  ipcMain.handle('stone:repair-all-affected-agents', (event, operationId?: unknown) => {
     assertTrustedSender(event)
-    return trackOperation(() => service.repairAllAffected())
+    return runCancellableOperation(operationId, (execution) => execution
+      ? service.repairAllAffected(execution)
+      : service.repairAllAffected())
+  })
+  ipcMain.handle('stone:cancel-agent-lifecycle-operation', (event, operationId: unknown) => {
+    assertTrustedSender(event)
+    const controller = cancellableOperations.get(parseOperationId(operationId))
+    if (!controller || controller.signal.aborted) return false
+    controller.abort()
+    return true
   })
   ipcMain.handle('stone:close-all-managed-agents', (event) => {
     assertTrustedSender(event)
@@ -92,6 +115,7 @@ export function registerAgentLifecycleApi(service: AgentLifecycleIpcService): ()
   return () => {
     if (disposeFlight) return disposeFlight
     disposed = true
+    for (const controller of cancellableOperations.values()) controller.abort()
     unsubscribe?.()
     for (const channel of agentLifecycleChannels) ipcMain.removeHandler(channel)
     disposeFlight = Promise.allSettled([...acceptedOperations]).then(() => undefined)
@@ -106,6 +130,43 @@ export function registerAgentLifecycleApi(service: AgentLifecycleIpcService): ()
       () => acceptedOperations.delete(flight),
     )
     return flight
+  }
+
+  function runCancellableOperation<T>(
+    operationId: unknown,
+    operation: (execution?: AgentLifecycleExecutionOptions) => T | Promise<T>,
+  ): Promise<T> {
+    if (operationId === undefined) return trackOperation(() => operation())
+    const id = parseOperationId(operationId)
+    if (cancellableOperations.has(id)) {
+      return Promise.reject(new Error('An Agent lifecycle operation with this identifier is already running.'))
+    }
+    const controller = new AbortController()
+    cancellableOperations.set(id, controller)
+    const flight = trackOperation(() => operation({
+      signal: controller.signal,
+      onProgress: (progress) => {
+        if (!disposed) broadcastProgress({ operationId: id, ...progress })
+      },
+    }))
+    return flight.finally(() => {
+      if (cancellableOperations.get(id) === controller) cancellableOperations.delete(id)
+    })
+  }
+}
+
+function parseOperationId(value: unknown): string {
+  if (typeof value !== 'string') throw new Error('Invalid Agent lifecycle operation identifier.')
+  const id = value.trim()
+  if (!/^[A-Za-z0-9][A-Za-z0-9_.:-]{7,127}$/.test(id)) {
+    throw new Error('Invalid Agent lifecycle operation identifier.')
+  }
+  return id
+}
+
+function broadcastProgress(progress: AgentLifecycleProgressEvent): void {
+  for (const window of BrowserWindow.getAllWindows()) {
+    if (!window.isDestroyed()) window.webContents.send('stone:agent-lifecycle-progress', progress)
   }
 }
 

@@ -1,5 +1,7 @@
 import { DatabaseSync, type StatementSync } from 'node:sqlite'
-import { join } from 'node:path'
+import { readFileSync } from 'node:fs'
+import { join, resolve } from 'node:path'
+import { codexStateDatabasePaths } from './state-database-paths'
 
 interface ThreadTitleRow {
   title?: unknown
@@ -15,13 +17,12 @@ const MISSING_TITLE_CACHE_TTL_MS = 1_000
 const MAX_CACHED_TITLES = 1_000
 
 export class CodexConversationTitleResolver {
-  private readonly databasePath: string
-  private database?: DatabaseSync
-  private statement?: StatementSync
+  private readonly codexHome: string
+  private databases: Array<{ database: DatabaseSync; statement: StatementSync }> = []
   private readonly cache = new Map<string, CachedTitle>()
 
-  public constructor(homeDirectory: string) {
-    this.databasePath = join(homeDirectory, '.codex', 'state_5.sqlite')
+  public constructor(codexHome: string) {
+    this.codexHome = resolve(codexHome)
   }
 
   public resolve(threadId: string): string | undefined {
@@ -32,20 +33,25 @@ export class CodexConversationTitleResolver {
     if (cached && cached.expiresAt > now) return cached.title
     try {
       this.ensureOpen()
-      const row = this.statement?.get(normalizedId) as ThreadTitleRow | undefined
-      const title = normalizeTitle(row?.title)
+      let title: string | undefined
+      for (const { statement } of this.databases) {
+        const row = statement.get(normalizedId) as ThreadTitleRow | undefined
+        title = normalizeTitle(row?.title)
+        if (title) break
+      }
       this.remember(normalizedId, title, now)
+      // A miss may mean Codex just created or relocated its state database.
+      // Re-resolve config/env on the next short missing-title cache expiry.
+      if (!title) this.closeDatabases()
       return title
     } catch {
-      this.close()
+      this.closeDatabases()
       return undefined
     }
   }
 
   public close(): void {
-    this.statement = undefined
-    this.database?.close()
-    this.database = undefined
+    this.closeDatabases()
   }
 
   private remember(threadId: string, title: string | undefined, now: number): void {
@@ -61,15 +67,29 @@ export class CodexConversationTitleResolver {
   }
 
   private ensureOpen(): void {
-    if (this.database && this.statement) return
-    const database = new DatabaseSync(this.databasePath, { readOnly: true })
+    if (this.databases.length > 0) return
+    let configText = ''
     try {
-      this.statement = database.prepare('SELECT title FROM threads WHERE id = ? LIMIT 1')
-      this.database = database
+      configText = readFileSync(join(this.codexHome, 'config.toml'), 'utf8')
     } catch (error) {
-      database.close()
-      throw error
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
     }
+    for (const path of codexStateDatabasePaths(this.codexHome, configText)) {
+      let database: DatabaseSync | undefined
+      try {
+        database = new DatabaseSync(path, { readOnly: true })
+        const statement = database.prepare('SELECT title FROM threads WHERE id = ? LIMIT 1')
+        this.databases.push({ database, statement })
+      } catch (error) {
+        database?.close()
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') continue
+      }
+    }
+  }
+
+  private closeDatabases(): void {
+    for (const { database } of this.databases) database.close()
+    this.databases = []
   }
 }
 

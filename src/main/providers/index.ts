@@ -44,7 +44,7 @@ export {
   KIRO_CLAUDE_REQUEST_CONTENT_TYPE,
   KIRO_CLAUDE_RESPONSE_CONTENT_TYPE,
 } from './kiro-claude'
-export { classifyProviderFailure, parseRetryAfter } from './failure'
+export { classifyProviderFailure, MAX_RETRY_AFTER_MS, parseRetryAfter } from './failure'
 export {
   applyGrokBuildHeaders,
   GROK_BUILD_BILLING_URL,
@@ -74,17 +74,23 @@ export {
   applyChatGptCodexHeaders,
   applyChatGptCodexSearchHeaders,
   applyChatGptAgentIdentityHeaders,
+  BUNDLED_CODEX_CLIENT_VERSION,
   CHATGPT_CODEX_MODELS_URL,
   CHATGPT_CODEX_RESPONSES_URL,
+  CHATGPT_CODEX_RESET_CREDITS_URL,
   CHATGPT_CODEX_SEARCH_URL,
   CHATGPT_CODEX_USAGE_URL,
   CODEX_CLIENT_VERSION,
+  CodexClientVersionSyncService,
   checkChatGptAccountAuthorized,
+  classifyChatGptCredentialRefreshFailure,
   classifyChatGptCodexFailure,
   probeChatGptAccount,
   probeChatGptAccountAuthorized,
   queryChatGptCodexModels,
   queryChatGptCodexModelsAuthorized,
+  getChatGptCodexModelsUrl,
+  getCodexClientVersion,
   queryChatGptCodexQuota,
   queryChatGptCodexQuotaAuthorized,
   refreshChatGptCredential,
@@ -92,6 +98,8 @@ export {
   isChatGptCodexResponsesLiteBody,
   withChatGptCodexBody
 } from './chatgpt-codex'
+export type { ChatGptCredentialRefreshErrorCode } from './chatgpt-codex'
+export { ChatGptCodexEndpointError, ChatGptCredentialRefreshError } from './chatgpt-codex'
 export {
   extractProtocolUsage,
   extractCodexQuotaFromHeaders,

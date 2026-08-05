@@ -160,18 +160,79 @@ export function extractCodexQuotaFromUsagePayload(
   now = Date.now()
 ): AccountCodexQuotaSnapshot | undefined {
   const root = objectValue(payload)
-  const rateLimit = objectValue(root?.rate_limit)
-  if (!rateLimit) return undefined
-  const primary = codexPayloadWindow(rateLimit.primary_window, now)
-  const secondary = codexPayloadWindow(rateLimit.secondary_window, now)
+  const rateLimit = objectValue(root?.rate_limit ?? root?.rateLimit)
+  const resetCredits = codexResetCredits(
+    root?.rate_limit_reset_credits ?? root?.rateLimitResetCredits,
+    now,
+  )
+  if (!rateLimit && !resetCredits) return undefined
+  const primary = codexPayloadWindow(rateLimit?.primary_window ?? rateLimit?.primaryWindow, now)
+  const secondary = codexPayloadWindow(rateLimit?.secondary_window ?? rateLimit?.secondaryWindow, now)
   return normalizeCodexWindows(primary, secondary, {
     observedAt: now,
     source: 'usage-endpoint',
-    allowed: booleanValue(rateLimit.allowed),
-    limitReached: booleanValue(rateLimit.limit_reached)
+    allowed: booleanValue(rateLimit?.allowed),
+    limitReached: booleanValue(rateLimit?.limit_reached ?? rateLimit?.limitReached),
+    ...(resetCredits ? { resetCredits } : {}),
   })
 }
 
+function codexResetCredits(
+  value: unknown,
+  now: number,
+): AccountCodexQuotaSnapshot['resetCredits'] | undefined {
+  const envelope = objectValue(value)
+  const nestedValue = envelope?.rate_limit_reset_credits ?? envelope?.rateLimitResetCredits
+  const nested = objectValue(nestedValue)
+  const source = nested ?? envelope
+  const rawCredits = Array.isArray(value)
+    ? value
+    : Array.isArray(nestedValue)
+      ? nestedValue
+      : [source?.credits, source?.items, source?.data].find(Array.isArray)
+  const countValue = source?.available_count ?? source?.availableCount
+  const numericCount = nonNegativeFinite(countValue)
+  const count = numericCount !== undefined && Number.isInteger(numericCount) ? numericCount : undefined
+  const expiresAt: number[] = []
+  let availableFromList = 0
+  for (const item of rawCredits ?? []) {
+    const credit = objectValue(item)
+    if (!credit) continue
+    const resetType = resetCreditText(credit.reset_type ?? credit.resetType)
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '')
+    const status = resetCreditText(credit.status).toLowerCase()
+    if (resetType && resetType !== 'codexratelimits') continue
+    if (status && status !== 'available') continue
+    availableFromList += 1
+    const expiry = resetCreditTimestamp(credit.expires_at ?? credit.expiresAt)
+    if (Number.isFinite(expiry) && expiry > now) expiresAt.push(expiry)
+  }
+  const availableCount = count ?? (rawCredits ? availableFromList : undefined)
+  if (availableCount === undefined) return undefined
+  return {
+    availableCount,
+    ...(expiresAt.length ? { expiresAt: [...new Set(expiresAt)].sort((left, right) => left - right) } : {}),
+  }
+}
+
+function resetCreditText(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : ''
+}
+
+function resetCreditTimestamp(value: unknown): number {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value < 10_000_000_000 ? Math.floor(value * 1_000) : Math.floor(value)
+  }
+  const parsed = Date.parse(resetCreditText(value))
+  return Number.isFinite(parsed) ? parsed : Number.NaN
+}
+
+/**
+ * Interprets a Codex usage snapshot for recovery timing after an account has
+ * already received a real quota rejection. Do not use this telemetry alone as
+ * an admission gate: the Responses endpoint can still accept work at 100%.
+ */
 export function codexQuotaIsExhausted(
   quota: AccountCodexQuotaSnapshot | undefined,
   now = Date.now()
@@ -258,10 +319,10 @@ function codexHeaderWindow(headers: Headers, slot: 'primary' | 'secondary', now:
 function codexPayloadWindow(value: unknown, now: number): RawCodexWindow | undefined {
   const window = objectValue(value)
   if (!window) return undefined
-  const usedPercent = nonNegativeFinite(window.used_percent)
-  const windowSeconds = nonNegativeFinite(window.limit_window_seconds)
-  const resetAt = absoluteResetAt(window.reset_at, now)
-    ?? futureResetAt(window.reset_after_seconds, now)
+  const usedPercent = nonNegativeFinite(window.used_percent ?? window.usedPercent)
+  const windowSeconds = nonNegativeFinite(window.limit_window_seconds ?? window.limitWindowSeconds)
+  const resetAt = absoluteResetAt(window.reset_at ?? window.resetAt, now)
+    ?? futureResetAt(window.reset_after_seconds ?? window.resetAfterSeconds, now)
   if (usedPercent === undefined && windowSeconds === undefined && resetAt === undefined) return undefined
   return {
     ...(usedPercent === undefined ? {} : { usedPercent }),
@@ -275,7 +336,8 @@ function normalizeCodexWindows(
   secondary: RawCodexWindow | undefined,
   metadata: Omit<AccountCodexQuotaSnapshot, 'fiveHour' | 'sevenDay'>
 ): AccountCodexQuotaSnapshot | undefined {
-  if (primary?.usedPercent === undefined && secondary?.usedPercent === undefined) return undefined
+  if (primary?.usedPercent === undefined && secondary?.usedPercent === undefined
+    && metadata.resetCredits === undefined) return undefined
 
   let fiveHourRaw: RawCodexWindow | undefined
   let sevenDayRaw: RawCodexWindow | undefined
@@ -344,6 +406,7 @@ function mergeCodexQuota(
     source: later.source,
     allowed: later.allowed ?? earlier?.allowed,
     limitReached: later.limitReached ?? earlier?.limitReached,
+    resetCredits: later.resetCredits ?? earlier?.resetCredits,
     fiveHour: mergeCodexWindow(earlier?.fiveHour, later.fiveHour),
     sevenDay: mergeCodexWindow(earlier?.sevenDay, later.sevenDay)
   }

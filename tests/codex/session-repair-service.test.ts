@@ -1,7 +1,7 @@
 import { DatabaseSync } from 'node:sqlite'
-import { appendFile, mkdir, mkdtemp, open, readFile, rm, stat, utimes, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, mkdtemp, open, readFile, readdir, rm, stat, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { CodexSessionRepairService } from '../../src/main/codex'
 
@@ -147,6 +147,41 @@ describe('CodexSessionRepairService', () => {
     expect(preview.revision).toMatch(/^[a-f0-9]{64}$/)
   })
 
+  it('repairs an external sqlite_home database and backs it up inside the managed tree', async () => {
+    const { service, codexHome } = await createFixture()
+    const sqliteHome = join(dirname(codexHome), 'relocated-state')
+    await mkdir(sqliteHome)
+    const configPath = join(codexHome, 'config.toml')
+    const originalConfig = await readFile(configPath, 'utf8')
+    await writeFile(
+      configPath,
+      `sqlite_home = '${sqliteHome.replace(/'/g, "''")}'\n${originalConfig}`,
+      'utf8',
+    )
+    const externalPath = join(sqliteHome, 'state_5.sqlite')
+    const external = new DatabaseSync(externalPath)
+    external.exec('CREATE TABLE threads (id TEXT PRIMARY KEY, model_provider TEXT)')
+    external.prepare('INSERT INTO threads (id, model_provider) VALUES (?, ?)')
+      .run('external-thread', 'openai')
+    external.close()
+
+    const preview = await service.preview('stone')
+    expect(preview.sqliteDatabases).toContain(externalPath)
+    expect(preview.sqliteProviderRowsToUpdate).toBe(3)
+    const result = await service.repair('stone', preview.revision)
+
+    const repaired = new DatabaseSync(externalPath, { readOnly: true })
+    expect((repaired.prepare('SELECT model_provider FROM threads WHERE id = ?')
+      .get('external-thread') as Record<string, unknown>).model_provider).toBe('stone')
+    repaired.close()
+    const metadata = JSON.parse(await readFile(join(result.backupPath!, 'metadata.json'), 'utf8')) as {
+      changedDatabases: string[]
+    }
+    expect(metadata.changedDatabases).toContainEqual(expect.stringMatching(
+      /^external-databases[\\/][a-f0-9]{16}[\\/]state_5\.sqlite$/,
+    ))
+  })
+
   it('combines overview and preview in one rollout analysis pass', async () => {
     const observed = observeRolloutReads()
     const { service } = await createFixture({ openRollout: observed.openRollout })
@@ -173,6 +208,45 @@ describe('CodexSessionRepairService', () => {
     expect(result).toMatchObject({ targetProvider: 'stone', repairedRolloutFiles: 1 })
     expect([...observed.opened.values()].reduce((sum, count) => sum + count, 0)).toBe(2)
     expect([...observed.closed.values()].reduce((sum, count) => sum + count, 0)).toBe(2)
+  })
+
+  it('repairs the startup index without reading rollout history or normalizing workspace state', async () => {
+    const observed = observeRolloutReads()
+    const { service, codexHome, activeRollout, databasePath } = await createFixture({
+      openRollout: observed.openRollout,
+    })
+    const statePath = join(codexHome, '.codex-global-state.json')
+    const state = JSON.stringify({
+      'active-workspace-roots': '\\\\?\\D:\\project\\stone+',
+      untouched: true,
+    })
+    await writeFile(statePath, state)
+
+    const result = await service.analyzeAndRepair('openai', undefined, {
+      scope: 'startup-index',
+    })
+
+    expect(result).toMatchObject({
+      targetProvider: 'openai',
+      repairedRolloutFiles: 0,
+      sqliteProviderRowsUpdated: 1,
+      globalStateFieldsUpdated: 0,
+    })
+    expect(observed.opened.size).toBe(0)
+    expect(observed.closed.size).toBe(0)
+    expect(await readFile(statePath, 'utf8')).toBe(state)
+    const firstLine = JSON.parse((await readFile(activeRollout, 'utf8')).split(/\r?\n/)[0]) as { payload: Record<string, unknown> }
+    expect(firstLine.payload.model_provider).toBe('openai')
+    const archived = JSON.parse((await readFile(join(
+      codexHome,
+      'archived_sessions',
+      'rollout-2026-07-17T12-00-00-thread-two.jsonl',
+    ), 'utf8')).trim()) as { payload: Record<string, unknown> }
+    expect(archived.payload.model_provider).toBe('stone')
+    const database = new DatabaseSync(databasePath, { readOnly: true })
+    const providers = database.prepare('SELECT DISTINCT model_provider FROM threads').all() as Array<Record<string, unknown>>
+    database.close()
+    expect(providers).toEqual([{ model_provider: 'openai' }])
   })
 
   it('recognizes first-line metadata without reading an oversized suffix and closes the handle', async () => {
@@ -257,6 +331,7 @@ describe('CodexSessionRepairService', () => {
 
   it('backs up and repairs rollout metadata and SQLite visibility indexes without changing conversation content or mtime', async () => {
     const { service, activeRollout, activeLines, databasePath, originalMtime } = await createFixture()
+    const originalFile = await stat(activeRollout)
     const preview = await service.preview('stone')
 
     const result = await service.repair('stone', preview.revision)
@@ -281,10 +356,27 @@ describe('CodexSessionRepairService', () => {
     })
     expect(repairedText).toContain('keep this text')
     expect((await stat(activeRollout)).mtimeMs).toBeCloseTo(originalMtime.getTime(), -2)
-    expect(await readFile(join(result.backupPath!, 'rollouts', 'sessions', '2026', '07', '18', 'rollout-2026-07-18T12-00-00-thread-one.jsonl'), 'utf8')).toBe(activeLines)
+    const patchJournal = (await readFile(join(result.backupPath!, 'rollout-patches.jsonl'), 'utf8'))
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line) as { relativePath: string; rewrites: Array<{ originalBase64: string }> })
+      .find((entry) => entry.relativePath.endsWith('rollout-2026-07-18T12-00-00-thread-one.jsonl'))!
+    const originalFirstLine = activeLines.slice(0, activeLines.indexOf('\r\n') + 2)
+    expect(Buffer.from(patchJournal.rewrites[0]!.originalBase64, 'base64').toString('utf8')).toBe(originalFirstLine)
+    const repairedFile = await stat(activeRollout)
+    if (originalFile.ino !== 0) {
+      expect(repairedFile.ino).toBe(originalFile.ino)
+    }
     expect(JSON.parse(await readFile(join(result.backupPath!, 'metadata.json'), 'utf8'))).toMatchObject({
+      version: 3,
       managedBy: 'Stone+ session repair',
+      status: 'complete',
       targetProvider: 'stone',
+      rolloutBackupStrategy: {
+        patchJournalFiles: 1,
+        hardLinkedFiles: 0,
+        copiedFiles: 0,
+      },
     })
 
     const database = new DatabaseSync(databasePath, { readOnly: true })
@@ -306,6 +398,25 @@ describe('CodexSessionRepairService', () => {
     expect(after.sqliteProviderRowsToUpdate).toBe(0)
     expect(after.sqliteUserEventRowsToUpdate).toBe(0)
     expect(after.sqliteCwdRowsToUpdate).toBe(0)
+  })
+
+  it('removes only Stone+ abandoned staging directories before publishing a complete backup', async () => {
+    const { service, codexHome } = await createFixture()
+    const backupRoot = join(codexHome, 'backups_state', 'stone-session-repair')
+    const abandoned = join(backupRoot, '.stone-session-repair-abandoned.partial')
+    const unrelated = join(backupRoot, 'user-created.partial')
+    await mkdir(abandoned, { recursive: true })
+    await mkdir(unrelated, { recursive: true })
+    await writeFile(join(abandoned, 'orphan'), 'incomplete')
+    await writeFile(join(unrelated, 'keep'), 'user data')
+
+    const result = await service.analyzeAndRepair('stone')
+
+    await expect(stat(abandoned)).rejects.toMatchObject({ code: 'ENOENT' })
+    expect(await readFile(join(unrelated, 'keep'), 'utf8')).toBe('user data')
+    expect(JSON.parse(await readFile(join(result.backupPath!, 'metadata.json'), 'utf8'))).toMatchObject({
+      managedBy: 'Stone+ session repair',
+    })
   })
 
   it('repairs persisted upstream models while preserving native models during restart repair', async () => {
@@ -406,6 +517,65 @@ describe('CodexSessionRepairService', () => {
     expect(repairedMeta.payload.base_instructions).toBe(oversizedInstructions)
   })
 
+  it('keeps a longer provider repair in-place by compacting an equivalent Windows cwd', async () => {
+    const { service, codexHome } = await createFixture()
+    const rolloutPath = join(codexHome, 'archived_sessions', 'rollout-provider-growth.jsonl')
+    const original = JSON.stringify({
+      timestamp: '2026-07-17T12:00:00Z',
+      type: 'session_meta',
+      payload: { id: 'provider-growth', cwd: 'D:\\project\\growth', model_provider: 'stone' },
+    }) + '\n'
+    await writeFile(rolloutPath, original)
+    const before = await stat(rolloutPath)
+    const preview = await service.preview('openai')
+
+    const result = await service.repair('openai', preview.revision)
+
+    const after = await stat(rolloutPath)
+    const repaired = JSON.parse((await readFile(rolloutPath, 'utf8')).trim()) as { payload: Record<string, unknown> }
+    expect(repaired.payload).toMatchObject({
+      model_provider: 'openai',
+      cwd: 'D:/project/growth',
+    })
+    expect(after.size).toBe(before.size)
+    if (before.ino !== 0) expect(after.ino).toBe(before.ino)
+    expect(JSON.parse(await readFile(join(result.backupPath!, 'metadata.json'), 'utf8'))).toMatchObject({
+      rolloutBackupStrategy: { patchJournalFiles: 2 },
+    })
+  })
+
+  it('uses an atomic full-file fallback only when an equal-length metadata patch is impossible', async () => {
+    const { service, codexHome } = await createFixture()
+    const rolloutPath = join(codexHome, 'archived_sessions', 'rollout-provider-growth-without-slack.jsonl')
+    const original = JSON.stringify({
+      type: 'session_meta',
+      payload: { id: 'provider-growth-without-slack', model_provider: 's' },
+    }) + '\n'
+    await writeFile(rolloutPath, original)
+    const before = await stat(rolloutPath)
+    const preview = await service.preview('openai')
+
+    const result = await service.repair('openai', preview.revision)
+
+    const after = await stat(rolloutPath)
+    const repaired = JSON.parse((await readFile(rolloutPath, 'utf8')).trim()) as { payload: Record<string, unknown> }
+    expect(repaired.payload.model_provider).toBe('openai')
+    expect(after.size).toBeGreaterThan(before.size)
+    if (before.ino !== 0) expect(after.ino).not.toBe(before.ino)
+    expect(await readFile(join(
+      result.backupPath!,
+      'rollouts',
+      'archived_sessions',
+      'rollout-provider-growth-without-slack.jsonl',
+    ), 'utf8')).toBe(original)
+    expect(JSON.parse(await readFile(join(result.backupPath!, 'metadata.json'), 'utf8'))).toMatchObject({
+      rolloutBackupStrategy: {
+        patchJournalFiles: 1,
+        hardLinkedFiles: 1,
+      },
+    })
+  })
+
   it('reports discovered rollout files whose session metadata is genuinely absent', async () => {
     const { service, codexHome } = await createFixture()
     const path = join(codexHome, 'archived_sessions', 'rollout-no-session-meta.jsonl')
@@ -438,6 +608,7 @@ describe('CodexSessionRepairService', () => {
     await expect(service.repair('stone', preview.revision)).rejects.toThrow('已自动回滚')
     expect(await readFile(activeRollout, 'utf8')).toBe(activeLines)
     expect(preserveCalls).toBe(2)
+    expect(await readdir(join(codexHome, 'backups_state', 'stone-session-repair'))).toEqual([])
   })
 
   it('rejects a stale preview before writing any repair changes', async () => {

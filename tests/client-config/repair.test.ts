@@ -9,7 +9,7 @@ describe('client configuration repair planning', () => {
   const paths = resolveClientConfigPaths({ homeDir: '/home/repair', platform: 'linux' })
   const target = { gatewayBaseUrl: 'http://127.0.0.1:15721', token: 'repair-secret' }
 
-  it('preserves valid Codex model, MCP, plugin, project, auth and unknown settings', () => {
+  it('preserves valid Codex model, MCP, plugin, project and unknown settings while repairing auth', () => {
     const source = [
       'model = "gpt-5.6-sol"',
       'approval_policy = "on-request"',
@@ -29,7 +29,15 @@ describe('client configuration repair planning', () => {
       'custom_option = "keep-provider-option"',
       '',
     ].join('\n')
-    const auth = JSON.stringify({ tokens: { access_token: 'keep-token' }, custom: { keep: true } }, null, 2) + '\n'
+    const auth = JSON.stringify({
+      auth_mode: 'chatgpt',
+      tokens: { access_token: 'stale-token' },
+      last_refresh: '2026-08-04T06:00:00.000Z',
+      agent_identity: { id: 'stale-agent' },
+      personal_access_token: 'stale-pat',
+      bedrock_api_key: 'stale-bedrock-key',
+      custom: { keep: true },
+    }, null, 2) + '\n'
 
     const plan = planClientConfigRepair('codex', paths, {
       'codex-config': source,
@@ -47,8 +55,7 @@ describe('client configuration repair planning', () => {
     expect(config).toContain('custom_option = "keep-provider-option"')
     expect(config).toContain('model_provider = "stone"')
     expect(config).toContain('base_url = "http://127.0.0.1:15721/v1"')
-    expect(repairedAuth).toMatchObject({
-      tokens: { access_token: 'keep-token' },
+    expect(repairedAuth).toEqual({
       custom: { keep: true },
       auth_mode: 'apikey',
       OPENAI_API_KEY: target.token,
@@ -184,7 +191,10 @@ describe('ClientConfigService repair transaction', () => {
     expect(repaired).toContain('model_provider = "stone"')
     expect(repaired).toContain('base_url = "http://127.0.0.1:15721/v1"')
     expect(repaired).not.toContain('lost-closing-quote')
-    expect(JSON.parse(await readFile(service.paths.codex.auth.path, 'utf8')).tokens.refresh_token).toBe('keep')
+    expect(JSON.parse(await readFile(service.paths.codex.auth.path, 'utf8'))).toEqual({
+      auth_mode: 'apikey',
+      OPENAI_API_KEY: target.token,
+    })
     expect(JSON.stringify(result)).not.toContain(target.token)
   })
 

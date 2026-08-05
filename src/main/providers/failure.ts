@@ -1,6 +1,7 @@
 import type { ProviderFailure, ProviderFailureInput } from './types'
 
 const DEFAULT_RETRY_AFTER_MS = 30_000
+export const MAX_RETRY_AFTER_MS = 7 * 24 * 60 * 60_000
 
 export function classifyProviderFailure(input: ProviderFailureInput): ProviderFailure {
   const now = input.now ?? Date.now()
@@ -9,18 +10,26 @@ export function classifyProviderFailure(input: ProviderFailureInput): ProviderFa
   return classifyThrownFailure(input.error)
 }
 
-export function parseRetryAfter(headers: HeadersInit | undefined, now = Date.now()): number | undefined {
+export function parseRetryAfter(
+  headers: HeadersInit | undefined,
+  now = Date.now(),
+  maxMs = MAX_RETRY_AFTER_MS,
+): number | undefined {
   if (!headers) return undefined
   const value = new Headers(headers).get('retry-after')?.trim()
   if (!value) return undefined
 
   if (/^\d+(?:\.\d+)?$/.test(value)) {
     const seconds = Number(value)
-    return Number.isFinite(seconds) ? Math.max(0, Math.ceil(seconds * 1000)) : undefined
+    return Number.isFinite(seconds)
+      ? Math.min(maxMs, Math.max(0, Math.ceil(seconds * 1000)))
+      : undefined
   }
 
   const retryAt = Date.parse(value)
-  return Number.isFinite(retryAt) ? Math.max(0, retryAt - now) : undefined
+  return Number.isFinite(retryAt)
+    ? Math.min(maxMs, Math.max(0, retryAt - now))
+    : undefined
 }
 
 export function invalidResponseFailure(): ProviderFailure {

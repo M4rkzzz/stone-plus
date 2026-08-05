@@ -73,7 +73,7 @@ export function deserializeChatGptCredential(value: string): ChatGptCredentialBu
       ...(validString(parsed.refreshToken) ? { refreshToken: parsed.refreshToken.trim() } : {}),
       ...(validString(parsed.idToken) ? { idToken: parsed.idToken.trim() } : {}),
       ...(validString(parsed.userId) ? { userId: parsed.userId.trim() } : {}),
-      ...(validString(parsed.email) ? { email: parsed.email.trim() } : {})
+      ...(validString(parsed.email) ? { email: parsed.email.trim() } : {}),
     }
     const userId = chatGptUserId(bundle)
     return userId && !bundle.userId ? { ...bundle, userId } : bundle
@@ -203,7 +203,7 @@ function parseAccount(value: unknown): { bundle: ChatGptCredentialBundle; repair
       ...(refreshToken ? { refreshToken } : {}),
       ...(idToken ? { idToken } : {}),
       ...(userId ? { userId } : {}),
-      ...(email ? { email } : {})
+      ...(email ? { email } : {}),
     }
   }
 }

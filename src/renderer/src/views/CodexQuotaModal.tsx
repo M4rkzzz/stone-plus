@@ -94,6 +94,7 @@ export function CodexQuotaModal({
           <QuotaSummary label={t(`${longQuotaPeriod}额度`, `${longQuotaPeriod} quota`)} window={quota?.sevenDay} stale={stale} costUsd={cycleCosts.sevenDayUsd} unpricedTokens={cycleCosts.sevenDayUnpricedUsdTokens} />
         </div>
         <div className="quota-credit-note">{t('美元消耗按 OpenAI 当前官方 Token 费率由本地请求记录估算；左侧为已记录消耗，右侧为按额度使用比例推算的整周期消耗。缓存写入不计费，Fast 模式附加费不作猜测。', 'USD usage is estimated from local request logs using OpenAI’s current official token rate card. The left value is recorded usage and the right value projects the full cycle from the quota percentage. Cache writes are free; Fast-mode surcharges are not guessed.')}</div>
+        {quota?.resetCredits && <div className="quota-credit-note"><strong>{t(`可用额度重置券：${quota.resetCredits.availableCount}`, `Available quota reset credits: ${quota.resetCredits.availableCount}`)}</strong>{quota.resetCredits.expiresAt?.[0] ? ` · ${t('最近到期', 'Earliest expiry')} ${new Date(quota.resetCredits.expiresAt[0]).toLocaleString(locale)}` : ''}</div>}
         {quota?.limitReached && <div className="warning-banner"><Clock3 size={17} /><div><strong>{t('上游已标记额度耗尽', 'Upstream reports that the quota is exhausted')}</strong><span>{t('Stone+ 会按实际 429 重置时间冷却账号', 'Stone+ cools the account down until the reset time reported by the actual 429 response.')}</span></div></div>}
         <QuotaTrend
           label={t('5 小时额度 · 最近 24 小时', '5-hour quota · Last 24 hours')}

@@ -21,6 +21,7 @@ import { DatabaseSync } from 'node:sqlite'
 import type { CodexManagedSession, CodexSessionKind, CodexSessionQuery } from '@shared/types'
 import { acquireCodexSessionMaintenanceLock } from './session-maintenance-lock'
 import { findBlockingWindowsCodexPids } from './windows-codex-processes'
+import { codexStateDatabasePaths } from './state-database-paths'
 
 const ROLLOUT_PATTERN = /^rollout-.*\.jsonl$/i
 const TRASH_DIRECTORY = 'trash_sessions'
@@ -91,6 +92,7 @@ export class CodexSessionManager {
   private catalogRefresh?: Promise<void>
   private trashRecoveryChecked = false
   private titleIndexCache?: { mtimeMs: number; size: number; values: Map<string, string> }
+  private managedDatabasePaths = new Set<string>()
 
   public constructor(options: SessionManagerOptions) {
     this.codexHome = resolve(options.codexHome)
@@ -609,6 +611,7 @@ export class CodexSessionManager {
 
   private isManagedDatabasePath(path: string): boolean {
     const candidate = resolve(path)
+    if (this.managedDatabasePaths.has(databasePathKey(candidate))) return true
     if (candidate === resolve(this.codexHome, 'state_5.sqlite')) return true
     const sqliteRoot = resolve(this.codexHome, 'sqlite')
     return candidate.startsWith(`${sqliteRoot}${sep}`) && /\.(?:db|sqlite|sqlite3)$/i.test(candidate)
@@ -649,10 +652,17 @@ export class CodexSessionManager {
   }
 
   private async sessionDatabases(): Promise<string[]> {
-    const candidates = [join(this.codexHome, 'state_5.sqlite')]
+    let configText = ''
+    try {
+      configText = await readFile(join(this.codexHome, 'config.toml'), 'utf8')
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    }
+    const candidates = codexStateDatabasePaths(this.codexHome, configText)
     for (const entry of await readdir(join(this.codexHome, 'sqlite'), { withFileTypes: true }).catch(() => [])) {
       if (entry.isFile() && /\.(?:db|sqlite|sqlite3)$/i.test(entry.name)) candidates.push(join(this.codexHome, 'sqlite', entry.name))
     }
+    this.managedDatabasePaths = new Set(candidates.map(databasePathKey))
     const output: string[] = []
     for (const path of candidates) {
       if (!await fileExists(path)) continue
@@ -667,6 +677,9 @@ export class CodexSessionManager {
   }
 
   private async recoverTrashManifests(): Promise<void> {
+    // Populate the exact configured sqlite_home allowlist before validating a
+    // durable manifest left by an earlier process generation.
+    await this.sessionDatabases()
     const paths: string[] = []
     await collectFiles(join(this.codexHome, TRASH_DIRECTORY), paths, (name) => name.endsWith('.stone-trash.json'))
     if (!paths.length) return
@@ -736,6 +749,11 @@ export class CodexSessionManager {
     }
     return true
   }
+}
+
+function databasePathKey(path: string): string {
+  const normalized = resolve(path)
+  return process.platform === 'win32' ? normalized.toLowerCase() : normalized
 }
 
 async function parseRollout(path: string): Promise<ParsedRollout> {

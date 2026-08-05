@@ -9,6 +9,7 @@ import type {
   ChatGptDesktopController,
   CodexRepairAndRestartOptions,
 } from '../codex/repair-and-restart-service'
+import type { AgentLifecycleExecutionOptions } from './service'
 
 export type CodexAgentTarget = 'codex-desktop' | 'codex-cli'
 
@@ -177,8 +178,11 @@ export class CodexLifecycleAdapter {
     return this.serialize(() => this.closeUnlocked())
   }
 
-  restore(options: AgentRestoreOptions = {}): Promise<CodexRestoreResult> {
-    return this.serialize(() => this.restoreUnlocked(options))
+  restore(
+    options: AgentRestoreOptions = {},
+    execution: AgentLifecycleExecutionOptions = {},
+  ): Promise<CodexRestoreResult> {
+    return this.serialize(() => this.restoreUnlocked(options, execution))
   }
 
   start(options?: AgentStartOptions): Promise<void> {
@@ -225,14 +229,20 @@ export class CodexLifecycleAdapter {
     }
   }
 
-  private async restoreUnlocked(options: AgentRestoreOptions): Promise<CodexRestoreResult> {
+  private async restoreUnlocked(
+    options: AgentRestoreOptions,
+    execution: AgentLifecycleExecutionOptions,
+  ): Promise<CodexRestoreResult> {
     if (this.target === 'codex-desktop') {
       const before = await this.desktopProbe.inspect()
       const repairSessions = options.repairSessions !== false
       const repairWorkspaceIndex = options.repairWorkspaceIndex !== false
       if (repairSessions || repairWorkspaceIndex) {
         try {
-          await this.deepRepair.run({ preserveRunningState: options.preserveRunningState !== false })
+          await this.deepRepair.run(this.deepRepairOptions(
+            options.preserveRunningState !== false,
+            execution,
+          ))
         } catch (cause) {
           throw new CodexLifecycleOperationError(
             this.target,
@@ -278,7 +288,7 @@ export class CodexLifecycleAdapter {
       const repairWorkspaceIndex = options.repairWorkspaceIndex === true
       if (repairSessions || repairWorkspaceIndex) {
         try {
-          await this.deepRepair.run({ preserveRunningState: true }, configDirectories)
+          await this.deepRepair.run(this.deepRepairOptions(true, execution), configDirectories)
         } catch (cause) {
           throw new CodexLifecycleOperationError(
             this.target,
@@ -410,6 +420,19 @@ export class CodexLifecycleAdapter {
       errors.push(`restart verification: ${messageOf(cause)}`)
     }
     return errors
+  }
+
+  private deepRepairOptions(
+    preserveRunningState: boolean,
+    execution: AgentLifecycleExecutionOptions,
+  ): CodexRepairAndRestartOptions {
+    return {
+      preserveRunningState,
+      ...(execution.signal ? { signal: execution.signal } : {}),
+      ...(execution.onProgress ? {
+        onProgress: (progress) => execution.onProgress?.({ target: this.target, ...progress }),
+      } : {}),
+    }
   }
 
   private serialize<T>(operation: () => Promise<T>): Promise<T> {

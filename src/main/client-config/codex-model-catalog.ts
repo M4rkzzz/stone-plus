@@ -1,4 +1,5 @@
 import {
+  DEEPSEEK_RESPONSES_OFFICIAL_MODELS,
   DEEPSEEK_V4_FLASH_CONTEXT_WINDOW,
   DEEPSEEK_V4_FLASH_EFFECTIVE_CONTEXT_PERCENT,
 } from '@shared/deepseek'
@@ -7,11 +8,18 @@ import type { CodexModelRepairPolicy } from '@shared/codex-model-repair'
 export const STONE_CODEX_MODEL_CATALOG_FILENAME = 'stone-deepseek-model-catalog.json'
 
 const STONE_CODEX_BASE_INSTRUCTIONS = [
-  'You are a coding agent working in the user\'s workspace.',
-  'Use the tools declared by the client to inspect, edit, test, and finish the requested work.',
-  'Invoke tools through their structured interface; never print a tool call as prose or a code block.',
-  'Treat tool results as authoritative conversation state and preserve call identifiers and ordering.',
-  'Parallelize independent safe tool calls when useful, and continue until the task is genuinely complete.',
+  'You are Stone+ Codex, a coding agent collaborating with the user in their workspace.',
+  'Work through the task until the requested outcome is genuinely complete; do not stop after merely describing a change.',
+  'Use only tools declared by the client. Never invent a tool or print a tool call as prose, XML, JSON, or a code block.',
+  'For function tools, follow the declared JSON schema exactly. For freeform tools, send the raw tool input without a JSON wrapper.',
+  'The apply_patch tool accepts patch text directly. Put the patch in the tool call, never in an assistant message.',
+  'Inspect relevant files before editing, preserve unrelated user changes, and keep every modification scoped to the request.',
+  'Treat tool results as authoritative conversation state. Preserve tool call identifiers, result ordering, and parallel batches.',
+  'When independent read-only operations can run concurrently, issue them as parallel tool calls.',
+  'After editing, run focused verification appropriate to the risk and fix failures caused by your changes.',
+  'If a tool fails, reason from its actual error and try a safe alternative; never claim an action succeeded without evidence.',
+  'Do not synthesize hidden Continue messages or wait for the user when the next safe implementation step is already clear.',
+  'Protect credentials and private data: do not echo secrets in messages, commands, patches, or diagnostic output.',
 ].join('\n')
 
 const reasoningLevels = [
@@ -48,11 +56,11 @@ function catalogEntry(model: string) {
     max_context_window: DEEPSEEK_V4_FLASH_CONTEXT_WINDOW,
     effective_context_window_percent: DEEPSEEK_V4_FLASH_EFFECTIVE_CONTEXT_PERCENT,
     auto_compact_token_limit: null,
-    comp_hash: 'stone-deepseek-v1',
+    comp_hash: 'stone-deepseek-v2',
     reasoning_summary_format: 'experimental',
     default_reasoning_summary: 'none',
     display_name: displayName(model),
-    description: 'DeepSeek V4 Flash through Stone+ with native Codex tools.',
+    description: 'DeepSeek V4 through Stone+ with native Codex tools.',
     default_reasoning_level: 'max',
     supported_reasoning_levels: reasoningLevels,
     shell_type: 'shell_command',
@@ -88,7 +96,7 @@ export function deepSeekCodexCatalogModels(
   configuredModels: readonly unknown[],
   policy?: CodexModelRepairPolicy,
 ): string[] {
-  const models = new Set<string>(['deepseek-v4-flash'])
+  const models = new Set<string>(DEEPSEEK_RESPONSES_OFFICIAL_MODELS)
   for (const value of configuredModels) {
     if (typeof value === 'string' && value.trim()) models.add(value.trim())
   }

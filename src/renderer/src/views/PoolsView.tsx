@@ -14,7 +14,8 @@ import {
   Zap,
 } from 'lucide-react'
 import { supportsFastServiceTier, supportsPoolFastServiceTier } from '@shared/types'
-import type { AppSnapshot, GatewayApi, ModelPolicy, Pool, PoolInput, PoolProtocol, PoolStrategy } from '@shared/types'
+import type { AppSnapshot, GatewayApi, ModelPolicy, Pool, PoolInput, PoolProtocol, PoolStrategy, ReasoningEffort } from '@shared/types'
+import { REASONING_EFFORTS } from '@shared/reasoning-policy'
 import { accountMatchesPoolProtocol, accountPoolProtocol } from '@shared/pool-protocol'
 import { providerSourceFamily } from '@shared/source-family'
 import { routeReferencesSource } from '@shared/route-models'
@@ -64,6 +65,16 @@ const strategyLabelsEn: Record<PoolStrategy, string> = {
   'round-robin': 'Round robin',
   'weighted-random': 'Weighted random',
   'weighted-round-robin': 'Smooth weighted round robin',
+}
+
+const reasoningEffortLabels: Record<ReasoningEffort, string> = {
+  none: 'None',
+  minimal: 'Minimal',
+  low: 'Low',
+  medium: 'Medium',
+  high: 'High',
+  xhigh: 'XHigh',
+  max: 'Max',
 }
 
 const strategyDescriptionsEn: Record<PoolStrategy, string> = {
@@ -139,6 +150,8 @@ function emptyDraft(): PoolDraft {
     stickySessions: true,
     stickyTtlMinutes: 30,
     maxRetries: 2,
+    reasoningEffortMap: undefined,
+    reasoningEffortCap: undefined,
     forceFastMode: false,
     hedgedRequests: false,
     hedgeDelayMs: 2500,
@@ -213,6 +226,8 @@ export function PoolsView({
       stickySessions: pool.stickySessions,
       stickyTtlMinutes: pool.stickyTtlMinutes,
       maxRetries: pool.maxRetries,
+      reasoningEffortMap: pool.reasoningEffortMap ? { ...pool.reasoningEffortMap } : undefined,
+      reasoningEffortCap: pool.reasoningEffortCap,
       forceFastMode: pool.forceFastMode ?? false,
       hedgedRequests: pool.hedgedRequests ?? false,
       hedgeDelayMs: pool.hedgeDelayMs ?? 2500,
@@ -572,6 +587,31 @@ export function PoolsView({
               <div><strong>{t('会话粘性', 'Session stickiness')}<InfoTip text={t('同一会话优先复用已分配账号，减少上下文和缓存命中波动。', 'Prefer the assigned account for the same session to reduce context and cache-hit variability.')} /></strong></div>
               <button className={`toggle ${draft.stickySessions ? 'toggle--on' : ''}`} role="switch" aria-label={t('会话粘性', 'Session stickiness')} aria-checked={draft.stickySessions} type="button" onClick={() => setDraft({ ...draft, stickySessions: !draft.stickySessions })}><span /></button>
             </div>
+            <label className="field">
+              <span className="field-label-with-help">{t('推理强度上限', 'Reasoning effort cap')}<InfoTip text={t('先应用下方精确映射，再限制最高强度；不会把较低强度主动抬高。DeepSeek 使用来源自身的原生强度设置。', 'Apply exact mappings first, then cap the maximum effort without raising lower efforts. DeepSeek uses its source-native effort setting.')} /></span>
+              <select value={draft.reasoningEffortCap ?? ''} disabled={draftSourceFamily === 'deepseek'} onChange={(event) => setDraft({ ...draft, reasoningEffortCap: (event.target.value || undefined) as ReasoningEffort | undefined })}>
+                <option value="">{t('不限制', 'No cap')}</option>
+                {REASONING_EFFORTS.map((effort) => <option value={effort} key={effort}>{reasoningEffortLabels[effort]}</option>)}
+              </select>
+            </label>
+            <details className="field field--full" open={Boolean(draft.reasoningEffortMap && Object.keys(draft.reasoningEffortMap).length)}>
+              <summary>{t('高级：精确映射推理强度', 'Advanced: exact reasoning effort mapping')}</summary>
+              <div className="form-grid">
+                {REASONING_EFFORTS.map((effort) => <label className="field" key={effort}>
+                  <span>{reasoningEffortLabels[effort]}</span>
+                  <select disabled={draftSourceFamily === 'deepseek'} value={draft.reasoningEffortMap?.[effort] ?? ''} onChange={(event) => {
+                    const next = { ...(draft.reasoningEffortMap ?? {}) }
+                    const value = event.target.value as ReasoningEffort | ''
+                    if (!value || value === effort) delete next[effort]
+                    else next[effort] = value
+                    setDraft({ ...draft, reasoningEffortMap: Object.keys(next).length ? next : undefined })
+                  }}>
+                    <option value="">{t('保持原值', 'Keep original')}</option>
+                    {REASONING_EFFORTS.map((target) => <option value={target} key={target}>{reasoningEffortLabels[target]}</option>)}
+                  </select>
+                </label>)}
+              </div>
+            </details>
             <div className="field field--full inline-settings">
               <div><strong>{t('额度保护线', 'Quota reserve guard')}<InfoTip text={t('达到保留额度后停止从该号池选择账号；不影响正在传输的请求。', 'Stop selecting accounts from this pool when its reserve is reached. In-flight requests are not interrupted.')} /></strong></div>
               <button className={`toggle ${draft.quotaProtection ? 'toggle--on' : ''}`} role="switch" aria-label={t('额度保护线', 'Quota reserve guard')} aria-checked={Boolean(draft.quotaProtection)} type="button" onClick={() => setDraft({ ...draft, quotaProtection: draft.quotaProtection ? undefined : { fiveHourRemainingPercent: 10, sevenDayRemainingPercent: 10, unavailableBehavior: 'allow', staleAfterMinutes: 15 } })}><span /></button>

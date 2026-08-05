@@ -329,6 +329,14 @@ describe('ChatGPT web login bridge', () => {
       hasFloraFeature: true,
     })
     expect(lightAccount).not.toHaveProperty('gracePeriodId')
+    expect(parseChatGptLightAccount({
+      accounts: {
+        default: {
+          account: { account_id: 'personal-plus', structure: 'personal', plan_type: 'plus' },
+          entitlement: {},
+        },
+      },
+    }, 'legacy-api-identity', { requireExact: true })).toBeUndefined()
   })
 
   it('recognizes a changed application bootstrap but does not modify it unsafely', () => {

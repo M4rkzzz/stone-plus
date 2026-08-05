@@ -255,6 +255,18 @@ describe('Claude launch surface integration boundaries', () => {
     expect(source).toContain('registerClaudeDesktopApi(claudeDesktopCoordinator)')
   })
 
+  it('reclaims Codex-owned OAuth before a one-click Stone connection repair rewrites auth.json', () => {
+    const integrationSource = readFileSync(new URL('../../src/main/agent-lifecycle/integration.ts', import.meta.url), 'utf8')
+    const bootstrapSource = readFileSync(new URL('../../src/main/index.ts', import.meta.url), 'utf8')
+
+    expect(integrationSource).toMatch(
+      /beforeRepair:\s*async\s*\(\)\s*=>\s*\{\s*await options\.beforeDefaultCodexConnectionRepair\?\.\(\)\s*await prepareDefaultCodexConnection\(\)/,
+    )
+    expect(bootstrapSource).toContain(
+      'beforeDefaultCodexConnectionRepair: () => codexOfficialAuthBridge.reclaimCurrent()',
+    )
+  })
+
   it('repairs VSC configuration and opens only the fixed official extension URI', async () => {
     const openExternal = vi.fn(async () => undefined)
     const prepareRoute = vi.fn(async () => undefined)

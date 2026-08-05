@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto'
 import { readBoundedResponseText } from './bounded-response'
+import { runOAuthRefreshRequest } from './oauth-refresh-gate'
 
 export const GROK_OAUTH_BASE_URL = 'https://cli-chat-proxy.grok.com/v1'
 export const GROK_OAUTH_TOKEN_URL = 'https://auth.x.ai/oauth2/token'
@@ -208,7 +209,8 @@ export async function refreshGrokOAuthCredential(
   fetchImplementation: typeof fetch = fetch,
   options: { signal?: AbortSignal; timeoutMs?: number } = {},
 ): Promise<GrokOAuthCredentialBundle> {
-  if (!current.refreshToken) throw new Error('Grok OAuth account has no refresh token.')
+  const refreshToken = current.refreshToken
+  if (!refreshToken) throw new Error('Grok OAuth account has no refresh token.')
   const timeoutMs = Math.max(1, options.timeoutMs ?? DEFAULT_REFRESH_TIMEOUT_MS)
   const timeoutSignal = AbortSignal.timeout(timeoutMs)
   const signal = options.signal
@@ -216,16 +218,17 @@ export async function refreshGrokOAuthCredential(
     : timeoutSignal
   let response: Response
   try {
-    response = await fetchImplementation(GROK_OAUTH_TOKEN_URL, {
+    response = await runOAuthRefreshRequest('xai', signal, () => fetchImplementation(GROK_OAUTH_TOKEN_URL, {
       method: 'POST', redirect: 'error', signal,
       headers: { 'content-type': 'application/x-www-form-urlencoded', 'user-agent': 'stoneplus-grok-oauth/1.0' },
-      body: new URLSearchParams({ grant_type: 'refresh_token', client_id: current.clientId, refresh_token: current.refreshToken }),
-    })
+      body: new URLSearchParams({ grant_type: 'refresh_token', client_id: current.clientId, refresh_token: refreshToken }),
+    }))
   } catch {
     if (signal.aborted) throw new Error('Grok OAuth token refresh timed out.')
     throw new Error('Grok OAuth token endpoint could not be reached.')
   }
   if (!response.ok) {
+    await response.body?.cancel().catch(() => undefined)
     if (response.status === 400 || response.status === 401) {
       throw new GrokOAuthCredentialError('Grok OAuth refresh token was rejected.', 'revoked')
     }

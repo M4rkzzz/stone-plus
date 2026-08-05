@@ -78,12 +78,17 @@ export function registerCodexSessionRepairApi(
       ? officialLogin.clientConfig.withOverrides({ codexDirectory: profile.directory })
       : officialLogin.clientConfig
     let clientConfig: Awaited<ReturnType<ClientConfigService['restoreCodexOfficialLogin']>> | undefined
+    let backupGroupId: string | undefined
     const restarted = await repairAndRestart.run({
       targetProvider: 'openai',
       beforeRepair: async () => {
         clientConfig = await scoped.restoreCodexOfficialLogin({
           backupRetention: profile?.backupRetention ?? 10,
         })
+        backupGroupId = clientConfig.backups[0]?.groupId
+      },
+      rollbackBeforeRepair: async () => {
+        if (backupGroupId) await scoped.restoreBackupSet('codex', backupGroupId)
       },
     })
     if (!clientConfig) throw new Error('Codex official login configuration was not restored.')

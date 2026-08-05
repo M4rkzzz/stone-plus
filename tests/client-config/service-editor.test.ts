@@ -327,7 +327,6 @@ describe('ClientConfigService editor workflow', () => {
     expect(auth).toEqual({
       auth_mode: 'apikey',
       OPENAI_API_KEY: 'stone-codex-token',
-      tokens: { refresh_token: 'unrelated-auth-value' },
     })
     const backups = Object.fromEntries(await Promise.all(result.backups.map(async (backup) => [
       backup.role,

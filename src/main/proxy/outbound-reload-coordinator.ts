@@ -7,18 +7,28 @@ import { resolveRouteSource } from '@shared/route-sources'
 import { routeReferencedSourceIds } from '@shared/route-models'
 import {
   CHATGPT_CODEX_RESPONSES_URL,
-  codexQuotaIsExhausted
+  getChatGptCodexModelsUrl,
 } from '../providers'
 import type { AppStore } from '../store/app-store'
 import { resolveEffectiveProxy, type OutboundTransportManager } from './transport'
 
 export const EXTERNAL_SYSTEM_PROXY_DETECTION_TARGETS = Object.freeze([
   CHATGPT_CODEX_RESPONSES_URL,
-  'https://chatgpt.com/backend-api/codex/models?client_version=0.144.3',
+  getChatGptCodexModelsUrl(),
   'https://chatgpt.com/backend-api/wham/usage',
   'https://api.openai.com/v1/models',
   'https://auth.openai.com/.well-known/openid-configuration'
 ])
+
+function currentExternalSystemProxyDetectionTargets(): readonly string[] {
+  return [
+    CHATGPT_CODEX_RESPONSES_URL,
+    getChatGptCodexModelsUrl(),
+    'https://chatgpt.com/backend-api/wham/usage',
+    'https://api.openai.com/v1/models',
+    'https://auth.openai.com/.well-known/openid-configuration',
+  ]
+}
 
 export interface EnabledOutboundTarget {
   proxy: PublicProxyDefinition | undefined
@@ -150,7 +160,9 @@ export function createOutboundReloadCoordinator(
 }
 
 export function isAccountQuotaExhausted(account: Account, now = Date.now()): boolean {
-  if (codexQuotaIsExhausted(account.codexQuota, now)) return true
+  // Codex usage snapshots are advisory; only a real upstream rejection puts
+  // an OAuth account into quota cooldown.
+  if (account.cooldownReason === 'quota') return true
   if (!account.quota) return false
   return [
     account.quota.requests,
@@ -306,7 +318,7 @@ export class OutboundReloadCoordinator {
       ? targets
       : targets.filter((target) => target.proxy === undefined)
     const targetUrls = [...new Set([
-      ...(options.includeExternalBaselineTargets ? EXTERNAL_SYSTEM_PROXY_DETECTION_TARGETS : []),
+      ...(options.includeExternalBaselineTargets ? currentExternalSystemProxyDetectionTargets() : []),
       ...selectedTargets.map((target) => target.targetUrl)
     ])]
 

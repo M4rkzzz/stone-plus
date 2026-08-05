@@ -34,6 +34,8 @@ export interface ResolvedGatewayCredential {
   kind: 'api-key' | 'chatgpt-oauth' | 'chatgpt-agent-identity' | 'grok-oauth'
   accountId?: string
   fedramp?: boolean
+  /** Refreshes an OAuth access token rejected by upstream and returns a replacement credential. */
+  recoverRejectedAccess?: (rejectedAccessToken?: string) => Promise<ResolvedGatewayCredential>
   /** Re-registers an invalid Agent Identity task and returns a fresh assertion. */
   recoverInvalidTask?: (expectedTaskId?: string) => Promise<ResolvedGatewayCredential>
 }
@@ -54,6 +56,8 @@ export interface GatewayAccountState {
   status: AccountStatus
   circuitState: AccountCircuitState
   consecutiveFailures: number
+  /** Present only for an immediate model-local routing transition. */
+  modelCooldowns?: Account['modelCooldowns']
   cooldownUntil?: number
   cooldownReason?: 'quota' | 'failure'
   latencyMs?: number
@@ -89,6 +93,15 @@ export type GatewayRuntimeStateHandler = (update: GatewayRuntimeStateUpdate) => 
 
 export type ConversationTitleResolver = (conversationId: string) => Promise<string | undefined> | string | undefined
 
+export interface PersistedGrokVideoBinding {
+  requestId: string
+  accountId: string
+  poolId: string
+  routeId: string
+  model: string
+  expiresAt: number
+}
+
 export interface GatewayServerOptions {
   config: GatewayConfig
   credentialResolver: CredentialResolver
@@ -101,6 +114,8 @@ export interface GatewayServerOptions {
   loopbackFetchImplementation?: typeof fetch
   outboundFetchResolver?: OutboundFetchResolver
   conversationTitleResolver?: ConversationTitleResolver
+  loadGrokVideoBindings?: () => Promise<readonly PersistedGrokVideoBinding[]> | readonly PersistedGrokVideoBinding[]
+  saveGrokVideoBindings?: (bindings: readonly PersistedGrokVideoBinding[]) => Promise<void>
   now?: () => number
   random?: () => number
   /** Internal protocol-stall guard; primarily injectable for deterministic tests. */
@@ -135,6 +150,8 @@ export interface SchedulerSelectionInput {
   pool: Pool
   accounts: readonly Account[]
   model: string
+  /** Endpoint capability is authoritative even when the text-model catalog omits media/live ids. */
+  skipAccountModelCatalog?: boolean
   sessionId?: string
   /** Accounts already proven bad during this request's retry chain. */
   excludedAccountIds?: readonly string[]

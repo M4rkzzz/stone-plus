@@ -69,6 +69,47 @@ describe('CodexSessionManager', () => {
     restoredDatabase.close()
   })
 
+  it('updates a config-selected sqlite_home when trashing and restoring a session', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'stone-session-manager-relocated-'))
+    directories.push(home)
+    const sqliteHome = join(home, 'external-state')
+    const sessionDirectory = join(home, 'sessions')
+    await Promise.all([mkdir(sqliteHome), mkdir(sessionDirectory)])
+    await writeFile(
+      join(home, 'config.toml'),
+      `sqlite_home = '${sqliteHome.replace(/'/g, "''")}'\n`,
+      'utf8',
+    )
+    const sessionId = '01981234-1234-7123-8123-123456789acc'
+    const rollout = join(sessionDirectory, `rollout-${sessionId}.jsonl`)
+    await writeFile(rollout, `${JSON.stringify({
+      type: 'session_meta',
+      payload: { id: sessionId, model_provider: 'stone' },
+    })}\n`)
+    const databasePath = join(sqliteHome, 'state_5.sqlite')
+    const database = new DatabaseSync(databasePath)
+    database.exec('CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, archived INTEGER NOT NULL, archived_at INTEGER)')
+    database.prepare('INSERT INTO threads (id, rollout_path, archived) VALUES (?, ?, 0)')
+      .run(sessionId, rollout)
+    database.close()
+    const manager = new CodexSessionManager({ codexHome: home, blockingCodexPids: async () => [] })
+
+    let [session] = await manager.list()
+    let sessions = await manager.trash(sessionId, session.revision)
+    let relocated = new DatabaseSync(databasePath, { readOnly: true })
+    expect(relocated.prepare('SELECT archived FROM threads WHERE id = ?').get(sessionId))
+      .toEqual({ archived: 1 })
+    relocated.close()
+
+    session = sessions.find((item) => item.id === sessionId)!
+    sessions = await manager.restore(sessionId, session.revision)
+    expect(sessions.find((item) => item.id === sessionId)?.kind).toBe('active')
+    relocated = new DatabaseSync(databasePath, { readOnly: true })
+    expect(relocated.prepare('SELECT rollout_path, archived FROM threads WHERE id = ?').get(sessionId))
+      .toEqual({ rollout_path: rollout, archived: 0 })
+    relocated.close()
+  })
+
   it('ignores empty usage objects in favor of a valid cumulative snapshot', async () => {
     const home = await mkdtemp(join(tmpdir(), 'stone-session-manager-usage-'))
     directories.push(home)

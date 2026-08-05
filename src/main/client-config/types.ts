@@ -68,6 +68,27 @@ export interface ClientConnectionTarget {
   codexModelRepair?: CodexModelRepairPolicy
 }
 
+/** Complete ChatGPT login material written to Codex's official file-backed auth cache. */
+export interface CodexOfficialAccountCredential {
+  accessToken: string
+  refreshToken: string
+  idToken: string
+  accountId: string
+  lastRefreshAt: number
+  /** Account-specific model catalog returned by the official Codex endpoint. */
+  availableModels?: string[]
+}
+
+/** Complete ChatGPT token bundle currently owned and rotated by Codex itself. */
+export interface CodexOfficialAccountAuthSnapshot {
+  accessToken: string
+  refreshToken: string
+  idToken: string
+  accountId: string
+  /** Parsed from auth.json `last_refresh` when Codex persisted one. */
+  lastRefreshAt?: number
+}
+
 export type ExistingClientConfig = Partial<Record<ClientConfigFileRole, string>>
 
 export interface PlannedFileMutation extends ClientConfigFilePath {

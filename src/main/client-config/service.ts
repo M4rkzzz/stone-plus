@@ -1,7 +1,9 @@
 import { mkdir, open, readdir, readFile, rm } from 'node:fs/promises'
 import { basename, dirname, resolve } from 'node:path'
 import { allClientFiles, clientDirectory, clientFiles, resolveClientConfigPaths } from './paths'
-import { planClientConfig, planClientConfigRepair, planCodexOfficialLoginConfig } from './planners'
+import { planClientConfig, planClientConfigRepair, planCodexOfficialAccountConfig, planCodexOfficialLoginConfig } from './planners'
+import { parseCodexToml } from './toml-format'
+import { parseJsonObject } from './json-format'
 import { applyClientConfigFieldPatches, clientConfigEditorFields } from './catalog'
 import { createClientConfigEditorFile, restoreClientConfigEditorContent, revisionOf } from './editor'
 import { atomicWriteFile, copyExclusive, pathStat, readTextIfPresent } from './filesystem'
@@ -19,6 +21,8 @@ import type {
   ClientConfigServiceOptions,
   CreateBackupSetResult,
   ClientConnectionTarget,
+  CodexOfficialAccountAuthSnapshot,
+  CodexOfficialAccountCredential,
   DetectedClientConfig,
   ExistingClientConfig,
   ResolvedClientConfigPaths,
@@ -273,6 +277,74 @@ export class ClientConfigService {
     })
   }
 
+  /** Transactionally select one exact renewable ChatGPT account for official Codex. */
+  async activateCodexOfficialAccount(
+    credential: CodexOfficialAccountCredential,
+    options: ClientConfigApplyOptions = {},
+  ): Promise<ApplyClientConfigResult> {
+    return runConfigMutation(async () => {
+      const existing = await this.readExisting('codex')
+      const plan = planCodexOfficialAccountConfig(this.paths.codex, existing, credential)
+      return this.applyPlan('codex', plan, options, existing)
+    })
+  }
+
+  /**
+   * Reads only a complete file-backed ChatGPT login. This is intentionally a
+   * main-process API: Codex can rotate a single-use refresh token in auth.json,
+   * and the switch coordinator must reclaim it before replacing that file.
+   */
+  async readCodexOfficialAccountAuth(): Promise<CodexOfficialAccountAuthSnapshot | undefined> {
+    // Managed writes use atomic rename, so an unlocked reader observes either
+    // the complete old generation or the complete new one. Keeping this small
+    // hot-path read outside the mutation queue avoids serializing concurrent
+    // gateway requests behind unrelated client configuration work.
+    const content = await readTextIfPresent(this.paths.codex.auth.path)
+    if (content === undefined) return undefined
+    const root = parseJsonObject(content, 'codex-auth')
+    if (root.auth_mode !== 'chatgpt') return undefined
+    const tokens = root.tokens
+    if (!tokens || typeof tokens !== 'object' || Array.isArray(tokens)) return undefined
+    const record = tokens as Record<string, unknown>
+    const accessToken = nonEmptyString(record.access_token)
+    const refreshToken = nonEmptyString(record.refresh_token)
+    const idToken = nonEmptyString(record.id_token)
+    const accountId = nonEmptyString(record.account_id)
+    if (!accessToken || !refreshToken || !idToken || !accountId) return undefined
+    const lastRefresh = nonEmptyString(root.last_refresh)
+    const lastRefreshAt = lastRefresh ? Date.parse(lastRefresh) : Number.NaN
+    return {
+      accessToken,
+      refreshToken,
+      idToken,
+      accountId,
+      ...(Number.isFinite(lastRefreshAt) && lastRefreshAt > 0 ? { lastRefreshAt } : {}),
+    }
+  }
+
+  /** Parse and validate the current Codex files without changing or closing the app. */
+  async validateCodexOfficialAccountActivation(
+    credential: CodexOfficialAccountCredential,
+  ): Promise<{ requiresSessionRepair: boolean }> {
+    return runConfigMutation(async () => {
+      const existing = await this.readExisting('codex')
+      planCodexOfficialAccountConfig(this.paths.codex, existing, credential)
+      const configContent = existing['codex-config'] ?? ''
+      const current = parseCodexToml(configContent)
+      const provider = typeof current.model_provider === 'string' && current.model_provider.trim()
+        ? current.model_provider.trim()
+        : 'openai'
+      const providers = current.model_providers
+      const hasStoneProvider = typeof providers === 'object'
+        && providers !== null
+        && !Array.isArray(providers)
+        && Object.prototype.hasOwnProperty.call(providers, 'stone')
+      return {
+        requiresSessionRepair: !configContent.trim() || provider !== 'openai' || hasStoneProvider,
+      }
+    })
+  }
+
   private async applyPlan(
     client: SupportedClient,
     plan: ClientConfigPlan,
@@ -294,6 +366,10 @@ export class ClientConfigService {
         await this.assertMatchesBackup(change, backups.find((backup) => backup.role === change.role))
         await atomicWriteFile(change.path, change.content, this.randomId, change.containsCredential)
         written.push(change)
+        const persisted = await readFile(change.path)
+        if (!persisted.equals(Buffer.from(change.content, 'utf8'))) {
+          throw new ClientConfigValidationError('Client configuration could not be verified after writing.')
+        }
       }
     } catch (error) {
       const rollbackFailures = await this.rollback(written, backups, plan)
@@ -850,6 +926,10 @@ export class ClientConfigService {
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined
 }
 
 function backupSequence(path: string): number {

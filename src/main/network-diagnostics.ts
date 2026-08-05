@@ -5,6 +5,7 @@ import type {
   NetworkDiagnosticStatus,
   NetworkDiagnosticTargetResult
 } from '../shared/types'
+import { getChatGptCodexModelsUrl } from './providers'
 
 const TEST_TIMEOUT_MS = 10_000
 const CHATGPT_HOST = 'chatgpt.com'
@@ -38,7 +39,7 @@ const BUILT_IN_PROXY_DIAGNOSES: Readonly<Record<BuiltInProxyDiagnosticCategory, 
 
 export const NETWORK_DIAGNOSTIC_HTTP_TARGETS = Object.freeze([
   { id: 'chatgpt-web', label: 'ChatGPT 网站', url: 'https://chatgpt.com/' },
-  { id: 'codex-models', label: 'Codex 模型接口', url: 'https://chatgpt.com/backend-api/codex/models?client_version=0.144.3' },
+  { id: 'codex-models', label: 'Codex 模型接口', get url() { return getChatGptCodexModelsUrl() } },
   { id: 'codex-usage', label: 'Codex 额度接口', url: 'https://chatgpt.com/backend-api/wham/usage' },
   { id: 'openai-auth', label: 'OpenAI OAuth', url: 'https://auth.openai.com/.well-known/openid-configuration' }
 ])
