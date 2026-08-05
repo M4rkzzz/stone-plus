@@ -162,10 +162,18 @@ try {
   const bootSnapshot = await window.evaluate(() => window.stone.getSnapshot())
   const originalOutboundNetworkMode = bootSnapshot.gateway.outboundNetworkMode ?? 'direct'
   const initialBuiltInProxyState = await window.evaluate(() => window.stone.getBuiltInProxyState())
+  const waitForExternalProxySurface = async () => {
+    const toolbarLabel = window.locator('.proxy-toolbar').getByText('可复用代理', { exact: true })
+    const emptyState = window.getByText('尚未配置代理', { exact: true })
+    await Promise.all([
+      toolbarLabel.waitFor({ state: 'visible', timeout: 30_000 }),
+      emptyState.waitFor({ state: 'visible', timeout: 30_000 }),
+    ])
+    return await toolbarLabel.isVisible() && await emptyState.isVisible()
+  }
   await window.locator('.nav-item').filter({ hasText: /^代理$/ }).click()
   await window.getByRole('heading', { name: '代理', exact: true }).waitFor()
-  const externalProxySurfaceVisible = await window.locator('.proxy-toolbar').getByText('可复用代理', { exact: true }).isVisible()
-    && await window.getByText('尚未配置代理', { exact: true }).isVisible()
+  const externalProxySurfaceVisible = await waitForExternalProxySurface()
   const enableBuiltInProxy = window.getByRole('switch', { name: '开启内置代理' })
   await enableBuiltInProxy.click()
   const builtInProxyMaster = window.locator('.built-in-proxy-master')
@@ -208,8 +216,7 @@ try {
   )), originalOutboundNetworkMode)
   const disabledBuiltInProxyState = await window.evaluate(() => window.stone.getBuiltInProxyState())
   const disabledBuiltInProxySnapshot = await window.evaluate(() => window.stone.getSnapshot())
-  const externalProxySurfaceRestored = await window.locator('.proxy-toolbar').getByText('可复用代理', { exact: true }).isVisible()
-    && await window.getByText('尚未配置代理', { exact: true }).isVisible()
+  const externalProxySurfaceRestored = await waitForExternalProxySurface()
   const initial = await window.evaluate(({ settings, port }) => window.stone.updateGateway({
     ...settings,
     port,
