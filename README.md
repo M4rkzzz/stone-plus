@@ -4,7 +4,7 @@
 
 <h1 align="center">StonePlus</h1>
 
-<p align="center"><strong>StonePlus（应用内保留 Stone+ 品牌）：把多个 AI 账号、API 与编程客户端，收进一个本地智能网关（加群+975259186！！）</strong></p>
+<p align="center"><strong>StonePlus（加群+975259186！！）：把多个 AI 账号、API 与编程客户端，收进一个本地智能网关（加群+975259186！！）</strong></p>
 
 <p align="center">
   <a href="README.en.md">English</a> · <strong>简体中文</strong>
