@@ -6911,6 +6911,12 @@ html.is-electron .boot-screen { background: var(--app-chrome); }
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
   }
+
+  /* The online ring is decorative, so do not leave a static halo behind
+     when reduced motion is requested. */
+  .status-dot--pulse::after {
+    display: none !important;
+  }
 }
 .codex-session-manager { margin-bottom:16px; overflow:hidden; }
 .codex-session-manager > header { display:flex; justify-content:space-between; align-items:center; padding:14px 18px; border-bottom:1px solid var(--border); }
@@ -7291,6 +7297,10 @@ html.low-resource-mode *::after {
 html.low-resource-mode .spin {
   animation-duration: 900ms !important;
   animation-iteration-count: infinite !important;
+}
+
+html.low-resource-mode .status-dot--pulse::after {
+  display: none !important;
 }
 
 .operation-center {

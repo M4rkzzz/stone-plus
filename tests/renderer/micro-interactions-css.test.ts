@@ -74,6 +74,8 @@ describe('renderer micro-interaction CSS contract', () => {
     expect(reducedMotion).toContain('transition-duration: 0.01ms !important')
     expect(reducedMotion).toContain('animation-duration: 0.01ms !important')
     expect(reducedMotion).toContain('animation-iteration-count: 1 !important')
+    expect(reducedMotion).toContain('.status-dot--pulse::after')
+    expect(reducedMotion).toContain('display: none !important')
   })
 
   it('turns decorative motion off in low-resource mode while retaining the functional spinner', () => {
@@ -87,5 +89,7 @@ describe('renderer micro-interaction CSS contract', () => {
     expect(lowResource).toContain('transition-duration: 1ms !important')
     expect(lowResource).toContain('html.low-resource-mode .spin')
     expect(lowResource).toContain('animation-iteration-count: infinite !important')
+    expect(lowResource).toContain('html.low-resource-mode .status-dot--pulse::after')
+    expect(lowResource).toContain('display: none !important')
   })
 })
