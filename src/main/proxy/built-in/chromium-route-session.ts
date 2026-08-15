@@ -128,7 +128,7 @@ function routesToMixed(resolution: string, endpoint: string): boolean {
   const expectedPort = url.port
   return resolution.split(';').some((rawDirective) => {
     const directive = rawDirective.trim()
-    const match = /^(?:PROXY|HTTPS|SOCKS|SOCKS5)\s+(.+):(\d+)$/i.exec(directive)
+    const match = /^(?:PROXY|HTTPS|SOCKS|SOCKS4|SOCKS5)\s+(.+):(\d+)$/i.exec(directive)
     if (!match) return false
     const host = match[1].replace(/^\[|\]$/g, '').toLowerCase()
     return host === expectedHost && match[2] === expectedPort

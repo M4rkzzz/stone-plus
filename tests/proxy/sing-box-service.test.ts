@@ -285,6 +285,17 @@ describe('SingBoxService', () => {
       .rejects.toThrow(/Fetch network policy/)
   })
 
+  it('rejects a Fetch-forbidden mixed listener before starting sing-box', async () => {
+    const directory = await temporaryDirectory()
+    const harness = createHarness(directory)
+
+    await expect(harness.service.start({ config: {}, mixedPort: 10_080, controllerPort: 20_802 }))
+      .rejects.toMatchObject({ code: 'mixed_port' })
+    expect(harness.reservePort).not.toHaveBeenCalled()
+    expect(harness.spawnProcess).not.toHaveBeenCalled()
+    expect(harness.fetchImplementation).not.toHaveBeenCalled()
+  })
+
   it('reports a retained route-owner exit even while a candidate is childContext', async () => {
     const directory = await temporaryDirectory()
     const harness = createHarness(directory)

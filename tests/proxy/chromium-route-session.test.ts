@@ -53,6 +53,20 @@ describe('built-in Chromium mixed session generation', () => {
     expect(closeAllConnections).toHaveBeenCalledOnce()
   })
 
+  it('accepts every Chromium proxy directive that points at the checked mixed port', async () => {
+    const generation = await createChromiumMixedSessionGeneration({
+      mixedEndpoint: 'http://127.0.0.1:23458',
+      createSession: () => ({
+        setProxy: vi.fn(async () => undefined),
+        forceReloadProxyConfig: vi.fn(async () => undefined),
+        resolveProxy: vi.fn(async () => 'SOCKS4 127.0.0.1:23458'),
+        closeAllConnections: vi.fn(async () => undefined),
+      }) as never,
+    })
+
+    await expect(generation.dispose()).resolves.toBeUndefined()
+  })
+
   it('bounds disposal even when Chromium never closes connections or resets the proxy', async () => {
     const never = new Promise<void>(() => undefined)
     const setProxy = vi.fn()

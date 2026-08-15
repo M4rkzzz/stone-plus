@@ -76,7 +76,44 @@ export function isLoopbackHostname(hostname: string): boolean {
   const normalized = hostname.replace(/^\[|\]$/g, '').toLowerCase()
   if (normalized === 'localhost' || normalized === '::1') return true
   if (isIP(normalized) === 4) return normalized.startsWith('127.')
+  // WHATWG URL canonicalizes IPv4-mapped IPv6 literals (for example
+  // ::ffff:127.0.0.1 becomes ::ffff:7f00:1). Treat the mapped IPv4 payload
+  // as loopback too; otherwise a local control endpoint can evade every
+  // loopback bypass and ownership check by using its IPv6 spelling.
+  if (isIP(normalized) === 6) {
+    const words = parseIpv6Words(normalized)
+    if (
+      words
+      && words.slice(0, 5).every((word) => word === 0)
+      && words[5] === 0xffff
+    ) {
+      const first = words[6] >>> 8
+      const second = words[6] & 0xff
+      const third = words[7] >>> 8
+      const fourth = words[7] & 0xff
+      return first === 127
+        && second >= 0
+        && third >= 0
+        && fourth >= 0
+    }
+  }
   return false
+}
+
+function parseIpv6Words(value: string): number[] | undefined {
+  const sections = value.split('::')
+  if (sections.length > 2) return undefined
+  const left = sections[0] ? sections[0].split(':') : []
+  const right = sections.length === 2 && sections[1] ? sections[1].split(':') : []
+  if ([...left, ...right].some((part) => !/^[0-9a-f]{1,4}$/.test(part))) return undefined
+  const missing = 8 - left.length - right.length
+  if (sections.length === 1 && missing !== 0) return undefined
+  if (sections.length === 2 && missing < 1) return undefined
+  return [
+    ...left.map((part) => Number.parseInt(part, 16)),
+    ...(sections.length === 2 ? Array.from({ length: missing }, () => 0) : []),
+    ...right.map((part) => Number.parseInt(part, 16))
+  ]
 }
 
 function proxyProtocol(keyword: string): ProxyProtocol {

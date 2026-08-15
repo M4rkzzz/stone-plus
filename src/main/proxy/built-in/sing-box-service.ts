@@ -729,9 +729,11 @@ export class SingBoxService {
     host: string
   ): Promise<LoopbackPortLease> {
     try {
-      return code === 'controller_port'
-        ? await reserveFetchSafeLoopbackPort(requestedPort, host, this.reservePort)
-        : await this.reservePort(requestedPort, host)
+      // Both listeners are consumed through Chromium/WHATWG Fetch: the mixed
+      // endpoint carries application traffic and the controller is probed via
+      // fetch during startup. Reserve a port that Fetch will actually accept
+      // for either listener, including automatic OS allocation.
+      return await reserveFetchSafeLoopbackPort(requestedPort, host, this.reservePort)
     } catch (error) {
       const label = code === 'mixed_port' ? 'Mixed' : 'Controller'
       const requested = requestedPort ? ` ${requestedPort}` : ''

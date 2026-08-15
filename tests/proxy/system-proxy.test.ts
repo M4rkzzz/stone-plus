@@ -48,6 +48,14 @@ describe('system proxy PAC parsing', () => {
     expect(isLocalTarget('http://localhost:15721/v1')).toBe(true)
     expect(isLocalTarget('http://127.99.2.1/test')).toBe(true)
     expect(isLocalTarget('http://[::1]/test')).toBe(true)
+    expect(isLocalTarget('http://[::ffff:127.0.0.1]/test')).toBe(true)
     expect(isLocalTarget('https://chatgpt.com/')).toBe(false)
+  })
+
+  it('blocks IPv4-mapped loopback proxy endpoints from Stone-owned ports', () => {
+    const chain = parseSystemProxyChain('PROXY [::ffff:127.0.0.1]:15721; DIRECT', {
+      blockedLoopbackPorts: [15721]
+    })
+    expect(chain).toEqual([{ kind: 'direct' }])
   })
 })
