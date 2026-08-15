@@ -2527,6 +2527,58 @@ describe('GatewayServer', () => {
     expect(JSON.parse(String(request.body))).toMatchObject({ store: false, stream: true, service_tier: 'priority' })
   })
 
+  it('sanitizes legacy relay item ids when a migrated Codex thread uses ChatGPT OAuth', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers[0].protocol = 'openai-responses'
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    gatewayConfig.accounts[0] = {
+      ...gatewayConfig.accounts[0],
+      credentialType: 'chatgpt-oauth',
+      chatgptAccountId: 'acct-migrated',
+      credentialExpiresAt: timestamp + 3_600_000
+    }
+    gatewayConfig.accounts[1].status = 'disabled'
+    const stream = 'data: {"type":"response.completed","response":{"id":"resp_migrated","status":"completed","output":[]}}\n\n'
+    const upstreamFetch = vi.fn(async () => new Response(stream, {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream' }
+    }))
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => ({ secret: 'oauth-migrated', kind: 'chatgpt-oauth', accountId: 'acct-migrated' }),
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'source-model',
+        input: [
+          { type: 'message', id: 'item_user-message', role: 'user', content: [{ type: 'input_text', text: 'continue' }] },
+          { type: 'reasoning', id: 'item_old-reasoning', summary: [] },
+          { type: 'message', id: 'item_assistant-message', role: 'assistant', content: [{ type: 'output_text', text: 'old' }] },
+          { type: 'custom_tool_call', id: 'item_tool-call', call_id: 'call_tool', name: 'exec', input: 'dir' },
+          { type: 'custom_tool_call_output', id: 'ctco_tool-output', call_id: 'call_tool', output: 'ok' }
+        ],
+        stream: true
+      })
+    })
+
+    expect(response.status).toBe(200)
+    const forwarded = JSON.parse(String(upstreamFetch.mock.calls[0][1]?.body)) as Record<string, unknown>
+    expect(forwarded.input).toEqual([
+      { type: 'message', id: 'msg_user-message', role: 'user', content: [{ type: 'input_text', text: 'continue' }] },
+      { type: 'message', id: 'msg_assistant-message', role: 'assistant', content: [{ type: 'output_text', text: 'old' }] },
+      { type: 'custom_tool_call', id: 'ctc_tool-call', call_id: 'call_tool', name: 'exec', input: 'dir' },
+      { type: 'custom_tool_call_output', id: 'ctco_tool-output', call_id: 'call_tool', output: 'ok' }
+    ])
+  })
+
   it('bridges Codex tools to a DeepSeek Chat relay and applies its source-level effort', async () => {
     const port = await freePort()
     const gatewayConfig = config(port)
@@ -9241,6 +9293,228 @@ describe('GatewayServer', () => {
     expect(gateway.getStatus()).toMatchObject({ activeRequests: 0, successRequests: 0 })
   })
 
+  it('aggregates a mislabeled Responses SSE body for a buffered relay request', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers[0] = {
+      ...gatewayConfig.providers[0],
+      sourceType: 'relay',
+      protocol: 'openai-responses'
+    }
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    gatewayConfig.accounts[1].status = 'disabled'
+    gatewayConfig.pools[0].maxRetries = 0
+    const upstreamFetch = vi.fn(async () => new Response([
+      'event: response.completed',
+      'data: {"type":"response.completed","response":{"id":"resp_adaptive_sse","object":"response","model":"source-model","status":"completed","output":[]}}',
+      '',
+      ''
+    ].join('\n'), {
+      status: 200,
+      // The relay claims JSON even though the wire is SSE.
+      headers: { 'content-type': 'application/json' }
+    }))
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'credential',
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'source-model', input: 'Hello', stream: false })
+    })
+
+    expect(response.status).toBe(200)
+    expect(await response.json()).toMatchObject({ id: 'resp_adaptive_sse', status: 'completed' })
+    expect(upstreamFetch).toHaveBeenCalledOnce()
+  })
+
+  it('recovers a relay HTML response before output even when ordinary retries are disabled', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers[0] = {
+      ...gatewayConfig.providers[0],
+      sourceType: 'relay',
+      protocol: 'openai-responses'
+    }
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    gatewayConfig.accounts[1].status = 'disabled'
+    gatewayConfig.pools[0].maxRetries = 0
+    let attempt = 0
+    const upstreamFetch = vi.fn(async () => {
+      attempt += 1
+      if (attempt === 1) {
+        return new Response('<html>temporary edge page</html>', {
+          status: 200,
+          headers: { 'content-type': 'text/html' }
+        })
+      }
+      return new Response(JSON.stringify({
+        id: 'resp_after_html',
+        object: 'response',
+        model: 'source-model',
+        status: 'completed',
+        output: []
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    })
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'credential',
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'source-model', input: 'Hello', stream: false })
+    })
+
+    expect(response.status).toBe(200)
+    expect(await response.json()).toMatchObject({ id: 'resp_after_html', status: 'completed' })
+    expect(upstreamFetch).toHaveBeenCalledTimes(2)
+  })
+
+  it('does not retry a buffered relay after semantic output has started', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers[0] = {
+      ...gatewayConfig.providers[0],
+      sourceType: 'relay',
+      protocol: 'openai-responses'
+    }
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    gatewayConfig.accounts[1].status = 'disabled'
+    gatewayConfig.pools[0].maxRetries = 0
+    const upstreamFetch = vi.fn(async () => new Response([
+      'event: response.created',
+      'data: {"type":"response.created","response":{"id":"resp_partial","status":"in_progress"}}',
+      '',
+      'event: response.output_text.delta',
+      'data: {"type":"response.output_text.delta","response_id":"resp_partial","output_index":0,"content_index":0,"delta":"already generated"}',
+      '',
+      ''
+    ].join('\n'), {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream' }
+    }))
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'credential',
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'source-model', input: 'Hello', stream: false })
+    })
+
+    expect(response.status).toBe(502)
+    expect(await response.json()).toMatchObject({ error: { type: 'incomplete_stream' } })
+    expect(upstreamFetch).toHaveBeenCalledOnce()
+  })
+
+  it('retries an invalid relay stream before committing any bytes to Codex', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers[0] = {
+      ...gatewayConfig.providers[0],
+      sourceType: 'relay',
+      protocol: 'openai-responses'
+    }
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    gatewayConfig.accounts[1].status = 'disabled'
+    gatewayConfig.pools[0].maxRetries = 0
+    let attempt = 0
+    const upstreamFetch = vi.fn(async () => {
+      attempt += 1
+      if (attempt === 1) {
+        return new Response('<html>temporary edge page</html>', {
+          status: 200,
+          headers: { 'content-type': 'text/html' }
+        })
+      }
+      return new Response([
+        'event: response.completed',
+        'data: {"type":"response.completed","response":{"id":"resp_stream_recovered","object":"response","model":"source-model","status":"completed","output":[]}}',
+        '',
+        ''
+      ].join('\n'), {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' }
+      })
+    })
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'credential',
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'source-model', input: 'Hello', stream: true })
+    })
+    const wire = await response.text()
+
+    expect(response.status).toBe(200)
+    expect(wire).toContain('resp_stream_recovered')
+    expect(wire).not.toContain('<html>')
+    expect(upstreamFetch).toHaveBeenCalledTimes(2)
+  })
+
+  it('retries a non-JSON relay 52x with a bounded budget and never reflects its HTML', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers[0] = {
+      ...gatewayConfig.providers[0],
+      sourceType: 'relay',
+      protocol: 'openai-responses'
+    }
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    gatewayConfig.accounts[1].status = 'disabled'
+    gatewayConfig.pools[0].maxRetries = 0
+    const upstreamFetch = vi.fn(async () => new Response(
+      '<html>edge-secret-marker</html>',
+      { status: 524, headers: { 'content-type': 'text/html' } }
+    ))
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'credential',
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'source-model', input: 'Hello', stream: false })
+    })
+    const wire = await response.text()
+
+    expect(response.status).toBe(524)
+    expect(upstreamFetch).toHaveBeenCalledTimes(3)
+    expect(wire).toContain('upstream_non_json_response')
+    expect(wire).not.toContain('edge-secret-marker')
+    expect(wire).not.toContain('<html>')
+  })
+
   it('rejects a malformed successful search response without reporting account success', async () => {
     const port = await freePort()
     const gatewayConfig = config(port)
@@ -9710,6 +9984,9 @@ describe('GatewayServer', () => {
     expect(wire).toContain('response.output_text.delta')
     expect(wire).toContain('event: error')
     expect(wire).toContain('"type":"error"')
+    expect(wire).toContain('event: response.failed')
+    expect(wire).toContain('"id":"resp_early_eof"')
+    expect(wire).toContain('"status":"failed"')
     expect(wire).toContain('Upstream stream ended before a terminal event')
     expect([...logs].reverse().find((log) => log.status !== 'streaming')).toMatchObject({
       status: 'error',
@@ -10006,6 +10283,9 @@ describe('GatewayServer', () => {
     expect(response.status).toBe(200)
     expect(wire).toContain('event: error')
     expect(wire).toContain('"type":"error"')
+    expect(wire).toContain('event: response.failed')
+    expect(wire).toContain('"id":"resp_idle"')
+    expect(wire).toContain('"status":"failed"')
     expect(wire).toContain('upstream_stream_idle_timeout')
     expect([...logs].reverse().find((log) => log.status !== 'streaming')).toMatchObject({
       status: 'error',

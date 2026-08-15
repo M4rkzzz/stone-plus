@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Clock3, LoaderCircle, RefreshCw } from 'lucide-react'
+import { CODEX_QUOTA_HISTORY_RETENTION_MS } from '@shared/types'
 import type { AppSnapshot, CodexQuotaCycleCosts, CodexQuotaHistoryPoint, CodexQuotaWindow, GatewayApi } from '@shared/types'
 import type { ActionRunner } from '../App'
 import { formatAccountQuotaUsd } from '../account-quota'
@@ -36,7 +37,7 @@ export function CodexQuotaModal({
     try {
       const end = Date.now()
       const [points, costs] = await Promise.all([
-        api.getAccountCodexQuotaHistory(accountId, end - 14 * 24 * 60 * 60 * 1000, end),
+        api.getAccountCodexQuotaHistory(accountId, end - CODEX_QUOTA_HISTORY_RETENTION_MS, end),
         api.getAccountCodexQuotaCycleCosts(accountId),
       ])
       setHistory(points)
@@ -78,8 +79,23 @@ export function CodexQuotaModal({
 
   const quota = account?.codexQuota
   const stale = quota ? Date.now() - quota.observedAt > 10 * 60 * 1000 : false
-  const longQuotaPeriodZh = codexLongQuotaPeriodLabel(quota?.sevenDay?.windowSeconds)
+  const longWindow = quota?.sevenDay ?? quota?.monthly
+  const exhausted = quotaExhaustionIsCurrent(quota)
+  const longQuotaPeriodZh = codexLongQuotaPeriodLabel(longWindow?.windowSeconds)
   const longQuotaPeriod = t(longQuotaPeriodZh, longQuotaPeriodZh === '月' ? 'Monthly' : 'Weekly')
+  const consumeResetCredit = useCallback(async () => {
+    if (!accountId) return
+    const confirmed = window.confirm(t(
+      '确定消耗 1 张额度重置券吗？此操作会立即在上游重置 Codex 额度，无法撤销。',
+      'Consume one quota reset credit? This resets Codex quota upstream immediately and cannot be undone.',
+    ))
+    if (!confirmed) return
+    const success = await runAction(
+      `consume-quota-credit-${accountId}`,
+      () => api.consumeAccountCodexResetCredit(accountId),
+    )
+    if (success) await loadHistory(accountId)
+  }, [accountId, api, loadHistory, runAction, t])
   return (
     <Modal
       open={Boolean(account)}
@@ -91,11 +107,27 @@ export function CodexQuotaModal({
       <div className="quota-modal">
         <div className="quota-summary-grid">
           <QuotaSummary label={t('5 小时额度', '5-hour quota')} window={quota?.fiveHour} stale={stale} costUsd={cycleCosts.fiveHourUsd} unpricedTokens={cycleCosts.fiveHourUnpricedUsdTokens} />
-          <QuotaSummary label={t(`${longQuotaPeriod}额度`, `${longQuotaPeriod} quota`)} window={quota?.sevenDay} stale={stale} costUsd={cycleCosts.sevenDayUsd} unpricedTokens={cycleCosts.sevenDayUnpricedUsdTokens} />
+          <QuotaSummary label={t(`${longQuotaPeriod}额度`, `${longQuotaPeriod} quota`)} window={longWindow} stale={stale} costUsd={cycleCosts.sevenDayUsd} unpricedTokens={cycleCosts.sevenDayUnpricedUsdTokens} />
         </div>
         <div className="quota-credit-note">{t('美元消耗按 OpenAI 当前官方 Token 费率由本地请求记录估算；左侧为已记录消耗，右侧为按额度使用比例推算的整周期消耗。缓存写入不计费，Fast 模式附加费不作猜测。', 'USD usage is estimated from local request logs using OpenAI’s current official token rate card. The left value is recorded usage and the right value projects the full cycle from the quota percentage. Cache writes are free; Fast-mode surcharges are not guessed.')}</div>
-        {quota?.resetCredits && <div className="quota-credit-note"><strong>{t(`可用额度重置券：${quota.resetCredits.availableCount}`, `Available quota reset credits: ${quota.resetCredits.availableCount}`)}</strong>{quota.resetCredits.expiresAt?.[0] ? ` · ${t('最近到期', 'Earliest expiry')} ${new Date(quota.resetCredits.expiresAt[0]).toLocaleString(locale)}` : ''}</div>}
-        {quota?.limitReached && <div className="warning-banner"><Clock3 size={17} /><div><strong>{t('上游已标记额度耗尽', 'Upstream reports that the quota is exhausted')}</strong><span>{t('Stone+ 会按实际 429 重置时间冷却账号', 'Stone+ cools the account down until the reset time reported by the actual 429 response.')}</span></div></div>}
+        {(cycleCosts.hiddenQuotaUsd ?? 0) > 0 && <div className="quota-hidden-credit-note" role="status">
+          <span className="quota-hidden-credit-note__mark">$</span>
+          <div>
+            <strong>{t(`Stone+ 已释放 ${formatAccountQuotaUsd(cycleCosts.hiddenQuotaUsd, locale)} 隐藏额度`, `Stone+ released ${formatAccountQuotaUsd(cycleCosts.hiddenQuotaUsd, locale)} in hidden quota`)}</strong>
+            <span>{t('指额度达到 100% 后仍记录到的 Token，按本地请求记录与官方费率估算。', 'Tokens recorded after the quota reached 100%, estimated from local request logs and the official rate card.')}</span>
+            {(cycleCosts.hiddenQuotaUnpricedTokens ?? 0) > 0 && <small>{t('部分模型未列入费率表，金额可能低估。', 'Some models are not on the rate card; the amount may be understated.')}</small>}
+          </div>
+        </div>}
+        {quota?.planType && <div className="quota-credit-note"><strong>{t('订阅方案', 'Plan')}：{quota.planType}</strong></div>}
+        {quota?.resetCredits && <div className="quota-credit-note"><strong>{t(`可用额度重置券：${quota.resetCredits.availableCount}`, `Available quota reset credits: ${quota.resetCredits.availableCount}`)}</strong>{quota.resetCredits.expiresAt?.[0] ? ` · ${t('最近到期', 'Earliest expiry')} ${new Date(quota.resetCredits.expiresAt[0]).toLocaleString(locale)}` : ''}{quota.resetCredits.availableCount > 0 && <button className="button button--secondary" type="button" disabled={busyKeys.has(`consume-quota-credit-${accountId}`)} onClick={() => void consumeResetCredit()}>{busyKeys.has(`consume-quota-credit-${accountId}`) ? <LoaderCircle size={15} className="spin" /> : <RefreshCw size={15} />}{t('使用重置券', 'Use reset credit')}</button>}</div>}
+        {(quota?.additionalBuckets?.length ?? 0) > 0 && <section className="quota-additional-buckets">
+          <strong>{t('模型专属额度', 'Model-specific quota')}</strong>
+          {quota!.additionalBuckets!.map((bucket) => {
+            const bucketLong = bucket.sevenDay ?? bucket.monthly
+            return <div key={bucket.id} className="quota-additional-buckets__row"><span>{bucket.label ?? bucket.id}</span><CompactWindow label="5h" window={bucket.fiveHour} /><CompactWindow label={bucket.monthly ? t('月', 'Month') : t('周', 'Week')} window={bucketLong} /></div>
+          })}
+        </section>}
+        {exhausted && <div className="warning-banner"><Clock3 size={17} /><div><strong>{t('上游已标记额度耗尽', 'Upstream reports that the quota is exhausted')}</strong><span>{t('Stone+ 会按实际 429 重置时间冷却账号', 'Stone+ cools the account down until the reset time reported by the actual 429 response.')}</span></div></div>}
         <QuotaTrend
           label={t('5 小时额度 · 最近 24 小时', '5-hour quota · Last 24 hours')}
           points={history.filter((point) => point.observedAt >= Date.now() - 24 * 60 * 60 * 1000)}
@@ -112,11 +144,12 @@ export function CodexQuotaModal({
 export function CodexQuotaCompact({ quota, onClick }: { quota: PublicAccount['codexQuota']; onClick?: () => void }) {
   const { t } = useI18n()
   if (!quota) return <button className="quota-compact quota-compact--empty" type="button" onClick={onClick}>{t('尚未采集', 'Not collected')}</button>
-  const longQuotaPeriodZh = codexLongQuotaPeriodLabel(quota.sevenDay?.windowSeconds)
+  const longWindow = quota.sevenDay ?? quota.monthly
+  const longQuotaPeriodZh = codexLongQuotaPeriodLabel(longWindow?.windowSeconds)
   const longQuotaPeriod = t(longQuotaPeriodZh, longQuotaPeriodZh === '月' ? 'Month' : 'Week')
   return <button className="quota-compact" type="button" title={t('查看额度趋势', 'View quota trends')} onClick={onClick}>
     <CompactWindow label="5h" window={quota.fiveHour} />
-    <CompactWindow label={longQuotaPeriod} window={quota.sevenDay} />
+    <CompactWindow label={longQuotaPeriod} window={longWindow} />
   </button>
 }
 
@@ -199,6 +232,18 @@ function formatPercent(value: number, locale = 'zh-CN'): string {
 function projectedQuotaAmount(used: number | undefined, usedPercent: number | undefined): number | undefined {
   if (used === undefined || usedPercent === undefined || usedPercent <= 0) return undefined
   return used * 100 / Math.min(100, usedPercent)
+}
+
+function quotaExhaustionIsCurrent(quota: PublicAccount['codexQuota'], now = Date.now()): boolean {
+  if (!quota) return false
+  const windows = [quota.fiveHour, quota.sevenDay, quota.monthly].filter(Boolean) as CodexQuotaWindow[]
+  const activeExhausted = windows.some((window) => (
+    window.usedPercent >= 100 && (window.resetAt === undefined || window.resetAt > now)
+  ))
+  if (activeExhausted) return true
+  const topLevelExhausted = quota.allowed === false || quota.limitReached === true
+  if (!topLevelExhausted || now - quota.observedAt > 2 * 60 * 60 * 1000) return false
+  return !windows.some((window) => window.resetAt !== undefined && window.resetAt <= now)
 }
 
 function formatWindow(seconds: number, t: ReturnType<typeof useI18n>['t']): string {

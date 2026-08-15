@@ -261,6 +261,8 @@ export async function forwardResponsesSse(
   let buffer = Buffer.alloc(0)
   let searchStart = 0
   let firstFrame = true
+  let sawTerminalEvent = false
+  let sawErrorEvent = false
   let reachedEof = false
   let failure: unknown
 
@@ -286,7 +288,11 @@ export async function forwardResponsesSse(
         if (frameLength > maxFrameBytes) throw new ResponsesSseFrameTooLargeError(maxFrameBytes)
         const event = parseSseFrame(buffer.subarray(cursor, delimiter.index), firstFrame)
         firstFrame = false
-        if (event) await onEvent(event)
+        if (event) {
+          sawTerminalEvent ||= isResponsesTerminalEvent(event.type)
+          sawErrorEvent ||= event.type === 'error'
+          await onEvent(event)
+        }
         cursor = delimiter.index + delimiter.length
         delimiter = findSseDelimiter(buffer, cursor)
       }
@@ -301,7 +307,17 @@ export async function forwardResponsesSse(
     if (buffer.byteLength > maxFrameBytes) throw new ResponsesSseFrameTooLargeError(maxFrameBytes)
     if (buffer.byteLength > 0) {
       const event = parseSseFrame(buffer, firstFrame)
-      if (event) await onEvent(event)
+      if (event) {
+        sawTerminalEvent ||= isResponsesTerminalEvent(event.type)
+        sawErrorEvent ||= event.type === 'error'
+        await onEvent(event)
+      }
+    }
+    // A wrapped error event is already terminal for Codex WebSocket clients.
+    // Otherwise require a real Responses terminal event; fabricating a
+    // success-like marker here would hide a truncated upstream stream.
+    if (!sawTerminalEvent && !sawErrorEvent && !signal?.aborted) {
+      throw new ResponsesSseMissingTerminalError()
     }
   } catch (error) {
     failure = error
@@ -312,10 +328,23 @@ export async function forwardResponsesSse(
   }
 }
 
+function isResponsesTerminalEvent(type: unknown): boolean {
+  return type === 'response.completed'
+    || type === 'response.failed'
+    || type === 'response.incomplete'
+}
+
 class ResponsesSseFrameTooLargeError extends Error {
   public constructor(public readonly maxFrameBytes: number) {
     super(`The Responses stream contained an SSE frame larger than ${maxFrameBytes} bytes.`)
     this.name = 'ResponsesSseFrameTooLargeError'
+  }
+}
+
+class ResponsesSseMissingTerminalError extends Error {
+  public constructor() {
+    super('The upstream Responses stream ended without a terminal event.')
+    this.name = 'ResponsesSseMissingTerminalError'
   }
 }
 
@@ -418,6 +447,13 @@ function dispatchErrorEvent(error: unknown): JsonObject {
       502,
       'upstream_sse_frame_too_large',
       `The upstream Responses stream emitted an SSE frame larger than ${error.maxFrameBytes} bytes.`,
+    )
+  }
+  if (error instanceof ResponsesSseMissingTerminalError) {
+    return errorEvent(
+      502,
+      'upstream_stream_missing_terminal',
+      'The upstream Responses stream ended without a terminal event.',
     )
   }
   return errorEvent(502, 'websocket_dispatch_error', safeErrorMessage(error))

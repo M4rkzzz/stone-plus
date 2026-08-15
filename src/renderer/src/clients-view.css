@@ -451,6 +451,172 @@ html[data-theme='dark'] .page-stack.client-manager-page {
   white-space: nowrap;
 }
 
+.harness-session-migration {
+  display: flex;
+  min-height: 58px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 10px 14px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--surface);
+  box-shadow: 0 1px 2px rgb(var(--shadow-rgb) / 3%);
+}
+
+.harness-session-migration > div {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 10px;
+  color: var(--accent-text);
+}
+
+.harness-session-migration > div > span {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.harness-session-migration strong {
+  color: var(--text);
+  font-size: 11px;
+}
+
+.harness-session-migration small {
+  overflow: hidden;
+  color: var(--faint);
+  font-size: 9px;
+  line-height: 14px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.harness-session-modal {
+  display: grid;
+  gap: 10px;
+}
+
+.harness-session-modal__toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.harness-session-modal__toolbar > label {
+  display: flex;
+  min-width: 0;
+  height: 34px;
+  flex: 1;
+  align-items: center;
+  gap: 7px;
+  padding: 0 9px;
+  border: 1px solid var(--control-border);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--muted);
+}
+
+.harness-session-modal__toolbar input {
+  min-width: 0;
+  height: 30px;
+  flex: 1;
+  padding: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--text);
+  font-size: 11px;
+}
+
+.harness-session-modal__count {
+  margin-right: auto;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.harness-session-modal__result {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 8px 10px;
+  border: 1px solid var(--ok-border);
+  border-radius: 6px;
+  background: var(--ok-soft);
+  color: var(--ok-text);
+  font-size: 10px;
+}
+
+.harness-session-modal__result.has-failures {
+  border-color: var(--warn-border);
+  background: var(--warn-soft);
+  color: var(--warn-text);
+}
+
+.harness-session-modal__list {
+  display: grid;
+  max-height: min(54vh, 520px);
+  overflow-y: auto;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}
+
+.harness-session-modal__item {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) minmax(150px, auto) minmax(0, auto);
+  align-items: center;
+  gap: 10px;
+  min-height: 56px;
+  padding: 8px 6px;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 74%, transparent);
+  cursor: pointer;
+}
+
+.harness-session-modal__item:last-child { border-bottom: 0; }
+.harness-session-modal__item:hover { background: var(--surface-hover); }
+.harness-session-modal__item > input { width: 15px; height: 15px; }
+
+.harness-session-modal__item > span {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.harness-session-modal__item > span:nth-of-type(2) { text-align: right; }
+
+.harness-session-modal__item strong,
+.harness-session-modal__item small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.harness-session-modal__item strong { color: var(--text); font-size: 10px; }
+.harness-session-modal__item small { color: var(--faint); font-size: 8px; }
+
+.harness-session-modal__item em {
+  max-width: 180px;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 9px;
+  font-style: normal;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.harness-session-modal__item em.is-imported { color: var(--ok-text); }
+.harness-session-modal__item em.is-failed { color: var(--danger); }
+
+.harness-session-modal__empty {
+  display: flex;
+  min-height: 150px;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
 .client-advanced {
   overflow: hidden;
   border: 1px solid var(--border);
@@ -1773,6 +1939,17 @@ html[data-theme='dark'] .page-stack.client-manager-page {
 }
 
 @media (max-width: 720px) {
+  .harness-session-migration {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .harness-session-modal__toolbar { align-items: stretch; flex-direction: column; }
+  .harness-session-modal__toolbar .button { width: 100%; }
+  .harness-session-modal__item { grid-template-columns: 18px minmax(0, 1fr); }
+  .harness-session-modal__item > span:nth-of-type(2),
+  .harness-session-modal__item > em { grid-column: 2; text-align: left; }
+
   .client-install__main {
     grid-template-columns: minmax(0, 1fr);
     gap: 11px;

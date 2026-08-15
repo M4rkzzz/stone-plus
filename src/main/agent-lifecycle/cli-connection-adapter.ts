@@ -8,7 +8,7 @@ import type {
 import { AGENT_CAPABILITIES } from '../../shared/agent-lifecycle'
 import type { AgentCapabilities, AgentLifecyclePhase, AgentStartOptions } from '../../shared/agent-lifecycle'
 
-export type ConnectionOnlyAgentTarget = 'claude-code' | 'gemini-cli' | 'grok-build'
+export type ConnectionOnlyAgentTarget = 'claude-code' | 'gemini-cli' | 'grok-build' | 'deepseek-harness'
 
 export interface CliInstallationState {
   installed: boolean
@@ -65,7 +65,7 @@ export type CliStartOptions = AgentStartOptions
 
 export interface ConnectionOnlyAgentSnapshot {
   target: ConnectionOnlyAgentTarget
-  client: 'claude' | 'gemini' | 'grokbuild'
+  client: 'claude' | 'gemini' | 'grokbuild' | 'deepseek-harness'
   capabilities: AgentCapabilities
   installation: CliInstallationState
   configured: boolean
@@ -114,7 +114,7 @@ export interface ConnectionOnlyCliAdapterOptions {
  */
 export class ConnectionOnlyCliLifecycleAdapter {
   readonly target: ConnectionOnlyAgentTarget
-  readonly client: 'claude' | 'gemini' | 'grokbuild'
+  readonly client: 'claude' | 'gemini' | 'grokbuild' | 'deepseek-harness'
   readonly capabilities: AgentCapabilities
 
   private readonly installation: CliInstallationPort
@@ -128,7 +128,9 @@ export class ConnectionOnlyCliLifecycleAdapter {
       ? 'claude'
       : options.target === 'gemini-cli'
         ? 'gemini'
-        : 'grokbuild'
+        : options.target === 'grok-build'
+          ? 'grokbuild'
+          : 'deepseek-harness'
     this.capabilities = AGENT_CAPABILITIES[options.target]
     this.installation = options.installation
     this.runtime = options.runtime
@@ -387,6 +389,12 @@ export class GrokBuildLifecycleAdapter extends ConnectionOnlyCliLifecycleAdapter
   }
 }
 
+export class DeepSeekHarnessLifecycleAdapter extends ConnectionOnlyCliLifecycleAdapter {
+  constructor(options: Omit<ConnectionOnlyCliAdapterOptions, 'target'>) {
+    super({ ...options, target: 'deepseek-harness' })
+  }
+}
+
 function uniqueConfigDirectories(instances: readonly ManagedCliInstanceState[]): string[] {
   return [...new Set(instances.map((instance) => instance.configDirectory).filter((value): value is string => Boolean(value)))]
 }
@@ -409,7 +417,8 @@ function mergeRepairResults(
 
 function displayName(target: ConnectionOnlyAgentTarget): string {
   if (target === 'claude-code') return 'Claude Code CLI'
-  return target === 'gemini-cli' ? 'Gemini CLI' : 'Grok Build'
+  if (target === 'gemini-cli') return 'Gemini CLI'
+  return target === 'grok-build' ? 'Grok Build' : 'DeepSeek Harness'
 }
 
 function messageOf(error: unknown): string {

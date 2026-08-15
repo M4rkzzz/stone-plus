@@ -7,6 +7,7 @@ import {
   resolveRouteSource,
 } from './route-sources'
 import { clientNativeProtocols } from './types'
+import { GPT_5_6_SOL_WM_MODEL, supportsPoolWmRouting } from './wm-routing'
 import type {
   AppSnapshot,
   RoutePreviewInput,
@@ -23,7 +24,8 @@ export function previewRoute(
   const route = input.route
   const issues: RoutePreviewIssue[] = []
   const requestedModel = normalizeModel(input.requestedModel)
-  const upstreamModel = requestedModel ? resolveRouteModel(route.modelMap, requestedModel) : undefined
+  const routedModel = requestedModel ? resolveRouteModel(route.modelMap, requestedModel) : undefined
+  let upstreamModel = routedModel
   const sourceId = requestedModel
     ? resolveRouteSourceId(route.poolId, route.modelSourceMap, requestedModel)
     : route.poolId
@@ -36,6 +38,11 @@ export function previewRoute(
   if (!source) {
     issues.push(issue('source-missing', 'error', '目标来源不存在或配置不完整。'))
     return result(sourceId, route.inboundProtocol, requestedModel, upstreamModel, 0, issues)
+  }
+  if (routedModel
+    && source.pool.routeToWm === true
+    && supportsPoolWmRouting(source.pool.protocol, source.accounts)) {
+    upstreamModel = GPT_5_6_SOL_WM_MODEL
   }
   if (sourceId !== route.poolId) {
     issues.push(issue('source-overridden', 'info', `模型 ${requestedModel} 将改走来源 ${source.summary.name}。`))
@@ -76,16 +83,16 @@ export function previewRoute(
   const eligibility = evaluateSourceEligibility({
     accounts: eligibleAccounts,
     providers: snapshot.providers,
-    model: upstreamModel,
+    model: routedModel,
     poolModelPolicy: source.pool.modelPolicy,
     poolModelAllowlist: source.pool.modelAllowlist,
     requiredCapabilities: input.requiredCapabilities,
     requireProvider: true,
   })
   const modelEligible = eligibility.modelEligible
-  if (upstreamModel && eligibleAccounts.length && !modelEligible.length) {
-    issues.push(issue('model-unavailable', 'error', `没有可用成员声明支持模型 ${upstreamModel}。`))
-  } else if (!upstreamModel && eligibleAccounts.length && !modelEligible.length) {
+  if (routedModel && eligibleAccounts.length && !modelEligible.length) {
+    issues.push(issue('model-unavailable', 'error', `没有可用成员声明支持模型 ${routedModel}。`))
+  } else if (!routedModel && eligibleAccounts.length && !modelEligible.length) {
     issues.push(issue('source-unavailable', 'error', '来源成员缺少有效的供应商配置。'))
   }
 
@@ -93,7 +100,7 @@ export function previewRoute(
     const capabilityOnly = evaluateSourceEligibility({
       accounts: modelEligible,
       providers: snapshot.providers,
-      model: upstreamModel,
+      model: routedModel,
       poolModelPolicy: source.pool.modelPolicy,
       poolModelAllowlist: source.pool.modelAllowlist,
       requiredCapabilities: [capability],

@@ -281,6 +281,25 @@ describe('BuiltInProxyRouteCoordinator', () => {
     expect(await (await routed('http://127.0.0.1:19104/control')).text()).toBe('external')
     expect(await (await routed('http://127.0.0.1:15721/control')).text()).toBe('loopback')
   })
+
+  it('revokes an old application loopback port when the local gateway is rebound', async () => {
+    const coordinator = trackCoordinator(new BuiltInProxyRouteCoordinator({ directLoopbackPorts: [15721] }))
+    const mixedFetch = fetchSpy('mixed')
+    const loopbackFetch = fetchSpy('loopback')
+    const routed = coordinator.bind(fetchSpy('external'), loopbackFetch)
+
+    coordinator.requestEnable()
+    coordinator.activate({
+      fetchImplementation: mixedFetch,
+      mixedEndpoint: 'http://127.0.0.1:19105',
+    })
+    expect(await (await routed('http://127.0.0.1:15721/old')).text()).toBe('loopback')
+
+    coordinator.setDirectLoopbackPorts([16661])
+
+    expect(await (await routed('http://127.0.0.1:15721/old')).text()).toBe('mixed')
+    expect(await (await routed('http://127.0.0.1:16661/current')).text()).toBe('loopback')
+  })
 })
 
 describe('OutboundTransportManager built-in integration', () => {

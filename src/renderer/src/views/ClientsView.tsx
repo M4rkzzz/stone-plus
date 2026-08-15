@@ -39,6 +39,8 @@ import type {
   ClientConfigFileRole,
   ClientConfigProfile,
   ClientConfigStatus,
+  CodexHarnessSessionImportResult,
+  CodexManagedSession,
   GatewayApi,
   ProfileBundle,
   Route,
@@ -74,7 +76,7 @@ import { ExclusiveAsyncOperation } from '../async-operation'
 import { agentLifecycleRenderKey } from '../app-render-state'
 import { shouldAcceptSnapshotRevision } from '../runtime-delta'
 
-const clientOrder: RouteClient[] = ['claude', 'codex', 'gemini', 'grokbuild']
+const clientOrder: RouteClient[] = ['claude', 'codex', 'gemini', 'grokbuild', 'deepseek-harness']
 
 interface AgentInstallMeta {
   name: string
@@ -153,6 +155,15 @@ const agentInstallMeta: Record<AgentTarget, AgentInstallMeta> = {
     configuration: ['Stone+ 自动维护 Grok Build 连接配置。', 'Stone+ manages the Grok Build connection automatically.'],
     installAction: ['打开官方指引', 'Open official guide'],
   },
+  'deepseek-harness': {
+    name: 'DeepSeek Harness',
+    client: 'deepseek-harness',
+    surface: 'terminal',
+    channel: ['官方 npm 固定版 0.1.0-rc.6', 'Pinned official npm 0.1.0-rc.6'],
+    detection: ['自动检查 dsh 命令与标准 npm 安装位置', 'Checks the dsh command and standard npm install locations'],
+    configuration: ['Stone+ 固定安装官方版本，自动维护本地网关连接，并在启动后打开工作台。', 'Stone+ installs the pinned official release, manages the local gateway connection, and opens the workbench.'],
+    installAction: ['一键安装并配置', 'Install and configure'],
+  },
 }
 
 const clientAgentTargets: Record<RouteClient, readonly AgentTarget[]> = {
@@ -160,6 +171,7 @@ const clientAgentTargets: Record<RouteClient, readonly AgentTarget[]> = {
   claude: ['claude-code', 'claude-code-desktop', 'claude-code-vsc'],
   gemini: ['gemini-cli'],
   grokbuild: ['grok-build'],
+  'deepseek-harness': ['deepseek-harness'],
 }
 
 const roleLabels: Record<ClientConfigFileRole, readonly [chinese: string, english: string]> = {
@@ -173,6 +185,7 @@ const roleLabels: Record<ClientConfigFileRole, readonly [chinese: string, englis
   'gemini-settings': ['Gemini 设置', 'Gemini settings'],
   'gemini-env': ['Gemini 环境变量', 'Gemini environment'],
   'grok-config': ['Grok Build 配置', 'Grok Build configuration'],
+  'deepseek-harness-env': ['DeepSeek Harness 环境变量', 'DeepSeek Harness environment'],
 }
 
 function roleLabel(role: ClientConfigFileRole, language: UiLanguage): string {
@@ -188,6 +201,14 @@ function agentSurfaceIcon(surface: AgentInstallMeta['surface']) {
 function newLocalToken(client: RouteClient): string {
   const bytes = crypto.getRandomValues(new Uint8Array(12))
   return `stone_${client}_${Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')}`
+}
+
+function formatSessionSize(value: number, locale: string): string {
+  if (!Number.isFinite(value) || value <= 0) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB']
+  const exponent = Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1)
+  const amount = value / (1024 ** exponent)
+  return `${amount.toLocaleString(locale, { maximumFractionDigits: exponent === 0 ? 0 : 1 })} ${units[exponent]}`
 }
 
 type FieldScope = 'all' | 'basic' | 'advanced'
@@ -245,11 +266,17 @@ export function ClientsView({
   const [fieldScope, setFieldScope] = useState<FieldScope>('basic')
   const [previewMode, setPreviewMode] = useState<PreviewMode>('preview')
   const [routeSelections, setRouteSelections] = useState<Partial<Record<RouteClient, string>>>({})
+  const [harnessImportOpen, setHarnessImportOpen] = useState(false)
+  const [harnessSessions, setHarnessSessions] = useState<CodexManagedSession[]>([])
+  const [harnessSelectedSessionIds, setHarnessSelectedSessionIds] = useState<Set<string>>(new Set())
+  const [harnessSessionSearch, setHarnessSessionSearch] = useState('')
+  const [harnessImportResult, setHarnessImportResult] = useState<CodexHarnessSessionImportResult | null>(null)
   const [activeProfiles, setActiveProfiles] = useState<Record<RouteClient, string>>({
     claude: 'default-claude',
     codex: 'default-codex',
     gemini: 'default-gemini',
     grokbuild: 'default-grokbuild',
+    'deepseek-harness': 'default-deepseek-harness',
   })
   const requestSequence = useRef(0)
   const agentLifecycleRevision = useRef(-1)
@@ -494,6 +521,24 @@ export function ClientsView({
     [visibleFields],
   )
 
+  const visibleHarnessSessions = useMemo(() => {
+    const query = harnessSessionSearch.trim().toLocaleLowerCase()
+    return harnessSessions.filter((session) => {
+      if (session.kind === 'trash') return false
+      if (!query) return true
+      return [session.title, session.id, session.cwd, session.modelProvider]
+        .some((value) => value?.toLocaleLowerCase().includes(query))
+    })
+  }, [harnessSessionSearch, harnessSessions])
+
+  const harnessSelectedSourceBytes = useMemo(
+    () => harnessSessions.reduce(
+      (total, session) => total + (harnessSelectedSessionIds.has(session.id) ? session.sizeBytes : 0),
+      0,
+    ),
+    [harnessSelectedSessionIds, harnessSessions],
+  )
+
   const requestContextSwitch = (client: RouteClient, profileId = activeProfiles[client]) => {
     if (client === activeClient && profileId === activeProfileId) return
     if (isDirty) {
@@ -641,10 +686,15 @@ export function ClientsView({
       return operation
     })
     if (!result) return
-    setNotice(t(
-      `已打开 ${agentInstallMeta[target].name} 官方安装指引；安装完成后请重新检测`,
-      `Opened the official ${agentInstallMeta[target].name} installation guide. Check again after installation.`,
-    ))
+    setNotice(target === 'deepseek-harness'
+      ? t(
+          'DeepSeek Harness 已安装、连接 Stone+ 并启动工作台',
+          'DeepSeek Harness was installed, connected to Stone+, and launched.',
+        )
+      : t(
+          `已打开 ${agentInstallMeta[target].name} 官方安装指引；安装完成后请重新检测`,
+          `Opened the official ${agentInstallMeta[target].name} installation guide. Check again after installation.`,
+        ))
   }
 
   const startInstalledAgent = async (target: AgentTarget) => {
@@ -681,7 +731,8 @@ export function ClientsView({
         ))
       return
     }
-    setNotice(itemMeta.launchOnly
+    const openedExistingInstance = Boolean(agent?.running && agent.capabilities.canOpenWhenRunning)
+    setNotice(itemMeta.launchOnly || openedExistingInstance
       ? t(`${itemMeta.name} 已打开`, `${itemMeta.name} opened`)
       : t(`${itemMeta.name} 已启动`, `${itemMeta.name} started`))
   }
@@ -994,6 +1045,73 @@ export function ClientsView({
     setNotice(t('Profile 已导入，可在顶部列表中快速切换', 'Profile imported; you can switch to it from the list at the top'))
   }
 
+  const openHarnessSessionImport = async () => {
+    setHarnessImportOpen(true)
+    setHarnessImportResult(null)
+    setHarnessSessionSearch('')
+    setHarnessSelectedSessionIds(new Set())
+    const sessions = await run('load-harness-sessions', () => api.listCodexSessions({
+      kind: 'all',
+      limit: 1_000,
+      detail: 'summary',
+    }))
+    if (sessions !== undefined) setHarnessSessions(sessions.filter((session) => session.kind !== 'trash'))
+  }
+
+  const toggleHarnessSession = (sessionId: string) => {
+    setHarnessSelectedSessionIds((current) => {
+      const next = new Set(current)
+      if (next.has(sessionId)) next.delete(sessionId)
+      else if (next.size < 50) next.add(sessionId)
+      return next
+    })
+  }
+
+  const selectVisibleHarnessSessions = () => {
+    setHarnessSelectedSessionIds((current) => {
+      const visibleIds = visibleHarnessSessions.slice(0, 50).map((session) => session.id)
+      const allSelected = visibleIds.length > 0 && visibleIds.every((id) => current.has(id))
+      if (allSelected) {
+        const next = new Set(current)
+        visibleIds.forEach((id) => next.delete(id))
+        return next
+      }
+      return new Set(visibleIds)
+    })
+  }
+
+  const importSelectedHarnessSessions = async () => {
+    const selected = harnessSessions.filter((session) => harnessSelectedSessionIds.has(session.id))
+    if (selected.length === 0) return
+    const result = await run('import-harness-sessions', () => api.importCodexSessionsToDeepSeekHarness(
+      selected.map((session) => ({ id: session.id, expectedRevision: session.revision })),
+    ))
+    if (!result) return
+    const failedIds = new Set(result.items
+      .filter((item) => item.status === 'failed')
+      .map((item) => item.sourceSessionId))
+    setHarnessSelectedSessionIds(failedIds)
+    if (result.failed === 0) {
+      setHarnessImportOpen(false)
+      setHarnessImportResult(null)
+      setNotice(result.imported > 0
+        ? t(
+          `已成功迁入 ${result.imported} 个 Codex 会话${result.alreadyImported > 0 ? `，另有 ${result.alreadyImported} 个已存在且未重复创建` : ''}`,
+          `${result.imported} Codex ${result.imported === 1 ? 'session was' : 'sessions were'} migrated successfully${result.alreadyImported > 0 ? `; ${result.alreadyImported} already existed and were not duplicated` : ''}`,
+        )
+        : t(
+          `所选 ${result.alreadyImported} 个会话此前已迁入，未创建重复副本`,
+          `The selected ${result.alreadyImported} ${result.alreadyImported === 1 ? 'session was' : 'sessions were'} already migrated; no duplicate was created`,
+        ))
+      return
+    }
+    setHarnessImportResult(result)
+    setNotice(t(
+      `会话迁入部分完成：新增 ${result.imported}，已存在 ${result.alreadyImported}，失败 ${result.failed}；失败项仍保留选中，可直接重试`,
+      `Session migration partially completed: ${result.imported} imported, ${result.alreadyImported} already present, ${result.failed} failed. Failed items remain selected for retry`,
+    ))
+  }
+
   const copyPreview = async () => {
     if (!activeDocument?.content) return
     await navigator.clipboard?.writeText(activeDocument.content)
@@ -1075,6 +1193,7 @@ export function ClientsView({
           const isDesktopDownload = target === 'codex-desktop'
           const isClaudeDesktop = target === 'claude-code-desktop'
           const launchOnly = itemMeta.launchOnly === true
+          const opensRunningInstance = Boolean(item?.running && item.capabilities.canOpenWhenRunning)
           const itemError = item?.error ? localizedLifecycleError(item.error, t) : agentCheckError
           const statusLabel = !item
             ? t('正在检测', 'Checking')
@@ -1092,7 +1211,9 @@ export function ClientsView({
               ? t('将打开 Claude 官方下载页；Stone+ 不会静默安装，完成安装后请返回重新检测。', 'Opens the official Claude download page. Stone+ does not install it silently; return and check again after installation.')
               : isDesktopDownload
                 ? t('ChatGPT Desktop 内含 Codex；从官方页面获取后 Stone+ 会自动识别。', 'ChatGPT Desktop includes Codex; Stone+ detects it automatically after installation.')
-                : t('打开官方安装指引；完成安装后返回此处重新检测。', 'Open the official installation guide, then return here and check again after installation.')
+                : target === 'deepseek-harness'
+                  ? t('固定安装官方 0.1.0-rc.6，写入当前 Stone+ 路由并启动本地工作台。需要 Node.js 22.19 或更高兼容版本。', 'Installs the pinned official 0.1.0-rc.6 release, writes the current Stone+ route, and launches the local workbench. A compatible Node.js 22.19 or newer release is required.')
+                  : t('打开官方安装指引；完成安装后返回此处重新检测。', 'Open the official installation guide, then return here and check again after installation.')
             : isClaudeDesktop
               ? item.configured
                 ? t('已写入；接管时会允许 Cowork 访问任意网络主机并隐藏官方模式选择器。完整退出并重开 Claude Desktop 后生效；Stone+ 不会结束宿主进程。', 'Written. Takeover allows Cowork to access any network host and hides the official mode chooser. Fully quit and reopen Claude Desktop to apply; Stone+ does not close the host app.')
@@ -1106,14 +1227,14 @@ export function ClientsView({
             ? item?.configured
               ? t('打开 Code', 'Open Code')
               : t('配置并打开 Code', 'Configure and open Code')
-            : launchOnly
+            : launchOnly || opensRunningInstance
               ? t('打开', 'Open')
               : t('启动', 'Launch')
           const startProgressLabel = isClaudeDesktop
             ? item?.configured
               ? t('正在打开 Code…', 'Opening Code…')
               : t('正在配置并打开 Code…', 'Configuring and opening Code…')
-            : launchOnly
+            : launchOnly || opensRunningInstance
               ? t('正在打开客户端…', 'Opening client…')
               : t('正在启动客户端…', 'Launching client…')
           return (
@@ -1164,23 +1285,29 @@ export function ClientsView({
                       disabled={!item || Boolean(busy) || agentLifecycle?.busy || installing}
                       onClick={() => void installAgent(target)}
                     >
-                      {installing ? <LoaderCircle size={16} className="spin" /> : <ExternalLink size={16} />}
+                      {installing
+                        ? <LoaderCircle size={16} className="spin" />
+                        : target === 'deepseek-harness' ? <Download size={16} /> : <ExternalLink size={16} />}
                       {t(...itemMeta.installAction)}
                     </button>
                   ) : (
                     <button
                       className="button button--primary client-install__primary"
                       type="button"
-                      disabled={Boolean(busy) || agentLifecycle?.busy || starting || (!launchOnly && item.running)}
+                      disabled={Boolean(busy) || agentLifecycle?.busy || starting || (!launchOnly && item.running && !opensRunningInstance)}
                       onClick={() => void startInstalledAgent(target)}
                     >
-                      {starting ? <LoaderCircle size={16} className="spin" /> : !launchOnly && item.running ? <CheckCircle2 size={16} /> : <Play size={16} />}
-                      {!launchOnly && item.running ? t('正在运行', 'Running') : installedActionLabel}
+                      {starting ? <LoaderCircle size={16} className="spin" /> : opensRunningInstance ? <ExternalLink size={16} /> : !launchOnly && item.running ? <CheckCircle2 size={16} /> : <Play size={16} />}
+                      {!launchOnly && item.running && !opensRunningInstance ? t('正在运行', 'Running') : installedActionLabel}
                     </button>
                   )}
                 </div>
               </div>
-              {(installing || starting) && <div className="client-install__progress" role="status"><LoaderCircle size={15} className="spin" /><span>{installing ? t('正在打开官方安装指引…', 'Opening the official installation guide…') : startProgressLabel}</span></div>}
+              {(installing || starting) && <div className="client-install__progress" role="status"><LoaderCircle size={15} className="spin" /><span>{installing
+                ? target === 'deepseek-harness'
+                  ? t('正在安装、配置并启动 DeepSeek Harness…', 'Installing, configuring, and launching DeepSeek Harness…')
+                  : t('正在打开官方安装指引…', 'Opening the official installation guide…')
+                : startProgressLabel}</span></div>}
               {itemError && <div className="client-install__error" role="alert"><AlertTriangle size={15} /><span>{itemError}</span></div>}
               <details className="client-install__advanced">
                 <summary className="client-install__advanced-toggle"><span><SlidersHorizontal size={15} />{t('安装详情', 'Installation details')}</span><ChevronDown size={15} /></summary>
@@ -1439,6 +1566,22 @@ export function ClientsView({
           )}</span>
         </footer>
       </section>
+
+      {activeClient === 'deepseek-harness' && (
+        <section className="harness-session-migration" aria-labelledby="harness-session-migration-title">
+          <div>
+            <History size={18} aria-hidden="true" />
+            <span>
+              <strong id="harness-session-migration-title">{t('迁入 Codex 会话', 'Migrate Codex sessions')}</strong>
+              <small>{t('按需选择会话；同一会话只落一份压缩历史，原文件保持不变。', 'Choose sessions as needed. Each session creates at most one compressed history copy, while original files stay unchanged.')}</small>
+            </span>
+          </div>
+          <button className="button button--secondary" type="button" disabled={Boolean(busy)} onClick={() => void openHarnessSessionImport()}>
+            {busy === 'load-harness-sessions' ? <LoaderCircle size={16} className="spin" /> : <Upload size={16} />}
+            {t('选择会话', 'Choose sessions')}
+          </button>
+        </section>
+      )}
 
       <ManagedClientInstancesPanel snapshot={snapshot} api={api} />
 
@@ -1714,6 +1857,77 @@ export function ClientsView({
       />
 
       <Modal
+        open={harnessImportOpen}
+        title={t('迁入 Codex 会话', 'Migrate Codex sessions')}
+        description={t('默认不选任何会话，只转换你勾选的项，不调用模型。对话、推理摘要及已完成工具记录会写成 Zstd 压缩的 DeepSeek Harness 原生历史；重复迁入不会新增副本，客户端设置、认证文件和附件原文件不复制。', 'Nothing is selected by default, and only checked sessions are converted without calling a model. Conversation, reasoning summaries, and completed tool records become Zstd-compressed native DeepSeek Harness history. Reimporting does not create another copy; client settings, auth files, and original attachment files are not copied.')}
+        onClose={() => setHarnessImportOpen(false)}
+        width="large"
+        closable={busy !== 'import-harness-sessions'}
+        busy={busy === 'import-harness-sessions'}
+        footer={<>
+          <span className="harness-session-modal__count">{t(
+            `已选 ${harnessSelectedSessionIds.size} / 50 · 原始 ${formatSessionSize(harnessSelectedSourceBytes, locale)}`,
+            `${harnessSelectedSessionIds.size} / 50 selected · ${formatSessionSize(harnessSelectedSourceBytes, locale)} source`,
+          )}</span>
+          <button className="button button--secondary" type="button" disabled={busy === 'import-harness-sessions'} onClick={() => setHarnessImportOpen(false)}>{t('关闭', 'Close')}</button>
+          <button className="button button--primary" type="button" disabled={Boolean(busy) || harnessSelectedSessionIds.size === 0} onClick={() => void importSelectedHarnessSessions()}>
+            {busy === 'import-harness-sessions' ? <LoaderCircle size={16} className="spin" /> : <Upload size={16} />}
+            {t('迁入所选会话', 'Migrate selected')}
+          </button>
+        </>}
+      >
+        <div className="harness-session-modal">
+          <div className="harness-session-modal__toolbar">
+            <label><Search size={15} aria-hidden="true" /><input value={harnessSessionSearch} onChange={(event) => setHarnessSessionSearch(event.target.value)} placeholder={t('搜索标题、项目或会话 ID', 'Search title, project, or session ID')} /></label>
+            <button className="button button--secondary" type="button" disabled={visibleHarnessSessions.length === 0 || Boolean(busy)} onClick={selectVisibleHarnessSessions}>
+              {visibleHarnessSessions.length > 0 && visibleHarnessSessions.slice(0, 50).every((session) => harnessSelectedSessionIds.has(session.id))
+                ? t('取消当前结果', 'Clear visible')
+                : t('选择当前结果', 'Select visible')}
+            </button>
+          </div>
+          {harnessImportResult && (
+            <div className={`harness-session-modal__result ${harnessImportResult.failed > 0 ? 'has-failures' : ''}`}>
+              <CheckCircle2 size={16} aria-hidden="true" />
+              <span>{t(
+                `新增 ${harnessImportResult.imported} · 已存在 ${harnessImportResult.alreadyImported} · 失败 ${harnessImportResult.failed}`,
+                `${harnessImportResult.imported} imported · ${harnessImportResult.alreadyImported} already present · ${harnessImportResult.failed} failed`,
+              )}</span>
+            </div>
+          )}
+          {error && harnessImportOpen && <div className="client-preview-error">{error}</div>}
+          <div className="harness-session-modal__list" aria-busy={busy === 'load-harness-sessions'}>
+            {busy === 'load-harness-sessions' ? (
+              <div className="harness-session-modal__empty"><LoaderCircle size={18} className="spin" />{t('正在读取 Codex 会话', 'Loading Codex sessions')}</div>
+            ) : visibleHarnessSessions.length === 0 ? (
+              <div className="harness-session-modal__empty">{t('没有可迁入的 Codex 会话', 'No Codex sessions are available to migrate')}</div>
+            ) : visibleHarnessSessions.map((session) => {
+              const itemResult = harnessImportResult?.items.find((item) => item.sourceSessionId === session.id)
+              return (
+                <label className="harness-session-modal__item" key={`${session.kind}:${session.relativePath}`}>
+                  <input type="checkbox" checked={harnessSelectedSessionIds.has(session.id)} disabled={busy === 'import-harness-sessions' || (!harnessSelectedSessionIds.has(session.id) && harnessSelectedSessionIds.size >= 50)} onChange={() => toggleHarnessSession(session.id)} />
+                  <span>
+                    <strong>{session.title}</strong>
+                    <small>{session.cwd ?? session.id}</small>
+                  </span>
+                  <span>
+                    <strong>{session.summaryOnly
+                      ? formatSessionSize(session.sizeBytes, locale)
+                      : `${session.totalTokens.toLocaleString(locale)} Token · ${formatSessionSize(session.sizeBytes, locale)}`}</strong>
+                    <small>{formatDateTime(session.updatedAt, locale)} · {session.kind === 'archived' ? t('已归档', 'Archived') : t('活跃', 'Active')}</small>
+                  </span>
+                  {itemResult && <em className={`is-${itemResult.status}`}>{itemResult.status === 'imported'
+                    ? t('已迁入', 'Imported')
+                    : itemResult.status === 'already-imported'
+                      ? t('已存在', 'Already present')
+                      : itemResult.error ?? t('失败', 'Failed')}</em>}
+                </label>
+              )
+            })}
+          </div>
+        </div>
+      </Modal>
+
+      <Modal
         open={profileBundleMode === 'export' && profileBundle !== '__closed__'}
         title={t('导出目录定义', 'Export directory definition')}
         description={t('只包含目录和备份策略，不包含配置正文或 Token。', 'Includes only the directory and backup policy, not configuration contents or tokens.')}
@@ -1744,7 +1958,7 @@ export function ClientsView({
         footer={<><button className="button button--secondary" type="button" onClick={() => setProfile(null)}>{t('取消', 'Cancel')}</button><button className="button button--primary" type="submit" form="client-profile-form" disabled={busy === 'save-profile'}><Save size={16} />{t('保存', 'Save')}</button></>}
       >
         {profile && <form id="client-profile-form" className="form-grid" onSubmit={(event) => void saveProfile(event)}>
-          <label className="field"><span>{t('客户端', 'Client')}</span><select value={profile.client} disabled={Boolean(profile.id)} onChange={(event) => setProfile({ ...profile, client: event.target.value as RouteClient })}><option value="claude">Claude Code</option><option value="codex">Codex</option><option value="gemini">Gemini CLI</option><option value="grokbuild">Grok Build</option></select></label>
+          <label className="field"><span>{t('客户端', 'Client')}</span><select value={profile.client} disabled={Boolean(profile.id)} onChange={(event) => setProfile({ ...profile, client: event.target.value as RouteClient })}><option value="claude">Claude Code</option><option value="codex">Codex</option><option value="gemini">Gemini CLI</option><option value="grokbuild">Grok Build</option><option value="deepseek-harness">DeepSeek Harness</option></select></label>
           <label className="field"><span>{t('名称', 'Name')}</span><input required value={profile.name} onChange={(event) => setProfile({ ...profile, name: event.target.value })} placeholder={t('例如：工作配置', 'For example: Work configuration')} /></label>
           <label className="field field--full">
             <span>{t('配置目录', 'Configuration directory')}</span>
@@ -1911,6 +2125,7 @@ function preferredRole(editor: ClientConfigEditorState): ClientConfigFileRole | 
     codex: 'codex-config',
     gemini: 'gemini-settings',
     grokbuild: 'grok-config',
+    'deepseek-harness': 'deepseek-harness-env',
   }
   return editor.files.find((file) => file.role === preferred[editor.client])?.role
     ?? editor.files.find((file) => file.editable)?.role

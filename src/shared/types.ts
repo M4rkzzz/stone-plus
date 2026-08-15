@@ -254,13 +254,14 @@ export interface ProxyDefinition {
 
 export type PublicProxyDefinition = Omit<ProxyDefinition, 'credentialId'>
 
-export type RouteClient = 'claude' | 'codex' | 'gemini' | 'grokbuild'
+export type RouteClient = 'claude' | 'codex' | 'gemini' | 'grokbuild' | 'deepseek-harness'
 
 export const clientNativeProtocols: Readonly<Record<RouteClient, Protocol>> = {
   claude: 'anthropic-messages',
   codex: 'openai-responses',
   gemini: 'gemini',
-  grokbuild: 'openai-responses'
+  grokbuild: 'openai-responses',
+  'deepseek-harness': 'openai-chat'
 }
 
 export type ClientConfigFileRole =
@@ -274,6 +275,7 @@ export type ClientConfigFileRole =
   | 'gemini-settings'
   | 'gemini-env'
   | 'grok-config'
+  | 'deepseek-harness-env'
 
 export type ClientConfigFileFormat = 'json' | 'toml' | 'dotenv' | 'text'
 export type ClientConfigFieldValue = string | number | boolean | string[] | null
@@ -455,18 +457,42 @@ export interface CodexManagedSession {
   cachedInputTokens: number
   reasoningTokens: number
   totalTokens: number
+  /** True when the row was built without reading the rollout body. */
+  summaryOnly?: boolean
 }
 
 export interface CodexSessionQuery {
   search?: string
   kind?: CodexSessionKind | 'all'
   limit?: number
+  /** Summary mode avoids parsing and hashing every rollout file. */
+  detail?: 'full' | 'summary'
 }
 
 export interface CodexSessionExportResult {
   cancelled: boolean
   sessionId: string
   filePath?: string
+}
+
+export interface CodexHarnessSessionImportSelection {
+  id: string
+  expectedRevision: string
+}
+
+export interface CodexHarnessSessionImportItemResult {
+  sourceSessionId: string
+  harnessSessionId?: string
+  title?: string
+  status: 'imported' | 'already-imported' | 'failed'
+  error?: string
+}
+
+export interface CodexHarnessSessionImportResult {
+  items: CodexHarnessSessionImportItemResult[]
+  imported: number
+  alreadyImported: number
+  failed: number
 }
 
 export interface ClientConfigProfileInput {
@@ -753,11 +779,35 @@ export interface CodexQuotaWindow {
   resetAt?: number
 }
 
+/**
+ * A quota family returned in WHAM `additional_rate_limits`. Keeping feature
+ * windows separate prevents one model family (for example Spark) from
+ * overwriting the account's primary Codex windows.
+ */
+export interface CodexQuotaBucket {
+  /** Sanitized upstream feature identifier. No credential or opaque token is retained. */
+  id: string
+  label?: string
+  fiveHour?: CodexQuotaWindow
+  sevenDay?: CodexQuotaWindow
+  monthly?: CodexQuotaWindow
+  allowed?: boolean
+  limitReached?: boolean
+}
+
 export type CodexQuotaSource = 'usage-endpoint' | 'response-headers'
 
 export interface AccountCodexQuotaSnapshot {
   fiveHour?: CodexQuotaWindow
   sevenDay?: CodexQuotaWindow
+  /** Native monthly window used by plans whose long quota period is not seven days. */
+  monthly?: CodexQuotaWindow
+  /** Per-feature/model quota families; never projected over the primary account windows. */
+  additionalBuckets?: CodexQuotaBucket[]
+  /** Sanitized plan label observed from WHAM, such as free, plus, pro, team, or business. */
+  planType?: string
+  /** Observation time for WHAM-only details preserved across response-header updates. */
+  detailsObservedAt?: number
   allowed?: boolean
   limitReached?: boolean
   resetCredits?: {
@@ -779,7 +829,7 @@ export interface QuotaProtectionPolicy {
   fiveHourRemainingPercent?: number
   sevenDayRemainingPercent?: number
   unavailableBehavior?: 'allow' | 'block'
-  /** Treat a snapshot older than this as unavailable. Omit to accept any age. */
+  /** Treat a snapshot older than this as unavailable. Omit for the two-hour safety default. */
   staleAfterMinutes?: number
 }
 
@@ -793,11 +843,19 @@ export interface CodexQuotaHistoryPoint {
   source: CodexQuotaSource
 }
 
+/** Retains a complete rolling monthly quota cycle, including reset-boundary drift. */
+export const CODEX_QUOTA_HISTORY_RETENTION_MS = 35 * 24 * 60 * 60 * 1000
+
 export interface CodexQuotaCycleCosts {
   fiveHourUsd?: number
   sevenDayUsd?: number
   fiveHourUnpricedUsdTokens?: number
   sevenDayUnpricedUsdTokens?: number
+  /** USD-equivalent usage recorded after any current quota window reached 100%; overlapping logs count once. */
+  hiddenQuotaUsd?: number
+  /** Total tokens represented by hiddenQuotaUsd, including models without a rate card. */
+  hiddenQuotaTokens?: number
+  hiddenQuotaUnpricedTokens?: number
   fiveHourCredits?: number
   sevenDayCredits?: number
   fiveHourUnpricedCreditTokens?: number
@@ -834,6 +892,8 @@ export interface Pool {
   reasoningEffortMap?: ReasoningEffortMap
   reasoningEffortCap?: ReasoningEffort
   forceFastMode?: boolean
+  /** Rewrite every model request served by this pool to the hidden gpt-5.6-sol-wm route. */
+  routeToWm?: boolean
   /** Pool-wide reserve guard, combined with each member's account policy. */
   quotaProtection?: QuotaProtectionPolicy
   hedgedRequests?: boolean
@@ -1471,6 +1531,7 @@ export interface PoolInput {
   reasoningEffortMap?: ReasoningEffortMap
   reasoningEffortCap?: ReasoningEffort
   forceFastMode?: boolean
+  routeToWm?: boolean
   quotaProtection?: QuotaProtectionPolicy
   hedgedRequests?: boolean
   hedgeDelayMs?: number
@@ -2103,6 +2164,8 @@ export interface GatewayApi {
   runNetworkDiagnostics(input?: NetworkDiagnosticInput): Promise<NetworkDiagnosticReport>
   checkAccount(id: string): Promise<AppSnapshot>
   refreshAccountCodexQuota(id: string): Promise<AppSnapshot>
+  /** Consumes one upstream reset credit after an explicit user confirmation. */
+  consumeAccountCodexResetCredit(id: string): Promise<AppSnapshot>
   getAccountCodexQuotaHistory(id: string, from?: number, to?: number): Promise<CodexQuotaHistoryPoint[]>
   getAccountCodexQuotaCycleCosts(id: string): Promise<CodexQuotaCycleCosts>
   clearLogs(): Promise<AppSnapshot>
@@ -2200,6 +2263,9 @@ export interface GatewayApi {
   exportCodexSession(id: string, expectedRevision: string): Promise<CodexSessionExportResult>
   trashCodexSession(id: string, expectedRevision: string): Promise<CodexManagedSession[]>
   restoreCodexSession(id: string, expectedRevision: string): Promise<CodexManagedSession[]>
+  importCodexSessionsToDeepSeekHarness(
+    selections: CodexHarnessSessionImportSelection[],
+  ): Promise<CodexHarnessSessionImportResult>
   onSnapshot(listener: (snapshot: AppSnapshot) => void): () => void
   onBuiltInProxyState(listener: (state: BuiltInProxyRuntimeState) => void): () => void
   onRuntimeDelta(listener: (delta: AppRuntimeDelta) => void): () => void

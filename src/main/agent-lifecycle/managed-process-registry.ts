@@ -1,6 +1,6 @@
 import { resolve } from 'node:path'
 
-export type ManagedAgentTarget = 'codex-desktop' | 'codex-cli' | 'claude-code' | 'gemini-cli' | 'grok-build'
+export type ManagedAgentTarget = 'codex-desktop' | 'codex-cli' | 'claude-code' | 'gemini-cli' | 'grok-build' | 'deepseek-harness'
 
 export interface ManagedAgentProcess {
   id: string

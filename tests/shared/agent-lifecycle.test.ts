@@ -16,6 +16,7 @@ const expectedTargets = [
   'claude-code-vsc',
   'gemini-cli',
   'grok-build',
+  'deepseek-harness',
 ] as const
 
 describe('agent lifecycle contract', () => {
@@ -103,6 +104,14 @@ describe('agent lifecycle contract', () => {
       canInstall: true,
       canRestart: true,
       sharedStateGroup: 'grok-home',
+    })
+  })
+
+  it('allows an already-running DeepSeek Harness workbench to be opened again', () => {
+    expect(AGENT_CAPABILITIES['deepseek-harness']).toMatchObject({
+      canDetectRunning: true,
+      canLaunch: true,
+      canOpenWhenRunning: true,
     })
   })
 

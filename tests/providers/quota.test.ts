@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
+  CODEX_QUOTA_STALE_AFTER_MS,
   codexQuotaCooldownUntil,
   codexQuotaIsExhausted,
   extractCodexQuotaFromHeaders,
@@ -7,6 +8,7 @@ import {
   extractProtocolUsage,
   extractQuotaSignals,
   extractRateLimitSignals,
+  mergeCodexQuotaSnapshots,
   mergeQuotaSignals,
   parseQuotaResetAt,
   type NormalizedQuotaSignals
@@ -50,8 +52,21 @@ describe('Codex quota cooldown', () => {
       sevenDay: { usedPercent: 16, resetAt: now + 7 * 24 * 60 * 60_000 }
     }
 
-    expect(codexQuotaIsExhausted(quota, now)).toBe(true)
+    expect(codexQuotaIsExhausted(quota, now)).toBe(false)
     expect(codexQuotaCooldownUntil(quota, now)).toBeUndefined()
+  })
+
+  it('releases reset-less exhaustion snapshots after the bounded freshness interval', () => {
+    const quota = {
+      observedAt: now,
+      source: 'usage-endpoint' as const,
+      allowed: false,
+      limitReached: true,
+      fiveHour: { usedPercent: 100 }
+    }
+
+    expect(codexQuotaIsExhausted(quota, now + CODEX_QUOTA_STALE_AFTER_MS)).toBe(true)
+    expect(codexQuotaIsExhausted(quota, now + CODEX_QUOTA_STALE_AFTER_MS + 1)).toBe(false)
   })
 })
 
@@ -315,7 +330,105 @@ describe('Codex quota extraction', () => {
     expect(extractCodexQuotaFromUsagePayload({ rate_limit: null }, now)).toBeUndefined()
     expect(extractCodexQuotaFromUsagePayload({
       rate_limit: { allowed: false, limit_reached: true, primary_window: null, secondary_window: null }
-    }, now)).toBeUndefined()
+    }, now)).toEqual({
+      allowed: false,
+      limitReached: true,
+      observedAt: now,
+      source: 'usage-endpoint'
+    })
+  })
+
+  it('keeps native percentages, monthly windows, plan metadata, and model buckets isolated', () => {
+    const quota = extractCodexQuotaFromUsagePayload({
+      data: {
+        usage: {
+          plan_type: 'Free Personal',
+          rate_limit: {
+            allowed: true,
+            limit_reached: false,
+            primary_window: {
+              used_percent: 1,
+              limit_window_seconds: 5 * 60 * 60,
+              reset_after_seconds: 60
+            },
+            secondary_window: {
+              used_percent: 45,
+              limit_window_seconds: 30 * 24 * 60 * 60,
+              reset_after_seconds: 600
+            }
+          },
+          additional_rate_limits: [{
+            limit_name: 'Spark · Private\u0000Label',
+            metered_feature: 'codex_bengalfox',
+            rate_limit: {
+              allowed: false,
+              limit_reached: true,
+              primary_window: {
+                used_percent: 100,
+                limit_window_seconds: 7 * 24 * 60 * 60,
+                reset_after_seconds: 120
+              }
+            }
+          }]
+        }
+      }
+    }, now)
+
+    expect(quota).toEqual({
+      fiveHour: {
+        usedPercent: 1,
+        windowSeconds: 5 * 60 * 60,
+        resetAt: now + 60_000
+      },
+      monthly: {
+        usedPercent: 45,
+        windowSeconds: 30 * 24 * 60 * 60,
+        resetAt: now + 600_000
+      },
+      allowed: true,
+      limitReached: false,
+      planType: 'free-personal',
+      detailsObservedAt: now,
+      additionalBuckets: [{
+        id: 'codex_bengalfox',
+        label: 'Spark · PrivateLabel',
+        sevenDay: {
+          usedPercent: 100,
+          windowSeconds: 7 * 24 * 60 * 60,
+          resetAt: now + 120_000
+        },
+        allowed: false,
+        limitReached: true
+      }],
+      observedAt: now,
+      source: 'usage-endpoint'
+    })
+    expect(codexQuotaIsExhausted(quota, now)).toBe(false)
+  })
+
+  it('excludes expired and unavailable reset credits when deriving a count from details', () => {
+    const quota = extractCodexQuotaFromUsagePayload({
+      rate_limit_reset_credits: {
+        credits: [{
+          reset_type: 'codex_rate_limits',
+          status: 'available',
+          expires_at: new Date(now - 1_000).toISOString()
+        }, {
+          reset_type: 'codex_rate_limits',
+          status: 'consumed',
+          expires_at: new Date(now + 60_000).toISOString()
+        }, {
+          reset_type: 'codex_rate_limits',
+          status: 'available',
+          expires_at: new Date(now + 120_000).toISOString()
+        }]
+      }
+    }, now)
+
+    expect(quota?.resetCredits).toEqual({
+      availableCount: 1,
+      expiresAt: [now + 120_000]
+    })
   })
 })
 
@@ -352,6 +465,21 @@ describe('protocol usage extraction', () => {
       totalTokens: 250,
       cachedInputTokens: 80,
       reasoningTokens: 20
+    })
+
+    expect(extractProtocolUsage('openai-responses', {
+      data: {
+        usage: {
+          input_tokens: 11,
+          output_tokens: 7,
+          input_tokens_details: { cached_tokens: 5 }
+        }
+      }
+    })).toEqual({
+      inputTokens: 11,
+      outputTokens: 7,
+      totalTokens: 18,
+      cachedInputTokens: 5
     })
   })
 
@@ -493,6 +621,56 @@ describe('quota signal merge precedence', () => {
         observedAt: now + 1_000,
         source: 'usage-endpoint'
       }
+    })
+  })
+
+  it('drops expired windows and stale exhaustion flags after a successful response observation', () => {
+    const earlier = {
+      fiveHour: { usedPercent: 100, resetAt: now + 1_000 },
+      sevenDay: { usedPercent: 40, resetAt: now + 600_000 },
+      allowed: false,
+      limitReached: true,
+      resetCredits: { availableCount: 2, expiresAt: [now + 86_400_000] },
+      detailsObservedAt: now,
+      observedAt: now,
+      source: 'usage-endpoint' as const
+    }
+    const later = {
+      fiveHour: { usedPercent: 3, resetAt: now + 18_000_000 },
+      observedAt: now + 2_000,
+      source: 'response-headers' as const
+    }
+
+    expect(mergeCodexQuotaSnapshots(earlier, later)).toEqual({
+      fiveHour: { usedPercent: 3, resetAt: now + 18_000_000 },
+      sevenDay: { usedPercent: 40, resetAt: now + 600_000 },
+      resetCredits: { availableCount: 2, expiresAt: [now + 86_400_000] },
+      detailsObservedAt: now,
+      observedAt: now + 2_000,
+      source: 'response-headers'
+    })
+  })
+
+  it('does not let frequent response headers keep old WHAM-only details alive forever', () => {
+    const earlier = {
+      fiveHour: { usedPercent: 20, resetAt: now + 24 * 60 * 60_000 },
+      planType: 'plus',
+      resetCredits: { availableCount: 1 },
+      additionalBuckets: [{ id: 'spark', sevenDay: { usedPercent: 80 } }],
+      detailsObservedAt: now,
+      observedAt: now + CODEX_QUOTA_STALE_AFTER_MS - 1,
+      source: 'response-headers' as const
+    }
+    const later = {
+      fiveHour: { usedPercent: 21, resetAt: now + 24 * 60 * 60_000 },
+      observedAt: now + CODEX_QUOTA_STALE_AFTER_MS + 1,
+      source: 'response-headers' as const
+    }
+
+    expect(mergeCodexQuotaSnapshots(earlier, later)).toEqual({
+      fiveHour: { usedPercent: 21, resetAt: now + 24 * 60 * 60_000 },
+      observedAt: now + CODEX_QUOTA_STALE_AFTER_MS + 1,
+      source: 'response-headers'
     })
   })
 })

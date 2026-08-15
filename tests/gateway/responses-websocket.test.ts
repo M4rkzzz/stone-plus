@@ -41,6 +41,30 @@ describe('Responses WebSocket message adapter', () => {
     expect(events).toEqual([{ type: 'response.created' }, { type: 'response.completed' }])
   })
 
+  it('preserves a failed Responses terminal event without fabricating success', async () => {
+    const events: Record<string, unknown>[] = []
+    const response = new Response([
+      'data: {"type":"response.created","response":{"id":"resp-cut","status":"in_progress"}}\n\n',
+      'data: {"type":"response.failed","response":{"id":"resp-cut","status":"failed","error":{"message":"cut"}}}\n\n',
+    ].join(''), { headers: { 'content-type': 'text/event-stream' } })
+
+    await forwardResponsesSse(response, (event) => events.push(event))
+
+    expect(events.map((event) => event.type)).toEqual([
+      'response.created',
+      'response.failed',
+    ])
+  })
+
+  it('rejects an upstream SSE stream that ends without a terminal or error event', async () => {
+    const response = new Response('data: {"type":"response.created"}\n\n', {
+      headers: { 'content-type': 'text/event-stream' },
+    })
+
+    await expect(forwardResponsesSse(response, () => undefined))
+      .rejects.toThrow('ended without a terminal event')
+  })
+
   it('accepts a UTF-8 BOM before the first SSE data field', async () => {
     const events: Record<string, unknown>[] = []
     const response = new Response('\uFEFFdata: {"type":"response.created"}\n\ndata: {"type":"response.completed"}\n\n')
@@ -238,6 +262,41 @@ describe('GatewayServer Responses WebSocket', () => {
     socket.close()
   })
 
+  it('closes a truncated streamed turn without leaving the WebSocket waiting for completion', async () => {
+    const port = await freePort()
+    const fetchImplementation = vi.fn(async () => responsesSse([
+      { type: 'response.created', response: { id: 'resp-cut', status: 'in_progress' } },
+      {
+        type: 'response.custom_tool_call_input.delta',
+        response_id: 'resp-cut',
+        item_id: 'tool-cut',
+        output_index: 0,
+        delta: 'partial'
+      },
+    ])) as unknown as typeof fetch
+    const gateway = makeGateway(port, { responsesWebSocketEnabled: true }, fetchImplementation)
+    running.push(gateway)
+    await gateway.start()
+
+    const socket = await connect(`ws://127.0.0.1:${port}/v1/responses`, 'local-secret')
+    const messages = collectMessages(socket)
+    socket.send(JSON.stringify({ type: 'response.create', model: 'gpt-test', input: 'hello' }))
+    await waitFor(() => messages.some((event) => event.type === 'response.failed'))
+
+    expect(messages.map((event) => event.type)).toEqual([
+      'response.created',
+      'response.custom_tool_call_input.delta',
+      'error',
+      'response.failed',
+    ])
+    expect(messages.find((event) => event.type === 'response.failed')).toMatchObject({
+      response: { id: 'resp-cut', status: 'failed' },
+    })
+    expect(socket.readyState).toBe(WebSocket.OPEN)
+    expect(fetchImplementation).toHaveBeenCalledTimes(1)
+    socket.close()
+  })
+
   it('aborts the ordinary gateway request when the WebSocket disconnects', async () => {
     const port = await freePort()
     let upstreamSignal: AbortSignal | undefined
@@ -299,6 +358,7 @@ describe('GatewayServer Responses WebSocket', () => {
       status: 400,
       error: { type: 'invalid_request_error', code: 'bad_request' },
     })
+    expect(messages.map((event) => event.type)).toEqual(['error'])
     socket.close()
   })
 

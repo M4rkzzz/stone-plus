@@ -150,7 +150,7 @@ export class OutboundTransportManager {
       directLoopbackPorts: this.localGatewayPort ? [this.localGatewayPort] : []
     })
     this.builtInRoutes.setExternalMode(this.outboundNetworkMode)
-    if (this.localGatewayPort) this.builtInRoutes.addDirectLoopbackPorts([this.localGatewayPort])
+    this.builtInRoutes.setDirectLoopbackPorts(this.localGatewayPort ? [this.localGatewayPort] : [])
     this.loopbackFetchImplementation = (async (input, init) => {
       if (this.closed) throw new Error('Outbound transport manager is closed.')
       return this.directFetch()(input, init)
@@ -314,7 +314,10 @@ export class OutboundTransportManager {
     this.outboundNetworkMode = mode
     this.builtInRoutes.setExternalMode(mode)
     this.localGatewayPort = localGatewayPort
-    if (localGatewayPort) this.builtInRoutes.addDirectLoopbackPorts([localGatewayPort])
+    // Rebinding the gateway must revoke the previous direct-loopback
+    // exception. Otherwise an unrelated process that later owns the old port
+    // can bypass a ready or fail-closed built-in route indefinitely.
+    this.builtInRoutes.setDirectLoopbackPorts(localGatewayPort ? [localGatewayPort] : [])
     if (changed) {
       this.invalidateSystemProxyCache()
       this.systemProxyResolutionWarningReported = false

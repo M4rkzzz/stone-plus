@@ -551,6 +551,63 @@ describe('canonical streaming protocol conversion', () => {
     expect(calls[1]).not.toHaveProperty('type')
   })
 
+  it('buffers parallel DSH tool calls and removes retry-only sandbox arguments', () => {
+    const streamEncoder = createCanonicalStreamEncoder('openai-chat', {
+      id: 'dsh.stream',
+      model: 'gpt-recorded',
+      now: () => 1_700_000_000_000,
+      sanitizeDeepSeekHarnessToolArguments: true,
+    })
+    const output = [
+      ...streamEncoder.encode({
+        type: 'tool-call-delta', index: 1, id: 'call_b', name: 'write_file',
+        arguments: '{"path":"b.txt","sandbox_permissions":"workspace-',
+      }),
+      ...streamEncoder.encode({
+        type: 'tool-call-delta', index: 0, id: 'call_a', name: 'pwsh',
+        arguments: '{"command":"Get-Content a.txt",',
+      }),
+      ...streamEncoder.encode({
+        type: 'tool-call-delta', index: 1,
+        arguments: 'write","justification":"write b"}',
+      }),
+      ...streamEncoder.encode({
+        type: 'tool-call-delta', index: 0,
+        arguments: '"sandbox_permissions":"workspace-write","justification":"read a"}',
+      }),
+      ...streamEncoder.encode({ type: 'tool-call-complete', index: 1 }),
+      // OpenAI Chat has no explicit complete event; finish_reason completes
+      // every remaining parallel call while Responses may emit it earlier.
+      ...streamEncoder.encode({ type: 'stop', reason: 'tool_calls' }),
+      ...streamEncoder.encode({ type: 'done' }),
+    ]
+    const wire = new TextDecoder().decode(joinBytes(output))
+    const calls = wire
+      .split('\n')
+      .filter((line) => line.startsWith('data: {'))
+      .map((line) => JSON.parse(line.slice(6)) as {
+        choices?: Array<{ delta?: { tool_calls?: Array<Record<string, unknown>> } }>
+      })
+      .flatMap((chunk) => chunk.choices?.[0]?.delta?.tool_calls ?? [])
+
+    expect(calls).toHaveLength(2)
+    expect(calls).toEqual([
+      expect.objectContaining({
+        index: 0,
+        id: 'call_a',
+        function: { name: 'pwsh', arguments: '{"command":"Get-Content a.txt"}' },
+      }),
+      expect.objectContaining({
+        index: 1,
+        id: 'call_b',
+        function: { name: 'write_file', arguments: '{"path":"b.txt"}' },
+      }),
+    ])
+    expect(wire).not.toContain('sandbox_permissions')
+    expect(wire).not.toContain('justification')
+    expect(wire).toContain('"finish_reason":"tool_calls"')
+  })
+
   it('parses OpenAI Chat SSE across arbitrary chunks, UTF-8 boundaries, usage and [DONE]', () => {
     const recording = [
       'data: {"id":"chat_recorded","object":"chat.completion.chunk","created":1700000000,"model":"gpt-recorded","choices":[{"index":0,"delta":{"role":"assistant","content":"你"},"finish_reason":null}]}\n\n',
@@ -1253,6 +1310,32 @@ describe('canonical streaming protocol conversion', () => {
 
     expect(text).toContain('"error"')
     expect(text).not.toContain('"finish_reason":"stop"')
+  })
+
+  it('terminates a Responses streaming error with response.failed', () => {
+    const streamEncoder = createCanonicalStreamEncoder('openai-responses', {
+      id: 'resp-failed',
+      model: 'model-test',
+      now: () => 1_700_000_000_000
+    })
+    const wire = [
+      ...streamEncoder.encode({
+        type: 'error',
+        message: 'upstream disconnected',
+        errorType: 'upstream_stream_error',
+        code: '502'
+      }),
+      ...streamEncoder.encode({ type: 'done' })
+    ]
+    const text = new TextDecoder().decode(Buffer.concat(wire.map((chunk) => Buffer.from(chunk))))
+
+    expect(text).toContain('event: error')
+    expect(text).toContain('event: response.failed')
+    expect(text.indexOf('event: error')).toBeLessThan(text.indexOf('event: response.failed'))
+    expect(text).toContain('"id":"resp-failed"')
+    expect(text).toContain('"status":"failed"')
+    expect(text).toContain('"code":"502"')
+    expect(text).not.toContain('event: response.completed')
   })
 
   it('does not publish an ignored out-of-order Responses terminal as protocol completion', () => {

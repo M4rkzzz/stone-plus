@@ -2423,6 +2423,166 @@ describe('refresh provider models IPC', () => {
     expect(oauth.cooldownUntil).toBeUndefined()
   })
 
+  it('single-flights reset-credit redemption and releases quota cooldown when the follow-up read fails', async () => {
+    const oauth = {
+      ...oauthAccount(),
+      status: 'cooldown' as const,
+      circuitState: 'open' as const,
+      cooldownReason: 'quota' as const,
+      cooldownUntil: Date.now() + 60_000,
+      codexQuota: {
+        fiveHour: { usedPercent: 100 },
+        additionalBuckets: [{ id: 'stale-model-bucket', sevenDay: { usedPercent: 100 } }],
+        resetCredits: { availableCount: 1, expiresAt: [Date.now() + 60_000] },
+        observedAt: Date.now(),
+        source: 'usage-endpoint' as const,
+      },
+    }
+    let releaseConsume: (() => void) | undefined
+    const consumeGate = new Promise<void>((resolve) => { releaseConsume = resolve })
+    const upstreamFetch = vi.fn(async (input: URL | RequestInfo) => {
+      if (String(input).endsWith('/consume')) {
+        await consumeGate
+        return new Response(JSON.stringify({ windows_reset: 2 }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        })
+      }
+      return new Response(null, { status: 503 })
+    })
+    const harness = createHarness([oauth], { [oauth.credentialId]: oauthCredential() }, upstreamFetch)
+    const handler = electron.handlers.get('stone:consume-account-codex-reset-credit')
+    if (!handler) throw new Error('consume-account-codex-reset-credit handler was not registered')
+    const mainFrame = { url: 'http://127.0.0.1:5173/index.html' }
+    const event = { senderFrame: mainFrame, sender: { mainFrame } }
+
+    const first = handler(event, oauth.id)
+    const second = handler(event, oauth.id)
+    await vi.waitFor(() => expect(upstreamFetch).toHaveBeenCalledTimes(1))
+    releaseConsume?.()
+    await Promise.all([first, second])
+
+    expect(upstreamFetch).toHaveBeenCalledTimes(2)
+    expect(oauth).toMatchObject({
+      status: 'active',
+      circuitState: 'closed',
+      codexQuota: {
+        allowed: true,
+        limitReached: false,
+        resetCredits: { availableCount: 0 },
+      },
+    })
+    expect(oauth.codexQuota?.additionalBuckets).toBeUndefined()
+    expect(oauth.cooldownReason).toBeUndefined()
+    expect(oauth.cooldownUntil).toBeUndefined()
+    expect(harness.gateway.resetAccountHealth).toHaveBeenCalledOnce()
+    expect(harness.store.setAccountCheckResult).toHaveBeenCalledOnce()
+  })
+
+  it('refreshes a rejected OAuth token and reuses the reset-credit idempotency key', async () => {
+    const oauth = {
+      ...oauthAccount(),
+      codexQuota: {
+        resetCredits: { availableCount: 1 },
+        observedAt: Date.now(),
+        source: 'usage-endpoint' as const,
+      },
+    }
+    const consumeRequestIds: string[] = []
+    let consumeCalls = 0
+    const upstreamFetch = vi.fn(async (input: URL | RequestInfo, init?: RequestInit) => {
+      const url = String(input)
+      if (url.endsWith('/consume')) {
+        consumeCalls += 1
+        const headers = new Headers(init?.headers)
+        const body = JSON.parse(String(init?.body)) as { redeem_request_id: string }
+        consumeRequestIds.push(body.redeem_request_id)
+        expect(headers.get('idempotency-key')).toBe(body.redeem_request_id)
+        if (consumeCalls === 1) {
+          expect(headers.get('authorization')).toBe('Bearer oauth-access-private')
+          return new Response(null, { status: 401 })
+        }
+        expect(headers.get('authorization')).toBe('Bearer oauth-access-rotated')
+        return new Response(JSON.stringify({ windows_reset: 2 }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        })
+      }
+      if (url === 'https://auth.openai.com/oauth/token') {
+        return new Response(JSON.stringify({
+          access_token: 'oauth-access-rotated',
+          refresh_token: 'oauth-refresh-rotated',
+          expires_in: 3600,
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      if (url.endsWith('/wham/usage')) {
+        return new Response(JSON.stringify({
+          rate_limit: {
+            allowed: true,
+            limit_reached: false,
+            primary_window: { used_percent: 0, limit_window_seconds: 18_000 },
+          },
+          rate_limit_reset_credits: { available_count: 0 },
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      throw new Error(`Unexpected reset-credit request: ${url}`)
+    })
+    const harness = createHarness([oauth], { [oauth.credentialId]: oauthCredential() }, upstreamFetch)
+    const handler = electron.handlers.get('stone:consume-account-codex-reset-credit')
+    if (!handler) throw new Error('consume-account-codex-reset-credit handler was not registered')
+    const mainFrame = { url: 'http://127.0.0.1:5173/index.html' }
+
+    await handler({ senderFrame: mainFrame, sender: { mainFrame } }, oauth.id)
+
+    expect(consumeCalls).toBe(2)
+    expect(consumeRequestIds).toHaveLength(2)
+    expect(consumeRequestIds[1]).toBe(consumeRequestIds[0])
+    expect(harness.store.updateChatGptCredential).toHaveBeenCalledOnce()
+    expect(oauth.codexQuota).toMatchObject({
+      allowed: true,
+      limitReached: false,
+      resetCredits: { availableCount: 0 },
+    })
+  })
+
+  it('does not enable a manually disabled account after consuming its reset credit', async () => {
+    const oauth = {
+      ...oauthAccount(),
+      status: 'disabled' as const,
+      codexQuota: {
+        resetCredits: { availableCount: 1 },
+        observedAt: Date.now(),
+        source: 'usage-endpoint' as const,
+      },
+    }
+    const upstreamFetch = vi.fn(async (input: URL | RequestInfo) => new Response(JSON.stringify(
+      String(input).endsWith('/consume')
+        ? { windows_reset: 2 }
+        : {
+            rate_limit: {
+              allowed: true,
+              limit_reached: false,
+              primary_window: { used_percent: 0, limit_window_seconds: 18_000 },
+            },
+            rate_limit_reset_credits: { available_count: 0 },
+          }
+    ), { status: 200, headers: { 'content-type': 'application/json' } }))
+    const harness = createHarness([oauth], { [oauth.credentialId]: oauthCredential() }, upstreamFetch)
+    const handler = electron.handlers.get('stone:consume-account-codex-reset-credit')
+    if (!handler) throw new Error('consume-account-codex-reset-credit handler was not registered')
+    const mainFrame = { url: 'http://127.0.0.1:5173/index.html' }
+
+    await handler({ senderFrame: mainFrame, sender: { mainFrame } }, oauth.id)
+
+    expect(oauth.status).toBe('disabled')
+    expect(oauth.codexQuota).toMatchObject({
+      allowed: true,
+      limitReached: false,
+      resetCredits: { availableCount: 0 },
+    })
+    expect(harness.gateway.resetAccountHealth).not.toHaveBeenCalled()
+  })
+
   it('releases a confirmed quota cooldown at its boundary even when WHAM still reports 100%', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(new Date('2026-07-25T10:36:52.000Z'))

@@ -37,6 +37,24 @@ describe('account quota summary', () => {
     })).toBe(35)
   })
 
+  it('keeps model-specific buckets out of whole-account remaining quota', () => {
+    expect(accountRemainingPercent({
+      ...baseAccount,
+      codexQuota: {
+        fiveHour: { usedPercent: 20 },
+        sevenDay: { usedPercent: 30 },
+        additionalBuckets: [{
+          id: 'codex_bengalfox',
+          sevenDay: { usedPercent: 100 },
+          allowed: false,
+          limitReached: true,
+        }],
+        observedAt: Date.now(),
+        source: 'usage-endpoint',
+      },
+    })).toBe(70)
+  })
+
   it('averages known usable accounts and excludes disabled accounts', () => {
     expect(summarizeAccountQuota([
       { ...baseAccount, quotaRemaining: 80, quotaUnit: 'percent' },

@@ -8,7 +8,7 @@ export interface RequestLogSummary {
   successCount: number
   errorCount: number
   averageLatency: number
-  averageFirstToken: number
+  averageFirstByte: number
   totalTokens: number
   hasStreaming: boolean
 }
@@ -21,7 +21,7 @@ export function formatTokenBillions(totalTokens: number): string {
   return `${digits ? formatted.replace(/\.?0+$/u, '') : formatted}b`
 }
 
-export const displayedRequestFirstTokenMs = (log: RequestLog): number | undefined =>
+export const displayedRequestFirstByteMs = (log: RequestLog): number | undefined =>
   log.requestKind === 'compaction' ? undefined : log.upstreamFirstByteMs ?? log.firstTokenMs
 
 export function summarizeRequestLogs(logs: readonly RequestLog[]): RequestLogSummary {
@@ -29,8 +29,8 @@ export function summarizeRequestLogs(logs: readonly RequestLog[]): RequestLogSum
   let errorCount = 0
   let completedCount = 0
   let totalLatency = 0
-  let firstTokenCount = 0
-  let totalFirstToken = 0
+  let firstByteCount = 0
+  let totalFirstByte = 0
   let totalTokens = 0
   let hasStreaming = false
 
@@ -43,10 +43,10 @@ export function summarizeRequestLogs(logs: readonly RequestLog[]): RequestLogSum
       completedCount += 1
       totalLatency += log.latencyMs
     }
-    const firstToken = displayedRequestFirstTokenMs(log)
-    if (firstToken !== undefined) {
-      firstTokenCount += 1
-      totalFirstToken += firstToken
+    const firstByte = displayedRequestFirstByteMs(log)
+    if (firstByte !== undefined) {
+      firstByteCount += 1
+      totalFirstByte += firstByte
     }
     totalTokens += (log.inputTokens ?? 0) + (log.outputTokens ?? 0)
   }
@@ -55,7 +55,7 @@ export function summarizeRequestLogs(logs: readonly RequestLog[]): RequestLogSum
     successCount,
     errorCount,
     averageLatency: completedCount ? Math.round(totalLatency / completedCount) : 0,
-    averageFirstToken: firstTokenCount ? Math.round(totalFirstToken / firstTokenCount) : 0,
+    averageFirstByte: firstByteCount ? Math.round(totalFirstByte / firstByteCount) : 0,
     totalTokens,
     hasStreaming,
   }

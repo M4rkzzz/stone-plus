@@ -18,6 +18,7 @@ export interface ClientConfigPathOverrides {
   codexDirectory?: string
   geminiDirectory?: string
   grokbuildDirectory?: string
+  deepseekHarnessDirectory?: string
 }
 
 export interface ClientConfigPathOptions {
@@ -56,6 +57,10 @@ export interface ResolvedClientConfigPaths {
   grokbuild: {
     directory: string
     config: ClientConfigFilePath
+  }
+  deepseekHarness: {
+    directory: string
+    env: ClientConfigFilePath
   }
 }
 

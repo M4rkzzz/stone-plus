@@ -107,6 +107,41 @@ describe('ClientInstanceManager', () => {
     expect(restarted.initialize()).toEqual([])
   }, 15_000)
 
+  it('applies trusted launch-plan preparation before validation and spawn', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'stone-client-instance-prepare-'))
+    directories.push(root)
+    const executable = join(root, 'dsh.exe')
+    await writeFile(executable, '')
+    const spawn = vi.fn(() => new FakeProcess())
+    const validateLaunchPlan = vi.fn()
+    const manager = new ClientInstanceManager({
+      store: new MemoryMetadata(),
+      processAdapter: { spawn },
+      prepareLaunchPlan: async (plan, instance) => ({
+        ...plan,
+        args: [...plan.args, '--patch', join(instance.configDirectory, 'stone.patch.yml')],
+      }),
+      validateLaunchPlan,
+    })
+    manager.initialize()
+    const [instance] = await manager.save({
+      name: 'DeepSeek Harness',
+      client: 'deepseek-harness',
+      configDirectory: root,
+      executablePath: executable,
+      launchArgs: ['web'],
+    })
+
+    await manager.start(instance.id)
+
+    const expectedArgs = ['web', '--patch', join(root, 'stone.patch.yml')]
+    expect(validateLaunchPlan).toHaveBeenCalledWith(expect.objectContaining({ args: expectedArgs }))
+    expect(spawn).toHaveBeenCalledWith(executable, expectedArgs, expect.objectContaining({
+      launchMode: 'background',
+    }))
+    await manager.stop(instance.id)
+  })
+
   it('does not inherit provider model overrides when launching Claude through Stone+', async () => {
     const root = await mkdtemp(join(tmpdir(), 'stone-client-instance-claude-env-'))
     directories.push(root)
@@ -417,6 +452,38 @@ describe('ClientInstanceManager', () => {
     expect(manager.initialize()[0].launchMode).toBe('background')
     const created = await manager.save({ name: 'New', client: 'codex', configDirectory: root })
     expect(created.find((item) => item.name === 'New')?.launchMode).toBe(expectedDefaultLaunchMode)
+  })
+
+  it('migrates legacy DSH terminal definitions and rejects terminal mode for new DSH web services', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'stone-client-instance-dsh-mode-'))
+    directories.push(root)
+    const metadata = new MemoryMetadata()
+    metadata.values.set('managed_client_instances_v1', JSON.stringify([{
+      id: 'legacy-dsh',
+      name: 'Legacy DSH',
+      client: 'deepseek-harness',
+      configDirectory: root,
+      launchArgs: ['web'],
+      launchMode: 'terminal',
+      status: 'stopped',
+      createdAt: 1,
+      updatedAt: 1,
+    }]))
+    const manager = new ClientInstanceManager({ store: metadata, platform: 'win32' })
+
+    expect(manager.initialize()[0].launchMode).toBe('background')
+    const created = await manager.save({
+      name: 'New DSH',
+      client: 'deepseek-harness',
+      configDirectory: root,
+      launchArgs: ['web'],
+      launchMode: 'terminal',
+    })
+
+    expect(created
+      .filter((item) => item.client === 'deepseek-harness')
+      .map((item) => item.launchMode))
+      .toEqual(['background', 'background'])
   })
 
   it('coalesces concurrent starts and ignores renderer listener failures', async () => {

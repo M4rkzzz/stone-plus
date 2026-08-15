@@ -189,6 +189,32 @@ describe('PoolScheduler', () => {
     expect(afterExpiry.account.id).toBe('first')
     afterExpiry.release()
   })
+  it('uses the upstream model cooldown key without exposing it to catalog matching', () => {
+    const first = account('first')
+    const second = account('second')
+    const scheduler = new PoolScheduler(() => timestamp, () => 0)
+    scheduler.recordModelFailure('first', 'gpt-5.6-sol-wm', {
+      reason: 'permission',
+      cooldownMs: 60_000,
+    })
+
+    const wm = scheduler.selectAndAcquire({
+      pool: pool({ strategy: 'priority', modelPolicy: 'selected', modelAllowlist: ['client-model'] }),
+      accounts: [first, second],
+      model: 'client-model',
+      modelCooldownKey: 'gpt-5.6-sol-wm',
+    })
+    expect(wm.account.id).toBe('second')
+    wm.release()
+
+    const ordinary = scheduler.selectAndAcquire({
+      pool: pool({ strategy: 'priority', modelPolicy: 'selected', modelAllowlist: ['client-model'] }),
+      accounts: [first, second],
+      model: 'client-model',
+    })
+    expect(ordinary.account.id).toBe('first')
+    ordinary.release()
+  })
   it('keeps quota reserves without changing legacy or unknown-quota behaviour by default', () => {
     expect(quotaProtectionBlocks(undefined, undefined, timestamp)).toBe(false)
     expect(quotaProtectionBlocks(undefined, {

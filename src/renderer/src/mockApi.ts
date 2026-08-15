@@ -32,7 +32,12 @@ import type {
 } from '@shared/types'
 import { previewRoute as buildRoutePreview } from '@shared/route-preview'
 import { normalizeRouteModelSourceMap, routeReferencesSource } from '@shared/route-models'
-import { DEFAULT_ACCOUNT_MAX_CONCURRENCY, supportsFastServiceTier, supportsPoolFastServiceTier } from '@shared/types'
+import {
+  CODEX_QUOTA_HISTORY_RETENTION_MS,
+  DEFAULT_ACCOUNT_MAX_CONCURRENCY,
+  supportsFastServiceTier,
+  supportsPoolFastServiceTier,
+} from '@shared/types'
 import { accountMatchesPoolProtocol } from '@shared/pool-protocol'
 import { normalizeProviderHttpUrl } from '@shared/provider-url'
 import {
@@ -42,6 +47,7 @@ import {
   normalizeDeepSeekReasoningEffort,
 } from '@shared/deepseek'
 import { providerSourceFamily } from '@shared/source-family'
+import { supportsPoolWmRouting } from '@shared/wm-routing'
 import {
   AGENT_CAPABILITIES,
   AGENT_TARGETS,
@@ -546,6 +552,7 @@ function clientNamesForMock(client: RequestLog['client']): string {
   if (client === 'claude') return 'Claude'
   if (client === 'gemini') return 'Gemini'
   if (client === 'grokbuild') return 'Grok Build'
+  if (client === 'deepseek-harness') return 'DeepSeek Harness'
   return 'Codex'
 }
 
@@ -577,7 +584,7 @@ const initialSnapshot: AppSnapshot = {
     successRequests: 1261,
   },
   requestLogs: logs,
-  clientProfiles: (['claude', 'codex', 'gemini', 'grokbuild'] as const).map((client) => ({
+  clientProfiles: (['claude', 'codex', 'gemini', 'grokbuild', 'deepseek-harness'] as const).map((client) => ({
     id: `default-${client}`,
     name: '默认配置',
     client,
@@ -889,6 +896,9 @@ const mockClientFiles: Record<RouteClient, Array<{ role: ClientConfigFileRole; p
   grokbuild: [
     { role: 'grok-config', path: '~/.grok/config.toml', containsCredential: true },
   ],
+  'deepseek-harness': [
+    { role: 'deepseek-harness-env', path: '~/.dsh/.env', containsCredential: true },
+  ],
 }
 
 const mockEditorContent: Record<RouteClient, Partial<Record<ClientConfigFileRole, string>>> = {
@@ -906,6 +916,9 @@ const mockEditorContent: Record<RouteClient, Partial<Record<ClientConfigFileRole
   gemini: { 'gemini-settings': '{\n  "model": { "name": "gemini-2.5-pro" },\n  "general": { "defaultApprovalMode": "default" },\n  "ui": { "theme": "Default" }\n}\n', 'gemini-env': 'GEMINI_API_KEY="stone-demo-gemini-token"\nGOOGLE_GEMINI_BASE_URL="http://127.0.0.1:15720"\n' },
   grokbuild: {
     'grok-config': '[auth]\npreferred_method = "api_key"\n\n[models]\ndefault = "stoneplus"\n\n[model.stoneplus]\nmodel = "grok-4.5"\nbase_url = "http://127.0.0.1:15721/grokbuild/v1"\nname = "Stone+"\napi_key = "stone-demo-grok-token"\napi_backend = "responses"\ncontext_window = 500000\n',
+  },
+  'deepseek-harness': {
+    'deepseek-harness-env': 'DEEPSEEK_BASE_URL="http://127.0.0.1:15720/deepseek-harness/v1"\nDEEPSEEK_API_KEY="stone-demo-harness-token"\n',
   },
 }
 
@@ -941,11 +954,12 @@ const mockEditorFields: Record<RouteClient, ClientConfigEditorState['fields']> =
     { id: 'grokbuild.baseUrl', role: 'grok-config', path: ['model', 'stoneplus', 'base_url'], section: 'Stone+ 连接', label: 'base_url', description: 'Stone+ 的 Grok Build 专属 Responses 入口；应用路由时自动维护。', control: 'text', value: 'http://127.0.0.1:15721/grokbuild/v1', readOnly: true, managedByStone: true },
     { id: 'grokbuild.apiBackend', role: 'grok-config', path: ['model', 'stoneplus', 'api_backend'], section: 'Stone+ 连接', label: 'API 后端', description: 'Grok Build 通过 OpenAI Responses 协议连接 Stone+。', control: 'text', value: 'responses', readOnly: true, managedByStone: true },
   ],
+  'deepseek-harness': [],
 }
 
 function mockConfigFormat(role: ClientConfigFileRole): 'json' | 'toml' | 'dotenv' | 'text' {
   if (role === 'codex-config' || role === 'grok-config') return 'toml'
-  if (role === 'gemini-env') return 'dotenv'
+  if (role === 'gemini-env' || role === 'deepseek-harness-env') return 'dotenv'
   if (role === 'codex-agents' || role === 'codex-rules') return 'text'
   return 'json'
 }
@@ -2097,6 +2111,7 @@ export function createMockApi(): GatewayApi {
         const provider = snapshot.providers.find((candidate) => candidate.id === account?.providerId)
         return !account || !accountMatchesPoolProtocol(input.protocol, account, provider)
       })) throw new Error(mockText('号池成员与对外协议不兼容', 'Pool members are incompatible with its public protocol'))
+      const selectedAccounts = selected.filter((account): account is PublicAccount => account !== undefined)
       const families = new Set(selected.map((account) => {
         const provider = snapshot.providers.find((candidate) => candidate.id === account?.providerId)
         return provider ? providerSourceFamily(provider.kind) : undefined
@@ -2122,6 +2137,8 @@ export function createMockApi(): GatewayApi {
         reasoningEffortCap: input.reasoningEffortCap,
         forceFastMode: supportsPoolFastServiceTier(input.protocol)
           && (input.forceFastMode ?? existing?.forceFastMode) === true,
+        routeToWm: supportsPoolWmRouting(input.protocol, selectedAccounts)
+          && (input.routeToWm ?? existing?.routeToWm) === true,
         hedgedRequests: input.protocol === 'openai-responses'
           && (input.hedgedRequests ?? existing?.hedgedRequests) === true,
         hedgeDelayMs: input.hedgeDelayMs ?? existing?.hedgeDelayMs ?? 2_500,
@@ -2465,7 +2482,8 @@ export function createMockApi(): GatewayApi {
       return { ok: true, latencyMs: 120, status: 200, responsePreview: 'OK' }
     },
     async setClientRouteSource(input) {
-      if (input.client !== 'claude' && input.client !== 'codex' && input.client !== 'gemini' && input.client !== 'grokbuild') {
+      if (input.client !== 'claude' && input.client !== 'codex' && input.client !== 'gemini' && input.client !== 'grokbuild'
+        && input.client !== 'deepseek-harness') {
         throw new Error(mockText('不支持的客户端路由', 'Unsupported client route'))
       }
       const sourceId = typeof input.sourceId === 'string' ? input.sourceId.trim() : ''
@@ -2600,11 +2618,34 @@ export function createMockApi(): GatewayApi {
       } : account)
       return changed()
     },
+    async consumeAccountCodexResetCredit(id: string) {
+      const observedAt = Date.now()
+      snapshot.accounts = snapshot.accounts.map((account) => account.id === id ? {
+        ...account,
+        ...(account.cooldownReason === 'quota' ? {
+          status: 'active' as const,
+          cooldownReason: undefined,
+          cooldownUntil: undefined,
+        } : {}),
+        codexQuota: account.codexQuota ? {
+          ...account.codexQuota,
+          fiveHour: account.codexQuota.fiveHour ? { ...account.codexQuota.fiveHour, usedPercent: 0 } : undefined,
+          sevenDay: account.codexQuota.sevenDay ? { ...account.codexQuota.sevenDay, usedPercent: 0 } : undefined,
+          monthly: account.codexQuota.monthly ? { ...account.codexQuota.monthly, usedPercent: 0 } : undefined,
+          resetCredits: { availableCount: Math.max(0, (account.codexQuota.resetCredits?.availableCount ?? 1) - 1) },
+          observedAt,
+          detailsObservedAt: observedAt,
+          allowed: true,
+          limitReached: false,
+        } : undefined,
+      } : account)
+      return changed()
+    },
     async getAccountCodexQuotaHistory(id, from, to) {
       const account = snapshot.accounts.find((candidate) => candidate.id === id)
       if (!account) throw new Error(mockText('账号不存在', 'Account not found'))
       const end = to ?? Date.now()
-      const start = from ?? end - 14 * 24 * 60 * 60 * 1000
+      const start = from ?? end - CODEX_QUOTA_HISTORY_RETENTION_MS
       return Array.from({ length: 56 }, (_, index) => {
         const observedAt = start + (end - start) * index / 55
         return {
@@ -2686,7 +2727,8 @@ export function createMockApi(): GatewayApi {
     },
     async importClientProfile(bundle) {
       const client = bundle.profile.client
-      if (client !== 'claude' && client !== 'codex' && client !== 'gemini' && client !== 'grokbuild') {
+      if (client !== 'claude' && client !== 'codex' && client !== 'gemini' && client !== 'grokbuild'
+        && client !== 'deepseek-harness') {
         throw new Error(mockText('不支持的客户端配置 Profile', 'Unsupported client configuration profile'))
       }
       return this.saveClientProfile(bundle.profile)
@@ -3135,6 +3177,18 @@ export function createMockApi(): GatewayApi {
       }
     },
     async listCodexSessions() { return [] },
+    async importCodexSessionsToDeepSeekHarness(selections) {
+      return {
+        items: selections.map((selection) => ({
+          sourceSessionId: selection.id,
+          harnessSessionId: `stone-codex-${selection.id}`,
+          status: 'imported' as const,
+        })),
+        imported: selections.length,
+        alreadyImported: 0,
+        failed: 0,
+      }
+    },
     async openCodexSessionLocation() {},
     async exportCodexSession(id) { return { cancelled: true, sessionId: id } },
     async trashCodexSession() { return [] },

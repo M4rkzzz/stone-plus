@@ -19,6 +19,7 @@ import { REASONING_EFFORTS } from '@shared/reasoning-policy'
 import { accountMatchesPoolProtocol, accountPoolProtocol } from '@shared/pool-protocol'
 import { providerSourceFamily } from '@shared/source-family'
 import { routeReferencesSource } from '@shared/route-models'
+import { GPT_5_6_SOL_WM_MODEL, supportsPoolWmRouting } from '@shared/wm-routing'
 import type { ActionRunner } from '../App'
 import { accountSourceLabel } from '../account-source-label'
 import { BUILT_IN_PROXY_BINDING_NOTICE, useBuiltInProxyInterlock } from '../built-in-proxy-interlocks'
@@ -129,10 +130,11 @@ function FastModeControl({
   )
 }
 
-type PoolDraft = Omit<PoolInput, 'modelPolicy' | 'modelAllowlist' | 'forceFastMode' | 'hedgedRequests' | 'hedgeDelayMs' | 'firstBodyTimeoutMs'> & {
+type PoolDraft = Omit<PoolInput, 'modelPolicy' | 'modelAllowlist' | 'forceFastMode' | 'routeToWm' | 'hedgedRequests' | 'hedgeDelayMs' | 'firstBodyTimeoutMs'> & {
   modelPolicy: ModelPolicy
   modelAllowlist: string[]
   forceFastMode: boolean
+  routeToWm: boolean
   hedgedRequests: boolean
   hedgeDelayMs: number
   firstBodyTimeoutMs: number
@@ -153,6 +155,7 @@ function emptyDraft(): PoolDraft {
     reasoningEffortMap: undefined,
     reasoningEffortCap: undefined,
     forceFastMode: false,
+    routeToWm: false,
     hedgedRequests: false,
     hedgeDelayMs: 2500,
     firstBodyTimeoutMs: 8000,
@@ -229,6 +232,7 @@ export function PoolsView({
       reasoningEffortMap: pool.reasoningEffortMap ? { ...pool.reasoningEffortMap } : undefined,
       reasoningEffortCap: pool.reasoningEffortCap,
       forceFastMode: pool.forceFastMode ?? false,
+      routeToWm: pool.routeToWm ?? false,
       hedgedRequests: pool.hedgedRequests ?? false,
       hedgeDelayMs: pool.hedgeDelayMs ?? 2500,
       firstBodyTimeoutMs: pool.firstBodyTimeoutMs ?? 8000,
@@ -286,6 +290,13 @@ export function PoolsView({
       forceFastMode: sourceFamily && providerSourceFamily(sourceFamily.kind) === 'deepseek'
         ? false
         : current.forceFastMode,
+      routeToWm: supportsPoolWmRouting(
+        current.protocol,
+        accountIds.flatMap((id) => {
+          const account = accountById.get(id)
+          return account ? [account] : []
+        }),
+      ) ? current.routeToWm : false,
     }))
   }
 
@@ -309,6 +320,13 @@ export function PoolsView({
     return provider ? providerSourceFamily(provider.kind) : undefined
   }, [accountById, draft.accountIds, providerById])
   const draftFastSupported = supportsPoolFastServiceTier(draft.protocol) && draftSourceFamily !== 'deepseek'
+  const draftWmSupported = supportsPoolWmRouting(
+    draft.protocol,
+    draft.accountIds.flatMap((id) => {
+      const account = accountById.get(id)
+      return account ? [account] : []
+    }),
+  )
 
   const removePool = async () => {
     if (!deleteTarget) return
@@ -367,7 +385,7 @@ export function PoolsView({
                   <div><span>{t('客户端路由', 'Client routes')}</span><strong>{routeCount}</strong></div>
                 </div>
 
-                <div className="pool-strategy"><Shuffle size={15} /><div><strong>{t(strategyLabels[pool.strategy], strategyLabelsEn[pool.strategy])}</strong><span>{t(strategyDescriptions[pool.strategy], strategyDescriptionsEn[pool.strategy])}</span></div>{pool.kind === 'relay-aggregate' && <Badge tone="info">{t('聚合中转', 'Aggregate relay')}</Badge>}</div>
+                <div className="pool-strategy"><Shuffle size={15} /><div><strong>{t(strategyLabels[pool.strategy], strategyLabelsEn[pool.strategy])}</strong><span>{t(strategyDescriptions[pool.strategy], strategyDescriptionsEn[pool.strategy])}</span></div>{pool.routeToWm && <Badge tone="info">WM</Badge>}{pool.kind === 'relay-aggregate' && <Badge tone="info">{t('聚合中转', 'Aggregate relay')}</Badge>}</div>
 
                 <div className="model-tags pool-card__models">
                   {openModels.slice(0, 3).map((model) => <span key={model}>{model}</span>)}
@@ -487,6 +505,13 @@ export function PoolsView({
                     accountIds,
                     modelAllowlist: pruneModelSelection(draft.modelAllowlist, candidates),
                     forceFastMode: supportsPoolFastServiceTier(protocol) ? draft.forceFastMode : false,
+                    routeToWm: supportsPoolWmRouting(
+                      protocol,
+                      accountIds.flatMap((id) => {
+                        const account = accountById.get(id)
+                        return account ? [account] : []
+                      }),
+                    ) ? draft.routeToWm : false,
                     hedgedRequests: protocol === 'openai-responses' ? draft.hedgedRequests : false,
                   })
                 }}
@@ -581,6 +606,18 @@ export function PoolsView({
                 type="button"
                 disabled={!draftFastSupported}
                 onClick={() => setDraft({ ...draft, forceFastMode: !draft.forceFastMode })}
+              ><span /></button>
+            </div>
+            <div className="field field--full inline-settings">
+              <div><strong>{t('路由到 WM', 'Route to WM')}<InfoTip text={draftWmSupported ? t(`开启后，该号池承接的所有模型请求都会将实际上游模型改写为 ${GPT_5_6_SOL_WM_MODEL}；客户端模型名和本地调度白名单保持不变。`, `Rewrite every model request served by this pool to ${GPT_5_6_SOL_WM_MODEL}; client model names and local scheduling allowlists remain unchanged.`) : t('仅由 ChatGPT OAuth 或 App 原生登录账号组成的 OpenAI Responses 号池支持此选项。', 'Only OpenAI Responses pools made entirely of ChatGPT OAuth or native app-login accounts support this option.')} /></strong></div>
+              <button
+                className={`toggle ${draft.routeToWm ? 'toggle--on' : ''}`}
+                role="switch"
+                aria-label={t('路由到 WM', 'Route to WM')}
+                aria-checked={draft.routeToWm}
+                type="button"
+                disabled={!draftWmSupported}
+                onClick={() => setDraft({ ...draft, routeToWm: !draft.routeToWm })}
               ><span /></button>
             </div>
             <div className="field field--full inline-settings">

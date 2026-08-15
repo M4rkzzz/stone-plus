@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 import {
   ClaudeCodeLifecycleAdapter,
   CliLifecycleOperationError,
+  DeepSeekHarnessLifecycleAdapter,
   GeminiCliLifecycleAdapter,
   GrokBuildLifecycleAdapter,
   type CliConnectionConfigPort,
@@ -11,7 +12,7 @@ import type { RepairClientConfigResult } from '../../src/main/client-config/type
 
 const connection = { gatewayBaseUrl: 'http://127.0.0.1:15720', token: 'local-token' }
 
-function repairResult(client: 'claude' | 'gemini' | 'grokbuild'): RepairClientConfigResult {
+function repairResult(client: 'claude' | 'gemini' | 'grokbuild' | 'deepseek-harness'): RepairClientConfigResult {
   return {
     client,
     changedFiles: [`/${client}/settings`],
@@ -21,9 +22,15 @@ function repairResult(client: 'claude' | 'gemini' | 'grokbuild'): RepairClientCo
   }
 }
 
-function harness(target: 'claude-code' | 'gemini-cli' | 'grok-build' = 'claude-code') {
+function harness(target: 'claude-code' | 'gemini-cli' | 'grok-build' | 'deepseek-harness' = 'claude-code') {
   const events: string[] = []
-  const client = target === 'claude-code' ? 'claude' : target === 'gemini-cli' ? 'gemini' : 'grokbuild'
+  const client = target === 'claude-code'
+    ? 'claude'
+    : target === 'gemini-cli'
+      ? 'gemini'
+      : target === 'grok-build'
+        ? 'grokbuild'
+        : 'deepseek-harness'
   const runtime: CliRuntimePort = {
     snapshot: vi.fn(async () => ({
       managedInstances: [{ id: 'one', running: true }, { id: 'idle', running: false }],
@@ -51,7 +58,9 @@ function harness(target: 'claude-code' | 'gemini-cli' | 'grok-build' = 'claude-c
     ? new ClaudeCodeLifecycleAdapter(options)
     : target === 'gemini-cli'
       ? new GeminiCliLifecycleAdapter(options)
-      : new GrokBuildLifecycleAdapter(options)
+      : target === 'grok-build'
+        ? new GrokBuildLifecycleAdapter(options)
+        : new DeepSeekHarnessLifecycleAdapter(options)
   return { adapter, client, config, events, runtime }
 }
 
@@ -60,6 +69,7 @@ describe('connection-only CLI lifecycle adapters', () => {
     ['claude-code', 'claude'],
     ['gemini-cli', 'gemini'],
     ['grok-build', 'grokbuild'],
+    ['deepseek-harness', 'deepseek-harness'],
   ] as const)('declares honest capabilities for %s', async (target, client) => {
     const { adapter } = harness(target)
     const snapshot = await adapter.getSnapshot()
@@ -169,7 +179,7 @@ describe('connection-only CLI lifecycle adapters', () => {
     })
   })
 
-  it.each(['claude-code', 'gemini-cli', 'grok-build'] as const)(
+  it.each(['claude-code', 'gemini-cli', 'grok-build', 'deepseek-harness'] as const)(
     'repairs every running profile directory and restarts the same %s instances',
     async (target) => {
       const { adapter, config, runtime } = harness(target)

@@ -188,7 +188,7 @@ function normalizeSetupState(value: unknown): SetupWizardState | null {
     ? input.sourceMethod
     : undefined
   const client = input.client === 'codex' || input.client === 'claude'
-    || input.client === 'gemini' || input.client === 'grokbuild'
+    || input.client === 'gemini' || input.client === 'grokbuild' || input.client === 'deepseek-harness'
     ? input.client
     : undefined
   return {

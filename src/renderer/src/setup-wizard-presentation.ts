@@ -5,6 +5,7 @@ export type SetupWizardPhaseId = 'prepare' | 'source' | 'client' | 'connect' | '
 export interface SetupWizardPhase {
   id: SetupWizardPhaseId
   label: string
+  description: string
 }
 
 type Translate = <T>(chinese: T, english: T) => T
@@ -45,11 +46,11 @@ const protocols = new Set<ApiSourceInput['protocol']>([
 
 export function setupWizardPhases(t: Translate): SetupWizardPhase[] {
   return [
-    { id: 'prepare', label: t('准备检查', 'Prepare') },
-    { id: 'source', label: t('添加来源', 'Add source') },
-    { id: 'client', label: t('选择用途', 'Choose client') },
-    { id: 'connect', label: t('连接验证', 'Connect and verify') },
-    { id: 'complete', label: t('完成', 'Complete') },
+    { id: 'prepare', label: t('准备检查', 'Prepare'), description: t('确认网络与本机环境', 'Check network and local environment') },
+    { id: 'source', label: t('添加来源', 'Add source'), description: t('登录账号或填写 API', 'Sign in or enter an API') },
+    { id: 'client', label: t('选择用途', 'Choose client'), description: t('选择要连接的客户端', 'Choose the client to connect') },
+    { id: 'connect', label: t('连接验证', 'Connect and verify'), description: t('一键建立并检查链路', 'Build and check the route') },
+    { id: 'complete', label: t('完成', 'Complete'), description: t('开始使用 Stone+', 'Start using Stone+') },
   ]
 }
 

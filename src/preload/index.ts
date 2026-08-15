@@ -100,6 +100,7 @@ const stone: GatewayApi = {
   runNetworkDiagnostics: (input) => ipcRenderer.invoke('stone:run-network-diagnostics', input),
   checkAccount: (id) => ipcRenderer.invoke('stone:check-account', id),
   refreshAccountCodexQuota: (id) => ipcRenderer.invoke('stone:refresh-account-codex-quota', id),
+  consumeAccountCodexResetCredit: (id) => ipcRenderer.invoke('stone:consume-account-codex-reset-credit', id),
   getAccountCodexQuotaHistory: (id, from, to) => ipcRenderer.invoke('stone:get-account-codex-quota-history', id, from, to),
   getAccountCodexQuotaCycleCosts: (id) => ipcRenderer.invoke('stone:get-account-codex-quota-cycle-costs', id),
   clearLogs: () => ipcRenderer.invoke('stone:clear-logs'),
@@ -202,6 +203,10 @@ const stone: GatewayApi = {
   exportCodexSession: (id, expectedRevision) => ipcRenderer.invoke('stone:export-codex-session', id, expectedRevision),
   trashCodexSession: (id, expectedRevision) => ipcRenderer.invoke('stone:trash-codex-session', id, expectedRevision),
   restoreCodexSession: (id, expectedRevision) => ipcRenderer.invoke('stone:restore-codex-session', id, expectedRevision),
+  importCodexSessionsToDeepSeekHarness: (selections) => ipcRenderer.invoke(
+    'stone:import-codex-sessions-to-deepseek-harness',
+    selections,
+  ),
   onSnapshot: (listener) => {
     const handler = (_event: Electron.IpcRendererEvent, snapshot: Awaited<ReturnType<GatewayApi['getSnapshot']>>) => {
       listener(snapshot)

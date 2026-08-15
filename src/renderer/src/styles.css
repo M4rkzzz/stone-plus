@@ -583,6 +583,8 @@ html.is-electron .sidebar__brand .brand-mark {
   border-radius: 0 2px 2px 0;
   background: var(--accent);
   content: '';
+  transform-origin: center;
+  animation: ui-nav-indicator-in var(--motion-fast) var(--ease-out) both;
 }
 
 .nav-count {
@@ -792,6 +794,7 @@ html.is-electron .workspace > .topbar {
 }
 
 .status-dot {
+  position: relative;
   display: inline-block;
   width: 8px;
   height: 8px;
@@ -810,6 +813,16 @@ html.is-electron .workspace > .topbar {
 
 .status-dot--pulse {
   box-shadow: 0 0 0 4px rgb(var(--accent-rgb) / 13%);
+}
+
+.status-dot--pulse::after {
+  position: absolute;
+  inset: -4px;
+  border: 1px solid var(--accent);
+  border-radius: inherit;
+  content: '';
+  pointer-events: none;
+  animation: ui-status-pulse 1.9s ease-out infinite;
 }
 
 .active-request-indicator {
@@ -1701,7 +1714,7 @@ html[data-theme='dark'] .account-status-badge.badge--success {
   pointer-events: none;
   text-align: left;
   transform: translateY(-3px);
-  transition: opacity 120ms ease, transform 120ms ease;
+  transition: opacity var(--motion-fast) var(--ease-out), transform var(--motion-fast) var(--ease-out);
   white-space: normal;
 }
 
@@ -3235,7 +3248,7 @@ html[data-theme='dark'] .brand-icon--openai {
 .account-import-progress__heading strong { color: var(--text); font-size: 11px; }
 .account-import-progress__heading span { color: var(--accent-text); font-size: 11px; font-weight: 760; }
 .account-import-progress__track { height: 7px; overflow: hidden; border-radius: 999px; background: var(--surface-muted); }
-.account-import-progress__track span { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, var(--accent), var(--border-active)); transition: width 180ms ease; }
+.account-import-progress__track span { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, var(--accent), var(--border-active)); transition: width var(--motion-base) var(--ease-out); }
 .account-import-progress__detail span { color: var(--text-soft); font-size: 10px; }
 .account-import-progress__detail small { color: var(--muted); font-size: 9px; white-space: nowrap; }
 
@@ -3906,7 +3919,7 @@ html[data-theme='dark'] .brand-icon--openai {
   border: 1px solid var(--control-border);
   border-radius: 10px;
   background: var(--surface-muted);
-  transition: border-color 140ms ease, background 140ms ease;
+  transition: border-color var(--motion-base) var(--ease-out), background-color var(--motion-base) var(--ease-out);
 }
 
 .toggle > span {
@@ -3918,7 +3931,7 @@ html[data-theme='dark'] .brand-icon--openai {
   border-radius: 50%;
   background: var(--surface-raised);
   box-shadow: 0 1px 2px rgb(var(--shadow-rgb) / 20%);
-  transition: transform 140ms ease;
+  transition: transform var(--motion-base) var(--ease-out);
 }
 
 .toggle--on {
@@ -6060,7 +6073,63 @@ html.is-electron .boot-screen { background: var(--app-chrome); }
 
 .quota-modal { display: grid; gap: 18px; }
 .quota-modal__source { min-width: 0; margin-right: auto; overflow: hidden; color: var(--muted); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
-.quota-credit-note { margin-top: -10px; color: var(--muted); font-size: 9px; line-height: 1.55; }
+.quota-credit-note {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: -10px;
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.55;
+}
+.quota-credit-note .button { min-height: 28px; margin-left: auto; padding: 5px 9px; font-size: 10px; }
+.quota-additional-buckets { display: grid; gap: 8px; }
+.quota-additional-buckets > strong { color: var(--text-soft); font-size: 11px; }
+.quota-additional-buckets__row {
+  display: grid;
+  grid-template-columns: minmax(120px, 1fr) auto auto;
+  align-items: center;
+  gap: 14px;
+  padding: 7px 0;
+  border-top: 1px solid var(--border-subtle, var(--border));
+}
+.quota-additional-buckets__row > span:first-child {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-soft);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.quota-hidden-credit-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  margin-top: -4px;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--accent) 34%, var(--border));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--accent) 9%, var(--surface-raised));
+  color: var(--accent-text);
+}
+.quota-hidden-credit-note__mark {
+  display: grid;
+  width: 22px;
+  height: 22px;
+  flex: 0 0 auto;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--accent);
+  color: var(--on-accent);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 760;
+}
+.quota-hidden-credit-note > div { display: grid; min-width: 0; gap: 2px; }
+.quota-hidden-credit-note strong { font-size: 11px; font-weight: 720; }
+.quota-hidden-credit-note span,
+.quota-hidden-credit-note small { color: var(--muted); font-size: 9px; line-height: 1.45; }
+.quota-hidden-credit-note small { color: var(--orange, var(--muted)); }
 
 .quota-summary-grid {
   display: grid;
@@ -6127,6 +6196,7 @@ html.is-electron .boot-screen { background: var(--app-chrome); }
   background: var(--surface-raised);
   color: var(--blue);
   box-shadow: var(--shadow-sm);
+  animation: ui-banner-in var(--motion-base) var(--ease-out) both;
 }
 
 .update-banner--downloaded {
@@ -6237,7 +6307,7 @@ html.is-electron .boot-screen { background: var(--app-chrome); }
   height: 100%;
   border-radius: inherit;
   background: linear-gradient(90deg, var(--accent), var(--accent));
-  transition: width 160ms ease;
+  transition: width var(--motion-base) var(--ease-out);
 }
 
 .update-progress__speed {
@@ -6493,7 +6563,7 @@ html.is-electron .boot-screen { background: var(--app-chrome); }
 .session-repair-progress__heading strong { font-size: 11px; }
 .session-repair-progress__heading small { color: var(--muted); font-size: 9px; }
 .session-repair-progress__track { height: 7px; overflow: hidden; border-radius: 999px; background: var(--surface-muted); }
-.session-repair-progress__track > span { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, var(--accent), var(--accent)); transition: width 160ms ease; }
+.session-repair-progress__track > span { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, var(--accent), var(--accent)); transition: width var(--motion-base) var(--ease-out); }
 .session-repair-progress__track > span.is-indeterminate { width: 32%; animation: session-repair-indeterminate 1.1s ease-in-out infinite; }
 .session-repair-progress__stages { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 5px; margin: 0; padding: 0; list-style: none; }
 .session-repair-progress__stages li { display: flex; min-width: 0; align-items: center; gap: 5px; color: var(--faint); font-size: 8px; }
@@ -6909,6 +6979,21 @@ html.is-electron .boot-screen { background: var(--app-chrome); }
   to { transform: none; }
 }
 
+@keyframes ui-nav-indicator-in {
+  from { opacity: 0; transform: scaleY(0.45); }
+  to { opacity: 1; transform: none; }
+}
+
+@keyframes ui-status-pulse {
+  from { opacity: 0.32; transform: scale(0.72); }
+  70%, to { opacity: 0; transform: scale(1.35); }
+}
+
+@keyframes ui-toast-in {
+  from { opacity: 0; transform: translateY(6px) scale(0.985); }
+  to { opacity: 1; transform: none; }
+}
+
 /* Press + hover feedback on every control family. Families that already
    declare their own transitions (.source-type-tabs button, .toggle) are
    intentionally not listed here so their tuned timings survive the cascade. */
@@ -6955,7 +7040,7 @@ html.is-electron .boot-screen { background: var(--app-chrome); }
 }
 
 .modal {
-  animation: ui-modal-in var(--motion-slow) var(--ease-pop) both;
+  animation: ui-modal-in var(--motion-slow) var(--ease-out) both;
 }
 
 .context-menu {
@@ -7268,6 +7353,7 @@ html.low-resource-mode .spin {
   border-radius: var(--radius-md);
   background: var(--surface);
   box-shadow: var(--shadow-md);
+  animation: ui-toast-in var(--motion-base) var(--ease-out) both;
 }
 
 .operation-toast--success { border-left-color: var(--success); }

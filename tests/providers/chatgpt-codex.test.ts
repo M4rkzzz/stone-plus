@@ -5,6 +5,7 @@ import {
   CHATGPT_CODEX_MODELS_URL,
   CHATGPT_CODEX_RESPONSES_URL,
   CHATGPT_CODEX_RESET_CREDITS_URL,
+  CHATGPT_CODEX_RESET_CREDITS_CONSUME_URL,
   CHATGPT_CODEX_SEARCH_URL,
   CHATGPT_CODEX_USAGE_URL,
   CODEX_CLIENT_VERSION,
@@ -13,6 +14,7 @@ import {
   checkChatGptAccountAuthorized,
   classifyChatGptCredentialRefreshFailure,
   classifyChatGptCodexFailure,
+  consumeChatGptCodexResetCredit,
   extractCodexQuotaFromUsagePayload,
   isChatGptCodexResponsesLiteBody,
   probeChatGptAccount,
@@ -20,6 +22,7 @@ import {
   queryChatGptCodexQuota,
   refreshChatGptCredential,
   resolveChatGptCredential,
+  sanitizeChatGptCodexInput,
   withChatGptCodexBody
 } from '../../src/main/providers'
 import { serializeChatGptCredential } from '../../src/main/auth'
@@ -64,6 +67,37 @@ describe('ChatGPT Codex provider path', () => {
     expect(headers.get('authorization')).not.toContain('local-route-token')
     expect(headers.has('x-api-key')).toBe(false)
     expect(withChatGptCodexBody({ model: 'gpt-5' })).toMatchObject({ store: false, stream: true })
+  })
+
+  it('converges only the installation identity while preserving client session metadata', () => {
+    const source = {
+      'x-codex-installation-id': 'foreign-device',
+      'x-codex-turn-metadata': JSON.stringify({
+        installation_id: 'foreign-device',
+        session_id: 'metadata-session',
+        thread_id: 'metadata-thread'
+      }),
+      session_id: 'session-safe',
+      'thread-id': 'thread-safe'
+    }
+    const first = new Headers()
+    const second = new Headers()
+    const other = new Headers()
+    applyChatGptCodexHeaders(first, bundle, source, 'account-stable-seed')
+    applyChatGptCodexHeaders(second, bundle, source, 'account-stable-seed')
+    applyChatGptCodexHeaders(other, bundle, source, 'different-account-seed')
+
+    const installationId = first.get('x-codex-installation-id')
+    expect(installationId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-a[0-9a-f]{3}-[0-9a-f]{12}$/)
+    expect(second.get('x-codex-installation-id')).toBe(installationId)
+    expect(other.get('x-codex-installation-id')).not.toBe(installationId)
+    expect(first.get('session_id')).toBe('session-safe')
+    expect(first.get('thread-id')).toBe('thread-safe')
+    expect(JSON.parse(first.get('x-codex-turn-metadata')!)).toEqual({
+      installation_id: installationId,
+      session_id: 'metadata-session',
+      thread_id: 'metadata-thread'
+    })
   })
 
   it('uses the standalone Codex Search contract with JSON headers and current client metadata', () => {
@@ -113,6 +147,43 @@ describe('ChatGPT Codex provider path', () => {
       store: false,
       stream: true
     })
+  })
+
+  it('repairs migrated relay history before sending it to the stateless Codex endpoint', () => {
+    const legacyInput = [
+      { type: 'message', id: 'msg_already-valid', role: 'user', content: [{ type: 'input_text', text: 'hello' }] },
+      { id: 'item_role-only-message', role: 'user', content: [{ type: 'input_text', text: 'legacy' }] },
+      { type: 'reasoning', id: 'item_ephemeral-reasoning', summary: [] },
+      { type: 'message', id: 'item_assistant-message', role: 'assistant', content: [{ type: 'output_text', text: 'old' }] },
+      { type: 'custom_tool_call', id: 'item_custom-call', call_id: 'call_custom', name: 'exec', input: 'dir' },
+      { type: 'custom_tool_call_output', id: 'ctco_existing', call_id: 'call_custom', output: 'ok' },
+      { type: 'function_call', id: 'item_function-call', call_id: 'call_function', name: 'lookup', arguments: '{}' },
+      { type: 'function_call_output', id: 'item_function-output', call_id: 'call_function', output: '{}' },
+      { type: 'item_reference', id: 'item_ephemeral-reasoning' }
+    ]
+    const body = { model: 'gpt-5.6', input: legacyInput }
+
+    const upstream = withChatGptCodexBody(body)
+    const input = upstream.input as Array<Record<string, unknown>>
+
+    expect(input).toEqual([
+      legacyInput[0],
+      { ...legacyInput[1], id: 'msg_role-only-message' },
+      { ...legacyInput[3], id: 'msg_assistant-message' },
+      { ...legacyInput[4], id: 'ctc_custom-call' },
+      legacyInput[5],
+      { ...legacyInput[6], id: 'fc_function-call' },
+      { ...legacyInput[7], id: 'fco_function-output' }
+    ])
+    expect(body.input).toBe(legacyInput)
+    expect(JSON.stringify(upstream)).not.toContain('item_ephemeral-reasoning')
+  })
+
+  it('leaves non-legacy input values untouched and does not normalize a string input', () => {
+    const input = 'hello'
+    expect(sanitizeChatGptCodexInput(input)).toBe(input)
+    const valid = [{ type: 'message', id: 'msg_stable', role: 'user', content: 'hello' }]
+    expect(sanitizeChatGptCodexInput(valid)).toBe(valid)
   })
 
   it('probes with a POST Responses request instead of Platform models', async () => {
@@ -457,6 +528,7 @@ describe('ChatGPT Codex provider path', () => {
       },
     }, quotaNow)).toEqual({
       resetCredits: { availableCount: 2, expiresAt: [Date.parse(expiresAt)] },
+      detailsObservedAt: quotaNow,
       observedAt: quotaNow,
       source: 'usage-endpoint',
     })
@@ -499,6 +571,43 @@ describe('ChatGPT Codex provider path', () => {
       availableCount: 1,
       expiresAt: [Date.parse('2026-07-13T00:00:00.000Z')],
     })
+  })
+
+  it('consumes one reset credit with a matching idempotency key and returns detached metadata', async () => {
+    const redeemedAt = '2026-07-12T00:01:00.000Z'
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+      windows_reset: 2,
+      credit: { redeemed_at: redeemedAt, private_id: 'credit-private' },
+      access_token: 'response-private'
+    }), { status: 200 }))
+
+    const result = await consumeChatGptCodexResetCredit(bundle, fetchMock as typeof fetch)
+
+    expect(fetchMock).toHaveBeenCalledOnce()
+    expect(fetchMock.mock.calls[0][0]).toBe(CHATGPT_CODEX_RESET_CREDITS_CONSUME_URL)
+    const init = fetchMock.mock.calls[0][1]!
+    expect(init.method).toBe('POST')
+    const headers = new Headers(init.headers)
+    const body = JSON.parse(String(init.body)) as { redeem_request_id: string }
+    expect(body.redeem_request_id).toMatch(/^[0-9a-f-]{36}$/)
+    expect(headers.get('idempotency-key')).toBe(body.redeem_request_id)
+    expect(headers.get('authorization')).toBe('Bearer access-private')
+    expect(headers.get('chatgpt-account-id')).toBe('acct-team')
+    expect(result).toEqual({ windowsReset: 2, redeemedAt: Date.parse(redeemedAt) })
+    expect(JSON.stringify(result)).not.toContain('credit-private')
+    expect(JSON.stringify(result)).not.toContain('response-private')
+    expect(JSON.stringify(result)).not.toContain(bundle.accessToken)
+  })
+
+  it('uses a caller-provided reset-credit idempotency key', async () => {
+    const fetchMock = vi.fn(async () => new Response('{}', { status: 200 }))
+    const requestId = '63c72dca-a393-4ff6-b0e2-63e47044db57'
+
+    await consumeChatGptCodexResetCredit(bundle, fetchMock as typeof fetch, undefined, requestId)
+
+    const init = fetchMock.mock.calls[0][1]!
+    expect(new Headers(init.headers).get('idempotency-key')).toBe(requestId)
+    expect(JSON.parse(String(init.body))).toEqual({ redeem_request_id: requestId })
   })
 
   it.each([

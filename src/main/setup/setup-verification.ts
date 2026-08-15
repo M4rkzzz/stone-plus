@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import type { RouteClient, SetupRouteVerificationResult } from '@shared/types'
 
 const TEST_PROMPT = 'Reply exactly with OK.'
@@ -47,6 +48,23 @@ export function buildSetupVerificationRequest(
         body: JSON.stringify({
           contents: [{ role: 'user', parts: [{ text: TEST_PROMPT }] }],
           generationConfig: { maxOutputTokens: 16 },
+        }),
+      },
+    }
+  }
+
+  if (client === 'deepseek-harness') {
+    headers.set('x-deepseek-harness-session-id', `stone-setup-${randomUUID()}`)
+    return {
+      url: `${root}/deepseek-harness/v1/chat/completions`,
+      init: {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          model,
+          messages: [{ role: 'user', content: TEST_PROMPT }],
+          max_tokens: 16,
+          stream: false,
         }),
       },
     }

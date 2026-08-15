@@ -38,6 +38,48 @@ describe('static route preview', () => {
     expect(result.issues).toContainEqual(expect.objectContaining({ code: 'model-mapped' }))
   })
 
+  it('previews WM as the actual upstream while checking eligibility against the routed model', () => {
+    const wmSnapshot = {
+      providers: [{
+        ...snapshot.providers[0],
+        id: 'chatgpt-provider',
+        name: 'ChatGPT OAuth',
+        sourceType: 'oauth-system' as const,
+        kind: 'openai' as const,
+      }],
+      accounts: [{
+        ...snapshot.accounts[0],
+        id: 'chatgpt-account',
+        providerId: 'chatgpt-provider',
+        credentialType: 'chatgpt-oauth' as const,
+        modelsRefreshedAt: 1,
+        modelPolicy: 'selected' as const,
+        modelAllowlist: ['gpt-test'],
+      }],
+      pools: [{
+        id: 'wm-pool', name: 'WM pool', kind: 'standard' as const,
+        protocol: 'openai-responses' as const, strategy: 'priority' as const,
+        members: [{ accountId: 'chatgpt-account', enabled: true }],
+        modelPolicy: 'selected' as const, modelAllowlist: ['gpt-test'],
+        stickySessions: false, stickyTtlMinutes: 30, maxRetries: 0,
+        routeToWm: true, createdAt: 1, updatedAt: 1,
+      }],
+    } as Pick<AppSnapshot, 'providers' | 'accounts' | 'pools'>
+
+    const result = previewRoute({
+      route: { ...route, poolId: 'wm-pool' },
+      requestedModel: 'alias',
+    }, wmSnapshot)
+
+    expect(result).toMatchObject({
+      status: 'ready',
+      upstreamModel: 'gpt-5.6-sol-wm',
+      eligibleAccountCount: 1,
+    })
+    expect(result.issues).toContainEqual(expect.objectContaining({ code: 'model-mapped' }))
+    expect(result.issues).not.toContainEqual(expect.objectContaining({ code: 'model-unavailable' }))
+  })
+
   it('previews the effective per-model source while preserving the default source for unmatched models', () => {
     const routedSnapshot = {
       ...snapshot,

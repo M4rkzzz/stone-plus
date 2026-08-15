@@ -1,6 +1,6 @@
 {
   "name": "stone-desktop",
-  "version": "0.9.17",
+  "version": "0.9.18",
   "private": true,
   "packageManager": "npm@10.9.3",
   "engines": {
@@ -302,6 +302,8 @@
   "overrides": {
     "fast-uri": "3.1.5",
     "ip-address": "10.4.0",
+    "js-yaml": "4.3.1",
+    "nanoid": "3.3.18",
     "minimatch@3.1.5": {
       "brace-expansion": "1.1.18"
     },

@@ -15,8 +15,9 @@ const targets: AgentTarget[] = [
   'claude-code-vsc',
   'gemini-cli',
   'grok-build',
+  'deepseek-harness',
 ]
-const runningTargets = ['codex-desktop', 'codex-cli', 'claude-code', 'gemini-cli', 'grok-build'] as const
+const runningTargets = ['codex-desktop', 'codex-cli', 'claude-code', 'gemini-cli', 'grok-build', 'deepseek-harness'] as const
 const launchOnlyTargets = ['claude-code-desktop', 'claude-code-vsc'] as const
 
 describe('AgentLifecycleService', () => {
@@ -177,9 +178,9 @@ describe('AgentLifecycleService', () => {
     const result = await service.repairAllAffected()
 
     expect(result.status).toBe('partial')
-    expect(result.results).toHaveLength(7)
+    expect(result.results).toHaveLength(8)
     expect(result.results.find((entry) => entry.target === 'gemini-cli')?.error?.message).toContain('cannot validate')
-    expect(result.results.filter((entry) => entry.status === 'succeeded')).toHaveLength(5)
+    expect(result.results.filter((entry) => entry.status === 'succeeded')).toHaveLength(6)
     expect(result.results.find((entry) => entry.target === 'codex-cli')?.status).toBe('skipped')
   })
 
@@ -357,7 +358,7 @@ describe('AgentLifecycleService', () => {
     await service.smartRepair()
 
     expect(completed).toHaveBeenCalledOnce()
-    expect(completed.mock.calls[0][0].results).toHaveLength(7)
+    expect(completed.mock.calls[0][0].results).toHaveLength(8)
   })
 
   it('soft-times out a stuck target without releasing its shared-state lock', async () => {
@@ -515,7 +516,7 @@ describe('AgentLifecycleService', () => {
     expect(result.snapshot.agents['claude-code'].error?.code).toBe('process-start-failed')
   })
 
-  it.each(runningTargets)('treats start as idempotent for an already-running %s target', async (target) => {
+  it.each(runningTargets.filter((target) => target !== 'deepseek-harness'))('treats start as idempotent for an already-running %s target', async (target) => {
     const start = vi.fn(async () => undefined)
     const service = createService(adaptersWith({ [target]: { start } }))
 
@@ -528,6 +529,21 @@ describe('AgentLifecycleService', () => {
       runningAfter: true,
     })
     expect(start).not.toHaveBeenCalled()
+  })
+
+  it('opens an already-running DeepSeek Harness workbench through its start adapter', async () => {
+    const start = vi.fn(async () => undefined)
+    const service = createService(adaptersWith({ 'deepseek-harness': { start } }))
+
+    const result = await service.start('deepseek-harness')
+
+    expect(result.status).toBe('succeeded')
+    expect(result.results[0]).toMatchObject({
+      status: 'succeeded',
+      phases: ['inspect', 'start'],
+      runningAfter: true,
+    })
+    expect(start).toHaveBeenCalledOnce()
   })
 
   it.each(runningTargets)('starts a previously stopped %s target after repair', async (target) => {
@@ -666,7 +682,7 @@ describe('AgentLifecycleService', () => {
     expect(start).not.toHaveBeenCalled()
   })
 
-  it.each(['claude-code', 'gemini-cli', 'grok-build'] as const)(
+  it.each(['claude-code', 'gemini-cli', 'grok-build', 'deepseek-harness'] as const)(
     'repairs only configuration while restarting a running %s target',
     async (target) => {
       const close = vi.fn(async () => ({ wasRunning: true }))
@@ -789,6 +805,47 @@ describe('AgentLifecycleService', () => {
     })
     expect(result.snapshot.agents['claude-code'].installed).toBe(true)
     expect(inspect).toHaveBeenCalledTimes(3)
+  })
+
+  it('configures and starts DeepSeek Harness immediately after its pinned installation', async () => {
+    let installed = false
+    let configured = false
+    let running = false
+    const inspect = vi.fn(async () => ({
+      ...healthySnapshot(),
+      installed,
+      configured,
+      running,
+      managedInstanceCount: running ? 1 : 0,
+    }))
+    const start = vi.fn(async () => {
+      configured = true
+      running = true
+    })
+    const installer: AgentInstallationPort = {
+      install: vi.fn(async (target, channel = 'recommended') => {
+        installed = true
+        return { operationId: 'dsh-install', target, channel, status: 'installed' }
+      }),
+    }
+    const service = createService(adaptersWith({ 'deepseek-harness': { inspect, start } }), { installer })
+
+    const result = await service.install('deepseek-harness')
+
+    expect(result.status).toBe('succeeded')
+    expect(result.results[0]).toMatchObject({
+      target: 'deepseek-harness',
+      status: 'succeeded',
+      phases: ['inspect', 'install', 'restore-connection', 'validate', 'start'],
+      changed: true,
+      runningAfter: true,
+    })
+    expect(start).toHaveBeenCalledOnce()
+    expect(result.snapshot.agents['deepseek-harness']).toMatchObject({
+      installed: true,
+      configured: true,
+      running: true,
+    })
   })
 
   it('maps installer prerequisites to a structured non-retryable lifecycle error', async () => {

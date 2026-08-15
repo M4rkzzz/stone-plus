@@ -139,6 +139,103 @@ describe('ManagedCliRuntimePort', () => {
     expect(save).toHaveBeenCalledWith(expect.objectContaining({ id: existing.id }))
     expect(start).toHaveBeenCalledWith(existing.id)
   })
+
+  it('deploys the Stone companion overlay before starting an official DSH instance', async () => {
+    const existing = {
+      ...instance('deepseek-harness', 'C:\\tools\\dsh.cmd'),
+      launchArgs: ['web', '--host', '127.0.0.1', '--port', '3080'],
+    }
+    const save = vi.fn(async () => [existing])
+    const start = vi.fn(async () => [existing])
+    const ensureInstalled = vi.fn(async () => ({
+      patchPath: 'C:\\Users\\test\\.dsh\\stoneplus\\model-family-bridge\\cordis.patch.yml',
+      changed: true,
+    }))
+    const runtime = new ManagedCliRuntimePort(
+      { list: () => [existing], save, start } as unknown as ClientInstanceManager,
+      {
+        paths: {
+          deepseekHarness: {
+            directory: 'C:\\Users\\test\\.dsh',
+            env: { path: 'C:\\Users\\test\\.dsh\\.env' },
+          },
+        },
+      } as unknown as ClientConfigService,
+      {
+        getSnapshot: () => ({
+          gateway: { host: '127.0.0.1', port: 15720 },
+          routes: [{
+            id: 'route-dsh',
+            client: 'deepseek-harness',
+            enabled: true,
+            poolId: 'pool-dsh',
+            inboundProtocol: 'openai-chat',
+            modelMap: {},
+            localToken: 'stone-dsh-token',
+            createdAt: 1,
+            updatedAt: 1,
+          }],
+        }),
+      } as unknown as AppStore,
+      vi.fn(async () => ({
+        target: 'deepseek-harness' as const,
+        platform: 'win32' as const,
+        supported: true,
+        installed: true,
+        executablePath: 'C:\\tools\\dsh.cmd',
+        source: 'command-path' as const,
+        processControl: 'managed-only' as const,
+        inspectedPaths: [],
+      })),
+      { ensureInstalled },
+    )
+
+    await runtime.startNew('deepseek-harness')
+
+    expect(ensureInstalled).toHaveBeenCalledWith({
+      gatewayBaseUrl: 'http://127.0.0.1:15720',
+      credentialFile: 'C:\\profiles\\one\\.env',
+    })
+    expect(save).toHaveBeenCalledWith(expect.objectContaining({
+      id: existing.id,
+      launchMode: 'background',
+      launchArgs: [
+        'web',
+        '--patch',
+        'C:\\Users\\test\\.dsh\\stoneplus\\model-family-bridge\\cordis.patch.yml',
+        '--host',
+        '127.0.0.1',
+        '--port',
+        '3080',
+      ],
+    }))
+    expect(start).toHaveBeenCalledWith(existing.id)
+  })
+
+  it('recognizes a ready external DSH service instead of starting a duplicate on port 3080', async () => {
+    const existing = instance('deepseek-harness', 'C:\\tools\\dsh.cmd')
+    const save = vi.fn(async () => [existing])
+    const start = vi.fn(async () => [existing])
+    const ready = vi.fn(async () => true)
+    const runtime = new ManagedCliRuntimePort(
+      { list: () => [existing], save, start } as unknown as ClientInstanceManager,
+      {} as ClientConfigService,
+      {} as AppStore,
+      undefined,
+      undefined,
+      ready,
+    )
+
+    await expect(runtime.snapshot('deepseek-harness')).resolves.toMatchObject({
+      externalSessionDetected: true,
+      managedInstances: [{ id: existing.id, running: false }],
+    })
+    await runtime.startNew('deepseek-harness')
+
+    expect(ready).toHaveBeenCalled()
+    expect(save).not.toHaveBeenCalled()
+    expect(start).not.toHaveBeenCalled()
+  })
 })
 
 describe('Claude launch surface integration boundaries', () => {

@@ -14,6 +14,10 @@ import {
   resolveDeepSeekToolBinding,
   restoreDeepSeekResponsesDsml,
 } from './deepseek-dsml'
+import {
+  sanitizeDeepSeekHarnessChatResponse,
+  sanitizeDeepSeekHarnessRequestTools,
+} from './deepseek-harness-tools'
 
 type JsonObject = Record<string, unknown>
 
@@ -613,6 +617,9 @@ export function convertRequest(
   targetModel: string,
   context?: ProtocolConversionContext
 ): ProtocolRequest {
+  if (context?.sanitizeDeepSeekHarnessToolArguments && from === 'openai-chat') {
+    body = sanitizeDeepSeekHarnessRequestTools(body)
+  }
   if (context?.dialect === 'xai-grok' && from === 'openai-responses') {
     body = prepareXaiResponsesSource(body, context)
   }
@@ -719,7 +726,9 @@ export function convertResponse(
         return restoreDeepSeekResponsesDsml(body, context.toolBridgePlan)
       }
     }
-    return body
+    return from === 'openai-chat' && context?.sanitizeDeepSeekHarnessToolArguments
+      ? sanitizeDeepSeekHarnessChatResponse(body)
+      : body
   }
   if (from === 'openai-responses') {
     const status = stringValue(body.status).trim().toLowerCase()
@@ -738,9 +747,18 @@ export function convertResponse(
     )
   }
   if (to === 'openai-chat') {
-    if (from === 'anthropic-messages') return anthropicResponseToChat(body, fallbackModel, now)
-    if (from === 'openai-responses') return responsesResponseToChat(body, fallbackModel, now)
-    if (from === 'gemini') return geminiResponseToChat(body, fallbackModel, now)
+    const converted = from === 'anthropic-messages'
+      ? anthropicResponseToChat(body, fallbackModel, now)
+      : from === 'openai-responses'
+      ? responsesResponseToChat(body, fallbackModel, now)
+      : from === 'gemini'
+      ? geminiResponseToChat(body, fallbackModel, now)
+      : undefined
+    if (converted) {
+      return context?.sanitizeDeepSeekHarnessToolArguments
+        ? sanitizeDeepSeekHarnessChatResponse(converted)
+        : converted
+    }
   }
   if (from === 'openai-chat' && to === 'anthropic-messages') {
     return chatResponseToAnthropic(body, fallbackModel, now)

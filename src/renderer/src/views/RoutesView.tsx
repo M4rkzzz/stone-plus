@@ -240,6 +240,7 @@ function randomToken(client: RouteClient) {
 
 function routePath(route: Route) {
   if (route.client === 'grokbuild') return '/grokbuild/v1/responses'
+  if (route.client === 'deepseek-harness') return '/deepseek-harness/v1/chat/completions'
   if (route.inboundProtocol === 'anthropic-messages') return '/v1/messages'
   if (route.inboundProtocol === 'openai-responses') return '/v1/responses'
   if (route.inboundProtocol === 'openai-chat') return '/v1/chat/completions'
@@ -250,6 +251,7 @@ function clientEnvironment(route: Route, baseUrl: string) {
   if (route.client === 'claude') return `ANTHROPIC_BASE_URL=${baseUrl}\nANTHROPIC_AUTH_TOKEN=${route.localToken}`
   if (route.client === 'codex') return `OPENAI_BASE_URL=${baseUrl}/v1\nOPENAI_API_KEY=${route.localToken}`
   if (route.client === 'grokbuild') return `[auth]\npreferred_method = "api_key"\n\n[models]\ndefault = "stoneplus"\n\n[model.stoneplus]\nmodel = "grok-4.5"\nbase_url = "${baseUrl}/grokbuild/v1"\nname = "Stone+"\napi_key = "${route.localToken}"\napi_backend = "responses"\ncontext_window = 500000`
+  if (route.client === 'deepseek-harness') return `DEEPSEEK_BASE_URL=${baseUrl}/deepseek-harness/v1\nDEEPSEEK_API_KEY=${route.localToken}`
   return `GOOGLE_GEMINI_BASE_URL=${baseUrl}\nGEMINI_API_KEY=${route.localToken}`
 }
 

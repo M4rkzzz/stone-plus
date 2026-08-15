@@ -183,6 +183,14 @@ export class BuiltInProxyRouteCoordinator {
     }
   }
 
+  /** Replace application-owned loopback listeners after the local gateway is
+   * rebound. Generation-owned mixed/controller ports remain isolated in the
+   * active route and are not affected by this update. */
+  public setDirectLoopbackPorts(ports: readonly number[]): void {
+    this.permanentDirectLoopbackPorts.clear()
+    this.addDirectLoopbackPorts(ports)
+  }
+
   /** Starting before the first healthy configuration intentionally keeps the external route. */
   public requestEnable(): void {
     this.assertOpen()

@@ -11,6 +11,7 @@ import {
   planCodexToml,
   planGeminiConfig,
   planGrokBuildConfig,
+  planClientConfig,
   resolveClientConfigPaths,
 } from '../../src/main/client-config'
 
@@ -468,6 +469,26 @@ describe('Grok Build planning', () => {
       'model.<selected>.api_backend',
     ])
     expect(plan.files[0].content).toContain('auth.preferred_method = "api_key"')
+  })
+})
+
+describe('DeepSeek Harness planning', () => {
+  it('moves the launch-only endpoint out of dotenv while preserving unrelated values', () => {
+    const existing = {
+      'deepseek-harness-env': 'KEEP_ME="yes"\nDEEPSEEK_BASE_URL="https://old.example"\nDEEPSEEK_API_KEY="old"\n',
+    }
+    const plan = planClientConfig('deepseek-harness', paths, existing, target)
+    const env = plan.files[0]
+
+    expect(env.role).toBe('deepseek-harness-env')
+    expect(env.content).toContain('KEEP_ME="yes"')
+    expect(env.content).toContain('DEEPSEEK_API_KEY="stone_local_secret"')
+    expect(env.content).not.toContain('DEEPSEEK_BASE_URL')
+    expect(env.content).not.toContain('https://old.example')
+
+    const repair = planClientConfigRepair('deepseek-harness', paths, existing, target)
+    expect(repair.files[0].content).toBe(env.content)
+    expect(repair.rebuiltRoles).toEqual([])
   })
 })
 

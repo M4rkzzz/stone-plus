@@ -1,6 +1,8 @@
 import { BrowserWindow, type IpcMainInvokeEvent } from 'electron'
-import { join } from 'node:path'
-import { pathToFileURL } from 'node:url'
+import { dirname, join } from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
+
+const MAIN_IPC_DIRECTORY = dirname(fileURLToPath(import.meta.url))
 
 function developmentRendererUrl(): URL | undefined {
   // Packaged builds never run as Electron's default app and are compiled with
@@ -25,7 +27,7 @@ function developmentRendererUrl(): URL | undefined {
 }
 
 function isPackagedRendererUrl(candidate: URL): boolean {
-  const expected = new URL(pathToFileURL(join(__dirname, '../renderer/index.html')).toString())
+  const expected = new URL(pathToFileURL(join(MAIN_IPC_DIRECTORY, '../renderer/index.html')).toString())
   return candidate.protocol === 'file:'
     && candidate.host === expected.host
     && decodeURIComponent(candidate.pathname).replaceAll('\\', '/')

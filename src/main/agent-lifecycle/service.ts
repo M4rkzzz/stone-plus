@@ -222,6 +222,23 @@ export class AgentLifecycleService {
       const before = await adapter.inspect()
       const installed = await this.installer.install(target, channel)
       if (installed.status === 'failed') throw installFailure(installed)
+      if (target === 'deepseek-harness' && installed.status === 'installed') {
+        const afterInstall = await adapter.inspect()
+        await this.assertStartable(target, afterInstall, false)
+        try {
+          // The DSH adapter transactionally repairs and validates ~/.dsh/.env
+          // before launching the managed local workbench.
+          await adapter.start()
+        } catch (cause) {
+          throw withDefaultLifecyclePhase(cause, 'start')
+        }
+        return {
+          before,
+          phases: ['inspect', 'install', 'restore-connection', 'validate', 'start'],
+          changed: true,
+          expectedRunningAfter: true,
+        }
+      }
       return { before, phases: ['inspect', 'install'], changed: true }
     })
   }
@@ -312,8 +329,9 @@ export class AgentLifecycleService {
     return this.runSingle('start', target, 'start', async (adapter) => {
       const before = await adapter.inspect()
       await this.assertStartable(target, before, !before.running)
-      const detectsRunning = AGENT_CAPABILITIES[target].canDetectRunning
-      if (detectsRunning && before.running && before.configured) {
+      const capabilities = AGENT_CAPABILITIES[target]
+      const detectsRunning = capabilities.canDetectRunning
+      if (detectsRunning && before.running && before.configured && !capabilities.canOpenWhenRunning) {
         return { before, phases: ['inspect'], changed: false, expectedRunningAfter: true }
       }
       await adapter.start(options)

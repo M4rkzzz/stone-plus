@@ -1,10 +1,14 @@
 import { app, dialog, ipcMain, shell } from 'electron'
 import { join } from 'node:path'
-import type { CodexSessionQuery } from '@shared/types'
+import type { CodexHarnessSessionImportSelection, CodexSessionQuery } from '@shared/types'
 import type { CodexSessionManager } from '../codex'
+import type { DeepSeekHarnessSessionImportService } from '../deepseek-harness'
 import { assertTrustedSender } from './trusted-sender'
 
-export function registerCodexSessionManagerApi(manager: CodexSessionManager): void {
+export function registerCodexSessionManagerApi(
+  manager: CodexSessionManager,
+  harnessImporter?: DeepSeekHarnessSessionImportService,
+): void {
   ipcMain.handle('stone:list-codex-sessions', (event, query?: CodexSessionQuery) => {
     assertTrustedSender(event)
     return manager.list(query)
@@ -35,4 +39,12 @@ export function registerCodexSessionManagerApi(manager: CodexSessionManager): vo
     assertTrustedSender(event)
     return manager.restore(id, expectedRevision)
   })
+  ipcMain.handle(
+    'stone:import-codex-sessions-to-deepseek-harness',
+    (event, selections: CodexHarnessSessionImportSelection[]) => {
+      assertTrustedSender(event)
+      if (!harnessImporter) throw new Error('DeepSeek Harness session import is unavailable.')
+      return harnessImporter.import(selections)
+    },
+  )
 }

@@ -81,3 +81,39 @@ export function mutateDotenv(content: string | undefined, values: Readonly<Recor
   if (trailingNewline && next !== '') next += eol
   return { content: next, changed: next !== content }
 }
+
+/**
+ * Remove complete dotenv assignments while preserving every unrelated line.
+ * Multiline quoted values are removed as one assignment so their continuation
+ * lines cannot be mistaken for standalone configuration.
+ */
+export function removeDotenvKeys(content: string | undefined, keys: ReadonlySet<string>): TextMutation {
+  const source = content ?? ''
+  const eol = source.includes('\r\n') ? '\r\n' : '\n'
+  const trailingNewline = content === undefined || /\r?\n$/.test(source)
+  const lines = source === '' ? [] : source.split(/\r?\n/)
+  if (lines.at(-1) === '') lines.pop()
+
+  const nextLines: string[] = []
+  let removedQuotedValue: '"' | "'" | undefined
+  for (const line of lines) {
+    if (removedQuotedValue) {
+      if (closesQuotedValue(line, removedQuotedValue)) removedQuotedValue = undefined
+      continue
+    }
+    const match = assignmentPattern.exec(line)
+    if (!match || !keys.has(match[3])) {
+      nextLines.push(line)
+      continue
+    }
+    const value = match[5].trimStart()
+    const quote = value[0]
+    if ((quote === '"' || quote === "'") && !closesQuotedValue(value.slice(1), quote)) {
+      removedQuotedValue = quote
+    }
+  }
+
+  let next = nextLines.join(eol)
+  if (trailingNewline && next !== '') next += eol
+  return { content: next, changed: next !== content }
+}

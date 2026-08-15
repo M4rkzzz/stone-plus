@@ -1914,6 +1914,48 @@ describe('AppStore', () => {
     expect(imported.warnings).toHaveLength(1)
   })
 
+  it('persists WM routing only for a native ChatGPT Responses pool', async () => {
+    const store = createStore()
+    await store.initialize()
+    const imported = await store.importChatGptAccounts({
+      content: JSON.stringify({
+        access_token: 'wm-access-private',
+        account_id: 'acct-wm-private',
+        expired: new Date(Date.now() + 3_600_000).toISOString(),
+      }),
+    })
+    const created = await store.savePool({
+      name: 'WM pool',
+      protocol: 'openai-responses',
+      strategy: 'priority',
+      accountIds: imported.importedAccountIds,
+      stickySessions: false,
+      stickyTtlMinutes: 30,
+      maxRetries: 0,
+      routeToWm: true,
+    })
+    const pool = created.pools.find((candidate) => candidate.name === 'WM pool')!
+    expect(pool.routeToWm).toBe(true)
+
+    const preserved = await store.savePool({
+      id: pool.id,
+      name: pool.name,
+      protocol: pool.protocol,
+      strategy: pool.strategy,
+      accountIds: pool.members.map((member) => member.accountId),
+      stickySessions: pool.stickySessions,
+      stickyTtlMinutes: pool.stickyTtlMinutes,
+      maxRetries: pool.maxRetries,
+    })
+    expect(preserved.pools.find((candidate) => candidate.id === pool.id)?.routeToWm).toBe(true)
+
+    await store.close()
+    const restarted = createStore()
+    await restarted.initialize()
+    expect(restarted.getSnapshot().pools.find((candidate) => candidate.id === pool.id)?.routeToWm).toBe(true)
+    expect(restarted.getRuntimeConfiguration().pools.find((candidate) => candidate.id === pool.id)?.routeToWm).toBe(true)
+  })
+
   it('imports Sub2API OAuth accounts whose unset expiration is zero', async () => {
     const store = createStore()
     await store.initialize()
@@ -2647,6 +2689,40 @@ describe('AppStore', () => {
     database.close()
   })
 
+  it('retains quota history older than fourteen days for monthly-cycle accounting', async () => {
+    const store = createStore()
+    await store.initialize()
+    const created = await store.saveAccount({
+      providerId: 'provider-openai',
+      name: 'Monthly quota account',
+      credential: 'sk-monthly-quota',
+      priority: 1,
+      weight: 1,
+      maxConcurrency: 1,
+      modelAllowlist: []
+    })
+    const accountId = created.accounts[0].id
+    const observedAt = Date.now() - 20 * 24 * 60 * 60 * 1000
+
+    await store.setAccountCheckResult(accountId, {
+      codexQuota: {
+        monthly: {
+          usedPercent: 100,
+          resetAt: observedAt + 30 * 24 * 60 * 60 * 1000,
+          windowSeconds: 30 * 24 * 60 * 60,
+        },
+        observedAt,
+        source: 'usage-endpoint'
+      }
+    })
+    await store.sanitizePersistedData()
+
+    expect(store.getAccountCodexQuotaHistory(accountId)).toEqual([
+      expect.objectContaining({ accountId, observedAt })
+    ])
+    await store.close()
+  })
+
   it('replaces authoritative Codex usage snapshots so stale exhaustion flags cannot survive recovery', async () => {
     const store = createStore()
     await store.initialize()
@@ -2971,7 +3047,8 @@ describe('AppStore', () => {
         { id: 'default-claude' },
         { id: 'default-codex' },
         { id: 'default-gemini' },
-        { id: 'default-grokbuild' }
+        { id: 'default-grokbuild' },
+        { id: 'default-deepseek-harness' }
       ]
     })
     expect(store.getCredential('legacy-credential')).toBe('legacy-secret')
@@ -4443,7 +4520,7 @@ describe('AppStore', () => {
     expect(readSchemaVersion(database)).toBe(SQLITE_SCHEMA_VERSION)
     expect(database.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'index' AND name = 'accounts_ordinal_unique'").get())
       .toEqual({ count: 1 })
-    expect(database.prepare('SELECT COUNT(*) AS count FROM client_profiles').get()).toEqual({ count: 4 })
+    expect(database.prepare('SELECT COUNT(*) AS count FROM client_profiles').get()).toEqual({ count: 5 })
     database.close()
   })
 

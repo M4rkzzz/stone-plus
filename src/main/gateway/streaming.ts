@@ -5,6 +5,7 @@ import {
   parseToolSearchArguments,
   resolveDeepSeekToolBinding,
 } from './deepseek-dsml'
+import { sanitizeDeepSeekHarnessToolArguments } from './deepseek-harness-tools'
 
 type JsonObject = Record<string, unknown>
 
@@ -58,8 +59,12 @@ export interface StreamEncodingOptions {
   id?: string
   model?: string
   now?: () => number
+  /** Append to an already-started Responses stream without replaying response.created. */
+  responsesAlreadyStarted?: boolean
   /** Request-scoped provider mapping used to authorize and restore streamed tools. */
   toolBridgePlan?: ToolBridgePlan
+  /** Buffer complete Chat tool calls and strip DSH retry-only escalation arguments. */
+  sanitizeDeepSeekHarnessToolArguments?: boolean
 }
 
 export interface StreamParsingOptions {
@@ -90,6 +95,8 @@ export interface CanonicalStreamParser {
   getRecognizedEventCount(): number
   /** Parsed terminal Responses payload, exposed without framing/parsing the SSE a second time. */
   getResponsesTerminalResponse(): JsonObject | undefined
+  /** Most recently observed Responses response id, including pre-terminal frames. */
+  getResponsesResponseId?(): string | undefined
 }
 
 export type ResponsesTerminalEvent = 'response.completed' | 'response.incomplete' | 'response.failed'
@@ -131,6 +138,8 @@ export interface OpenAiResponsesStreamResult {
   error?: string
   errorCode?: string
   errorType?: string
+  /** True once the upstream emitted model output, tool data, usage, or a terminal response event. */
+  upstreamSemanticObserved?: boolean
 }
 
 export interface OpenAiResponsesStreamCollector {
@@ -299,11 +308,13 @@ class ResponsesStreamCollector implements OpenAiResponsesStreamCollector {
     if (!this.error) this.validateCompletedTools()
 
     const usage = Object.keys(this.usage).length > 0 ? { ...this.usage } : undefined
+    const upstreamSemanticObserved = this.parser.getProtocolState().responsesProgressEventCount > 0
     const error = this.error
       ?? (!this.stopReason || !this.done ? 'Upstream Responses stream ended before a terminal response' : undefined)
     if (error) {
       this.result = {
         ...(usage ? { usage } : {}),
+        ...(upstreamSemanticObserved ? { upstreamSemanticObserved: true } : {}),
         error,
         ...(this.errorCode ? { errorCode: this.errorCode } : {}),
         ...(this.errorType ? { errorType: this.errorType } : {})
@@ -312,7 +323,11 @@ class ResponsesStreamCollector implements OpenAiResponsesStreamCollector {
     }
 
     const response = this.buildResponse()
-    this.result = { response, ...(usage ? { usage } : {}) }
+    this.result = {
+      response,
+      ...(usage ? { usage } : {}),
+      ...(upstreamSemanticObserved ? { upstreamSemanticObserved: true } : {}),
+    }
     return this.result
   }
 
@@ -686,6 +701,7 @@ class ProtocolParser implements CanonicalStreamParser {
   private responsesEventCount = 0
   private responsesProgressEventCount = 0
   private responsesTerminalEvent: ResponsesTerminalEvent | undefined
+  private responsesResponseId: string | undefined
   private responsesLastEventType: string | undefined
   private responsesLastSequenceNumber: number | undefined
   private responsesTerminalResponse: JsonObject | undefined
@@ -755,6 +771,10 @@ class ProtocolParser implements CanonicalStreamParser {
 
   getResponsesTerminalResponse(): JsonObject | undefined {
     return this.responsesTerminalResponse
+  }
+
+  getResponsesResponseId(): string | undefined {
+    return this.responsesResponseId
   }
 
   private consumeText(text: string): void {
@@ -917,6 +937,9 @@ class ProtocolParser implements CanonicalStreamParser {
       return
     }
     const recognized = type ? recognizedResponsesPayload(type, payload) : false
+    const response = objectValue(payload.response)
+    const responseId = optionalString(response?.id) ?? optionalString(payload.response_id)
+    if (responseId) this.responsesResponseId = responseId
     const terminalType: ResponsesTerminalEvent | undefined = type === 'response.completed'
       || type === 'response.incomplete'
       || type === 'response.failed'
@@ -981,7 +1004,6 @@ class ProtocolParser implements CanonicalStreamParser {
       this.emitDone()
       return
     }
-    const response = objectValue(payload.response)
     if (type === 'response.created' || type === 'response.in_progress') {
       this.emitStart(response?.id, response?.model, response?.created_at)
       return
@@ -1858,16 +1880,20 @@ class ProtocolEncoder implements CanonicalStreamEncoder {
   private responsesTextStarted = false
   private readonly responsesTextSourceIndices = new Set<number>()
   private readonly responsesCompletedMessageIndices = new Set<number>()
+  private responsesFailureEmitted = false
   private chatUsageEmitted = false
   private readonly chatToolIds = new Map<number, string>()
   private readonly toolBridgePlan?: ToolBridgePlan
+  private readonly sanitizeDeepSeekHarnessToolArguments: boolean
 
   constructor(private readonly protocol: Protocol, options: StreamEncodingOptions) {
     this.now = options.now ?? Date.now
     this.createdAt = this.now()
     this.id = options.id ?? `stream_${this.createdAt}`
     this.model = options.model ?? ''
+    this.started = protocol === 'openai-responses' && options.responsesAlreadyStarted === true
     this.toolBridgePlan = options.toolBridgePlan
+    this.sanitizeDeepSeekHarnessToolArguments = options.sanitizeDeepSeekHarnessToolArguments === true
   }
 
   encode(event: CanonicalStreamEvent): Uint8Array[] {
@@ -1920,6 +1946,10 @@ class ProtocolEncoder implements CanonicalStreamEncoder {
     }
     if (event.type === 'tool-call-delta') {
       this.ensureOpenAiChatStart()
+      if (this.sanitizeDeepSeekHarnessToolArguments) {
+        this.updateTool(event)
+        return
+      }
       const firstDelta = !this.chatToolIds.has(event.index)
       const id = this.chatToolIds.get(event.index)
         ?? event.id
@@ -1941,6 +1971,11 @@ class ProtocolEncoder implements CanonicalStreamEncoder {
       }))
       return
     }
+    if (event.type === 'tool-call-complete') {
+      const tool = this.tools.get(event.index)
+      if (tool) tool.completed = true
+      return
+    }
     if (event.type === 'usage') {
       this.mergeUsage(event)
       return
@@ -1948,6 +1983,15 @@ class ProtocolEncoder implements CanonicalStreamEncoder {
     if (event.type === 'stop') {
       if (this.failed || this.stopped) return
       this.ensureOpenAiChatStart()
+      if (this.sanitizeDeepSeekHarnessToolArguments) {
+        // Chat SSE has no separate tool-complete lifecycle frame; its
+        // finish_reason is the authoritative boundary for every accumulated
+        // parallel call. Responses streams may already have marked them.
+        if (event.reason === 'tool_calls') {
+          for (const tool of this.tools.values()) tool.completed = true
+        }
+        this.emitDeepSeekHarnessChatTools()
+      }
       this.stopped = true
       this.frames.push(sseFrame({
         ...this.openAiChatEnvelope(),
@@ -1976,6 +2020,33 @@ class ProtocolEncoder implements CanonicalStreamEncoder {
       }
       this.done = true
       this.frames.push(sseFrame('[DONE]'))
+    }
+  }
+
+  private emitDeepSeekHarnessChatTools(): void {
+    for (const tool of [...this.tools.values()].sort((left, right) => left.index - right.index)) {
+      if (tool.emitted || !tool.completed) continue
+      const id = tool.id || `call_${safeIdentifier(this.id)}_${tool.index}`
+      this.chatToolIds.set(tool.index, id)
+      tool.emitted = true
+      this.frames.push(sseFrame({
+        ...this.openAiChatEnvelope(),
+        choices: [{
+          index: 0,
+          delta: {
+            tool_calls: [{
+              index: tool.index,
+              id,
+              type: 'function',
+              function: {
+                name: tool.name,
+                arguments: sanitizeDeepSeekHarnessToolArguments(tool.arguments || '{}'),
+              },
+            }],
+          },
+          finish_reason: null,
+        }],
+      }))
     }
   }
 
@@ -2045,10 +2116,28 @@ class ProtocolEncoder implements CanonicalStreamEncoder {
       this.failed = true
       const error = canonicalError(event)
       const { type: errorType, ...details } = error
+      // A bare Responses error followed by EOF is not a protocol terminal
+      // for several clients (notably Codex-compatible WebSocket consumers).
+      // Keep the error visible, but close the response with the standard
+      // response.failed event so consumers never have to infer completion
+      // from a disconnected stream. This is deliberately a failed response;
+      // it must not turn a partial tool call into a successful turn.
+      const emitFailure = !this.responsesFailureEmitted
+      if (emitFailure) this.ensureResponsesStart()
       this.frames.push(responsesSse('error', omitUndefined({
         ...details,
         error_type: errorType
       })))
+      if (emitFailure) {
+        const failedResponse = this.responsesEnvelope('failed', [])
+        failedResponse.error = omitUndefined({
+          message: event.message,
+          type: event.errorType,
+          code: event.code
+        })
+        this.frames.push(responsesSse('response.failed', { response: failedResponse }))
+        this.responsesFailureEmitted = true
+      }
       return
     }
     if (event.type === 'done' && !this.done) {

@@ -43,6 +43,8 @@ export type {
   GatewayRuntimeStateHandler,
   GatewayRuntimeStateUpdate,
   GatewayServerOptions,
+  DeepSeekHarnessModelFamily,
+  PersistedDeepSeekHarnessModelBinding,
   PersistedGrokVideoBinding,
   ProtocolRequest,
   ProtocolConversionContext,

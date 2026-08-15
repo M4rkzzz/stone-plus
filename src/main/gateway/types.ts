@@ -102,6 +102,14 @@ export interface PersistedGrokVideoBinding {
   expiresAt: number
 }
 
+export type DeepSeekHarnessModelFamily = 'gpt' | 'deepseek'
+
+export interface PersistedDeepSeekHarnessModelBinding {
+  sessionId: string
+  family: DeepSeekHarnessModelFamily
+  boundAt: number
+}
+
 export interface GatewayServerOptions {
   config: GatewayConfig
   credentialResolver: CredentialResolver
@@ -116,6 +124,8 @@ export interface GatewayServerOptions {
   conversationTitleResolver?: ConversationTitleResolver
   loadGrokVideoBindings?: () => Promise<readonly PersistedGrokVideoBinding[]> | readonly PersistedGrokVideoBinding[]
   saveGrokVideoBindings?: (bindings: readonly PersistedGrokVideoBinding[]) => Promise<void>
+  loadDeepSeekHarnessModelBindings?: () => Promise<readonly PersistedDeepSeekHarnessModelBinding[]> | readonly PersistedDeepSeekHarnessModelBinding[]
+  saveDeepSeekHarnessModelBindings?: (bindings: readonly PersistedDeepSeekHarnessModelBinding[]) => Promise<void>
   now?: () => number
   random?: () => number
   /** Internal protocol-stall guard; primarily injectable for deterministic tests. */
@@ -149,7 +159,10 @@ export interface ScheduledAccount {
 export interface SchedulerSelectionInput {
   pool: Pool
   accounts: readonly Account[]
+  /** Client-visible or route-mapped model used for pool and account catalog eligibility. */
   model: string
+  /** Actual upstream model used only for model-scoped cooldown eligibility. */
+  modelCooldownKey?: string
   /** Endpoint capability is authoritative even when the text-model catalog omits media/live ids. */
   skipAccountModelCatalog?: boolean
   sessionId?: string
@@ -207,4 +220,6 @@ export interface ToolBridgePlan {
 export interface ProtocolConversionContext {
   dialect?: ProtocolConversionDialect
   toolBridgePlan?: ToolBridgePlan
+  /** DSH must not receive speculative first-call sandbox escalation arguments. */
+  sanitizeDeepSeekHarnessToolArguments?: boolean
 }

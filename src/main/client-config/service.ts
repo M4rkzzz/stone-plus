@@ -116,7 +116,9 @@ export class ClientConfigService {
   }
 
   async detect(client?: SupportedClient): Promise<DetectedClientConfig[]> {
-    const clients: SupportedClient[] = client ? [client] : ['claude', 'codex', 'gemini', 'grokbuild']
+    const clients: SupportedClient[] = client
+      ? [client]
+      : ['claude', 'codex', 'gemini', 'grokbuild', 'deepseek-harness']
     return Promise.all(clients.map(async (candidate) => {
       const directory = clientDirectory(this.paths, candidate)
       const directoryInfo = await pathStat(directory)

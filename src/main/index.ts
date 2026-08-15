@@ -1,10 +1,11 @@
 import { app, BrowserWindow, Menu, nativeImage, nativeTheme, net, powerMonitor, safeStorage, session, shell, Tray } from 'electron'
 import electronUpdater from 'electron-updater'
-import { join, resolve } from 'node:path'
-import { pathToFileURL } from 'node:url'
+import { dirname, join, resolve } from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import {
   GatewayServer,
   type GatewayConfig,
+  type PersistedDeepSeekHarnessModelBinding,
   type PersistedGrokVideoBinding,
   type ResolvedGatewayCredential,
 } from './gateway'
@@ -52,6 +53,11 @@ import { ClaudeDesktopOperationCoordinator } from './agent-lifecycle/claude-desk
 import type { AgentLifecycleService } from './agent-lifecycle/service'
 import { AgentInstallationService } from './agent-installation'
 import { registerCodexSessionManagerApi } from './ipc/session-manager-api'
+import {
+  DeepSeekHarnessCompanionInstaller,
+  DeepSeekHarnessSessionImportService,
+  withDeepSeekHarnessCompanionPatch,
+} from './deepseek-harness'
 import { registerPersistentTaskApi } from './ipc/persistent-task-api'
 import { registerRequestMonitorApi } from './ipc/request-monitor-api'
 import { BROWSER_SESSION_PARTITION, BrowserImportQueue } from './browser-import-queue'
@@ -78,6 +84,9 @@ const WINDOWS_APP_USER_MODEL_ID = 'io.github.m4rkzzz.stoneplus'
 const WINDOWS_DEV_APP_USER_MODEL_ID = `${WINDOWS_APP_USER_MODEL_ID}.dev`
 const GROK_VIDEO_BINDINGS_METADATA_KEY = 'grok_video_bindings_v1'
 const GROK_VIDEO_BINDINGS_METADATA_MAX_CHARS = 1024 * 1024
+const DEEPSEEK_HARNESS_MODEL_BINDINGS_METADATA_KEY = 'deepseek_harness_model_bindings_v1'
+const DEEPSEEK_HARNESS_MODEL_BINDINGS_METADATA_MAX_CHARS = 16 * 1024 * 1024
+const MAIN_BUNDLE_DIRECTORY = dirname(fileURLToPath(import.meta.url))
 
 let mainWindow: BrowserWindow | undefined
 let tray: Tray | undefined
@@ -154,7 +163,12 @@ app.on('child-process-gone', (_event, details) => {
 })
 
 if (process.platform === 'win32') app.setAppUserModelId(windowsAppUserModelId())
-const ownsSingleInstanceLock = app.requestSingleInstanceLock()
+const isolatedElectronSmoke = !app.isPackaged
+  && process.env.STONE_ELECTRON_SMOKE === '1'
+  && Boolean(process.env.STONE_USER_DATA_DIR?.trim())
+// The smoke suite owns a disposable userData tree and must coexist with an
+// installed Stone+ instance. Packaged builds can never enter this bypass.
+const ownsSingleInstanceLock = isolatedElectronSmoke || app.requestSingleInstanceLock()
 if (ownsSingleInstanceLock) {
   app.on('second-instance', () => {
     focusMainWindowOnReady = true
@@ -187,13 +201,15 @@ async function bootstrap(): Promise<void> {
     ? resolve(configuredCodexHome)
     : join(resolvedClientConfigHome, '.codex')
   const grokBuildHome = process.env.GROK_HOME?.trim()
+  const deepSeekHarnessHome = process.env.DSH_HOME?.trim()
   const clientConfig = new ClientConfigService({
     homeDir: resolvedClientConfigHome,
     platform: process.platform,
-    ...((configuredCodexHome || grokBuildHome) ? {
+    ...((configuredCodexHome || grokBuildHome || deepSeekHarnessHome) ? {
       overrides: {
         ...(configuredCodexHome ? { codexDirectory: defaultCodexHome } : {}),
         ...(grokBuildHome ? { grokbuildDirectory: resolve(grokBuildHome) } : {}),
+        ...(deepSeekHarnessHome ? { deepseekHarnessDirectory: resolve(deepSeekHarnessHome) } : {}),
       },
     } : {}),
   })
@@ -506,6 +522,28 @@ async function bootstrap(): Promise<void> {
       }
       await repository.writeAppMetadata(GROK_VIDEO_BINDINGS_METADATA_KEY, JSON.stringify(bindings))
     },
+    loadDeepSeekHarnessModelBindings: () => {
+      const serialized = store.getStateRepository().readAppMetadata(DEEPSEEK_HARNESS_MODEL_BINDINGS_METADATA_KEY)
+      if (!serialized) return []
+      if (serialized.length > DEEPSEEK_HARNESS_MODEL_BINDINGS_METADATA_MAX_CHARS) {
+        throw new Error('The DeepSeek Harness model-family journal is too large.')
+      }
+      const parsed: unknown = JSON.parse(serialized)
+      if (!Array.isArray(parsed)) throw new Error('The DeepSeek Harness model-family journal is invalid.')
+      return parsed as PersistedDeepSeekHarnessModelBinding[]
+    },
+    saveDeepSeekHarnessModelBindings: async (bindings) => {
+      const repository = store.getStateRepository()
+      if (bindings.length === 0) {
+        await repository.removeAppMetadata(DEEPSEEK_HARNESS_MODEL_BINDINGS_METADATA_KEY)
+        return
+      }
+      const serialized = JSON.stringify(bindings)
+      if (serialized.length > DEEPSEEK_HARNESS_MODEL_BINDINGS_METADATA_MAX_CHARS) {
+        throw new Error('The DeepSeek Harness model-family journal is too large.')
+      }
+      await repository.writeAppMetadata(DEEPSEEK_HARNESS_MODEL_BINDINGS_METADATA_KEY, serialized)
+    },
     outboundFetchResolver: (account, pool, proxies) => {
       const proxy = resolveEffectiveProxy(account, pool, proxies)
       if (!proxy) return outboundTransport.fetchFor(undefined)
@@ -537,6 +575,20 @@ async function bootstrap(): Promise<void> {
   claudeDesktopCoordinator = new ClaudeDesktopOperationCoordinator(claudeDesktopConfig)
   clientInstanceManager = new ClientInstanceManager({
     store: store.getStateRepository(),
+    prepareLaunchPlan: async (plan, instance) => {
+      if (instance.client !== 'deepseek-harness') return plan
+      const snapshot = store.getSnapshot()
+      const host = snapshot.gateway.host.includes(':') ? `[${snapshot.gateway.host}]` : snapshot.gateway.host
+      const companion = new DeepSeekHarnessCompanionInstaller(instance.configDirectory)
+      const installed = await companion.ensureInstalled({
+        gatewayBaseUrl: `http://${host}:${snapshot.gateway.port}`,
+        credentialFile: resolve(instance.configDirectory, '.env'),
+      })
+      return {
+        ...plan,
+        args: withDeepSeekHarnessCompanionPatch(plan.args, installed.patchPath),
+      }
+    },
     validateLaunchPlan: async () => {
       const expected = store.getSnapshot().gateway
       if (!gateway.getStatus().running) await gateway.start(expected)
@@ -566,6 +618,15 @@ async function bootstrap(): Promise<void> {
       if (instance.client === 'codex') return { env: { OPENAI_BASE_URL: `${base}/v1`, OPENAI_API_KEY: route.localToken } }
       if (instance.client === 'claude') return { env: { ANTHROPIC_BASE_URL: base, ANTHROPIC_AUTH_TOKEN: route.localToken } }
       if (instance.client === 'gemini') return { env: { GOOGLE_GEMINI_BASE_URL: base, GEMINI_API_KEY: route.localToken } }
+      if (instance.client === 'deepseek-harness') {
+        return {
+          env: {
+            DEEPSEEK_BASE_URL: `${base}/deepseek-harness/v1`,
+            DEEPSEEK_SEARCH_BASE_URL: `${base}/deepseek-harness/anthropic/v1`,
+            DEEPSEEK_API_KEY: route.localToken,
+          },
+        }
+      }
       // Grok Build primarily reads config.toml, but env fallbacks keep a managed
       // launch usable when the selected profile was not rewritten yet.
       return {
@@ -719,12 +780,19 @@ async function bootstrap(): Promise<void> {
   disposeClientInstanceApi = registerClientInstanceApi(clientInstanceManager, store)
   disposeAgentLifecycleApi = registerAgentLifecycleApi(agentLifecycle)
   disposeClaudeDesktopApi = registerClaudeDesktopApi(claudeDesktopCoordinator)
-  registerCodexSessionManagerApi(codexSessionManager)
+  registerCodexSessionManagerApi(codexSessionManager, new DeepSeekHarnessSessionImportService({
+    sessionManager: codexSessionManager,
+    isHarnessRunning: async () => {
+      const state = (await agentLifecycle.getSnapshot()).agents['deepseek-harness']
+      return state.running || state.busyAction !== undefined
+    },
+    harnessHome: clientConfig.paths.deepseekHarness.directory,
+  }))
   registerPersistentTaskApi(store.getPersistentTaskRunner())
   registerUpdateApi(updateService)
   registerTunnelApi(tunnelService)
   requestMonitorWindow = new RequestMonitorWindowController({
-    preloadPath: join(__dirname, '../preload/index.cjs'),
+    preloadPath: join(MAIN_BUNDLE_DIRECTORY, '../preload/index.cjs'),
     rendererTarget: rendererTargetUrl(),
     iconPath: stoneIconPath(),
     windowsAppUserModelId: windowsAppUserModelId(),
@@ -799,7 +867,7 @@ function createWindow(): void {
       }
     }),
     webPreferences: {
-      preload: join(__dirname, '../preload/index.cjs'),
+      preload: join(MAIN_BUNDLE_DIRECTORY, '../preload/index.cjs'),
       contextIsolation: true,
       sandbox: true,
       nodeIntegration: false,
@@ -867,7 +935,7 @@ function createWindow(): void {
   if (trustedDevelopmentRendererUrl()) {
     void mainWindow.loadURL(rendererTarget)
   } else {
-    void mainWindow.loadFile(join(__dirname, '../renderer/index.html'))
+    void mainWindow.loadFile(join(MAIN_BUNDLE_DIRECTORY, '../renderer/index.html'))
   }
 }
 
@@ -886,7 +954,7 @@ function trustedDevelopmentRendererUrl(): string | undefined {
 
 function rendererTargetUrl(): string {
   return trustedDevelopmentRendererUrl()
-    ?? pathToFileURL(join(__dirname, '../renderer/index.html')).toString()
+    ?? pathToFileURL(join(MAIN_BUNDLE_DIRECTORY, '../renderer/index.html')).toString()
 }
 
 function createTray(): void {
@@ -968,7 +1036,9 @@ function updateTrayMenu(): void {
           ? 'Claude Code'
           : route.client === 'codex'
             ? 'Codex'
-            : route.client === 'grokbuild' ? 'Grok Build' : 'Gemini CLI'} Route`,
+            : route.client === 'grokbuild'
+              ? 'Grok Build'
+              : route.client === 'deepseek-harness' ? 'DeepSeek Harness' : 'Gemini CLI'} Route`,
         type: 'checkbox' as const,
         checked: route.enabled,
         click: () => void toggleRouteFromTray(route.id)

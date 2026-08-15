@@ -19,6 +19,8 @@ import {
 } from '../../shared/source-eligibility'
 import type { ScheduledAccount, SchedulerSelectionInput } from './types'
 
+const DEFAULT_CODEX_QUOTA_PROTECTION_STALE_MS = 2 * 60 * 60 * 1000
+
 interface StickyAssignment {
   poolId: string
   accountId: string
@@ -463,6 +465,7 @@ export class PoolScheduler {
 
   selectAndAcquire(input: SchedulerSelectionInput): ScheduledSelection {
     const { pool, accounts, model, sessionId } = input
+    const modelCooldownKey = input.modelCooldownKey ?? model
     this.assertSupportedStrategy(pool.strategy)
     const now = this.now()
     this.cleanupExpiredSticky(now)
@@ -494,7 +497,7 @@ export class PoolScheduler {
     // member and turn a compatible pool into a false 503.
     const runtimeEligible = (account: Account): boolean => (
       !excludedAccountIds?.has(account.id)
-      && this.isEligible(account, pool, adaptiveConcurrency, now, model)
+      && this.isEligible(account, pool, adaptiveConcurrency, now, modelCooldownKey)
     )
     const verifiedCandidates = sourceEligibility.verified.filter(runtimeEligible)
     const candidates = verifiedCandidates.length > 0
@@ -613,7 +616,8 @@ export class PoolScheduler {
       requireProvider: input.providers !== undefined,
     })
     const available = (account: Account): boolean => (
-      !excluded?.has(account.id) && this.isAvailable(account, input.pool, this.now(), input.model)
+      !excluded?.has(account.id)
+      && this.isAvailable(account, input.pool, this.now(), input.modelCooldownKey ?? input.model)
     )
     const verified = eligibility.verified.filter(available)
     const tier = verified.length > 0 ? verified : eligibility.unknown.filter(available)
@@ -1759,8 +1763,9 @@ export function quotaProtectionBlocks(
 
   const staleAfterMinutes = positiveFinite(policy.staleAfterMinutes)
   const unavailable = !quota || (
-    staleAfterMinutes !== undefined
-    && now - quota.observedAt > staleAfterMinutes * 60_000
+    now - quota.observedAt > (staleAfterMinutes !== undefined
+      ? staleAfterMinutes * 60_000
+      : DEFAULT_CODEX_QUOTA_PROTECTION_STALE_MS)
   )
   if (unavailable) return policy.unavailableBehavior === 'block'
 
@@ -1775,7 +1780,7 @@ export function quotaProtectionBlocks(
   }
   const sevenDayReserve = finiteReserve(policy.sevenDayRemainingPercent)
   if (sevenDayReserve !== undefined) {
-    const used = finiteUsedPercent(quota.sevenDay?.usedPercent)
+    const used = finiteUsedPercent((quota.sevenDay ?? quota.monthly)?.usedPercent)
     if (used === undefined) {
       if (policy.unavailableBehavior === 'block') return true
     } else if (100 - used <= sevenDayReserve) {
@@ -1969,6 +1974,13 @@ function quotaObservedAt(account: Account): number {
 
 function quotaPressure(account: Account, now: number): number {
   let pressure = 0
+  const codexQuota = account.codexQuota
+  if (codexQuota && now - codexQuota.observedAt <= DEFAULT_CODEX_QUOTA_PROTECTION_STALE_MS) {
+    for (const window of [codexQuota.fiveHour, codexQuota.sevenDay, codexQuota.monthly]) {
+      if (!window || (window.resetAt !== undefined && window.resetAt <= now)) continue
+      pressure = Math.max(pressure, Math.max(0, Math.min(1, window.usedPercent / 100)))
+    }
+  }
   const grokQuota = account.grokQuota
   if (grokQuota && (grokQuota.resetAt === undefined || grokQuota.resetAt > now)) {
     if (grokQuota.remainingPercent !== undefined) {

@@ -5,7 +5,7 @@ import { posix, win32 } from 'node:path'
 import type { AgentProcessControl, AgentTarget } from '@shared/agent-lifecycle'
 
 export type DiscoverableAgentTarget = AgentTarget
-type DiscoverableCliTarget = 'codex-cli' | 'claude-code' | 'gemini-cli' | 'grok-build'
+type DiscoverableCliTarget = 'codex-cli' | 'claude-code' | 'gemini-cli' | 'grok-build' | 'deepseek-harness'
 
 export type AgentExecutableSource =
   | 'command-path'
@@ -394,7 +394,8 @@ async function discoverWindowsClaudeDesktopApp(
 function cliCommandName(target: DiscoverableCliTarget): string {
   if (target === 'codex-cli') return 'codex'
   if (target === 'claude-code') return 'claude'
-  return target === 'gemini-cli' ? 'gemini' : 'grok'
+  if (target === 'gemini-cli') return 'gemini'
+  return target === 'grok-build' ? 'grok' : 'dsh'
 }
 
 function isDiscoverableCliTarget(target: DiscoverableAgentTarget): target is DiscoverableCliTarget {
@@ -402,6 +403,7 @@ function isDiscoverableCliTarget(target: DiscoverableAgentTarget): target is Dis
     || target === 'claude-code'
     || target === 'gemini-cli'
     || target === 'grok-build'
+    || target === 'deepseek-harness'
 }
 
 function isOfficialClaudeCodeExtensionDirectory(name: string): boolean {

@@ -69,6 +69,42 @@ describe('CodexSessionManager', () => {
     restoredDatabase.close()
   })
 
+  it('lists lightweight import summaries without parsing rollout bodies and validates only the selected file', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'stone-session-manager-summary-'))
+    directories.push(home)
+    const sessionDirectory = join(home, 'sessions', '2026', '08', '15')
+    await mkdir(sessionDirectory, { recursive: true })
+    const id = '01981234-1234-7123-8123-123456789ad0'
+    const rollout = join(sessionDirectory, `rollout-2026-08-15T00-00-00-${id}.jsonl`)
+    await writeFile(rollout, [
+      { type: 'session_meta', payload: { id, cwd: 'D:\\slow-project', model_provider: 'stone' } },
+      { type: 'event_msg', payload: { type: 'user_message', message: 'Body title must not be parsed' } },
+      { type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 99, output_tokens: 1, total_tokens: 100 } } } },
+    ].map((record) => JSON.stringify(record)).join('\n'))
+    await writeFile(join(home, 'session_index.jsonl'), `${JSON.stringify({ id, thread_name: 'Indexed summary title' })}\n`)
+    const manager = new CodexSessionManager({ codexHome: home, blockingCodexPids: async () => [] })
+
+    const [summary] = await manager.list({ detail: 'summary', limit: 1_000 })
+
+    expect(summary).toMatchObject({
+      id,
+      title: 'Indexed summary title',
+      summaryOnly: true,
+      inputTokens: 0,
+      outputTokens: 0,
+      totalTokens: 0,
+    })
+    expect(summary.cwd).toBeUndefined()
+    await expect(manager.resolveForImport(id, summary.revision)).resolves.toMatchObject({
+      session: { id, summaryOnly: true },
+      path: rollout,
+    })
+
+    await writeFile(rollout, `${await readFile(rollout, 'utf8')}\nchanged-after-listing`)
+    await expect(manager.resolveForImport(id, summary.revision))
+      .rejects.toThrow('changed after it was listed')
+  })
+
   it('updates a config-selected sqlite_home when trashing and restoring a session', async () => {
     const home = await mkdtemp(join(tmpdir(), 'stone-session-manager-relocated-'))
     directories.push(home)

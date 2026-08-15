@@ -12,7 +12,7 @@ describe('request monitor renderer', () => {
     expect(main).toContain('<RequestMonitorWindow />')
     expect(main).toContain('isElectron && !isRequestMonitor')
     expect(source).toContain("t('活跃', 'Active')")
-    expect(source).toContain("t('首字', 'First')")
+    expect(source).toContain("t('首包', 'First Byte')")
     expect(source).toContain("t('耗时', 'Time')")
     expect(source).toContain('<span>Token</span>')
     expect(source).toContain('snapshot.observability.tokenCosts.allTime.totalTokens')

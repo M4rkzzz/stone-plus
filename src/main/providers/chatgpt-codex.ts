@@ -1,5 +1,5 @@
 import type { Account, AccountCodexQuotaSnapshot } from '@shared/types'
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import type { ProviderFailure } from './types'
 import { parseRetryAfter } from './failure'
 import { extractCodexQuotaFromUsagePayload } from './quota'
@@ -26,6 +26,7 @@ export const CODEX_CLIENT_VERSION = BUNDLED_CODEX_CLIENT_VERSION
 export const CHATGPT_CODEX_MODELS_URL = getChatGptCodexModelsUrl()
 export const CHATGPT_CODEX_USAGE_URL = 'https://chatgpt.com/backend-api/wham/usage'
 export const CHATGPT_CODEX_RESET_CREDITS_URL = 'https://chatgpt.com/backend-api/wham/rate-limit-reset-credits'
+export const CHATGPT_CODEX_RESET_CREDITS_CONSUME_URL = `${CHATGPT_CODEX_RESET_CREDITS_URL}/consume`
 export const CODEX_OAUTH_CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann'
 const CODEX_PASSTHROUGH_HEADERS = Object.freeze([
   'accept-language',
@@ -57,6 +58,11 @@ export interface ChatGptCodexAuthorization {
   authorization: string
   accountId: string
   fedramp?: boolean
+}
+
+export interface ChatGptCodexResetCreditResult {
+  windowsReset?: number
+  redeemedAt?: number
 }
 
 export interface ChatGptCredentialRefreshOptions {
@@ -363,13 +369,15 @@ function abortReason(signal: AbortSignal): Error {
 export function applyChatGptCodexHeaders(
   headers: Headers,
   bundle: ChatGptCredentialBundle,
-  sourceHeaders?: ChatGptSourceHeaders
+  sourceHeaders?: ChatGptSourceHeaders,
+  installationSeed?: string,
 ): void {
   for (const name of CODEX_PASSTHROUGH_HEADERS) {
     const value = readSourceHeader(sourceHeaders, name)
     if (value) headers.set(name, value)
   }
   applyChatGptCodexIdentityHeaders(headers, bundle, sourceHeaders)
+  convergeChatGptCodexInstallationId(headers, installationSeed)
   headers.set('accept', 'text/event-stream')
   headers.set('content-type', 'application/json')
   headers.set('openai-beta', 'responses=experimental')
@@ -378,13 +386,15 @@ export function applyChatGptCodexHeaders(
 export function applyChatGptCodexSearchHeaders(
   headers: Headers,
   bundle: ChatGptCredentialBundle,
-  sourceHeaders?: ChatGptSourceHeaders
+  sourceHeaders?: ChatGptSourceHeaders,
+  installationSeed?: string,
 ): void {
   for (const name of CODEX_PASSTHROUGH_HEADERS) {
     const value = readSourceHeader(sourceHeaders, name)
     if (value) headers.set(name, value)
   }
   applyChatGptCodexIdentityHeaders(headers, bundle, sourceHeaders)
+  convergeChatGptCodexInstallationId(headers, installationSeed)
   headers.set('accept', 'application/json')
   headers.set('content-type', 'application/json')
 }
@@ -396,7 +406,8 @@ export function applyChatGptAgentIdentityHeaders(
   accountId: string,
   fedramp = false,
   sourceHeaders?: ChatGptSourceHeaders,
-  accept: 'stream' | 'json' = 'stream'
+  accept: 'stream' | 'json' = 'stream',
+  installationSeed?: string,
 ): void {
   for (const name of CODEX_PASSTHROUGH_HEADERS) {
     const value = readSourceHeader(sourceHeaders, name)
@@ -409,9 +420,31 @@ export function applyChatGptAgentIdentityHeaders(
   headers.set('originator', 'codex_cli_rs')
   headers.set('user-agent', `codex_cli_rs/${clientVersion} (Windows 11; x86_64)`)
   headers.set('version', clientVersion)
+  convergeChatGptCodexInstallationId(headers, installationSeed)
   headers.set('accept', accept === 'stream' ? 'text/event-stream' : 'application/json')
   headers.set('content-type', 'application/json')
   if (accept === 'stream') headers.set('openai-beta', 'responses=experimental')
+}
+
+function convergeChatGptCodexInstallationId(headers: Headers, seed: string | undefined): void {
+  const normalizedSeed = seed?.trim()
+  if (!normalizedSeed) return
+  const hex = createHash('sha256').update(`stone+:codex-device:v1\0${normalizedSeed}`).digest('hex')
+  const installationId = `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`
+  headers.set('x-codex-installation-id', installationId)
+  const metadataValue = headers.get('x-codex-turn-metadata')
+  if (!metadataValue) return
+  try {
+    const metadata = JSON.parse(metadataValue) as unknown
+    if (metadata && typeof metadata === 'object' && !Array.isArray(metadata)) {
+      headers.set('x-codex-turn-metadata', JSON.stringify({
+        ...(metadata as Record<string, unknown>),
+        installation_id: installationId,
+      }))
+    }
+  } catch {
+    // Preserve opaque client metadata; the canonical dedicated header is enough.
+  }
 }
 
 function applyChatGptCodexIdentityHeaders(
@@ -436,8 +469,10 @@ function readSourceHeader(source: ChatGptSourceHeaders | undefined, name: string
 }
 
 export function withChatGptCodexBody(body: Record<string, unknown>): Record<string, unknown> {
+  const input = sanitizeChatGptCodexInput(body.input)
   const upstream: Record<string, unknown> = {
     ...body,
+    ...(input === body.input ? {} : { input }),
     store: false,
     stream: true
   }
@@ -452,6 +487,120 @@ export function withChatGptCodexBody(body: Record<string, unknown>): Record<stri
       ? body.instructions
       : 'You are Codex, a coding assistant.'
   }
+}
+
+/**
+ * Prepares a Responses history for the stateless ChatGPT Codex endpoint.
+ *
+ * The OAuth/Agent Identity endpoint forces `store:false`. Reasoning items are
+ * therefore ephemeral and replaying them (even with a correctly shaped `rs_`
+ * id) asks the upstream to look up state that it has already discarded. Older
+ * relays also emitted `item_*` ids for ordinary messages and tool items; those
+ * ids fail the Responses type-prefix validator after an account is switched
+ * to ChatGPT OAuth. Normalize the legacy ids on the outbound copy only so the
+ * local Codex session remains untouched.
+ */
+export function sanitizeChatGptCodexInput(input: unknown): unknown {
+  if (!Array.isArray(input)) return input
+
+  const remappedIds = new Map<string, string>()
+  for (const rawItem of input) {
+    const item = chatGptCodexInputRecord(rawItem)
+    if (!item) continue
+    const type = chatGptCodexInputItemType(item)
+    const id = typeof item.id === 'string' ? item.id.trim() : ''
+    if (!id || type === 'reasoning') continue
+    const normalized = normalizeChatGptCodexItemId(type, id)
+    if (normalized && normalized !== id && !remappedIds.has(id)) {
+      remappedIds.set(id, normalized)
+    }
+  }
+
+  let changed = false
+  const sanitized: unknown[] = []
+  for (const rawItem of input) {
+    const item = chatGptCodexInputRecord(rawItem)
+    if (!item) {
+      sanitized.push(rawItem)
+      continue
+    }
+
+    const type = chatGptCodexInputItemType(item)
+    if (type === 'reasoning') {
+      changed = true
+      continue
+    }
+
+    // References to a prior reasoning/legacy item cannot be resolved after
+    // switching accounts because the OAuth endpoint is stateless. Keep valid
+    // tool references intact, but drop these stale pointers entirely.
+    if (type === 'item_reference') {
+      const referenceId = typeof item.id === 'string' ? item.id.trim() : ''
+      if (referenceId.startsWith('rs_') || referenceId.startsWith('item_')) {
+        changed = true
+        continue
+      }
+    }
+
+    const id = typeof item.id === 'string' ? item.id.trim() : ''
+    const normalizedId = id ? remappedIds.get(id) : undefined
+    if (normalizedId && normalizedId !== id) {
+      sanitized.push({ ...item, id: normalizedId })
+      changed = true
+      continue
+    }
+
+    // Unknown legacy item kinds should not carry the relay's `item_*` id into
+    // the strict upstream validator. Known kinds are remapped above; for an
+    // unknown kind, omitting the optional id is safer than sending a guaranteed
+    // invalid prefix. Tool pairing continues through call_id.
+    if (id.startsWith('item_') && !normalizedId) {
+      const copy = { ...item }
+      delete copy.id
+      sanitized.push(copy)
+      changed = true
+      continue
+    }
+
+    sanitized.push(rawItem)
+  }
+
+  return changed ? sanitized : input
+}
+
+const CHATGPT_CODEX_ITEM_ID_PREFIXES: Readonly<Record<string, string>> = Object.freeze({
+  message: 'msg_',
+  function_call: 'fc_',
+  function_call_output: 'fco_',
+  custom_tool_call: 'ctc_',
+  custom_tool_call_output: 'ctco_',
+  compaction: 'cmp_'
+})
+
+function chatGptCodexInputRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined
+}
+
+function chatGptCodexInputItemType(item: Record<string, unknown>): string {
+  if (typeof item.type === 'string' && item.type.trim()) return item.type.trim()
+  return typeof item.role === 'string' ? 'message' : ''
+}
+
+function normalizeChatGptCodexItemId(type: string, id: string): string | undefined {
+  const prefix = CHATGPT_CODEX_ITEM_ID_PREFIXES[type]
+  if (!prefix || id.startsWith(prefix)) return id
+
+  // Preserve the useful suffix produced by the old relay when it is already
+  // made of safe id characters. For arbitrary local ids, use a deterministic
+  // digest so retries and item references remain stable without echoing the
+  // original value into an upstream identifier.
+  const legacySuffix = id.startsWith('item_') ? id.slice('item_'.length) : ''
+  if (legacySuffix && /^[A-Za-z0-9_-]{1,96}$/.test(legacySuffix)) {
+    return `${prefix}${legacySuffix}`
+  }
+  return `${prefix}${createHash('sha256').update(`${type}\0${id}`).digest('hex').slice(0, 48)}`
 }
 
 export function isChatGptCodexResponsesLiteBody(body: Record<string, unknown>): boolean {
@@ -706,6 +855,76 @@ export async function queryChatGptCodexQuotaAuthorized(
     }
   }
   return { quota, latencyMs: Math.max(0, Date.now() - startedAt) }
+}
+
+export async function consumeChatGptCodexResetCredit(
+  bundle: ChatGptCredentialBundle,
+  fetchImplementation: typeof fetch = fetch,
+  signal?: AbortSignal,
+  requestId?: string,
+): Promise<ChatGptCodexResetCreditResult> {
+  return consumeChatGptCodexResetCreditAuthorized({
+    authorization: `Bearer ${bundle.accessToken}`,
+    accountId: bundle.accountId,
+  }, fetchImplementation, signal, requestId)
+}
+
+export async function consumeChatGptCodexResetCreditAuthorized(
+  authorization: ChatGptCodexAuthorization,
+  fetchImplementation: typeof fetch = fetch,
+  signal?: AbortSignal,
+  requestId: string = randomUUID(),
+): Promise<ChatGptCodexResetCreditResult> {
+  let response: Response
+  try {
+    response = await fetchImplementation(CHATGPT_CODEX_RESET_CREDITS_CONSUME_URL, {
+      method: 'POST',
+      headers: {
+        authorization: authorization.authorization,
+        'chatgpt-account-id': authorization.accountId,
+        ...(authorization.fedramp ? { 'x-openai-fedramp': 'true' } : {}),
+        'openai-beta': 'codex-1',
+        originator: 'Codex Desktop',
+        accept: 'application/json',
+        'content-type': 'application/json',
+        'idempotency-key': requestId,
+      },
+      body: JSON.stringify({ redeem_request_id: requestId }),
+      signal,
+    })
+  } catch (error) {
+    if (isAbortOrTimeout(error)) throw new Error('ChatGPT Codex quota reset request timed out.')
+    throw new Error('ChatGPT Codex quota reset endpoint could not be reached.')
+  }
+  if (!response.ok) {
+    await response.body?.cancel().catch(() => undefined)
+    if (response.status === 401) throw new ChatGptCodexEndpointError(401, 'ChatGPT session access token was rejected.')
+    if (response.status === 403) throw new ChatGptCodexEndpointError(403, 'ChatGPT account is not permitted to reset Codex quota.')
+    if (response.status === 409) throw new ChatGptCodexEndpointError(409, 'No usable Codex quota reset credit is available.')
+    throw new ChatGptCodexEndpointError(response.status, `ChatGPT Codex quota reset endpoint returned HTTP ${response.status}.`)
+  }
+  const text = await readLimitedResponseText(response, 128 * 1024, 'ChatGPT Codex quota reset response is too large.', signal)
+  let payload: Record<string, unknown> = {}
+  if (text.trim()) {
+    try {
+      const parsed = JSON.parse(text) as unknown
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) payload = parsed as Record<string, unknown>
+    } catch {
+      throw new Error('ChatGPT Codex quota reset endpoint returned invalid JSON.')
+    }
+  }
+  const credit = payload.credit && typeof payload.credit === 'object' && !Array.isArray(payload.credit)
+    ? payload.credit as Record<string, unknown>
+    : undefined
+  const windowsReset = typeof payload.windows_reset === 'number' && Number.isSafeInteger(payload.windows_reset)
+    ? Math.max(0, payload.windows_reset)
+    : undefined
+  const redeemedAtText = typeof credit?.redeemed_at === 'string' ? credit.redeemed_at : undefined
+  const redeemedAtParsed = redeemedAtText ? Date.parse(redeemedAtText) : Number.NaN
+  return {
+    ...(windowsReset === undefined ? {} : { windowsReset }),
+    ...(Number.isFinite(redeemedAtParsed) ? { redeemedAt: redeemedAtParsed } : {}),
+  }
 }
 
 async function readLimitedResponseText(

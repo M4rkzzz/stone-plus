@@ -12,6 +12,104 @@ const weatherSchema = {
 }
 
 describe('non-streaming tool protocol conversion', () => {
+  it('removes speculative DSH sandbox escalation without changing ordinary clients', () => {
+    const source = {
+      model: 'gpt-source',
+      messages: [{ role: 'user', content: 'Create the marker.' }],
+      tools: [{
+        type: 'function',
+        function: {
+          name: 'pwsh',
+          description: 'Run PowerShell.',
+          parameters: {
+            type: 'object',
+            properties: {
+              command: { type: 'string' },
+              sandbox_permissions: { type: 'string' },
+              justification: { type: 'string' },
+            },
+            required: ['command', 'sandbox_permissions', 'justification'],
+            additionalProperties: false,
+          },
+        },
+      }],
+    }
+
+    const ordinary = convertRequest('openai-chat', 'openai-responses', source, 'gpt-target')
+    expect(ordinary.body.tools).toMatchObject([{
+      parameters: { properties: { sandbox_permissions: {}, justification: {} } },
+    }])
+
+    const converted = convertRequest('openai-chat', 'openai-responses', source, 'gpt-target', {
+      sanitizeDeepSeekHarnessToolArguments: true,
+    })
+    const tool = (converted.body.tools as Array<Record<string, unknown>>)[0]
+    const parameters = tool.parameters as Record<string, unknown>
+    expect(parameters).toMatchObject({
+      properties: { command: { type: 'string' } },
+      required: ['command'],
+      additionalProperties: false,
+    })
+    expect(parameters.properties).not.toHaveProperty('sandbox_permissions')
+    expect(parameters.properties).not.toHaveProperty('justification')
+    expect(tool.description).toContain('invoke this tool without sandbox_permissions')
+
+    const response = {
+      id: 'resp_dsh_tool',
+      status: 'completed',
+      output: [{
+        type: 'function_call',
+        call_id: 'call_pwsh',
+        name: 'pwsh',
+        arguments: JSON.stringify({
+          command: "Set-Content -Path marker.txt -Value ok",
+          sandbox_permissions: 'workspace-write',
+          justification: 'Need to write the marker.',
+        }),
+      }],
+    }
+    const ordinaryResponse = convertResponse('openai-responses', 'openai-chat', response, 'gpt-target')
+    expect(ordinaryResponse).toMatchObject({
+      choices: [{ message: { tool_calls: [{ function: {
+        arguments: expect.stringContaining('sandbox_permissions'),
+      } }] } }],
+    })
+    const dshResponse = convertResponse('openai-responses', 'openai-chat', response, 'gpt-target', Date.now, {
+      sanitizeDeepSeekHarnessToolArguments: true,
+    })
+    expect(dshResponse).toMatchObject({
+      choices: [{ message: { tool_calls: [{ function: {
+        arguments: JSON.stringify({ command: "Set-Content -Path marker.txt -Value ok" }),
+      } }] } }],
+    })
+  })
+
+  it('sanitizes same-protocol Chat tool responses for DSH only', () => {
+    const source = {
+      choices: [{
+        message: {
+          role: 'assistant',
+          content: null,
+          tool_calls: [{
+            id: 'call_1',
+            type: 'function',
+            function: {
+              name: 'write_file',
+              arguments: '{"path":"marker.txt","sandbox_permissions":"workspace-write","justification":"write"}',
+            },
+          }],
+        },
+      }],
+    }
+    expect(convertResponse('openai-chat', 'openai-chat', source, 'gpt').choices)
+      .toBe(source.choices)
+    expect(convertResponse('openai-chat', 'openai-chat', source, 'gpt', Date.now, {
+      sanitizeDeepSeekHarnessToolArguments: true,
+    })).toMatchObject({ choices: [{ message: { tool_calls: [{ function: {
+      arguments: '{"path":"marker.txt"}',
+    } }] } }] })
+  })
+
   it('normalizes every tool schema root to an object without dropping unions or constraints', () => {
     const union = {
       type: null,

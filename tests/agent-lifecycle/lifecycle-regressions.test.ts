@@ -25,6 +25,7 @@ const targets: AgentTarget[] = [
   'claude-code-vsc',
   'gemini-cli',
   'grok-build',
+  'deepseek-harness',
 ]
 
 describe('Agent lifecycle regressions', () => {
@@ -173,7 +174,7 @@ describe('Agent lifecycle regressions', () => {
 
     const [firstResult, secondResult] = await Promise.all([first, second])
     expect(firstResult.operationId).toBe(secondResult.operationId)
-    expect(firstResult.results).toHaveLength(7)
+    expect(firstResult.results).toHaveLength(8)
     expect(restore).toHaveBeenCalledTimes(3)
   })
 

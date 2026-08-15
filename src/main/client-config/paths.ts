@@ -36,6 +36,9 @@ export function resolveClientConfigPaths(options: ClientConfigPathOptions): Reso
   const codexDirectory = pathApi.normalize(options.overrides?.codexDirectory ?? pathApi.join(home, '.codex'))
   const geminiDirectory = pathApi.normalize(options.overrides?.geminiDirectory ?? pathApi.join(home, '.gemini'))
   const grokbuildDirectory = pathApi.normalize(options.overrides?.grokbuildDirectory ?? pathApi.join(home, '.grok'))
+  const deepseekHarnessDirectory = pathApi.normalize(
+    options.overrides?.deepseekHarnessDirectory ?? pathApi.join(home, '.dsh'),
+  )
 
   return {
     claude: {
@@ -63,6 +66,16 @@ export function resolveClientConfigPaths(options: ClientConfigPathOptions): Reso
       directory: grokbuildDirectory,
       config: file('grokbuild', 'grok-config', 'toml', pathApi.join(grokbuildDirectory, 'config.toml'), true),
     },
+    deepseekHarness: {
+      directory: deepseekHarnessDirectory,
+      env: file(
+        'deepseek-harness',
+        'deepseek-harness-env',
+        'dotenv',
+        pathApi.join(deepseekHarnessDirectory, '.env'),
+        true,
+      ),
+    },
   }
 }
 
@@ -76,7 +89,8 @@ export function clientFiles(paths: ResolvedClientConfigPaths, client: SupportedC
     paths.codex.rules,
   ]
   if (client === 'gemini') return [paths.gemini.settings, paths.gemini.env]
-  return [paths.grokbuild.config]
+  if (client === 'grokbuild') return [paths.grokbuild.config]
+  return [paths.deepseekHarness.env]
 }
 
 export function allClientFiles(paths: ResolvedClientConfigPaths): ClientConfigFilePath[] {
@@ -85,9 +99,12 @@ export function allClientFiles(paths: ResolvedClientConfigPaths): ClientConfigFi
     ...clientFiles(paths, 'codex'),
     ...clientFiles(paths, 'gemini'),
     ...clientFiles(paths, 'grokbuild'),
+    ...clientFiles(paths, 'deepseek-harness'),
   ]
 }
 
 export function clientDirectory(paths: ResolvedClientConfigPaths, client: SupportedClient): string {
-  return paths[client].directory
+  return client === 'deepseek-harness'
+    ? paths.deepseekHarness.directory
+    : paths[client].directory
 }

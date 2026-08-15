@@ -135,6 +135,7 @@ const clientLabels: Record<RouteClient, string> = {
   claude: 'Claude Code',
   gemini: 'Gemini CLI',
   grokbuild: 'Grok Build',
+  'deepseek-harness': 'DeepSeek Harness',
 }
 
 const emptyApiSource = (sourceType: 'official-api' | 'relay'): ApiSourceInput => {
@@ -223,7 +224,9 @@ export function SetupWizardView({
   const availableAccounts = useMemo(() => snapshot.accounts.filter(isAvailableRouteAccount), [snapshot.accounts])
   const setupEligibleAccounts = useMemo(() => availableAccounts.filter((account) => {
     const provider = providerById.get(account.providerId)
-    if (provider && providerSourceFamily(provider.kind) === 'deepseek') return client === 'codex'
+    if (provider && providerSourceFamily(provider.kind) === 'deepseek') {
+      return client === 'codex' || client === 'deepseek-harness'
+    }
     if (!provider || provider.kind !== KIRO_COMPATIBLE_KIND && provider.protocol !== 'kiro-claude') return true
     return isKiroClaudeRouteSource(resolveRouteSource(provider.id, snapshot), snapshot)
   }), [availableAccounts, client, providerById, snapshot])
@@ -240,6 +243,7 @@ export function SetupWizardView({
       && providerSourceFamily(selectedProvider.kind) === 'grok'
   const selectedRouteSource = resolveRouteSource(aggregatePoolId || selectedProvider?.id || '', snapshot)
   const selectedSourceIsKiroClaude = routeSourceUsesKiroClaude(selectedRouteSource, snapshot)
+  const selectedSourceIsDeepSeek = routeSourceUsesDeepSeek(selectedRouteSource, snapshot)
   const compatiblePools = snapshot.pools.filter((pool) => pool.kind === 'standard'
     && pool.protocol === 'openai-responses'
     && pool.members.every((member) => {
@@ -252,7 +256,8 @@ export function SetupWizardView({
       && setupEligibleAccounts.some((account) => account.id === member.accountId))
     && (!routeSourceUsesKiroClaude(resolveRouteSource(pool.id, snapshot), snapshot)
       || isKiroClaudeRouteSource(resolveRouteSource(pool.id, snapshot), snapshot))
-    && (client === 'codex' || !routeSourceUsesDeepSeek(resolveRouteSource(pool.id, snapshot), snapshot))), [client, setupEligibleAccounts, snapshot])
+    && (client === 'codex' || client === 'deepseek-harness'
+      || !routeSourceUsesDeepSeek(resolveRouteSource(pool.id, snapshot), snapshot))), [client, setupEligibleAccounts, snapshot])
   const selectedAggregate = useMemo(
     () => aggregatePools.find((pool) => pool.id === aggregatePoolId),
     [aggregatePoolId, aggregatePools],
@@ -272,6 +277,19 @@ export function SetupWizardView({
   const currentIndex = Math.max(0, wizardStepOrder.indexOf(currentStep))
   const currentPhaseId = setupWizardPhaseForStep(currentStep)
   const currentPhaseIndex = Math.max(0, phases.findIndex((phase) => phase.id === currentPhaseId))
+  const currentPhase = phases[currentPhaseIndex]
+  const completedPhaseCount = currentStep === 'complete' ? phases.length : currentPhaseIndex
+  const sourceContext = selectedAccountId || aggregatePoolId
+    ? selectedSourceName
+    : sourceMode === 'oauth-import'
+      ? t('Codex 账号', 'Codex account')
+      : sourceMode === 'official-api'
+        ? t('官方 API', 'Official API')
+        : sourceMode === 'relay'
+          ? t('API 中转站', 'API relay')
+          : sourceMode === 'aggregate'
+            ? t('聚合中转', 'Aggregate relay')
+            : t('待选择', 'Not selected')
   const previousStepIndexRef = useRef(currentIndex)
   const stepMotionDirection = currentIndex < previousStepIndexRef.current ? 'backward' : 'forward'
   const oauthActive = oauthStage === 'starting' || oauthStage === 'waiting' || oauthStage === 'submitting' || oauthStage === 'exchanging' || oauthStage === 'cancelling'
@@ -1118,19 +1136,34 @@ export function SetupWizardView({
   return (
     <div className="setup-wizard page-stack">
       <header className="setup-wizard__header">
-        <div><span className="eyebrow">STONE+ QUICK START</span><h1>{t('配置向导', 'Setup wizard')}</h1><p>{t('五个阶段完成来源接入、客户端连接和真实请求验证。', 'Connect a source and client, then verify a real request in five stages.')}</p></div>
+        <div><span className="eyebrow">STONE+ QUICK START</span><h1>{t('配置向导', 'Setup wizard')}</h1><p>{t('跟着页面完成选择，其余连接与验证由 Stone+ 自动处理。', 'Make the choices shown on each page. Stone+ handles the connection and verification automatically.')}</p></div>
         <div className="setup-wizard__exit"><small>{t('非敏感表单会自动保存；Key 和导入内容不会落盘。', 'Non-sensitive fields are saved automatically. Keys and import payloads are never cached.')}</small><button className="button button--secondary" type="button" disabled={oauthCommitLocked || Boolean(busy)} onClick={() => void exitWizard()}>{oauthCommitLocked ? t('正在保存账号…', 'Saving account…') : t('暂时退出', 'Exit for now')}</button></div>
       </header>
+
+      <section className="setup-wizard__overview" aria-label={t('当前配置进度', 'Current setup progress')}>
+        <div className="setup-wizard__overview-main">
+          <span className="setup-wizard__overview-index">{currentStep === 'complete' ? <CheckCircle2 size={20} /> : currentPhaseIndex + 1}</span>
+          <div><small>{t(`已完成 ${completedPhaseCount} / ${phases.length} 个阶段`, `${completedPhaseCount} of ${phases.length} stages complete`)}</small><strong>{currentPhase?.label}</strong><p>{currentPhase?.description}</p></div>
+        </div>
+        <div className="setup-wizard__overview-context">
+          <span><small>{t('来源', 'Source')}</small><strong>{sourceContext}</strong></span>
+          <ArrowRight size={15} />
+          <span><small>{t('客户端', 'Client')}</small><strong>{currentPhaseIndex < 2 ? t('待选择', 'Not selected') : clientLabels[client]}</strong></span>
+          <ArrowRight size={15} />
+          <span><small>{t('连接', 'Connection')}</small><strong>{verification?.ok ? t('已验证', 'Verified') : routing ? t('验证中', 'Checking') : t('待建立', 'Not connected')}</strong></span>
+        </div>
+        <div className="setup-wizard__overview-track" aria-hidden="true"><i style={{ width: `${Math.max(4, ((currentStep === 'complete' ? phases.length : currentPhaseIndex + 0.35) / phases.length) * 100)}%` }} /></div>
+      </section>
 
       <div className="setup-wizard__layout">
         <aside className="setup-wizard__steps" aria-label={t('配置步骤', 'Setup steps')}>
           {phases.map((item, index) => <div className={`${index === currentPhaseIndex ? 'active' : ''} ${index < currentPhaseIndex ? 'done' : ''}`} key={item.id}>
-            <span>{index < currentPhaseIndex ? <CheckCircle2 size={15} /> : index + 1}</span><strong>{item.label}</strong>
+            <span>{index < currentPhaseIndex ? <CheckCircle2 size={15} /> : index + 1}</span><div><strong>{item.label}</strong><small>{item.description}</small></div>
           </div>)}
         </aside>
 
         <main className="setup-wizard__content">
-          <div className="setup-wizard__phase-context" data-phase-index={currentPhaseIndex} key={`${currentPhaseId}-${currentStep}`} aria-live="polite"><span>{t(`阶段 ${currentPhaseIndex + 1} / ${phases.length}`, `Stage ${currentPhaseIndex + 1} / ${phases.length}`)}</span><strong>{setupWizardStepLabel(currentStep, t)}</strong></div>
+          <div className="setup-wizard__phase-context" data-phase-index={currentPhaseIndex} key={`${currentPhaseId}-${currentStep}`} aria-live="polite"><span>{t(`现在需要你完成`, `Your action now`)}</span><strong>{setupWizardStepLabel(currentStep, t)}</strong><small>{currentPhase?.description}</small></div>
           <div className={`setup-wizard__stage setup-wizard__stage--${stepMotionDirection}`} key={currentStep}>
           {error && <div className="setup-message setup-message--error"><CircleAlert size={17} /><span>{error}</span></div>}
           {notice && <div className="setup-message setup-message--success"><CheckCircle2 size={17} /><span>{notice}</span></div>}
@@ -1245,18 +1278,21 @@ export function SetupWizardView({
           </WizardSection>}
 
           {currentStep === 'client' && <WizardSection icon={<Settings2 />} title={t('选择主客户端', 'Choose your primary client')} description={t('向导一次配置一个客户端，完成后可以继续配置其他客户端。', 'The wizard configures one client at a time. You can add more after this setup.')}>
-            <div className="setup-choice-grid setup-choice-grid--clients">{(['codex', 'claude', 'gemini', 'grokbuild'] as RouteClient[]).map((item) => {
+            <div className="setup-choice-grid setup-choice-grid--clients">{(['codex', 'claude', 'gemini', 'grokbuild', 'deepseek-harness'] as RouteClient[]).map((item) => {
               const brand = clientBrandMeta[item]
-              return <Choice key={item} icon={<img className={brand.iconClassName} src={brand.icon} alt="" />} title={clientLabels[item]} description={item === 'codex' ? t('推荐用于 OAuth / Responses 来源', 'Recommended for OAuth / Responses sources') : item === 'grokbuild' ? t('仅连接原生 Responses 的 Grok 号池或中转站', 'Connects only to Responses-native Grok pools or relays') : t(`通过 Stone+ 协议转换接入 ${clientLabels[item]}`, `Connect ${clientLabels[item]} through Stone+ protocol conversion`)} selected={client === item} onClick={() => setClient(item)} disabled={Boolean(busy) || (item === 'grokbuild' && !selectedSourceIsGrok) || (selectedSourceIsKiroClaude && item !== 'claude')} />
+              const deepSeekClientUnsupported = selectedSourceIsDeepSeek && item !== 'codex' && item !== 'deepseek-harness'
+              return <Choice key={item} icon={<img className={brand.iconClassName} src={brand.icon} alt="" />} title={clientLabels[item]} description={item === 'codex' ? t('推荐用于 OAuth / Responses 来源', 'Recommended for OAuth / Responses sources') : item === 'grokbuild' ? t('仅连接原生 Responses 的 Grok 号池或中转站', 'Connects only to Responses-native Grok pools or relays') : t(`通过 Stone+ 协议转换接入 ${clientLabels[item]}`, `Connect ${clientLabels[item]} through Stone+ protocol conversion`)} selected={client === item} onClick={() => setClient(item)} disabled={Boolean(busy) || (item === 'grokbuild' && !selectedSourceIsGrok) || (selectedSourceIsKiroClaude && item !== 'claude') || deepSeekClientUnsupported} />
             })}</div>
             {!selectedSourceIsGrok && <small>{t('当前来源不是 Grok 原生 Responses 来源，因此不能选择 Grok Build。', 'The current source is not a Responses-native Grok source, so Grok Build is unavailable.')}</small>}
             {selectedSourceIsKiroClaude && <small>{t('Kiro Claude 使用 Anthropic Messages 入站并直转 AWS Event Stream，仅支持 Claude Code CLI、Desktop 与 VSC。', 'Kiro Claude accepts Anthropic Messages and translates directly to AWS Event Stream. It is available only to Claude Code CLI, Desktop, and VSC.')}</small>}
-            <PrimaryAction busy={false} disabled={Boolean(busy) || (client === 'grokbuild' && !selectedSourceIsGrok) || (selectedSourceIsKiroClaude && client !== 'claude')} onClick={() => void move('routing', { client, model })} label={t('下一步：确认连接', 'Next: confirm connection')} />
+            {selectedSourceIsDeepSeek && <small>{t('DeepSeek 来源仅支持 Codex 或 DeepSeek Harness。', 'DeepSeek sources are available only to Codex or DeepSeek Harness.')}</small>}
+            <PrimaryAction busy={false} disabled={Boolean(busy) || (client === 'grokbuild' && !selectedSourceIsGrok) || (selectedSourceIsKiroClaude && client !== 'claude') || (selectedSourceIsDeepSeek && client !== 'codex' && client !== 'deepseek-harness')} onClick={() => void move('routing', { client, model })} label={t('下一步：确认连接', 'Next: confirm connection')} />
           </WizardSection>}
 
           {currentStep === 'routing' && <WizardSection icon={<Waypoints />} title={t('建立连接并自动验证', 'Connect and verify automatically')} description={t('确认后 Stone+ 会连续完成号池与路由、网关启动和端到端真实请求。', 'Stone+ will create the pool and route, start the gateway, and run a real end-to-end request in one sequence.')}>
             <SummaryRows rows={[[t('来源', 'Source'), selectedSourceName], [t('客户端', 'Client'), clientLabels[client]], [t('模型', 'Model'), model || t('未选择', 'Not selected')], [t('目标号池', 'Target pool'), snapshot.pools.find((pool) => pool.id === (aggregatePoolId || poolId))?.name ?? t('自动创建或复用', 'Create or reuse automatically')]]} />
-            <div className="setup-auto-flow"><span><CheckCircle2 size={16} />{t('原子创建或复用号池与客户端路由', 'Atomically create or reuse the pool and client route')}</span><span><CheckCircle2 size={16} />{t('启动本地网关；端口冲突时自动选择可用端口', 'Start the local gateway and select an available port if needed')}</span><span><CheckCircle2 size={16} />{t('通过本地鉴权、调度和协议转换发送真实请求', 'Send a real request through local authentication, scheduling, and protocol conversion')}</span></div>
+            <div className="setup-route-visual" aria-label={t('连接路径预览', 'Connection path preview')}><span><strong>{clientLabels[client]}</strong><small>{t('你的客户端', 'Your client')}</small></span><ArrowRight /><span><strong>Stone+</strong><small>{t('自动路由', 'Automatic routing')}</small></span><ArrowRight /><span><strong>{selectedSourceName}</strong><small>{model || t('自动选择模型', 'Automatic model')}</small></span></div>
+            <div className="setup-auto-flow"><span><CheckCircle2 size={16} />{t('自动创建或复用号池与客户端路由', 'Automatically create or reuse the pool and client route')}</span><span><CheckCircle2 size={16} />{t('自动启动网关并处理端口冲突', 'Automatically start the gateway and handle port conflicts')}</span><span><CheckCircle2 size={16} />{t('自动发送真实请求，确认整条链路可用', 'Automatically send a real request to confirm the complete route works')}</span></div>
             <PrimaryAction busy={busy === 'connect'} disabled={Boolean(busy)} onClick={() => void createRouting()} label={t('一键连接并验证', 'Connect and verify')} />
           </WizardSection>}
 
@@ -1373,7 +1409,7 @@ function ApiSourceForm({ draft, proxies, proxyId, proxyInterlocked, official, on
           ? effectiveResponsesCompactMode(draft.responsesCompactMode)
           : undefined,
       })
-    }}>{protocols.map((protocol) => <option value={protocol} key={protocol}>{protocolOptionLabel(draft.kind, protocol, protocolLabels, t)}</option>)}</select>{draft.kind === XAI_COMPATIBLE_KIND && <small>{t('默认使用官方当前主路径 Responses；仅当中转明确只兼容 Chat Completions 时选择高级兼容模式。', 'Responses is the current primary API path. Choose advanced Chat compatibility only when the relay explicitly requires Chat Completions.')}</small>}{draft.kind === KIRO_COMPATIBLE_KIND && <small>{t('协议固定为 Kiro Claude；保存前必须通过两轮结构化工具测试。', 'The protocol is fixed to Kiro Claude. A two-round structured tool test is required before binding.')}</small>}{(draft.kind === DEEPSEEK_KIND || draft.kind === DEEPSEEK_COMPATIBLE_KIND) && <small>{t('原生 DeepSeek Responses 直通，仅可绑定 Codex，不经过 Chat 转换。', 'Native DeepSeek Responses passthrough; Codex-only and no Chat conversion.')}</small>}</label>
+    }}>{protocols.map((protocol) => <option value={protocol} key={protocol}>{protocolOptionLabel(draft.kind, protocol, protocolLabels, t)}</option>)}</select>{draft.kind === XAI_COMPATIBLE_KIND && <small>{t('默认使用官方当前主路径 Responses；仅当中转明确只兼容 Chat Completions 时选择高级兼容模式。', 'Responses is the current primary API path. Choose advanced Chat compatibility only when the relay explicitly requires Chat Completions.')}</small>}{draft.kind === KIRO_COMPATIBLE_KIND && <small>{t('协议固定为 Kiro Claude；保存前必须通过两轮结构化工具测试。', 'The protocol is fixed to Kiro Claude. A two-round structured tool test is required before binding.')}</small>}{(draft.kind === DEEPSEEK_KIND || draft.kind === DEEPSEEK_COMPATIBLE_KIND) && <small>{t('DeepSeek Responses 可原生绑定 Codex，也可由 Stone+ 转换给 DeepSeek Harness。', 'DeepSeek Responses can bind natively to Codex or be translated by Stone+ for DeepSeek Harness.')}</small>}</label>
     {relayCanConfigureResponsesCompact(draft.sourceType, draft.protocol, draft.kind) && <label className="full"><span className="field-label-with-help">{t('Responses Compact 能力', 'Responses compact capability')}<InfoTip text={t(compactCopy.helpZh, compactCopy.helpEn)} /></span><select value={compactMode} onChange={(event) => onChange({ ...draft, responsesCompactMode: event.target.value as ResponsesCompactMode })}>{responsesCompactModes.map((mode) => <option value={mode} key={mode}>{t(responsesCompactModeCopy[mode].labelZh, responsesCompactModeCopy[mode].labelEn)}</option>)}</select></label>}
     {officialOpenAiUsesNativeCompact(draft.sourceType, draft.kind, draft.protocol) && <label className="full"><span className="field-label-with-help"><ShieldCheck size={13} />{t('Responses Compact 能力', 'Responses compact capability')}<InfoTip text={t('官方 OpenAI 按 Responses 协议自动使用完整原生 Compact，无需手动配置。', 'Official OpenAI automatically uses full native compact through the Responses protocol. No manual setting is needed.')} /></span><input disabled value={t('自动：完整原生 Compact', 'Automatic: full native compact')} /></label>}
     <label><span>{t('测试/默认模型', 'Test/default model')}</span><input value={draft.defaultModel ?? ''} onChange={(event) => onChange({ ...draft, defaultModel: event.target.value })} placeholder={draft.kind === KIRO_COMPATIBLE_KIND ? t('手动填写 Kiro 模型', 'Enter the Kiro model manually') : draft.kind === DEEPSEEK_KIND || draft.kind === DEEPSEEK_COMPATIBLE_KIND ? 'deepseek-v4-flash' : t('例如 gpt-5.4', 'For example, gpt-5.4')} />{draft.kind === KIRO_COMPATIBLE_KIND && <small>{t('Kiro Claude 不进行模型发现。', 'Kiro Claude does not use model discovery.')}</small>}</label>

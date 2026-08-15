@@ -90,6 +90,9 @@ export class CodexSessionManager {
   private readonly blockingCodexPids: () => Promise<number[]>
   private readonly catalog = new Map<string, CachedSession>()
   private catalogRefresh?: Promise<void>
+  private readonly summaryCatalog = new Map<string, CachedSession>()
+  private summaryCatalogRefresh?: Promise<void>
+  private summaryCatalogInitialized = false
   private trashRecoveryChecked = false
   private titleIndexCache?: { mtimeMs: number; size: number; values: Map<string, string> }
   private managedDatabasePaths = new Set<string>()
@@ -101,8 +104,11 @@ export class CodexSessionManager {
   }
 
   public async list(query: CodexSessionQuery = {}): Promise<CodexManagedSession[]> {
-    await this.refreshCatalog()
-    const sessions = [...this.catalog.values()].map((entry) => entry.session)
+    const summaryOnly = query.detail === 'summary'
+    if (summaryOnly) await this.refreshSummaryCatalog()
+    else await this.refreshCatalog()
+    const sessions = [...(summaryOnly ? this.summaryCatalog : this.catalog).values()]
+      .map((entry) => entry.session)
     const search = query.search?.trim().toLocaleLowerCase()
     return sessions
       .filter((session) => !query.kind || query.kind === 'all' || session.kind === query.kind)
@@ -110,6 +116,30 @@ export class CodexSessionManager {
         .some((value) => value?.toLocaleLowerCase().includes(search)))
       .sort((left, right) => right.updatedAt - left.updatedAt || left.id.localeCompare(right.id))
       .slice(0, boundedLimit(query.limit))
+  }
+
+  public async resolveForImport(
+    id: string,
+    expectedRevision: string,
+  ): Promise<{ session: CodexManagedSession; path: string }> {
+    validateSessionIdentity(id, expectedRevision)
+    if (!this.summaryCatalogInitialized) await this.refreshSummaryCatalog()
+    const matches = [...this.summaryCatalog.values()]
+      .map((entry) => entry.session)
+      .filter((session) => session.id === id)
+    if (matches.length === 0) throw new Error('Codex session not found.')
+    if (matches.length > 1) throw new Error('Multiple Codex session files use the same id.')
+    const session = matches[0]
+    if (session.revision !== expectedRevision) {
+      throw new Error('The Codex session changed after it was listed. Refresh and try again.')
+    }
+    const path = this.absoluteFromRelative(session.relativePath)
+    const info = await lstat(path).catch(() => undefined)
+    if (!info?.isFile() || info.isSymbolicLink()
+      || summarySessionRevision(session.id, session.relativePath, session.kind, info) !== expectedRevision) {
+      throw new Error('The Codex session changed after it was listed. Refresh and try again.')
+    }
+    return { session, path }
   }
 
   public async pathFor(id: string, expectedRevision: string): Promise<string> {
@@ -246,6 +276,8 @@ export class CodexSessionManager {
     } finally {
       await release?.()
     }
+    this.summaryCatalog.clear()
+    this.summaryCatalogInitialized = false
     await this.refreshCatalog()
     return this.list({ limit: 10_000 })
   }
@@ -257,6 +289,71 @@ export class CodexSessionManager {
     })
     this.catalogRefresh = flight
     return flight
+  }
+
+  private async refreshSummaryCatalog(): Promise<void> {
+    if (this.summaryCatalogRefresh) return this.summaryCatalogRefresh
+    const flight = this.runSummaryCatalogRefresh().finally(() => {
+      if (this.summaryCatalogRefresh === flight) this.summaryCatalogRefresh = undefined
+    })
+    this.summaryCatalogRefresh = flight
+    return flight
+  }
+
+  private async runSummaryCatalogRefresh(): Promise<void> {
+    const titleIndex = await this.readTitleIndex()
+    const paths = await this.findRollouts()
+    const present = new Set(paths.map((entry) => entry.path))
+    for (const path of this.summaryCatalog.keys()) if (!present.has(path)) this.summaryCatalog.delete(path)
+    const queue = [...paths]
+    const workers = Array.from({ length: Math.min(16, Math.max(1, queue.length)) }, async () => {
+      while (queue.length) {
+        const entry = queue.shift()
+        if (!entry) return
+        try {
+          const info = await lstat(entry.path)
+          if (!info.isFile() || info.isSymbolicLink()) {
+            this.summaryCatalog.delete(entry.path)
+            continue
+          }
+          const cached = this.summaryCatalog.get(entry.path)
+          if (cached && cached.mtimeMs === info.mtimeMs && cached.size === info.size && cached.kind === entry.kind) {
+            const indexedTitle = titleIndex.get(cached.session.id)
+            if (indexedTitle && indexedTitle !== cached.session.title) {
+              this.summaryCatalog.set(entry.path, { ...cached, session: { ...cached.session, title: indexedTitle } })
+            }
+            continue
+          }
+          const relativePath = relative(this.codexHome, entry.path)
+          const id = rolloutIdFromFilename(entry.path) ?? basename(entry.path)
+          const session: CodexManagedSession = {
+            id,
+            revision: summarySessionRevision(id, relativePath, entry.kind, info),
+            title: titleIndex.get(id) ?? id,
+            kind: entry.kind,
+            relativePath,
+            updatedAt: Number(info.mtimeMs),
+            sizeBytes: Number(info.size),
+            inputTokens: 0,
+            outputTokens: 0,
+            cachedInputTokens: 0,
+            reasoningTokens: 0,
+            totalTokens: 0,
+            summaryOnly: true,
+          }
+          this.summaryCatalog.set(entry.path, {
+            mtimeMs: Number(info.mtimeMs),
+            size: Number(info.size),
+            kind: entry.kind,
+            session,
+          })
+        } catch {
+          this.summaryCatalog.delete(entry.path)
+        }
+      }
+    })
+    await Promise.all(workers)
+    this.summaryCatalogInitialized = true
   }
 
   private async runCatalogRefresh(): Promise<void> {
@@ -325,10 +422,7 @@ export class CodexSessionManager {
   }
 
   private async requiredSession(id: string, expectedRevision: string): Promise<CodexManagedSession> {
-    if (typeof id !== 'string' || !id.trim()) throw new Error('Codex session id is invalid.')
-    if (typeof expectedRevision !== 'string' || !/^[a-f0-9]{64}$/.test(expectedRevision)) {
-      throw new Error('Codex session revision is invalid. Refresh the session list.')
-    }
+    validateSessionIdentity(id, expectedRevision)
     await this.refreshCatalog()
     const matches = [...this.catalog.values()].map((entry) => entry.session).filter((session) => session.id === id)
     if (matches.length === 0) throw new Error('Codex session not found.')
@@ -1075,6 +1169,34 @@ function sessionRevision(
   return createHash('sha256')
     .update(JSON.stringify([id, relativePath, kind, size, contentSha256]))
     .digest('hex')
+}
+
+function summarySessionRevision(
+  id: string,
+  relativePath: string,
+  kind: CodexSessionKind,
+  info: Awaited<ReturnType<typeof lstat>>,
+): string {
+  return createHash('sha256')
+    .update(JSON.stringify([
+      id,
+      relativePath,
+      kind,
+      Number(info.size),
+      Number(info.mtimeMs),
+      Number(info.ctimeMs),
+      Number(info.birthtimeMs),
+      Number(info.dev),
+      Number(info.ino),
+    ]))
+    .digest('hex')
+}
+
+function validateSessionIdentity(id: string, expectedRevision: string): void {
+  if (typeof id !== 'string' || !id.trim()) throw new Error('Codex session id is invalid.')
+  if (typeof expectedRevision !== 'string' || !/^[a-f0-9]{64}$/.test(expectedRevision)) {
+    throw new Error('Codex session revision is invalid. Refresh the session list.')
+  }
 }
 
 async function sha256File(path: string): Promise<string> {

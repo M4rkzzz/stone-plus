@@ -142,6 +142,13 @@ describe('agent lifecycle control summary', () => {
     expect(clientsSource).toContain('operationGate.current.run')
   })
 
+  it('keeps the running DeepSeek Harness card actionable as Open', () => {
+    const clientsSource = readFileSync(new URL('../../src/renderer/src/views/ClientsView.tsx', import.meta.url), 'utf8')
+    expect(clientsSource).toContain('const opensRunningInstance = Boolean(item?.running && item.capabilities.canOpenWhenRunning)')
+    expect(clientsSource).toContain('item.running && !opensRunningInstance')
+    expect(clientsSource).toContain('launchOnly || opensRunningInstance')
+  })
+
   it('shows real repair progress and exposes safe cancellation', () => {
     const appSource = readFileSync(new URL('../../src/renderer/src/App.tsx', import.meta.url), 'utf8')
     const controlSource = readFileSync(new URL('../../src/renderer/src/agent-lifecycle-control.tsx', import.meta.url), 'utf8')
@@ -329,6 +336,12 @@ describe('agent lifecycle control summary', () => {
     expect(agentOutcomeLabel({ ...repaired, wasRunning: false, runningAfter: false }, 'restore', zh)).toBe('修复完成；客户端保持停止')
     expect(agentOutcomeLabel({ ...repaired, wasRunning: false, runningAfter: true }, 'restore', zh)).toBe('修复完成并已启动')
     expect(agentOutcomeLabel({ ...repaired, wasRunning: false, runningAfter: false }, 'install', zh)).toBe('已打开官方安装指引')
+    expect(agentOutcomeLabel({
+      ...repaired,
+      target: 'deepseek-harness',
+      wasRunning: false,
+      runningAfter: true,
+    }, 'install', zh)).toBe('已安装、配置并启动')
   })
 
   it.each(['claude-code-desktop', 'claude-code-vsc'] as const)(

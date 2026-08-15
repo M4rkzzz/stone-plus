@@ -23,6 +23,7 @@ describe('setup wizard presentation', () => {
       'prepare', 'source', 'source', 'source', 'source', 'client',
       'connect', 'connect', 'connect', 'connect', 'complete',
     ])
+    expect(setupWizardPhases(zh).every((phase) => phase.description.length > 0)).toBe(true)
   })
 
   it('restores non-sensitive source fields without caching credentials or probe evidence', () => {
@@ -110,7 +111,24 @@ describe('setup wizard presentation', () => {
     expect(styles).toContain('@keyframes setup-stage-forward')
     expect(styles).toContain('@keyframes setup-stage-backward')
     expect(styles).toContain('.setup-choice:nth-child(5)')
+    expect(styles).toContain('animation: setup-stage-forward var(--motion-slow)')
+    expect(styles).toContain('.setup-choice:nth-child(6) { animation-delay: 140ms; }')
+    expect(styles).not.toContain('scale(1.08)')
+    expect(styles).not.toContain('animation-delay: 225ms')
+    expect(styles).not.toContain('animation: setup-icon-pop 320ms')
     expect(globalStyles).toContain('@media (prefers-reduced-motion: reduce)')
     expect(globalStyles).toContain('html.low-resource-mode *')
+  })
+
+  it('shows a visual overview of source, client, connection, and route direction', () => {
+    const source = readFileSync(new URL('../../src/renderer/src/views/SetupWizardView.tsx', import.meta.url), 'utf8')
+    const styles = readFileSync(new URL('../../src/renderer/src/setup-wizard.css', import.meta.url), 'utf8')
+    expect(source).toContain('setup-wizard__overview-context')
+    expect(source).toContain('setup-route-visual')
+    expect(source).toContain("t('来源', 'Source')")
+    expect(source).toContain("t('客户端', 'Client')")
+    expect(source).toContain("t('连接', 'Connection')")
+    expect(styles).toContain('.setup-wizard__overview-track')
+    expect(styles).toContain('.setup-route-visual')
   })
 })

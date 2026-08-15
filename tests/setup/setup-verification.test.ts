@@ -6,12 +6,15 @@ describe('setup route verification', () => {
     const codex = buildSetupVerificationRequest('http://127.0.0.1:15721/', 'codex', 'gpt-test', 'local-token')
     const claude = buildSetupVerificationRequest('http://127.0.0.1:15721', 'claude', 'claude-test', 'local-token')
     const gemini = buildSetupVerificationRequest('http://127.0.0.1:15721', 'gemini', 'gemini/test', 'local-token')
+    const harness = buildSetupVerificationRequest('http://127.0.0.1:15721', 'deepseek-harness', 'gpt-5.6-sol', 'local-token')
 
     expect(codex.url).toBe('http://127.0.0.1:15721/v1/responses')
     expect(JSON.parse(String(codex.init.body))).toMatchObject({ model: 'gpt-test', max_output_tokens: 16 })
     expect(claude.url).toBe('http://127.0.0.1:15721/v1/messages')
     expect(new Headers(claude.init.headers).get('x-api-key')).toBe('local-token')
     expect(gemini.url).toContain('/v1beta/models/gemini%2Ftest:generateContent')
+    expect(harness.url).toBe('http://127.0.0.1:15721/deepseek-harness/v1/chat/completions')
+    expect(new Headers(harness.init.headers).get('x-deepseek-harness-session-id')).toMatch(/^stone-setup-/)
   })
 
   it('returns a short parsed success preview', async () => {

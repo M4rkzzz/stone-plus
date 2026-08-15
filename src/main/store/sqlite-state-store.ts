@@ -17,6 +17,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { createHash, randomUUID } from 'node:crypto'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { estimateOpenAiTokenCosts, resolveModelPricing } from '@shared/openai-pricing'
+import { CODEX_QUOTA_HISTORY_RETENTION_MS } from '@shared/types'
 import type {
   CodexQuotaHistoryPoint,
   OpenAiTokenCostBreakdown,
@@ -860,7 +861,7 @@ export class SqliteStateStore<T extends SqlitePersistedShape> {
             const result = update.run(entry.payload, entry.id)
             if (result.changes !== 1) throw new Error('Account not found.')
           }
-          writeCodexQuotaSamples(database, quotaSamples, 14 * 24 * 60 * 60 * 1000)
+          writeCodexQuotaSamples(database, quotaSamples, CODEX_QUOTA_HISTORY_RETENTION_MS)
           database.exec('COMMIT')
         } catch (error) {
           rollback(database)
@@ -955,7 +956,7 @@ export class SqliteStateStore<T extends SqlitePersistedShape> {
   public async appendCodexQuotaSample(
     sample: CodexQuotaHistoryPoint,
     bucketSizeMs = 5 * 60 * 1000,
-    retentionMs = 14 * 24 * 60 * 60 * 1000
+    retentionMs = CODEX_QUOTA_HISTORY_RETENTION_MS
   ): Promise<void> {
     await this.appendCodexQuotaSamples([sample], bucketSizeMs, retentionMs)
   }
@@ -964,7 +965,7 @@ export class SqliteStateStore<T extends SqlitePersistedShape> {
   public async appendCodexQuotaSamples(
     samples: readonly CodexQuotaHistoryPoint[],
     bucketSizeMs = 5 * 60 * 1000,
-    retentionMs = 14 * 24 * 60 * 60 * 1000
+    retentionMs = CODEX_QUOTA_HISTORY_RETENTION_MS
   ): Promise<void> {
     this.assertWriteAllowed()
     const batch = normalizeCodexQuotaSamples(samples, bucketSizeMs)

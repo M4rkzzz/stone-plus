@@ -55,6 +55,11 @@ export interface ClientInstanceManagerOptions {
   store: ClientInstanceMetadataStore
   processAdapter?: ClientInstanceProcessAdapter
   resolveBinding?: (instance: ManagedClientInstance) => ClientInstanceLaunchBinding
+  /** Final trusted-main-process launch augmentation (for example a managed DSH overlay). */
+  prepareLaunchPlan?: (
+    plan: ClientInstanceLaunchPlan,
+    instance: ManagedClientInstance,
+  ) => ClientInstanceLaunchPlan | Promise<ClientInstanceLaunchPlan>
   validateLaunchPlan?: (plan: ClientInstanceLaunchPlan) => void | Promise<void>
   baseEnvironment?: NodeJS.ProcessEnv
   platform?: NodeJS.Platform
@@ -136,7 +141,12 @@ export class ClientInstanceManager {
   public initialize(): ManagedClientInstance[] {
     const raw = this.options.store.readAppMetadata(METADATA_KEY)
     this.definitions = parseDefinitions(raw)
-      .map((instance) => ({ ...instance, status: 'stopped', pid: undefined }))
+      .map((instance) => ({
+        ...instance,
+        launchMode: managedLaunchMode(instance.client, instance.launchMode),
+        status: 'stopped',
+        pid: undefined,
+      }))
     this.processJournals.clear()
     for (const journal of parseProcessJournals(raw)) {
       if (this.definitions.some((definition) => definition.id === journal.instanceId)) {
@@ -209,7 +219,10 @@ export class ClientInstanceManager {
     }
     const timestamp = this.now()
     const client = supportedClient(input.client)
-    const resolvedLaunchMode = launchMode(input.launchMode ?? existing?.launchMode ?? defaultLaunchMode(this.platform))
+    const resolvedLaunchMode = managedLaunchMode(
+      client,
+      launchMode(input.launchMode ?? existing?.launchMode ?? defaultLaunchMode(this.platform)),
+    )
     // Preserve an old explicit terminal definition so startup migrations and
     // unrelated edits remain possible, but never allow a new unsupported mode
     // to be selected. start() performs the same check unconditionally.
@@ -283,7 +296,7 @@ export class ClientInstanceManager {
     await this.awaitStartStep(mkdir(instance.configDirectory, { recursive: true }).then(() => undefined))
     await this.awaitStartStep(assertDirectory(instance.configDirectory, 'Configuration directory'))
     const binding = this.options.resolveBinding?.(structuredClone(instance))
-    const plan: ClientInstanceLaunchPlan = Object.freeze({
+    const basePlan: ClientInstanceLaunchPlan = Object.freeze({
       instanceId: instance.id,
       executable: launchExecutable,
       // Apply the sanitizer again at the final launch boundary so legacy
@@ -295,7 +308,18 @@ export class ClientInstanceManager {
         ...configDirectoryEnvironment(instance.client, instance.configDirectory),
         ...(binding?.env ?? {}),
       }),
-      launchMode: instance.launchMode,
+      launchMode: managedLaunchMode(instance.client, instance.launchMode),
+    })
+    const preparedPlan = this.options.prepareLaunchPlan
+      ? await this.awaitStartStep(Promise.resolve(this.options.prepareLaunchPlan(basePlan, structuredClone(instance))))
+      : basePlan
+    if (preparedPlan.instanceId !== instance.id) {
+      throw new Error('The prepared client launch plan changed the managed instance identity.')
+    }
+    const plan: ClientInstanceLaunchPlan = Object.freeze({
+      ...preparedPlan,
+      args: Object.freeze([...preparedPlan.args]),
+      env: Object.freeze({ ...preparedPlan.env }),
     })
     if (this.options.validateLaunchPlan) {
       await this.awaitStartStep(Promise.resolve(this.options.validateLaunchPlan(plan)))
@@ -1047,6 +1071,7 @@ function configDirectoryEnvironment(client: RouteClient, directory: string): Nod
     case 'claude': return { CLAUDE_CONFIG_DIR: directory }
     case 'gemini': return { GEMINI_CLI_HOME: directory }
     case 'grokbuild': return { GROK_HOME: directory }
+    case 'deepseek-harness': return { DSH_HOME: directory }
   }
 }
 
@@ -1082,7 +1107,8 @@ function requiredName(value: string): string {
 }
 
 function supportedClient(value: RouteClient): RouteClient {
-  if (value !== 'claude' && value !== 'codex' && value !== 'gemini' && value !== 'grokbuild') {
+  if (value !== 'claude' && value !== 'codex' && value !== 'gemini' && value !== 'grokbuild'
+    && value !== 'deepseek-harness') {
     throw new Error('Unsupported client instance type.')
   }
   return value
@@ -1095,6 +1121,13 @@ function launchMode(value: ManagedClientLaunchMode): ManagedClientLaunchMode {
 
 function defaultLaunchMode(platform: NodeJS.Platform): ManagedClientLaunchMode {
   return platform === 'win32' ? 'terminal' : 'background'
+}
+
+function managedLaunchMode(client: RouteClient, requested: ManagedClientLaunchMode): ManagedClientLaunchMode {
+  // DSH is a long-running local web service. Launching it through a visible
+  // Windows `cmd start` wrapper can detach the real Node child and make Stone+
+  // report a false startup failure while port 3080 remains occupied.
+  return client === 'deepseek-harness' ? 'background' : requested
 }
 
 function requiredAbsolutePath(value: string, label: string): string {

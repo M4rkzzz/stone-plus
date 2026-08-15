@@ -1,7 +1,9 @@
-import type { AccountCodexQuotaSnapshot, CodexQuotaWindow, Protocol } from '../../shared/types'
+import type { AccountCodexQuotaSnapshot, CodexQuotaBucket, CodexQuotaWindow, Protocol } from '../../shared/types'
 import { parseRetryAfter } from './failure'
 
 const MAX_DURATION_MS = 366 * 24 * 60 * 60 * 1000
+/** A quota flag without a fresh observation must never keep an account blocked forever. */
+export const CODEX_QUOTA_STALE_AFTER_MS = 2 * 60 * 60 * 1000
 
 export interface NormalizedQuotaWindow {
   limit?: number
@@ -127,7 +129,7 @@ export function mergeQuotaSignals(...signals: ReadonlyArray<NormalizedQuotaSigna
   for (const signal of signals) {
     if (!signal) continue
     if (signal.rateLimits) rateLimits = mergeRateLimits(rateLimits, signal.rateLimits)
-    if (signal.codexQuota) codexQuota = mergeCodexQuota(codexQuota, signal.codexQuota)
+    if (signal.codexQuota) codexQuota = mergeCodexQuotaSnapshots(codexQuota, signal.codexQuota)
     if (signal.usage) usage = compactUsage({ ...usage, ...compactUsage(signal.usage) })
     if (signal.retryAfterMs !== undefined) retryAfterMs = signal.retryAfterMs
     if (signal.retryAt !== undefined) retryAt = signal.retryAt
@@ -160,21 +162,102 @@ export function extractCodexQuotaFromUsagePayload(
   now = Date.now()
 ): AccountCodexQuotaSnapshot | undefined {
   const root = objectValue(payload)
-  const rateLimit = objectValue(root?.rate_limit ?? root?.rateLimit)
+  if (!root) return undefined
+  // WHAM has appeared as both a flat object and `{ data: { usage: ... } }`.
+  // Merge envelopes in order instead of selecting one shape so a provider can
+  // add metadata at the outer level without hiding nested rate limits.
+  const data = objectValue(root.data)
+  const nestedUsage = objectValue(root.usage)
+  const dataUsage = objectValue(data?.usage)
+  const envelope = mergeObjects(root, data, nestedUsage, dataUsage)
+  const rateLimit = objectValue(envelope?.rate_limit ?? envelope?.rateLimit)
   const resetCredits = codexResetCredits(
-    root?.rate_limit_reset_credits ?? root?.rateLimitResetCredits,
+    envelope?.rate_limit_reset_credits ?? envelope?.rateLimitResetCredits,
     now,
   )
-  if (!rateLimit && !resetCredits) return undefined
+  const planType = sanitizePlanType(
+    envelope?.plan_type ?? envelope?.planType ?? envelope?.subscription_plan ?? envelope?.subscriptionPlan,
+  )
+  const additionalBuckets = parseAdditionalCodexBuckets(envelope?.additional_rate_limits ?? envelope?.additionalRateLimits, now)
+  if (!rateLimit && !resetCredits && !planType && additionalBuckets.length === 0) return undefined
+  const hasWhamDetails = Boolean(resetCredits || planType || additionalBuckets.length)
   const primary = codexPayloadWindow(rateLimit?.primary_window ?? rateLimit?.primaryWindow, now)
   const secondary = codexPayloadWindow(rateLimit?.secondary_window ?? rateLimit?.secondaryWindow, now)
+  const allowed = booleanValue(rateLimit?.allowed)
+  const limitReached = booleanValue(rateLimit?.limit_reached ?? rateLimit?.limitReached)
   return normalizeCodexWindows(primary, secondary, {
     observedAt: now,
     source: 'usage-endpoint',
-    allowed: booleanValue(rateLimit?.allowed),
-    limitReached: booleanValue(rateLimit?.limit_reached ?? rateLimit?.limitReached),
+    ...(allowed === undefined ? {} : { allowed }),
+    ...(limitReached === undefined ? {} : { limitReached }),
+    ...(planType ? { planType } : {}),
+    ...(additionalBuckets.length ? { additionalBuckets } : {}),
     ...(resetCredits ? { resetCredits } : {}),
+    ...(hasWhamDetails ? { detailsObservedAt: now } : {}),
   })
+}
+
+function parseAdditionalCodexBuckets(value: unknown, now: number): CodexQuotaBucket[] {
+  if (!Array.isArray(value)) return []
+  const buckets: CodexQuotaBucket[] = []
+  const seen = new Map<string, number>()
+  for (const item of value) {
+    const entry = objectValue(item)
+    if (!entry) continue
+    const rateLimit = objectValue(entry.rate_limit ?? entry.rateLimit)
+    if (!rateLimit) continue
+    const primary = codexPayloadWindow(rateLimit.primary_window ?? rateLimit.primaryWindow, now)
+    const secondary = codexPayloadWindow(rateLimit.secondary_window ?? rateLimit.secondaryWindow, now)
+    const allowed = booleanValue(rateLimit.allowed)
+    const limitReached = booleanValue(rateLimit.limit_reached ?? rateLimit.limitReached)
+    const idBase = safeQuotaBucketId(entry.metered_feature ?? entry.meteredFeature ?? entry.limit_name ?? entry.limitName)
+    if (!idBase && !primary && !secondary && allowed === undefined && limitReached === undefined) continue
+    const next = (seen.get(idBase || 'bucket') ?? 0) + 1
+    seen.set(idBase || 'bucket', next)
+    const id = idBase ? (next > 1 ? `${idBase}#${next}` : idBase) : `bucket-${next}`
+    const projected = normalizeCodexWindows(primary, secondary, {
+      observedAt: now,
+      source: 'usage-endpoint',
+      ...(allowed === undefined ? {} : { allowed }),
+      ...(limitReached === undefined ? {} : { limitReached }),
+    })
+    if (!projected && allowed === undefined && limitReached === undefined) continue
+    const label = safeQuotaBucketLabel(entry.limit_name ?? entry.limitName)
+    buckets.push({
+      id,
+      ...(label ? { label } : {}),
+      ...(projected?.fiveHour ? { fiveHour: projected.fiveHour } : {}),
+      ...(projected?.sevenDay ? { sevenDay: projected.sevenDay } : {}),
+      ...(projected?.monthly ? { monthly: projected.monthly } : {}),
+      ...(allowed === undefined ? {} : { allowed }),
+      ...(limitReached === undefined ? {} : { limitReached }),
+    })
+  }
+  return buckets
+}
+
+function safeQuotaBucketId(value: unknown): string {
+  return typeof value === 'string'
+    ? value.trim().toLowerCase().replace(/[^a-z0-9._:-]+/g, '-').slice(0, 80)
+    : ''
+}
+
+function safeQuotaBucketLabel(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined
+  const valueTrimmed = [...value.trim()]
+    .filter((character) => {
+      const code = character.charCodeAt(0)
+      return code > 31 && code !== 127
+    })
+    .join('')
+    .slice(0, 80)
+  return valueTrimmed || undefined
+}
+
+function sanitizePlanType(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined
+  const normalized = value.trim().toLowerCase().replace(/[^a-z0-9._:-]+/g, '-').slice(0, 64)
+  return normalized || undefined
 }
 
 function codexResetCredits(
@@ -204,10 +287,14 @@ function codexResetCredits(
     const status = resetCreditText(credit.status).toLowerCase()
     if (resetType && resetType !== 'codexratelimits') continue
     if (status && status !== 'available') continue
-    availableFromList += 1
     const expiry = resetCreditTimestamp(credit.expires_at ?? credit.expiresAt)
-    if (Number.isFinite(expiry) && expiry > now) expiresAt.push(expiry)
+    if (Number.isFinite(expiry) && expiry <= now) continue
+    availableFromList += 1
+    if (Number.isFinite(expiry)) expiresAt.push(expiry)
   }
+  // The list may be a paginated/detail sample, while available_count is the
+  // authoritative total. Only derive the count from list entries when the
+  // summary is absent.
   const availableCount = count ?? (rawCredits ? availableFromList : undefined)
   if (availableCount === undefined) return undefined
   return {
@@ -238,9 +325,16 @@ export function codexQuotaIsExhausted(
   now = Date.now()
 ): boolean {
   if (!quota) return false
-  if (quota.allowed === false || quota.limitReached === true) return true
-  return codexQuotaWindows(quota).some((window) =>
-    window.usedPercent >= 100 && (window.resetAt === undefined || window.resetAt > now))
+  const windows = codexQuotaWindows(quota)
+  const fresh = now - quota.observedAt <= CODEX_QUOTA_STALE_AFTER_MS
+  const hasActiveWindow = windows.some((window) => isActiveCodexWindow(window, quota.observedAt, now))
+  const hasExpiredBoundary = windows.some((window) => window.resetAt !== undefined && window.resetAt <= now)
+  // WHAM's top-level flag is a snapshot, not a permanent account state. Once
+  // its observation is stale or the first known reset boundary has crossed,
+  // release it and let the next real request establish the current state.
+  if ((quota.allowed === false || quota.limitReached === true)
+    && fresh && (windows.length === 0 || (hasActiveWindow && !hasExpiredBoundary))) return true
+  return windows.some((window) => window.usedPercent >= 100 && isActiveCodexWindow(window, quota.observedAt, now))
 }
 
 /**
@@ -255,8 +349,7 @@ export function codexQuotaCooldownUntil(
   if (!codexQuotaIsExhausted(quota, now) || !quota) return undefined
   const windows = codexQuotaWindows(quota)
   const activeExhaustedWindows = windows
-    .filter((window) => window.usedPercent >= 100
-      && (window.resetAt === undefined || window.resetAt > now))
+    .filter((window) => window.usedPercent >= 100 && isActiveCodexWindow(window, quota.observedAt, now))
   if (activeExhaustedWindows.some((window) => window.resetAt === undefined)) return undefined
   const exhaustedResets = activeExhaustedWindows
     .map((window) => window.resetAt!)
@@ -272,7 +365,15 @@ export function codexQuotaCooldownUntil(
 }
 
 function codexQuotaWindows(quota: AccountCodexQuotaSnapshot): CodexQuotaWindow[] {
-  return [quota.fiveHour, quota.sevenDay].filter((window): window is CodexQuotaWindow => Boolean(window))
+  // Additional feature buckets are model-scoped. A depleted Spark/model
+  // bucket must not cool the entire account or unrelated model routes.
+  return [quota.fiveHour, quota.sevenDay, quota.monthly]
+    .filter((window): window is CodexQuotaWindow => Boolean(window))
+}
+
+function isActiveCodexWindow(window: CodexQuotaWindow, observedAt: number, now: number): boolean {
+  if (window.resetAt !== undefined) return window.resetAt > now
+  return now - observedAt <= CODEX_QUOTA_STALE_AFTER_MS
 }
 
 export function parseQuotaResetAt(value: string | undefined, now = Date.now()): number | undefined {
@@ -334,16 +435,32 @@ function codexPayloadWindow(value: unknown, now: number): RawCodexWindow | undef
 function normalizeCodexWindows(
   primary: RawCodexWindow | undefined,
   secondary: RawCodexWindow | undefined,
-  metadata: Omit<AccountCodexQuotaSnapshot, 'fiveHour' | 'sevenDay'>
+  metadata: Omit<AccountCodexQuotaSnapshot, 'fiveHour' | 'sevenDay' | 'monthly'>
 ): AccountCodexQuotaSnapshot | undefined {
   if (primary?.usedPercent === undefined && secondary?.usedPercent === undefined
-    && metadata.resetCredits === undefined) return undefined
+    && metadata.resetCredits === undefined
+    && metadata.allowed === undefined
+    && metadata.limitReached === undefined
+    && metadata.planType === undefined
+    && !(metadata.additionalBuckets && metadata.additionalBuckets.length > 0)) return undefined
 
   let fiveHourRaw: RawCodexWindow | undefined
   let sevenDayRaw: RawCodexWindow | undefined
+  let monthlyRaw: RawCodexWindow | undefined
   const primaryDuration = primary?.windowSeconds
   const secondaryDuration = secondary?.windowSeconds
-  if (primaryDuration !== undefined && secondaryDuration !== undefined) {
+  const all = [primary, secondary].filter((window): window is RawCodexWindow => Boolean(window))
+  const monthlyCandidate = all.find((window) => isMonthlyQuotaDuration(window.windowSeconds))
+  if (monthlyCandidate) {
+    monthlyRaw = monthlyCandidate
+    const rest = all.filter((window) => window !== monthlyCandidate)
+    const ordered = [...rest].sort((left, right) => (left.windowSeconds ?? Number.MAX_SAFE_INTEGER)
+      - (right.windowSeconds ?? Number.MAX_SAFE_INTEGER))
+    if (ordered[0]?.windowSeconds !== undefined && ordered[0].windowSeconds <= 6 * 60 * 60) {
+      fiveHourRaw = ordered.shift()
+    }
+    sevenDayRaw = ordered[0]
+  } else if (primaryDuration !== undefined && secondaryDuration !== undefined) {
     if (primaryDuration < secondaryDuration) {
       fiveHourRaw = primary
       sevenDayRaw = secondary
@@ -374,11 +491,17 @@ function normalizeCodexWindows(
 
   const fiveHour = publicCodexWindow(fiveHourRaw)
   const sevenDay = publicCodexWindow(sevenDayRaw)
+  const monthly = publicCodexWindow(monthlyRaw)
   return {
     ...metadata,
     ...(fiveHour ? { fiveHour } : {}),
-    ...(sevenDay ? { sevenDay } : {})
+    ...(sevenDay ? { sevenDay } : {}),
+    ...(monthly ? { monthly } : {})
   }
+}
+
+function isMonthlyQuotaDuration(seconds: number | undefined): boolean {
+  return seconds !== undefined && seconds >= 27 * 24 * 60 * 60 && seconds <= 32 * 24 * 60 * 60
 }
 
 function publicCodexWindow(window: RawCodexWindow | undefined): CodexQuotaWindow | undefined {
@@ -390,7 +513,7 @@ function publicCodexWindow(window: RawCodexWindow | undefined): CodexQuotaWindow
   }
 }
 
-function mergeCodexQuota(
+export function mergeCodexQuotaSnapshots(
   earlier: AccountCodexQuotaSnapshot | undefined,
   later: AccountCodexQuotaSnapshot
 ): AccountCodexQuotaSnapshot {
@@ -398,26 +521,91 @@ function mergeCodexQuota(
     return {
       ...later,
       ...(later.fiveHour ? { fiveHour: { ...later.fiveHour } } : {}),
-      ...(later.sevenDay ? { sevenDay: { ...later.sevenDay } } : {})
+      ...(later.sevenDay ? { sevenDay: { ...later.sevenDay } } : {}),
+      ...(later.monthly ? { monthly: { ...later.monthly } } : {}),
+      ...(later.additionalBuckets ? {
+        additionalBuckets: later.additionalBuckets.map((bucket) => ({
+          ...bucket,
+          ...(bucket.fiveHour ? { fiveHour: { ...bucket.fiveHour } } : {}),
+          ...(bucket.sevenDay ? { sevenDay: { ...bucket.sevenDay } } : {}),
+          ...(bucket.monthly ? { monthly: { ...bucket.monthly } } : {}),
+        }))
+      } : {})
     }
   }
+  const previousIsFresh = earlier !== undefined
+    && later.observedAt - earlier.observedAt <= CODEX_QUOTA_STALE_AFTER_MS
+  const mergedFiveHour = mergeCodexWindow(earlier?.fiveHour, later.fiveHour, later.observedAt, previousIsFresh)
+  const mergedSevenDay = mergeCodexWindow(earlier?.sevenDay, later.sevenDay, later.observedAt, previousIsFresh)
+  const mergedMonthly = mergeCodexWindow(earlier?.monthly, later.monthly, later.observedAt, previousIsFresh)
+  const earlierDetailsObservedAt = earlier?.detailsObservedAt
+    ?? (earlier?.source === 'usage-endpoint' && hasCodexQuotaDetails(earlier) ? earlier.observedAt : undefined)
+  const laterDetailsObservedAt = later.detailsObservedAt
+  const preserveEarlierDetails = earlierDetailsObservedAt !== undefined
+    && later.observedAt - earlierDetailsObservedAt <= CODEX_QUOTA_STALE_AFTER_MS
+  const additionalBuckets = mergeAdditionalCodexBuckets(
+    earlier?.additionalBuckets,
+    later.additionalBuckets,
+    later.observedAt,
+    preserveEarlierDetails,
+  )
+  const resetCredits = later.resetCredits ?? (preserveEarlierDetails ? earlier?.resetCredits : undefined)
+  const planType = later.planType ?? (preserveEarlierDetails ? earlier?.planType : undefined)
+  const detailsObservedAt = laterDetailsObservedAt
+    ?? (later.resetCredits || later.planType || later.additionalBuckets ? later.observedAt : undefined)
+    ?? (preserveEarlierDetails ? earlierDetailsObservedAt : undefined)
   return {
     observedAt: later.observedAt,
     source: later.source,
-    allowed: later.allowed ?? earlier?.allowed,
-    limitReached: later.limitReached ?? earlier?.limitReached,
-    resetCredits: later.resetCredits ?? earlier?.resetCredits,
-    fiveHour: mergeCodexWindow(earlier?.fiveHour, later.fiveHour),
-    sevenDay: mergeCodexWindow(earlier?.sevenDay, later.sevenDay)
+    // A newer successful response-header observation supersedes stale WHAM
+    // top-level flags even when the response does not repeat those fields.
+    ...(later.allowed === undefined ? {} : { allowed: later.allowed }),
+    ...(later.limitReached === undefined ? {} : { limitReached: later.limitReached }),
+    ...(resetCredits ? { resetCredits: { ...resetCredits, expiresAt: resetCredits.expiresAt?.slice() } } : {}),
+    ...(planType ? { planType } : {}),
+    ...(detailsObservedAt === undefined ? {} : { detailsObservedAt }),
+    ...(mergedFiveHour ? { fiveHour: mergedFiveHour } : {}),
+    ...(mergedSevenDay ? { sevenDay: mergedSevenDay } : {}),
+    ...(mergedMonthly ? { monthly: mergedMonthly } : {}),
+    ...(additionalBuckets.length ? { additionalBuckets } : {})
   }
 }
 
-function mergeCodexWindow(earlier: CodexQuotaWindow | undefined, later: CodexQuotaWindow | undefined): CodexQuotaWindow | undefined {
-  if (!later) return earlier
+function hasCodexQuotaDetails(quota: AccountCodexQuotaSnapshot): boolean {
+  return Boolean(quota.resetCredits || quota.planType || quota.additionalBuckets?.length)
+}
+
+function mergeCodexWindow(
+  earlier: CodexQuotaWindow | undefined,
+  later: CodexQuotaWindow | undefined,
+  observedAt: number,
+  preserveEarlier: boolean,
+): CodexQuotaWindow | undefined {
+  if (!later) {
+    if (!preserveEarlier) return undefined
+    if (earlier?.resetAt !== undefined && earlier.resetAt <= observedAt) return undefined
+    return earlier
+  }
+  if (earlier?.resetAt !== undefined && earlier.resetAt <= observedAt) return { ...later }
   return {
     ...earlier,
     ...later
   }
+}
+
+function mergeAdditionalCodexBuckets(
+  earlier: CodexQuotaBucket[] | undefined,
+  later: CodexQuotaBucket[] | undefined,
+  observedAt: number,
+  preserveEarlier: boolean,
+): CodexQuotaBucket[] {
+  if (later) return later.map((bucket) => ({ ...bucket }))
+  if (!preserveEarlier) return []
+  return (earlier ?? []).flatMap((bucket) => {
+    const windows = [bucket.fiveHour, bucket.sevenDay, bucket.monthly]
+    if (windows.some((window) => window?.resetAt !== undefined && window.resetAt <= observedAt)) return []
+    return [{ ...bucket }]
+  })
 }
 
 function parseNonNegativeNumber(value: string | null): number | undefined {
@@ -562,8 +750,17 @@ function safeTimestamp(timestamp: number, now: number): number | undefined {
 }
 
 function extractOpenAIUsage(root: Record<string, unknown>): NormalizedTokenUsage | undefined {
+  const data = objectValue(root.data)
   const nestedResponse = objectValue(root.response)
-  const usage = mergeObjects(objectValue(nestedResponse?.usage), objectValue(root.usage), looksLikeOpenAIUsage(root) ? root : undefined)
+  const dataResponse = objectValue(data?.response)
+  const usage = mergeObjects(
+    objectValue(dataResponse?.usage),
+    objectValue(data?.usage),
+    looksLikeOpenAIUsage(data ?? {}) ? data : undefined,
+    objectValue(nestedResponse?.usage),
+    objectValue(root.usage),
+    looksLikeOpenAIUsage(root) ? root : undefined,
+  )
   if (!usage) return undefined
   const inputDetails = mergeObjects(objectValue(usage.prompt_tokens_details), objectValue(usage.input_tokens_details))
   const outputDetails = mergeObjects(objectValue(usage.completion_tokens_details), objectValue(usage.output_tokens_details))

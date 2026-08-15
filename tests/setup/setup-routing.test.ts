@@ -113,7 +113,7 @@ describe('setup routing transaction', () => {
     expect(draft.pools).toEqual([])
   })
 
-  it('allows DeepSeek Responses only for Codex routes', () => {
+  it('allows DeepSeek Responses only for Codex and DeepSeek Harness routes', () => {
     const codexDraft = state()
     codexDraft.providers[0] = {
       ...codexDraft.providers[0],
@@ -136,6 +136,21 @@ describe('setup routing transaction', () => {
       modelMap: {},
     })
 
+    const harnessDraft = state()
+    harnessDraft.providers[0] = { ...codexDraft.providers[0] }
+    harnessDraft.accounts.forEach((account) => {
+      account.credentialType = 'api-key'
+      account.availableModels = ['deepseek-v4-flash']
+    })
+    applySetupRoutingDraft(harnessDraft, {
+      sessionId: 'session', sourceId: 'one', client: 'deepseek-harness', model: 'deepseek-v4-flash',
+    })
+    expect(harnessDraft.routes[0]).toMatchObject({
+      client: 'deepseek-harness',
+      inboundProtocol: 'openai-chat',
+      modelMap: {},
+    })
+
     for (const client of ['claude', 'gemini', 'grokbuild'] as const) {
       const rejected = state()
       rejected.providers[0] = { ...codexDraft.providers[0] }
@@ -145,7 +160,7 @@ describe('setup routing transaction', () => {
       })
       expect(() => applySetupRoutingDraft(rejected, {
         sessionId: 'session', sourceId: 'one', client, model: 'deepseek-v4-flash',
-      })).toThrow(/DeepSeek Responses/)
+      })).toThrow(/DeepSeek/)
       expect(rejected.routes).toEqual([])
       expect(rejected.pools).toEqual([])
     }

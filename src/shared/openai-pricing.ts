@@ -1,6 +1,7 @@
 import type {
   AccountCodexQuotaSnapshot,
   CodexQuotaCycleCosts,
+  CodexQuotaHistoryPoint,
   CodexQuotaWindow,
   OpenAiModelPricing,
   OpenAiPricedModelFamily,
@@ -8,6 +9,7 @@ import type {
   OpenAiTokenCostOverview,
   RequestLog
 } from './types'
+import { GPT_5_6_SOL_WM_MODEL } from './wm-routing'
 
 const MILLION = 1_000_000
 const LONG_CONTEXT_THRESHOLD_TOKENS = 272_000
@@ -265,7 +267,9 @@ export function resolveCodexTokenCreditPricing(model: string): CodexTokenCreditP
   const parsed = normalizedModel(model)
   if (parsed.namespace && parsed.namespace !== 'openai') return undefined
   const normalized = parsed.model
-  if (isModelOrSnapshot(normalized, 'gpt-5.6-sol')) return CODEX_CREDIT_PRICING['gpt-5.6-sol']
+  if (normalized === GPT_5_6_SOL_WM_MODEL || isModelOrSnapshot(normalized, 'gpt-5.6-sol')) {
+    return CODEX_CREDIT_PRICING['gpt-5.6-sol']
+  }
   if (isModelOrSnapshot(normalized, 'gpt-5.6-terra')) return CODEX_CREDIT_PRICING['gpt-5.6-terra']
   if (isModelOrSnapshot(normalized, 'gpt-5.6-luna')) return CODEX_CREDIT_PRICING['gpt-5.6-luna']
   if (isModelOrSnapshot(normalized, 'gpt-5.6')) return CODEX_CREDIT_PRICING['gpt-5.6-sol']
@@ -321,7 +325,9 @@ export function resolveModelPricing(model: string, effectiveAt = Date.now()): Op
   const parsed = normalizedModel(model)
   const normalized = parsed.model
   if (!parsed.namespace || parsed.namespace === 'openai') {
-    if (isModelOrSnapshot(normalized, 'gpt-5.6-sol')) return PRICING['gpt-5.6-sol']
+    if (normalized === GPT_5_6_SOL_WM_MODEL || isModelOrSnapshot(normalized, 'gpt-5.6-sol')) {
+      return PRICING['gpt-5.6-sol']
+    }
     if (isModelOrSnapshot(normalized, 'gpt-5.6-terra')) return PRICING['gpt-5.6-terra']
     if (isModelOrSnapshot(normalized, 'gpt-5.6-luna')) return PRICING['gpt-5.6-luna']
     // gpt-5.6 is the canonical alias of the Sol tier.
@@ -614,39 +620,58 @@ export function summarizeAccountCodexQuotaCycleCosts(
   logs: readonly RequestLog[],
   accountId: string,
   quota: AccountCodexQuotaSnapshot | undefined,
-  now = Date.now()
+  now = Date.now(),
+  history: readonly CodexQuotaHistoryPoint[] = []
 ): CodexQuotaCycleCosts {
+  const longWindow = quota?.sevenDay ?? quota?.monthly
   const fiveHour = quota?.fiveHour
     ? createOpenAiTokenCostAccumulator()
     : undefined
-  const sevenDay = quota?.sevenDay
+  const sevenDay = longWindow
     ? createOpenAiTokenCostAccumulator()
     : undefined
   const fiveHourCredits = quota?.fiveHour
     ? createCodexTokenCreditAccumulator()
     : undefined
-  const sevenDayCredits = quota?.sevenDay
+  const sevenDayCredits = longWindow
     ? createCodexTokenCreditAccumulator()
     : undefined
   const fiveHourBounds = quota?.fiveHour
     ? quotaWindowBounds(quota.fiveHour, 5 * 60 * 60, now)
     : undefined
-  const sevenDayBounds = quota?.sevenDay
-    ? quotaWindowBounds(quota.sevenDay, 7 * 24 * 60 * 60, now)
+  const sevenDayBounds = longWindow
+    ? quotaWindowBounds(longWindow, quota?.sevenDay ? 7 * 24 * 60 * 60 : 30 * 24 * 60 * 60, now)
+    : undefined
+  const fiveHourHiddenStart = quota?.fiveHour && fiveHourBounds
+    ? quotaOverageStart(quota.fiveHour, 'fiveHour', fiveHourBounds, quota.observedAt, accountId, history)
+    : undefined
+  const sevenDayHiddenStart = longWindow && sevenDayBounds
+    ? quotaOverageStart(longWindow, 'sevenDay', sevenDayBounds, quota?.observedAt ?? now, accountId, history)
+    : undefined
+  const hiddenQuota = fiveHourHiddenStart !== undefined || sevenDayHiddenStart !== undefined
+    ? createOpenAiTokenCostAccumulator()
     : undefined
   // Account quota cards are opened while request history may contain 20k rows.
   // Keep the account filter and both window checks in a single traversal rather
   // than allocating an account array and rescanning it for each quota cycle.
   for (const log of logs) {
     if (log.accountId !== accountId) continue
+    let isHiddenQuotaUsage = false
     if (fiveHourBounds && log.timestamp >= fiveHourBounds.start && log.timestamp < fiveHourBounds.end) {
       accumulateOpenAiTokenCost(fiveHour!, log)
       accumulateCodexTokenCredits(fiveHourCredits!, log)
+      if (fiveHourHiddenStart !== undefined && log.timestamp >= fiveHourHiddenStart) {
+        isHiddenQuotaUsage = true
+      }
     }
     if (sevenDayBounds && log.timestamp >= sevenDayBounds.start && log.timestamp < sevenDayBounds.end) {
       accumulateOpenAiTokenCost(sevenDay!, log)
       accumulateCodexTokenCredits(sevenDayCredits!, log)
+      if (sevenDayHiddenStart !== undefined && log.timestamp >= sevenDayHiddenStart) {
+        isHiddenQuotaUsage = true
+      }
     }
+    if (hiddenQuota && isHiddenQuotaUsage) accumulateOpenAiTokenCost(hiddenQuota, log)
   }
   const fiveHourCreditEstimate = fiveHourCredits
     ? finishCodexTokenCreditAccumulator(fiveHourCredits)
@@ -660,6 +685,9 @@ export function summarizeAccountCodexQuotaCycleCosts(
   const sevenDayUsdEstimate = sevenDay
     ? finishOpenAiTokenCostAccumulator(sevenDay)
     : undefined
+  const hiddenQuotaEstimate = hiddenQuota
+    ? finishOpenAiTokenCostAccumulator(hiddenQuota)
+    : undefined
   return {
     ...(fiveHourUsdEstimate ? {
       fiveHourUsd: fiveHourUsdEstimate.totalCostUsd,
@@ -668,6 +696,11 @@ export function summarizeAccountCodexQuotaCycleCosts(
     ...(sevenDayUsdEstimate ? {
       sevenDayUsd: sevenDayUsdEstimate.totalCostUsd,
       sevenDayUnpricedUsdTokens: sevenDayUsdEstimate.unpricedTokens,
+    } : {}),
+    ...(hiddenQuotaEstimate ? {
+      hiddenQuotaUsd: hiddenQuotaEstimate.totalCostUsd,
+      hiddenQuotaTokens: hiddenQuotaEstimate.totalTokens,
+      hiddenQuotaUnpricedTokens: hiddenQuotaEstimate.unpricedTokens
     } : {}),
     ...(fiveHourCreditEstimate ? {
       fiveHourCredits: fiveHourCreditEstimate.totalCredits,
@@ -678,6 +711,51 @@ export function summarizeAccountCodexQuotaCycleCosts(
       sevenDayUnpricedCreditTokens: sevenDayCreditEstimate.unpricedTokens
     } : {})
   }
+}
+
+type QuotaWindowKind = 'fiveHour' | 'sevenDay'
+
+/**
+ * Finds the first trustworthy observation at or above 100% in the active
+ * quota cycle. We intentionally use the observation time rather than trying
+ * to interpolate a crossing point between samples: doing so would claim
+ * hidden usage that the retained telemetry cannot prove.
+ */
+function quotaOverageStart(
+  window: CodexQuotaWindow,
+  kind: QuotaWindowKind,
+  bounds: { start: number; end: number },
+  currentObservedAt: number,
+  accountId: string,
+  history: readonly CodexQuotaHistoryPoint[]
+): number | undefined {
+  const candidates: number[] = []
+  for (const point of history) {
+    if (point.accountId !== accountId) continue
+    if (point.observedAt < bounds.start || point.observedAt >= bounds.end) continue
+    const usedPercent = kind === 'fiveHour'
+      ? point.fiveHourUsedPercent
+      : point.sevenDayUsedPercent
+    if (usedPercent === undefined || !Number.isFinite(usedPercent) || usedPercent < 100) continue
+    const pointResetAt = kind === 'fiveHour' ? point.fiveHourResetAt : point.sevenDayResetAt
+    if (!sameQuotaCycle(pointResetAt, window.resetAt)) continue
+    candidates.push(point.observedAt)
+  }
+  if (window.usedPercent >= 100
+    && Number.isFinite(currentObservedAt)
+    && currentObservedAt >= bounds.start
+    && currentObservedAt < bounds.end) {
+    candidates.push(currentObservedAt)
+  }
+  return candidates.length ? Math.min(...candidates) : undefined
+}
+
+function sameQuotaCycle(sampleResetAt: number | undefined, currentResetAt: number | undefined): boolean {
+  if (sampleResetAt === undefined || currentResetAt === undefined) return true
+  // Different upstream responses can expose the same reset boundary with a
+  // small clock/rounding drift. Keep the match tight enough to avoid joining
+  // a neighbouring rolling cycle.
+  return Math.abs(sampleResetAt - currentResetAt) <= 5 * 60 * 1000
 }
 
 function quotaWindowBounds(

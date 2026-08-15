@@ -1,4 +1,4 @@
-import { mutateDotenv, validateDotenv } from './dotenv-format'
+import { mutateDotenv, removeDotenvKeys, validateDotenv } from './dotenv-format'
 import { normalizeCodexModelRepairPolicy } from '@shared/codex-model-repair'
 import { CLAUDE_RELAY_MODEL_ENV_KEYS, isClaudeClientModelName } from './claude-environment'
 import { planGrokBuildToml } from './grok-build-toml'
@@ -358,6 +358,30 @@ export function planGrokBuildConfig(
   }
 }
 
+export function planDeepSeekHarnessConfig(
+  paths: ResolvedClientConfigPaths['deepseekHarness'],
+  existing: ExistingClientConfig,
+  target: ClientConnectionTarget,
+): ClientConfigPlan {
+  const desired = normalizedTarget(target)
+  const source = existing['deepseek-harness-env']
+  // DSH treats network bootstrap variables as inherited-process-only input and
+  // refuses to start when DEEPSEEK_BASE_URL is present in ~/.dsh/.env. Stone+
+  // injects the endpoint at the managed process boundary instead; retain only
+  // the API credential here and remove the legacy value written by older builds.
+  const withoutLegacyBaseUrl = removeDotenvKeys(source, new Set(['DEEPSEEK_BASE_URL'])).content
+  const env = mutateDotenv(withoutLegacyBaseUrl, {
+    DEEPSEEK_API_KEY: desired.token,
+  })
+  return {
+    client: 'deepseek-harness',
+    files: [mutation(paths.env, source, env, [
+      'DEEPSEEK_API_KEY',
+      'legacy DEEPSEEK_BASE_URL removal',
+    ])],
+  }
+}
+
 export function planClientConfig(
   client: SupportedClient,
   paths: ResolvedClientConfigPaths,
@@ -367,7 +391,8 @@ export function planClientConfig(
   if (client === 'claude') return planClaudeConfig(paths.claude, existing, target)
   if (client === 'codex') return planCodexConfig(paths.codex, existing, target)
   if (client === 'gemini') return planGeminiConfig(paths.gemini, existing, target)
-  return planGrokBuildConfig(paths.grokbuild, existing, target)
+  if (client === 'grokbuild') return planGrokBuildConfig(paths.grokbuild, existing, target)
+  return planDeepSeekHarnessConfig(paths.deepseekHarness, existing, target)
 }
 
 const repairableRoles: Readonly<Record<SupportedClient, ReadonlySet<ClientConfigFilePath['role']>>> = {
@@ -375,6 +400,7 @@ const repairableRoles: Readonly<Record<SupportedClient, ReadonlySet<ClientConfig
   codex: new Set(['codex-config', 'codex-auth', 'codex-model-catalog']),
   gemini: new Set(['gemini-settings', 'gemini-env']),
   grokbuild: new Set(['grok-config']),
+  'deepseek-harness': new Set(['deepseek-harness-env']),
 }
 
 function repairObjectField(parent: JsonObject, key: string): JsonObject {
@@ -485,6 +511,16 @@ export function planClientConfigRepair(
       if (!(error instanceof ClientConfigParseError)) throw error
       delete repairInput['grok-config']
       rebuiltRoles.push('grok-config')
+    }
+  }
+
+  if (client === 'deepseek-harness' && repairInput['deepseek-harness-env'] !== undefined) {
+    try {
+      validateDotenv(repairInput['deepseek-harness-env'], 'deepseek-harness-env')
+    } catch (error) {
+      if (!(error instanceof ClientConfigParseError)) throw error
+      delete repairInput['deepseek-harness-env']
+      rebuiltRoles.push('deepseek-harness-env')
     }
   }
 

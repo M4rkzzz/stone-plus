@@ -80,6 +80,7 @@ const targetMeta: Record<AgentTarget, AgentDisplayMeta> = {
   'claude-code-vsc': { name: 'Claude Code VSC', icon: clientBrandMeta.claude.icon },
   'gemini-cli': { name: 'Gemini CLI', icon: clientBrandMeta.gemini.icon },
   'grok-build': { name: 'Grok Build', icon: clientBrandMeta.grokbuild.icon },
+  'deepseek-harness': { name: 'DeepSeek Harness', icon: clientBrandMeta['deepseek-harness'].icon },
 }
 
 const targetOrder: readonly AgentTarget[] = [
@@ -90,6 +91,7 @@ const targetOrder: readonly AgentTarget[] = [
   'claude-code-vsc',
   'gemini-cli',
   'grok-build',
+  'deepseek-harness',
 ]
 
 const displayPriority: Record<AgentLifecycleDisplayState, number> = {
@@ -534,6 +536,9 @@ function actionProgressLabel(action: AgentLifecycleBusyAction, t: Translator, ag
   if (action === 'close') return t('正在关闭', 'Closing')
   if (action === 'restore') return t('正在修复', 'Repairing')
   if (action === 'restart') return t('正在重启', 'Restarting')
+  if (action === 'install' && agent?.target === 'deepseek-harness') {
+    return t('正在安装、配置并启动', 'Installing, configuring, and launching')
+  }
   if (action === 'install') return t('正在打开安装指引', 'Opening installation guide')
   if (action === 'smart-repair') return t('正在智能修复', 'Smart repair in progress')
   if (agent?.target === 'claude-code-desktop') {
@@ -546,6 +551,9 @@ function actionProgressLabel(action: AgentLifecycleBusyAction, t: Translator, ag
 
 function defaultAgentDetail(agent: AgentLifecycleState, t: Translator): string {
   if (agent.error) return localizedLifecycleError(agent.error, t)
+  if (!agent.installed && agent.target === 'deepseek-harness') {
+    return t('可在客户端配置中一键安装并接入 Stone+', 'Install and connect to Stone+ with one click in Client Configuration')
+  }
   if (!agent.installed) return t('可在客户端配置中打开官方安装指引', 'Open the official installation guide from Client Configuration')
   if (agent.target === 'claude-code-desktop') {
     if (!agent.enabled) return t('请先启用兼容的 Claude 路由', 'Enable a compatible Claude route first')
@@ -586,6 +594,11 @@ export function agentOutcomeLabel(
   if (outcome.error?.code === 'cancelled') return t('已安全取消并回滚', 'Safely cancelled and rolled back')
   if (outcome.error) return localizedLifecycleError(outcome.error, t)
   if (outcome.status === 'succeeded') {
+    if (action === 'install' && outcome.target === 'deepseek-harness') {
+      return outcome.runningAfter
+        ? t('已安装、配置并启动', 'Installed, configured, and launched')
+        : t('已安装并配置', 'Installed and configured')
+    }
     if (action === 'install') return t('已打开官方安装指引', 'Official installation guide opened')
     if (action === 'close') return outcome.runningAfter
       ? t('关闭未完成，客户端仍在运行', 'Close did not complete; the client is still running')
@@ -635,6 +648,9 @@ export function agentActionBlockReasonFor(
   t: Translator,
 ): string | undefined {
   if (!agent.installed) {
+    if (agent.target === 'deepseek-harness') {
+      return t('尚未安装 DeepSeek Harness。请在“客户端配置”中点击“一键安装并配置”。', 'DeepSeek Harness is not installed. Select “Install and configure” in Client Configuration.')
+    }
     return t('尚未安装该客户端。请打开“客户端配置”中的官方安装指引。', 'This client is not installed. Open its official installation guide from Client Configuration.')
   }
 
@@ -703,6 +719,12 @@ function isLaunchOnly(agent: AgentLifecycleState): boolean {
 }
 
 export function localizedLifecycleError(error: AgentLifecycleError, t: Translator): string {
+  if (error.code === 'installation-prerequisite-missing' && /DeepSeek Harness/i.test(error.message)) {
+    return t(
+      '一键安装 DeepSeek Harness 需要兼容的 Node.js（22.19 以上的 22.x，或 24 及以上）和 npm。安装或升级后再重试。',
+      'One-click DeepSeek Harness installation requires compatible Node.js (22.19+ on Node 22, or Node 24+) and npm. Install or update them, then try again.',
+    )
+  }
   if (error.code === 'installation-prerequisite-missing' && /Node\.js 20/i.test(error.message)) {
     return t('安装 Gemini CLI 需要 Node.js 20 或更高版本。请先安装或升级 Node.js，再点击重试。', 'Gemini CLI requires Node.js 20 or newer. Install or update Node.js, then try again.')
   }

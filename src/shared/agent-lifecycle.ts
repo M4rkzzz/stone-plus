@@ -7,12 +7,13 @@ export const AGENT_TARGETS = [
   'claude-code-vsc',
   'gemini-cli',
   'grok-build',
+  'deepseek-harness',
 ] as const
 
 export type AgentTarget = (typeof AGENT_TARGETS)[number]
 
-export type AgentRouteClient = 'codex' | 'claude' | 'gemini' | 'grokbuild'
-export type AgentSharedStateGroup = 'codex-home' | 'claude-home' | 'gemini-home' | 'grok-home'
+export type AgentRouteClient = 'codex' | 'claude' | 'gemini' | 'grokbuild' | 'deepseek-harness'
+export type AgentSharedStateGroup = 'codex-home' | 'claude-home' | 'gemini-home' | 'grok-home' | 'deepseek-harness-home'
 
 export interface AgentCapabilities {
   readonly canInstall: boolean
@@ -21,6 +22,8 @@ export interface AgentCapabilities {
   readonly canCloseKnownProcess: boolean
   /** The target can be opened even when Stone+ cannot observe its host process. */
   readonly canLaunch?: boolean
+  /** A running target can be surfaced again without starting another process. */
+  readonly canOpenWhenRunning?: boolean
   readonly canRestoreConnection: boolean
   readonly canRepairSessions: boolean
   readonly canRepairWorkspaceIndex: boolean
@@ -119,6 +122,19 @@ export const AGENT_CAPABILITIES: Readonly<Record<AgentTarget, AgentCapabilities>
     canRestart: true,
     sharedStateGroup: 'grok-home',
   }),
+  'deepseek-harness': Object.freeze({
+    canInstall: true,
+    canDetectInstallation: true,
+    canDetectRunning: true,
+    canCloseKnownProcess: true,
+    canLaunch: true,
+    canOpenWhenRunning: true,
+    canRestoreConnection: true,
+    canRepairSessions: false,
+    canRepairWorkspaceIndex: false,
+    canRestart: true,
+    sharedStateGroup: 'deepseek-harness-home',
+  }),
 })
 
 export const AGENT_ROUTE_CLIENT: Readonly<Record<AgentTarget, AgentRouteClient>> = Object.freeze({
@@ -129,6 +145,7 @@ export const AGENT_ROUTE_CLIENT: Readonly<Record<AgentTarget, AgentRouteClient>>
   'claude-code-vsc': 'claude',
   'gemini-cli': 'gemini',
   'grok-build': 'grokbuild',
+  'deepseek-harness': 'deepseek-harness',
 })
 
 export type AgentCompatibility = 'native' | 'compatible' | 'needs-check' | 'unsupported'

@@ -21,7 +21,11 @@ export function formatAccountQuotaUsd(value: number | undefined, locale: string)
  * multiple rate windows, the tightest window is the account's effective quota.
  */
 export function accountRemainingPercent(account: PublicAccount): number | undefined {
-  const codexWindows = [account.codexQuota?.fiveHour, account.codexQuota?.sevenDay]
+  const codexWindows = [
+    account.codexQuota?.fiveHour,
+    account.codexQuota?.sevenDay,
+    account.codexQuota?.monthly,
+  ]
     .filter((window) => window !== undefined)
     .map((window) => 100 - window.usedPercent)
   if (codexWindows.length) return clampPercent(Math.min(...codexWindows))
@@ -91,7 +95,8 @@ export function accountRecoveryAt(account: PublicAccount, now: number): number |
   if (quotaResets.length) candidates.push(Math.max(...quotaResets))
 
   if (accountQuotaIsExhausted(account, now) && account.codexQuota) {
-    const windows = [account.codexQuota.fiveHour, account.codexQuota.sevenDay].filter(Boolean)
+    const windows = [account.codexQuota.fiveHour, account.codexQuota.sevenDay, account.codexQuota.monthly]
+      .filter(Boolean)
     const exhaustedResets = windows
       .filter((window) => window!.usedPercent >= 100 && window!.resetAt !== undefined && window!.resetAt! > now)
       .map((window) => window!.resetAt!)

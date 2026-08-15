@@ -18,6 +18,7 @@ export const clientBrandMeta: Record<RouteClient, ClientBrandMeta> = {
   codex: { name: 'Codex', icon: openAiIcon, iconClassName: 'brand-icon--openai' },
   gemini: { name: 'Gemini CLI', icon: geminiIcon },
   grokbuild: { name: 'Grok Build', icon: grokIcon },
+  'deepseek-harness': { name: 'DeepSeek Harness', icon: deepSeekIcon },
 }
 
 export function providerBrandIcon(kind: ProviderKind): string | undefined {

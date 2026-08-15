@@ -16,6 +16,8 @@ describe('resolveClientConfigPaths', () => {
     expect(linux.gemini.settings.path).toBe('/home/alice/.gemini/settings.json')
     expect(linux.gemini.env.path).toBe('/home/alice/.gemini/.env')
     expect(mac.gemini.env.path).toBe('/Users/alice/.gemini/.env')
+    expect(linux.deepseekHarness.env.path).toBe('/home/alice/.dsh/.env')
+    expect(mac.deepseekHarness.env.path).toBe('/Users/alice/.dsh/.env')
   })
 
   it('uses Windows separators when the injected platform is win32', () => {
@@ -27,6 +29,7 @@ describe('resolveClientConfigPaths', () => {
     expect(paths.codex.agents.path).toBe('C:\\Users\\Alice\\.codex\\AGENTS.md')
     expect(paths.codex.rules.path).toBe('C:\\Users\\Alice\\.codex\\rules\\default.rules')
     expect(paths.gemini.env.path).toBe('C:\\Users\\Alice\\.gemini\\.env')
+    expect(paths.deepseekHarness.env.path).toBe('C:\\Users\\Alice\\.dsh\\.env')
   })
 
   it('accepts explicit client directory overrides', () => {

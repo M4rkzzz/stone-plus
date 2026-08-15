@@ -40,7 +40,7 @@ import type {
 } from '@shared/types'
 import { applyWindowChromeTheme } from '../window-chrome'
 import type { GatewayAccountState, GatewayConfig, GatewayRuntimeStateUpdate } from '../gateway'
-import { AccountModelProbeError, applyGrokBuildHeaders, ChatGptCodexEndpointError, checkChatGptAccountAuthorized, classifyChatGptCredentialRefreshFailure, codexQuotaCooldownUntil, codexQuotaIsExhausted, getProviderAdapter, probeChatGptAccountAuthorized, probeChatGptCodexModel, probeProviderModel, queryChatGptCodexModels, queryChatGptCodexModelsAuthorized, queryChatGptCodexQuota, queryChatGptCodexQuotaAuthorized, queryGrokBuildQuota, resolveChatGptCredential, type GrokBuildQuotaResult, type GrokBuildQuotaSnapshot, type ProviderFailure } from '../providers'
+import { AccountModelProbeError, applyGrokBuildHeaders, ChatGptCodexEndpointError, checkChatGptAccountAuthorized, classifyChatGptCredentialRefreshFailure, codexQuotaCooldownUntil, codexQuotaIsExhausted, consumeChatGptCodexResetCredit, consumeChatGptCodexResetCreditAuthorized, getProviderAdapter, probeChatGptAccountAuthorized, probeChatGptCodexModel, probeProviderModel, queryChatGptCodexModels, queryChatGptCodexModelsAuthorized, queryChatGptCodexQuota, queryChatGptCodexQuotaAuthorized, queryGrokBuildQuota, resolveChatGptCredential, type GrokBuildQuotaResult, type GrokBuildQuotaSnapshot, type ProviderFailure } from '../providers'
 import { validateAccountImportProxySelection, type AppStore } from '../store/app-store'
 import { clientFiles, type ClientConfigService, type ClientConnectionTarget } from '../client-config'
 import { WebDavBackupService, type DatabaseBackupService } from '../backup'
@@ -137,6 +137,7 @@ export function registerGatewayApi(
   const quotaProbeTimers = new Map<string, ReturnType<typeof setTimeout>>()
   const quotaProbeFlights = new Set<string>()
   const lastQuotaProbeAt = new Map<string, number>()
+  const codexResetCreditFlights = new Map<string, Promise<AppSnapshot>>()
   const apiSourceCapabilityProbeOwners = new Map<string, symbol>()
   const unsavedApiSourceProbeEvidence = new Map<string, {
     draftId: string
@@ -2435,6 +2436,109 @@ export function registerGatewayApi(
     else if (account?.cooldownReason === 'quota') gateway.resetAccountHealth(id)
     return publish(refreshRuntime())
   })
+  ipcMain.handle('stone:consume-account-codex-reset-credit', async (event, id: string) => {
+    assertTrustedSender(event)
+    const existing = codexResetCreditFlights.get(id)
+    if (existing) return await existing
+    const operation = (async (): Promise<AppSnapshot> => {
+      const account = store.getRuntimeAccount(id)
+      if (!account) throw new Error('Account not found.')
+      const releaseQuotaCooldown = account.cooldownReason === 'quota'
+      if ((account.codexQuota?.resetCredits?.availableCount ?? 0) <= 0) {
+        throw new Error('No usable Codex quota reset credit is available.')
+      }
+      const fetchImplementation = accountFetchImplementation(store, outboundTransport, account)
+      const requestId = randomUUID()
+      const resetSignal = (): AbortSignal => AbortSignal.timeout(30_000)
+      if (account.credentialType === 'chatgpt-agent-identity') {
+        let authorization = await resolveAgentIdentityForOperation(store, account, fetchImplementation)
+        try {
+          await consumeChatGptCodexResetCreditAuthorized(
+            authorization, fetchImplementation, resetSignal(), requestId
+          )
+        } catch (error) {
+          if (!(error instanceof ChatGptCodexEndpointError) || error.statusCode !== 401) throw error
+          authorization = await resolveAgentIdentityForOperation(
+            store,
+            account,
+            fetchImplementation,
+            undefined,
+            { forceTaskRegistration: true, expectedTaskId: authorization.taskId }
+          )
+          await consumeChatGptCodexResetCreditAuthorized(
+            authorization, fetchImplementation, resetSignal(), requestId
+          )
+        }
+      } else if (account.credentialType === 'chatgpt-oauth') {
+        const serialized = store.getCredential(account.credentialId)
+        if (!serialized) throw new Error('This ChatGPT account has no readable credential.')
+        let resolved = await resolveChatGptCredential(
+          serialized,
+          (rotated, expectedSource) => store.persistRotatedChatGptCredential(account.id, rotated, expectedSource),
+          fetchImplementation,
+          Date.now(),
+          { refreshKey: account.id },
+        )
+        try {
+          await consumeChatGptCodexResetCredit(
+            resolved.bundle, fetchImplementation, resetSignal(), requestId
+          )
+        } catch (error) {
+          if (!(error instanceof ChatGptCodexEndpointError) || error.statusCode !== 401) throw error
+          resolved = await recoverRejectedChatGptCredential(
+            store, account, fetchImplementation, resolved.bundle.accessToken
+          )
+          await consumeChatGptCodexResetCredit(
+            resolved.bundle, fetchImplementation, resetSignal(), requestId
+          )
+        }
+      } else {
+        throw new Error('Codex quota reset is only available for ChatGPT accounts.')
+      }
+      let quota
+      try {
+        quota = await refreshAccountCodexQuota(store, outboundTransport, id)
+      } catch {
+        // The reset has already committed upstream. A transient follow-up WHAM
+        // read must not report the whole operation as failed or leave the
+        // account in a stale quota cooldown.
+        const previousCredits = account.codexQuota?.resetCredits
+        const availableCount = Math.max(0, (previousCredits?.availableCount ?? 1) - 1)
+        const remainingExpiries = previousCredits?.expiresAt?.slice(1)
+        quota = {
+          observedAt: Date.now(),
+          source: 'usage-endpoint' as const,
+          allowed: true,
+          limitReached: false,
+          ...(account.codexQuota?.planType ? { planType: account.codexQuota.planType } : {}),
+          resetCredits: {
+            availableCount,
+            ...(remainingExpiries?.length ? { expiresAt: remainingExpiries } : {}),
+          },
+          detailsObservedAt: Date.now(),
+        }
+      }
+      await store.setAccountCheckResult(id, {
+        codexQuota: quota,
+        ...(releaseQuotaCooldown ? {
+          status: 'active' as const,
+          circuitState: 'closed' as const,
+          consecutiveFailures: 0,
+          cooldownReason: undefined,
+          cooldownUntil: undefined,
+          lastError: undefined,
+        } : {}),
+      })
+      if (releaseQuotaCooldown) gateway.resetAccountHealth(id)
+      return publish(refreshRuntime())
+    })()
+    codexResetCreditFlights.set(id, operation)
+    try {
+      return await operation
+    } finally {
+      if (codexResetCreditFlights.get(id) === operation) codexResetCreditFlights.delete(id)
+    }
+  })
   ipcMain.handle('stone:get-account-codex-quota-history', (event, id: string, from?: number, to?: number) => {
     assertTrustedSender(event)
     if (!store.getSnapshot().accounts.some((account) => account.id === id)) throw new Error('Account not found.')
@@ -2963,7 +3067,8 @@ function clientConnectionTarget(
 }
 
 function assertRouteClient(value: unknown): asserts value is RouteClient {
-  if (value !== 'claude' && value !== 'codex' && value !== 'gemini' && value !== 'grokbuild') {
+  if (value !== 'claude' && value !== 'codex' && value !== 'gemini' && value !== 'grokbuild'
+    && value !== 'deepseek-harness') {
     throw new Error('Unsupported client configuration target.')
   }
 }
@@ -3151,20 +3256,22 @@ async function resolveAgentIdentityForOperation(
   store: AppStore,
   account: Account,
   fetchImplementation: typeof fetch,
-  signal?: AbortSignal
-): Promise<{ authorization: string; accountId: string; fedramp?: boolean }> {
+  signal?: AbortSignal,
+  recovery?: { forceTaskRegistration?: boolean; expectedTaskId?: string }
+): Promise<{ authorization: string; accountId: string; fedramp?: boolean; taskId?: string }> {
   const serialized = store.getCredential(account.credentialId)
   if (!serialized) throw new Error('This Agent Identity account has no readable credential.')
   const access = await resolveChatGptAgentIdentity(
     serialized,
     (rotated, expectedSource) => store.persistRotatedChatGptAgentIdentityCredential(account.id, rotated, expectedSource),
     fetchImplementation,
-    { signal }
+    { signal, ...recovery }
   )
   return {
     authorization: access.authorization,
     accountId: access.bundle.accountId,
-    fedramp: access.bundle.fedramp
+    fedramp: access.bundle.fedramp,
+    taskId: access.bundle.taskId
   }
 }
 

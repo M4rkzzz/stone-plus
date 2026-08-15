@@ -15,6 +15,7 @@ import {
 import { supportsFastServiceTier } from '../../shared/types'
 import { providerSourceFamily } from '../../shared/source-family'
 import { applyReasoningEffortPolicy, normalizeReasoningEffort } from '../../shared/reasoning-policy'
+import { GPT_5_6_SOL_WM_MODEL, supportsPoolWmRouting } from '../../shared/wm-routing'
 import {
   DEEPSEEK_DEFAULT_REASONING_EFFORT,
   DEEPSEEK_RESPONSES_DEFAULT_MODEL,
@@ -60,6 +61,7 @@ import type {
   RequestLog,
   Route,
   RouteClient,
+  ModelCapabilityDefinition,
   UpstreamCapabilityRequirement
 } from '../../shared/types'
 import {
@@ -123,6 +125,8 @@ import type {
   OutboundFetchResolver,
   ConversationTitleResolver,
   GatewayServerOptions,
+  DeepSeekHarnessModelFamily,
+  PersistedDeepSeekHarnessModelBinding,
   ProtocolConversionContext,
   PersistedGrokVideoBinding,
   ResolvedGatewayCredential
@@ -152,6 +156,18 @@ interface IncomingRoute {
   operation: 'generate' | 'count-tokens' | 'codex-search' | 'codex-compact'
   client?: RouteClient
   geminiMethod?: 'generateContent' | 'streamGenerateContent'
+  authenticationProtocol?: Protocol
+  deepSeekHarnessSearch?: boolean
+}
+
+interface DeepSeekHarnessModelLimits {
+  contextWindow: number
+  maxOutputTokens: number
+}
+
+interface DeepSeekHarnessRouteModel {
+  id: string
+  family: DeepSeekHarnessModelFamily
 }
 
 interface GatewayConfigIndex {
@@ -167,6 +183,12 @@ interface GatewayConfigIndex {
 
 const MIN_FIRST_BODY_TIMEOUT_MS = 1_000
 const MAX_FIRST_BODY_TIMEOUT_MS = 12_000
+const CODEX_COMPATIBLE_CONTEXT_WINDOW = 272_000
+const CODEX_COMPATIBLE_MAX_OUTPUT_TOKENS = 128_000
+const GENERIC_HARNESS_CONTEXT_WINDOW = 128_000
+const GENERIC_HARNESS_MAX_OUTPUT_TOKENS = 32_768
+const MAX_DEEPSEEK_HARNESS_MODEL_BINDINGS = 100_000
+const CODEX_IMPORTED_HARNESS_SESSION_PREFIX = 'stone-codex-v2-'
 const HEDGE_ERROR_GRACE_MS = 750
 // Exhausted headers without a trustworthy reset must still stop a request
 // stampede, while remaining short enough to probe again promptly.
@@ -177,6 +199,22 @@ const QUOTA_EXHAUSTED_RECHECK_MS = 30_000
 // half-open streams. The configured idle timeout still wins when it is lower.
 const TRAILING_FRAME_DRAIN_MS = 2_000
 const RESPONSES_TERMINAL_IDLE_TIMEOUT_MS = 65_000
+// Relay edges occasionally answer a valid Responses request with an HTML
+// gateway page (Cloudflare 52x is the common case), an empty 2xx body, or a
+// buffered/streamed body whose Content-Type does not match its framing. These
+// failures happen before any client-visible byte. Retry them only while no
+// application-level output, tool call, usage, or terminal event was observed,
+// even when the route's ordinary retry budget is intentionally zero. Keep the
+// compatibility budget small and inside the original response-start deadline
+// so a sick relay cannot create an unbounded retry loop.
+const MAX_RESPONSES_RELAY_ADAPTIVE_RETRIES = 2
+const RESPONSES_RELAY_RETRY_BASE_DELAY_MS = 150
+// Request-scoped capacity shedding is neither an account-health failure nor a
+// useful error for Codex to surface immediately. Keep the first two identical
+// failures private and expose the third. A separate total cap prevents a relay
+// that alternates error wording from spinning until the response deadline.
+const REQUEST_TRANSIENT_EXPLICIT_FAILURE_COUNT = 3
+const MAX_REQUEST_TRANSIENT_RETRIES = 6
 // Search entitlement is attached to the concrete OAuth grant, not merely to
 // the account's broad credential type. Remember a proven endpoint capability
 // long enough to remove a guaranteed 401 from normal use, while periodically
@@ -364,6 +402,8 @@ export class GatewayServer implements GatewayController {
   private readonly conversationTitleResolver?: ConversationTitleResolver
   private readonly loadGrokVideoBindings?: GatewayServerOptions['loadGrokVideoBindings']
   private readonly saveGrokVideoBindings?: GatewayServerOptions['saveGrokVideoBindings']
+  private readonly loadDeepSeekHarnessModelBindings?: GatewayServerOptions['loadDeepSeekHarnessModelBindings']
+  private readonly saveDeepSeekHarnessModelBindings?: GatewayServerOptions['saveDeepSeekHarnessModelBindings']
   private readonly beforeStart?: () => Promise<void>
   private readonly scheduler: PoolScheduler
   private readonly largeRequestBodies = new WeightedByteGate(LARGE_REQUEST_BODY_BUDGET_BYTES)
@@ -374,6 +414,10 @@ export class GatewayServer implements GatewayController {
   private readonly grokVideoBindings = new Map<string, GrokVideoBinding>()
   private grokVideoBindingsRestored = false
   private grokVideoBindingPersistence: Promise<void> = Promise.resolve()
+  private readonly deepSeekHarnessModelBindings = new Map<string, PersistedDeepSeekHarnessModelBinding>()
+  private deepSeekHarnessModelBindingsRestored = false
+  private deepSeekHarnessModelBindingRestoreError?: Error
+  private deepSeekHarnessModelBindingPersistence: Promise<void> = Promise.resolve()
   private readonly requestReplays: RequestReplayStore
   private requestReplayCaptureEnabled: boolean
   private requestReplayGeneration = 0
@@ -399,6 +443,8 @@ export class GatewayServer implements GatewayController {
     this.conversationTitleResolver = options.conversationTitleResolver
     this.loadGrokVideoBindings = options.loadGrokVideoBindings
     this.saveGrokVideoBindings = options.saveGrokVideoBindings
+    this.loadDeepSeekHarnessModelBindings = options.loadDeepSeekHarnessModelBindings
+    this.saveDeepSeekHarnessModelBindings = options.saveDeepSeekHarnessModelBindings
     this.beforeStart = options.beforeStart
     this.now = options.now ?? (() => Date.now())
     this.random = options.random ?? (() => Math.random())
@@ -425,6 +471,7 @@ export class GatewayServer implements GatewayController {
     if (this.server) return
     await this.beforeStart?.()
     await this.restoreGrokVideoBindings()
+    await this.restoreDeepSeekHarnessModelBindings()
     this.scheduler.hydrate(this.config.accounts, this.config.pools)
     this.scheduler.hydratePerformance(this.config.recentRequestLogs ?? [])
 
@@ -693,6 +740,13 @@ export class GatewayServer implements GatewayController {
       await this.handleLiveCapabilityBoundary(request, response, requestIndex)
       return
     }
+    if (
+      (request.method === 'GET' || request.method === 'POST')
+      && pathname === '/deepseek-harness/stone/session-models'
+    ) {
+      await this.handleDeepSeekHarnessSessionModels(request, response, requestIndex)
+      return
+    }
     const modelListRoute = request.method === 'GET' ? classifyModelListRoute(pathname) : undefined
     if (modelListRoute) {
       await this.handleModelList(request, response, modelListRoute.kind, requestIndex, modelListRoute.client)
@@ -751,6 +805,7 @@ export class GatewayServer implements GatewayController {
     let toolUseCount: number | undefined
     let stopReason: string | undefined
     let kiroStructuralRecoveryCount: number | undefined
+    let deepSeekHarnessSearchQuery: string | undefined
     let lastProgressLogAt = 0
     let progressStage: NonNullable<RequestLog['progressStage']> = 'receiving-body'
     let scheduledProgressLog: ReturnType<typeof setImmediate> | undefined
@@ -950,7 +1005,12 @@ export class GatewayServer implements GatewayController {
       return log
     }
       try {
-        logRoute = this.authenticate(request, incoming.protocol, requestIndex, incoming.client)
+        logRoute = this.authenticate(
+          request,
+          incoming.authenticationProtocol ?? incoming.protocol,
+          requestIndex,
+          incoming.client,
+        )
         const authenticatedClient = logRoute.client
         subagentRequest = logRoute.client === 'codex' && isCodexSubagentRequest(request)
       // Route objects can be mutated and handed back through updateConfig.
@@ -1007,6 +1067,11 @@ export class GatewayServer implements GatewayController {
       }
       const bodyReadyAt = this.now()
       bodyReadMs = Math.max(0, bodyReadyAt - started)
+      if (incoming.deepSeekHarnessSearch) {
+        const search = transformDeepSeekHarnessSearchRequest(body)
+        body = search.body
+        deepSeekHarnessSearchQuery = search.query
+      }
       if (incoming.protocol === 'openai-responses' && isResponsesAgentClient(logRoute.client)) {
         body = normalizeCodexCompactHistory(body)
       }
@@ -1016,9 +1081,27 @@ export class GatewayServer implements GatewayController {
         : { hasToolState: false, hasToolResult: false }
       model = getRequestModel(incoming.protocol, body, pathname)
       if (!model) throw new GatewayHttpError(400, 'A model is required')
-      const targetModel = resolveRouteModel(logRoute.modelMap, model)
+      const routedModel = resolveRouteModel(logRoute.modelMap, model)
       const effectiveSourceId = resolveRouteSourceId(logRoute.poolId, logRoute.modelSourceMap, model)
+      const pool = requestIndex.poolsById.get(effectiveSourceId)
+      if (!pool) throw new GatewayHttpError(503, 'The matched route has no available pool')
+      const configuredProviderAccounts = requestIndex.accountsByPoolId.get(pool.id) ?? []
+      const targetModel = pool.routeToWm === true
+        && supportsPoolWmRouting(pool.protocol, configuredProviderAccounts)
+        ? GPT_5_6_SOL_WM_MODEL
+        : routedModel
       upstreamModel = targetModel
+      if (logRoute.client === 'deepseek-harness' && incoming.operation === 'generate') {
+        await this.enforceDeepSeekHarnessModelFamily({
+          request,
+          body,
+          route: logRoute,
+          requestedModel: model,
+          targetModel,
+          sourceId: effectiveSourceId,
+          index: requestIndex,
+        })
+      }
       const codexSearch = incoming.operation === 'codex-search'
       const codexCompact = incoming.operation === 'codex-compact'
       const countTokens = incoming.operation === 'count-tokens'
@@ -1040,9 +1123,6 @@ export class GatewayServer implements GatewayController {
         : false
 
       failureStage = 'scheduler'
-      const pool = requestIndex.poolsById.get(effectiveSourceId)
-      if (!pool) throw new GatewayHttpError(503, 'The matched route has no available pool')
-      const configuredProviderAccounts = requestIndex.accountsByPoolId.get(pool.id) ?? []
       let providerAccounts = configuredProviderAccounts
       if (countTokens) {
         providerAccounts = configuredProviderAccounts.filter((account) => (
@@ -1289,10 +1369,13 @@ export class GatewayServer implements GatewayController {
            * (codexCompact || codexCompactV2 ? 4 : 1)
       let lastAttemptError: GatewayHttpError | undefined
       let ordinaryRetriesUsed = 0
+      let responsesRelayAdaptiveRetriesUsed = 0
       let compactCompatibilityRetriesUsed = 0
       let kiroInvalidStateRetryUsed = false
       let preferredTransientRetryAccountId: string | undefined
-      const transientSameAccountRetryCount = new Map<string, number>()
+      let lastRequestTransientFailureSignature: string | undefined
+      let consecutiveRequestTransientFailures = 0
+      let requestTransientRetriesUsed = 0
       const failedAccountIds = new Set<string>()
       const nativeCompactCapabilityFailedAccountIds = new Set<string>()
       const currentExcludedAccountIds = (): string[] => codexCompactV2 && !codexCompactV2Fallback
@@ -1307,6 +1390,7 @@ export class GatewayServer implements GatewayController {
         if (countTokens) countTokensUpstreamResponseHeaders = undefined
         let release: (() => void) | undefined
         let attemptedAccount: Account | undefined
+        let attemptedCredentialKind: ResolvedGatewayCredential['kind'] | undefined
         let attemptedCompactFallback = false
         let selectedHealthRevision: number | undefined
         let selectedResetEpoch: number | undefined
@@ -1339,7 +1423,8 @@ export class GatewayServer implements GatewayController {
             scheduled = await this.scheduler.selectAndAcquireWhenAvailable({
               pool: schedulingPool,
               accounts: accountsForCurrentAttempt(),
-              model: targetModel,
+              model: routedModel,
+              modelCooldownKey: targetModel,
               sessionId,
               excludedAccountIds: currentExcludedAccountIds(),
               providers: requestConfig.providers,
@@ -1369,7 +1454,8 @@ export class GatewayServer implements GatewayController {
                 scheduled = await this.scheduler.selectAndAcquireWhenAvailable({
                   pool: schedulingPool,
                   accounts: accountsForCurrentAttempt(),
-                  model: targetModel,
+                  model: routedModel,
+                  modelCooldownKey: targetModel,
                   sessionId,
                   excludedAccountIds: currentExcludedAccountIds(),
                   providers: requestConfig.providers,
@@ -1471,6 +1557,7 @@ export class GatewayServer implements GatewayController {
           let resolvedCredential = typeof resolvedValue === 'string'
             ? { secret: resolvedValue, kind: 'api-key' as const }
             : resolvedValue
+          attemptedCredentialKind = resolvedCredential.kind
           const credential = resolvedCredential.secret
           const cachedSearchCapability = codexSearch && isChatGptCodexCredentialKind(resolvedCredential.kind)
             ? this.getCodexSearchCapability(account.id, resolvedCredential)
@@ -1533,7 +1620,8 @@ export class GatewayServer implements GatewayController {
                 resolvedCredential.accountId,
                 resolvedCredential.fedramp,
                 request.headers,
-                (codexSearch && !preferSearchFallback) || codexCompact ? 'json' : 'stream'
+                (codexSearch && !preferSearchFallback) || codexCompact ? 'json' : 'stream',
+                account.id,
               )
             } else {
               const credentialBundle = {
@@ -1542,9 +1630,9 @@ export class GatewayServer implements GatewayController {
                 expiresAt: account.credentialExpiresAt ?? Number.MAX_SAFE_INTEGER
               }
               if (codexSearch && !preferSearchFallback) {
-                applyChatGptCodexSearchHeaders(upstreamHeaders, credentialBundle, request.headers)
+                applyChatGptCodexSearchHeaders(upstreamHeaders, credentialBundle, request.headers, account.id)
               } else {
-                applyChatGptCodexHeaders(upstreamHeaders, credentialBundle, request.headers)
+                applyChatGptCodexHeaders(upstreamHeaders, credentialBundle, request.headers, account.id)
               }
             }
             if (codexCompact) upstreamHeaders.set('accept', 'application/json')
@@ -1974,9 +2062,9 @@ export class GatewayServer implements GatewayController {
                 expiresAt: account.credentialExpiresAt ?? Number.MAX_SAFE_INTEGER,
               }
               if (codexSearch && !preferSearchFallback) {
-                applyChatGptCodexSearchHeaders(upstreamHeaders, recoveredBundle, request.headers)
+                applyChatGptCodexSearchHeaders(upstreamHeaders, recoveredBundle, request.headers, account.id)
               } else {
-                applyChatGptCodexHeaders(upstreamHeaders, recoveredBundle, request.headers)
+                applyChatGptCodexHeaders(upstreamHeaders, recoveredBundle, request.headers, account.id)
               }
               if (codexCompact) upstreamHeaders.set('accept', 'application/json')
               if (sessionId && !upstreamHeaders.has('session-id')) upstreamHeaders.set('session-id', sessionId)
@@ -2183,14 +2271,15 @@ export class GatewayServer implements GatewayController {
                   resolvedCredential.accountId!,
                   resolvedCredential.fedramp,
                   request.headers,
-                  'stream'
+                  'stream',
+                  account.id,
                 )
               } else {
                 applyChatGptCodexHeaders(fallbackHeaders, {
                   accessToken: resolvedCredential.secret,
                   accountId: resolvedCredential.accountId!,
                   expiresAt: account.credentialExpiresAt ?? Number.MAX_SAFE_INTEGER
-                }, request.headers)
+                }, request.headers, account.id)
               }
               if (sessionId && !fallbackHeaders.has('session-id')) fallbackHeaders.set('session-id', sessionId)
               const fallbackBody = withChatGptCodexBody(buildChatGptSearchFallbackBody(body, targetModel))
@@ -2270,7 +2359,14 @@ export class GatewayServer implements GatewayController {
 
           if (!upstreamResponse.ok) {
             const payload = errorPayload ?? {}
-            const safePayload = sanitizeUpstreamPayload(payload, sensitiveValues(resolvedCredential))
+            // Edge proxies commonly replace a relay's structured JSON error
+            // with an HTML page. Never reflect that page (or its request
+            // metadata) to Codex; retain a machine-readable marker so the
+            // precommit retry path below can recover transparently.
+            const safePayload = provider.sourceType === 'relay'
+              && isNonJsonUpstreamPayload(payload)
+              ? relayNonJsonErrorBody(upstreamResponse.status)
+              : sanitizeUpstreamPayload(payload, sensitiveValues(resolvedCredential))
             const providerFailure = modelScopedProviderFailure(
               upstreamResponse.status,
               payload,
@@ -2288,7 +2384,7 @@ export class GatewayServer implements GatewayController {
               upstreamResponse.status,
               isChatGptCodexCredentialKind(resolvedCredential.kind) ? providerFailure.message : upstreamErrorMessage(safePayload),
               `provider_${providerFailure.category}`,
-              isChatGptCodexCredentialKind(resolvedCredential.kind)
+               isChatGptCodexCredentialKind(resolvedCredential.kind)
                 ? { error: { message: providerFailure.message, type: `provider_${providerFailure.category}` } }
                 : safePayload,
               providerFailure,
@@ -2428,13 +2524,25 @@ export class GatewayServer implements GatewayController {
               await readUpstreamJson(upstreamResponse, responseBodySignal),
               sensitiveValues(resolvedCredential)
             )
+            const downstreamPayload = incoming.deepSeekHarnessSearch
+              ? buildDeepSeekHarnessSearchResponse(
+                  payload,
+                  deepSeekHarnessSearchQuery ?? '',
+                  model,
+                )
+              : payload
             performanceRevision = this.reportAccountSuccess(
               account, attemptStarted, headerSignals, selectedHealthRevision, selectedResetEpoch
             )
             release?.()
             release = undefined
             releaseCommittedRequestBody()
-            const written = await this.writeJson(response, upstreamResponse.status, payload, markClientFirstWrite)
+            const written = await this.writeJson(
+              response,
+              upstreamResponse.status,
+              downstreamPayload,
+              markClientFirstWrite,
+            )
             if (!written) throw new GatewayHttpError(499, 'Client closed the request', 'client_closed')
             const completedAt = this.now()
             this.successRequests += 1
@@ -2741,7 +2849,7 @@ export class GatewayServer implements GatewayController {
               onResponseCommit: releaseCommittedRequestBody
             }
             const bridgeSameProtocolResponse = incoming.protocol === provider.protocol
-              && conversionContext?.toolBridgePlan?.requiresResponseBridge === true
+              && conversionContextRequiresResponseBridge(conversionContext)
             let kiroParser = provider.protocol === 'kiro-claude'
               ? createKiroEventStreamParser({
                   declaredToolNames: kiroDeclaredToolNames,
@@ -2758,7 +2866,13 @@ export class GatewayServer implements GatewayController {
                 response,
                 provider.protocol,
                 incoming.protocol,
-                { id: randomUUID(), model, toolBridgePlan: conversionContext?.toolBridgePlan },
+                {
+                  id: randomUUID(),
+                  model,
+                  toolBridgePlan: conversionContext?.toolBridgePlan,
+                  sanitizeDeepSeekHarnessToolArguments:
+                    conversionContext?.sanitizeDeepSeekHarnessToolArguments,
+                },
                 sensitiveValues(resolvedCredential),
                 streamTiming,
                 kiroParser || deepSeekParser ? {
@@ -2776,7 +2890,14 @@ export class GatewayServer implements GatewayController {
                   provider.protocol,
                   { id: randomUUID(), model },
                   sensitiveValues(resolvedCredential),
-                  streamTiming
+                  streamTiming,
+                  {
+                    // ChatGPT may finish an otherwise healthy HTTP 200 stream
+                    // with request-scoped server_is_overloaded/slow_down. Keep
+                    // lifecycle and reasoning frames private until real output
+                    // makes replay unsafe, so Stone+ can recover transparently.
+                    commitOnlyOnOutputOrTerminal: isChatGptCodexCredentialKind(resolvedCredential.kind),
+                  }
                 )
               : await pipeCurrentConvertedStream()
             if (kiroParser
@@ -2979,8 +3100,27 @@ export class GatewayServer implements GatewayController {
               )
             }
             payload = streamResult.response
+          } else if (provider.sourceType === 'relay'
+            && provider.protocol === 'openai-responses') {
+            const parsed = await readAdaptiveOpenAiResponsesRelay(
+              upstreamResponse,
+              { id: randomUUID(), model, now: this.now },
+              responseBodySignal,
+              firstBodyTimeoutMs,
+              streamIdleTimeoutMs,
+              responsesProgressIdleTimeoutMs,
+              sensitiveValues(resolvedCredential)
+            )
+            payload = parsed.payload
+            // Only same-protocol JSON may reuse the exact upstream bytes. SSE
+            // was intentionally aggregated, while converted responses must be
+            // serialized from the converted object below.
+            if (provider.protocol === incoming.protocol
+              && !conversionContextRequiresResponseBridge(conversionContext)) {
+              reusableResponseBytes = parsed.rawJson
+            }
           } else if (provider.protocol === incoming.protocol
-            && conversionContext?.toolBridgePlan?.requiresResponseBridge !== true) {
+            && !conversionContextRequiresResponseBridge(conversionContext)) {
             // Preserve the exact upstream bytes only for the identity path,
             // where they can be forwarded without a second serialization. A
             // converted response does not need that extra Buffer/concat copy;
@@ -3094,6 +3234,10 @@ export class GatewayServer implements GatewayController {
             : undefined
           const requestScopedModelFailure = modelScopedFailure !== undefined
           const requestScopedTransientFailure = gatewayError.providerFailure?.scope === 'request'
+            || (
+              isChatGptCodexCredentialKind(attemptedCredentialKind ?? 'api-key')
+              && isChatGptTransientStreamFailure(gatewayError)
+            )
           const failureNow = this.now()
           const actualResetAt = quotaSignalCooldownUntil(gatewayError.quotaSignals, failureNow)
           // Codex percentage/WHAM telemetry is advisory. A real OAuth 429/402
@@ -3130,6 +3274,49 @@ export class GatewayServer implements GatewayController {
               fallbackRequirements,
               [...failedAccountIds]
             )
+          const attemptedProvider = attemptedAccount
+            ? requestIndex.providersById.get(attemptedAccount.providerId)
+            : undefined
+          const adaptiveRelayFailure = isAdaptiveResponsesRelayFailure(
+            attemptedProvider,
+            gatewayError
+          )
+          if (
+            adaptiveRelayFailure
+            && attemptedAccount
+            && !response.headersSent
+            && !gatewayError.upstreamSemanticObserved
+            && responsesRelayAdaptiveRetriesUsed < MAX_RESPONSES_RELAY_ADAPTIVE_RETRIES
+          ) {
+            const retryDelayMs = hasCurrentModeAlternative
+              ? 0
+              : Math.min(
+                  1_000,
+                  RESPONSES_RELAY_RETRY_BASE_DELAY_MS
+                    * (2 ** responsesRelayAdaptiveRetriesUsed)
+                )
+            if (this.now() + retryDelayMs < responseStartDeadlineAt) {
+              responsesRelayAdaptiveRetriesUsed += 1
+              lastAttemptError = gatewayError
+              failoverCount += 1
+              if (hasCurrentModeAlternative) {
+                failedAccountIds.add(attemptedAccount.id)
+                this.scheduler.recordStickyFailure(schedulingPool.id, sessionId, attemptedAccount.id)
+              } else {
+                // A standalone relay still receives a bounded compatibility
+                // retry even when maxRetries=0. This is deliberately scoped to
+                // pre-semantic response-format/edge failures, never 4xx requests.
+                preferredTransientRetryAccountId = attemptedAccount.id
+              }
+              release?.()
+              release = undefined
+              scheduleProgressLog('retrying')
+              if (retryDelayMs > 0) {
+                await waitForRetryDelay(retryDelayMs, clientAbortController.signal)
+              }
+              continue
+            }
+          }
           const provenAccountFailure = !requestScopedTransientFailure && gatewayError.type !== 'kiro_invalid_state' && (
             retryable
               || accountAction === 'disable'
@@ -3179,19 +3366,39 @@ export class GatewayServer implements GatewayController {
             }
           }
           if (attemptedAccount && requestScopedTransientFailure) {
-            const used = transientSameAccountRetryCount.get(attemptedAccount.id) ?? 0
-            const sameAccountRetryLimit = Math.min(2, retryLimit)
+            const signature = requestTransientFailureSignature(gatewayError)
+            if (signature === lastRequestTransientFailureSignature) {
+              consecutiveRequestTransientFailures += 1
+            } else {
+              lastRequestTransientFailureSignature = signature
+              consecutiveRequestTransientFailures = 1
+            }
             const retryDelayMs = Math.min(2_000, Math.max(
               100,
               gatewayError.providerFailure?.retryAfterMs ?? 500
             ))
             if (
-              used < sameAccountRetryLimit
+              consecutiveRequestTransientFailures < REQUEST_TRANSIENT_EXPLICIT_FAILURE_COUNT
+              && requestTransientRetriesUsed < MAX_REQUEST_TRANSIENT_RETRIES
               && !response.headersSent
               && this.now() + retryDelayMs < responseStartDeadlineAt
             ) {
-              transientSameAccountRetryCount.set(attemptedAccount.id, used + 1)
-              preferredTransientRetryAccountId = attemptedAccount.id
+              requestTransientRetriesUsed += 1
+              failoverCount += 1
+              // Prefer a fresh peer when one exists. If every peer has already
+              // been tried, retry the current source without mutating its
+              // health: overload/slow_down is request-scoped capacity noise.
+              if (hasCurrentModeAlternative) {
+                failedAccountIds.add(attemptedAccount.id)
+                preferredTransientRetryAccountId = undefined
+              } else {
+                // The peer set may be exhausted after two different accounts
+                // have shed the request. Remove this account from the
+                // per-request exclusion before pinning the final retry, so the
+                // scheduler cannot fail early with NoEligibleAccountError.
+                failedAccountIds.delete(attemptedAccount.id)
+                preferredTransientRetryAccountId = attemptedAccount.id
+              }
               lastAttemptError = gatewayError
               release?.()
               release = undefined
@@ -3202,7 +3409,10 @@ export class GatewayServer implements GatewayController {
             // Capacity shedding is not an account-health signal. Exclude the
             // exhausted member only from this request so a peer may try, but
             // keep its circuit, persisted status and future sticky sessions.
-            if (hasCurrentModeAlternative) failedAccountIds.add(attemptedAccount.id)
+            if (
+              consecutiveRequestTransientFailures < REQUEST_TRANSIENT_EXPLICIT_FAILURE_COUNT
+              && hasCurrentModeAlternative
+            ) failedAccountIds.add(attemptedAccount.id)
           }
           if (attemptedAccount && provenAccountFailure && !requestScopedModelFailure) {
             const hasUsableAlternative = hasCurrentModeAlternative || hasCompactFallbackPeer
@@ -3259,6 +3469,16 @@ export class GatewayServer implements GatewayController {
             && !response.headersSent
             && retryable
             && attemptedAccount !== undefined
+            // Request-scoped overload/slow_down has its own strict
+            // same-error budget. Do not let the ordinary pool retry budget
+            // turn the third identical failure into a fourth hidden attempt.
+            && !(
+              requestScopedTransientFailure
+              && (
+                consecutiveRequestTransientFailures >= REQUEST_TRANSIENT_EXPLICIT_FAILURE_COUNT
+                || requestTransientRetriesUsed >= MAX_REQUEST_TRANSIENT_RETRIES
+              )
+            )
             // A Claude tool-result continuation belongs to the source that
             // emitted the matching tool_use. Retrying it through another
             // account/relay can detach stateful Anthropic-compatible bridges
@@ -3268,9 +3488,6 @@ export class GatewayServer implements GatewayController {
             && this.now() < responseStartDeadlineAt
             && (!(requestScopedModelFailure || requestScopedTransientFailure) || hasCurrentModeAlternative)
             && (hasCurrentModeAlternative || (!hardAccountFailure && !explicitRetryAfterAdmissionFailure))
-          const attemptedProvider = attemptedAccount
-            ? requestIndex.providersById.get(attemptedAccount.providerId)
-            : undefined
           const attemptedAccountId = attemptedAccount?.id
           const sameSourceCanUseOrdinaryResponses = attemptedProvider?.protocol === 'openai-responses'
             && attemptedAccountId !== undefined
@@ -3988,6 +4205,227 @@ export class GatewayServer implements GatewayController {
     return operation
   }
 
+  private async restoreDeepSeekHarnessModelBindings(): Promise<void> {
+    if (this.deepSeekHarnessModelBindingsRestored) return
+    this.deepSeekHarnessModelBindingsRestored = true
+    this.deepSeekHarnessModelBindingRestoreError = undefined
+    if (!this.loadDeepSeekHarnessModelBindings) return
+
+    let persisted: readonly PersistedDeepSeekHarnessModelBinding[]
+    try {
+      persisted = await this.loadDeepSeekHarnessModelBindings()
+      if (persisted.length > MAX_DEEPSEEK_HARNESS_MODEL_BINDINGS) {
+        throw new Error('The model-family journal contains too many sessions.')
+      }
+      for (const candidate of persisted) {
+        const binding = validPersistedDeepSeekHarnessModelBinding(candidate)
+        if (!binding) continue
+        const current = this.deepSeekHarnessModelBindings.get(binding.sessionId)
+        if (current && current.family !== binding.family) {
+          throw new Error('The model-family journal contains a conflicting session binding.')
+        }
+        if (!current || current.boundAt > binding.boundAt) {
+          this.deepSeekHarnessModelBindings.set(binding.sessionId, binding)
+        }
+      }
+      await this.persistDeepSeekHarnessModelBindings()
+    } catch (error) {
+      this.deepSeekHarnessModelBindings.clear()
+      this.deepSeekHarnessModelBindingRestoreError = error instanceof Error
+        ? error
+        : new Error('The model-family journal could not be restored.')
+      console.warn('Stone+ could not restore DeepSeek Harness model-family bindings', error)
+    }
+  }
+
+  private persistDeepSeekHarnessModelBindings(): Promise<void> {
+    if (!this.saveDeepSeekHarnessModelBindings) return Promise.resolve()
+    const snapshot = [...this.deepSeekHarnessModelBindings.values()]
+      .sort((left, right) => left.boundAt - right.boundAt || left.sessionId.localeCompare(right.sessionId))
+      .map((binding) => ({ ...binding }))
+    const operation = this.deepSeekHarnessModelBindingPersistence
+      .catch(() => undefined)
+      .then(() => this.saveDeepSeekHarnessModelBindings!(snapshot))
+    this.deepSeekHarnessModelBindingPersistence = operation
+    return operation
+  }
+
+  private async enforceDeepSeekHarnessModelFamily(input: {
+    request: IncomingMessage
+    body: JsonObject
+    route: Route
+    requestedModel: string
+    targetModel: string
+    sourceId: string
+    index: GatewayConfigIndex
+  }): Promise<void> {
+    const sessionId = readDeepSeekHarnessSessionId(input.request, input.body)
+    if (!sessionId) {
+      throw new GatewayHttpError(
+        400,
+        'DeepSeek Harness requests must include a valid session id.',
+        'missing_session_id',
+      )
+    }
+    const requestedFamily = deepSeekHarnessModelNameFamily(input.requestedModel)
+    const targetFamily = deepSeekHarnessModelNameFamily(input.targetModel)
+    const family = resolveDeepSeekHarnessModelFamily(
+      input.requestedModel,
+      input.targetModel,
+      input.sourceId,
+      input.index,
+    )
+    if (!family) {
+      const detail = requestedFamily && targetFamily && requestedFamily !== targetFamily
+        ? 'Cross-family model aliases are not available to DeepSeek Harness.'
+        : 'DeepSeek Harness only accepts DeepSeek models or genuine GPT-5.6 models from a matching source.'
+      throw new GatewayHttpError(422, detail, 'unsupported_model_family')
+    }
+    await this.bindDeepSeekHarnessModelFamily(sessionId, family)
+  }
+
+  private deepSeekHarnessLockedFamily(sessionId: string): DeepSeekHarnessModelFamily | undefined {
+    return sessionId.startsWith(CODEX_IMPORTED_HARNESS_SESSION_PREFIX)
+      ? 'gpt'
+      : this.deepSeekHarnessModelBindings.get(sessionId)?.family
+  }
+
+  private assertDeepSeekHarnessModelFamilySelection(
+    sessionId: string,
+    family: DeepSeekHarnessModelFamily,
+  ): DeepSeekHarnessModelFamily | undefined {
+    const lockedFamily = this.deepSeekHarnessLockedFamily(sessionId)
+    if (lockedFamily !== undefined && family !== lockedFamily) {
+      throw new GatewayHttpError(
+        409,
+        lockedFamily === 'gpt'
+          ? 'This DeepSeek Harness session is permanently bound to GPT-5.6 models.'
+          : 'This DeepSeek Harness session is permanently bound to DeepSeek models.',
+        'model_family_locked',
+      )
+    }
+    return lockedFamily
+  }
+
+  private async bindDeepSeekHarnessModelFamily(
+    sessionId: string,
+    family: DeepSeekHarnessModelFamily,
+  ): Promise<void> {
+    if (this.deepSeekHarnessModelBindingRestoreError) {
+      throw new GatewayHttpError(
+        503,
+        'DeepSeek Harness session model-family state is unavailable. Restart Stone+ after repairing its local state.',
+        'model_family_state_unavailable',
+      )
+    }
+
+    const current = this.deepSeekHarnessModelBindings.get(sessionId)
+    const lockedFamily = this.assertDeepSeekHarnessModelFamilySelection(sessionId, family) ?? family
+
+    const needsBinding = !current || current.family !== lockedFamily
+    if (needsBinding) {
+      if (!current && this.deepSeekHarnessModelBindings.size >= MAX_DEEPSEEK_HARNESS_MODEL_BINDINGS) {
+        throw new GatewayHttpError(507, 'The DeepSeek Harness session model-family journal is full.', 'model_family_state_full')
+      }
+      this.deepSeekHarnessModelBindings.set(sessionId, {
+        sessionId,
+        family: lockedFamily,
+        boundAt: current?.boundAt ?? Math.max(0, Math.floor(this.now())),
+      })
+    }
+
+    try {
+      if (needsBinding) {
+        await this.persistDeepSeekHarnessModelBindings()
+      } else {
+        await this.deepSeekHarnessModelBindingPersistence
+      }
+    } catch {
+      try {
+        await this.persistDeepSeekHarnessModelBindings()
+      } catch (error) {
+        if (current) this.deepSeekHarnessModelBindings.set(sessionId, current)
+        else this.deepSeekHarnessModelBindings.delete(sessionId)
+        console.warn('Stone+ could not persist a DeepSeek Harness model-family binding', error)
+        throw new GatewayHttpError(
+          503,
+          'DeepSeek Harness could not persist this session model-family binding. No upstream request was sent.',
+          'model_family_state_unavailable',
+        )
+      }
+    }
+  }
+
+  private async handleDeepSeekHarnessSessionModels(
+    request: IncomingMessage,
+    response: ServerResponse,
+    index: GatewayConfigIndex,
+  ): Promise<void> {
+    try {
+      const route = this.authenticateModelList(request, 'openai', index, 'deepseek-harness')
+      if (this.deepSeekHarnessModelBindingRestoreError) {
+        throw new GatewayHttpError(
+          503,
+          'DeepSeek Harness session model-family state is unavailable. Restart Stone+ after repairing its local state.',
+          'model_family_state_unavailable',
+        )
+      }
+
+      let sessionId: string | undefined
+      let selectedModel: string | undefined
+      if (request.method === 'POST') {
+        const parsed = await readJsonBody(request, {
+          hardLimitBytes: 16 * 1024,
+          signal: new AbortController().signal,
+          idleTimeoutMs: 5_000,
+        })
+        sessionId = normalizeDeepSeekHarnessSessionId(parsed.value.sessionId)
+        selectedModel = typeof parsed.value.model === 'string' ? parsed.value.model.trim() : undefined
+      } else {
+        const rawUrl = new URL(request.url ?? '/', 'http://localhost')
+        sessionId = normalizeDeepSeekHarnessSessionId(rawUrl.searchParams.get('session_id'))
+      }
+      if (!sessionId) {
+        throw new GatewayHttpError(400, 'A valid DeepSeek Harness session id is required.', 'missing_session_id')
+      }
+      if (request.method === 'POST' && !selectedModel) {
+        throw new GatewayHttpError(400, 'A DeepSeek Harness model selection is required.', 'invalid_request_error')
+      }
+
+      const entries = deepSeekHarnessRouteModelDirectory(route, index)
+      if (selectedModel !== undefined) {
+        const selected = entries.find((entry) => entry.id === selectedModel)
+        if (!selected) {
+          throw new GatewayHttpError(
+            422,
+            'The selected model is not available on this DeepSeek Harness route.',
+            'unsupported_model_family',
+          )
+        }
+        // DSH selects its default model while creating an empty session. A
+        // selection alone must not lock the session family; the first actual
+        // generation request performs the durable binding instead.
+        this.assertDeepSeekHarnessModelFamilySelection(sessionId, selected.family)
+      }
+
+      const family = this.deepSeekHarnessLockedFamily(sessionId)
+      response.setHeader('cache-control', 'no-store')
+      await this.writeJson(response, 200, {
+        family: family ?? null,
+        allowedModels: entries
+          .filter((entry) => family === undefined || entry.family === family)
+          .map((entry) => entry.id),
+      })
+    } catch (error) {
+      const gatewayError = normalizeError(error)
+      await this.writeJson(
+        response,
+        gatewayError.statusCode,
+        gatewayError.responseBody ?? { error: { message: gatewayError.message, type: gatewayError.type } },
+      )
+    }
+  }
+
   private dispatchResponsesWebSocket(input: ResponsesWebSocketDispatchInput): Promise<Response> {
     const headers = responsesWebSocketForwardHeaders(input.headers)
     const host = formatUrlHost(this.config.settings.host)
@@ -4010,7 +4448,9 @@ export class GatewayServer implements GatewayController {
     if (!token) throw new GatewayHttpError(401, 'A local gateway token is required', 'authentication_error')
     const route = (index.enabledRoutesByProtocol.get(protocol) ?? [])
       .find((candidate) => (
-        (client ? candidate.client === client : candidate.client !== 'grokbuild')
+        (client
+          ? candidate.client === client
+          : candidate.client !== 'grokbuild' && candidate.client !== 'deepseek-harness')
         && secureEquals(candidate.localToken, token)
       ))
     if (!route) throw new GatewayHttpError(401, 'Invalid local gateway token', 'authentication_error')
@@ -4066,17 +4506,26 @@ export class GatewayServer implements GatewayController {
       const pool = index.poolsById.get(route.poolId)
       if (!pool) throw new GatewayHttpError(503, 'The matched route has no available pool')
       const accounts = index.accountsByPoolId.get(pool.id) ?? []
-      const models = uniqueModels([
+      const projectedModels = uniqueModels([
         ...projectRouteModels(
         enumerablePoolModels(pool, accounts, index.providersById),
         route.modelMap
         ),
         ...Object.keys(route.modelSourceMap ?? {}).filter((model) => model !== '*' && isSafeRouteModelMapKey(model)),
       ])
+      const models = client === 'deepseek-harness'
+        ? deepSeekHarnessRouteModelDirectory(route, index).map((entry) => entry.id)
+        : projectedModels
       const sourceUpdatedAt = Math.max(
         pool.updatedAt,
         ...Object.values(route.modelSourceMap ?? {}).map((sourceId) => index.poolsById.get(sourceId)?.updatedAt ?? 0),
       )
+      const deepSeekHarnessLimits = client === 'deepseek-harness'
+        ? Object.fromEntries(models.map((model) => [
+            model,
+            resolveDeepSeekHarnessModelLimits(route, model, index),
+          ]))
+        : undefined
       response.setHeader('cache-control', 'no-store')
       await this.writeJson(
         response,
@@ -4085,7 +4534,7 @@ export class GatewayServer implements GatewayController {
           ? geminiModelList(models)
           : route.inboundProtocol === 'anthropic-messages'
             ? anthropicModelList(models, sourceUpdatedAt)
-            : openAiModelList(models, sourceUpdatedAt)
+            : openAiModelList(models, sourceUpdatedAt, deepSeekHarnessLimits)
       )
     } catch (error) {
       const gatewayError = normalizeError(error)
@@ -4109,7 +4558,9 @@ export class GatewayServer implements GatewayController {
       ? index.enabledRoutesByProtocol.get('gemini') ?? []
       : client
         ? index.enabledNonGeminiRoutes
-        : index.enabledNonGeminiRoutes.filter((candidate) => candidate.client !== 'grokbuild')
+        : index.enabledNonGeminiRoutes.filter((candidate) => (
+          candidate.client !== 'grokbuild' && candidate.client !== 'deepseek-harness'
+        ))
     const route = candidates.find((candidate) => (
       (!client || candidate.client === client) && secureEquals(candidate.localToken, token)
     ))
@@ -4563,7 +5014,8 @@ class GatewayHttpError extends Error {
     readonly quotaSignals?: {
       quota?: AccountQuotaSnapshot
       codexQuota?: AccountCodexQuotaSnapshot
-    }
+    },
+    readonly upstreamSemanticObserved = false
   ) {
     super(message)
     this.name = 'GatewayHttpError'
@@ -4585,6 +5037,26 @@ function classifyIncomingRoute(pathname: string): IncomingRoute | undefined {
     return { protocol: 'openai-responses', operation: 'codex-compact', client: 'grokbuild' }
   }
   if (pathname === '/v1/chat/completions') return { protocol: 'openai-chat', operation: 'generate' }
+  if (pathname === '/deepseek-harness/v1/chat/completions') {
+    return { protocol: 'openai-chat', operation: 'generate', client: 'deepseek-harness' }
+  }
+  if (pathname === '/deepseek-harness/v1/responses') {
+    return {
+      protocol: 'openai-responses',
+      authenticationProtocol: 'openai-chat',
+      operation: 'generate',
+      client: 'deepseek-harness',
+    }
+  }
+  if (pathname === '/deepseek-harness/anthropic/v1/messages') {
+    return {
+      protocol: 'openai-responses',
+      authenticationProtocol: 'openai-chat',
+      operation: 'codex-search',
+      client: 'deepseek-harness',
+      deepSeekHarnessSearch: true,
+    }
+  }
   if (/^\/v1beta\/models\/[^/]+:generateContent$/.test(pathname)) {
     return { protocol: 'gemini', operation: 'generate', geminiMethod: 'generateContent' }
   }
@@ -4605,7 +5077,9 @@ function attributableClientRoute(
   index: GatewayConfigIndex,
 ): Route | undefined {
   if (!incoming.client) return undefined
-  const candidates = (index.enabledRoutesByProtocol.get(incoming.protocol) ?? [])
+  const candidates = (index.enabledRoutesByProtocol.get(
+    incoming.authenticationProtocol ?? incoming.protocol,
+  ) ?? [])
     .filter((candidate) => candidate.client === incoming.client)
   return candidates.length === 1 ? candidates[0] : undefined
 }
@@ -4629,6 +5103,7 @@ function requestPathname(value: string | undefined): string {
 function classifyModelListRoute(pathname: string): { kind: 'openai' | 'gemini'; client?: RouteClient } | undefined {
   if (pathname === '/v1/models') return { kind: 'openai' }
   if (pathname === '/grokbuild/v1/models') return { kind: 'openai', client: 'grokbuild' }
+  if (pathname === '/deepseek-harness/v1/models') return { kind: 'openai', client: 'deepseek-harness' }
   if (pathname === '/v1beta/models') return { kind: 'gemini' }
   return undefined
 }
@@ -4662,12 +5137,193 @@ function projectRouteModels(models: string[], modelMap: Record<string, string>):
     .flatMap((model) => [model, ...(aliasesByTarget.get(model) ?? [])]))
 }
 
-function openAiModelList(models: string[], updatedAt: number): JsonObject {
+function openAiModelList(
+  models: string[],
+  updatedAt: number,
+  limits?: Readonly<Record<string, DeepSeekHarnessModelLimits>>,
+): JsonObject {
   const created = Math.max(0, Math.floor((Number.isFinite(updatedAt) ? updatedAt : 0) / 1000))
   return {
     object: 'list',
-    data: models.map((id) => ({ id, object: 'model', created, owned_by: 'stone' }))
+    data: models.map((id) => ({
+      id,
+      object: 'model',
+      created,
+      owned_by: 'stone',
+      ...(limits?.[id]
+        ? {
+            context_window: limits[id].contextWindow,
+            max_output_tokens: limits[id].maxOutputTokens,
+          }
+        : {}),
+    }))
   }
+}
+
+function resolveDeepSeekHarnessModelLimits(
+  route: Route,
+  requestedModel: string,
+  index: GatewayConfigIndex,
+): DeepSeekHarnessModelLimits {
+  const upstreamModel = resolveRouteModel(route.modelMap, requestedModel)
+  const sourceId = resolveRouteSourceId(route.poolId, route.modelSourceMap, requestedModel)
+  const accounts = index.accountsByPoolId.get(sourceId) ?? []
+  const fallback = fallbackDeepSeekHarnessModelLimits(upstreamModel)
+  const candidates = accounts.flatMap((account) => {
+    const provider = index.providersById.get(account.providerId)
+    if (!provider) return []
+    const catalog = provider.modelCatalog?.find((entry) => entry.id === upstreamModel)
+    return [{
+      contextWindow: positiveModelLimit(catalog?.contextWindow) ?? fallback.contextWindow,
+      maxOutputTokens: positiveModelLimit(catalog?.maxOutputTokens) ?? fallback.maxOutputTokens,
+    }]
+  })
+  if (candidates.length === 0) return fallback
+  const contextWindow = Math.min(...candidates.map((candidate) => candidate.contextWindow))
+  return {
+    contextWindow,
+    maxOutputTokens: Math.min(
+      contextWindow,
+      ...candidates.map((candidate) => candidate.maxOutputTokens),
+    ),
+  }
+}
+
+function deepSeekHarnessModelNameFamily(model: string): DeepSeekHarnessModelFamily | undefined {
+  const normalized = model.trim()
+  if (/^gpt-5\.6(?:$|[-._])/i.test(normalized)) return 'gpt'
+  if (/^deepseek(?:$|[-._])/i.test(normalized)) return 'deepseek'
+  return undefined
+}
+
+function resolveDeepSeekHarnessModelFamily(
+  requestedModel: string,
+  targetModel: string,
+  sourceId: string,
+  index: GatewayConfigIndex,
+): DeepSeekHarnessModelFamily | undefined {
+  const requestedFamily = deepSeekHarnessModelNameFamily(requestedModel)
+  const targetFamily = deepSeekHarnessModelNameFamily(targetModel)
+  if (!requestedFamily || requestedFamily !== targetFamily) return undefined
+  const accounts = index.accountsByPoolId.get(sourceId) ?? []
+  if (accounts.length === 0) return undefined
+  const allowedSourceFamilies = requestedFamily === 'gpt'
+    ? new Set(['openai', 'custom'])
+    : new Set(['deepseek', 'custom'])
+  const sourceFamilies = accounts.flatMap((account) => {
+    const provider = index.providersById.get(account.providerId)
+    return provider ? [providerSourceFamily(provider.kind)] : []
+  })
+  return sourceFamilies.length === accounts.length
+    && sourceFamilies.every((family) => allowedSourceFamilies.has(family))
+    ? requestedFamily
+    : undefined
+}
+
+function deepSeekHarnessRouteModelDirectory(
+  route: Route,
+  index: GatewayConfigIndex,
+): DeepSeekHarnessRouteModel[] {
+  const pool = index.poolsById.get(route.poolId)
+  if (!pool) throw new GatewayHttpError(503, 'The matched DeepSeek Harness route has no available pool.')
+  const accounts = index.accountsByPoolId.get(pool.id) ?? []
+  const projectedModels = uniqueModels([
+    ...projectRouteModels(
+      enumerablePoolModels(pool, accounts, index.providersById),
+      route.modelMap,
+    ),
+    ...Object.keys(route.modelSourceMap ?? {})
+      .filter((model) => model !== '*' && isSafeRouteModelMapKey(model)),
+  ])
+  return projectedModels.flatMap((model): DeepSeekHarnessRouteModel[] => {
+    const family = resolveDeepSeekHarnessModelFamily(
+      model,
+      resolveRouteModel(route.modelMap, model),
+      resolveRouteSourceId(route.poolId, route.modelSourceMap, model),
+      index,
+    )
+    return family ? [{ id: model, family }] : []
+  })
+}
+
+function readDeepSeekHarnessSessionId(
+  request: IncomingMessage,
+  body?: JsonObject,
+): string | undefined {
+  const headerNames = [
+    'x-deepseek-harness-session-id',
+    'session_id',
+    'session-id',
+    'x-session-id',
+    'x-client-request-id',
+    'x-session-affinity',
+    'x-stone-session-id',
+  ]
+  for (const name of headerNames) {
+    const value = request.headers[name]
+    const normalized = normalizeDeepSeekHarnessSessionId(Array.isArray(value) ? value[0] : value)
+    if (normalized) return normalized
+  }
+  if (!body) return undefined
+  const clientMetadata = objectValue(body.client_metadata)
+  const metadata = objectValue(body.metadata)
+  for (const value of [
+    body.session_id,
+    body.sessionId,
+    clientMetadata?.session_id,
+    clientMetadata?.sessionId,
+    metadata?.session_id,
+    metadata?.sessionId,
+  ]) {
+    const normalized = normalizeDeepSeekHarnessSessionId(value)
+    if (normalized) return normalized
+  }
+  return undefined
+}
+
+function normalizeDeepSeekHarnessSessionId(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined
+  const normalized = value.trim()
+  return !normalized || normalized.length > 256 || hasAsciiControlCharacter(normalized)
+    ? undefined
+    : normalized
+}
+
+function validPersistedDeepSeekHarnessModelBinding(
+  value: unknown,
+): PersistedDeepSeekHarnessModelBinding | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const record = value as Record<string, unknown>
+  const sessionId = typeof record.sessionId === 'string' ? record.sessionId.trim() : ''
+  if (!sessionId || sessionId.length > 256 || hasAsciiControlCharacter(sessionId)) return undefined
+  if (record.family !== 'gpt' && record.family !== 'deepseek') return undefined
+  if (typeof record.boundAt !== 'number' || !Number.isSafeInteger(record.boundAt) || record.boundAt < 0) return undefined
+  return { sessionId, family: record.family, boundAt: record.boundAt }
+}
+
+function fallbackDeepSeekHarnessModelLimits(model: string): DeepSeekHarnessModelLimits {
+  if (/^deepseek-/i.test(model)) {
+    return {
+      contextWindow: 1_048_576,
+      maxOutputTokens: DEEPSEEK_V4_FLASH_MAX_OUTPUT_TOKENS,
+    }
+  }
+  if (/^gpt-/i.test(model)) {
+    return {
+      contextWindow: CODEX_COMPATIBLE_CONTEXT_WINDOW,
+      maxOutputTokens: CODEX_COMPATIBLE_MAX_OUTPUT_TOKENS,
+    }
+  }
+  return {
+    contextWindow: GENERIC_HARNESS_CONTEXT_WINDOW,
+    maxOutputTokens: GENERIC_HARNESS_MAX_OUTPUT_TOKENS,
+  }
+}
+
+function positiveModelLimit(value: ModelCapabilityDefinition['contextWindow']): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0
+    ? value
+    : undefined
 }
 
 function anthropicModelList(models: string[], updatedAt: number): JsonObject {
@@ -4736,7 +5392,12 @@ function requestBodyPolicy(route: Route, incoming: IncomingRoute): RequestBodyPo
   const largeCodexBody = isResponsesAgentClient(route.client)
     && incoming.protocol === 'openai-responses'
     && (incoming.operation === 'generate' || incoming.operation === 'codex-compact')
-  return largeCodexBody
+  const largeDeepSeekHarnessBody = route.client === 'deepseek-harness'
+    && (
+      incoming.operation === 'generate'
+      || (incoming.protocol === 'openai-responses' && incoming.operation === 'codex-search')
+    )
+  return largeCodexBody || largeDeepSeekHarnessBody
     ? {
         hardLimitBytes: CODEX_REQUEST_BODY_LIMIT_BYTES,
         largeThresholdBytes: STANDARD_REQUEST_BODY_LIMIT_BYTES
@@ -6120,6 +6781,135 @@ function buildChatGptSearchFallbackBody(body: JsonObject, model: string): JsonOb
   }
 }
 
+function transformDeepSeekHarnessSearchRequest(body: JsonObject): {
+  body: JsonObject
+  query: string
+} {
+  const model = typeof body.model === 'string' ? body.model.trim() : ''
+  if (!model) throw new GatewayHttpError(400, 'A model is required')
+  const tools = Array.isArray(body.tools) ? body.tools : []
+  const declaresSearch = tools.some((value) => {
+    const tool = objectValue(value)
+    return tool?.type === 'web_search_20250305' && tool.name === 'web_search'
+  })
+  if (!declaresSearch) {
+    throw new GatewayHttpError(
+      422,
+      'DeepSeek Harness search must declare the native web_search tool.',
+      'invalid_search_request',
+    )
+  }
+  const messages = Array.isArray(body.messages) ? body.messages : []
+  const text = messages.flatMap((value) => {
+    const message = objectValue(value)
+    if (message?.role !== 'user') return []
+    if (typeof message.content === 'string') return [message.content]
+    if (!Array.isArray(message.content)) return []
+    return message.content.flatMap((content) => {
+      const block = objectValue(content)
+      return block?.type === 'text' && typeof block.text === 'string' ? [block.text] : []
+    })
+  }).at(-1)?.trim() ?? ''
+  const prefix = 'Perform a web search for the query:'
+  const query = (text.startsWith(prefix) ? text.slice(prefix.length) : text).trim()
+  if (!query || query.length > 8_192 || hasAsciiControlCharacter(query)) {
+    throw new GatewayHttpError(422, 'DeepSeek Harness search query is invalid.', 'invalid_search_request')
+  }
+  const requestedMax = positiveModelLimit(
+    typeof body.max_tokens === 'number' ? body.max_tokens : undefined,
+  ) ?? 4_096
+  return {
+    query,
+    body: {
+      model,
+      id: randomUUID(),
+      action: 'search',
+      query,
+      commands: { search_query: [{ q: query }] },
+      settings: { search_context_size: 'medium', external_web_access: true },
+      max_output_tokens: Math.max(256, Math.min(8_192, requestedMax)),
+    },
+  }
+}
+
+function buildDeepSeekHarnessSearchResponse(
+  payload: JsonObject,
+  query: string,
+  model: string,
+): JsonObject {
+  const sources = extractDeepSeekHarnessSearchSources(payload)
+  if (sources.length === 0) {
+    throw new GatewayHttpError(
+      502,
+      'Stone+ search returned no citeable URL.',
+      'upstream_search_result_error',
+    )
+  }
+  const toolUseId = `srvtoolu_${randomUUID().replaceAll('-', '')}`
+  return {
+    id: `msg_${randomUUID().replaceAll('-', '')}`,
+    type: 'message',
+    role: 'assistant',
+    model,
+    content: [
+      {
+        type: 'server_tool_use',
+        id: toolUseId,
+        name: 'web_search',
+        input: { query },
+      },
+      {
+        type: 'web_search_tool_result',
+        tool_use_id: toolUseId,
+        content: sources.map((source) => ({
+          type: 'web_search_result',
+          url: source.url,
+          title: source.title,
+        })),
+      },
+    ],
+    stop_reason: 'end_turn',
+    stop_sequence: null,
+    usage: { input_tokens: 0, output_tokens: 0 },
+  }
+}
+
+function extractDeepSeekHarnessSearchSources(payload: JsonObject): Array<{
+  url: string
+  title: string
+}> {
+  const sources: Array<{ url: string; title: string }> = []
+  const seen = new Set<string>()
+  const append = (urlValue: unknown, titleValue?: unknown): void => {
+    if (typeof urlValue !== 'string') return
+    let url: URL
+    try {
+      url = new URL(urlValue)
+    } catch {
+      return
+    }
+    if ((url.protocol !== 'http:' && url.protocol !== 'https:') || seen.has(url.toString())) return
+    seen.add(url.toString())
+    const title = typeof titleValue === 'string' && titleValue.trim()
+      ? titleValue.trim().slice(0, 512)
+      : url.hostname
+    sources.push({ url: url.toString(), title })
+  }
+  for (const collection of [payload.data, payload.results]) {
+    if (!Array.isArray(collection)) continue
+    for (const value of collection) {
+      const source = objectValue(value)
+      if (source) append(source.url, source.title)
+    }
+  }
+  if (typeof payload.output === 'string') {
+    for (const match of payload.output.matchAll(/https?:\/\/[^\s<>()[\]{}"']+/giu)) {
+      append(match[0].replace(/[.,;:!?]+$/u, ''))
+    }
+  }
+  return sources.slice(0, 20)
+}
+
 function copyResponsesResponseHeaders(source: Headers, target: ServerResponse, client: RouteClient): void {
   if (client === 'grokbuild') {
     const requestId = source.get('x-request-id')
@@ -6388,6 +7178,64 @@ async function pipeRawUpstreamResponse(
 
 async function readUpstreamJson(response: Response, signal?: AbortSignal): Promise<JsonObject> {
   return (await readUpstreamJsonWithBytes(response, signal)).payload
+}
+
+async function readAdaptiveOpenAiResponsesRelay(
+  upstream: Response,
+  options: StreamEncodingOptions,
+  signal: AbortSignal | undefined,
+  firstBodyTimeoutMs: number,
+  idleTimeoutMs: number,
+  progressIdleTimeoutMs: number,
+  secrets: readonly string[]
+): Promise<ParsedUpstreamJson> {
+  // Some OpenAI-compatible relays ignore `stream:false`, and others label SSE
+  // as application/json. Inspect the framing rather than trusting headers so
+  // the downstream still receives the buffered JSON response it requested.
+  const inspected = await inspectCompactFallbackResponse(
+    upstream,
+    'openai-responses',
+    signal,
+    firstBodyTimeoutMs
+  )
+  if (inspected.kind === 'json') {
+    return readUpstreamJsonWithBytes(inspected.response, signal)
+  }
+
+  const collected = await collectOpenAiResponsesUpstream(
+    inspected.response,
+    options,
+    signal,
+    firstBodyTimeoutMs,
+    idleTimeoutMs,
+    progressIdleTimeoutMs
+  )
+  if (collected.error || !collected.response) {
+    const message = redactSensitiveText(
+      collected.error ?? 'Upstream Responses stream did not produce a response',
+      secrets
+    )
+    const requestError = compactFallbackIsRequestError(
+      collected.errorType,
+      collected.errorCode
+    )
+    throw new GatewayHttpError(
+      requestError ? 400 : 502,
+      message,
+      requestError ? 'invalid_request_error' : 'upstream_stream_error',
+      {
+        error: {
+          message,
+          ...(collected.errorType ? { type: collected.errorType } : {}),
+          ...(collected.errorCode ? { code: collected.errorCode } : {}),
+        },
+      },
+      undefined,
+      undefined,
+      collected.upstreamSemanticObserved === true
+    )
+  }
+  return { payload: collected.response }
 }
 
 function upstreamResponseTooLargeError(): GatewayHttpError {
@@ -7728,6 +8576,11 @@ interface ConvertedStreamBridgeOptions {
   commitOnlyOnOutputOrTerminal?: boolean
 }
 
+interface DirectStreamBridgeOptions {
+  /** Keep lifecycle/reasoning frames retryable until output or a healthy terminal is known. */
+  commitOnlyOnOutputOrTerminal?: boolean
+}
+
 interface AbortDeadline {
   signal: AbortSignal
   clear(): void
@@ -7786,7 +8639,8 @@ async function pipeUpstreamResponse(
   protocol: Protocol,
   options: StreamEncodingOptions,
   secrets: readonly string[],
-  timing: StreamTimingCallbacks
+  timing: StreamTimingCallbacks,
+  bridge: DirectStreamBridgeOptions = {}
 ): Promise<StreamPipeResult> {
   const parser = createCanonicalStreamParser(protocol)
   const redactor = new StreamingSecretRedactor(secrets)
@@ -7814,6 +8668,7 @@ async function pipeUpstreamResponse(
   const frameGuard = new ProtocolStreamFrameGuard(protocol, MAX_STREAM_FRAME_BYTES)
   const diagnostics: StreamTerminationDiagnostics = {}
   const pendingToolCalls = new Set<number>()
+  let commitEligibleEventObserved = false
   const logicalCompletionObserved = (): boolean => (
     terminalObserved
     || stopObserved
@@ -7900,6 +8755,14 @@ async function pipeUpstreamResponse(
         // Keep reading ordinary completions for trailing usage/[DONE],
         // including tool-call turns whose usage arrives after finish_reason.
       }
+      if (event.type === 'text-delta' || event.type === 'tool-call-delta') {
+        commitEligibleEventObserved = true
+      } else if (acceptTerminal && !streamError && (
+        event.type === 'stop'
+        || event.type === 'done'
+      )) {
+        commitEligibleEventObserved = true
+      }
       if (meaningfulStreamEvent(event)) timing.onFirstToken?.()
     }
   }
@@ -7971,7 +8834,10 @@ async function pipeUpstreamResponse(
             'upstream_stream_error'
           )
         }
-        if (parser.getRecognizedEventCount() === 0 || observationFailed) return true
+        const readyToCommit = bridge.commitOnlyOnOutputOrTerminal
+          ? commitEligibleEventObserved && !streamError
+          : parser.getRecognizedEventCount() > 0 && !observationFailed
+        if (!readyToCommit || observationFailed) return true
         commitResponseHeaders()
         return await flushPendingPrecommitChunks()
       }
@@ -8110,6 +8976,23 @@ async function pipeUpstreamResponse(
           'upstream_stream_error'
         )
       }
+      if (bridge.commitOnlyOnOutputOrTerminal && explicitUpstreamStreamError) {
+        return streamPipeResult(
+          false,
+          usage,
+          explicitUpstreamStreamError,
+          undefined,
+          diagnostics,
+          canonicalStreamError
+        )
+      }
+      if (bridge.commitOnlyOnOutputOrTerminal && !commitEligibleEventObserved) {
+        throw new GatewayHttpError(
+          502,
+          'Upstream stream ended before a terminal event',
+          'upstream_stream_error'
+        )
+      }
       commitResponseHeaders()
       if (!await flushPendingPrecommitChunks()) {
         diagnostics.streamEndReason = 'client-closed'
@@ -8124,6 +9007,20 @@ async function pipeUpstreamResponse(
       diagnostics.streamEndReason ??= 'explicit-error'
       streamError = explicitUpstreamStreamError
       streamFailure = new GatewayHttpError(502, explicitUpstreamStreamError, 'upstream_stream_error')
+      // A raw response.failed frame is already an explicit Responses terminal.
+      // Only synthesize the missing terminal for a bare `error` frame; sending
+      // a second response.failed would itself violate the stream contract.
+      if (protocol !== 'openai-responses'
+        || parser.getProtocolState().responsesTerminalEvent !== 'response.failed') {
+        await writeProtocolStreamFailure(
+          response,
+          protocol,
+          options,
+          streamFailure,
+          timing.onClientWrite,
+          parser.getResponsesResponseId?.()
+        )
+      }
     } else if (!protocolCompletionObserved()) {
       diagnostics.streamEndReason ??= 'upstream-eof'
       streamFailure = new GatewayHttpError(
@@ -8132,7 +9029,14 @@ async function pipeUpstreamResponse(
         'upstream_stream_error'
       )
       streamError = streamFailure.message
-      await writeProtocolStreamFailure(response, protocol, options, streamFailure, timing.onClientWrite)
+      await writeProtocolStreamFailure(
+        response,
+        protocol,
+        options,
+        streamFailure,
+        timing.onClientWrite,
+        parser.getResponsesResponseId?.()
+      )
     }
   } catch (error) {
     // Every exceptional exit owns the upstream reader until it explicitly
@@ -8167,7 +9071,14 @@ async function pipeUpstreamResponse(
     streamFailure = streamFailureFrom(error, secrets)
     streamError = streamFailure.message
     diagnostics.streamEndReason ??= isStreamIdleTimeout(error) ? 'stream-idle-timeout' : 'explicit-error'
-    await writeProtocolStreamFailure(response, protocol, options, streamFailure, timing.onClientWrite)
+    await writeProtocolStreamFailure(
+      response,
+      protocol,
+      options,
+      streamFailure,
+      timing.onClientWrite,
+      parser.getResponsesResponseId?.()
+    )
   } finally {
     if (terminalWaitStartedAt !== undefined && diagnostics.terminalWaitMs === undefined) {
       diagnostics.terminalWaitMs = Math.max(0, Date.now() - terminalWaitStartedAt)
@@ -8636,10 +9547,15 @@ async function writeProtocolStreamFailure(
   protocol: Protocol,
   options: StreamEncodingOptions,
   failure: GatewayHttpError,
-  onClientWrite?: () => void
+  onClientWrite?: () => void,
+  responseId?: string
 ): Promise<void> {
   if (response.destroyed || response.writableEnded) return
-  const encoder = createCanonicalStreamEncoder(protocol, options)
+  const encoder = createCanonicalStreamEncoder(protocol, {
+    ...options,
+    ...(responseId ? { id: responseId } : {}),
+    ...(protocol === 'openai-responses' ? { responsesAlreadyStarted: true } : {})
+  })
   await writeStreamChunks(response, encoder.encode({
     type: 'error',
     message: failure.message,
@@ -9072,6 +9988,14 @@ function getSessionId(
 ): string | undefined {
   const headerNames = [
     ...(client === 'grokbuild' ? ['x-grok-conv-id', 'x-grok-session-id'] : []),
+    ...(client === 'deepseek-harness'
+      ? [
+          'x-deepseek-harness-session-id',
+          'x-session-id',
+          'x-client-request-id',
+          'x-session-affinity',
+        ]
+      : []),
     'x-claude-code-session-id',
     'x-stone-session-id',
     'session-id',
@@ -9239,6 +10163,9 @@ function routeConversionContext(
   pool: Pool,
   provider?: ProviderDefinition,
 ): ProtocolConversionContext | undefined {
+  const deepSeekHarnessContext: ProtocolConversionContext | undefined = client === 'deepseek-harness'
+    ? { sanitizeDeepSeekHarnessToolArguments: true }
+    : undefined
   if (client === 'grokbuild' && provider?.protocol === 'openai-responses') return undefined
   if (client === 'codex'
     && provider
@@ -9249,7 +10176,14 @@ function routeConversionContext(
   const aggregateGrokRelay = pool.kind === 'relay-aggregate'
     && provider?.sourceType === 'relay'
     && providerSourceFamily(provider.kind) === 'grok'
-  return pool.protocol === 'grok' || aggregateGrokRelay ? { dialect: 'xai-grok' } : undefined
+  return pool.protocol === 'grok' || aggregateGrokRelay
+    ? { ...deepSeekHarnessContext, dialect: 'xai-grok' }
+    : deepSeekHarnessContext
+}
+
+function conversionContextRequiresResponseBridge(context?: ProtocolConversionContext): boolean {
+  return context?.toolBridgePlan?.requiresResponseBridge === true
+    || context?.sanitizeDeepSeekHarnessToolArguments === true
 }
 
 function applyPoolReasoningPolicy(
@@ -9780,9 +10714,75 @@ function isRetryable(error: GatewayHttpError): boolean {
     error.statusCode === 429 || error.statusCode >= 500
 }
 
+function requestTransientFailureSignature(error: GatewayHttpError): string {
+  if (error.providerFailure?.scope === 'request') {
+    // HTTP and SSE overload envelopes do not carry the same wire fields (the
+    // former is normalized before it reaches this loop), so key them by the
+    // provider's stable request-scoped classification rather than by a relay's
+    // presentation-specific message/code.
+    return [
+      error.providerFailure.category,
+      'request',
+      error.providerFailure.message.trim().toLowerCase().replace(/\s+/g, ' ').slice(0, 240),
+    ].join('|')
+  }
+  const envelope = objectValue(error.responseBody?.error)
+  const code = providerErrorCode(envelope ?? {})
+  const message = (typeof envelope?.message === 'string' ? envelope.message : error.message)
+    .trim()
+    .toLowerCase()
+    .replace(/\b(?:req|request|trace)[-_ ]?id\s*[:=]?\s*[a-z0-9_-]+\b/gi, '<request-id>')
+    .replace(/\b[0-9a-f]{8}-[0-9a-f-]{27,}\b/gi, '<uuid>')
+    .replace(/\s+/g, ' ')
+    .slice(0, 240)
+  return [
+    error.providerFailure?.category ?? error.type,
+    error.providerFailure?.statusCode ?? error.statusCode,
+    code,
+    message,
+  ].join('|')
+}
+
+function isChatGptTransientStreamFailure(error: GatewayHttpError): boolean {
+  if (error.statusCode < 500) return false
+  return error.type === 'upstream_stream_error'
+    || error.type === 'upstream_response_terminal_timeout'
+    || error.type === 'upstream_response_progress_timeout'
+    || error.type === 'upstream_first_body_timeout'
+}
+
 function upstreamErrorMessage(payload: JsonObject): string {
   const error = objectValue(payload.error)
   return typeof error?.message === 'string' ? error.message : 'Upstream request failed'
+}
+
+function isNonJsonUpstreamPayload(payload: JsonObject | undefined): boolean {
+  const error = objectValue(payload?.error)
+  return error?.message === 'Upstream returned a non-JSON response'
+}
+
+function relayNonJsonErrorBody(statusCode: number): JsonObject {
+  return {
+    error: {
+      message: 'Upstream relay is temporarily unavailable.',
+      type: 'upstream_error',
+      code: 'upstream_non_json_response',
+      status: statusCode,
+    },
+  }
+}
+
+function isAdaptiveResponsesRelayFailure(
+  provider: ProviderDefinition | undefined,
+  error: GatewayHttpError
+): boolean {
+  if (provider?.sourceType !== 'relay' || provider.protocol !== 'openai-responses') return false
+  if (error.statusCode < 500) return false
+  const responseError = objectValue(error.responseBody?.error)
+  if (responseError?.code === 'upstream_non_json_response') return true
+  return error.type === 'upstream_invalid_response'
+    || error.type === 'upstream_stream_error'
+    || error.type === 'upstream_first_body_timeout'
 }
 
 function providerErrorEnvelope(payload: JsonObject): JsonObject | undefined {

@@ -113,7 +113,7 @@ describe('request log renderer pressure bounds', () => {
       successCount: 2,
       errorCount: 1,
       averageLatency: 300,
-      averageFirstToken: 50,
+      averageFirstByte: 50,
       totalTokens: 17,
       hasStreaming: true,
     })

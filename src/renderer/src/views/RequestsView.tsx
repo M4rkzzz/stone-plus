@@ -35,7 +35,7 @@ import { useVisibilityAwareInterval } from '../visibility-interval'
 import { accountDisplayName, conversationDisplayName } from '../system-generated-text'
 import { paginateRequestLogs } from '../request-log-page'
 import {
-  displayedRequestFirstTokenMs as displayedFirstTokenMs,
+  displayedRequestFirstByteMs,
   filterRequestLogs,
   summarizeRequestLogs,
 } from '../request-log-view-model'
@@ -45,6 +45,7 @@ const clientNames: Record<RouteClient, string> = {
   codex: 'Codex',
   gemini: 'Gemini CLI',
   grokbuild: 'Grok Build',
+  'deepseek-harness': 'DeepSeek Harness',
 }
 
 const failureStageLabels: Record<NonNullable<RequestLog['failureStage']>, readonly [string, string]> = {
@@ -77,7 +78,7 @@ const liveStageLabels: Record<NonNullable<RequestLog['progressStage']>, readonly
   scheduling: ['选择上游', 'Selecting upstream'],
   'resolving-credential': ['准备凭据', 'Preparing credentials'],
   connecting: ['连接上游', 'Connecting upstream'],
-  'waiting-first-byte': ['等待首字', 'Waiting for first token'],
+  'waiting-first-byte': ['等待首包', 'Waiting for first byte'],
   streaming: ['正在传输', 'Streaming'],
   retrying: ['切换重试', 'Retrying'],
 }
@@ -92,7 +93,7 @@ const REQUEST_COLUMNS: RequestColumnDefinition[] = [
   { id: 'model', label: ['模型', 'Model'], defaultWidth: 135, minimumWidth: 92 },
   { id: 'account', label: ['上游源', 'Upstream'], defaultWidth: 145, minimumWidth: 105 },
   { id: 'status', label: ['状态', 'Status'], defaultWidth: 94, minimumWidth: 78 },
-  { id: 'firstToken', label: ['首字', 'First Token'], defaultWidth: 82, minimumWidth: 68 },
+  { id: 'firstToken', label: ['上游首包', 'Upstream First Byte'], defaultWidth: 96, minimumWidth: 82 },
   { id: 'latency', label: ['总耗时', 'Total Time'], defaultWidth: 88, minimumWidth: 72 },
   { id: 'tokens', label: ['Token', 'Tokens'], defaultWidth: 84, minimumWidth: 68 },
 ]
@@ -177,7 +178,7 @@ const RequestLogRow = memo(function RequestLogRow({
       <td>{log.status === 'streaming'
         ? <span className="request-live-status"><i aria-hidden="true" /><span>{t(liveStageLabels[log.progressStage ?? 'receiving-body'][0], liveStageLabels[log.progressStage ?? 'receiving-body'][1])}</span></span>
         : <><RequestStatusBadge status={log.status} statusCode={log.statusCode} requestKind={log.requestKind} />{log.statusCode && <span className="status-code">{log.statusCode}</span>}</>}</td>
-      <td>{displayedFirstTokenMs(log) !== undefined ? durationLabel(displayedFirstTokenMs(log)!) : '—'}</td>
+      <td>{displayedRequestFirstByteMs(log) !== undefined ? durationLabel(displayedRequestFirstByteMs(log)!) : '—'}</td>
       <td className={log.status === 'streaming' ? 'request-live-duration' : ''}>{durationLabel(liveElapsedMs(log, liveNow))}</td>
       <td>{log.inputTokens !== undefined
         ? formatCompactNumber((log.inputTokens ?? 0) + (log.outputTokens ?? 0), locale)
@@ -404,7 +405,7 @@ export function RequestsView({
         <div><Activity size={16} /><span>{t('记录', 'Records')}</span><strong>{snapshot.requestLogs.length}</strong></div>
         <div><CheckCircle2 size={16} /><span>{t('成功', 'Success')}</span><strong>{summary.successCount}</strong></div>
         <div><TriangleAlert size={16} /><span>{t('失败', 'Failed')}</span><strong>{summary.errorCount}</strong></div>
-        <div><span>{t('平均首字', 'Average First Token')}</span><strong>{summary.averageFirstToken ? durationLabel(summary.averageFirstToken) : '—'}</strong></div>
+        <div><span>{t('平均首包', 'Average First Byte')}</span><strong>{summary.averageFirstByte ? durationLabel(summary.averageFirstByte) : '—'}</strong></div>
         <div><span>{t('平均延迟', 'Average Latency')}</span><strong>{summary.averageLatency ? durationLabel(summary.averageLatency) : '—'}</strong></div>
         <div><span>Token</span><strong>{formatCompactNumber(summary.totalTokens, locale)}</strong></div>
       </section>
@@ -412,7 +413,7 @@ export function RequestsView({
       <section className="panel panel--flush request-log-panel">
         <div className="table-toolbar">
           <label className="search-input"><Search size={16} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={t('搜索对话、模型、供应商或请求 ID', 'Search conversations, models, providers, or request IDs')} /></label>
-          <div className="filter-group"><Filter size={15} /><select value={client} aria-label={t('筛选客户端', 'Filter clients')} onChange={(event) => setClient(event.target.value as 'all' | RouteClient)}><option value="all">{t('全部客户端', 'All Clients')}</option><option value="claude">Claude Code</option><option value="codex">Codex</option><option value="gemini">Gemini CLI</option><option value="grokbuild">Grok Build</option></select><select value={status} aria-label={t('筛选状态', 'Filter status')} onChange={(event) => setStatus(event.target.value as 'all' | RequestLog['status'])}><option value="all">{t('全部状态', 'All Statuses')}</option><option value="success">{t('成功', 'Success')}</option><option value="error">{t('失败', 'Failed')}</option><option value="streaming">{t('传输中', 'Streaming')}</option></select></div>
+          <div className="filter-group"><Filter size={15} /><select value={client} aria-label={t('筛选客户端', 'Filter clients')} onChange={(event) => setClient(event.target.value as 'all' | RouteClient)}><option value="all">{t('全部客户端', 'All Clients')}</option><option value="claude">Claude Code</option><option value="codex">Codex</option><option value="gemini">Gemini CLI</option><option value="grokbuild">Grok Build</option><option value="deepseek-harness">DeepSeek Harness</option></select><select value={status} aria-label={t('筛选状态', 'Filter status')} onChange={(event) => setStatus(event.target.value as 'all' | RequestLog['status'])}><option value="all">{t('全部状态', 'All Statuses')}</option><option value="success">{t('成功', 'Success')}</option><option value="error">{t('失败', 'Failed')}</option><option value="streaming">{t('传输中', 'Streaming')}</option></select></div>
         </div>
 
         {filtered.length ? (
@@ -495,7 +496,7 @@ export function RequestsView({
               <DetailItem label={t('账号', 'Account')}>{accountDisplayName(selected.accountName, t)}</DetailItem>
               {selected.status === 'streaming' && <DetailItem label={t('实时阶段', 'Live Stage')}>{t(liveStageLabels[selected.progressStage ?? 'receiving-body'][0], liveStageLabels[selected.progressStage ?? 'receiving-body'][1])}</DetailItem>}
               {selected.failureStage && <DetailItem label={t('失败阶段', 'Failure Stage')}>{t(failureStageLabels[selected.failureStage][0], failureStageLabels[selected.failureStage][1])}</DetailItem>}
-              <DetailItem label={t('首字时间', 'First Token Time')}>{displayedFirstTokenMs(selected) !== undefined ? durationLabel(displayedFirstTokenMs(selected)!) : '—'}</DetailItem>
+              <DetailItem label={t('上游首包时间', 'Upstream First Byte Time')}>{displayedRequestFirstByteMs(selected) !== undefined ? durationLabel(displayedRequestFirstByteMs(selected)!) : '—'}</DetailItem>
               <DetailItem label={t('可见首字时间', 'Visible First Token Time')}>{selected.firstTokenMs !== undefined ? durationLabel(selected.firstTokenMs) : '—'}</DetailItem>
               <DetailItem label={t('请求体读取', 'Request Body Read')}>{selected.bodyReadMs !== undefined ? durationLabel(selected.bodyReadMs) : '—'}</DetailItem>
               <DetailItem label={t('账号调度', 'Account Scheduling')}>{selected.schedulerSelectMs !== undefined ? durationLabel(selected.schedulerSelectMs) : '—'}</DetailItem>

@@ -1,8 +1,12 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
   AGENT_INSTALL_GUIDE_URLS,
+  AgentInstallerProcessError,
   AgentInstallationService,
   CODEX_DESKTOP_DOWNLOAD_URL,
+  DEEPSEEK_HARNESS_PACKAGE_NAME,
+  DEEPSEEK_HARNESS_PACKAGE_SPEC,
+  DEEPSEEK_HARNESS_VERSION,
   type AgentInstallerProcessPort,
   type AgentInstallerProcessResult,
 } from '../../src/main/agent-installation'
@@ -51,7 +55,7 @@ describe('AgentInstallationService', () => {
     expect(processes.calls).toEqual([])
   })
 
-  it.each(Object.entries(AGENT_INSTALL_GUIDE_URLS))(
+  it.each(Object.entries(AGENT_INSTALL_GUIDE_URLS).filter(([target]) => target !== 'deepseek-harness'))(
     'opens the fixed official %s guide without executing a process',
     async (target, expectedUrl) => {
       const openExternal = vi.fn(async () => undefined)
@@ -152,7 +156,7 @@ describe('AgentInstallationService', () => {
     expect(processes.calls).toEqual([])
   })
 
-  it('never builds shell, PowerShell, curl, npm, or floating-tag installation commands', async () => {
+  it('keeps all non-DSH installations browser-only', async () => {
     const opened: string[] = []
     const processes = processPort(async () => ({ stdout: '', stderr: '' }))
     const service = new AgentInstallationService({
@@ -170,7 +174,141 @@ describe('AgentInstallationService', () => {
     ])
 
     expect(processes.calls).toEqual([])
-    expect(opened.sort()).toEqual(Object.values(AGENT_INSTALL_GUIDE_URLS).sort())
+    expect(opened.sort()).toEqual(Object.entries(AGENT_INSTALL_GUIDE_URLS)
+      .filter(([target]) => target !== 'deepseek-harness')
+      .map(([, url]) => url)
+      .sort())
+  })
+
+  it('installs and verifies only the pinned official DeepSeek Harness package without a shell', async () => {
+    const nodeExecutable = 'C:\\Tools\\nodejs\\node.exe'
+    const npmCli = 'C:\\Tools\\nodejs\\node_modules\\npm\\bin\\npm-cli.js'
+    const prefix = 'C:\\Users\\tester\\AppData\\Roaming\\npm'
+    const entrypoint = `${prefix}\\node_modules\\@deepseek-ai\\dsh\\lib\\bin.js`
+    const processes = processPort(async ({ executable, args }) => {
+      if (executable === 'node.exe' && args[0] === '--version') return { stdout: 'v22.20.0\n', stderr: '' }
+      if (executable === 'node.exe' && args[0] === '-p') return { stdout: `${nodeExecutable}\n`, stderr: '' }
+      if (executable === nodeExecutable && args[0] === npmCli && args[1] === '--version') {
+        return { stdout: '10.9.3\n', stderr: '' }
+      }
+      if (executable === nodeExecutable && args.includes('install')) return { stdout: 'added packages\n', stderr: '' }
+      if (executable === nodeExecutable && args[0] === entrypoint && args[1] === '--version') {
+        return { stdout: `${DEEPSEEK_HARNESS_VERSION}\n`, stderr: '' }
+      }
+      throw new Error(`Unexpected process call: ${executable} ${args.join(' ')}`)
+    })
+    const stages: string[] = []
+    const service = new AgentInstallationService({
+      platform: 'win32',
+      processPort: processes,
+      environment: { APPDATA: 'C:\\Users\\tester\\AppData\\Roaming' },
+      homeDir: 'C:\\Users\\tester',
+      createOperationId: () => 'dsh-install',
+    })
+
+    await expect(service.install('deepseek-harness', 'recommended', ({ stage }) => stages.push(stage))).resolves.toEqual({
+      operationId: 'dsh-install',
+      target: 'deepseek-harness',
+      channel: 'recommended',
+      status: 'installed',
+      packageName: DEEPSEEK_HARNESS_PACKAGE_NAME,
+      version: DEEPSEEK_HARNESS_VERSION,
+    })
+    expect(stages).toEqual(['checking-node', 'checking-npm', 'installing', 'verifying', 'completed'])
+    const install = processes.calls.find(({ args }) => args.includes('install'))
+    expect(install).toEqual({
+      executable: nodeExecutable,
+      args: [
+        npmCli,
+        'install',
+        '--global',
+        '--prefix',
+        prefix,
+        '--no-audit',
+        '--no-fund',
+        '--loglevel=error',
+        DEEPSEEK_HARNESS_PACKAGE_SPEC,
+      ],
+      timeoutMs: 5 * 60_000,
+    })
+    expect(processes.calls.flatMap(({ executable, args }) => [executable, ...args]).join(' ')).not.toMatch(
+      /(?:powershell|pwsh|cmd\.exe|curl|\blatest\b|https?:\/\/)/i,
+    )
+  })
+
+  it('fails closed when DeepSeek Harness sees an incompatible Node.js release', async () => {
+    const processes = processPort(async ({ args }) => {
+      if (args[0] === '--version') return { stdout: 'v23.9.0\n', stderr: '' }
+      return { stdout: 'C:\\Tools\\nodejs\\node.exe\n', stderr: '' }
+    })
+    const service = new AgentInstallationService({ platform: 'win32', processPort: processes })
+
+    await expect(service.install('deepseek-harness')).resolves.toMatchObject({
+      status: 'failed',
+      error: { code: 'node-not-found', detail: 'Detected Node.js 23.9.0.' },
+    })
+    expect(processes.calls).toHaveLength(2)
+  })
+
+  it('reports a missing npm runtime without attempting installation', async () => {
+    const nodeExecutable = 'C:\\PortableNode\\node.exe'
+    const processes = processPort(async ({ executable, args }) => {
+      if (executable === 'node.exe' && args[0] === '--version') return { stdout: 'v22.20.0\n', stderr: '' }
+      if (executable === 'node.exe' && args[0] === '-p') return { stdout: `${nodeExecutable}\n`, stderr: '' }
+      if (executable === 'where.exe') throw new Error('npm.cmd was not found')
+      throw new AgentInstallerProcessError('npm CLI was not found', false)
+    })
+    const service = new AgentInstallationService({ platform: 'win32', processPort: processes })
+
+    await expect(service.install('deepseek-harness')).resolves.toMatchObject({
+      status: 'failed',
+      error: { code: 'npm-not-found' },
+    })
+    expect(processes.calls.some(({ args }) => args.includes('install'))).toBe(false)
+  })
+
+  it('classifies a timed-out pinned DeepSeek Harness install', async () => {
+    const nodeExecutable = 'C:\\Tools\\nodejs\\node.exe'
+    const npmCli = 'C:\\Tools\\nodejs\\node_modules\\npm\\bin\\npm-cli.js'
+    const processes = processPort(async ({ executable, args }) => {
+      if (executable === 'node.exe' && args[0] === '--version') return { stdout: 'v24.1.0\n', stderr: '' }
+      if (executable === 'node.exe' && args[0] === '-p') return { stdout: `${nodeExecutable}\n`, stderr: '' }
+      if (args[0] === npmCli && args[1] === '--version') return { stdout: '10.9.3\n', stderr: '' }
+      throw new AgentInstallerProcessError('timed out', true, '', 'registry timeout')
+    })
+    const service = new AgentInstallationService({ platform: 'win32', processPort: processes, installTimeoutMs: 1234 })
+
+    await expect(service.install('deepseek-harness')).resolves.toMatchObject({
+      status: 'failed',
+      error: { code: 'install-timeout', detail: 'registry timeout' },
+    })
+    expect(processes.calls.find(({ args }) => args.includes('install'))?.timeoutMs).toBe(1234)
+  })
+
+  it('rejects a DeepSeek Harness installation that reports a different version', async () => {
+    const nodeExecutable = 'C:\\Tools\\nodejs\\node.exe'
+    const npmCli = 'C:\\Tools\\nodejs\\node_modules\\npm\\bin\\npm-cli.js'
+    const processes = processPort(async ({ executable, args }) => {
+      if (executable === 'node.exe' && args[0] === '--version') return { stdout: 'v22.20.0\n', stderr: '' }
+      if (executable === 'node.exe' && args[0] === '-p') return { stdout: `${nodeExecutable}\n`, stderr: '' }
+      if (args[0] === npmCli && args[1] === '--version') return { stdout: '10.9.3\n', stderr: '' }
+      if (args.includes('install')) return { stdout: '', stderr: '' }
+      return { stdout: '0.1.0-rc.5\n', stderr: '' }
+    })
+    const service = new AgentInstallationService({
+      platform: 'win32',
+      processPort: processes,
+      environment: { APPDATA: 'C:\\Users\\tester\\AppData\\Roaming' },
+      homeDir: 'C:\\Users\\tester',
+    })
+
+    await expect(service.install('deepseek-harness')).resolves.toMatchObject({
+      status: 'failed',
+      error: {
+        code: 'verification-failed',
+        detail: `Expected ${DEEPSEEK_HARNESS_VERSION}, but the installed CLI reported 0.1.0-rc.5.`,
+      },
+    })
   })
 
   it('keeps unsupported preview channels fail closed without opening a page', async () => {

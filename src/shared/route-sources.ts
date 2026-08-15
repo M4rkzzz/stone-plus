@@ -453,13 +453,15 @@ export function analyzeRouteSourceCompatibility<TAccount extends RouteSourceAcco
     }
     return { eligible: true, inboundProtocol, sourceProtocol, mode: 'kiro-claude' }
   }
-  if (routeSourceUsesDeepSeek(source, collections) && client !== 'codex') {
+  if (routeSourceUsesDeepSeek(source, collections)
+    && client !== 'codex'
+    && client !== 'deepseek-harness') {
     return {
       eligible: false,
       inboundProtocol,
       sourceProtocol,
       mode: 'unsupported',
-      reason: 'DeepSeek Responses sources are available only to Codex clients.',
+      reason: 'DeepSeek sources are available only to Codex and DeepSeek Harness clients.',
     }
   }
   if (client === 'grokbuild' && !isNativeGrokRouteSource(source, collections)) {
@@ -496,7 +498,7 @@ export function routeSourceUsesKiroClaude<TAccount extends RouteSourceAccount>(
   })
 }
 
-/** DeepSeek Responses is a Codex-specific native source family. */
+/** DeepSeek is restricted to clients with a complete DeepSeek tool bridge. */
 export function routeSourceUsesDeepSeek<TAccount extends RouteSourceAccount>(
   source: ResolvedRouteSource<TAccount> | undefined,
   collections: Pick<RouteSourceCollections<TAccount>, 'providers'>,

@@ -319,7 +319,7 @@ describe('route sources', () => {
     expect(isKiroClaudeRouteSource(resolveRouteSource(aggregate.id, collections), collections)).toBe(false)
   })
 
-  it('exposes DeepSeek Responses only to Codex clients', () => {
+  it('exposes DeepSeek Responses only to Codex and DeepSeek Harness clients', () => {
     const deepseek = provider('deepseek', 'official-api', 'openai-responses')
     deepseek.kind = 'deepseek'
     const deepseekAccount = account('deepseek-account', deepseek.id)
@@ -331,6 +331,12 @@ describe('route sources', () => {
       mode: 'native',
       sourceProtocol: 'openai-responses',
     })
+    expect(analyzeRouteSourceCompatibility('deepseek-harness', source, collections)).toMatchObject({
+      eligible: true,
+      inboundProtocol: 'openai-chat',
+      mode: 'translated',
+      sourceProtocol: 'openai-responses',
+    })
     for (const client of ['claude', 'gemini', 'grokbuild'] as const) {
       expect(analyzeRouteSourceCompatibility(client, source, collections)).toMatchObject({
         eligible: false,
@@ -340,6 +346,23 @@ describe('route sources', () => {
     }
     expect(listRouteSourcesForClient('codex', collections).map((candidate) => candidate.id))
       .toEqual([deepseek.id])
+    expect(listRouteSourcesForClient('deepseek-harness', collections).map((candidate) => candidate.id))
+      .toEqual([deepseek.id])
+  })
+
+  it('allows an OpenAI source to back the DeepSeek Harness translation route', () => {
+    const openai = provider('openai', 'official-api', 'openai-responses')
+    openai.kind = 'openai'
+    const openaiAccount = account('openai-account', openai.id)
+    const collections = { pools: [] as Pool[], providers: [openai], accounts: [openaiAccount] }
+    const source = resolveRouteSource(openai.id, collections)
+
+    expect(analyzeRouteSourceCompatibility('deepseek-harness', source, collections)).toMatchObject({
+      eligible: true,
+      inboundProtocol: 'openai-chat',
+      sourceProtocol: 'openai-responses',
+      mode: 'translated',
+    })
   })
 })
 

@@ -51,6 +51,7 @@ try {
     cwd: projectRoot,
     env: {
       ...process.env,
+      STONE_ELECTRON_SMOKE: '1',
       STONE_USER_DATA_DIR: userData,
       STONE_CLIENT_CONFIG_HOME: clientConfigHome
     },
@@ -959,10 +960,12 @@ try {
     stateBackupCreated: Boolean(backupCreated.backup)
       && stateBackups.some((backup) => backup.path === backupCreated.backup?.path)
       && backupVerified.integrity === 'valid',
-    defaultProfilesPresent: initial.clientProfiles.length === 4
+    defaultProfilesPresent: initial.clientProfiles.length === 5
+      && new Set(initial.clientProfiles.map((candidate) => candidate.client)).size === 5
+      && initial.clientProfiles.some((candidate) => candidate.client === 'deepseek-harness')
       && initial.clientProfiles.every((candidate) => candidate.isDefault),
     profileCreated: Boolean(profile && profile.client === 'claude' && profile.backupRetention === 2),
-    profileScoped: profileConfigs.length === 4
+    profileScoped: profileConfigs.length === 5
       && profileConfigs.find((config) => config.client === 'claude')?.directory === profileDirectory
       && profilePreview.profileId === profile?.id
       && profilePreview.files.every((file) => file.managedFields.length > 0)
@@ -1053,9 +1056,9 @@ try {
     result.title !== 'Stone+' ||
     !result.quickNavigationWorks ||
     result.providers < 1 ||
-    result.routes !== 4 ||
+    result.routes !== 5 ||
     result.credentialsExposed ||
-    result.clientConfigCount !== 4 ||
+    result.clientConfigCount !== 5 ||
     !result.externalProxySurfaceVisible ||
     !result.builtInProxyFirstRunSafe ||
     !result.builtInProxyDisabledCleanly ||

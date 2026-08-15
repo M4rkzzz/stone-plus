@@ -78,6 +78,7 @@ export {
   CHATGPT_CODEX_MODELS_URL,
   CHATGPT_CODEX_RESPONSES_URL,
   CHATGPT_CODEX_RESET_CREDITS_URL,
+  CHATGPT_CODEX_RESET_CREDITS_CONSUME_URL,
   CHATGPT_CODEX_SEARCH_URL,
   CHATGPT_CODEX_USAGE_URL,
   CODEX_CLIENT_VERSION,
@@ -93,22 +94,28 @@ export {
   getCodexClientVersion,
   queryChatGptCodexQuota,
   queryChatGptCodexQuotaAuthorized,
+  consumeChatGptCodexResetCredit,
+  consumeChatGptCodexResetCreditAuthorized,
   refreshChatGptCredential,
   resolveChatGptCredential,
+  sanitizeChatGptCodexInput,
   isChatGptCodexResponsesLiteBody,
   withChatGptCodexBody
 } from './chatgpt-codex'
 export type { ChatGptCredentialRefreshErrorCode } from './chatgpt-codex'
+export type { ChatGptCodexResetCreditResult } from './chatgpt-codex'
 export { ChatGptCodexEndpointError, ChatGptCredentialRefreshError } from './chatgpt-codex'
 export {
   extractProtocolUsage,
   extractCodexQuotaFromHeaders,
   extractCodexQuotaFromUsagePayload,
+  CODEX_QUOTA_STALE_AFTER_MS,
   codexQuotaCooldownUntil,
   codexQuotaIsExhausted,
   extractQuotaSignals,
   extractRateLimitSignals,
   mergeQuotaSignals,
+  mergeCodexQuotaSnapshots,
   parseQuotaResetAt
 } from './quota'
 export {

@@ -17,6 +17,7 @@ const clientNames: Record<RouteClient, string> = {
   codex: 'Codex',
   gemini: 'Gemini',
   grokbuild: 'Grok',
+  'deepseek-harness': 'Harness',
 }
 
 const requestStartedAt = (log: RequestLog): number => log.startedAt ?? log.timestamp
@@ -149,7 +150,7 @@ export function RequestMonitorWindow() {
     >
       <section className="request-monitor__stats" aria-label={t('请求统计', 'Request statistics')}>
         <div><span>{t('活跃', 'Active')}</span><strong>{snapshot.gatewayStatus.activeRequests}</strong></div>
-        <div><span>{t('首字', 'First')}</span><strong>{summary.averageFirstToken ? durationLabel(summary.averageFirstToken) : '—'}</strong></div>
+        <div><span>{t('首包', 'First Byte')}</span><strong>{summary.averageFirstByte ? durationLabel(summary.averageFirstByte) : '—'}</strong></div>
         <div><span>{t('耗时', 'Time')}</span><strong>{summary.averageLatency ? durationLabel(summary.averageLatency) : '—'}</strong></div>
         <div title={t('历史累计 Token', 'Lifetime tokens')}><span>Token</span><strong>{formatTokenBillions(snapshot.observability.tokenCosts.allTime.totalTokens)}</strong></div>
         <button

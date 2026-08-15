@@ -30,6 +30,7 @@ function log(model: string, overrides: Partial<RequestLog> = {}): RequestLog {
 describe('Standard API token pricing', () => {
   it.each([
     ['gpt-5.6-sol', 'gpt-5.6-sol', 125, 12.5, 750],
+    ['gpt-5.6-sol-wm', 'gpt-5.6-sol', 125, 12.5, 750],
     ['gpt-5.6', 'gpt-5.6-sol', 125, 12.5, 750],
     ['gpt-5.6-terra', 'gpt-5.6-terra', 50, 5, 300],
     ['gpt-5.6-luna', 'gpt-5.6-luna', 5, 0.5, 30],
@@ -79,6 +80,7 @@ describe('Standard API token pricing', () => {
 
   it.each([
     ['gpt-5.6-sol', 'gpt-5.6-sol'],
+    ['gpt-5.6-sol-wm', 'gpt-5.6-sol'],
     ['gpt-5.6', 'gpt-5.6-sol'],
     ['gpt-5.6-sol-2026-07-19', 'gpt-5.6-sol'],
     ['openai/gpt-5.6-20260719', 'gpt-5.6-sol'],
@@ -597,5 +599,72 @@ describe('Standard API token pricing', () => {
 
     expect(costs.fiveHourUnpricedUsdTokens).toBe(200)
     expect(costs.fiveHourUnpricedCreditTokens).toBe(100)
+  })
+
+  it('counts priced usage after the 100% boundary once across overlapping quota windows', () => {
+    const now = 1_800_000_000_000
+    const fiveHourReset = now + 60 * 60 * 1000
+    const sevenDayReset = now + 24 * 60 * 60 * 1000
+    const boundary = now - 30 * 60 * 1000
+    const costs = summarizeAccountCodexQuotaCycleCosts([
+      log('gpt-5.6-terra', {
+        accountId: 'target', timestamp: boundary - 1, inputTokens: 1_000_000
+      }),
+      log('gpt-5.6-terra', {
+        accountId: 'target', timestamp: boundary + 1, inputTokens: 1_000_000
+      }),
+      log('gpt-5.6-terra', {
+        accountId: 'target', timestamp: boundary + 2, outputTokens: 1_000_000
+      })
+    ], 'target', {
+      fiveHour: { usedPercent: 100, windowSeconds: 5 * 60 * 60, resetAt: fiveHourReset },
+      sevenDay: { usedPercent: 100, windowSeconds: 7 * 24 * 60 * 60, resetAt: sevenDayReset },
+      observedAt: now,
+      source: 'usage-endpoint'
+    }, now, [
+      {
+        accountId: 'other',
+        observedAt: boundary - 10 * 60 * 1000,
+        fiveHourUsedPercent: 100,
+        fiveHourResetAt: fiveHourReset,
+        sevenDayUsedPercent: 100,
+        sevenDayResetAt: sevenDayReset,
+        source: 'usage-endpoint'
+      },
+      {
+        accountId: 'target',
+        observedAt: boundary,
+        fiveHourUsedPercent: 100,
+        fiveHourResetAt: fiveHourReset,
+        sevenDayUsedPercent: 100,
+        sevenDayResetAt: sevenDayReset,
+        source: 'usage-endpoint'
+      }
+    ])
+
+    expect(costs).toMatchObject({
+      hiddenQuotaUsd: 16,
+      hiddenQuotaTokens: 2_000_000,
+      hiddenQuotaUnpricedTokens: 0
+    })
+  })
+
+  it('uses the current exhausted snapshot as a conservative boundary when no sample exists', () => {
+    const now = 1_800_000_000_000
+    const costs = summarizeAccountCodexQuotaCycleCosts([
+      log('gpt-5.6-terra', {
+        accountId: 'target', timestamp: now - 500, inputTokens: 1_000_000
+      })
+    ], 'target', {
+      fiveHour: { usedPercent: 100, windowSeconds: 5 * 60 * 60, resetAt: now + 60 * 60 * 1000 },
+      observedAt: now - 1_000,
+      source: 'response-headers'
+    }, now)
+
+    expect(costs).toMatchObject({
+      hiddenQuotaUsd: 4,
+      hiddenQuotaTokens: 1_000_000,
+      hiddenQuotaUnpricedTokens: 0
+    })
   })
 })

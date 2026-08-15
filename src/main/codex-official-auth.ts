@@ -150,9 +150,14 @@ function identityIssue(bundle: ChatGptCredentialBundle): boolean {
 }
 
 function sameStoredUser(current: ChatGptCredentialBundle, candidate: ChatGptCredentialBundle): boolean {
-  const currentSubject = current.userId
-    ?? stringValue(jwtClaims(current.accessToken)?.sub)
+  // Imported bundles can carry a provider-specific userId that is not the
+  // OpenAI OAuth `sub` (for example a Sub2API composite identity). Prefer the
+  // signed token subjects and use stored metadata only when neither token has
+  // one; otherwise the exact same Codex auth.json generation is rejected as a
+  // different user and the gateway receives no credential.
+  const currentSubject = stringValue(jwtClaims(current.accessToken)?.sub)
     ?? stringValue(current.idToken ? jwtClaims(current.idToken)?.sub : undefined)
+    ?? current.userId
   const candidateSubject = stringValue(jwtClaims(candidate.accessToken)?.sub)
     ?? stringValue(candidate.idToken ? jwtClaims(candidate.idToken)?.sub : undefined)
   return !currentSubject || !candidateSubject || currentSubject === candidateSubject

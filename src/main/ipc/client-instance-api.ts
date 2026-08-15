@@ -123,7 +123,7 @@ function parseIdentifier(value: unknown): string {
 }
 
 function isRouteClient(value: unknown): value is RouteClient {
-  return typeof value === 'string' && ['claude', 'codex', 'gemini', 'grokbuild'].includes(value)
+  return typeof value === 'string' && ['claude', 'codex', 'gemini', 'grokbuild', 'deepseek-harness'].includes(value)
 }
 
 function isLaunchMode(value: unknown): value is ManagedClientLaunchMode {

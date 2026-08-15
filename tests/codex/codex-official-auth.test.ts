@@ -17,6 +17,20 @@ describe('CodexOfficialAuthBridge', () => {
     })
   })
 
+  it('prefers signed OAuth subjects over provider-specific imported user metadata', async () => {
+    const now = Date.now()
+    const auth = officialAuth(now + 60 * 60_000)
+    const stored = JSON.parse(storedCredential(now + 30 * 60_000))
+    stored.userId = 'sub2api-user__official-account'
+    const { bridge } = createBridge(auth, JSON.stringify(stored))
+
+    await expect(bridge.gatewayCredential(runtimeAccount(), now)).resolves.toEqual({
+      owned: true,
+      accessToken: auth.accessToken,
+      accountId: 'official-account',
+    })
+  })
+
   it('keeps Codex ownership when its access expires so Stone never races the refresh token', async () => {
     const now = Date.now()
     const auth = officialAuth(now + 10_000)

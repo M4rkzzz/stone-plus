@@ -5,6 +5,7 @@ import { isAbsolute, join, normalize } from 'node:path'
 import { valid as validSemver } from 'semver'
 import {
   DEFAULT_ACCOUNT_MAX_CONCURRENCY,
+  CODEX_QUOTA_HISTORY_RETENTION_MS,
   clientNativeProtocols,
   supportsFastServiceTier,
   supportsPoolFastServiceTier,
@@ -46,6 +47,7 @@ import {
 } from '@shared/route-models'
 import { providerSourceFamily } from '@shared/source-family'
 import { normalizeReasoningEffort, normalizeReasoningEffortMap } from '@shared/reasoning-policy'
+import { supportsPoolWmRouting } from '@shared/wm-routing'
 import {
   buildModelCatalog,
   inferUpstreamCapabilities,
@@ -120,6 +122,7 @@ import type {
 } from './types'
 import type { SqliteStateSection } from './sqlite-state-store'
 import { getProviderAdapter } from '../providers'
+import { mergeCodexQuotaSnapshots } from '../providers/quota'
 import {
   chatGptAccessTokenOnlyWarning,
   agentIdentitySensitiveValues,
@@ -365,7 +368,7 @@ export class AppStore {
 
   public async sanitizePersistedData(): Promise<void> {
     await this.sanitizePersistedMessages()
-    await this.store.pruneCodexQuotaHistory(Date.now() - 14 * 24 * 60 * 60 * 1000)
+    await this.store.pruneCodexQuotaHistory(Date.now() - CODEX_QUOTA_HISTORY_RETENTION_MS)
     await this.store.scrubDeletedContentOnce()
   }
 
@@ -2210,7 +2213,8 @@ export class AppStore {
     if (candidate.profile.client !== 'claude'
       && candidate.profile.client !== 'codex'
       && candidate.profile.client !== 'gemini'
-      && candidate.profile.client !== 'grokbuild') {
+      && candidate.profile.client !== 'grokbuild'
+      && candidate.profile.client !== 'deepseek-harness') {
       throw new Error('Unsupported client profile target.')
     }
     return this.saveClientProfile({
@@ -2318,6 +2322,13 @@ export class AppStore {
         forceFastMode: !finalFamilies.has('deepseek')
           && supportsPoolFastServiceTier(protocol)
           && (input.forceFastMode ?? existing?.forceFastMode) === true,
+        routeToWm: supportsPoolWmRouting(
+          protocol,
+          members.flatMap((member) => {
+            const account = state.accounts.find((candidate) => candidate.id === member.accountId)
+            return account ? [account] : []
+          }),
+        ) && (input.routeToWm ?? existing?.routeToWm) === true,
         quotaProtection: input.quotaProtection === undefined
           ? existing?.quotaProtection
           : normalizeQuotaProtection(input.quotaProtection),
@@ -2663,16 +2674,24 @@ export class AppStore {
 
   public getAccountCodexQuotaHistory(accountId: string, from?: number, to?: number): CodexQuotaHistoryPoint[] {
     const end = Number.isFinite(to) ? Number(to) : Date.now()
-    const start = Number.isFinite(from) ? Number(from) : end - 14 * 24 * 60 * 60 * 1000
+    const start = Number.isFinite(from) ? Number(from) : end - CODEX_QUOTA_HISTORY_RETENTION_MS
     return this.store.readCodexQuotaHistory(accountId, start, end)
   }
 
   public getAccountCodexQuotaCycleCosts(accountId: string): CodexQuotaCycleCosts {
-    return this.store.select((state) => {
-      const account = state.accounts.find((candidate) => candidate.id === accountId)
-      if (!account) throw new Error('Account not found.')
-      return summarizeAccountCodexQuotaCycleCosts(state.requestLogs, accountId, account.codexQuota)
-    })
+    const now = Date.now()
+    const account = this.store.select((state) =>
+      state.accounts.find((candidate) => candidate.id === accountId)
+    )
+    if (!account) throw new Error('Account not found.')
+    const history = account.codexQuota
+      ? this.store.readCodexQuotaHistory(accountId, now - CODEX_QUOTA_HISTORY_RETENTION_MS, now)
+      : []
+    // Run the 20k-row scan inside select so SqliteStateStore only clones the
+    // compact summary, rather than cloning the complete request-log array.
+    return this.store.select((state) => summarizeAccountCodexQuotaCycleCosts(
+      state.requestLogs, accountId, account.codexQuota, now, history
+    ))
   }
 
   public async appendLog(log: RequestLog): Promise<RequestLog | undefined> {
@@ -3188,14 +3207,18 @@ function codexQuotaSample(
   accountId: string,
   quota: AccountCodexQuotaSnapshot
 ): CodexQuotaHistoryPoint | undefined {
-  if (!quota.fiveHour && !quota.sevenDay) return undefined
+  const longWindow = quota.sevenDay ?? quota.monthly
+  if (!quota.fiveHour && !longWindow) return undefined
   return {
     accountId,
     observedAt: quota.observedAt,
     fiveHourUsedPercent: quota.fiveHour?.usedPercent,
     fiveHourResetAt: quota.fiveHour?.resetAt,
-    sevenDayUsedPercent: quota.sevenDay?.usedPercent,
-    sevenDayResetAt: quota.sevenDay?.resetAt,
+    // Keep the existing SQLite columns as the generic long-window series.
+    // This preserves v9 compatibility while correctly storing Free monthly
+    // windows instead of requiring a schema migration.
+    sevenDayUsedPercent: longWindow?.usedPercent,
+    sevenDayResetAt: longWindow?.resetAt,
     source: quota.source
   }
 }
@@ -3807,6 +3830,10 @@ function normalizePersistedState(
   const normalizedPools: Pool[] = state.pools.map((pool): Pool => {
     const persistedAllowlist = normalizeModels(pool.modelAllowlist)
     const modelPolicy = normalizePersistedModelPolicy(pool.modelPolicy, persistedAllowlist)
+    const memberAccounts = pool.members.flatMap((member) => {
+      const account = accountsById.get(member.accountId)
+      return account ? [account] : []
+    })
     return {
       ...pool,
       kind: pool.kind === 'relay-aggregate' ? 'relay-aggregate' : 'standard',
@@ -3817,6 +3844,10 @@ function normalizePersistedState(
       reasoningEffortMap: normalizeReasoningEffortMap(pool.reasoningEffortMap),
       reasoningEffortCap: normalizeReasoningEffort(pool.reasoningEffortCap),
       forceFastMode: supportsPoolFastServiceTier(pool.protocol) && pool.forceFastMode === true,
+      routeToWm: pool.kind !== 'relay-aggregate'
+        && memberAccounts.length === pool.members.length
+        && supportsPoolWmRouting(pool.protocol, memberAccounts)
+        && pool.routeToWm === true,
       members: pool.members.map((member, index) => ({
         accountId: member.accountId,
         enabled: member.enabled === true && (pool.protocol !== 'kiro-claude'
@@ -3909,7 +3940,7 @@ export function enumeratePoolOpenModels(
 }
 
 function createDefaultRoutes(timestamp: number): Route[] {
-  return (['claude', 'codex', 'gemini', 'grokbuild'] as const).map((client) => ({
+  return (['claude', 'codex', 'gemini', 'grokbuild', 'deepseek-harness'] as const).map((client) => ({
     id: `route-${client}`,
     client,
     enabled: false,
@@ -3984,7 +4015,7 @@ function normalizePersistedRoutes(
 }
 
 function createDefaultClientProfiles(timestamp: number): ClientConfigProfile[] {
-  return (['claude', 'codex', 'gemini', 'grokbuild'] as const).map((client) => ({
+  return (['claude', 'codex', 'gemini', 'grokbuild', 'deepseek-harness'] as const).map((client) => ({
     id: `default-${client}`,
     name: '默认配置',
     client,
@@ -4311,22 +4342,7 @@ function mergeAccountCodexQuota(
   earlier: AccountCodexQuotaSnapshot | undefined,
   later: AccountCodexQuotaSnapshot
 ): AccountCodexQuotaSnapshot {
-  if (later.source === 'usage-endpoint') {
-    return {
-      ...later,
-      ...(later.fiveHour ? { fiveHour: { ...later.fiveHour } } : {}),
-      ...(later.sevenDay ? { sevenDay: { ...later.sevenDay } } : {})
-    }
-  }
-  return {
-    observedAt: later.observedAt,
-    source: later.source,
-    allowed: later.allowed ?? earlier?.allowed,
-    limitReached: later.limitReached ?? earlier?.limitReached,
-    resetCredits: later.resetCredits ?? earlier?.resetCredits,
-    fiveHour: later.fiveHour ? { ...earlier?.fiveHour, ...later.fiveHour } : earlier?.fiveHour,
-    sevenDay: later.sevenDay ? { ...earlier?.sevenDay, ...later.sevenDay } : earlier?.sevenDay
-  }
+  return mergeCodexQuotaSnapshots(earlier, later)
 }
 
 function createId(): string {

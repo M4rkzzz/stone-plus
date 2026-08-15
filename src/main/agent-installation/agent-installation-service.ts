@@ -1,5 +1,8 @@
 import { randomUUID } from 'node:crypto'
 import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process'
+import { homedir } from 'node:os'
+import { posix, win32 } from 'node:path'
+import { clean as cleanSemver, satisfies as satisfiesSemver } from 'semver'
 import type { AgentTarget } from '../../shared/agent-lifecycle'
 import { terminateProcessTree } from '../proxy/built-in/process-utils'
 
@@ -77,6 +80,10 @@ export interface AgentInstallationServiceOptions {
 }
 
 export const CODEX_DESKTOP_DOWNLOAD_URL = 'https://chatgpt.com/download/'
+export const DEEPSEEK_HARNESS_PACKAGE_NAME = '@deepseek-ai/dsh'
+export const DEEPSEEK_HARNESS_VERSION = '0.1.0-rc.6'
+export const DEEPSEEK_HARNESS_PACKAGE_SPEC = `${DEEPSEEK_HARNESS_PACKAGE_NAME}@${DEEPSEEK_HARNESS_VERSION}`
+export const DEEPSEEK_HARNESS_NODE_RANGE = '^22.19.0 || >=24.0.0'
 export const AGENT_INSTALL_GUIDE_URLS = Object.freeze({
   'codex-cli': 'https://learn.chatgpt.com/docs/codex/cli',
   'claude-code': 'https://code.claude.com/docs/en/getting-started',
@@ -84,17 +91,35 @@ export const AGENT_INSTALL_GUIDE_URLS = Object.freeze({
   'claude-code-vsc': 'https://marketplace.visualstudio.com/items?itemName=anthropic.claude-code',
   'gemini-cli': 'https://github.com/google-gemini/gemini-cli',
   'grok-build': 'https://x.ai/cli',
+  'deepseek-harness': 'https://github.com/deepseek-ai/deepseek-harness',
 } satisfies Readonly<Record<Exclude<AgentInstallTarget, 'codex-desktop'>, string>>)
 
 const MAX_DETAIL_LENGTH = 2_000
+const DEFAULT_RUNTIME_CHECK_TIMEOUT_MS = 10_000
+const DEFAULT_INSTALL_TIMEOUT_MS = 5 * 60_000
+const DEFAULT_VERIFICATION_TIMEOUT_MS = 30_000
+
+interface NpmInvocation {
+  executable: string
+  leadingArgs: string[]
+}
 
 /**
- * Opens only hard-coded official installation guidance. Stone+ deliberately
- * does not pipe mutable network content into a shell or install floating npm
- * tags; calls remain serialized so the UI receives deterministic progress.
+ * Opens hard-coded official installation guidance for external products. The
+ * DeepSeek Harness exception uses a fixed official npm package and version,
+ * invokes npm without a shell, and verifies the installed CLI before handing
+ * it to the lifecycle coordinator. Calls remain serialized so the UI receives
+ * deterministic progress.
  */
 export class AgentInstallationService {
+  private readonly processPort: AgentInstallerProcessPort
   private readonly openExternal?: (url: string) => Promise<unknown>
+  private readonly platform: NodeJS.Platform
+  private readonly runtimeCheckTimeoutMs: number
+  private readonly installTimeoutMs: number
+  private readonly verificationTimeoutMs: number
+  private readonly environment: NodeJS.ProcessEnv
+  private readonly homeDir: string
   private readonly now: () => number
   private readonly createOperationId: () => string
   private readonly listeners = new Set<AgentInstallProgressListener>()
@@ -102,7 +127,14 @@ export class AgentInstallationService {
   private queueDepth = 0
 
   public constructor(options: AgentInstallationServiceOptions = {}) {
+    this.platform = options.platform ?? process.platform
+    this.processPort = options.processPort ?? new NativeAgentInstallerProcessPort(this.platform)
     this.openExternal = options.openExternal
+    this.runtimeCheckTimeoutMs = positiveTimeout(options.runtimeCheckTimeoutMs, DEFAULT_RUNTIME_CHECK_TIMEOUT_MS)
+    this.installTimeoutMs = positiveTimeout(options.installTimeoutMs, DEFAULT_INSTALL_TIMEOUT_MS)
+    this.verificationTimeoutMs = positiveTimeout(options.verificationTimeoutMs, DEFAULT_VERIFICATION_TIMEOUT_MS)
+    this.environment = options.environment ?? process.env
+    this.homeDir = options.homeDir ?? homedir()
     this.now = options.now ?? Date.now
     this.createOperationId = options.createOperationId ?? randomUUID
   }
@@ -150,7 +182,177 @@ export class AgentInstallationService {
       return this.fail(operationId, target, channel, 'unsupported-channel', `${displayName(target)} does not provide a supported preview installation channel.`, undefined, onProgress)
     }
 
+    if (target === 'deepseek-harness') {
+      return this.installDeepSeekHarness(operationId, channel, onProgress)
+    }
+
     return this.openOfficialInstallGuide(operationId, target, channel, onProgress)
+  }
+
+  private async installDeepSeekHarness(
+    operationId: string,
+    channel: AgentInstallChannel,
+    onProgress?: AgentInstallProgressListener,
+  ): Promise<AgentInstallResult> {
+    const target = 'deepseek-harness' as const
+    const packageName = DEEPSEEK_HARNESS_PACKAGE_NAME
+    this.emit({ operationId, target, channel, stage: 'checking-node', packageName }, onProgress)
+
+    let nodeExecutable: string
+    try {
+      const command = this.platform === 'win32' ? 'node.exe' : 'node'
+      const [versionResult, executableResult] = await Promise.all([
+        this.processPort.execute(command, ['--version'], { timeoutMs: this.runtimeCheckTimeoutMs }),
+        this.processPort.execute(command, ['-p', 'process.execPath'], { timeoutMs: this.runtimeCheckTimeoutMs }),
+      ])
+      const version = cleanSemver(firstOutputLine(versionResult.stdout))
+      if (!version || !satisfiesSemver(version, DEEPSEEK_HARNESS_NODE_RANGE)) {
+        return this.fail(
+          operationId,
+          target,
+          channel,
+          'node-not-found',
+          `DeepSeek Harness requires Node.js ${DEEPSEEK_HARNESS_NODE_RANGE}.`,
+          version ? `Detected Node.js ${version}.` : 'Unable to read the installed Node.js version.',
+          onProgress,
+          packageName,
+        )
+      }
+      nodeExecutable = firstOutputLine(executableResult.stdout)
+      const pathApi = this.platform === 'win32' ? win32 : posix
+      if (!pathApi.isAbsolute(nodeExecutable)) throw new Error('Node.js did not report an absolute executable path.')
+    } catch (cause) {
+      return this.fail(
+        operationId,
+        target,
+        channel,
+        'node-not-found',
+        `DeepSeek Harness requires Node.js ${DEEPSEEK_HARNESS_NODE_RANGE}.`,
+        errorDetail(cause),
+        onProgress,
+        packageName,
+      )
+    }
+
+    this.emit({ operationId, target, channel, stage: 'checking-npm', packageName }, onProgress)
+    let npm: NpmInvocation
+    try {
+      npm = await this.resolveNpmInvocation(nodeExecutable)
+    } catch (cause) {
+      return this.fail(
+        operationId,
+        target,
+        channel,
+        'npm-not-found',
+        'DeepSeek Harness installation requires npm from the selected Node.js installation.',
+        errorDetail(cause),
+        onProgress,
+        packageName,
+      )
+    }
+
+    const prefix = managedNpmPrefix(this.platform, this.homeDir, this.environment)
+    this.emit({
+      operationId,
+      target,
+      channel,
+      stage: 'installing',
+      packageName,
+      detail: DEEPSEEK_HARNESS_VERSION,
+    }, onProgress)
+    try {
+      await this.processPort.execute(npm.executable, [
+        ...npm.leadingArgs,
+        'install',
+        '--global',
+        '--prefix',
+        prefix,
+        '--no-audit',
+        '--no-fund',
+        '--loglevel=error',
+        DEEPSEEK_HARNESS_PACKAGE_SPEC,
+      ], { timeoutMs: this.installTimeoutMs })
+    } catch (cause) {
+      const timedOut = cause instanceof AgentInstallerProcessError && cause.timedOut
+      return this.fail(
+        operationId,
+        target,
+        channel,
+        timedOut ? 'install-timeout' : 'install-failed',
+        timedOut
+          ? 'DeepSeek Harness installation timed out.'
+          : 'DeepSeek Harness could not be installed from the official npm package.',
+        errorDetail(cause),
+        onProgress,
+        packageName,
+      )
+    }
+
+    this.emit({ operationId, target, channel, stage: 'verifying', packageName }, onProgress)
+    try {
+      const result = await this.processPort.execute(nodeExecutable, [
+        deepSeekHarnessEntrypoint(this.platform, prefix),
+        '--version',
+      ], { timeoutMs: this.verificationTimeoutMs })
+      const version = firstOutputLine(result.stdout)
+      if (version !== DEEPSEEK_HARNESS_VERSION) {
+        throw new Error(`Expected ${DEEPSEEK_HARNESS_VERSION}, but the installed CLI reported ${version || 'no version'}.`)
+      }
+    } catch (cause) {
+      return this.fail(
+        operationId,
+        target,
+        channel,
+        'verification-failed',
+        'DeepSeek Harness was installed, but its fixed version could not be verified.',
+        errorDetail(cause),
+        onProgress,
+        packageName,
+      )
+    }
+
+    this.emit({ operationId, target, channel, stage: 'completed', packageName }, onProgress)
+    return {
+      operationId,
+      target,
+      channel,
+      status: 'installed',
+      packageName,
+      version: DEEPSEEK_HARNESS_VERSION,
+    }
+  }
+
+  private async resolveNpmInvocation(nodeExecutable: string): Promise<NpmInvocation> {
+    if (this.platform !== 'win32') {
+      await this.processPort.execute('npm', ['--version'], { timeoutMs: this.runtimeCheckTimeoutMs })
+      return { executable: 'npm', leadingArgs: [] }
+    }
+
+    const npmCliCandidates = [
+      win32.join(win32.dirname(nodeExecutable), 'node_modules', 'npm', 'bin', 'npm-cli.js'),
+      ...await this.windowsNpmCliCandidates(),
+    ]
+    let lastError: unknown
+    for (const npmCli of uniqueWindowsPaths(npmCliCandidates)) {
+      try {
+        await this.processPort.execute(nodeExecutable, [npmCli, '--version'], { timeoutMs: this.runtimeCheckTimeoutMs })
+        return { executable: nodeExecutable, leadingArgs: [npmCli] }
+      } catch (cause) {
+        lastError = cause
+      }
+    }
+    throw lastError ?? new Error('npm could not be located next to the selected Node.js installation.')
+  }
+
+  private async windowsNpmCliCandidates(): Promise<string[]> {
+    try {
+      const result = await this.processPort.execute('where.exe', ['npm.cmd'], { timeoutMs: this.runtimeCheckTimeoutMs })
+      return outputLines(result.stdout)
+        .filter((path) => win32.isAbsolute(path))
+        .map((path) => win32.join(win32.dirname(path), 'node_modules', 'npm', 'bin', 'npm-cli.js'))
+    } catch {
+      return []
+    }
   }
 
   private async openOfficialInstallGuide(
@@ -298,7 +500,7 @@ export class NativeAgentInstallerProcessPort implements AgentInstallerProcessPor
 export function isAgentInstallTarget(value: unknown): value is AgentInstallTarget {
   return value === 'codex-desktop' || value === 'codex-cli' || value === 'claude-code'
     || value === 'claude-code-desktop' || value === 'claude-code-vsc'
-    || value === 'gemini-cli' || value === 'grok-build'
+    || value === 'gemini-cli' || value === 'grok-build' || value === 'deepseek-harness'
 }
 
 function displayName(target: Exclude<AgentInstallTarget, 'codex-desktop'>): string {
@@ -306,12 +508,57 @@ function displayName(target: Exclude<AgentInstallTarget, 'codex-desktop'>): stri
   if (target === 'claude-code') return 'Claude Code CLI'
   if (target === 'claude-code-desktop') return 'Claude Code Desktop'
   if (target === 'claude-code-vsc') return 'Claude Code VSC'
-  return target === 'gemini-cli' ? 'Gemini CLI' : 'Grok Build'
+  if (target === 'gemini-cli') return 'Gemini CLI'
+  return target === 'grok-build' ? 'Grok Build' : 'DeepSeek Harness'
 }
 
 function appendOutput(current: string, chunk: Buffer | string): string {
   const combined = current + String(chunk)
   return combined.length <= MAX_DETAIL_LENGTH ? combined : combined.slice(-MAX_DETAIL_LENGTH)
+}
+
+function positiveTimeout(value: number | undefined, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0
+    ? Math.floor(value)
+    : fallback
+}
+
+function outputLines(value: string): string[] {
+  return value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)
+}
+
+function firstOutputLine(value: string): string {
+  return outputLines(value)[0] ?? ''
+}
+
+function managedNpmPrefix(
+  platform: NodeJS.Platform,
+  homeDir: string,
+  environment: NodeJS.ProcessEnv,
+): string {
+  if (platform !== 'win32') return posix.join(homeDir, '.local')
+  const appData = environment.APPDATA?.trim()
+  const roaming = appData && win32.isAbsolute(appData)
+    ? appData
+    : win32.join(homeDir, 'AppData', 'Roaming')
+  return win32.join(roaming, 'npm')
+}
+
+function deepSeekHarnessEntrypoint(platform: NodeJS.Platform, prefix: string): string {
+  const pathApi = platform === 'win32' ? win32 : posix
+  return platform === 'win32'
+    ? pathApi.join(prefix, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js')
+    : pathApi.join(prefix, 'lib', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js')
+}
+
+function uniqueWindowsPaths(paths: readonly string[]): string[] {
+  const seen = new Set<string>()
+  return paths.filter((path) => {
+    const key = win32.normalize(path).toLocaleLowerCase('en-US')
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
 }
 
 function errorDetail(cause: unknown): string | undefined {

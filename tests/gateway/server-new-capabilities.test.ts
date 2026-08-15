@@ -1,8 +1,9 @@
 import { createServer as createNodeServer } from 'node:net'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import type { Account, GatewaySettings, Pool, ProviderDefinition, Route } from '../../src/shared/types'
+import type { Account, GatewaySettings, Pool, ProviderDefinition, RequestLog, Route } from '../../src/shared/types'
 import { GatewayServer } from '../../src/main/gateway'
 import type { GatewayConfig } from '../../src/main/gateway'
+import { GPT_5_6_SOL_WM_MODEL } from '../../src/shared/wm-routing'
 
 const timestamp = 1_700_000_000_000
 const runningServers: GatewayServer[] = []
@@ -49,6 +50,7 @@ function config(input: {
   account: Account
   poolProtocol?: Pool['protocol']
   routeProtocol?: Route['inboundProtocol']
+  routeClient?: Route['client']
   maxRetries?: number
 }): GatewayConfig {
   const pool: Pool = {
@@ -68,7 +70,7 @@ function config(input: {
   }
   const route: Route = {
     id: 'route',
-    client: 'codex',
+    client: input.routeClient ?? 'codex',
     enabled: true,
     poolId: pool.id,
     inboundProtocol: input.routeProtocol ?? 'openai-responses',
@@ -98,6 +100,449 @@ afterEach(async () => {
 })
 
 describe('GatewayServer new capability boundaries', () => {
+  it('routes every enabled-pool model request to WM without exposing WM to local model matching', async () => {
+    const port = await freePort()
+    const provider: ProviderDefinition = {
+      id: 'provider',
+      name: 'ChatGPT OAuth',
+      kind: 'openai',
+      sourceType: 'oauth-system',
+      baseUrl: 'https://chatgpt.com/backend-api/codex',
+      protocol: 'openai-responses',
+      models: ['client-model'],
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    }
+    const selectedAccount = account({
+      credentialType: 'chatgpt-oauth',
+      availableModels: ['client-model'],
+      modelsRefreshedAt: timestamp,
+      modelPolicy: 'selected',
+      modelAllowlist: ['client-model'],
+    })
+    const gatewayConfig = config({ port, provider, account: selectedAccount, maxRetries: 0 })
+    gatewayConfig.pools[0].modelPolicy = 'selected'
+    gatewayConfig.pools[0].modelAllowlist = ['client-model']
+    gatewayConfig.pools[0].routeToWm = true
+    const logs: RequestLog[] = []
+    const completed = [
+      'event: response.completed',
+      'data: {"type":"response.completed","response":{"id":"resp_wm","model":"gpt-5.6-sol","status":"completed","output":[]}}',
+      '',
+      '',
+    ].join('\n')
+    const upstreamFetch = vi.fn(async () => new Response(completed, {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream' },
+    }))
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => ({
+        secret: 'oauth-access-token',
+        kind: 'chatgpt-oauth',
+        accountId: 'chatgpt-account',
+      }),
+      fetchImplementation: upstreamFetch as typeof fetch,
+      onLog: (log) => logs.push(log),
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'client-model', input: 'hello', stream: true }),
+    })
+
+    expect(response.status, await response.clone().text()).toBe(200)
+    expect(await response.text()).toContain('response.completed')
+    expect(upstreamFetch).toHaveBeenCalledOnce()
+    expect(JSON.parse(String(upstreamFetch.mock.calls[0][1]?.body))).toMatchObject({
+      model: GPT_5_6_SOL_WM_MODEL,
+    })
+    expect(logs.findLast((log) => log.status === 'success')).toMatchObject({
+      model: 'client-model',
+      upstreamModel: GPT_5_6_SOL_WM_MODEL,
+    })
+  })
+
+  it('isolates the DeepSeek Harness Chat Completions endpoint and model catalog by route token', async () => {
+    const port = await freePort()
+    const provider: ProviderDefinition = {
+      id: 'provider',
+      name: 'OpenAI-compatible relay',
+      kind: 'openai-compatible',
+      sourceType: 'relay',
+      baseUrl: 'https://relay.example.test/v1',
+      protocol: 'openai-chat',
+      models: ['gpt-5.6-sol', 'gpt-5.5'],
+      modelCatalog: [
+        { id: 'gpt-5.6-sol', contextWindow: 64_000, maxOutputTokens: 8_192 },
+        { id: 'gpt-5.5', contextWindow: 32_000, maxOutputTokens: 4_096 },
+      ],
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    }
+    const upstreamFetch = vi.fn(async () => new Response(JSON.stringify({
+      id: 'chatcmpl-harness',
+      model: 'gpt-5.6-sol',
+      choices: [{ index: 0, message: { role: 'assistant', content: 'Harness ready' }, finish_reason: 'stop' }],
+    }), { status: 200, headers: { 'content-type': 'application/json' } }))
+    const gateway = new GatewayServer({
+      config: config({
+        port,
+        provider,
+        account: account({ credentialType: 'api-key', availableModels: ['gpt-5.6-sol', 'gpt-5.5'] }),
+        poolProtocol: 'openai-chat',
+        routeProtocol: 'openai-chat',
+        routeClient: 'deepseek-harness',
+      }),
+      credentialResolver: () => ({ secret: 'relay-key', kind: 'api-key' }),
+      fetchImplementation: upstreamFetch as typeof fetch,
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/deepseek-harness/v1/chat/completions`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer local-secret',
+        'content-type': 'application/json',
+        'x-deepseek-harness-session-id': 'dsh-gpt-session',
+      },
+      body: JSON.stringify({
+        model: 'gpt-5.6-sol',
+        messages: [{ role: 'user', content: 'hello' }],
+        reasoning_effort: 'xhigh',
+      }),
+    })
+    const catalog = await fetch(`http://127.0.0.1:${port}/deepseek-harness/v1/models`, {
+      headers: { authorization: 'Bearer local-secret' },
+    })
+
+    expect(response.status, await response.clone().text()).toBe(200)
+    expect(await response.json()).toMatchObject({ choices: [{ message: { content: 'Harness ready' } }] })
+    expect(upstreamFetch).toHaveBeenCalledOnce()
+    expect(upstreamFetch.mock.calls[0][0]).toBe('https://relay.example.test/v1/chat/completions')
+    expect(JSON.parse(String(upstreamFetch.mock.calls[0][1]?.body))).toMatchObject({
+      reasoning_effort: 'xhigh',
+    })
+    expect(catalog.status, await catalog.clone().text()).toBe(200)
+    expect(await catalog.json()).toMatchObject({
+      data: [{ id: 'gpt-5.6-sol', context_window: 64_000, max_output_tokens: 8_192 }],
+    })
+    expect((await fetch(`http://127.0.0.1:${port}/v1/models`, {
+      headers: { authorization: 'Bearer local-secret' },
+    })).status).toBe(401)
+    expect((await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-5.6-sol', messages: [{ role: 'user', content: 'hello' }] }),
+    })).status).toBe(401)
+  })
+
+  it('admits bounded DeepSeek Harness Chat and Responses histories above the standard 10 MiB limit', async () => {
+    const port = await freePort()
+    const provider: ProviderDefinition = {
+      id: 'provider',
+      name: 'OpenAI-compatible relay',
+      kind: 'openai-compatible',
+      sourceType: 'relay',
+      baseUrl: 'https://relay.example.test/v1',
+      protocol: 'openai-chat',
+      models: ['gpt-5.6-sol'],
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    }
+    const upstreamFetch = vi.fn(async () => new Response(JSON.stringify({
+      id: 'chatcmpl-large-harness',
+      model: 'gpt-5.6-sol',
+      choices: [{ index: 0, message: { role: 'assistant', content: 'Harness ready' }, finish_reason: 'stop' }],
+    }), { status: 200, headers: { 'content-type': 'application/json' } }))
+    const gateway = new GatewayServer({
+      config: config({
+        port,
+        provider,
+        account: account({ credentialType: 'api-key', availableModels: ['gpt-5.6-sol'] }),
+        poolProtocol: 'openai-chat',
+        routeProtocol: 'openai-chat',
+        routeClient: 'deepseek-harness',
+      }),
+      credentialResolver: () => ({ secret: 'relay-key', kind: 'api-key' }),
+      fetchImplementation: upstreamFetch as typeof fetch,
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const largeText = 'x'.repeat(10 * 1024 * 1024 + 1)
+    const chatResponse = await fetch(`http://127.0.0.1:${port}/deepseek-harness/v1/chat/completions`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer local-secret',
+        'content-type': 'application/json',
+        'x-deepseek-harness-session-id': 'dsh-large-session',
+      },
+      body: JSON.stringify({
+        model: 'gpt-5.6-sol',
+        messages: [{ role: 'user', content: largeText }],
+      }),
+    })
+    const responsesResponse = await fetch(`http://127.0.0.1:${port}/deepseek-harness/v1/responses`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer local-secret',
+        'content-type': 'application/json',
+        'x-deepseek-harness-session-id': 'dsh-large-responses-session',
+      },
+      body: JSON.stringify({
+        model: 'gpt-5.6-sol',
+        input: largeText,
+        stream: false,
+      }),
+    })
+
+    expect(chatResponse.status, await chatResponse.clone().text()).toBe(200)
+    expect(responsesResponse.status, await responsesResponse.clone().text()).toBe(200)
+    expect(upstreamFetch).toHaveBeenCalledTimes(2)
+  }, 20_000)
+
+  it('persists DSH model families and keeps Codex imports on GPT-5.6', async () => {
+    const provider: ProviderDefinition = {
+      id: 'provider',
+      name: 'Multi-family test relay',
+      kind: 'custom',
+      sourceType: 'relay',
+      baseUrl: 'https://relay.example.test/v1',
+      protocol: 'openai-chat',
+      models: ['gpt-5.6-terra', 'gpt-5.5', 'deepseek-v4-flash'],
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    }
+    const harnessAccount = account({
+      credentialType: 'api-key',
+      availableModels: ['gpt-5.6-terra', 'gpt-5.5', 'deepseek-v4-flash'],
+    })
+    let persisted: Array<{ sessionId: string; family: 'gpt' | 'deepseek'; boundAt: number }> = []
+    const createHarnessGateway = async (port: number, upstreamFetch: typeof fetch): Promise<GatewayServer> => {
+      const gateway = new GatewayServer({
+        config: config({
+          port,
+          provider,
+          account: harnessAccount,
+          poolProtocol: 'openai-chat',
+          routeProtocol: 'openai-chat',
+          routeClient: 'deepseek-harness',
+        }),
+        credentialResolver: () => ({ secret: 'relay-key', kind: 'api-key' }),
+        fetchImplementation: upstreamFetch,
+        loadDeepSeekHarnessModelBindings: () => persisted,
+        saveDeepSeekHarnessModelBindings: async (bindings) => {
+          persisted = bindings.map((binding) => ({ ...binding }))
+        },
+      })
+      runningServers.push(gateway)
+      await gateway.start()
+      return gateway
+    }
+    const send = (
+      port: number,
+      sessionId: string,
+      model: string,
+      sessionHeader = 'x-deepseek-harness-session-id',
+    ) => fetch(
+      `http://127.0.0.1:${port}/deepseek-harness/v1/chat/completions`,
+      {
+        method: 'POST',
+        headers: {
+          authorization: 'Bearer local-secret',
+          'content-type': 'application/json',
+          [sessionHeader]: sessionId,
+        },
+        body: JSON.stringify({ model, messages: [{ role: 'user', content: 'hello' }] }),
+      },
+    )
+    const sendResponses = (port: number, sessionId: string, model: string) => fetch(
+      `http://127.0.0.1:${port}/deepseek-harness/v1/responses`,
+      {
+        method: 'POST',
+        headers: {
+          authorization: 'Bearer local-secret',
+          'content-type': 'application/json',
+          session_id: sessionId,
+        },
+        body: JSON.stringify({ model, input: 'hello', stream: false }),
+      },
+    )
+
+    const firstPort = await freePort()
+    const firstUpstream = vi.fn(async () => Response.json({
+      id: 'first',
+      choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+    })) as unknown as typeof fetch
+    const firstGateway = await createHarnessGateway(firstPort, firstUpstream)
+    const unboundDirectory = await fetch(
+      `http://127.0.0.1:${firstPort}/deepseek-harness/stone/session-models?session_id=gpt-session`,
+      { headers: { authorization: 'Bearer local-secret' } },
+    )
+    expect(unboundDirectory.status, await unboundDirectory.clone().text()).toBe(200)
+    expect(await unboundDirectory.json()).toEqual({
+      family: null,
+      allowedModels: ['gpt-5.6-terra', 'deepseek-v4-flash'],
+    })
+    const selectedDirectory = await fetch(
+      `http://127.0.0.1:${firstPort}/deepseek-harness/stone/session-models`,
+      {
+        method: 'POST',
+        headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+        body: JSON.stringify({ sessionId: 'gpt-session', model: 'gpt-5.6-terra' }),
+      },
+    )
+    expect(selectedDirectory.status, await selectedDirectory.clone().text()).toBe(200)
+    expect(await selectedDirectory.json()).toEqual({
+      family: null,
+      allowedModels: ['gpt-5.6-terra', 'deepseek-v4-flash'],
+    })
+    expect(persisted).toEqual([])
+    expect((await send(firstPort, 'gpt-session', 'gpt-5.6-terra')).status).toBe(200)
+    expect(persisted).toMatchObject([{ sessionId: 'gpt-session', family: 'gpt' }])
+    await firstGateway.stop({ force: true })
+
+    const secondPort = await freePort()
+    const secondUpstream = vi.fn(async () => Response.json({
+      id: 'second',
+      choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+    })) as unknown as typeof fetch
+    await createHarnessGateway(secondPort, secondUpstream)
+    const restoredSwitch = await send(secondPort, 'gpt-session', 'deepseek-v4-flash')
+    expect(restoredSwitch.status).toBe(409)
+    expect(await restoredSwitch.text()).toContain('permanently bound to GPT-5.6')
+    const importedSwitch = await send(
+      secondPort,
+      'stone-codex-v2-0123456789abcdef0123456789abcdef',
+      'deepseek-v4-flash',
+      'session_id',
+    )
+    expect(importedSwitch.status).toBe(409)
+    expect(secondUpstream).not.toHaveBeenCalled()
+    const importedResume = await sendResponses(
+      secondPort,
+      'stone-codex-v2-0123456789abcdef0123456789abcdef',
+      'gpt-5.6-terra',
+    )
+    expect(importedResume.status, await importedResume.clone().text()).toBe(200)
+
+    expect((await send(secondPort, 'deepseek-session', 'deepseek-v4-flash')).status).toBe(200)
+    expect((await send(secondPort, 'deepseek-session', 'gpt-5.6-terra')).status).toBe(409)
+    expect(secondUpstream).toHaveBeenCalledTimes(2)
+
+    const restoredDirectory = await fetch(
+      `http://127.0.0.1:${secondPort}/deepseek-harness/stone/session-models?session_id=gpt-session`,
+      { headers: { authorization: 'Bearer local-secret' } },
+    )
+    expect(await restoredDirectory.json()).toEqual({
+      family: 'gpt',
+      allowedModels: ['gpt-5.6-terra'],
+    })
+    const importedDirectory = await fetch(
+      `http://127.0.0.1:${secondPort}/deepseek-harness/stone/session-models?session_id=stone-codex-v2-0123456789abcdef0123456789abcdef`,
+      { headers: { authorization: 'Bearer local-secret' } },
+    )
+    expect(await importedDirectory.json()).toEqual({
+      family: 'gpt',
+      allowedModels: ['gpt-5.6-terra'],
+    })
+    const rejectedSelection = await fetch(
+      `http://127.0.0.1:${secondPort}/deepseek-harness/stone/session-models`,
+      {
+        method: 'POST',
+        headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+        body: JSON.stringify({ sessionId: 'gpt-session', model: 'deepseek-v4-flash' }),
+      },
+    )
+    expect(rejectedSelection.status).toBe(409)
+    expect(await rejectedSelection.text()).toContain('permanently bound to GPT-5.6')
+
+    const catalog = await fetch(`http://127.0.0.1:${secondPort}/deepseek-harness/v1/models`, {
+      headers: { authorization: 'Bearer local-secret' },
+    })
+    const payload = await catalog.json() as { data: Array<{ id: string }> }
+    expect(payload.data.map((entry) => entry.id)).toEqual(['gpt-5.6-terra', 'deepseek-v4-flash'])
+  })
+
+  it('bridges the DSH native search provider through the routed Responses source', async () => {
+    const port = await freePort()
+    const provider: ProviderDefinition = {
+      id: 'provider',
+      name: 'OpenAI Responses relay',
+      kind: 'openai-compatible',
+      sourceType: 'relay',
+      baseUrl: 'https://relay.example.test/v1',
+      protocol: 'openai-responses',
+      models: ['gpt-search'],
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    }
+    const upstreamFetch = vi.fn(async () => Response.json({
+      id: 'search-result',
+      action: 'search',
+      data: [{ title: 'Stone result', url: 'https://example.test/stone' }],
+    }))
+    const gateway = new GatewayServer({
+      config: config({
+        port,
+        provider,
+        account: account({ credentialType: 'api-key', availableModels: ['gpt-search'] }),
+        poolProtocol: 'openai-responses',
+        routeProtocol: 'openai-chat',
+        routeClient: 'deepseek-harness',
+      }),
+      credentialResolver: () => ({ secret: 'relay-key', kind: 'api-key' }),
+      fetchImplementation: upstreamFetch as typeof fetch,
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/deepseek-harness/anthropic/v1/messages`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'gpt-search',
+        max_tokens: 4_096,
+        messages: [{
+          role: 'user',
+          content: [{ type: 'text', text: 'Perform a web search for the query: Stone+ docs' }],
+        }],
+        tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 5 }],
+      }),
+    })
+
+    expect(response.status, await response.clone().text()).toBe(200)
+    expect(await response.json()).toMatchObject({
+      type: 'message',
+      model: 'gpt-search',
+      content: [
+        { type: 'server_tool_use', name: 'web_search', input: { query: 'Stone+ docs' } },
+        {
+          type: 'web_search_tool_result',
+          content: [{
+            type: 'web_search_result',
+            title: 'Stone result',
+            url: 'https://example.test/stone',
+          }],
+        },
+      ],
+      stop_reason: 'end_turn',
+    })
+    expect(upstreamFetch).toHaveBeenCalledOnce()
+    expect(upstreamFetch.mock.calls[0][0]).toBe('https://relay.example.test/v1/alpha/search')
+    expect(JSON.parse(String(upstreamFetch.mock.calls[0][1]?.body))).toMatchObject({
+      model: 'gpt-search',
+      action: 'search',
+      query: 'Stone+ docs',
+      commands: { search_query: [{ q: 'Stone+ docs' }] },
+    })
+  })
+
   it('retries a transient ChatGPT overload on the same account without opening its circuit', async () => {
     const port = await freePort()
     const provider: ProviderDefinition = {
@@ -163,7 +608,7 @@ describe('GatewayServer new capability boundaries', () => {
     expect(states).not.toContainEqual(expect.objectContaining({ status: 'disabled' }))
   })
 
-  it('does not cool down a ChatGPT account for a streamed overload terminal', async () => {
+  it('silently retries the first two identical streamed overload terminals and exposes the third', async () => {
     const port = await freePort()
     const provider: ProviderDefinition = {
       id: 'provider',
@@ -211,11 +656,128 @@ describe('GatewayServer new capability boundaries', () => {
       body: JSON.stringify({ model: 'source-model', input: 'hello', stream: true }),
     })
 
-    expect(response.status).toBe(200)
-    expect(await response.text()).toContain('server_is_overloaded')
-    expect(upstreamFetch).toHaveBeenCalledOnce()
+    const body = await response.text()
+    expect(response.status).toBe(502)
+    expect(body).toContain('server_is_overloaded')
+    expect(upstreamFetch).toHaveBeenCalledTimes(3)
     expect(states).not.toContainEqual(expect.objectContaining({ status: 'cooldown' }))
     expect(states).not.toContainEqual(expect.objectContaining({ status: 'disabled' }))
+  })
+
+  it('does not expose a streamed overload when the third attempt recovers', async () => {
+    const port = await freePort()
+    const provider: ProviderDefinition = {
+      id: 'provider',
+      name: 'ChatGPT OAuth',
+      kind: 'openai',
+      sourceType: 'oauth-system',
+      baseUrl: 'https://chatgpt.com/backend-api/codex',
+      protocol: 'openai-responses',
+      models: ['source-model'],
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    }
+    const failed = [
+      'event: response.failed',
+      'data: {"type":"response.failed","response":{"id":"resp_busy","status":"failed","error":{"code":"server_is_overloaded","message":"capacity is temporarily constrained"}}}',
+      '',
+      '',
+    ].join('\n')
+    const completed = [
+      'event: response.completed',
+      'data: {"type":"response.completed","response":{"id":"resp_recovered","model":"source-model","status":"completed","output":[]}}',
+      '',
+      '',
+    ].join('\n')
+    const upstreamFetch = vi.fn(async () => new Response(
+      upstreamFetch.mock.calls.length < 3 ? failed : completed,
+      { status: 200, headers: { 'content-type': 'text/event-stream' } }
+    ))
+    const gateway = new GatewayServer({
+      config: config({
+        port,
+        provider,
+        account: account({ credentialType: 'chatgpt-oauth' }),
+        maxRetries: 0,
+      }),
+      credentialResolver: () => ({
+        secret: 'oauth-access-token',
+        kind: 'chatgpt-oauth',
+        accountId: 'chatgpt-account',
+      }),
+      fetchImplementation: upstreamFetch as typeof fetch,
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'source-model', input: 'hello', stream: true }),
+    })
+    const body = await response.text()
+    expect(response.status, body).toBe(200)
+    expect(body).toContain('response.completed')
+    expect(body).not.toContain('server_is_overloaded')
+    expect(upstreamFetch).toHaveBeenCalledTimes(3)
+  })
+
+  it('retries a ChatGPT stream that closes before response.completed while still precommit', async () => {
+    const port = await freePort()
+    const provider: ProviderDefinition = {
+      id: 'provider',
+      name: 'ChatGPT OAuth',
+      kind: 'openai',
+      sourceType: 'oauth-system',
+      baseUrl: 'https://chatgpt.com/backend-api/codex',
+      protocol: 'openai-responses',
+      models: ['source-model'],
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    }
+    const truncated = [
+      'event: response.created',
+      'data: {"type":"response.created","response":{"id":"resp_truncated","model":"source-model","status":"in_progress","output":[]}}',
+      '',
+      '',
+    ].join('\n')
+    const completed = [
+      'event: response.completed',
+      'data: {"type":"response.completed","response":{"id":"resp_recovered","model":"source-model","status":"completed","output":[]}}',
+      '',
+      '',
+    ].join('\n')
+    const upstreamFetch = vi.fn(async () => new Response(
+      upstreamFetch.mock.calls.length < 3 ? truncated : completed,
+      { status: 200, headers: { 'content-type': 'text/event-stream' } }
+    ))
+    const gateway = new GatewayServer({
+      config: config({
+        port,
+        provider,
+        account: account({ credentialType: 'chatgpt-oauth' }),
+        maxRetries: 0,
+      }),
+      credentialResolver: () => ({
+        secret: 'oauth-access-token',
+        kind: 'chatgpt-oauth',
+        accountId: 'chatgpt-account',
+      }),
+      fetchImplementation: upstreamFetch as typeof fetch,
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'source-model', input: 'hello', stream: true }),
+    })
+    const body = await response.text()
+    expect(response.status, body).toBe(200)
+    expect(body).toContain('response.completed')
+    expect(body).not.toContain('incomplete_stream')
+    expect(upstreamFetch).toHaveBeenCalledTimes(3)
   })
 
   it('applies pool reasoning remapping and its cap to the actual upstream request', async () => {

@@ -69,7 +69,9 @@ export class ClientConfigConnectionPort implements CliConnectionConfigPort {
         ? { codexDirectory: configDirectory }
         : client === 'gemini'
           ? { geminiDirectory: configDirectory }
-          : { grokbuildDirectory: configDirectory }
+          : client === 'grokbuild'
+            ? { grokbuildDirectory: configDirectory }
+            : { deepseekHarnessDirectory: configDirectory }
     return new ClientConfigService({
       homeDir: dirname(configDirectory),
       platform: process.platform,

@@ -23,7 +23,14 @@ import { sanitizeManagedClientLaunchArgs, type ClientInstanceManager } from '../
 import type { AppStore } from '../store/app-store'
 import type { AgentInstallationService } from '../agent-installation'
 import {
+  DeepSeekHarnessCompanionInstaller,
+  DeepSeekHarnessRpcClient,
+  withDeepSeekHarnessCompanionPatch,
+  type DeepSeekHarnessCompanionPort,
+} from '../deepseek-harness'
+import {
   ClaudeCodeLifecycleAdapter,
+  DeepSeekHarnessLifecycleAdapter,
   GeminiCliLifecycleAdapter,
   GrokBuildLifecycleAdapter,
   type ConnectionOnlyCliLifecycleAdapter,
@@ -66,7 +73,15 @@ export function createAgentLifecycleService(options: CreateAgentLifecycleService
   const configPort = new ClientConfigConnectionPort(options.clientConfig)
   const installation = new DiscoveryInstallationPort()
   const desktopProbe = new DefaultCodexDesktopProbe()
-  const cliRuntime = new ManagedCliRuntimePort(options.instances, options.clientConfig, options.store)
+  const deepSeekHarnessRpc = new DeepSeekHarnessRpcClient()
+  const cliRuntime = new ManagedCliRuntimePort(
+    options.instances,
+    options.clientConfig,
+    options.store,
+    undefined,
+    undefined,
+    () => deepSeekHarnessRpc.isReady(250),
+  )
   const surfaceInstallation = {
     inspect: (target: 'claude-code-desktop' | 'claude-code-vsc') => discoverAgentExecutable(target),
   }
@@ -199,6 +214,11 @@ export function createAgentLifecycleService(options: CreateAgentLifecycleService
     runtime: cliRuntime,
     config: configPort,
   })
+  const deepSeekHarnessAdapter = new DeepSeekHarnessLifecycleAdapter({
+    installation,
+    runtime: cliRuntime,
+    config: configPort,
+  })
 
   const adapters: Record<AgentTarget, AgentLifecycleAdapterPort> = {
     'codex-desktop': {
@@ -230,6 +250,20 @@ export function createAgentLifecycleService(options: CreateAgentLifecycleService
     'claude-code-vsc': launchSurfacePort(claudeVscAdapter),
     'gemini-cli': connectionOnlyPort(geminiAdapter, () => connection('gemini')),
     'grok-build': connectionOnlyPort(grokBuildAdapter, () => connection('grokbuild')),
+    'deepseek-harness': connectionOnlyPort(
+      deepSeekHarnessAdapter,
+      () => connection('deepseek-harness'),
+      undefined,
+      async (target) => {
+        await deepSeekHarnessRpc.waitUntilReady()
+        await deepSeekHarnessRpc.configureStoneRoute({
+          gatewayBaseUrl: target.gatewayBaseUrl,
+          token: target.token,
+          preferredModel: resolveDeepSeekHarnessPreferredModel(options.store),
+        })
+        await options.openExternal(deepSeekHarnessRpc.origin)
+      },
+    ),
   }
 
   return new AgentLifecycleService({
@@ -253,6 +287,7 @@ function connectionOnlyPort(
   adapter: ConnectionOnlyCliLifecycleAdapter,
   connection: () => ClientConnectionTarget,
   prepareRoute?: () => Promise<void>,
+  afterStart?: (connection: ClientConnectionTarget) => Promise<unknown>,
 ): AgentLifecycleAdapterPort {
   const preparedConnection = async () => {
     await prepareRoute?.()
@@ -276,7 +311,11 @@ function connectionOnlyPort(
       {},
       restoreOptions?.preserveRunningState !== false,
     ),
-    start: async (options?: AgentStartOptions) => adapter.start(options, await preparedConnection()),
+    start: async (options?: AgentStartOptions) => {
+      const target = await preparedConnection()
+      await adapter.start(options, target)
+      await afterStart?.(target)
+    },
   }
 }
 
@@ -336,7 +375,7 @@ async function repairAndValidateConnection(
 }
 
 class DiscoveryInstallationPort implements CliInstallationPort {
-  async inspect(target: 'claude-code' | 'gemini-cli') {
+  async inspect(target: import('./cli-connection-adapter').ConnectionOnlyAgentTarget) {
     const result = await discoverAgentExecutable(target)
     return {
       installed: result.installed,
@@ -355,21 +394,28 @@ export class ManagedCliRuntimePort implements CliRuntimePort {
     private readonly clientConfig: ClientConfigService,
     private readonly store: AppStore,
     private readonly discover: typeof discoverAgentExecutable = discoverAgentExecutable,
+    private readonly deepSeekHarnessCompanion?: DeepSeekHarnessCompanionPort,
+    private readonly deepSeekHarnessReady?: () => Promise<boolean>,
   ) {}
 
   async snapshot(client: RouteClient) {
+    const managedInstances = this.instances.list()
+      .filter((instance) => instance.client === client)
+      .map((instance) => ({
+        id: instance.id,
+        running: isRunning(instance),
+        configDirectory: instance.configDirectory,
+        ...(instance.profileId ? { profileId: instance.profileId } : {}),
+        ...(instance.lastStartedAt ? { lastStartedAt: instance.lastStartedAt } : {}),
+      }))
     return {
-      managedInstances: this.instances.list()
-        .filter((instance) => instance.client === client)
-        .map((instance) => ({
-          id: instance.id,
-          running: isRunning(instance),
-          configDirectory: instance.configDirectory,
-          ...(instance.profileId ? { profileId: instance.profileId } : {}),
-          ...(instance.lastStartedAt ? { lastStartedAt: instance.lastStartedAt } : {}),
-        })),
-      // External processes are deliberately neither enumerated nor controlled.
-      externalSessionDetected: false,
+      managedInstances,
+      // A previous Stone+ build could lose the Windows `cmd start` wrapper
+      // while the DSH web child kept serving. Recognize only a valid DSH RPC
+      // endpoint; it remains external and is never terminated by Stone+.
+      externalSessionDetected: managedInstances.some((instance) => instance.running)
+        ? false
+        : await this.isExternalDeepSeekHarnessReady(client),
     }
   }
 
@@ -378,10 +424,24 @@ export class ManagedCliRuntimePort implements CliRuntimePort {
   }
 
   async startManaged(instanceId: string): Promise<void> {
+    const existing = this.instances.list().find((instance) => instance.id === instanceId)
+    if (existing?.client === 'deepseek-harness' && !isRunning(existing)) {
+      if (await this.isExternalDeepSeekHarnessReady(existing.client)) return
+      await this.instances.save({
+        ...existing,
+        launchMode: 'background',
+        launchArgs: await this.prepareLaunchArgs(
+          existing.client,
+          existing.launchArgs,
+          existing.configDirectory,
+        ),
+      })
+    }
     await this.instances.start(instanceId)
   }
 
   async startNew(client: RouteClient, options?: AgentStartOptions): Promise<void> {
+    if (await this.isExternalDeepSeekHarnessReady(client)) return
     const existing = selectInstance(this.instances.list(), client, options?.profileId)
     if (existing) {
       if (!isRunning(existing)) {
@@ -391,7 +451,11 @@ export class ManagedCliRuntimePort implements CliRuntimePort {
         await this.instances.save({
           ...existing,
           executablePath: executable.executablePath,
-          launchArgs: sanitizeManagedClientLaunchArgs(client, existing.launchArgs),
+          launchArgs: sanitizeManagedClientLaunchArgs(
+            client,
+            await this.prepareLaunchArgs(client, existing.launchArgs, existing.configDirectory),
+          ),
+          ...(client === 'deepseek-harness' ? { launchMode: 'background' as const } : {}),
         })
       }
       await this.instances.start(existing.id)
@@ -406,15 +470,16 @@ export class ManagedCliRuntimePort implements CliRuntimePort {
       : snapshot.clientProfiles.find((candidate) => candidate.client === client && candidate.isDefault)
     if (options?.profileId && !profile) throw new Error('Client configuration profile not found.')
     const route = enabledNativeRoute(this.store, client)
+    const configDirectory = profile?.directory ?? configDirectoryForClient(this.clientConfig, client)
     const before = new Set(this.instances.list().map((instance) => instance.id))
     const created = await this.instances.save({
       name: `${displayName(target)} · Stone+`,
       client,
-      configDirectory: profile?.directory ?? this.clientConfig.paths[client].directory,
+      configDirectory,
       ...(options?.workingDirectory ? { workingDirectory: options.workingDirectory } : {}),
       executablePath: executable.executablePath,
-      launchArgs: [],
-      launchMode: process.platform === 'win32' ? 'terminal' : 'background',
+      launchArgs: await this.prepareLaunchArgs(client, [], configDirectory),
+      launchMode: managedLaunchMode(client),
       routeId: route.id,
       ...(profile ? { profileId: profile.id } : {}),
     })
@@ -422,13 +487,59 @@ export class ManagedCliRuntimePort implements CliRuntimePort {
     if (!instance) throw new Error('Managed Agent instance was not created.')
     await this.instances.start(instance.id)
   }
+
+  private async prepareLaunchArgs(
+    client: RouteClient,
+    current: readonly string[],
+    configDirectory?: string,
+  ): Promise<string[]> {
+    const launchArgs = launchArgsForClient(client, current)
+    if (client !== 'deepseek-harness') return launchArgs
+    const paths = this.clientConfig.paths?.deepseekHarness
+    if (!paths) throw new Error('DeepSeek Harness configuration paths are unavailable.')
+    const companion = this.deepSeekHarnessCompanion
+      ?? new DeepSeekHarnessCompanionInstaller(configDirectory ?? paths.directory)
+    const target = resolveConnection(this.store, 'deepseek-harness')
+    const installed = await companion.ensureInstalled({
+      gatewayBaseUrl: target.gatewayBaseUrl,
+      credentialFile: configDirectory ? resolvePath(configDirectory, '.env') : paths.env.path,
+    })
+    return withDeepSeekHarnessCompanionPatch(launchArgs, installed.patchPath)
+  }
+
+  private async isExternalDeepSeekHarnessReady(client: RouteClient): Promise<boolean> {
+    if (client !== 'deepseek-harness' || !this.deepSeekHarnessReady) return false
+    if (this.instances.list().some((instance) => instance.client === client && isRunning(instance))) return false
+    try {
+      return await this.deepSeekHarnessReady()
+    } catch {
+      return false
+    }
+  }
 }
 
 function agentTargetForClient(client: RouteClient): Exclude<AgentTarget, 'codex-desktop'> {
   if (client === 'claude') return 'claude-code'
   if (client === 'gemini') return 'gemini-cli'
   if (client === 'grokbuild') return 'grok-build'
+  if (client === 'deepseek-harness') return 'deepseek-harness'
   return 'codex-cli'
+}
+
+function launchArgsForClient(client: RouteClient, current: readonly string[]): string[] {
+  if (client !== 'deepseek-harness' || current.length > 0) return [...current]
+  return ['web', '--host', '127.0.0.1', '--port', '3080']
+}
+
+function configDirectoryForClient(service: ClientConfigService, client: RouteClient): string {
+  return client === 'deepseek-harness'
+    ? service.paths.deepseekHarness.directory
+    : service.paths[client].directory
+}
+
+function managedLaunchMode(client: RouteClient): ManagedClientInstance['launchMode'] {
+  if (client === 'deepseek-harness') return 'background'
+  return process.platform === 'win32' ? 'terminal' : 'background'
 }
 
 export { sanitizeManagedClientLaunchArgs } from '../client-instances'
@@ -624,6 +735,14 @@ function enabledNativeRoute(store: AppStore, client: RouteClient) {
   return route
 }
 
+function resolveDeepSeekHarnessPreferredModel(store: AppStore): string | undefined {
+  const route = enabledNativeRoute(store, 'deepseek-harness')
+  const wildcard = route.modelMap['*']?.trim()
+  if (wildcard) return wildcard
+  const exactTargets = [...new Set(Object.values(route.modelMap).map((model) => model.trim()).filter(Boolean))]
+  return exactTargets.length === 1 ? exactTargets[0] : undefined
+}
+
 /** Keep client-native model names out of provider configuration. A route-layer
  * wildcard is safe only when a translated source exposes one unambiguous
  * upstream model; explicit exact/default mappings remain authoritative. */
@@ -661,7 +780,8 @@ function displayName(target: Exclude<AgentTarget, 'codex-desktop'>): string {
   if (target === 'claude-code') return 'Claude Code CLI'
   if (target === 'claude-code-desktop') return 'Claude Code Desktop'
   if (target === 'claude-code-vsc') return 'Claude Code VSC'
-  return target === 'gemini-cli' ? 'Gemini CLI' : 'Grok Build'
+  if (target === 'gemini-cli') return 'Gemini CLI'
+  return target === 'grok-build' ? 'Grok Build' : 'DeepSeek Harness'
 }
 
 function hasMacCodexProcess(): Promise<boolean> {
