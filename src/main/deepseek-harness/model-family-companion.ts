@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { readFile, stat } from 'node:fs/promises'
 import { pathToFileURL } from 'node:url'
-import { dirname, join, resolve } from 'node:path'
+import { dirname, join, resolve, win32 as win32Path } from 'node:path'
 import { atomicWriteFile, readTextIfPresent } from '../client-config/filesystem'
 
 export const SUPPORTED_DEEPSEEK_HARNESS_VERSION = '0.1.0-rc.6'
@@ -273,9 +273,15 @@ function isLoopbackHostname(value: string): boolean {
 }
 
 function samePath(left: string, right: string): boolean {
-  const normalizedLeft = resolve(left)
-  const normalizedRight = resolve(right)
-  return process.platform === 'win32'
+  // Managed profiles can be inspected by a non-Windows CI/runtime while
+  // retaining their original Windows paths.  Node's host-native `resolve`
+  // would otherwise turn `C:\\...` into a POSIX-relative path, causing the
+  // same overlay to be duplicated and breaking launch argument persistence.
+  const windowsPath = /^(?:[A-Za-z]:[\\/]|\\\\)/
+  const useWindowsDialect = process.platform === 'win32' || windowsPath.test(left) || windowsPath.test(right)
+  const normalizedLeft = useWindowsDialect ? win32Path.resolve(left) : resolve(left)
+  const normalizedRight = useWindowsDialect ? win32Path.resolve(right) : resolve(right)
+  return useWindowsDialect
     ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase()
     : normalizedLeft === normalizedRight
 }
