@@ -160,7 +160,10 @@ export function withDeepSeekHarnessCompanionPatch(
   current: readonly string[],
   patchPath: string,
 ): string[] {
-  const normalizedPatch = resolve(patchPath)
+  // Keep the path dialect supplied by the managed profile.  A Windows
+  // profile may be prepared on a POSIX CI host; native `resolve()` would
+  // incorrectly prefix that absolute path with the CI workspace.
+  const normalizedPatch = normalizeManagedPath(patchPath)
   const args: string[] = []
   const userPatches: string[] = []
   for (let index = 0; index < current.length; index += 1) {
@@ -284,6 +287,13 @@ function samePath(left: string, right: string): boolean {
   return useWindowsDialect
     ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase()
     : normalizedLeft === normalizedRight
+}
+
+function normalizeManagedPath(value: string): string {
+  const windowsPath = /^(?:[A-Za-z]:[\\/]|\\\\)/
+  return windowsPath.test(value)
+    ? win32Path.resolve(value)
+    : resolve(value)
 }
 
 export const DEEPSEEK_HARNESS_COMPANION_SOURCE = String.raw`import { readFile } from 'node:fs/promises'
