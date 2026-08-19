@@ -26,6 +26,7 @@ const operationLabels: Array<[prefix: string, zh: string, en: string]> = [
   ['check-all-accounts', '检测全部账号', 'Check all accounts'],
   ['refresh-account-models-', '刷新账号模型', 'Refresh account models'],
   ['open-chatgpt-codex-app-', '切换 Codex App OAuth 账号', 'Switch Codex App OAuth account'],
+  ['verify-web-wm-', '检测 Web WM 资格', 'Verify Web WM eligibility'],
   ['refresh-quota-', '刷新账号额度', 'Refresh account quota'],
   ['check-proxy-', '检测代理出口', 'Check proxy exit'],
   ['check-', '检测账号', 'Check account'],

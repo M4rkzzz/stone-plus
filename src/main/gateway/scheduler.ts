@@ -745,13 +745,14 @@ export class PoolScheduler {
     pool?: Pool,
     providers?: readonly ProviderDefinition[],
     requiredCapabilities: readonly UpstreamCapabilityRequirement[] = [],
-    excludedAccountIds: readonly string[] = []
+    excludedAccountIds: readonly string[] = [],
+    skipAccountModelCatalog = false,
   ): boolean {
     const excluded = new Set([accountId, ...excludedAccountIds])
     const eligibility = evaluateSourceEligibility({
       accounts: accounts.filter((account) => !excluded.has(account.id)),
       providers: providers ?? [],
-      model,
+      model: skipAccountModelCatalog ? undefined : model,
       poolModelPolicy: pool?.modelPolicy,
       poolModelAllowlist: pool?.modelAllowlist,
       requiredCapabilities,

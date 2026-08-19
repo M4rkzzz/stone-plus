@@ -16,7 +16,7 @@ export type Protocol = 'anthropic-messages' | 'openai-responses' | 'openai-chat'
  * Build accepts only Responses-native Grok sources; other clients may still
  * use Stone+'s explicit xAI compatibility bridge when required.
  */
-export type PoolProtocol = Protocol | 'grok'
+export type PoolProtocol = Protocol | 'grok' | 'chatgpt-web-wm'
 
 /** Default capacity for newly created accounts and standalone API/relay sources. */
 export const DEFAULT_ACCOUNT_MAX_CONCURRENCY = 20
@@ -26,9 +26,9 @@ export function supportsFastServiceTier(protocol: Protocol): boolean {
   return protocol === 'openai-responses' || protocol === 'openai-chat'
 }
 
-/** Logical Grok pools do not expose an OpenAI service-tier control. */
+/** Logical pool protocols do not expose an OpenAI service-tier control. */
 export function supportsPoolFastServiceTier(protocol: PoolProtocol): boolean {
-  return protocol !== 'grok' && supportsFastServiceTier(protocol)
+  return protocol === 'openai-responses' || protocol === 'openai-chat'
 }
 
 export type ProviderKind =
@@ -261,7 +261,11 @@ export const clientNativeProtocols: Readonly<Record<RouteClient, Protocol>> = {
   codex: 'openai-responses',
   gemini: 'gemini',
   grokbuild: 'openai-responses',
-  'deepseek-harness': 'openai-chat'
+  // DeepSeek Harness is managed through pi-ai's Responses adapter. Chat
+  // Completions remains a gateway compatibility alias for older clients, but
+  // the persisted/native route protocol is Responses so session affinity and
+  // model-family metadata use the real DSH transport.
+  'deepseek-harness': 'openai-responses'
 }
 
 export type ClientConfigFileRole =
@@ -658,6 +662,28 @@ export interface AccountModelCooldown {
   updatedAt: number
 }
 
+/** Main-process-owned proof that this OAuth account completed a real Sol Web WM turn. */
+export interface ChatGptWebWmCapability {
+  version: 2
+  protocolRevision: 'chatgpt-web-wm-v2'
+  model: 'gpt-5.6-sol-wm'
+  catalogModel: 'gpt-5.6-sol-wm'
+  turnModel: 'gpt-5.6-sol-wm'
+  workspacePlanType: string
+  workspaceStructure: 'personal' | 'workspace'
+  verifiedAt: number
+  latencyMs: number
+}
+
+export interface ChatGptWebWmVerificationResult {
+  latencyMs: number
+  statusCode: number
+  catalogModel: 'gpt-5.6-sol-wm'
+  turnModel: 'gpt-5.6-sol-wm'
+  workspacePlanType: string
+  workspaceStructure: 'personal' | 'workspace'
+}
+
 export interface Account {
   id: string
   providerId: string
@@ -678,6 +704,7 @@ export interface Account {
   modelsRefreshedAt?: number
   modelPolicy: ModelPolicy
   modelAllowlist: string[]
+  chatgptWebWm?: ChatGptWebWmCapability
   proxyId?: string
   quotaRemaining?: number
   quotaUnit?: 'usd' | 'requests' | 'tokens' | 'percent'
@@ -793,6 +820,8 @@ export interface CodexQuotaBucket {
   monthly?: CodexQuotaWindow
   allowed?: boolean
   limitReached?: boolean
+  /** Explicit upstream decision for this feature bucket; null means allowed. */
+  rateLimitReachedType?: string | null
 }
 
 export type CodexQuotaSource = 'usage-endpoint' | 'response-headers'
@@ -810,6 +839,11 @@ export interface AccountCodexQuotaSnapshot {
   detailsObservedAt?: number
   allowed?: boolean
   limitReached?: boolean
+  /**
+   * Explicit WHAM/header decision. A null value means the upstream reported
+   * no active rate-limit reason, even when a usage window displays 100%.
+   */
+  rateLimitReachedType?: string | null
   resetCredits?: {
     availableCount: number
     /** Sanitized expiry timestamps only; upstream credit ids are never persisted. */
@@ -892,8 +926,6 @@ export interface Pool {
   reasoningEffortMap?: ReasoningEffortMap
   reasoningEffortCap?: ReasoningEffort
   forceFastMode?: boolean
-  /** Rewrite every model request served by this pool to the hidden gpt-5.6-sol-wm route. */
-  routeToWm?: boolean
   /** Pool-wide reserve guard, combined with each member's account policy. */
   quotaProtection?: QuotaProtectionPolicy
   hedgedRequests?: boolean
@@ -1385,6 +1417,24 @@ export interface AccountImportProgress {
   message: string
 }
 
+export type ChatGptWebWmVerificationStage =
+  | 'session'
+  | 'identity'
+  | 'catalog'
+  | 'protocol'
+  | 'turn'
+  | 'persist'
+  | 'complete'
+
+export interface ChatGptWebWmVerificationProgress {
+  progressId: string
+  accountId: string
+  stage: ChatGptWebWmVerificationStage
+  status: 'running' | 'complete' | 'failed'
+  percent: number
+  message: string
+}
+
 export type PersistentTaskStatus = 'running' | 'paused' | 'cancelled' | 'completed' | 'failed'
 
 export interface PersistentTaskProgress {
@@ -1531,7 +1581,6 @@ export interface PoolInput {
   reasoningEffortMap?: ReasoningEffortMap
   reasoningEffortCap?: ReasoningEffort
   forceFastMode?: boolean
-  routeToWm?: boolean
   quotaProtection?: QuotaProtectionPolicy
   hedgedRequests?: boolean
   hedgeDelayMs?: number
@@ -2097,6 +2146,7 @@ export interface GatewayApi {
   refreshAccountModels(id: string): Promise<AppSnapshot>
   openChatGptWebLogin(id: string): Promise<AppSnapshot>
   openChatGptCodexApp(id: string): Promise<AppSnapshot>
+  verifyChatGptWebWmAccount(accountId: string, progressId: string): Promise<AppSnapshot>
   testAccountModel(accountId: string, model: string): Promise<AccountModelTestResult>
   importChatGptAccounts(input: ChatGptAccountImportInput): Promise<ChatGptAccountImportResult>
   importGrokAccounts(input: GrokAccountImportInput): Promise<GrokAccountImportResult>
@@ -2269,6 +2319,7 @@ export interface GatewayApi {
   onSnapshot(listener: (snapshot: AppSnapshot) => void): () => void
   onBuiltInProxyState(listener: (state: BuiltInProxyRuntimeState) => void): () => void
   onRuntimeDelta(listener: (delta: AppRuntimeDelta) => void): () => void
+  onChatGptWebWmVerificationProgress(listener: (progress: ChatGptWebWmVerificationProgress) => void): () => void
   onAccountImportProgress(listener: (progress: AccountImportProgress) => void): () => void
   onBrowserImportQueue(listener: (state: BrowserImportQueueState) => void): () => void
   onBrowserOpenTab(listener: (request: BrowserOpenTabRequest) => void): () => void

@@ -372,12 +372,10 @@ export function applyChatGptCodexHeaders(
   sourceHeaders?: ChatGptSourceHeaders,
   installationSeed?: string,
 ): void {
-  for (const name of CODEX_PASSTHROUGH_HEADERS) {
-    const value = readSourceHeader(sourceHeaders, name)
-    if (value) headers.set(name, value)
-  }
+  const privacySeed = installationSeed?.trim() || bundle.accountId
+  copyRedactedCodexSourceHeaders(headers, sourceHeaders, privacySeed)
   applyChatGptCodexIdentityHeaders(headers, bundle, sourceHeaders)
-  convergeChatGptCodexInstallationId(headers, installationSeed)
+  convergeChatGptCodexInstallationId(headers, privacySeed)
   headers.set('accept', 'text/event-stream')
   headers.set('content-type', 'application/json')
   headers.set('openai-beta', 'responses=experimental')
@@ -389,12 +387,10 @@ export function applyChatGptCodexSearchHeaders(
   sourceHeaders?: ChatGptSourceHeaders,
   installationSeed?: string,
 ): void {
-  for (const name of CODEX_PASSTHROUGH_HEADERS) {
-    const value = readSourceHeader(sourceHeaders, name)
-    if (value) headers.set(name, value)
-  }
+  const privacySeed = installationSeed?.trim() || bundle.accountId
+  copyRedactedCodexSourceHeaders(headers, sourceHeaders, privacySeed)
   applyChatGptCodexIdentityHeaders(headers, bundle, sourceHeaders)
-  convergeChatGptCodexInstallationId(headers, installationSeed)
+  convergeChatGptCodexInstallationId(headers, privacySeed)
   headers.set('accept', 'application/json')
   headers.set('content-type', 'application/json')
 }
@@ -409,10 +405,8 @@ export function applyChatGptAgentIdentityHeaders(
   accept: 'stream' | 'json' = 'stream',
   installationSeed?: string,
 ): void {
-  for (const name of CODEX_PASSTHROUGH_HEADERS) {
-    const value = readSourceHeader(sourceHeaders, name)
-    if (value) headers.set(name, value)
-  }
+  const privacySeed = installationSeed?.trim() || accountId
+  copyRedactedCodexSourceHeaders(headers, sourceHeaders, privacySeed)
   const clientVersion = resolveCodexClientVersion(sourceHeaders)
   headers.set('authorization', authorization)
   headers.set('chatgpt-account-id', accountId)
@@ -420,10 +414,15 @@ export function applyChatGptAgentIdentityHeaders(
   headers.set('originator', 'codex_cli_rs')
   headers.set('user-agent', `codex_cli_rs/${clientVersion} (Windows 11; x86_64)`)
   headers.set('version', clientVersion)
-  convergeChatGptCodexInstallationId(headers, installationSeed)
+  convergeChatGptCodexInstallationId(headers, privacySeed)
   headers.set('accept', accept === 'stream' ? 'text/event-stream' : 'application/json')
   headers.set('content-type', 'application/json')
   if (accept === 'stream') headers.set('openai-beta', 'responses=experimental')
+}
+
+/** Redacts the gateway-derived affinity id before it is sent upstream. */
+export function redactChatGptCodexSessionId(value: string, seed: string): string {
+  return stableCodexPseudonym('session', value.trim(), seed.trim() || 'default')
 }
 
 function convergeChatGptCodexInstallationId(headers: Headers, seed: string | undefined): void {
@@ -450,7 +449,7 @@ function convergeChatGptCodexInstallationId(headers: Headers, seed: string | und
 function applyChatGptCodexIdentityHeaders(
   headers: Headers,
   bundle: ChatGptCredentialBundle,
-  sourceHeaders?: ChatGptSourceHeaders
+  sourceHeaders?: ChatGptSourceHeaders,
 ): void {
   const clientVersion = resolveCodexClientVersion(sourceHeaders)
   headers.set('authorization', `Bearer ${bundle.accessToken}`)
@@ -458,6 +457,154 @@ function applyChatGptCodexIdentityHeaders(
   headers.set('originator', 'codex_cli_rs')
   headers.set('user-agent', `codex_cli_rs/${clientVersion} (Windows 11; x86_64)`)
   headers.set('version', clientVersion)
+}
+
+/**
+ * Copy only protocol-relevant Codex headers from the local client. Client
+ * identifiers are converted to stable, account-scoped pseudonyms and the
+ * turn metadata is reduced to non-location fields before it leaves Stone+.
+ * Authentication and the request body are deliberately handled elsewhere.
+ */
+function copyRedactedCodexSourceHeaders(
+  target: Headers,
+  sourceHeaders: ChatGptSourceHeaders | undefined,
+  seed: string,
+): void {
+  for (const name of CODEX_PASSTHROUGH_HEADERS) {
+    const value = readSourceHeader(sourceHeaders, name)
+    if (!value) continue
+    const redacted = redactCodexSourceHeader(name, value, seed)
+    if (redacted !== undefined) target.set(name, redacted)
+  }
+}
+
+function redactCodexSourceHeader(name: string, value: string, seed: string): string | undefined {
+  const normalized = value.trim()
+  if (!normalized) return undefined
+  if (name === 'accept-language' || name === 'x-codex-installation-id') return undefined
+  if (name === 'x-codex-turn-metadata') return redactCodexTurnMetadata(normalized, seed)
+  const namespace = codexHeaderIdentityNamespace(name)
+  if (namespace) return stableCodexPseudonym(namespace, normalized, seed)
+  // Capability and state headers are protocol inputs, not identity fields.
+  // Keep their semantics while rejecting control characters and oversized
+  // values that could otherwise carry local diagnostics or paths.
+  return stripCodexControlCharacters(normalized).slice(0, 4096) || undefined
+}
+
+function codexHeaderIdentityNamespace(name: string): string | undefined {
+  if (name === 'conversation_id') return 'conversation'
+  if (name === 'session_id' || name === 'session-id') return 'session'
+  if (name === 'thread-id') return 'thread'
+  if (name === 'x-codex-parent-thread-id') return 'parent-thread'
+  if (name === 'x-codex-window-id') return 'window'
+  if (name === 'x-client-request-id') return 'request'
+  return undefined
+}
+
+function stableCodexPseudonym(namespace: string, value: string, seed: string): string {
+  const digest = createHash('sha256')
+    .update(`stone+:codex-header:v1\0${seed}\0${namespace}\0${value}`)
+    .digest('hex')
+  return formatDeterministicUuid(digest)
+}
+
+function formatDeterministicUuid(digest: string): string {
+  return `${digest.slice(0, 8)}-${digest.slice(8, 12)}-4${digest.slice(13, 16)}-a${digest.slice(17, 20)}-${digest.slice(20, 32)}`
+}
+
+function redactCodexTurnMetadata(value: string, seed: string): string | undefined {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(value)
+  } catch {
+    // Do not forward an opaque value that may contain a path or repository URL.
+    return undefined
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined
+  const sanitized = sanitizeCodexMetadataObject(parsed as Record<string, unknown>, seed, 0)
+  if (!sanitized) return undefined
+  const encoded = JSON.stringify(sanitized)
+  return Buffer.byteLength(encoded, 'utf8') <= 32 * 1024 ? encoded : undefined
+}
+
+function sanitizeCodexMetadataObject(
+  source: Record<string, unknown>,
+  seed: string,
+  depth: number,
+): Record<string, unknown> | undefined {
+  if (depth > 5) return undefined
+  const result: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(source)) {
+    const normalizedKey = key.trim().toLowerCase().replace(/[-\s]+/g, '_')
+    if (isCodexLocationMetadataKey(normalizedKey)) continue
+    const namespace = codexMetadataIdentityNamespace(normalizedKey)
+    if (namespace) {
+      if (typeof value === 'string' && value.trim()) result[key] = stableCodexPseudonym(namespace, value.trim(), seed)
+      continue
+    }
+    if (typeof value === 'string') {
+      const cleaned = stripCodexControlCharacters(value).trim()
+      if (cleaned && !looksLikeLocalPathOrRepositoryUrl(cleaned)) result[key] = cleaned.slice(0, 4096)
+      continue
+    }
+    if (Array.isArray(value)) {
+      const items = value.map((item) => {
+        if (!item || typeof item !== 'object' || Array.isArray(item)) return typeof item === 'string' ? item.slice(0, 512) : item
+        return sanitizeCodexMetadataObject(item as Record<string, unknown>, seed, depth + 1)
+      }).filter((item) => item !== undefined)
+      if (items.length) result[key] = items
+      continue
+    }
+    if (value && typeof value === 'object') {
+      const nested = sanitizeCodexMetadataObject(value as Record<string, unknown>, seed, depth + 1)
+      if (nested && Object.keys(nested).length) result[key] = nested
+      continue
+    }
+    if (typeof value === 'boolean' || typeof value === 'number') result[key] = value
+  }
+  return Object.keys(result).length ? result : undefined
+}
+
+function codexMetadataIdentityNamespace(key: string): string | undefined {
+  if (key === 'installation_id' || key === 'installationid') return 'installation'
+  if (key === 'session_id' || key === 'sessionid') return 'session'
+  if (key === 'thread_id' || key === 'threadid') return 'thread'
+  if (key === 'turn_id' || key === 'turnid') return 'turn'
+  if (key === 'window_id' || key === 'windowid') return 'window'
+  if (key === 'workspace_id' || key === 'workspaceid' || key === 'project_id' || key === 'projectid') return 'workspace'
+  if (key === 'parent_thread_id' || key === 'parent_threadid') return 'parent-thread'
+  if (key === 'parent_turn_id' || key === 'parent_turnid') return 'parent-turn'
+  if (key === 'root_turn_id' || key === 'root_turnid') return 'root-turn'
+  if (key === 'forked_from_thread_id' || key === 'forked_from_threadid') return 'fork-thread'
+  return undefined
+}
+
+function isCodexLocationMetadataKey(key: string): boolean {
+  return key === 'workspaces'
+    || key === 'workspace'
+    || key === 'cwd'
+    || key === 'path'
+    || key === 'git'
+    || key === 'dirty'
+    || key === 'tools'
+    || key === 'mcp'
+    || key === 'plugins'
+    || key === 'skills'
+    || /(?:^|_)(?:workspace_root|workspace_path|worktree|git_remote|remote_url|repo|repository|repository_url|repo_url|commit|commit_hash|commit_sha|branch)(?:_|$)/u.test(key)
+}
+
+function looksLikeLocalPathOrRepositoryUrl(value: string): boolean {
+  return /^(?:[a-z]:[\\/]|\\\\|\/Users\/|\/home\/|file:|https?:\/\/|git@)/iu.test(value)
+}
+
+function stripCodexControlCharacters(value: string): string {
+  let result = ''
+  for (const character of value) {
+    const code = character.charCodeAt(0)
+    if (code < 0x20 || code === 0x7f) continue
+    result += character
+  }
+  return result
 }
 
 function readSourceHeader(source: ChatGptSourceHeaders | undefined, name: string): string | undefined {
@@ -983,6 +1130,21 @@ export function classifyChatGptCodexFailure(
       scope: 'request',
     }
   }
+  // The Responses endpoint reports its hard per-request item cap as a plain
+  // 400 ("array too long ... maximum length 16384"). Keep this in the
+  // context-overflow vocabulary understood by DSH's automatic compactor;
+  // otherwise the harness treats it as an unrecoverable generic invalid
+  // request and never gets a chance to compact the session.
+  if (statusCode === 400 && isChatGptCodexContextOverflowPayload(payload)) {
+    return {
+      category: 'invalid_request',
+      message: 'The request history exceeds the upstream context limit and must be compacted before retrying.',
+      retryable: false,
+      accountAction: 'none',
+      statusCode,
+      scope: 'request',
+    }
+  }
   if (statusCode === 401) return { category: 'authentication', message: 'ChatGPT session access token was rejected.', retryable: true, accountAction: 'disable', statusCode }
   if (statusCode === 402) return { category: 'quota', message: 'ChatGPT account quota is depleted or requires payment.', retryable: true, accountAction: 'disable', statusCode }
   if (statusCode === 403) return { category: 'permission', message: 'ChatGPT account is not permitted to use the Codex endpoint.', retryable: true, accountAction: 'disable', statusCode }
@@ -991,6 +1153,17 @@ export function classifyChatGptCodexFailure(
     return { category: 'rate_limit', message: 'ChatGPT account rate limit reached.', retryable: true, accountAction: 'cooldown', statusCode, retryAfterMs, retryAt: now + retryAfterMs }
   }
   return { category: statusCode >= 500 ? 'upstream' : 'invalid_request', message: 'ChatGPT Codex endpoint rejected the request.', retryable: statusCode >= 500, accountAction: statusCode >= 500 ? 'cooldown' : 'none', statusCode }
+}
+
+function isChatGptCodexContextOverflowPayload(payload: unknown): boolean {
+  if (!payload || typeof payload !== 'object') return false
+  let description = ''
+  try {
+    description = JSON.stringify(payload).toLowerCase()
+  } catch {
+    return false
+  }
+  return /\binput\b[^\n]{0,220}array\s+too\s+long[^\n]{0,220}maximum\s+length\s+\d+/.test(description)
 }
 
 function chatGptCodexErrorCode(payload: unknown): string {

@@ -56,14 +56,18 @@ export function buildSetupVerificationRequest(
   if (client === 'deepseek-harness') {
     headers.set('x-deepseek-harness-session-id', `stone-setup-${randomUUID()}`)
     return {
-      url: `${root}/deepseek-harness/v1/chat/completions`,
+      // The managed Harness client is configured with pi-ai's Responses
+      // adapter.  Keep the Chat endpoint as a gateway compatibility alias,
+      // but probe the native path so setup verification tests the real DSH
+      // transport (including session affinity).
+      url: `${root}/deepseek-harness/v1/responses`,
       init: {
         method: 'POST',
         headers,
         body: JSON.stringify({
           model,
-          messages: [{ role: 'user', content: TEST_PROMPT }],
-          max_tokens: 16,
+          input: TEST_PROMPT,
+          max_output_tokens: 16,
           stream: false,
         }),
       },

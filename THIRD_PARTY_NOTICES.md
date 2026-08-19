@@ -59,12 +59,17 @@ those terms.
 | `universalify` | 2.0.1 | MIT |
 | `ws` | 8.21.1 | MIT |
 | `zustand` | 5.0.14 | MIT |
+| `@deepseek-ai/dsh-terminal-bash` | 0.1.0-rc.6 | MIT |
 
 The complete license text published with each npm package is retained with that
 package inside the application archive. The `lazy-val@1.0.5` npm artifact
 declares MIT and Vladimir Krivosheev as its author but omits a standalone
 license file; Stone+ therefore supplies the complete MIT notice separately at
 `licenses/npm/lazy-val-1.0.5-MIT.txt` in the installed application resources.
+Stone+ applies a narrowly scoped readiness transform to the managed
+`@deepseek-ai/dsh-terminal-bash@0.1.0-rc.6` source at launch. The upstream
+package remains MIT-licensed; its notice is distributed separately at
+`licenses/npm/dsh-terminal-bash-0.1.0-rc.6-MIT.txt`.
 
 ## Fonts
 

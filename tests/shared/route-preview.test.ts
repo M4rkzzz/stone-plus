@@ -55,14 +55,25 @@ describe('static route preview', () => {
         modelsRefreshedAt: 1,
         modelPolicy: 'selected' as const,
         modelAllowlist: ['gpt-test'],
+        chatgptWebWm: {
+          version: 2 as const,
+          protocolRevision: 'chatgpt-web-wm-v2' as const,
+          model: 'gpt-5.6-sol-wm' as const,
+          catalogModel: 'gpt-5.6-sol-wm' as const,
+          turnModel: 'gpt-5.6-sol-wm' as const,
+          workspacePlanType: 'team',
+          workspaceStructure: 'workspace' as const,
+          verifiedAt: 1,
+          latencyMs: 100,
+        },
       }],
       pools: [{
         id: 'wm-pool', name: 'WM pool', kind: 'standard' as const,
-        protocol: 'openai-responses' as const, strategy: 'priority' as const,
+        protocol: 'chatgpt-web-wm' as const, strategy: 'priority' as const,
         members: [{ accountId: 'chatgpt-account', enabled: true }],
-        modelPolicy: 'selected' as const, modelAllowlist: ['gpt-test'],
+        modelPolicy: 'selected' as const, modelAllowlist: ['gpt-5.6-sol-wm'],
         stickySessions: false, stickyTtlMinutes: 30, maxRetries: 0,
-        routeToWm: true, createdAt: 1, updatedAt: 1,
+        createdAt: 1, updatedAt: 1,
       }],
     } as Pick<AppSnapshot, 'providers' | 'accounts' | 'pools'>
 
@@ -78,6 +89,13 @@ describe('static route preview', () => {
     })
     expect(result.issues).toContainEqual(expect.objectContaining({ code: 'model-mapped' }))
     expect(result.issues).not.toContainEqual(expect.objectContaining({ code: 'model-unavailable' }))
+
+    const luna = previewRoute({
+      route: { ...route, poolId: 'wm-pool' },
+      requestedModel: 'gpt-5.6-luna',
+    }, wmSnapshot)
+    expect(luna).toMatchObject({ status: 'ready', upstreamModel: 'gpt-5.6-luna' })
+    expect(luna.issues).not.toContainEqual(expect.objectContaining({ code: 'model-mapped' }))
   })
 
   it('previews the effective per-model source while preserving the default source for unmatched models', () => {

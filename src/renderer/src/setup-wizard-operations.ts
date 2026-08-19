@@ -51,7 +51,9 @@ export async function persistSetupWizardSourceProxy(
   aggregate?: Pool,
 ): Promise<AppSnapshot | null> {
   if (aggregate?.kind === 'relay-aggregate') {
-    if (aggregate.protocol === 'grok') throw new Error('A Grok logical pool cannot be saved as an aggregate relay.')
+    if (aggregate.protocol === 'grok' || aggregate.protocol === 'chatgpt-web-wm') {
+      throw new Error('A logical pool cannot be saved as an aggregate relay.')
+    }
     if ((aggregate.proxyId ?? '') === proxyId) return null
     return api.saveAggregateRelay({
       id: aggregate.id,

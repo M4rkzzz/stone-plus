@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest'
-import { deserializeChatGptCredential, parseChatGptAccountImport, serializeChatGptCredential } from '../../src/main/auth'
+import {
+  CHATGPT_PERSONAL_ACCESS_TOKEN_EXPIRY,
+  deserializeChatGptCredential,
+  parseChatGptAccountImport,
+  serializeChatGptCredential
+} from '../../src/main/auth'
 
 function token(exp: number, accountId = 'acct_claim', userId = 'user_claim') {
   return ['header', Buffer.from(JSON.stringify({
@@ -224,6 +229,44 @@ describe('ChatGPT account import', () => {
     }))
 
     expect(parsed.accounts[0]).toMatchObject({ expiresAt: expiresAtSeconds * 1000 })
+  })
+
+  it('imports an opaque Codex Personal Access Token without a fabricated source expiry', () => {
+    const parsed = parseChatGptAccountImport(JSON.stringify({
+      type: 'sub2api-data',
+      version: 1,
+      proxies: [],
+      accounts: [{
+        name: 'pat@example.com',
+        platform: 'openai',
+        type: 'oauth',
+        extra: {
+          auth_provider: 'codex_personal_access_token',
+          import_source: 'codex_personal_access_token'
+        },
+        credentials: {
+          auth_mode: 'personalAccessToken',
+          openai_auth_mode: 'personal_access_token',
+          access_token: 'at-example-private-token',
+          chatgpt_account_id: 'acct_pat_workspace',
+          chatgpt_user_id: 'user_pat_member',
+          email: 'pat@example.com'
+        }
+      }]
+    }))
+
+    expect(parsed.accounts).toEqual([expect.objectContaining({
+      accessToken: 'at-example-private-token',
+      accountId: 'acct_pat_workspace',
+      userId: 'user_pat_member',
+      email: 'pat@example.com',
+      expiresAt: CHATGPT_PERSONAL_ACCESS_TOKEN_EXPIRY,
+      authMode: 'personal-access-token'
+    })])
+    expect(parsed.accessTokenOnlyCount).toBe(0)
+    expect(parsed.warnings.join(' ')).not.toContain('no refresh token')
+    expect(deserializeChatGptCredential(serializeChatGptCredential(parsed.accounts[0])))
+      .toEqual(parsed.accounts[0])
   })
 
   it('rejects expired sessions and round-trips valid encrypted payloads', () => {

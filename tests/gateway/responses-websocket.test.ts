@@ -396,6 +396,7 @@ function makeGateway(
     config: config(port, overrides),
     credentialResolver: () => 'upstream-secret',
     fetchImplementation,
+    requestTransientRetryDelayMs: 0,
     onLog(log) {
       const index = logs.findIndex((candidate) => candidate.id === log.id)
       if (index >= 0) logs[index] = log

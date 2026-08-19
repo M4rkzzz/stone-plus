@@ -2,6 +2,7 @@ import type {
   AccountInput,
   AccountTagDefinition,
   AccountImportProgress,
+  ChatGptWebWmVerificationProgress,
   ApiSourceInput,
   ApiSourceProbeInput,
   AppSnapshot,
@@ -47,7 +48,11 @@ import {
   normalizeDeepSeekReasoningEffort,
 } from '@shared/deepseek'
 import { providerSourceFamily } from '@shared/source-family'
-import { supportsPoolWmRouting } from '@shared/wm-routing'
+import {
+  CHATGPT_WEB_WM_PROTOCOL_REVISION,
+  GPT_5_6_SOL_WM_MODEL,
+  isChatGptWebWmPoolProtocol,
+} from '@shared/wm-routing'
 import {
   AGENT_CAPABILITIES,
   AGENT_TARGETS,
@@ -1125,6 +1130,7 @@ export function createMockApi(): GatewayApi {
   const listeners = new Set<(value: AppSnapshot) => void>()
   const builtInProxyListeners = new Set<(value: BuiltInProxyRuntimeState) => void>()
   const accountImportProgressListeners = new Set<(value: AccountImportProgress) => void>()
+  const webWmVerificationProgressListeners = new Set<(value: ChatGptWebWmVerificationProgress) => void>()
   const updateListeners = new Set<(value: AppUpdateState) => void>()
   const browserImportListeners = new Set<(value: BrowserImportQueueState) => void>()
   const agentLifecycleListeners = new Set<(value: AgentLifecycleChangedEvent) => void>()
@@ -1533,16 +1539,63 @@ export function createMockApi(): GatewayApi {
     async openChatGptCodexApp() {
       return structuredClone(snapshot)
     },
+    async verifyChatGptWebWmAccount(accountId: string, progressId: string) {
+      const account = snapshot.accounts.find((candidate) => candidate.id === accountId)
+      if (!account || account.credentialType !== 'chatgpt-oauth') {
+        throw new Error(mockText('仅 ChatGPT OAuth 账号可检测 Web WM', 'Only ChatGPT OAuth accounts can be checked for Web WM'))
+      }
+      const emit = (stage: ChatGptWebWmVerificationProgress['stage'], percent: number, message: string, status: ChatGptWebWmVerificationProgress['status'] = 'running') => {
+        const progress = { progressId, accountId, stage, percent, message, status }
+        for (const listener of webWmVerificationProgressListeners) listener(progress)
+      }
+      emit('session', 8, mockText('正在准备账号专属网页会话…', 'Preparing the account web session…'))
+      await new Promise((resolve) => setTimeout(resolve, 100))
+      emit('identity', 40, mockText('网页身份已确认', 'Web identity confirmed'))
+      emit('catalog', 50, mockText('正在校验 5.6 Sol WM 模型权限…', 'Checking 5.6 Sol WM model access…'))
+      emit('protocol', 62, mockText('正在初始化 WM 协议…', 'Initializing the WM protocol…'))
+      await new Promise((resolve) => setTimeout(resolve, 100))
+      emit('turn', 78, mockText('正在执行真实 WM 回合…', 'Running a real WM turn…'))
+      await new Promise((resolve) => setTimeout(resolve, 180))
+      const latencyMs = 380
+      emit('persist', 95, mockText('正在写入号池资格…', 'Saving pool eligibility…'))
+      account.chatgptWebWm = {
+        version: 2,
+        protocolRevision: CHATGPT_WEB_WM_PROTOCOL_REVISION,
+        model: GPT_5_6_SOL_WM_MODEL,
+        catalogModel: GPT_5_6_SOL_WM_MODEL,
+        turnModel: GPT_5_6_SOL_WM_MODEL,
+        workspacePlanType: account.codexQuota?.planType?.trim().toLowerCase() || 'team',
+        workspaceStructure: 'workspace',
+        verifiedAt: Date.now(),
+        latencyMs,
+      }
+      emit('complete', 100, mockText('5.6 Sol WM 实测通过', '5.6 Sol WM verification passed'), 'complete')
+      return publish()
+    },
     async testAccountModel(accountId: string, model: string) {
       const account = snapshot.accounts.find((candidate) => candidate.id === accountId)
       if (!account) throw new Error(mockText('账号不存在', 'Account not found'))
       if (!model.trim()) throw new Error(mockText('模型标识不能为空', 'The model identifier cannot be empty'))
       const startedAt = performance.now()
       await new Promise((resolve) => setTimeout(resolve, 180))
+      const latencyMs = Math.max(1, Math.round(performance.now() - startedAt))
+      if (model.trim() === GPT_5_6_SOL_WM_MODEL && account.credentialType === 'chatgpt-oauth') {
+        account.chatgptWebWm = {
+          version: 2,
+          protocolRevision: CHATGPT_WEB_WM_PROTOCOL_REVISION,
+          model: GPT_5_6_SOL_WM_MODEL,
+          catalogModel: GPT_5_6_SOL_WM_MODEL,
+          turnModel: GPT_5_6_SOL_WM_MODEL,
+          workspacePlanType: account.codexQuota?.planType?.trim().toLowerCase() || 'team',
+          workspaceStructure: 'workspace',
+          verifiedAt: Date.now(),
+          latencyMs,
+        }
+      }
       return {
         ok: true,
         model,
-        latencyMs: Math.max(1, Math.round(performance.now() - startedAt)),
+        latencyMs,
         statusCode: 200,
         responsePreview: 'OK',
       }
@@ -2111,14 +2164,16 @@ export function createMockApi(): GatewayApi {
         const provider = snapshot.providers.find((candidate) => candidate.id === account?.providerId)
         return !account || !accountMatchesPoolProtocol(input.protocol, account, provider)
       })) throw new Error(mockText('号池成员与对外协议不兼容', 'Pool members are incompatible with its public protocol'))
-      const selectedAccounts = selected.filter((account): account is PublicAccount => account !== undefined)
       const families = new Set(selected.map((account) => {
         const provider = snapshot.providers.find((candidate) => candidate.id === account?.providerId)
         return provider ? providerSourceFamily(provider.kind) : undefined
       }))
       if (families.has(undefined) || families.size !== 1) throw new Error(mockText('一个号池只能使用同一种来源', 'A pool can use only one source family'))
-      const modelPolicy = input.modelPolicy ?? existing?.modelPolicy ?? 'all'
-      const modelAllowlist = modelPolicy === 'selected'
+      const webWmPool = isChatGptWebWmPoolProtocol(input.protocol)
+      const modelPolicy = webWmPool ? 'selected' : input.modelPolicy ?? existing?.modelPolicy ?? 'all'
+      const modelAllowlist = webWmPool
+        ? [GPT_5_6_SOL_WM_MODEL]
+        : modelPolicy === 'selected'
         ? pruneModelSelection(input.modelAllowlist ?? existing?.modelAllowlist ?? [], poolModelCandidates(input.accountIds))
         : []
       const pool: Pool = {
@@ -2137,8 +2192,6 @@ export function createMockApi(): GatewayApi {
         reasoningEffortCap: input.reasoningEffortCap,
         forceFastMode: supportsPoolFastServiceTier(input.protocol)
           && (input.forceFastMode ?? existing?.forceFastMode) === true,
-        routeToWm: supportsPoolWmRouting(input.protocol, selectedAccounts)
-          && (input.routeToWm ?? existing?.routeToWm) === true,
         hedgedRequests: input.protocol === 'openai-responses'
           && (input.hedgedRequests ?? existing?.hedgedRequests) === true,
         hedgeDelayMs: input.hedgeDelayMs ?? existing?.hedgeDelayMs ?? 2_500,
@@ -3203,6 +3256,10 @@ export function createMockApi(): GatewayApi {
     },
     onRuntimeDelta() {
       return () => undefined
+    },
+    onChatGptWebWmVerificationProgress(listener) {
+      webWmVerificationProgressListeners.add(listener)
+      return () => webWmVerificationProgressListeners.delete(listener)
     },
     onAccountImportProgress(listener) {
       accountImportProgressListeners.add(listener)

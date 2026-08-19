@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { ChatGptCredentialBundle } from '../../src/main/auth'
+import type { AppSnapshot } from '../../src/shared/types'
 
 vi.mock('electron', () => ({
   BrowserWindow: class {},
@@ -9,6 +10,8 @@ vi.mock('electron', () => ({
 
 import {
   applyChatGptWebIdentityHeaders,
+  authenticatedBootstrapState,
+  chatGptWebWmCatalogModel,
   chatGptAccountCookieValue,
   chatGptUnauthenticatedShellRecovery,
   chatGptShellDiagnostic,
@@ -22,10 +25,74 @@ import {
   parseChatGptLightAccount,
   parseChatGptImageActionUrl,
   patchChatGptAuthenticatedDocument,
+  primaryChatGptWebWmPrewarmAccountId,
   probeNeedsTransientRetry,
 } from '../../src/main/chatgpt-web-login'
 
 describe('ChatGPT web login bridge', () => {
+  it('builds the minimum authenticated bootstrap required by the hidden WM runtime', () => {
+    const credential = bundle()
+    const state = authenticatedBootstrapState({}, credential)
+    const statsig = JSON.parse(String(state.statsigPayload))
+
+    expect(state.authStatus).toBe('logged_in')
+    expect(state.sessionId).toMatch(/^[0-9a-f-]{36}$/i)
+    expect((state.session as { accessToken?: string }).accessToken).toBe(credential.accessToken)
+    expect(statsig).toMatchObject({
+      user: {
+        userID: 'user-1',
+        custom: { auth_status: 'logged_in', has_logged_in_before: true },
+      },
+      evaluated_keys: { userID: 'user-1' },
+      feature_gates: {},
+      dynamic_configs: {},
+      layer_configs: {},
+      has_updates: false,
+    })
+  })
+
+  it('prewarms only the first verified account used by an enabled Web WM route', () => {
+    const verified = (id: string, status = 'active') => ({
+      id,
+      status,
+      credentialType: 'chatgpt-oauth',
+      chatgptWebWm: {
+        version: 2,
+        protocolRevision: 'chatgpt-web-wm-v2',
+        model: 'gpt-5.6-sol-wm',
+        catalogModel: 'gpt-5.6-sol-wm',
+        turnModel: 'gpt-5.6-sol-wm',
+        workspacePlanType: 'plus',
+        workspaceStructure: 'personal',
+        verifiedAt: 1,
+        latencyMs: 100,
+      },
+    })
+    const snapshot = {
+      accounts: [
+        verified('disabled', 'disabled'),
+        { id: 'unverified', status: 'active', credentialType: 'chatgpt-oauth' },
+        verified('primary'),
+        verified('secondary'),
+      ],
+      pools: [{
+        id: 'wm-pool',
+        protocol: 'chatgpt-web-wm',
+        members: [
+          { accountId: 'disabled', enabled: true },
+          { accountId: 'unverified', enabled: true },
+          { accountId: 'primary', enabled: true },
+          { accountId: 'secondary', enabled: true },
+        ],
+      }],
+      routes: [{ id: 'codex-route', poolId: 'wm-pool', enabled: true }],
+    } as unknown as Pick<AppSnapshot, 'accounts' | 'pools' | 'routes'>
+
+    expect(primaryChatGptWebWmPrewarmAccountId(snapshot)).toBe('primary')
+    snapshot.routes[0].enabled = false
+    expect(primaryChatGptWebWmPrewarmAccountId(snapshot)).toBeUndefined()
+  })
+
   it('retries only transient web-probe failures', () => {
     expect(probeNeedsTransientRetry({ me: 'network-error', accounts: 200 })).toBe(true)
     expect(probeNeedsTransientRetry({ me: 200, accounts: 'timeout' })).toBe(true)
@@ -378,6 +445,20 @@ describe('ChatGPT web login bridge', () => {
       Authorization: `Bearer ${credential.accessToken}`,
       'ChatGPT-Account-Id': credential.accountId,
     })
+  })
+
+  it('accepts only an explicitly listed 5.6 Sol Work model catalog entry', () => {
+    expect(chatGptWebWmCatalogModel({
+      default_model_slug: 'gpt-5.6-sol-wm',
+      models: [{ slug: 'gpt-5.6-sol-wm', is_work_mode_model: true }],
+    })).toBe('gpt-5.6-sol-wm')
+    expect(chatGptWebWmCatalogModel({
+      models: [{ slug: 'gpt-5.6-sol-wm', is_work_mode_model: false }],
+    })).toBeUndefined()
+    expect(chatGptWebWmCatalogModel({
+      models: [{ slug: 'gpt-5.6-terra-wm', is_work_mode_model: true }],
+    })).toBeUndefined()
+    expect(chatGptWebWmCatalogModel(undefined)).toBeUndefined()
   })
 
   it('allows only HTTPS navigation on the exact ChatGPT web host', () => {

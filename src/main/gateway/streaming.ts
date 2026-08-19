@@ -2076,7 +2076,7 @@ class ProtocolEncoder implements CanonicalStreamEncoder {
       // A provider bridge cannot authorize the call until the complete wire
       // alias is known. Custom wrappers additionally require complete JSON so
       // their raw input can be restored without exposing the wrapper to Codex.
-      if (this.toolBridgePlan) return
+      if (this.toolBridgePlan || this.sanitizeDeepSeekHarnessToolArguments) return
       const wasStarted = tool.started
       this.ensureResponsesToolStarted(tool)
       if (tool.started && event.arguments !== undefined) {
@@ -2556,7 +2556,10 @@ class ProtocolEncoder implements CanonicalStreamEncoder {
       this.ensureResponsesToolStarted(tool, true)
       const toolSearch = tool.bridgeBinding?.sourceType === 'tool_search'
       const custom = tool.bridgeBinding?.sourceType === 'custom' || tool.toolType === 'custom_tool_call'
-      const streamedValue = custom ? (tool.customInput ?? tool.arguments) : tool.arguments
+      const rawStreamedValue = custom ? (tool.customInput ?? tool.arguments) : tool.arguments
+      const streamedValue = this.sanitizeDeepSeekHarnessToolArguments
+        ? sanitizeDeepSeekHarnessToolArguments(rawStreamedValue)
+        : rawStreamedValue
       const deltaEvent = custom
         ? 'response.custom_tool_call_input.delta'
         : 'response.function_call_arguments.delta'
@@ -2593,14 +2596,14 @@ class ProtocolEncoder implements CanonicalStreamEncoder {
         call_id: tool.id || tool.itemId,
         name: tool.bridgeBinding?.sourceName ?? tool.name,
         ...(tool.bridgeBinding?.sourceNamespace ? { namespace: tool.bridgeBinding.sourceNamespace } : {}),
-        arguments: tool.arguments
+        arguments: streamedValue
       }
       if (!toolSearch) {
         this.frames.push(responsesSse(doneEvent, {
           response_id: this.id,
           item_id: tool.itemId,
           output_index: tool.outputIndex,
-          ...(custom ? { input: streamedValue } : { arguments: tool.arguments })
+          ...(custom ? { input: streamedValue } : { arguments: streamedValue })
         }))
       }
       this.frames.push(responsesSse('response.output_item.done', {

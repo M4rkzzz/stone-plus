@@ -42,22 +42,29 @@ export function sanitizeDeepSeekHarnessRequestTools(body: JsonObject): JsonObjec
   let changed = false
   const tools = body.tools.map((toolValue) => {
     const tool = objectValue(toolValue)
-    const definition = objectValue(tool?.function)
-    if (!tool || !definition) return toolValue
+    if (!tool) return toolValue
+    const wrappedDefinition = objectValue(tool.function)
+    const definition = wrappedDefinition ?? tool
     const sanitized = sanitizeToolSchema(definition.parameters)
     if (!sanitized.changed) return toolValue
     changed = true
     const description = typeof definition.description === 'string'
       ? `${definition.description}\n\n${DSH_COMPATIBILITY_NOTE}`
       : DSH_COMPATIBILITY_NOTE
-    return {
-      ...tool,
-      function: {
-        ...definition,
-        description,
-        parameters: sanitized.schema,
-      },
+    const sanitizedDefinition = {
+      ...definition,
+      description,
+      parameters: sanitized.schema,
     }
+    return wrappedDefinition
+      ? {
+          ...tool,
+          function: sanitizedDefinition,
+        }
+      : {
+        ...definition,
+        ...sanitizedDefinition,
+      }
   })
   return changed ? { ...body, tools } : body
 }
@@ -104,4 +111,22 @@ export function sanitizeDeepSeekHarnessChatResponse(body: JsonObject): JsonObjec
     return { ...choice, message: { ...message, tool_calls: toolCalls } }
   })
   return changed ? { ...body, choices } : body
+}
+
+/** Sanitize native Responses output without touching text or nested user data. */
+export function sanitizeDeepSeekHarnessResponsesResponse(body: JsonObject): JsonObject {
+  if (!Array.isArray(body.output)) return body
+  let changed = false
+  const output = body.output.map((itemValue) => {
+    const item = objectValue(itemValue)
+    if (!item) return itemValue
+    const type = typeof item.type === 'string' ? item.type : ''
+    const field = type === 'custom_tool_call' ? 'input' : type === 'function_call' ? 'arguments' : undefined
+    if (!field || typeof item[field] !== 'string') return itemValue
+    const sanitized = sanitizeDeepSeekHarnessToolArguments(item[field] as string)
+    if (sanitized === item[field]) return itemValue
+    changed = true
+    return { ...item, [field]: sanitized }
+  })
+  return changed ? { ...body, output } : body
 }

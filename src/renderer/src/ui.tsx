@@ -12,6 +12,7 @@ export const protocolLabels: Record<PoolProtocol, string> = {
   'kiro-claude': 'Kiro Claude',
   gemini: 'Gemini',
   grok: 'Grok',
+  'chatgpt-web-wm': 'ChatGPT Web WM',
 }
 
 export const accountStatusLabels = {

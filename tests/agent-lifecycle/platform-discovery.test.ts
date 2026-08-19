@@ -180,7 +180,7 @@ describe('agent platform discovery', () => {
 
   it('uses an installed Windows app identity when no ordinary executable is found', async () => {
     const runCommand = vi.fn(async () => ({
-      stdout: 'OpenAI.Codex_2p2nqsd0c76g0!App\r\nC:\\Program Files\\WindowsApps\\OpenAI.Codex\\app\\ChatGPT.exe\r\n',
+      stdout: 'OpenAI.Codex_2p2nqsd0c76g0!App\r\nC:\\Program Files\\WindowsApps\\OpenAI.Codex\\app\\ChatGPT.exe\r\n26.803.5235.0\r\n',
       stderr: '',
     }))
     const result = await discoverAgentExecutable('codex-desktop', {
@@ -192,6 +192,7 @@ describe('agent platform discovery', () => {
       installed: true,
       launchTarget: 'OpenAI.Codex_2p2nqsd0c76g0!App',
       executablePath: 'C:\\Program Files\\WindowsApps\\OpenAI.Codex\\app\\ChatGPT.exe',
+      version: '26.803.5235.0',
       source: 'windows-app',
       processControl: 'full',
     })

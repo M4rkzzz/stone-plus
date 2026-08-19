@@ -51,6 +51,18 @@ function agent(overrides: Partial<AgentLifecycleState> = {}): AgentLifecycleStat
 }
 
 describe('agent lifecycle control summary', () => {
+  it('shows a Web WM-specific Codex Desktop update action without an old-client compatibility path', () => {
+    const source = readFileSync(
+      new URL('../../src/renderer/src/views/ClientsView.tsx', import.meta.url),
+      'utf8',
+    )
+
+    expect(source).toContain('codexDesktopWebWmUpdateRequired(item?.version)')
+    expect(source).toContain("t('需要更新', 'Update required')")
+    expect(source).toContain("t('更新 Codex', 'Update Codex')")
+    expect(source).toContain('不支持 Web WM')
+  })
+
   it('keeps the dark-mode OpenAI filter off the icon background surface', () => {
     const source = readFileSync(new URL('../../src/renderer/src/agent-lifecycle-control.tsx', import.meta.url), 'utf8')
     const styles = readFileSync(new URL('../../src/renderer/src/agent-lifecycle-control.css', import.meta.url), 'utf8')
@@ -101,7 +113,10 @@ describe('agent lifecycle control summary', () => {
   it('keeps Claude Desktop official-mode recovery reachable and blocks lifecycle races', () => {
     const clientsSource = readFileSync(new URL('../../src/renderer/src/views/ClientsView.tsx', import.meta.url), 'utf8')
     const restoreButtonStart = clientsSource.indexOf('{isClaudeDesktop && (')
-    const restoreButtonEnd = clientsSource.indexOf('{!item?.installed ? (', restoreButtonStart)
+    const restoreButtonEnd = clientsSource.indexOf(
+      '{!item?.installed || desktopUpdateRequired ? (',
+      restoreButtonStart,
+    )
     const restoreButtonSource = clientsSource.slice(restoreButtonStart, restoreButtonEnd)
 
     expect(clientsSource).toContain('restoreClaudeDesktopOfficialMode()')

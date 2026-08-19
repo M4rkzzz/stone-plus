@@ -110,6 +110,98 @@ describe('non-streaming tool protocol conversion', () => {
     } }] } }] })
   })
 
+  it('sanitizes native Responses tool schemas and responses for DSH only', () => {
+    const source = {
+      model: 'gpt-source',
+      input: 'Create the marker.',
+      tools: [{
+        type: 'function',
+        name: 'write',
+        description: 'Write a file.',
+        parameters: {
+          type: 'object',
+          properties: {
+            path: { type: 'string' },
+            content: { type: 'string' },
+            sandbox_permissions: { type: 'string' },
+            justification: { type: 'string' },
+          },
+          required: ['path', 'content', 'sandbox_permissions', 'justification'],
+          additionalProperties: false,
+        },
+      }],
+    }
+    const converted = convertRequest(
+      'openai-responses',
+      'openai-responses',
+      source,
+      'gpt-target',
+      { sanitizeDeepSeekHarnessToolArguments: true },
+    )
+    const tool = (converted.body.tools as Array<Record<string, unknown>>)[0]
+    const parameters = tool.parameters as Record<string, unknown>
+    expect(parameters).toMatchObject({
+      properties: { path: { type: 'string' }, content: { type: 'string' } },
+      required: ['path', 'content'],
+      additionalProperties: false,
+    })
+    expect(parameters.properties).not.toHaveProperty('sandbox_permissions')
+    expect(parameters.properties).not.toHaveProperty('justification')
+    expect(tool.description).toContain('invoke this tool without sandbox_permissions')
+
+    const response = {
+      id: 'resp_native_dsh',
+      status: 'completed',
+      output: [{
+        type: 'function_call',
+        call_id: 'call_write',
+        name: 'write',
+        arguments: JSON.stringify({
+          path: 'marker.txt',
+          content: 'ok',
+          sandbox_permissions: 'workspace-write',
+          justification: 'write',
+          metadata: { justification: 'preserved nested user data' },
+        }),
+      }],
+    }
+    expect(convertResponse(
+      'openai-responses',
+      'openai-responses',
+      response,
+      'gpt-target',
+      Date.now,
+      { sanitizeDeepSeekHarnessToolArguments: true },
+    )).toMatchObject({ output: [{ arguments: JSON.stringify({
+      path: 'marker.txt',
+      content: 'ok',
+      metadata: { justification: 'preserved nested user data' },
+    }) }] })
+
+    const chatResponse = {
+      id: 'chat_native_dsh',
+      choices: [{ message: { role: 'assistant', tool_calls: [{
+        id: 'call_write_chat',
+        type: 'function',
+        function: {
+          name: 'write',
+          arguments: '{"path":"marker.txt","sandbox_permissions":"danger-full-access","justification":"write"}',
+        },
+      }] } }],
+    }
+    expect(convertResponse(
+      'openai-chat',
+      'openai-responses',
+      chatResponse,
+      'gpt-target',
+      Date.now,
+      { sanitizeDeepSeekHarnessToolArguments: true },
+    )).toMatchObject({ output: [{
+      type: 'function_call',
+      arguments: '{"path":"marker.txt"}',
+    }] })
+  })
+
   it('normalizes every tool schema root to an object without dropping unions or constraints', () => {
     const union = {
       type: null,

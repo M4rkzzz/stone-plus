@@ -1,6 +1,14 @@
 import { describe, expect, it } from 'vitest'
-import { accountMatchesPoolProtocol, accountPoolProtocol } from '../../src/shared/pool-protocol'
+import {
+  accountMatchesPoolProtocol,
+  accountPoolProtocol,
+  isChatGptWebWmAccountCandidate,
+} from '../../src/shared/pool-protocol'
 import type { Account, ProviderDefinition } from '../../src/shared/types'
+import {
+  CHATGPT_WEB_WM_PROTOCOL_REVISION,
+  GPT_5_6_SOL_WM_MODEL,
+} from '../../src/shared/wm-routing'
 
 const account = (credentialType: Account['credentialType']): Pick<Account, 'credentialType'> => ({ credentialType })
 
@@ -45,5 +53,31 @@ describe('logical pool protocol', () => {
     const kiro = provider('kiro-compatible', 'kiro-claude', 'relay')
     expect(accountPoolProtocol(account('api-key'), kiro)).toBe('kiro-claude')
     expect(accountMatchesPoolProtocol('kiro-claude', account('api-key'), kiro)).toBe(false)
+  })
+
+  it('admits every ChatGPT OAuth plan as a WM probe candidate but requires a real verification', () => {
+    const oauth = provider('openai', 'openai-responses', 'oauth-system')
+    const team = account('chatgpt-oauth')
+
+    expect(isChatGptWebWmAccountCandidate(team, oauth)).toBe(true)
+    expect(accountMatchesPoolProtocol('chatgpt-web-wm', team, oauth)).toBe(false)
+
+    const verified = {
+      ...team,
+      chatgptWebWm: {
+        version: 2 as const,
+        protocolRevision: CHATGPT_WEB_WM_PROTOCOL_REVISION,
+        model: GPT_5_6_SOL_WM_MODEL,
+        catalogModel: GPT_5_6_SOL_WM_MODEL,
+        turnModel: GPT_5_6_SOL_WM_MODEL,
+        workspacePlanType: 'team',
+        workspaceStructure: 'workspace' as const,
+        verifiedAt: Date.now(),
+        latencyMs: 321,
+      },
+    }
+    expect(accountMatchesPoolProtocol('chatgpt-web-wm', verified, oauth)).toBe(true)
+    expect(isChatGptWebWmAccountCandidate(account('chatgpt-agent-identity'), oauth)).toBe(false)
+    expect(isChatGptWebWmAccountCandidate(team, provider('openai', 'openai-responses', 'relay'))).toBe(false)
   })
 })

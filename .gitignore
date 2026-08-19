@@ -89,6 +89,16 @@ pnpm-debug.log*
 /temp/
 /crashpad/
 
+# Root-level research probes and captured responses
+/_wm_*.cjs
+/_wm_*.json
+/_native_responses_*.cjs
+/_native_responses_*.json
+/_codex_app_*.cjs
+/_codex_app_*.json
+/_reasoning_*.cjs
+/_reasoning_*.json
+
 # Downloaded sing-box runtimes are verified build inputs, not source files.
 /build/sing-box/*/
 /build/installer-license.txt

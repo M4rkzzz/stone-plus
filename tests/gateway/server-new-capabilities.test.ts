@@ -2,8 +2,11 @@ import { createServer as createNodeServer } from 'node:net'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { Account, GatewaySettings, Pool, ProviderDefinition, RequestLog, Route } from '../../src/shared/types'
 import { GatewayServer } from '../../src/main/gateway'
-import type { GatewayConfig } from '../../src/main/gateway'
-import { GPT_5_6_SOL_WM_MODEL } from '../../src/shared/wm-routing'
+import type { GatewayConfig, GatewayRuntimeStateUpdate } from '../../src/main/gateway'
+import {
+  CHATGPT_WEB_WM_PROTOCOL_REVISION,
+  GPT_5_6_SOL_WM_MODEL,
+} from '../../src/shared/wm-routing'
 
 const timestamp = 1_700_000_000_000
 const runningServers: GatewayServer[] = []
@@ -73,7 +76,7 @@ function config(input: {
     client: input.routeClient ?? 'codex',
     enabled: true,
     poolId: pool.id,
-    inboundProtocol: input.routeProtocol ?? 'openai-responses',
+    inboundProtocol: input.routeProtocol ?? (input.routeClient === 'deepseek-harness' ? 'openai-chat' : 'openai-responses'),
     modelMap: {},
     localToken: 'local-secret',
     createdAt: timestamp,
@@ -100,7 +103,7 @@ afterEach(async () => {
 })
 
 describe('GatewayServer new capability boundaries', () => {
-  it('routes every enabled-pool model request to WM without exposing WM to local model matching', async () => {
+  it('routes every model in a verified Web WM pool through the protocol transport', async () => {
     const port = await freePort()
     const provider: ProviderDefinition = {
       id: 'provider',
@@ -119,11 +122,27 @@ describe('GatewayServer new capability boundaries', () => {
       modelsRefreshedAt: timestamp,
       modelPolicy: 'selected',
       modelAllowlist: ['client-model'],
+      chatgptWebWm: {
+        version: 2,
+        protocolRevision: CHATGPT_WEB_WM_PROTOCOL_REVISION,
+        model: GPT_5_6_SOL_WM_MODEL,
+        catalogModel: GPT_5_6_SOL_WM_MODEL,
+        turnModel: GPT_5_6_SOL_WM_MODEL,
+        workspacePlanType: 'team',
+        workspaceStructure: 'workspace',
+        verifiedAt: timestamp,
+        latencyMs: 100,
+      },
     })
-    const gatewayConfig = config({ port, provider, account: selectedAccount, maxRetries: 0 })
+    const gatewayConfig = config({
+      port,
+      provider,
+      account: selectedAccount,
+      poolProtocol: 'chatgpt-web-wm',
+      maxRetries: 0,
+    })
     gatewayConfig.pools[0].modelPolicy = 'selected'
     gatewayConfig.pools[0].modelAllowlist = ['client-model']
-    gatewayConfig.pools[0].routeToWm = true
     const logs: RequestLog[] = []
     const completed = [
       'event: response.completed',
@@ -131,19 +150,191 @@ describe('GatewayServer new capability boundaries', () => {
       '',
       '',
     ].join('\n')
-    const upstreamFetch = vi.fn(async () => new Response(completed, {
+    const webTransport = vi.fn(async () => new Response(completed, {
       status: 200,
       headers: { 'content-type': 'text/event-stream' },
     }))
+    const upstreamFetch = vi.fn(async () => {
+      throw new Error('Web WM generation must not use the ordinary Codex transport')
+    })
     const gateway = new GatewayServer({
       config: gatewayConfig,
       credentialResolver: () => ({
-        secret: 'oauth-access-token',
+        secret: 'oauth-token',
         kind: 'chatgpt-oauth',
         accountId: 'chatgpt-account',
       }),
       fetchImplementation: upstreamFetch as typeof fetch,
+      chatGptWebWmTransport: webTransport,
       onLog: (log) => logs.push(log),
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer local-secret',
+        'content-type': 'application/json',
+        'x-deepseek-harness-session-id': 'dsh-overflow-session',
+      },
+      body: JSON.stringify({
+        model: 'client-model',
+        input: [
+          { type: 'additional_tools', role: 'developer', tools: [] },
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hello' }] },
+        ],
+        reasoning: { effort: 'high', context: 'all_turns' },
+        text: { verbosity: 'low' },
+        stream: true,
+      }),
+    })
+
+    expect(response.status, await response.clone().text()).toBe(200)
+    expect(await response.text()).toContain('response.completed')
+    expect(upstreamFetch).not.toHaveBeenCalled()
+    expect(webTransport).toHaveBeenCalledOnce()
+    expect(webTransport.mock.calls[0][0]).toMatchObject({
+      operation: 'responses',
+      credential: { accessToken: 'oauth-token', accountId: 'chatgpt-account' },
+      body: {
+        model: GPT_5_6_SOL_WM_MODEL,
+        input: [
+          { type: 'additional_tools', role: 'developer', tools: [] },
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hello' }] },
+        ],
+        reasoning: { effort: 'high', context: 'all_turns' },
+        text: { verbosity: 'low' },
+      },
+    })
+    expect(logs.findLast((log) => log.status === 'success')).toMatchObject({
+      model: 'client-model',
+      upstreamModel: GPT_5_6_SOL_WM_MODEL,
+    })
+  })
+
+  it('preserves safe Web WM request errors instead of replacing them with an OAuth generic error', async () => {
+    const port = await freePort()
+    const provider: ProviderDefinition = {
+      id: 'provider', name: 'ChatGPT OAuth', kind: 'openai', sourceType: 'oauth-system',
+      baseUrl: 'https://chatgpt.com/backend-api/codex', protocol: 'openai-responses',
+      models: ['client-model'], createdAt: timestamp, updatedAt: timestamp,
+    }
+    const selectedAccount = account({
+      credentialType: 'chatgpt-oauth',
+      chatgptWebWm: {
+        version: 2,
+        protocolRevision: CHATGPT_WEB_WM_PROTOCOL_REVISION,
+        model: GPT_5_6_SOL_WM_MODEL,
+        catalogModel: GPT_5_6_SOL_WM_MODEL,
+        turnModel: GPT_5_6_SOL_WM_MODEL,
+        workspacePlanType: 'team',
+        workspaceStructure: 'workspace',
+        verifiedAt: timestamp,
+        latencyMs: 100,
+      },
+    })
+    const logs: RequestLog[] = []
+    const webTransport = vi.fn(async () => new Response(JSON.stringify({
+      error: {
+        type: 'invalid_request_error',
+        code: 'web_wm_state_not_found',
+        message: 'The Web WM continuation state is unavailable.',
+        param: 'input',
+      },
+    }), { status: 400, headers: { 'content-type': 'application/json' } }))
+    const gateway = new GatewayServer({
+      config: config({
+        port, provider, account: selectedAccount, poolProtocol: 'chatgpt-web-wm', maxRetries: 5,
+      }),
+      credentialResolver: () => ({
+        secret: 'oauth-token', kind: 'chatgpt-oauth', accountId: 'chatgpt-account',
+      }),
+      chatGptWebWmTransport: webTransport,
+      onLog: (log) => logs.push(log),
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'client-model', input: 'continue', stream: true }),
+    })
+
+    expect(response.status).toBe(400)
+    expect(await response.json()).toEqual({
+      error: {
+        type: 'invalid_request_error',
+        code: 'web_wm_state_not_found',
+        message: 'The Web WM continuation state is unavailable.',
+        param: 'input',
+      },
+    })
+    expect(logs.findLast((log) => log.status === 'error')?.error)
+      .toBe('The Web WM continuation state is unavailable.')
+    expect(webTransport).toHaveBeenCalledOnce()
+  })
+
+  it('refreshes a Web WM OAuth token rejected inside an HTTP 200 Responses stream', async () => {
+    const port = await freePort()
+    const provider: ProviderDefinition = {
+      id: 'provider', name: 'ChatGPT OAuth', kind: 'openai', sourceType: 'oauth-system',
+      baseUrl: 'https://chatgpt.com/backend-api/codex', protocol: 'openai-responses',
+      models: ['client-model'], createdAt: timestamp, updatedAt: timestamp,
+    }
+    const selectedAccount = account({
+      credentialType: 'chatgpt-oauth',
+      chatgptWebWm: {
+        version: 2,
+        protocolRevision: CHATGPT_WEB_WM_PROTOCOL_REVISION,
+        model: GPT_5_6_SOL_WM_MODEL,
+        catalogModel: GPT_5_6_SOL_WM_MODEL,
+        turnModel: GPT_5_6_SOL_WM_MODEL,
+        workspacePlanType: 'team',
+        workspaceStructure: 'workspace',
+        verifiedAt: timestamp,
+        latencyMs: 100,
+      },
+    })
+    const gatewayConfig = config({
+      port, provider, account: selectedAccount, poolProtocol: 'chatgpt-web-wm', maxRetries: 0,
+    })
+    const rejected = [
+      'event: response.failed',
+      'data: {"type":"response.failed","response":{"id":"resp_rejected","object":"response","status":"failed","error":{"code":"authentication_error","message":"Access token rejected"},"output":[]}}',
+      '',
+      '',
+    ].join('\n')
+    const completed = [
+      'event: response.completed',
+      'data: {"type":"response.completed","response":{"id":"resp_recovered","object":"response","status":"completed","output":[]}}',
+      '',
+      '',
+    ].join('\n')
+    const usedTokens: string[] = []
+    const recoverRejectedAccess = vi.fn(async () => ({
+      secret: 'fresh-oauth-token',
+      kind: 'chatgpt-oauth' as const,
+      accountId: 'chatgpt-account',
+    }))
+    const webTransport = vi.fn(async (input: { credential: { accessToken: string } }) => {
+      usedTokens.push(input.credential.accessToken)
+      return new Response(input.credential.accessToken === 'stale-oauth-token' ? rejected : completed, {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' },
+      })
+    })
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => ({
+        secret: 'stale-oauth-token',
+        kind: 'chatgpt-oauth',
+        accountId: 'chatgpt-account',
+        recoverRejectedAccess,
+      }),
+      chatGptWebWmTransport: webTransport,
+      requestTransientRetryDelayMs: 0,
     })
     runningServers.push(gateway)
     await gateway.start()
@@ -155,16 +346,262 @@ describe('GatewayServer new capability boundaries', () => {
     })
 
     expect(response.status, await response.clone().text()).toBe(200)
-    expect(await response.text()).toContain('response.completed')
-    expect(upstreamFetch).toHaveBeenCalledOnce()
-    expect(JSON.parse(String(upstreamFetch.mock.calls[0][1]?.body))).toMatchObject({
-      model: GPT_5_6_SOL_WM_MODEL,
-    })
-    expect(logs.findLast((log) => log.status === 'success')).toMatchObject({
-      model: 'client-model',
-      upstreamModel: GPT_5_6_SOL_WM_MODEL,
-    })
+    expect(await response.text()).toContain('resp_recovered')
+    expect(usedTokens).toEqual(['stale-oauth-token', 'fresh-oauth-token'])
+    expect(recoverRejectedAccess).toHaveBeenCalledOnce()
   })
+
+  it('retries an HTTP 200 Web WM response.failed 429 twice before succeeding', async () => {
+    const port = await freePort()
+    const provider: ProviderDefinition = {
+      id: 'provider', name: 'ChatGPT OAuth', kind: 'openai', sourceType: 'oauth-system',
+      baseUrl: 'https://chatgpt.com/backend-api/codex', protocol: 'openai-responses',
+      models: ['client-model'], createdAt: timestamp, updatedAt: timestamp,
+    }
+    const selectedAccount = account({
+      credentialType: 'chatgpt-oauth',
+      chatgptWebWm: {
+        version: 2,
+        protocolRevision: CHATGPT_WEB_WM_PROTOCOL_REVISION,
+        model: GPT_5_6_SOL_WM_MODEL,
+        catalogModel: GPT_5_6_SOL_WM_MODEL,
+        turnModel: GPT_5_6_SOL_WM_MODEL,
+        workspacePlanType: 'team',
+        workspaceStructure: 'workspace',
+        verifiedAt: timestamp,
+        latencyMs: 100,
+      },
+    })
+    const gatewayConfig = config({
+      port, provider, account: selectedAccount, poolProtocol: 'chatgpt-web-wm', maxRetries: 0,
+    })
+    const overloaded = [
+      'event: response.failed',
+      'data: {"type":"response.failed","response":{"id":"resp_busy","object":"response","status":"failed","error":{"code":"rate_limit_error","message":"Temporarily overloaded"},"output":[]}}',
+      '',
+      '',
+    ].join('\n')
+    const completed = [
+      'event: response.completed',
+      'data: {"type":"response.completed","response":{"id":"resp_third","object":"response","status":"completed","output":[]}}',
+      '',
+      '',
+    ].join('\n')
+    let attempts = 0
+    const webTransport = vi.fn(async () => {
+      attempts += 1
+      return new Response(attempts < 3 ? overloaded : completed, {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' },
+      })
+    })
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => ({
+        secret: 'oauth-token', kind: 'chatgpt-oauth', accountId: 'chatgpt-account',
+      }),
+      chatGptWebWmTransport: webTransport,
+      requestTransientRetryDelayMs: 0,
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'client-model', input: 'hello', stream: true }),
+    })
+
+    expect(response.status, await response.clone().text()).toBe(200)
+    expect(await response.text()).toContain('resp_third')
+    expect(webTransport).toHaveBeenCalledTimes(3)
+  })
+
+  it('isolates the ChatGPT WM unsupported response to one account and fails over', async () => {
+    const port = await freePort()
+    const provider: ProviderDefinition = {
+      id: 'provider',
+      name: 'ChatGPT OAuth',
+      kind: 'openai',
+      sourceType: 'oauth-system',
+      baseUrl: 'https://chatgpt.com/backend-api/codex',
+      protocol: 'openai-responses',
+      models: ['client-model'],
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    }
+    const deniedAccount = account({
+      id: 'wm-denied',
+      name: 'WM denied',
+      credentialId: 'credential-wm-denied',
+      credentialType: 'chatgpt-oauth',
+      priority: 1,
+      availableModels: ['client-model'],
+      chatgptWebWm: {
+        version: 2,
+        protocolRevision: CHATGPT_WEB_WM_PROTOCOL_REVISION,
+        model: GPT_5_6_SOL_WM_MODEL,
+        catalogModel: GPT_5_6_SOL_WM_MODEL,
+        turnModel: GPT_5_6_SOL_WM_MODEL,
+        workspacePlanType: 'team',
+        workspaceStructure: 'workspace',
+        verifiedAt: timestamp,
+        latencyMs: 100,
+      },
+    })
+    const workingAccount = account({
+      id: 'wm-working',
+      name: 'WM working',
+      credentialId: 'credential-wm-working',
+      credentialType: 'chatgpt-oauth',
+      priority: 10,
+      availableModels: ['client-model'],
+      chatgptWebWm: {
+        version: 2,
+        protocolRevision: CHATGPT_WEB_WM_PROTOCOL_REVISION,
+        model: GPT_5_6_SOL_WM_MODEL,
+        catalogModel: GPT_5_6_SOL_WM_MODEL,
+        turnModel: GPT_5_6_SOL_WM_MODEL,
+        workspacePlanType: 'team',
+        workspaceStructure: 'workspace',
+        verifiedAt: timestamp,
+        latencyMs: 100,
+      },
+    })
+    const gatewayConfig = config({
+      port,
+      provider,
+      account: deniedAccount,
+      poolProtocol: 'chatgpt-web-wm',
+      maxRetries: 1,
+    })
+    gatewayConfig.accounts.push(workingAccount)
+    gatewayConfig.pools[0].members.push({ accountId: workingAccount.id, enabled: true })
+    const selectedAccounts: string[] = []
+    const states: GatewayRuntimeStateUpdate[] = []
+    const completed = [
+      'event: response.completed',
+      'data: {"type":"response.completed","response":{"id":"resp_wm_peer","model":"gpt-5.6-sol","status":"completed","output":[]}}',
+      '',
+      '',
+    ].join('\n')
+    const webTransport = vi.fn(async (input: { account: Account }) => {
+      if (input.account.id === 'wm-denied') {
+        return new Response(JSON.stringify({
+          detail: `The '${GPT_5_6_SOL_WM_MODEL}' model is not supported when using Codex with a ChatGPT account.`,
+        }), { status: 400, headers: { 'content-type': 'application/json' } })
+      }
+      return new Response(completed, {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' },
+      })
+    })
+    const upstreamFetch = vi.fn(async () => {
+      throw new Error('Web WM generation must not use the ordinary Codex transport')
+    })
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: (selected) => {
+        selectedAccounts.push(selected.id)
+        return {
+          secret: `token-${selected.id}`,
+          kind: 'chatgpt-oauth',
+          accountId: `chatgpt-${selected.id}`,
+        }
+      },
+      fetchImplementation: upstreamFetch as typeof fetch,
+      chatGptWebWmTransport: webTransport,
+      onAccountState: (state) => states.push(state),
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const request = (): Promise<Response> => fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'client-model', input: 'hello', stream: true }),
+    })
+    const firstResponse = await request()
+    expect(firstResponse.status, await firstResponse.clone().text()).toBe(200)
+    await firstResponse.text()
+    const secondResponse = await request()
+    expect(secondResponse.status, await secondResponse.clone().text()).toBe(200)
+    await secondResponse.text()
+
+    expect(selectedAccounts).toEqual(['wm-denied', 'wm-working', 'wm-working'])
+    expect(upstreamFetch).not.toHaveBeenCalled()
+    expect(webTransport.mock.calls.map(([input]) => input.body.model))
+      .toEqual([
+        GPT_5_6_SOL_WM_MODEL,
+        GPT_5_6_SOL_WM_MODEL,
+        GPT_5_6_SOL_WM_MODEL,
+      ])
+    expect(states).toContainEqual(expect.objectContaining({
+      accountId: 'wm-denied',
+      status: 'active',
+      modelCooldowns: expect.objectContaining({
+        [GPT_5_6_SOL_WM_MODEL]: expect.objectContaining({ reason: 'not-found', statusCode: 400 }),
+      }),
+    }))
+    expect(states).not.toContainEqual(expect.objectContaining({ accountId: 'wm-denied', status: 'disabled' }))
+    expect(states).not.toContainEqual(expect.objectContaining({ accountId: 'wm-denied', status: 'cooldown' }))
+  })
+
+  it('preserves ChatGPT Responses item-limit errors as context overflow for DSH compaction', async () => {
+    const port = await freePort()
+    const provider: ProviderDefinition = {
+      id: 'provider',
+      name: 'ChatGPT OAuth',
+      kind: 'openai',
+      sourceType: 'oauth-system',
+      baseUrl: 'https://chatgpt.com/backend-api/codex',
+      protocol: 'openai-responses',
+      models: ['gpt-5.6-sol'],
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    }
+    const gateway = new GatewayServer({
+      config: config({
+        port,
+        provider,
+        account: account({
+          credentialType: 'chatgpt-oauth',
+          availableModels: ['gpt-5.6-sol'],
+        }),
+        poolProtocol: 'openai-responses',
+        routeProtocol: 'openai-responses',
+        routeClient: 'deepseek-harness',
+        maxRetries: 0,
+      }),
+      credentialResolver: () => ({ secret: 'oauth-access-token', kind: 'chatgpt-oauth', accountId: 'chatgpt-account' }),
+      fetchImplementation: vi.fn(async () => new Response(JSON.stringify({
+        error: {
+          message: "Invalid 'input': array too long. Expected an array with maximum length 16384, but got 38250",
+          type: 'invalid_request_error',
+        },
+      }), { status: 400, headers: { 'content-type': 'application/json' } })) as typeof fetch,
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/deepseek-harness/v1/responses`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer local-secret',
+        'content-type': 'application/json',
+        'x-deepseek-harness-session-id': 'dsh-overflow-session',
+      },
+      body: JSON.stringify({ model: 'gpt-5.6-sol', input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hello' }] }], stream: true }),
+    })
+
+    expect(response.status, await response.clone().text()).toBe(400)
+    expect(await response.json()).toMatchObject({
+      error: {
+        type: 'context_length_exceeded',
+        code: 'context_length_exceeded',
+      },
+    })
+  }, 15_000)
 
   it('isolates the DeepSeek Harness Chat Completions endpoint and model catalog by route token', async () => {
     const port = await freePort()
@@ -194,7 +631,7 @@ describe('GatewayServer new capability boundaries', () => {
         provider,
         account: account({ credentialType: 'api-key', availableModels: ['gpt-5.6-sol', 'gpt-5.5'] }),
         poolProtocol: 'openai-chat',
-        routeProtocol: 'openai-chat',
+        routeProtocol: 'openai-responses',
         routeClient: 'deepseek-harness',
       }),
       credentialResolver: () => ({ secret: 'relay-key', kind: 'api-key' }),
@@ -265,7 +702,7 @@ describe('GatewayServer new capability boundaries', () => {
         provider,
         account: account({ credentialType: 'api-key', availableModels: ['gpt-5.6-sol'] }),
         poolProtocol: 'openai-chat',
-        routeProtocol: 'openai-chat',
+        routeProtocol: 'openai-responses',
         routeClient: 'deepseek-harness',
       }),
       credentialResolver: () => ({ secret: 'relay-key', kind: 'api-key' }),
@@ -330,7 +767,7 @@ describe('GatewayServer new capability boundaries', () => {
           provider,
           account: harnessAccount,
           poolProtocol: 'openai-chat',
-          routeProtocol: 'openai-chat',
+          routeProtocol: 'openai-responses',
           routeClient: 'deepseek-harness',
         }),
         credentialResolver: () => ({ secret: 'relay-key', kind: 'api-key' }),
@@ -493,7 +930,7 @@ describe('GatewayServer new capability boundaries', () => {
         provider,
         account: account({ credentialType: 'api-key', availableModels: ['gpt-search'] }),
         poolProtocol: 'openai-responses',
-        routeProtocol: 'openai-chat',
+        routeProtocol: 'openai-responses',
         routeClient: 'deepseek-harness',
       }),
       credentialResolver: () => ({ secret: 'relay-key', kind: 'api-key' }),
@@ -590,6 +1027,7 @@ describe('GatewayServer new capability boundaries', () => {
         accountId: 'chatgpt-account',
       }),
       fetchImplementation: upstreamFetch as typeof fetch,
+      requestTransientRetryDelayMs: 0,
       onAccountState: (state) => states.push(state),
     })
     runningServers.push(gateway)
@@ -608,7 +1046,7 @@ describe('GatewayServer new capability boundaries', () => {
     expect(states).not.toContainEqual(expect.objectContaining({ status: 'disabled' }))
   })
 
-  it('silently retries the first two identical streamed overload terminals and exposes the third', async () => {
+  it('does not hide a streamed overload terminal on the ordinary ChatGPT Responses path', async () => {
     const port = await freePort()
     const provider: ProviderDefinition = {
       id: 'provider',
@@ -645,6 +1083,7 @@ describe('GatewayServer new capability boundaries', () => {
         accountId: 'chatgpt-account',
       }),
       fetchImplementation: upstreamFetch as typeof fetch,
+      requestTransientRetryDelayMs: 0,
       onAccountState: (state) => states.push(state),
     })
     runningServers.push(gateway)
@@ -657,14 +1096,17 @@ describe('GatewayServer new capability boundaries', () => {
     })
 
     const body = await response.text()
-    expect(response.status).toBe(502)
+    // Only Web WM keeps lifecycle/terminal frames private. The ordinary
+    // ChatGPT OAuth path commits the upstream terminal immediately so the
+    // main chain retains its original streaming behavior.
+    expect(response.status).toBe(200)
     expect(body).toContain('server_is_overloaded')
-    expect(upstreamFetch).toHaveBeenCalledTimes(3)
+    expect(upstreamFetch).toHaveBeenCalledTimes(1)
     expect(states).not.toContainEqual(expect.objectContaining({ status: 'cooldown' }))
     expect(states).not.toContainEqual(expect.objectContaining({ status: 'disabled' }))
   })
 
-  it('does not expose a streamed overload when the third attempt recovers', async () => {
+  it('does not retry a streamed overload after the ordinary ChatGPT path commits it', async () => {
     const port = await freePort()
     const provider: ProviderDefinition = {
       id: 'provider',
@@ -706,6 +1148,7 @@ describe('GatewayServer new capability boundaries', () => {
         accountId: 'chatgpt-account',
       }),
       fetchImplementation: upstreamFetch as typeof fetch,
+      requestTransientRetryDelayMs: 0,
     })
     runningServers.push(gateway)
     await gateway.start()
@@ -717,12 +1160,12 @@ describe('GatewayServer new capability boundaries', () => {
     })
     const body = await response.text()
     expect(response.status, body).toBe(200)
-    expect(body).toContain('response.completed')
-    expect(body).not.toContain('server_is_overloaded')
-    expect(upstreamFetch).toHaveBeenCalledTimes(3)
+    expect(body).toContain('server_is_overloaded')
+    expect(body).not.toContain('response.completed')
+    expect(upstreamFetch).toHaveBeenCalledTimes(1)
   })
 
-  it('retries a ChatGPT stream that closes before response.completed while still precommit', async () => {
+  it('does not hide a truncated stream after the ordinary ChatGPT path commits its first event', async () => {
     const port = await freePort()
     const provider: ProviderDefinition = {
       id: 'provider',
@@ -775,9 +1218,10 @@ describe('GatewayServer new capability boundaries', () => {
     })
     const body = await response.text()
     expect(response.status, body).toBe(200)
-    expect(body).toContain('response.completed')
-    expect(body).not.toContain('incomplete_stream')
-    expect(upstreamFetch).toHaveBeenCalledTimes(3)
+    expect(body).toContain('response.created')
+    expect(body).toContain('Upstream stream ended before a terminal event')
+    expect(body).not.toContain('response.completed')
+    expect(upstreamFetch).toHaveBeenCalledTimes(1)
   })
 
   it('applies pool reasoning remapping and its cap to the actual upstream request', async () => {

@@ -20,6 +20,8 @@ import type {
   AccountModelTestResult,
   AppRuntimeDelta,
   AppSnapshot,
+  ChatGptWebWmVerificationProgress,
+  ChatGptWebWmVerificationStage,
   ClientConfigEditorSaveInput,
   ClientConfigEditorState,
   ClientConfigFileRole,
@@ -1064,6 +1066,20 @@ export function registerGatewayApi(
     sender.send('stone:account-import-progress', { progressId, ...progress } satisfies AccountImportProgress)
   }
 
+  const emitWebWmVerificationProgress = (
+    sender: WebContents,
+    progressId: unknown,
+    accountId: string,
+    progress: Omit<ChatGptWebWmVerificationProgress, 'progressId' | 'accountId'>,
+  ): void => {
+    if (typeof progressId !== 'string' || !progressId || progressId.length > 120 || sender.isDestroyed()) return
+    sender.send('stone:chatgpt-web-wm-verification-progress', {
+      progressId,
+      accountId,
+      ...progress,
+    } satisfies ChatGptWebWmVerificationProgress)
+  }
+
   const persistTerminalLog = (id: string): void => {
     const pending = pendingTerminalLogs.get(id)
     if (!pending || pending.flight || closed) return
@@ -1456,6 +1472,58 @@ export function registerGatewayApi(
     if (!chatGptCodexAppLogin) throw new Error('ChatGPT OAuth 转 Codex App 能力不可用。')
     await chatGptCodexAppLogin.open(id.trim())
     return withRuntimeMetrics(store.getSnapshot())
+  })
+  ipcMain.handle('stone:verify-chatgpt-web-wm-account', async (event, accountId: string, progressId: string) => {
+    assertTrustedSender(event)
+    if (typeof accountId !== 'string' || !accountId.trim()) throw new Error('ChatGPT OAuth 账号参数无效。')
+    if (typeof progressId !== 'string' || !progressId.trim() || progressId.length > 120) {
+      throw new Error('Web WM 检测任务参数无效。')
+    }
+    if (!chatGptWebLogin) throw new Error('ChatGPT Web WM 检测能力不可用。')
+    const selectedId = accountId.trim()
+    let currentStage: ChatGptWebWmVerificationStage = 'session'
+    let currentPercent = 0
+    const stageMessage = (stage: ChatGptWebWmVerificationStage): string => {
+      switch (stage) {
+        case 'session': return nativeText('正在准备账号专属网页会话…', 'Preparing the account web session…')
+        case 'identity': return nativeText('网页身份已确认', 'Web identity confirmed')
+        case 'catalog': return nativeText('正在校验 5.6 Sol WM 模型权限…', 'Checking 5.6 Sol WM model access…')
+        case 'protocol': return nativeText('正在初始化 WM 协议…', 'Initializing the WM protocol…')
+        case 'turn': return nativeText('正在执行真实 WM 回合…', 'Running a real WM turn…')
+        case 'persist': return nativeText('正在写入号池资格…', 'Saving pool eligibility…')
+        case 'complete': return nativeText('5.6 Sol WM 实测通过', '5.6 Sol WM verification passed')
+      }
+    }
+    const report = (
+      stage: ChatGptWebWmVerificationStage,
+      percent: number,
+      status: ChatGptWebWmVerificationProgress['status'] = 'running',
+      message = stageMessage(stage),
+    ): void => {
+      currentStage = stage
+      currentPercent = Math.max(0, Math.min(100, Math.round(percent)))
+      emitWebWmVerificationProgress(event.sender, progressId, selectedId, {
+        stage,
+        percent: currentPercent,
+        status,
+        message,
+      })
+    }
+    try {
+      const result = await chatGptWebLogin.verifyWebWm(selectedId, (stage, percent) => report(stage, percent))
+      report('persist', 95)
+      const snapshot = await mutate(() => store.recordChatGptWebWmVerification(selectedId, result))
+      report('complete', 100, 'complete')
+      return snapshot
+    } catch (error) {
+      report(
+        currentStage,
+        currentPercent,
+        'failed',
+        nativeText('Web WM 检测在当前阶段失败', 'Web WM verification failed at the current stage'),
+      )
+      throw error
+    }
   })
   ipcMain.handle('stone:test-account-model', async (event, accountId: string, model: string) => {
     assertTrustedSender(event)

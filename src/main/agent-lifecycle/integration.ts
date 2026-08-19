@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process'
-import { resolve as resolvePath } from 'node:path'
+import { resolve as resolvePath, win32 as win32Path } from 'node:path'
 import type { AgentRestoreOptions, AgentStartOptions, AgentTarget } from '@shared/agent-lifecycle'
 import { agentRouteClient } from '@shared/agent-lifecycle'
 import {
@@ -434,6 +434,7 @@ export class ManagedCliRuntimePort implements CliRuntimePort {
           existing.client,
           existing.launchArgs,
           existing.configDirectory,
+          existing.executablePath,
         ),
       })
     }
@@ -453,7 +454,7 @@ export class ManagedCliRuntimePort implements CliRuntimePort {
           executablePath: executable.executablePath,
           launchArgs: sanitizeManagedClientLaunchArgs(
             client,
-            await this.prepareLaunchArgs(client, existing.launchArgs, existing.configDirectory),
+            await this.prepareLaunchArgs(client, existing.launchArgs, existing.configDirectory, executable.executablePath),
           ),
           ...(client === 'deepseek-harness' ? { launchMode: 'background' as const } : {}),
         })
@@ -478,7 +479,7 @@ export class ManagedCliRuntimePort implements CliRuntimePort {
       configDirectory,
       ...(options?.workingDirectory ? { workingDirectory: options.workingDirectory } : {}),
       executablePath: executable.executablePath,
-      launchArgs: await this.prepareLaunchArgs(client, [], configDirectory),
+      launchArgs: await this.prepareLaunchArgs(client, [], configDirectory, executable.executablePath),
       launchMode: managedLaunchMode(client),
       routeId: route.id,
       ...(profile ? { profileId: profile.id } : {}),
@@ -492,6 +493,7 @@ export class ManagedCliRuntimePort implements CliRuntimePort {
     client: RouteClient,
     current: readonly string[],
     configDirectory?: string,
+    executablePath?: string,
   ): Promise<string[]> {
     const launchArgs = launchArgsForClient(client, current)
     if (client !== 'deepseek-harness') return launchArgs
@@ -502,7 +504,10 @@ export class ManagedCliRuntimePort implements CliRuntimePort {
     const target = resolveConnection(this.store, 'deepseek-harness')
     const installed = await companion.ensureInstalled({
       gatewayBaseUrl: target.gatewayBaseUrl,
-      credentialFile: configDirectory ? resolvePath(configDirectory, '.env') : paths.env.path,
+      credentialFile: configDirectory
+        ? resolveDeepSeekHarnessCredentialFile(configDirectory)
+        : paths.env.path,
+      ...(executablePath ? { executablePath } : {}),
     })
     return withDeepSeekHarnessCompanionPatch(launchArgs, installed.patchPath)
   }
@@ -516,6 +521,21 @@ export class ManagedCliRuntimePort implements CliRuntimePort {
       return false
     }
   }
+}
+
+/**
+ * Resolve the DSH credential file using the path dialect of the configured
+ * profile. Managed instances can retain a Windows path while Stone+ is being
+ * inspected or repaired from a non-Windows host (for example CI or an
+ * imported profile). Node's host-native `resolve()` would otherwise prefix a
+ * Windows path with the current POSIX working directory and generate a path
+ * that cannot be read by DSH.
+ */
+function resolveDeepSeekHarnessCredentialFile(configDirectory: string): string {
+  if (/^(?:[A-Za-z]:[\\/]|\\\\)/.test(configDirectory)) {
+    return win32Path.resolve(configDirectory, '.env')
+  }
+  return resolvePath(configDirectory, '.env')
 }
 
 function agentTargetForClient(client: RouteClient): Exclude<AgentTarget, 'codex-desktop'> {
@@ -662,6 +682,7 @@ class DefaultCodexDesktopProbe implements CodexDesktopProbe {
         : false
     return {
       installed: installation.installed,
+      ...(installation.version ? { version: installation.version } : {}),
       ...(installation.executablePath ? { executablePath: installation.executablePath } : {}),
       configured: installation.installed,
       running,

@@ -47,7 +47,11 @@ import {
 } from '@shared/route-models'
 import { providerSourceFamily } from '@shared/source-family'
 import { normalizeReasoningEffort, normalizeReasoningEffortMap } from '@shared/reasoning-policy'
-import { supportsPoolWmRouting } from '@shared/wm-routing'
+import {
+  CHATGPT_WEB_WM_PROTOCOL_REVISION,
+  GPT_5_6_SOL_WM_MODEL,
+  isChatGptWebWmPoolProtocol,
+} from '@shared/wm-routing'
 import {
   buildModelCatalog,
   inferUpstreamCapabilities,
@@ -75,6 +79,7 @@ import type {
   BuiltInProxyProfileSummary,
   BuiltInProxySettings,
   ClientConfigProfile,
+  ChatGptWebWmVerificationResult,
   ClientConfigProfileInput,
   ChatGptAccountExportFormat,
   ChatGptAccountImportInput,
@@ -185,6 +190,7 @@ const SUPPORTED_POOL_PROTOCOLS = new Set<PoolProtocol>([
   'gemini',
   'kiro-claude',
   'grok',
+  'chatgpt-web-wm',
 ])
 
 const DEFAULT_BUILT_IN_PROXY_SETTINGS: Omit<BuiltInProxySettings, 'updatedAt'> = {
@@ -1143,6 +1149,43 @@ export class AppStore {
     return this.getSnapshot()
   }
 
+  public async recordChatGptWebWmVerification(
+    accountId: string,
+    verification: ChatGptWebWmVerificationResult,
+  ): Promise<AppSnapshot> {
+    if (!Number.isFinite(verification.latencyMs) || verification.latencyMs < 0) {
+      throw new Error('Web WM verification latency is invalid.')
+    }
+    const workspacePlanType = verification.workspacePlanType.trim().toLowerCase()
+    if (!workspacePlanType || workspacePlanType.length > 64
+      || verification.catalogModel !== GPT_5_6_SOL_WM_MODEL
+      || verification.turnModel !== GPT_5_6_SOL_WM_MODEL
+      || (verification.workspaceStructure !== 'personal'
+        && verification.workspaceStructure !== 'workspace')) {
+      throw new Error('Web WM verification evidence is invalid.')
+    }
+    const timestamp = Date.now()
+    await this.store.mutate((state) => {
+      const account = state.accounts.find((candidate) => candidate.id === accountId)
+      if (!account || account.credentialType !== 'chatgpt-oauth') {
+        throw new Error('Only ChatGPT OAuth accounts can be verified for Web WM.')
+      }
+      account.chatgptWebWm = {
+        version: 2,
+        protocolRevision: CHATGPT_WEB_WM_PROTOCOL_REVISION,
+        model: GPT_5_6_SOL_WM_MODEL,
+        catalogModel: verification.catalogModel,
+        turnModel: verification.turnModel,
+        workspacePlanType,
+        workspaceStructure: verification.workspaceStructure,
+        verifiedAt: timestamp,
+        latencyMs: Math.round(verification.latencyMs),
+      }
+      account.updatedAt = timestamp
+    }, ['accounts'])
+    return this.getSnapshot()
+  }
+
   public async saveAccount(input: AccountInput): Promise<AppSnapshot> {
     const name = requiredName(input.name, 'Account name')
     const timestamp = Date.now()
@@ -1413,6 +1456,7 @@ export class AppStore {
           modelsRefreshedAt: existing?.modelsRefreshedAt,
           modelPolicy: existing?.modelPolicy ?? (existing?.modelAllowlist.length ? 'selected' : 'all'),
           modelAllowlist: existing?.modelAllowlist ?? [],
+          chatgptWebWm: existing?.chatgptWebWm,
           proxyId,
           quota: existing?.quota,
           codexQuota: existing?.codexQuota,
@@ -1435,7 +1479,9 @@ export class AppStore {
           createdAccountIds.push(accountId)
         }
         importedAccountIds.push(accountId)
-        if (!credentialBundle.refreshToken) accessTokenOnlyCount += 1
+        if (!credentialBundle.refreshToken && credentialBundle.authMode !== 'personal-access-token') {
+          accessTokenOnlyCount += 1
+        }
       }
       for (const [index, bundle] of parsedAgentIdentities.identities.entries()) {
         let existing: Account | undefined
@@ -2285,8 +2331,13 @@ export class AppStore {
       if (sourceFamilies.has(undefined) || sourceFamilies.size !== 1) {
         throw new Error('Every account in a pool must use the same source family.')
       }
-      const requestedModelAllowlist = normalizeModels(input.modelAllowlist ?? existing?.modelAllowlist ?? [])
-      const modelPolicy = resolvePoolInputModelPolicy(input.modelPolicy, input.modelAllowlist !== undefined, existing)
+      const webWmPool = isChatGptWebWmPoolProtocol(protocol)
+      const requestedModelAllowlist = webWmPool
+        ? [GPT_5_6_SOL_WM_MODEL]
+        : normalizeModels(input.modelAllowlist ?? existing?.modelAllowlist ?? [])
+      const modelPolicy = webWmPool
+        ? 'selected' as const
+        : resolvePoolInputModelPolicy(input.modelPolicy, input.modelAllowlist !== undefined, existing)
       const members = mergeStandardPoolMembers(existing?.members ?? [], accountIds, protocol, state.accounts, state.providers)
       const finalFamilies = new Set(members.map((member) => {
         const account = state.accounts.find((candidate) => candidate.id === member.accountId)
@@ -2322,13 +2373,6 @@ export class AppStore {
         forceFastMode: !finalFamilies.has('deepseek')
           && supportsPoolFastServiceTier(protocol)
           && (input.forceFastMode ?? existing?.forceFastMode) === true,
-        routeToWm: supportsPoolWmRouting(
-          protocol,
-          members.flatMap((member) => {
-            const account = state.accounts.find((candidate) => candidate.id === member.accountId)
-            return account ? [account] : []
-          }),
-        ) && (input.routeToWm ?? existing?.routeToWm) === true,
         quotaProtection: input.quotaProtection === undefined
           ? existing?.quotaProtection
           : normalizeQuotaProtection(input.quotaProtection),
@@ -3812,6 +3856,7 @@ function normalizePersistedState(
       modelsRefreshedAt,
       modelPolicy,
       modelAllowlist,
+      chatgptWebWm: normalizeChatGptWebWmCapability(account.chatgptWebWm, credentialType),
       modelCooldowns: normalizePersistedModelCooldowns(account.modelCooldowns, timestamp),
       grokQuota: credentialType === 'grok-oauth' ? normalizePersistedGrokQuota(account.grokQuota) : undefined,
       quotaProtection: credentialType === 'grok-oauth'
@@ -3828,14 +3873,12 @@ function normalizePersistedState(
   const accountsById = new Map(accounts.map((account) => [account.id, account]))
   const providersById = new Map(providers.map((provider) => [provider.id, provider]))
   const normalizedPools: Pool[] = state.pools.map((pool): Pool => {
+    const { routeToWm: _removedRouteToWm, ...persistedPool } = pool as Pool & { routeToWm?: unknown }
     const persistedAllowlist = normalizeModels(pool.modelAllowlist)
     const modelPolicy = normalizePersistedModelPolicy(pool.modelPolicy, persistedAllowlist)
-    const memberAccounts = pool.members.flatMap((member) => {
-      const account = accountsById.get(member.accountId)
-      return account ? [account] : []
-    })
+    const webWmPool = isChatGptWebWmPoolProtocol(pool.protocol)
     return {
-      ...pool,
+      ...persistedPool,
       kind: pool.kind === 'relay-aggregate' ? 'relay-aggregate' : 'standard',
       strategy: normalizePersistedPoolStrategy(pool.strategy),
       stickySessions: pool.stickySessions === true,
@@ -3844,10 +3887,6 @@ function normalizePersistedState(
       reasoningEffortMap: normalizeReasoningEffortMap(pool.reasoningEffortMap),
       reasoningEffortCap: normalizeReasoningEffort(pool.reasoningEffortCap),
       forceFastMode: supportsPoolFastServiceTier(pool.protocol) && pool.forceFastMode === true,
-      routeToWm: pool.kind !== 'relay-aggregate'
-        && memberAccounts.length === pool.members.length
-        && supportsPoolWmRouting(pool.protocol, memberAccounts)
-        && pool.routeToWm === true,
       members: pool.members.map((member, index) => ({
         accountId: member.accountId,
         enabled: member.enabled === true && (pool.protocol !== 'kiro-claude'
@@ -3857,8 +3896,10 @@ function normalizePersistedState(
           ? { order: nonNegativeOptionalInteger(member.order) }
           : pool.kind === 'relay-aggregate' ? { order: index } : {})
       })),
-      modelPolicy,
-      modelAllowlist: modelPolicy === 'selected' ? persistedAllowlist : [],
+      modelPolicy: webWmPool ? 'selected' : modelPolicy,
+      modelAllowlist: webWmPool
+        ? [GPT_5_6_SOL_WM_MODEL]
+        : modelPolicy === 'selected' ? persistedAllowlist : [],
       quotaProtection: normalizeQuotaProtection(pool.quotaProtection),
       ...(pool.proxyId && !proxyIds.has(pool.proxyId) ? { proxyId: undefined } : {})
     }
@@ -3916,6 +3957,7 @@ export function enumeratePoolAvailableModels(
   accounts: readonly Account[],
   providers: readonly ProviderDefinition[]
 ): string[] {
+  if (isChatGptWebWmPoolProtocol(pool.protocol)) return [GPT_5_6_SOL_WM_MODEL]
   const accountsById = new Map(accounts.map((account) => [account.id, account]))
   const providersById = new Map(providers.map((provider) => [provider.id, provider]))
   const models: string[] = []
@@ -4761,6 +4803,46 @@ function normalizeTimestamp(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined
 }
 
+function normalizeChatGptWebWmCapability(
+  value: unknown,
+  credentialType: Account['credentialType'],
+): Account['chatgptWebWm'] {
+  if (credentialType !== 'chatgpt-oauth' || value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return undefined
+  }
+  const candidate = value as Record<string, unknown>
+  const verifiedAt = normalizeTimestamp(candidate.verifiedAt)
+  const latencyMs = candidate.latencyMs
+  const workspacePlanType = typeof candidate.workspacePlanType === 'string'
+    ? candidate.workspacePlanType.trim().toLowerCase()
+    : ''
+  if (candidate.version !== 2
+    || candidate.protocolRevision !== CHATGPT_WEB_WM_PROTOCOL_REVISION
+    || candidate.model !== GPT_5_6_SOL_WM_MODEL
+    || candidate.catalogModel !== GPT_5_6_SOL_WM_MODEL
+    || candidate.turnModel !== GPT_5_6_SOL_WM_MODEL
+    || !workspacePlanType
+    || workspacePlanType.length > 64
+    || (candidate.workspaceStructure !== 'personal' && candidate.workspaceStructure !== 'workspace')
+    || verifiedAt === undefined
+    || typeof latencyMs !== 'number'
+    || !Number.isFinite(latencyMs)
+    || latencyMs < 0) {
+    return undefined
+  }
+  return {
+    version: 2,
+    protocolRevision: CHATGPT_WEB_WM_PROTOCOL_REVISION,
+    model: GPT_5_6_SOL_WM_MODEL,
+    catalogModel: GPT_5_6_SOL_WM_MODEL,
+    turnModel: GPT_5_6_SOL_WM_MODEL,
+    workspacePlanType,
+    workspaceStructure: candidate.workspaceStructure,
+    verifiedAt,
+    latencyMs: Math.round(latencyMs),
+  }
+}
+
 function normalizePersistedModelCooldowns(
   value: unknown,
   now: number,
@@ -5157,6 +5239,13 @@ function reconcilePoolModelAllowlists(
   const accountsById = new Map(state.accounts.map((account) => [account.id, account]))
   for (const pool of state.pools) {
     if (pool.modelPolicy !== 'selected') continue
+    if (isChatGptWebWmPoolProtocol(pool.protocol)) {
+      if (!sameModels(pool.modelAllowlist, [GPT_5_6_SOL_WM_MODEL])) {
+        pool.modelAllowlist = [GPT_5_6_SOL_WM_MODEL]
+        pool.updatedAt = timestamp
+      }
+      continue
+    }
     if (affectedAccountIds && !pool.members.some((member) => affectedAccountIds.has(member.accountId))) continue
     const modelAllowlist = pool.modelAllowlist.filter((model) => pool.members.some((member) => {
       if (!member.enabled) return false

@@ -6,6 +6,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   DeepSeekHarnessCompanionInstaller,
   SUPPORTED_DEEPSEEK_HARNESS_VERSION,
+  STONE_DSH_CONTROLLED_PROMPT,
+  patchDshTerminalBashSource,
   withDeepSeekHarnessCompanionPatch,
 } from '../../src/main/deepseek-harness'
 
@@ -20,6 +22,19 @@ afterEach(async () => {
 })
 
 describe('DeepSeek Harness model-family companion', () => {
+  it('patches only the supported DSH terminal readiness literals and is idempotent', () => {
+    const upstream = [
+      'const CONTROLLED_PROMPT = "dsh> ";',
+      'const remaining = Math.max(0, 6 - this.promptTail.length);',
+    ].join('\n')
+
+    const patched = patchDshTerminalBashSource(upstream)
+    expect(patched).toContain(`const CONTROLLED_PROMPT = ${JSON.stringify(STONE_DSH_CONTROLLED_PROMPT)};`)
+    expect(patched).toContain('const remaining = Math.max(0, CONTROLLED_PROMPT.length + 1 - this.promptTail.length);')
+    expect(patchDshTerminalBashSource(patched)).toBe(patched)
+    expect(() => patchDshTerminalBashSource('const CONTROLLED_PROMPT = "other";')).toThrow('does not match')
+  })
+
   it('installs an idempotent credential-free official-DSH overlay', async () => {
     const home = await mkdtemp(join(tmpdir(), 'stone-dsh-companion-'))
     temporaryDirectories.push(home)
@@ -42,6 +57,12 @@ describe('DeepSeek Harness model-family companion', () => {
     expect(patch).toContain('- id: llm-deepseek')
     expect(patch).toContain("name: '@deepseek-ai/dsh-llm-deepseek'")
     expect(patch).toContain('disabled: true')
+    expect(patch).toContain('- id: compaction-basic')
+    expect(patch).toContain("name: '@deepseek-ai/dsh-compaction-basic'")
+    expect(patch).toContain('thresholdRatio: 0.55')
+    expect(patch).toContain('retainRatio: 0.10')
+    expect(patch).toContain('- id: command-compact')
+    expect(patch).toContain('- id: tool-result-pruner')
     expect(patch).toContain('stoneplus-model-family-bridge')
     expect(patch).toContain('http://127.0.0.1:15720')
     expect(patch).toContain(SUPPORTED_DEEPSEEK_HARNESS_VERSION)

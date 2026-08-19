@@ -3489,6 +3489,30 @@ function createHarness(
       }
       return snapshot
     }),
+    recordChatGptWebWmVerification: vi.fn(async (id: string, verification: {
+      latencyMs: number
+      catalogModel: 'gpt-5.6-sol-wm'
+      turnModel: 'gpt-5.6-sol-wm'
+      workspacePlanType: string
+      workspaceStructure: 'personal' | 'workspace'
+    }) => {
+      const capability = {
+        version: 2 as const,
+        protocolRevision: 'chatgpt-web-wm-v2' as const,
+        model: 'gpt-5.6-sol-wm' as const,
+        catalogModel: verification.catalogModel,
+        turnModel: verification.turnModel,
+        workspacePlanType: verification.workspacePlanType,
+        workspaceStructure: verification.workspaceStructure,
+        verifiedAt: Date.now(),
+        latencyMs: verification.latencyMs,
+      }
+      const runtimeAccount = accounts.find((account) => account.id === id)
+      if (runtimeAccount) runtimeAccount.chatgptWebWm = capability
+      const publicAccount = snapshot.accounts.find((account) => account.id === id)
+      if (publicAccount) publicAccount.chatgptWebWm = capability
+      return snapshot
+    }),
     setGatewayStatus: vi.fn(),
     updateGateway: vi.fn(async (settings) => {
       snapshot.gateway = { ...snapshot.gateway, ...settings }
@@ -3657,6 +3681,15 @@ describe('ChatGPT web login IPC', () => {
   it('opens the exact selected account and disposes the owned controller at shutdown', async () => {
     const webLogin = {
       open: vi.fn(async () => undefined),
+      verifyWebWm: vi.fn(async () => ({
+        latencyMs: 100,
+        statusCode: 200,
+        catalogModel: 'gpt-5.6-sol-wm' as const,
+        turnModel: 'gpt-5.6-sol-wm' as const,
+        workspacePlanType: 'team',
+        workspaceStructure: 'workspace' as const,
+      })),
+      requestWebWm: vi.fn(async () => new Response(null, { status: 200 })),
       dispose: vi.fn(async () => undefined),
     } satisfies ChatGptWebLoginController
     const harness = createHarness(
@@ -3680,6 +3713,61 @@ describe('ChatGPT web login IPC', () => {
     expect(snapshot.accounts.some((account) => account.id === 'account-oauth')).toBe(true)
     await harness.dispose()
     expect(webLogin.dispose).toHaveBeenCalledOnce()
+  })
+
+  it('reports real WM verification progress and persists Team account eligibility', async () => {
+    const verifyWebWm = vi.fn(async (
+      _accountId: string,
+      onProgress?: (stage: 'session' | 'identity' | 'catalog' | 'protocol' | 'turn', percent: number) => void,
+    ) => {
+      onProgress?.('session', 8)
+      onProgress?.('identity', 40)
+      onProgress?.('catalog', 50)
+      onProgress?.('protocol', 62)
+      onProgress?.('turn', 78)
+      return {
+        latencyMs: 456,
+        statusCode: 200,
+        catalogModel: 'gpt-5.6-sol-wm' as const,
+        turnModel: 'gpt-5.6-sol-wm' as const,
+        workspacePlanType: 'team',
+        workspaceStructure: 'workspace' as const,
+      }
+    })
+    const webLogin = {
+      open: vi.fn(async () => undefined),
+      verifyWebWm,
+      requestWebWm: vi.fn(async () => new Response(null, { status: 200 })),
+      dispose: vi.fn(async () => undefined),
+    } satisfies ChatGptWebLoginController
+    const harness = createHarness(
+      [oauthAccount()],
+      { 'credential-oauth': oauthCredential() },
+      vi.fn(),
+      [],
+      { current: 'web-wm-verification-fingerprint' },
+      {} as ClientConfigService,
+      undefined,
+      undefined,
+      webLogin,
+    )
+    const handler = electron.handlers.get('stone:verify-chatgpt-web-wm-account')
+    if (!handler) throw new Error('verify-chatgpt-web-wm-account handler was not registered')
+    const event = rendererEvent(991)
+
+    const snapshot = await handler(event, 'account-oauth', 'wm-progress-test') as AppSnapshot
+
+    expect(verifyWebWm).toHaveBeenCalledWith('account-oauth', expect.any(Function))
+    expect(snapshot.accounts.find((account) => account.id === 'account-oauth')?.chatgptWebWm)
+      .toMatchObject({ model: 'gpt-5.6-sol-wm', latencyMs: 456 })
+    const progress = event.sender.send.mock.calls
+      .filter(([channel]) => channel === 'stone:chatgpt-web-wm-verification-progress')
+      .map(([, value]) => value as { stage: string; percent: number; status: string })
+    expect(progress.map((item) => item.stage)).toEqual([
+      'session', 'identity', 'catalog', 'protocol', 'turn', 'persist', 'complete',
+    ])
+    expect(progress.at(-1)).toMatchObject({ percent: 100, status: 'complete' })
+    await harness.dispose()
   })
 
   it('switches the exact selected OAuth account into the default Codex App', async () => {

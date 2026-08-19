@@ -74,7 +74,7 @@ import { ElevatedSingBoxTunAdapter } from './proxy/built-in/tun-sidecar-adapter'
 import { TunController } from './proxy/built-in/tun-controller'
 import { RequestMonitorWindowController } from './request-monitor-window'
 import { FileRequestMonitorWindowStateStore } from './request-monitor-window-state'
-import { ChatGptWebLoginService } from './chatgpt-web-login'
+import { ChatGptWebLoginService, primaryChatGptWebWmPrewarmAccountId } from './chatgpt-web-login'
 import { ChatGptCodexAppLoginService } from './chatgpt-codex-app-login'
 import { CodexOfficialAuthBridge } from './codex-official-auth'
 import { PersistentDiagnosticLog } from './diagnostics/persistent-diagnostic-log'
@@ -375,9 +375,16 @@ async function bootstrap(): Promise<void> {
     console.warn('[backup] Raw database backups remain safety-blocked because legacy WebDAV credentials could not be removed safely.')
   }
   if (bootstrapShouldStop()) return
+  const chatGptWebLogin = new ChatGptWebLoginService({
+    store,
+    outboundTransport,
+    iconPath: stoneIconPath(),
+    webWmPreloadPath: join(MAIN_BUNDLE_DIRECTORY, '../preload/chatgpt-web-wm.cjs'),
+  })
   gateway = new GatewayServer({
     config: toGatewayConfig(store),
     beforeStart: ensureSystemProxyRecoveryBarrier,
+    chatGptWebWmTransport: (request) => chatGptWebLogin.requestWebWm(request),
     credentialResolver: async (account, fetchImplementation = fetch, signal) => {
       if (account.credentialType === 'chatgpt-agent-identity') {
         const serialized = store.getCredential(account.credentialId)
@@ -583,6 +590,7 @@ async function bootstrap(): Promise<void> {
       const installed = await companion.ensureInstalled({
         gatewayBaseUrl: `http://${host}:${snapshot.gateway.port}`,
         credentialFile: resolve(instance.configDirectory, '.env'),
+        executablePath: plan.executable,
       })
       return {
         ...plan,
@@ -741,11 +749,6 @@ async function bootstrap(): Promise<void> {
     })
   })
 
-  const chatGptWebLogin = new ChatGptWebLoginService({
-    store,
-    outboundTransport,
-    iconPath: stoneIconPath(),
-  })
   const chatGptCodexAppLogin = new ChatGptCodexAppLoginService({
     store,
     outboundTransport,
@@ -826,6 +829,16 @@ async function bootstrap(): Promise<void> {
     }
   }
   if (bootstrapShouldStop()) return
+
+  const webWmPrewarmAccountId = primaryChatGptWebWmPrewarmAccountId(store.getSnapshot())
+  if (webWmPrewarmAccountId) {
+    const timer = setTimeout(() => {
+      void chatGptWebLogin.prewarmWebWm(webWmPrewarmAccountId).catch(() => {
+        console.warn('[web-wm] Background protocol prewarm failed')
+      })
+    }, 250)
+    timer.unref()
+  }
 
   app.on('activate', () => {
     if (!mainWindow || mainWindow.isDestroyed()) {

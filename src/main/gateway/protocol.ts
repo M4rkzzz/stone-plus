@@ -16,6 +16,7 @@ import {
 } from './deepseek-dsml'
 import {
   sanitizeDeepSeekHarnessChatResponse,
+  sanitizeDeepSeekHarnessResponsesResponse,
   sanitizeDeepSeekHarnessRequestTools,
 } from './deepseek-harness-tools'
 
@@ -617,7 +618,8 @@ export function convertRequest(
   targetModel: string,
   context?: ProtocolConversionContext
 ): ProtocolRequest {
-  if (context?.sanitizeDeepSeekHarnessToolArguments && from === 'openai-chat') {
+  if (context?.sanitizeDeepSeekHarnessToolArguments
+    && (from === 'openai-chat' || from === 'openai-responses')) {
     body = sanitizeDeepSeekHarnessRequestTools(body)
   }
   if (context?.dialect === 'xai-grok' && from === 'openai-responses') {
@@ -719,6 +721,10 @@ export function convertResponse(
   if (from === 'openai-responses' && stringValue(body.status).trim().toLowerCase() === 'failed') {
     throw new ResponsesResponseFailedError(body)
   }
+  if (context?.sanitizeDeepSeekHarnessToolArguments) {
+    if (from === 'openai-chat') body = sanitizeDeepSeekHarnessChatResponse(body)
+    if (from === 'openai-responses') body = sanitizeDeepSeekHarnessResponsesResponse(body)
+  }
   if (from === to) {
     if (from === 'openai-responses' && context?.toolBridgePlan) {
       if (context.dialect === 'xai-grok') return restoreXaiResponsesToolCalls(body, context)
@@ -726,9 +732,7 @@ export function convertResponse(
         return restoreDeepSeekResponsesDsml(body, context.toolBridgePlan)
       }
     }
-    return from === 'openai-chat' && context?.sanitizeDeepSeekHarnessToolArguments
-      ? sanitizeDeepSeekHarnessChatResponse(body)
-      : body
+    return body
   }
   if (from === 'openai-responses') {
     const status = stringValue(body.status).trim().toLowerCase()

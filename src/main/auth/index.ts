@@ -10,7 +10,12 @@ export {
   parseChatGptAccountImport,
   serializeChatGptCredential
 } from './chatgpt-account'
-export type { ChatGptCredentialBundle, ParsedChatGptAccounts } from './chatgpt-account'
+export type {
+  ChatGptCredentialAuthMode,
+  ChatGptCredentialBundle,
+  ParsedChatGptAccounts
+} from './chatgpt-account'
+export { CHATGPT_PERSONAL_ACCESS_TOKEN_EXPIRY } from './chatgpt-account'
 export {
   deserializeGrokOAuthCredential,
   GrokOAuthCredentialError,

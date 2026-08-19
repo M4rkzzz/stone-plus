@@ -24,6 +24,7 @@ type RouteSourceAccount = Pick<
   | 'id'
   | 'providerId'
   | 'credentialType'
+  | 'chatgptWebWm'
   | 'status'
   | 'cooldownUntil'
   | 'inFlight'
@@ -301,6 +302,7 @@ export function enumerateRouteSourceModels<TAccount extends RouteSourceModelAcco
   collections: Pick<RouteSourceCollections<TAccount>, 'providers'>,
 ): string[] {
   if (!source) return []
+  if (source.summary.protocol === 'chatgpt-web-wm') return ['gpt-5.6-sol-wm']
   const providersById = new Map(collections.providers.map((provider) => [provider.id, provider]))
   const models: string[] = []
   for (const account of source.accounts.filter(isAvailableRouteAccount)) {
@@ -432,6 +434,15 @@ export function analyzeRouteSourceCompatibility<TAccount extends RouteSourceAcco
       reason: 'Route source members must use one valid pool protocol and source family.',
     }
   }
+  if (sourceProtocol === 'chatgpt-web-wm' && client !== 'codex') {
+    return {
+      eligible: false,
+      inboundProtocol,
+      sourceProtocol,
+      mode: 'unsupported',
+      reason: 'ChatGPT Web WM pools are available only to Codex clients.',
+    }
+  }
   if (routeSourceUsesKiroClaude(source, collections)) {
     if (client !== 'claude') {
       return {
@@ -477,7 +488,7 @@ export function analyzeRouteSourceCompatibility<TAccount extends RouteSourceAcco
     eligible: true,
     inboundProtocol,
     sourceProtocol,
-    mode: inboundProtocol === sourceProtocol ? 'native' : 'translated',
+    mode: sourceProtocol === 'chatgpt-web-wm' || inboundProtocol === sourceProtocol ? 'native' : 'translated',
   }
 }
 

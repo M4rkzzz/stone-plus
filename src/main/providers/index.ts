@@ -74,6 +74,7 @@ export {
   applyChatGptCodexHeaders,
   applyChatGptCodexSearchHeaders,
   applyChatGptAgentIdentityHeaders,
+  redactChatGptCodexSessionId,
   BUNDLED_CODEX_CLIENT_VERSION,
   CHATGPT_CODEX_MODELS_URL,
   CHATGPT_CODEX_RESPONSES_URL,

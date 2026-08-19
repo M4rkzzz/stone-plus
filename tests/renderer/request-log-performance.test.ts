@@ -8,10 +8,12 @@ import {
   paginateRequestLogs,
 } from '../../src/renderer/src/request-log-page'
 import {
+  displayedRequestFirstTokenMs,
   filterRequestLogs,
   formatTokenBillions,
   summarizeRequestLogs,
 } from '../../src/renderer/src/request-log-view-model'
+import { GPT_5_6_SOL_WM_MODEL } from '../../src/shared/wm-routing'
 import { RequestsView } from '../../src/renderer/src/views/RequestsView'
 
 describe('request log renderer pressure bounds', () => {
@@ -103,7 +105,7 @@ describe('request log renderer pressure bounds', () => {
 
   it('summarizes the retained logs in one pass without counting compaction first-token timing', () => {
     const logs: RequestLog[] = [
-      requestLog({ status: 'success', latencyMs: 100, upstreamFirstByteMs: 40, inputTokens: 2, outputTokens: 3 }),
+      requestLog({ status: 'success', latencyMs: 100, upstreamModel: GPT_5_6_SOL_WM_MODEL, upstreamFirstByteMs: 4, firstTokenMs: 9000, inputTokens: 2, outputTokens: 3 }),
       requestLog({ id: 'error', status: 'error', latencyMs: 300, firstTokenMs: 60, inputTokens: 5 }),
       requestLog({ id: 'live', status: 'streaming', latencyMs: 20, outputTokens: 7 }),
       requestLog({ id: 'compact', requestKind: 'compaction', status: 'success', latencyMs: 500, firstTokenMs: 9_999 }),
@@ -113,10 +115,22 @@ describe('request log renderer pressure bounds', () => {
       successCount: 2,
       errorCount: 1,
       averageLatency: 300,
-      averageFirstByte: 50,
+      averageFirstByte: 4530,
       totalTokens: 17,
       hasStreaming: true,
     })
+  })
+
+  it('keeps the main chain on transport first-byte timing while WM uses meaningful output timing', () => {
+    expect(displayedRequestFirstTokenMs(requestLog({
+      upstreamFirstByteMs: 4,
+      firstTokenMs: 9_000,
+    }))).toBe(4)
+    expect(displayedRequestFirstTokenMs(requestLog({
+      upstreamModel: GPT_5_6_SOL_WM_MODEL,
+      upstreamFirstByteMs: 4,
+      firstTokenMs: 9_000,
+    }))).toBe(9_000)
   })
 
   it('formats lifetime token totals in compact billions', () => {

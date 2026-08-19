@@ -19,6 +19,8 @@ export interface AgentExecutableDiscovery {
   platform: NodeJS.Platform
   supported: boolean
   installed: boolean
+  /** Installed product/package version when the platform exposes it without launching the app. */
+  version?: string
   /** A directly executable file. Store-app installations can omit this. */
   executablePath?: string
   /** An OS launch identifier such as a Windows AppsFolder application ID. */
@@ -267,6 +269,7 @@ async function discoverCodexDesktop(
     return {
       target: 'codex-desktop', platform, supported: true, installed: true,
       ...(storeApp.executablePath ? { executablePath: storeApp.executablePath } : {}),
+      ...(storeApp.version ? { version: storeApp.version } : {}),
       launchTarget: storeApp.launchTarget,
       source: 'windows-app', processControl: 'full', inspectedPaths: uniquePaths(inspectedPaths, platform),
     }
@@ -349,20 +352,24 @@ function macCodexDesktopPaths(homeDir: string): string[] {
 
 async function discoverWindowsCodexApp(
   runCommand: (file: string, args: string[]) => Promise<PlatformCommandResult>,
-): Promise<{ launchTarget: string; executablePath?: string } | undefined> {
+): Promise<{ launchTarget: string; executablePath?: string; version?: string } | undefined> {
   const script = [
     "$package = Get-AppxPackage -Name 'OpenAI.Codex' -ErrorAction SilentlyContinue | Sort-Object Version -Descending | Select-Object -First 1;",
     'if (-not $package) { exit 0 };',
     "$executable = Join-Path $package.InstallLocation 'app\\ChatGPT.exe';",
-    `[Console]::Out.Write('${windowsCodexAppId}' + [Environment]::NewLine + $(if (Test-Path -LiteralPath $executable) { $executable } else { '' }));`,
+    `[Console]::Out.Write('${windowsCodexAppId}' + [Environment]::NewLine + $(if (Test-Path -LiteralPath $executable) { $executable } else { '' }) + [Environment]::NewLine + $package.Version.ToString());`,
   ].join(' ')
   try {
     const result = await runCommand('powershell.exe', [
       '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script,
     ])
-    const [launchTarget, executablePath] = result.stdout.split(/\r?\n/).map((value) => value.trim())
+    const [launchTarget, executablePath, version] = result.stdout.split(/\r?\n/).map((value) => value.trim())
     if (!launchTarget) return undefined
-    return { launchTarget, ...(executablePath ? { executablePath } : {}) }
+    return {
+      launchTarget,
+      ...(executablePath ? { executablePath } : {}),
+      ...(version ? { version } : {}),
+    }
   } catch {
     return undefined
   }

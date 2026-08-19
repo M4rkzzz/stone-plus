@@ -1,6 +1,6 @@
 {
   "name": "stone-desktop",
-  "version": "0.9.18",
+  "version": "0.9.20",
   "private": true,
   "packageManager": "npm@10.9.3",
   "engines": {
@@ -159,6 +159,10 @@
       {
         "from": "LICENSES/npm/lazy-val-1.0.5-MIT.txt",
         "to": "licenses/npm/lazy-val-1.0.5-MIT.txt"
+      },
+      {
+        "from": "LICENSES/npm/dsh-terminal-bash-0.1.0-rc.6-MIT.txt",
+        "to": "licenses/npm/dsh-terminal-bash-0.1.0-rc.6-MIT.txt"
       },
       {
         "from": "build/sing-box/runtime-manifest.json",

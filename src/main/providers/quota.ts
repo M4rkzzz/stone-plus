@@ -151,9 +151,14 @@ export function extractCodexQuotaFromHeaders(
   const headers = source instanceof Headers ? source : new Headers(source)
   const primary = codexHeaderWindow(headers, 'primary', now)
   const secondary = codexHeaderWindow(headers, 'secondary', now)
+  const reachedTypeHeader = headers.get('x-codex-rate-limit-reached-type')
+  const rateLimitReachedType = reachedTypeHeader === null
+    ? undefined
+    : sanitizeRateLimitReachedType(reachedTypeHeader)
   return normalizeCodexWindows(primary, secondary, {
     observedAt: now,
-    source: 'response-headers'
+    source: 'response-headers',
+    ...(rateLimitReachedType === undefined ? {} : { rateLimitReachedType })
   })
 }
 
@@ -170,6 +175,7 @@ export function extractCodexQuotaFromUsagePayload(
   const nestedUsage = objectValue(root.usage)
   const dataUsage = objectValue(data?.usage)
   const envelope = mergeObjects(root, data, nestedUsage, dataUsage)
+  if (!envelope) return undefined
   const rateLimit = objectValue(envelope?.rate_limit ?? envelope?.rateLimit)
   const resetCredits = codexResetCredits(
     envelope?.rate_limit_reset_credits ?? envelope?.rateLimitResetCredits,
@@ -178,8 +184,17 @@ export function extractCodexQuotaFromUsagePayload(
   const planType = sanitizePlanType(
     envelope?.plan_type ?? envelope?.planType ?? envelope?.subscription_plan ?? envelope?.subscriptionPlan,
   )
+  const reachedTypeValue = Object.hasOwn(envelope, 'rate_limit_reached_type')
+    ? envelope.rate_limit_reached_type
+    : Object.hasOwn(envelope, 'rateLimitReachedType')
+      ? envelope.rateLimitReachedType
+      : rateLimit && Object.hasOwn(rateLimit, 'rate_limit_reached_type')
+        ? rateLimit.rate_limit_reached_type
+        : rateLimit?.rateLimitReachedType
+  const rateLimitReachedType = sanitizeRateLimitReachedType(reachedTypeValue)
   const additionalBuckets = parseAdditionalCodexBuckets(envelope?.additional_rate_limits ?? envelope?.additionalRateLimits, now)
-  if (!rateLimit && !resetCredits && !planType && additionalBuckets.length === 0) return undefined
+  if (!rateLimit && !resetCredits && !planType && additionalBuckets.length === 0
+    && rateLimitReachedType === undefined) return undefined
   const hasWhamDetails = Boolean(resetCredits || planType || additionalBuckets.length)
   const primary = codexPayloadWindow(rateLimit?.primary_window ?? rateLimit?.primaryWindow, now)
   const secondary = codexPayloadWindow(rateLimit?.secondary_window ?? rateLimit?.secondaryWindow, now)
@@ -190,6 +205,7 @@ export function extractCodexQuotaFromUsagePayload(
     source: 'usage-endpoint',
     ...(allowed === undefined ? {} : { allowed }),
     ...(limitReached === undefined ? {} : { limitReached }),
+    ...(rateLimitReachedType === undefined ? {} : { rateLimitReachedType }),
     ...(planType ? { planType } : {}),
     ...(additionalBuckets.length ? { additionalBuckets } : {}),
     ...(resetCredits ? { resetCredits } : {}),
@@ -210,8 +226,13 @@ function parseAdditionalCodexBuckets(value: unknown, now: number): CodexQuotaBuc
     const secondary = codexPayloadWindow(rateLimit.secondary_window ?? rateLimit.secondaryWindow, now)
     const allowed = booleanValue(rateLimit.allowed)
     const limitReached = booleanValue(rateLimit.limit_reached ?? rateLimit.limitReached)
+    const reachedTypeValue = Object.hasOwn(rateLimit, 'rate_limit_reached_type')
+      ? rateLimit.rate_limit_reached_type
+      : rateLimit.rateLimitReachedType
+    const rateLimitReachedType = sanitizeRateLimitReachedType(reachedTypeValue)
     const idBase = safeQuotaBucketId(entry.metered_feature ?? entry.meteredFeature ?? entry.limit_name ?? entry.limitName)
-    if (!idBase && !primary && !secondary && allowed === undefined && limitReached === undefined) continue
+    if (!idBase && !primary && !secondary && allowed === undefined && limitReached === undefined
+      && rateLimitReachedType === undefined) continue
     const next = (seen.get(idBase || 'bucket') ?? 0) + 1
     seen.set(idBase || 'bucket', next)
     const id = idBase ? (next > 1 ? `${idBase}#${next}` : idBase) : `bucket-${next}`
@@ -220,8 +241,10 @@ function parseAdditionalCodexBuckets(value: unknown, now: number): CodexQuotaBuc
       source: 'usage-endpoint',
       ...(allowed === undefined ? {} : { allowed }),
       ...(limitReached === undefined ? {} : { limitReached }),
+      ...(rateLimitReachedType === undefined ? {} : { rateLimitReachedType }),
     })
-    if (!projected && allowed === undefined && limitReached === undefined) continue
+    if (!projected && allowed === undefined && limitReached === undefined
+      && rateLimitReachedType === undefined) continue
     const label = safeQuotaBucketLabel(entry.limit_name ?? entry.limitName)
     buckets.push({
       id,
@@ -231,6 +254,7 @@ function parseAdditionalCodexBuckets(value: unknown, now: number): CodexQuotaBuc
       ...(projected?.monthly ? { monthly: projected.monthly } : {}),
       ...(allowed === undefined ? {} : { allowed }),
       ...(limitReached === undefined ? {} : { limitReached }),
+      ...(rateLimitReachedType === undefined ? {} : { rateLimitReachedType }),
     })
   }
   return buckets
@@ -257,6 +281,25 @@ function safeQuotaBucketLabel(value: unknown): string | undefined {
 function sanitizePlanType(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined
   const normalized = value.trim().toLowerCase().replace(/[^a-z0-9._:-]+/g, '-').slice(0, 64)
+  return normalized || undefined
+}
+
+/**
+ * Keeps only the small, non-sensitive discriminator used by the upstream
+ * rate-limit decision. `null` is meaningful: it explicitly means no active
+ * limit reason, so it must survive parsing instead of becoming "unknown".
+ */
+function sanitizeRateLimitReachedType(value: unknown): string | null | undefined {
+  if (value === null) return null
+  const object = objectValue(value)
+  const raw = typeof value === 'string'
+    ? value
+    : object?.type ?? object?.name ?? object?.code
+  if (typeof raw !== 'string') return undefined
+  const normalized = raw.trim().toLowerCase().replace(/[^a-z0-9._:-]+/g, '-').slice(0, 96)
+  if (normalized === 'null' || normalized === 'none' || normalized === 'not-reached' || normalized === 'not_reached') {
+    return null
+  }
   return normalized || undefined
 }
 
@@ -332,8 +375,21 @@ export function codexQuotaIsExhausted(
   // WHAM's top-level flag is a snapshot, not a permanent account state. Once
   // its observation is stale or the first known reset boundary has crossed,
   // release it and let the next real request establish the current state.
-  if ((quota.allowed === false || quota.limitReached === true)
-    && fresh && (windows.length === 0 || (hasActiveWindow && !hasExpiredBoundary))) return true
+  const explicitWindowState = quota.rateLimitReachedType !== undefined
+  if (explicitWindowState) {
+    // WHAM's null reached-type is authoritative. It is common for the usage
+    // meter to display 100% while another model family remains allowed.
+    if (quota.rateLimitReachedType === null) return false
+    if (fresh && (windows.length === 0 || (hasActiveWindow && !hasExpiredBoundary))) return true
+    return false
+  }
+  const explicitAllowedState = quota.allowed !== undefined || quota.limitReached !== undefined
+  if (explicitAllowedState) {
+    if ((quota.allowed === false || quota.limitReached === true)
+      && fresh && (windows.length === 0 || (hasActiveWindow && !hasExpiredBoundary))) return true
+    // A present positive decision is stronger than the informational meter.
+    return false
+  }
   return windows.some((window) => window.usedPercent >= 100 && isActiveCodexWindow(window, quota.observedAt, now))
 }
 
@@ -407,13 +463,20 @@ function codexHeaderWindow(headers: Headers, slot: 'primary' | 'secondary', now:
   const usedPercent = parseNonNegativeNumber(headers.get(`${prefix}used-percent`))
   const windowMinutes = parseNonNegativeNumber(headers.get(`${prefix}window-minutes`))
   const resetAfterSeconds = parseNonNegativeNumber(headers.get(`${prefix}reset-after-seconds`))
-  if (usedPercent === undefined && windowMinutes === undefined && resetAfterSeconds === undefined) return undefined
+  const resetAtHeader = headers.get(`${prefix}reset-at`)
+  const resetAt = resetAtHeader === null ? undefined : parseQuotaResetAt(resetAtHeader, now)
+  if (usedPercent === undefined && windowMinutes === undefined
+    && resetAfterSeconds === undefined && resetAt === undefined) return undefined
   return {
     ...(usedPercent === undefined ? {} : { usedPercent }),
     ...(windowMinutes === undefined || !Number.isSafeInteger(Math.ceil(windowMinutes * 60))
       ? {}
       : { windowSeconds: windowMinutes * 60 }),
-    ...(resetAfterSeconds === undefined ? {} : { resetAt: safeFutureTime(now, resetAfterSeconds) })
+    ...(resetAt !== undefined
+      ? { resetAt }
+      : resetAfterSeconds === undefined
+        ? {}
+        : { resetAt: safeFutureTime(now, resetAfterSeconds) })
   }
 }
 
@@ -441,6 +504,7 @@ function normalizeCodexWindows(
     && metadata.resetCredits === undefined
     && metadata.allowed === undefined
     && metadata.limitReached === undefined
+    && metadata.rateLimitReachedType === undefined
     && metadata.planType === undefined
     && !(metadata.additionalBuckets && metadata.additionalBuckets.length > 0)) return undefined
 
@@ -538,6 +602,11 @@ export function mergeCodexQuotaSnapshots(
   const mergedFiveHour = mergeCodexWindow(earlier?.fiveHour, later.fiveHour, later.observedAt, previousIsFresh)
   const mergedSevenDay = mergeCodexWindow(earlier?.sevenDay, later.sevenDay, later.observedAt, previousIsFresh)
   const mergedMonthly = mergeCodexWindow(earlier?.monthly, later.monthly, later.observedAt, previousIsFresh)
+  const mergedRateLimitReachedType = later.rateLimitReachedType !== undefined
+    ? later.rateLimitReachedType
+    : earlier?.rateLimitReachedType !== undefined
+      ? null
+      : undefined
   const earlierDetailsObservedAt = earlier?.detailsObservedAt
     ?? (earlier?.source === 'usage-endpoint' && hasCodexQuotaDetails(earlier) ? earlier.observedAt : undefined)
   const laterDetailsObservedAt = later.detailsObservedAt
@@ -561,6 +630,11 @@ export function mergeCodexQuotaSnapshots(
     // top-level flags even when the response does not repeat those fields.
     ...(later.allowed === undefined ? {} : { allowed: later.allowed }),
     ...(later.limitReached === undefined ? {} : { limitReached: later.limitReached }),
+    // A newer response-header observation is allowed to clear an older WHAM
+    // decision. Without an explicit null here, a successful request followed
+    // by a 100% informational meter would fall back to the old false-positive
+    // window heuristic.
+    ...(mergedRateLimitReachedType === undefined ? {} : { rateLimitReachedType: mergedRateLimitReachedType }),
     ...(resetCredits ? { resetCredits: { ...resetCredits, expiresAt: resetCredits.expiresAt?.slice() } } : {}),
     ...(planType ? { planType } : {}),
     ...(detailsObservedAt === undefined ? {} : { detailsObservedAt }),

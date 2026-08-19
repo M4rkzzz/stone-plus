@@ -1224,6 +1224,7 @@ describe('AppStore', () => {
       stickySessions: false,
       stickyTtlMinutes: 30,
       maxRetries: 0,
+      forceFastMode: true,
     })
     const targetPool = withPool.pools.find((pool) => pool.name === 'Legacy cross-wire pool')!
     const codex = withPool.routes.find((route) => route.client === 'codex')!
@@ -1914,7 +1915,7 @@ describe('AppStore', () => {
     expect(imported.warnings).toHaveLength(1)
   })
 
-  it('persists WM routing only for a native ChatGPT Responses pool', async () => {
+  it('persists a verified Web WM capability and dedicated pool protocol', async () => {
     const store = createStore()
     await store.initialize()
     const imported = await store.importChatGptAccounts({
@@ -1924,18 +1925,41 @@ describe('AppStore', () => {
         expired: new Date(Date.now() + 3_600_000).toISOString(),
       }),
     })
+    await store.recordChatGptWebWmVerification(imported.importedAccountIds[0], {
+      latencyMs: 123,
+      statusCode: 200,
+      catalogModel: 'gpt-5.6-sol-wm',
+      turnModel: 'gpt-5.6-sol-wm',
+      workspacePlanType: 'team',
+      workspaceStructure: 'workspace',
+    })
     const created = await store.savePool({
       name: 'WM pool',
-      protocol: 'openai-responses',
+      protocol: 'chatgpt-web-wm',
       strategy: 'priority',
       accountIds: imported.importedAccountIds,
       stickySessions: false,
       stickyTtlMinutes: 30,
       maxRetries: 0,
-      routeToWm: true,
+      forceFastMode: true,
     })
     const pool = created.pools.find((candidate) => candidate.name === 'WM pool')!
-    expect(pool.routeToWm).toBe(true)
+    expect(pool).toMatchObject({
+      protocol: 'chatgpt-web-wm',
+      modelPolicy: 'selected',
+      modelAllowlist: ['gpt-5.6-sol-wm'],
+      forceFastMode: false,
+    })
+    await expect(store.setRouteSourceFastMode({ sourceId: pool.id, enabled: true }))
+      .rejects.toThrow(/only by OpenAI Responses and OpenAI Chat/)
+    expect(created.accounts.find((candidate) => candidate.id === imported.importedAccountIds[0])?.chatgptWebWm)
+      .toMatchObject({
+        model: 'gpt-5.6-sol-wm',
+        catalogModel: 'gpt-5.6-sol-wm',
+        turnModel: 'gpt-5.6-sol-wm',
+        workspacePlanType: 'team',
+        latencyMs: 123,
+      })
 
     const preserved = await store.savePool({
       id: pool.id,
@@ -1947,13 +1971,14 @@ describe('AppStore', () => {
       stickyTtlMinutes: pool.stickyTtlMinutes,
       maxRetries: pool.maxRetries,
     })
-    expect(preserved.pools.find((candidate) => candidate.id === pool.id)?.routeToWm).toBe(true)
+    expect(preserved.pools.find((candidate) => candidate.id === pool.id)?.protocol).toBe('chatgpt-web-wm')
 
     await store.close()
     const restarted = createStore()
     await restarted.initialize()
-    expect(restarted.getSnapshot().pools.find((candidate) => candidate.id === pool.id)?.routeToWm).toBe(true)
-    expect(restarted.getRuntimeConfiguration().pools.find((candidate) => candidate.id === pool.id)?.routeToWm).toBe(true)
+    expect(restarted.getSnapshot().pools.find((candidate) => candidate.id === pool.id)?.protocol).toBe('chatgpt-web-wm')
+    expect(restarted.getRuntimeConfiguration().pools.find((candidate) => candidate.id === pool.id)?.protocol)
+      .toBe('chatgpt-web-wm')
   })
 
   it('imports Sub2API OAuth accounts whose unset expiration is zero', async () => {
@@ -1987,6 +2012,57 @@ describe('AppStore', () => {
       credentialExpiresAt: expiresAtSeconds * 1000,
       renewable: true,
       status: 'active'
+    })
+  })
+
+  it('imports and persists an opaque Sub2API personal access token without an expiry', async () => {
+    const store = createStore()
+    await store.initialize()
+    const imported = await store.importChatGptAccounts({
+      content: JSON.stringify({
+        type: 'sub2api-data',
+        version: 1,
+        accounts: [{
+          name: 'pat-import@example.com',
+          platform: 'openai',
+          type: 'oauth',
+          extra: {
+            auth_provider: 'codex_personal_access_token',
+            import_source: 'codex_personal_access_token'
+          },
+          credentials: {
+            auth_mode: 'personalAccessToken',
+            openai_auth_mode: 'personal_access_token',
+            access_token: 'at-example-private-token',
+            chatgpt_account_id: 'acct-pat-import',
+            chatgpt_user_id: 'user-pat-import',
+            email: 'pat-import@example.com'
+          }
+        }]
+      })
+    })
+
+    const accountId = imported.importedAccountIds[0]
+    const account = store.getRuntimeAccount(accountId)!
+    expect(account).toMatchObject({
+      name: 'pat-import@example.com',
+      credentialExpiresAt: Date.UTC(9999, 11, 31, 23, 59, 59, 999),
+      renewable: false,
+      status: 'active'
+    })
+    expect(imported.warnings.join(' ')).not.toContain('no refresh token')
+    expect(store.getChatGptCredential(account.credentialId)).toMatchObject({
+      accessToken: 'at-example-private-token',
+      authMode: 'personal-access-token'
+    })
+
+    await store.close()
+    const restarted = createStore()
+    await restarted.initialize()
+    const persisted = restarted.getRuntimeAccount(accountId)!
+    expect(restarted.getChatGptCredential(persisted.credentialId)).toMatchObject({
+      accessToken: 'at-example-private-token',
+      authMode: 'personal-access-token'
     })
   })
 

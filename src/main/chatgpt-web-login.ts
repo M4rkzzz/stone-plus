@@ -1,10 +1,23 @@
 import { app, BrowserWindow, dialog, Menu, session, shell, type Session } from 'electron'
-import { createHash, randomBytes } from 'node:crypto'
+import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { writeFile } from 'node:fs/promises'
 import { extname, join } from 'node:path'
-import type { Account, PublicProxyDefinition } from '@shared/types'
+import type {
+  Account,
+  AppSnapshot,
+  ChatGptWebWmVerificationResult,
+  ChatGptWebWmVerificationStage,
+  PublicProxyDefinition,
+} from '@shared/types'
+import {
+  GPT_5_6_SOL_WM_MODEL,
+  hasVerifiedChatGptWebWm,
+  isChatGptWebWmPoolProtocol,
+} from '@shared/wm-routing'
 import { deserializeChatGptCredential, type ChatGptCredentialBundle } from './auth'
 import { readBoundedResponseBuffer } from './auth/bounded-response'
+import { ChatGptWebWmProtocolRuntime } from './chatgpt-web-wm'
+import type { ChatGptWebWmTransportRequest } from './gateway'
 import { ChatGptCredentialRefreshError, resolveChatGptCredential } from './providers/chatgpt-codex'
 import { resolveEffectiveProxy, type OutboundTransportManager } from './proxy'
 import type { AppStore } from './store/app-store'
@@ -24,6 +37,7 @@ const IMAGE_VIEWER_ACTION_SCHEME = 'stone-chatgpt-image:'
 const IMAGE_VIEWER_BRIDGE_KEY = '__stoneChatGptImageViewer'
 const MAX_IMAGE_DOWNLOAD_BYTES = 64 * 1024 * 1024
 const IMAGE_DOWNLOAD_TIMEOUT_MS = 60_000
+const CODEX_DESKTOP_USER_AGENT = 'Codex Desktop/26.803.41515 (Windows NT 10.0; x64)'
 
 interface FetchPausedParameters {
   requestId: string
@@ -65,6 +79,8 @@ interface ChatGptAccountBootstrap {
   lightAccount?: ChatGptLightAccount
 }
 
+type ChatGptWebWmProbeStage = Exclude<ChatGptWebWmVerificationStage, 'persist' | 'complete'>
+
 export type ChatGptAccountCookieMode = 'preferred' | 'account-id' | 'none'
 
 interface ChatGptWebHistoryItem {
@@ -91,6 +107,11 @@ interface ActiveWebLogin {
   imageActionToken: string
   imageSaveInFlight: boolean
   debuggerAttached: boolean
+  ready: boolean
+  visible: boolean
+  webUiReady: boolean
+  webUiPreparation?: Promise<void>
+  webWmRuntime?: ChatGptWebWmProtocolRuntime
   cleaned: boolean
 }
 
@@ -108,13 +129,38 @@ interface ChatGptImagePayload {
 
 export interface ChatGptWebLoginController {
   open(accountId: string): Promise<void>
+  verifyWebWm(
+    accountId: string,
+    onProgress?: (stage: ChatGptWebWmProbeStage, percent: number) => void,
+  ): Promise<ChatGptWebWmVerificationResult>
+  requestWebWm(input: ChatGptWebWmTransportRequest): Promise<Response>
   dispose(): Promise<void>
+}
+
+export function primaryChatGptWebWmPrewarmAccountId(
+  snapshot: Pick<AppSnapshot, 'accounts' | 'pools' | 'routes'>,
+): string | undefined {
+  const routedPoolIds = new Set(snapshot.routes
+    .filter((route) => route.enabled)
+    .map((route) => route.poolId))
+  const accounts = new Map(snapshot.accounts.map((account) => [account.id, account]))
+  for (const pool of snapshot.pools) {
+    if (!routedPoolIds.has(pool.id) || !isChatGptWebWmPoolProtocol(pool.protocol)) continue
+    for (const member of pool.members) {
+      if (!member.enabled) continue
+      const account = accounts.get(member.accountId)
+      if (!account || account.status === 'disabled' || !hasVerifiedChatGptWebWm(account)) continue
+      return account.id
+    }
+  }
+  return undefined
 }
 
 export interface ChatGptWebLoginServiceOptions {
   store: AppStore
   outboundTransport: OutboundTransportManager
   iconPath?: string
+  webWmPreloadPath?: string
 }
 
 /**
@@ -142,9 +188,15 @@ export class ChatGptWebLoginService implements ChatGptWebLoginController {
     if (pending) {
       const context = this.active.get(accountId)
       if (context && !context.window.isDestroyed()) {
-        if (context.window.isMinimized()) context.window.restore()
-        context.window.show()
-        context.window.focus()
+        this.showContext(context)
+        void pending.then(async () => {
+          const ready = this.active.get(accountId)
+          if (!ready || ready.window.isDestroyed()) return
+          await this.ensureVisibleWebUi(ready)
+        }).catch(async (error) => {
+          const failed = this.active.get(accountId)
+          if (failed && !failed.window.isDestroyed()) await this.showFailure(failed, error)
+        })
       } else if (!this.reopenAfterOpening.has(accountId)) {
         this.reopenAfterOpening.add(accountId)
         void pending.finally(() => {
@@ -156,33 +208,76 @@ export class ChatGptWebLoginService implements ChatGptWebLoginController {
     }
     const existing = this.active.get(accountId)
     if (existing && !existing.window.isDestroyed()) {
-      if (existing.window.isMinimized()) existing.window.restore()
-      existing.window.show()
-      existing.window.focus()
+      this.showContext(existing)
+      void this.ensureVisibleWebUi(existing).catch(async (error) => {
+        if (!existing.window.isDestroyed()) await this.showFailure(existing, error)
+      })
       return
     }
-    const account = this.options.store.getRuntimeAccount(accountId)
-    if (!account) throw new Error('账号不存在或已被删除。')
-    if (account.credentialType !== 'chatgpt-oauth') {
-      throw new Error('仅 ChatGPT OAuth 账号支持网页登录。')
-    }
-    const serialized = this.options.store.getCredential(account.credentialId)
-    if (!serialized) throw new Error('无法读取该 ChatGPT OAuth 凭据。')
-    const credential = deserializeChatGptCredential(serialized)
-    if (!credential) throw new Error('ChatGPT OAuth 凭据格式无效，请重新授权该账号。')
-
-    const operation = this.openFresh(account, serialized, credential).catch(async (error) => {
+    const selected = this.readSelectedAccount(accountId)
+    const operation = this.startOpening(selected.account, selected.serialized, selected.credential, true)
+    void operation.catch(async (error) => {
       const context = this.active.get(accountId)
       if (!context || context.window.isDestroyed()) return
       await this.showFailure(context, error)
-    }).finally(() => {
-      if (this.opening.get(accountId) === operation) this.opening.delete(accountId)
     })
-    this.opening.set(accountId, operation)
     // The account action must not stay busy while Chromium, Cloudflare or a
     // remote proxy is warming up. The owned window is created synchronously
     // before openFresh reaches its first await and reports progress itself.
-    void operation
+  }
+
+  public async requestWebWm(input: ChatGptWebWmTransportRequest): Promise<Response> {
+    try {
+      const context = await this.ensureTransportContext(input.account.id)
+      if (context.accountId !== input.account.id) {
+        throw new Error('Web WM account isolation check failed.')
+      }
+      this.synchronizeTransportCredential(context, input.credential)
+      const runtime = await this.ensureWebWmRuntime(context)
+      return input.operation === 'search'
+        ? await runtime.search(input.body, context.credential.accessToken, input.signal)
+        : await runtime.responses(input.body, context.credential.accessToken, input.signal)
+    } catch (error) {
+      if (input.signal.aborted) throw error
+      return webWmTransportErrorResponse(502, 'web_wm_transport_failed', safeWebWmErrorMessage(error))
+    }
+  }
+
+  public async prewarmWebWm(accountId: string): Promise<void> {
+    const selectedId = accountId.trim()
+    if (!selectedId || this.disposed) return
+    const context = await this.ensureTransportContext(selectedId)
+    const runtime = await this.ensureWebWmRuntime(context)
+    await runtime.prewarm()
+  }
+
+  public async verifyWebWm(
+    accountId: string,
+    onProgress?: (stage: ChatGptWebWmProbeStage, percent: number) => void,
+  ): Promise<ChatGptWebWmVerificationResult> {
+    const selectedId = accountId.trim()
+    if (!selectedId) throw new Error('Web WM verification requires an account.')
+    const signal = AbortSignal.timeout(180_000)
+    try {
+      onProgress?.('session', 8)
+      const context = await this.ensureTransportContext(selectedId)
+      signal.throwIfAborted()
+      onProgress?.('identity', 40)
+      if (context.accountId !== selectedId) throw new Error('Web WM account isolation check failed.')
+      onProgress?.('catalog', 50)
+      const catalog = await this.verifyWebWmCatalog(context, signal)
+      onProgress?.('protocol', 62)
+      const runtime = await this.ensureWebWmRuntime(context)
+      const turn = await runtime.probe(
+        context.credential.accessToken,
+        signal,
+        () => onProgress?.('turn', 78),
+      )
+      return { ...turn, ...catalog }
+    } catch (error) {
+      if (signal.aborted) throw new Error('Web WM verification timed out after 180 seconds.')
+      throw error
+    }
   }
 
   public async dispose(): Promise<void> {
@@ -197,6 +292,7 @@ export class ChatGptWebLoginService implements ChatGptWebLoginController {
     account: Account,
     serialized: string,
     initialCredential: ChatGptCredentialBundle,
+    showWindow: boolean,
   ): Promise<void> {
     const accountId = account.id
     const fetchImplementation = this.accountFetch(account)
@@ -232,14 +328,16 @@ export class ChatGptWebLoginService implements ChatGptWebLoginController {
       imageActionToken: randomBytes(24).toString('hex'),
       imageSaveInFlight: false,
       debuggerAttached: false,
+      ready: false,
+      visible: showWindow,
+      webUiReady: false,
       cleaned: false,
     }
     this.active.set(accountId, context)
     context.window.setMenuBarVisibility(false)
     context.window.webContents.setUserAgent(chatGptUserAgent())
     void context.window.loadURL(statusPageUrl(account.name, '正在建立账号专属安全会话…'))
-    context.window.show()
-    context.window.focus()
+    if (showWindow) this.showContext(context)
     this.installMediaPermissions(context)
     this.installNavigationGuards(context)
     context.window.once('closed', () => { void this.cleanup(context, false, false) })
@@ -310,6 +408,25 @@ export class ChatGptWebLoginService implements ChatGptWebLoginController {
     }
     context.lightAccount = accountBootstrap.lightAccount
     await this.installAccountSelectionCookies(electronSession, context.credential, context.lightAccount)
+    if (showWindow) await this.ensureVisibleWebUi(context)
+    if (this.disposed || context.window.isDestroyed()) throw new Error('Stone+ 正在退出，无法打开 ChatGPT 网页。')
+    context.ready = true
+  }
+
+  private ensureVisibleWebUi(context: ActiveWebLogin): Promise<void> {
+    if (context.webUiReady) return Promise.resolve()
+    if (context.webUiPreparation) return context.webUiPreparation
+    const operation = this.prepareVisibleWebUi(context).finally(() => {
+      if (context.webUiPreparation === operation) context.webUiPreparation = undefined
+    })
+    context.webUiPreparation = operation
+    return operation
+  }
+
+  private async prepareVisibleWebUi(context: ActiveWebLogin): Promise<void> {
+    if (context.cleaned || context.window.isDestroyed()) {
+      throw new Error('ChatGPT 网页会话已经关闭。')
+    }
     const bridge = this.installAuthenticatedBridge(context)
     const history = this.refreshHistory(context)
     await bridge
@@ -317,7 +434,133 @@ export class ChatGptWebLoginService implements ChatGptWebLoginController {
     this.historyCache.set(context.accountId, context.history)
     await this.installStableSidebarHistory(context, context.history)
     await context.window.webContents.executeJavaScript(`document.getElementById(${JSON.stringify(AUTHENTICATED_LOADING_STYLE_ID)})?.remove()`).catch(() => undefined)
-    if (this.disposed || context.window.isDestroyed()) throw new Error('Stone+ 正在退出，无法打开 ChatGPT 网页。')
+    if (context.cleaned || context.window.isDestroyed()) {
+      throw new Error('ChatGPT 网页会话已经关闭。')
+    }
+    context.webUiReady = true
+  }
+
+  private readSelectedAccount(accountId: string): {
+    account: Account
+    serialized: string
+    credential: ChatGptCredentialBundle
+  } {
+    const account = this.options.store.getRuntimeAccount(accountId)
+    if (!account) throw new Error('账号不存在或已被删除。')
+    if (account.credentialType !== 'chatgpt-oauth') {
+      throw new Error('仅 ChatGPT OAuth 账号支持网页登录。')
+    }
+    const serialized = this.options.store.getCredential(account.credentialId)
+    if (!serialized) throw new Error('无法读取该 ChatGPT OAuth 凭据。')
+    const credential = deserializeChatGptCredential(serialized)
+    if (!credential) throw new Error('ChatGPT OAuth 凭据格式无效，请重新授权该账号。')
+    return { account, serialized, credential }
+  }
+
+  private startOpening(
+    account: Account,
+    serialized: string,
+    credential: ChatGptCredentialBundle,
+    showWindow: boolean,
+  ): Promise<void> {
+    const operation = this.openFresh(account, serialized, credential, showWindow).finally(() => {
+      if (this.opening.get(account.id) === operation) this.opening.delete(account.id)
+    })
+    this.opening.set(account.id, operation)
+    return operation
+  }
+
+  private async ensureTransportContext(accountId: string): Promise<ActiveWebLogin> {
+    if (this.disposed) throw new Error('Stone+ is shutting down.')
+    let pending = this.opening.get(accountId)
+    let context = this.active.get(accountId)
+    if (!pending && context?.ready && !context.window.isDestroyed()) return context
+    if (!pending) {
+      if (context) await this.cleanup(context, true, false)
+      const selected = this.readSelectedAccount(accountId)
+      pending = this.startOpening(selected.account, selected.serialized, selected.credential, false)
+    }
+    await pending
+    context = this.active.get(accountId)
+    if (!context?.ready || context.window.isDestroyed()) {
+      throw new Error('ChatGPT Web WM account session did not become ready.')
+    }
+    return context
+  }
+
+  private synchronizeTransportCredential(
+    context: ActiveWebLogin,
+    credential: ChatGptWebWmTransportRequest['credential'],
+  ): void {
+    if (!credential.accessToken.trim()) throw new Error('Web WM OAuth access token is unavailable.')
+    if (credential.accountId !== context.credential.accountId) {
+      throw new Error('Web WM OAuth account identity changed during the active session.')
+    }
+    if (credential.accessToken === context.credential.accessToken) return
+    context.credential = {
+      ...context.credential,
+      accessToken: credential.accessToken,
+    }
+  }
+
+  private showContext(context: ActiveWebLogin): void {
+    context.visible = true
+    if (context.window.isMinimized()) context.window.restore()
+    context.window.show()
+    context.window.focus()
+  }
+
+  private async ensureWebWmRuntime(context: ActiveWebLogin): Promise<ChatGptWebWmProtocolRuntime> {
+    if (context.webWmRuntime) {
+      await context.webWmRuntime.initialize()
+      return context.webWmRuntime
+    }
+    const captured = await context.window.webContents.executeJavaScript(`(() => {
+      const valid = (value) => value && typeof value === 'object' && !Array.isArray(value)
+      let bootstrapState = null
+      const element = document.getElementById('client-bootstrap')
+      if (element?.textContent) {
+        try {
+          const parsed = JSON.parse(element.textContent)
+          if (valid(parsed)) bootstrapState = parsed
+        } catch {}
+      }
+      if (!bootstrapState && valid(globalThis.CLIENT_BOOTSTRAP)) {
+        bootstrapState = JSON.parse(JSON.stringify(globalThis.CLIENT_BOOTSTRAP))
+      }
+      const assets = new Set()
+      const add = (value) => {
+        try {
+          const url = new URL(value, location.href)
+          if (url.origin === location.origin && /\\.js(?:$|\\?)/i.test(url.href)) assets.add(url.href)
+        } catch {}
+      }
+      document.querySelectorAll('script[src]').forEach((script) => add(script.src))
+      performance.getEntriesByType('resource').forEach((entry) => add(entry.name))
+      return { bootstrapState, assets: [...assets].slice(0, 140) }
+    })()`)
+    const bootstrapState = authenticatedBootstrapState(
+      captured?.bootstrapState,
+      context.credential,
+      context.lightAccount,
+    )
+    const runtime = new ChatGptWebWmProtocolRuntime({
+      electronSession: context.electronSession,
+      bootstrapState,
+      preloadPath: this.options.webWmPreloadPath,
+      seedAssetUrls: Array.isArray(captured?.assets)
+        ? captured.assets.filter((value: unknown): value is string => typeof value === 'string')
+        : [],
+    })
+    context.webWmRuntime = runtime
+    try {
+      await runtime.initialize()
+      return runtime
+    } catch (error) {
+      runtime.dispose()
+      if (context.webWmRuntime === runtime) context.webWmRuntime = undefined
+      throw error
+    }
   }
 
   private accountFetch(account: Pick<Account, 'proxyId'>): typeof fetch {
@@ -438,8 +681,18 @@ export class ChatGptWebLoginService implements ChatGptWebLoginController {
     context.electronSession.webRequest.onBeforeSendHeaders(
       { urls: [`${CHATGPT_ORIGIN}/backend-api/*`, 'wss://chatgpt.com/backend-api/*'] },
       (details, callback) => {
+        const requestHeaders = applyChatGptWebIdentityHeaders(details.requestHeaders, context.credential)
+        if (details.webContentsId === context.webWmRuntime?.webContentsId) {
+          for (const key of Object.keys(requestHeaders)) {
+            if (key.toLowerCase() === 'originator' || key.toLowerCase() === 'user-agent') {
+              delete requestHeaders[key]
+            }
+          }
+          requestHeaders.originator = 'Codex Desktop'
+          requestHeaders['User-Agent'] = CODEX_DESKTOP_USER_AGENT
+        }
         callback({
-          requestHeaders: applyChatGptWebIdentityHeaders(details.requestHeaders, context.credential),
+          requestHeaders,
         })
       },
     )
@@ -472,6 +725,37 @@ export class ChatGptWebLoginService implements ChatGptWebLoginController {
       }
     } finally {
       clearTimeout(timer)
+    }
+  }
+
+  private async verifyWebWmCatalog(
+    context: ActiveWebLogin,
+    signal: AbortSignal,
+  ): Promise<Pick<ChatGptWebWmVerificationResult,
+    'catalogModel' | 'workspacePlanType' | 'workspaceStructure'>> {
+    const lightAccount = context.lightAccount
+    if (!lightAccount || lightAccount.id !== context.credential.accountId) {
+      throw new Error('Web WM verification could not confirm the exact ChatGPT workspace identity.')
+    }
+    const response = await context.electronSession.fetch(`${CHATGPT_ORIGIN}/backend-api/tpp/models/`, {
+      cache: 'no-store',
+      headers: applyChatGptWebIdentityHeaders({ Accept: 'application/json' }, context.credential),
+      signal,
+    })
+    if (!response.ok) {
+      await response.body?.cancel().catch(() => undefined)
+      throw new Error(
+        `This ChatGPT workspace does not expose the ${GPT_5_6_SOL_WM_MODEL} model catalog (HTTP ${response.status}).`,
+      )
+    }
+    const catalogModel = chatGptWebWmCatalogModel(await response.json().catch(() => undefined))
+    if (!catalogModel) {
+      throw new Error(`This ChatGPT workspace does not list ${GPT_5_6_SOL_WM_MODEL} as a Work model.`)
+    }
+    return {
+      catalogModel,
+      workspacePlanType: lightAccount.planType,
+      workspaceStructure: lightAccount.structure,
     }
   }
 
@@ -789,9 +1073,8 @@ export class ChatGptWebLoginService implements ChatGptWebLoginController {
             // real application document instead of reporting a false contract
             // change. The window remains hidden until a patched document and
             // the synthetic session endpoint both pass validation.
-            if (isChatGptSecurityInterstitial(decoded) && !context.window.isDestroyed()) {
-              context.window.show()
-              context.window.focus()
+            if (isChatGptSecurityInterstitial(decoded) && context.visible && !context.window.isDestroyed()) {
+              this.showContext(context)
             }
             await debuggerApi.sendCommand('Fetch.continueRequest', { requestId })
             return
@@ -1081,8 +1364,7 @@ export class ChatGptWebLoginService implements ChatGptWebLoginController {
       true,
     )).catch(() => undefined)
     if (!context.window.isDestroyed()) {
-      context.window.show()
-      context.window.focus()
+      this.showContext(context)
     }
   }
 
@@ -1090,6 +1372,8 @@ export class ChatGptWebLoginService implements ChatGptWebLoginController {
     if (context.cleaned) return
     context.cleaned = true
     if (this.active.get(context.accountId) === context) this.active.delete(context.accountId)
+    context.webWmRuntime?.dispose()
+    context.webWmRuntime = undefined
     context.electronSession.webRequest.onBeforeSendHeaders(null)
     if (context.debuggerAttached && !context.window.isDestroyed()) {
       try { context.window.webContents.debugger.detach() } catch (error) { void error }
@@ -1102,6 +1386,24 @@ export class ChatGptWebLoginService implements ChatGptWebLoginController {
     if (purgeSession) operations.push(context.electronSession.clearStorageData())
     await Promise.allSettled(operations)
   }
+}
+
+function webWmTransportErrorResponse(status: number, code: string, message: string): Response {
+  return new Response(JSON.stringify({
+    error: { type: 'chatgpt_web_wm_transport_error', code, message },
+  }), {
+    status,
+    headers: { 'content-type': 'application/json; charset=utf-8' },
+  })
+}
+
+function safeWebWmErrorMessage(error: unknown): string {
+  const source = error instanceof Error && error.message.trim()
+    ? error.message.trim()
+    : 'ChatGPT Web WM transport failed.'
+  return source
+    .replace(/\b(?:eyJ|at-)[A-Za-z0-9._-]{20,}\b/g, '[redacted-token]')
+    .slice(0, 1_000)
 }
 
 export function isAllowedChatGptMediaPermission(
@@ -1861,6 +2163,22 @@ export function applyChatGptWebIdentityHeaders(
   return headers
 }
 
+export function chatGptWebWmCatalogModel(
+  value: unknown,
+): typeof GPT_5_6_SOL_WM_MODEL | undefined {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const models = (value as { models?: unknown }).models
+  if (!Array.isArray(models)) return undefined
+  const exact = models.some((model) => (
+    model !== null
+    && typeof model === 'object'
+    && !Array.isArray(model)
+    && (model as { slug?: unknown }).slug === GPT_5_6_SOL_WM_MODEL
+    && (model as { is_work_mode_model?: unknown }).is_work_mode_model === true
+  ))
+  return exact ? GPT_5_6_SOL_WM_MODEL : undefined
+}
+
 export function isChatGptSecurityInterstitial(source: string): boolean {
   return source.includes('/cdn-cgi/challenge-platform')
     || /enable javascript and cookies to continue/i.test(source)
@@ -1975,6 +2293,56 @@ function syntheticSession(
     accessToken: credential.accessToken,
     authProvider: 'openai',
     ...(account ? { account } : {}),
+  }
+}
+
+export function authenticatedBootstrapState(
+  source: unknown,
+  credential: ChatGptCredentialBundle,
+  lightAccount?: ChatGptLightAccount,
+): Record<string, unknown> {
+  const state = source !== null && typeof source === 'object' && !Array.isArray(source)
+    ? structuredClone(source as Record<string, unknown>)
+    : {}
+  const sessionValue = syntheticSession(credential, lightAccount)
+  state.authStatus = 'logged_in'
+  if (typeof state.sessionId !== 'string' || !state.sessionId.trim()) {
+    state.sessionId = randomUUID()
+  }
+  state.session = sessionValue
+  state.user = { ...sessionValue.user, groups: [], mfa: false }
+  state.isNoAuthEnabled = false
+  if (Array.isArray(state.flags)) state.flags = state.flags.filter((flag) => flag !== 'naefu')
+  if (!validStatsigBootstrapPayload(state.statsigPayload)) {
+    state.statsigPayload = JSON.stringify({
+      user: {
+        userID: sessionValue.user.id,
+        ...(sessionValue.user.email ? { email: sessionValue.user.email } : {}),
+        custom: {
+          auth_status: 'logged_in',
+          has_logged_in_before: true,
+          account_user_id: credential.userId ?? sessionValue.user.id,
+          ...(sessionValue.account ? { is_paid: sessionValue.account.planType !== 'free' } : {}),
+        },
+      },
+      evaluated_keys: { userID: sessionValue.user.id },
+      feature_gates: {},
+      dynamic_configs: {},
+      layer_configs: {},
+      has_updates: false,
+    })
+  }
+  patchStatsigAuthenticatedState(state, credential, sessionValue)
+  return state
+}
+
+function validStatsigBootstrapPayload(value: unknown): value is string {
+  if (typeof value !== 'string' || !value.trim()) return false
+  try {
+    const parsed = JSON.parse(value) as unknown
+    return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
+  } catch {
+    return false
   }
 }
 

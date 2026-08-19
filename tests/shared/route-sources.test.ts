@@ -333,8 +333,8 @@ describe('route sources', () => {
     })
     expect(analyzeRouteSourceCompatibility('deepseek-harness', source, collections)).toMatchObject({
       eligible: true,
-      inboundProtocol: 'openai-chat',
-      mode: 'translated',
+      inboundProtocol: 'openai-responses',
+      mode: 'native',
       sourceProtocol: 'openai-responses',
     })
     for (const client of ['claude', 'gemini', 'grokbuild'] as const) {
@@ -359,9 +359,9 @@ describe('route sources', () => {
 
     expect(analyzeRouteSourceCompatibility('deepseek-harness', source, collections)).toMatchObject({
       eligible: true,
-      inboundProtocol: 'openai-chat',
+      inboundProtocol: 'openai-responses',
       sourceProtocol: 'openai-responses',
-      mode: 'translated',
+      mode: 'native',
     })
   })
 })

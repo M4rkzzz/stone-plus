@@ -62,23 +62,27 @@ describe('ChatGPT Codex provider path', () => {
     expect(headers.get('authorization')).toBe('Bearer access-private')
     expect(headers.get('chatgpt-account-id')).toBe('acct-team')
     expect(headers.get('originator')).toBe('codex_cli_rs')
-    expect(headers.get('session_id')).toBe('session-safe')
+    expect(headers.get('session_id')).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-a[0-9a-f]{3}-[0-9a-f]{12}$/)
+    expect(headers.get('session_id')).not.toBe('session-safe')
     expect(headers.get('x-codex-turn-state')).toBe('turn-state')
     expect(headers.get('authorization')).not.toContain('local-route-token')
     expect(headers.has('x-api-key')).toBe(false)
     expect(withChatGptCodexBody({ model: 'gpt-5' })).toMatchObject({ store: false, stream: true })
   })
 
-  it('converges only the installation identity while preserving client session metadata', () => {
+  it('converges installation identity and pseudonymizes client session metadata', () => {
     const source = {
       'x-codex-installation-id': 'foreign-device',
       'x-codex-turn-metadata': JSON.stringify({
         installation_id: 'foreign-device',
         session_id: 'metadata-session',
-        thread_id: 'metadata-thread'
+        thread_id: 'metadata-thread',
+        workspaces: { 'C:\\Users\\Alice\\source\\private-repo': { remote_url: 'https://github.com/private/repo', commit: 'deadbeef' } },
+        request_kind: 'turn'
       }),
       session_id: 'session-safe',
-      'thread-id': 'thread-safe'
+      'thread-id': 'thread-safe',
+      'accept-language': 'zh-CN'
     }
     const first = new Headers()
     const second = new Headers()
@@ -91,13 +95,20 @@ describe('ChatGPT Codex provider path', () => {
     expect(installationId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-a[0-9a-f]{3}-[0-9a-f]{12}$/)
     expect(second.get('x-codex-installation-id')).toBe(installationId)
     expect(other.get('x-codex-installation-id')).not.toBe(installationId)
-    expect(first.get('session_id')).toBe('session-safe')
-    expect(first.get('thread-id')).toBe('thread-safe')
-    expect(JSON.parse(first.get('x-codex-turn-metadata')!)).toEqual({
-      installation_id: installationId,
-      session_id: 'metadata-session',
-      thread_id: 'metadata-thread'
-    })
+    expect(first.get('session_id')).toMatch(/^[0-9a-f-]{36}$/)
+    expect(first.get('session_id')).not.toBe('session-safe')
+    expect(first.get('thread-id')).toMatch(/^[0-9a-f-]{36}$/)
+    expect(first.get('thread-id')).not.toBe('thread-safe')
+    const metadata = JSON.parse(first.get('x-codex-turn-metadata')!) as Record<string, string>
+    expect(metadata.installation_id).toBe(installationId)
+    expect(metadata.session_id).toMatch(/^[0-9a-f-]{36}$/)
+    expect(metadata.session_id).not.toBe('metadata-session')
+    expect(metadata.thread_id).toMatch(/^[0-9a-f-]{36}$/)
+    expect(metadata.thread_id).not.toBe('metadata-thread')
+    expect(metadata.request_kind).toBe('turn')
+    expect(JSON.stringify(metadata)).not.toContain('private-repo')
+    expect(JSON.stringify(metadata)).not.toContain('github.com')
+    expect(first.has('accept-language')).toBe(false)
   })
 
   it('uses the standalone Codex Search contract with JSON headers and current client metadata', () => {
@@ -117,11 +128,14 @@ describe('ChatGPT Codex provider path', () => {
       'chatgpt-account-id': 'acct-team',
       'content-type': 'application/json',
       originator: 'codex_cli_rs',
-      'session-id': 'session-safe',
-      'thread-id': 'thread-safe',
-      'x-client-request-id': 'request-safe',
       version: '0.145.2'
     })
+    expect(headers.get('session-id')).toMatch(/^[0-9a-f-]{36}$/)
+    expect(headers.get('session-id')).not.toBe('session-safe')
+    expect(headers.get('thread-id')).toMatch(/^[0-9a-f-]{36}$/)
+    expect(headers.get('thread-id')).not.toBe('thread-safe')
+    expect(headers.get('x-client-request-id')).toMatch(/^[0-9a-f-]{36}$/)
+    expect(headers.get('x-client-request-id')).not.toBe('request-safe')
     expect(headers.get('user-agent')).toBe('codex_cli_rs/0.145.2 (Windows 11; x86_64)')
     expect(headers.has('openai-beta')).toBe(false)
     expect(headers.get('authorization')).not.toContain('local-route-token')
@@ -454,6 +468,18 @@ describe('ChatGPT Codex provider path', () => {
       error: { type: 'slow_down' }
     })).toMatchObject({
       category: 'upstream', accountAction: 'none', retryable: true, scope: 'request'
+    })
+    expect(classifyChatGptCodexFailure(400, undefined, 1_000, {
+      error: {
+        message: "Invalid 'input': array too long. Expected an array with maximum length 16384, but got 38250",
+        type: 'invalid_request_error',
+      },
+    })).toMatchObject({
+      category: 'invalid_request',
+      message: expect.stringContaining('context limit'),
+      retryable: false,
+      accountAction: 'none',
+      scope: 'request',
     })
   })
 

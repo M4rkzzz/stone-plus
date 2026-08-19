@@ -1,14 +1,21 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
+import { readFile, stat } from 'node:fs/promises'
 import { pathToFileURL } from 'node:url'
-import { join, resolve } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { atomicWriteFile, readTextIfPresent } from '../client-config/filesystem'
 
 export const SUPPORTED_DEEPSEEK_HARNESS_VERSION = '0.1.0-rc.6'
+export const SUPPORTED_DSH_TERMINAL_BASH_VERSION = '0.1.0-rc.6'
+/** SHA-256 of the upstream dsh-terminal-bash@0.1.0-rc.6 source Stone+ patches. */
+export const SUPPORTED_DSH_TERMINAL_BASH_SOURCE_SHA256 = 'DE1DBFD60B4034E74A2825679A3066802AC45D2F510A62A706FA1E5A83112F6C'
+export const STONE_DSH_CONTROLLED_PROMPT = '__DSH_PERSISTENT_BASH_PROMPT__ '
 export const STONE_DEEPSEEK_HARNESS_PROVIDER_ID = 'deepseek-official'
 
 export interface DeepSeekHarnessCompanionInstallOptions {
   gatewayBaseUrl: string
   credentialFile: string
+  /** The executable Stone+ is about to launch, used to locate the managed DSH package. */
+  executablePath?: string
 }
 
 export interface DeepSeekHarnessCompanionInstallResult {
@@ -50,7 +57,101 @@ export class DeepSeekHarnessCompanionInstaller implements DeepSeekHarnessCompani
       writeIfChanged(this.pluginPath, DEEPSEEK_HARNESS_COMPANION_SOURCE),
       writeIfChanged(this.patchPath, patch),
     ])
-    return { patchPath: this.patchPath, changed: changes.some(Boolean) }
+    let kernelChanged = false
+    if (options.executablePath) {
+      kernelChanged = await ensureDshTerminalBashKernel(options.executablePath)
+    }
+    return { patchPath: this.patchPath, changed: changes.some(Boolean) || kernelChanged }
+  }
+}
+
+/**
+ * Apply the small readiness fix from the upstream dsh-terminal-bash source.
+ * This is deliberately a source transform with an exact upstream hash guard:
+ * Stone+ must never rewrite an unknown third-party version in place.
+ */
+export function patchDshTerminalBashSource(source: string): string {
+  const desiredPrompt = `const CONTROLLED_PROMPT = ${JSON.stringify(STONE_DSH_CONTROLLED_PROMPT)};`
+  const desiredTail = 'const remaining = Math.max(0, CONTROLLED_PROMPT.length + 1 - this.promptTail.length);'
+  if (source.includes(desiredPrompt) && source.includes(desiredTail)) return source
+
+  const prompt = 'const CONTROLLED_PROMPT = "dsh> ";'
+  const tail = 'const remaining = Math.max(0, 6 - this.promptTail.length);'
+  if (countOccurrences(source, prompt) !== 1 || countOccurrences(source, tail) !== 1) {
+    throw new Error('Stone+ DSH kernel patch does not match the supported dsh-terminal-bash source.')
+  }
+  return source
+    .replace(prompt, desiredPrompt)
+    .replace(tail, desiredTail)
+}
+
+async function ensureDshTerminalBashKernel(executablePath: string): Promise<boolean> {
+  const packageSource = await findDshTerminalBashSource(executablePath)
+  if (!packageSource) {
+    throw new Error('Stone+ could not locate the managed dsh-terminal-bash package for the DSH executable.')
+  }
+  const packageMetadata = await readJsonFile(join(dirname(dirname(packageSource)), 'package.json'))
+  if (packageMetadata?.name !== '@deepseek-ai/dsh-terminal-bash'
+    || packageMetadata.version !== SUPPORTED_DSH_TERMINAL_BASH_VERSION) {
+    throw new Error(
+      `Stone+ DSH kernel patch supports @deepseek-ai/dsh-terminal-bash@${SUPPORTED_DSH_TERMINAL_BASH_VERSION}; `
+      + `found ${String(packageMetadata?.name ?? 'unknown')}@${String(packageMetadata?.version ?? 'unknown')}.`,
+    )
+  }
+
+  const source = await readFile(packageSource, 'utf8')
+  if (source.includes(`const CONTROLLED_PROMPT = ${JSON.stringify(STONE_DSH_CONTROLLED_PROMPT)};`)
+    && source.includes('const remaining = Math.max(0, CONTROLLED_PROMPT.length + 1 - this.promptTail.length);')) {
+    return false
+  }
+  const sourceHash = createHash('sha256').update(source).digest('hex').toUpperCase()
+  if (sourceHash !== SUPPORTED_DSH_TERMINAL_BASH_SOURCE_SHA256) {
+    throw new Error(
+      `Stone+ refused to patch an unrecognized dsh-terminal-bash source (SHA-256 ${sourceHash}). `
+      + 'Update Stone+ before starting DeepSeek Harness.',
+    )
+  }
+  const patched = patchDshTerminalBashSource(source)
+  await atomicWriteFile(packageSource, patched, randomUUID, false)
+  return true
+}
+
+async function findDshTerminalBashSource(executablePath: string): Promise<string | undefined> {
+  let directory = dirname(resolve(executablePath))
+  for (let depth = 0; depth < 8; depth += 1) {
+    const candidates = [
+      join(directory, 'node_modules', '@deepseek-ai', 'dsh', 'node_modules', '@deepseek-ai', 'dsh-terminal-bash', 'lib', 'index.js'),
+      join(directory, 'node_modules', '@deepseek-ai', 'dsh-terminal-bash', 'lib', 'index.js'),
+      join(directory, 'lib', 'node_modules', '@deepseek-ai', 'dsh', 'node_modules', '@deepseek-ai', 'dsh-terminal-bash', 'lib', 'index.js'),
+      join(directory, 'lib', 'node_modules', '@deepseek-ai', 'dsh-terminal-bash', 'lib', 'index.js'),
+    ]
+    for (const candidate of candidates) {
+      if ((await stat(candidate).catch(() => undefined))?.isFile()) return candidate
+    }
+    const parent = dirname(directory)
+    if (parent === directory) break
+    directory = parent
+  }
+  return undefined
+}
+
+async function readJsonFile(path: string): Promise<Record<string, unknown> | undefined> {
+  try {
+    const value: unknown = JSON.parse(await readFile(path, 'utf8'))
+    return value && typeof value === 'object' ? value as Record<string, unknown> : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function countOccurrences(source: string, needle: string): number {
+  let count = 0
+  let offset = 0
+  while (true) {
+    const index = source.indexOf(needle, offset)
+    if (index < 0) return count
+    count += 1
+    offset = index + needle.length
   }
 }
 
@@ -114,6 +215,25 @@ function companionPatch(input: {
     '- id: llm-deepseek',
     "  name: '@deepseek-ai/dsh-llm-deepseek'",
     '  disabled: true',
+    '# DSH ships these safety features disabled in the web profile. Stone+ enables',
+    '# them for managed sessions so imported Codex histories compact before the',
+    '# upstream Responses item limit is reached. The engine preserves complete',
+    '# tool-call/result pairs while replacing only an acknowledged old range.',
+    '- id: compaction-basic',
+    "  name: '@deepseek-ai/dsh-compaction-basic'",
+    '  disabled: false',
+    '  config:',
+    '    auto: true',
+    '    thresholdRatio: 0.55',
+    '    retainRatio: 0.10',
+    '    compactionRetries: 2',
+    '    maxOverflowRetries: 2',
+    '- id: command-compact',
+    "  name: '@deepseek-ai/dsh-command-compact'",
+    '  disabled: false',
+    '- id: tool-result-pruner',
+    "  name: '@deepseek-ai/dsh-compaction-tool-result-pruner'",
+    '  disabled: false',
     '- insert:',
     '    - id: stoneplus-model-family-bridge',
     `      name: ${JSON.stringify(input.pluginUrl)}`,

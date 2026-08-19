@@ -15,7 +15,16 @@ import {
 import { supportsFastServiceTier } from '../../shared/types'
 import { providerSourceFamily } from '../../shared/source-family'
 import { applyReasoningEffortPolicy, normalizeReasoningEffort } from '../../shared/reasoning-policy'
-import { GPT_5_6_SOL_WM_MODEL, supportsPoolWmRouting } from '../../shared/wm-routing'
+import {
+  GPT_5_6_SOL_MODEL,
+  GPT_5_6_SOL_WM_MODEL,
+  MINIMUM_CODEX_APP_SERVER_WEB_WM_VERSION,
+  MINIMUM_CODEX_DESKTOP_WEB_WM_VERSION,
+  codexWebWmClientUpdateRequired,
+  isChatGptWebWmPassthroughModel,
+  isChatGptWebWmPoolProtocol,
+} from '../../shared/wm-routing'
+import { estimateResponsesInputTokens } from '../../shared/web-wm-responses'
 import {
   DEEPSEEK_DEFAULT_REASONING_EFFORT,
   DEEPSEEK_RESPONSES_DEFAULT_MODEL,
@@ -35,6 +44,7 @@ import {
   applyChatGptAgentIdentityHeaders,
   applyChatGptCodexHeaders,
   applyChatGptCodexSearchHeaders,
+  redactChatGptCodexSessionId,
   CHATGPT_CODEX_RESPONSES_URL,
   CHATGPT_CODEX_SEARCH_URL,
   classifyChatGptCredentialRefreshFailure,
@@ -116,6 +126,7 @@ import {
 } from './grok-media'
 import type {
   CredentialResolver,
+  ChatGptWebWmTransport,
   GatewayAccountState,
   GatewayAccountStateHandler,
   GatewayConfig,
@@ -153,7 +164,7 @@ class KiroBufferedCollectionError extends Error {
 
 interface IncomingRoute {
   protocol: Protocol
-  operation: 'generate' | 'count-tokens' | 'codex-search' | 'codex-compact'
+  operation: 'generate' | 'count-tokens' | 'responses-input-tokens' | 'codex-search' | 'codex-compact'
   client?: RouteClient
   geminiMethod?: 'generateContent' | 'streamGenerateContent'
   authenticationProtocol?: Protocol
@@ -209,12 +220,13 @@ const RESPONSES_TERMINAL_IDLE_TIMEOUT_MS = 65_000
 // so a sick relay cannot create an unbounded retry loop.
 const MAX_RESPONSES_RELAY_ADAPTIVE_RETRIES = 2
 const RESPONSES_RELAY_RETRY_BASE_DELAY_MS = 150
-// Request-scoped capacity shedding is neither an account-health failure nor a
-// useful error for Codex to surface immediately. Keep the first two identical
-// failures private and expose the third. A separate total cap prevents a relay
-// that alternates error wording from spinning until the response deadline.
+// Ordinary request-scoped capacity errors keep the established bounded retry
+// policy. Web WM additionally needs a strict three-attempt boundary because
+// its transport can report request capacity through an HTTP-200 terminal.
 const REQUEST_TRANSIENT_EXPLICIT_FAILURE_COUNT = 3
 const MAX_REQUEST_TRANSIENT_RETRIES = 6
+const MAX_WEB_WM_REQUEST_TRANSIENT_RETRIES = REQUEST_TRANSIENT_EXPLICIT_FAILURE_COUNT - 1
+const DEFAULT_REQUEST_TRANSIENT_RETRY_DELAY_MS = 3_000
 // Search entitlement is attached to the concrete OAuth grant, not merely to
 // the account's broad credential type. Remember a proven endpoint capability
 // long enough to remove a guaranteed 401 from normal use, while periodically
@@ -399,6 +411,7 @@ export class GatewayServer implements GatewayController {
   private readonly fetchImplementation: typeof fetch
   private readonly loopbackFetchImplementation: typeof fetch
   private readonly outboundFetchResolver?: OutboundFetchResolver
+  private readonly chatGptWebWmTransport?: ChatGptWebWmTransport
   private readonly conversationTitleResolver?: ConversationTitleResolver
   private readonly loadGrokVideoBindings?: GatewayServerOptions['loadGrokVideoBindings']
   private readonly saveGrokVideoBindings?: GatewayServerOptions['saveGrokVideoBindings']
@@ -423,6 +436,7 @@ export class GatewayServer implements GatewayController {
   private requestReplayGeneration = 0
   private readonly now: () => number
   private readonly random: () => number
+  private readonly requestTransientRetryDelayMs: number
   private readonly responsesProgressIdleTimeoutMs: number
   private server?: Server
   private responsesWebSocket?: ResponsesWebSocketAdapter
@@ -440,6 +454,7 @@ export class GatewayServer implements GatewayController {
     this.fetchImplementation = options.fetchImplementation ?? fetch
     this.loopbackFetchImplementation = options.loopbackFetchImplementation ?? fetch
     this.outboundFetchResolver = options.outboundFetchResolver
+    this.chatGptWebWmTransport = options.chatGptWebWmTransport
     this.conversationTitleResolver = options.conversationTitleResolver
     this.loadGrokVideoBindings = options.loadGrokVideoBindings
     this.saveGrokVideoBindings = options.saveGrokVideoBindings
@@ -448,6 +463,12 @@ export class GatewayServer implements GatewayController {
     this.beforeStart = options.beforeStart
     this.now = options.now ?? (() => Date.now())
     this.random = options.random ?? (() => Math.random())
+    this.requestTransientRetryDelayMs = Math.max(
+      0,
+      Number.isFinite(options.requestTransientRetryDelayMs)
+        ? Math.floor(options.requestTransientRetryDelayMs!)
+        : DEFAULT_REQUEST_TRANSIENT_RETRY_DELAY_MS
+    )
     this.responsesProgressIdleTimeoutMs = Math.max(
       1,
       options.responsesProgressIdleTimeoutMs ?? Number.POSITIVE_INFINITY
@@ -832,6 +853,15 @@ export class GatewayServer implements GatewayController {
       firstTokenAt = this.now()
       scheduleProgressLog('streaming')
     }
+    // The Web WM adapter emits local `response.created`/`in_progress` SSE
+    // frames before ChatGPT has produced any content.  Those protocol-shell
+    // bytes are not an upstream first token (and used to appear as bogus
+    // 4 ms "首字" values).  For this transport, start both timing metrics on
+    // the first meaningful text/tool event observed by the Responses parser.
+    const markWebWmFirstMeaningful = (): void => {
+      markUpstreamFirstByte()
+      markFirstToken()
+    }
     const markUpstreamFirstByte = (): void => {
       if (upstreamFirstByteAt !== undefined) return
       upstreamFirstByteAt = this.now()
@@ -1086,11 +1116,74 @@ export class GatewayServer implements GatewayController {
       const pool = requestIndex.poolsById.get(effectiveSourceId)
       if (!pool) throw new GatewayHttpError(503, 'The matched route has no available pool')
       const configuredProviderAccounts = requestIndex.accountsByPoolId.get(pool.id) ?? []
-      const targetModel = pool.routeToWm === true
-        && supportsPoolWmRouting(pool.protocol, configuredProviderAccounts)
-        ? GPT_5_6_SOL_WM_MODEL
+      const codexSearch = incoming.operation === 'codex-search'
+      const codexCompact = incoming.operation === 'codex-compact'
+      const countTokens = incoming.operation === 'count-tokens'
+      const responsesInputTokens = incoming.operation === 'responses-input-tokens'
+      const codexCompactV2 = incoming.operation === 'generate'
+        && incoming.protocol === 'openai-responses'
+        && isCodexCompactV2Body(body)
+      const webWmPool = isChatGptWebWmPoolProtocol(pool.protocol)
+      const codexOpaqueCompactHistory = incoming.protocol === 'openai-responses'
+        && hasCodexOpaqueCompactHistory(body)
+      const webWmPassthroughModel = webWmPool
+        && incoming.operation === 'generate'
+        && isChatGptWebWmPassthroughModel(model)
+      const useWebWmTransport = webWmPool
+        && !webWmPassthroughModel
+        && !codexCompactV2
+        && !codexOpaqueCompactHistory
+        && (incoming.operation === 'generate' || codexSearch)
+      if (useWebWmTransport && codexWebWmClientUpdateRequired(headerText(request.headers['user-agent']))) {
+        throw new GatewayHttpError(
+          426,
+          `ChatGPT Web WM requires Codex Desktop ${MINIMUM_CODEX_DESKTOP_WEB_WM_VERSION} or newer `
+            + `(app-server ${MINIMUM_CODEX_APP_SERVER_WEB_WM_VERSION} or newer). Update Codex Desktop and retry.`,
+          'codex_desktop_update_required',
+        )
+      }
+      const targetModel = webWmPool
+        ? webWmPassthroughModel
+          ? model
+          : codexCompact || codexCompactV2 || codexOpaqueCompactHistory
+          ? GPT_5_6_SOL_MODEL
+          : GPT_5_6_SOL_WM_MODEL
         : routedModel
       upstreamModel = targetModel
+      if (webWmPool && countTokens) {
+        throw new GatewayHttpError(
+          501,
+          'ChatGPT Web WM does not support token counting.',
+          'unsupported_operation',
+        )
+      }
+      if (responsesInputTokens) {
+        // This endpoint was added for the Web WM client boundary only.  A
+        // relay-backed Responses source has authoritative usage in its normal
+        // response stream; intercepting it here with a JSON-size estimate can
+        // make Codex compact the main conversation far too early.  Keep the
+        // approximation strictly inside the Web WM protocol instead of
+        // changing the semantics of the ordinary OAuth/API-key path.
+        if (!webWmPool) {
+          throw new GatewayHttpError(
+            501,
+            'Responses input token counting is not provided for this relay. Use the response usage field.',
+            'unsupported_operation',
+          )
+        }
+        const inputTokens = estimateResponsesInputTokens(body)
+        response.setHeader('cache-control', 'no-store')
+        response.setHeader('x-stone-token-count-source', 'estimate')
+        releaseCommittedRequestBody()
+        const written = await this.writeJson(response, 200, {
+          object: 'response.input_tokens',
+          input_tokens: inputTokens,
+        }, markClientFirstWrite)
+        if (!written) throw new GatewayHttpError(499, 'Client closed the request', 'client_closed')
+        this.successRequests += 1
+        finishRequestLog({ status: 'success', statusCode: 200, recordPerformance: false })
+        return
+      }
       if (logRoute.client === 'deepseek-harness' && incoming.operation === 'generate') {
         await this.enforceDeepSeekHarnessModelFamily({
           request,
@@ -1102,18 +1195,12 @@ export class GatewayServer implements GatewayController {
           index: requestIndex,
         })
       }
-      const codexSearch = incoming.operation === 'codex-search'
-      const codexCompact = incoming.operation === 'codex-compact'
-      const countTokens = incoming.operation === 'count-tokens'
       if (codexSearch && (typeof body.id !== 'string' || !body.id.trim())) {
         throw new GatewayHttpError(400, 'A search session id is required')
       }
       if (codexCompact && !Array.isArray(body.input)) {
         throw new GatewayHttpError(400, 'A compact request requires an input history')
       }
-      const codexCompactV2 = incoming.operation === 'generate'
-        && incoming.protocol === 'openai-responses'
-        && isCodexCompactV2Body(body)
       if (codexCompactV2) requestKind = 'compaction'
       const compactFallbackCompatibilityBody = codexCompactV2 && isResponsesAgentClient(logRoute.client)
         ? buildCompactFallbackBody(body, model, 0, false, true)
@@ -1184,8 +1271,6 @@ export class GatewayServer implements GatewayController {
           )
         }
       }
-      const codexOpaqueCompactHistory = incoming.protocol === 'openai-responses'
-        && hasCodexOpaqueCompactHistory(body)
       const declaredNativeCompactAccounts = codexCompactV2
         ? providerAccounts.filter((account) => accountSupportsNativeCompact(
             account,
@@ -1349,14 +1434,25 @@ export class GatewayServer implements GatewayController {
       )
       const responsesLite = incoming.protocol === 'openai-responses' && isChatGptCodexResponsesLiteBody(body)
       const schedulingPool = sessionId && (
-        codexSearch
+        webWmPool
+        || codexSearch
         || codexCompact
         || compactSensitive
         || responsesLite
         || anthropicToolTurn.hasToolState
         || (pool.kind === 'relay-aggregate' && kiroClaudeRoute)
       )
-        ? { ...pool, stickySessions: true }
+        ? {
+            ...pool,
+            stickySessions: true,
+            ...(webWmPool ? {
+              // Web WM continuation state belongs to one account-local Work
+              // runtime. Do not let autobalancing escape that assignment while
+              // another request for the same Codex session is in flight.
+              strategy: 'round-robin' as const,
+              stickyTtlMinutes: Math.max(60, pool.stickyTtlMinutes),
+            } : {}),
+          }
         : pool
       const retryLimit = Number.isFinite(pool.maxRetries) ? Math.max(0, Math.floor(pool.maxRetries)) : 0
       // Retries share one response-start budget. A failed attempt must not reset
@@ -1364,7 +1460,7 @@ export class GatewayServer implements GatewayController {
       // grants standalone compaction four times the ordinary request budget;
       // mirror that contract so a valid native compact body is not cut off by
       // Stone+ before the client itself would abandon it.
-      const responseStartDeadlineAt = bodyReadyAt
+      let responseStartDeadlineAt = bodyReadyAt
          + Math.max(1, requestConfig.settings.requestTimeoutSeconds) * 1000
            * (codexCompact || codexCompactV2 ? 4 : 1)
       let lastAttemptError: GatewayHttpError | undefined
@@ -1376,6 +1472,12 @@ export class GatewayServer implements GatewayController {
       let lastRequestTransientFailureSignature: string | undefined
       let consecutiveRequestTransientFailures = 0
       let requestTransientRetriesUsed = 0
+      let requestTransientDeadlineExtended = false
+      const webWmRejectedAccessRecoveryUsed = new Set<string>()
+      let recoveredWebWmCredential: {
+        accountId: string
+        credential: ResolvedGatewayCredential
+      } | undefined
       const failedAccountIds = new Set<string>()
       const nativeCompactCapabilityFailedAccountIds = new Set<string>()
       const currentExcludedAccountIds = (): string[] => codexCompactV2 && !codexCompactV2Fallback
@@ -1391,6 +1493,7 @@ export class GatewayServer implements GatewayController {
         let release: (() => void) | undefined
         let attemptedAccount: Account | undefined
         let attemptedCredentialKind: ResolvedGatewayCredential['kind'] | undefined
+        let attemptedResolvedCredential: ResolvedGatewayCredential | undefined
         let attemptedCompactFallback = false
         let selectedHealthRevision: number | undefined
         let selectedResetEpoch: number | undefined
@@ -1425,6 +1528,7 @@ export class GatewayServer implements GatewayController {
               accounts: accountsForCurrentAttempt(),
               model: routedModel,
               modelCooldownKey: targetModel,
+              skipAccountModelCatalog: webWmPool,
               sessionId,
               excludedAccountIds: currentExcludedAccountIds(),
               providers: requestConfig.providers,
@@ -1456,6 +1560,7 @@ export class GatewayServer implements GatewayController {
                   accounts: accountsForCurrentAttempt(),
                   model: routedModel,
                   modelCooldownKey: targetModel,
+                  skipAccountModelCatalog: webWmPool,
                   sessionId,
                   excludedAccountIds: currentExcludedAccountIds(),
                   providers: requestConfig.providers,
@@ -1544,10 +1649,15 @@ export class GatewayServer implements GatewayController {
             if (!attemptSignal) {
               throw new GatewayHttpError(504, 'Upstream request timed out', 'timeout_error')
             }
-            resolvedValue = await awaitWithAbortSignal(
-              Promise.resolve(this.credentialResolver(account, outboundFetch, attemptSignal)),
-              attemptSignal
-            )
+            if (useWebWmTransport && recoveredWebWmCredential?.accountId === account.id) {
+              resolvedValue = recoveredWebWmCredential.credential
+              recoveredWebWmCredential = undefined
+            } else {
+              resolvedValue = await awaitWithAbortSignal(
+                Promise.resolve(this.credentialResolver(account, outboundFetch, attemptSignal)),
+                attemptSignal
+              )
+            }
           } finally {
             credentialResolveMs = Math.max(0, this.now() - credentialResolveStarted)
           }
@@ -1557,14 +1667,17 @@ export class GatewayServer implements GatewayController {
           let resolvedCredential = typeof resolvedValue === 'string'
             ? { secret: resolvedValue, kind: 'api-key' as const }
             : resolvedValue
+          attemptedResolvedCredential = resolvedCredential
           attemptedCredentialKind = resolvedCredential.kind
           const credential = resolvedCredential.secret
-          const cachedSearchCapability = codexSearch && isChatGptCodexCredentialKind(resolvedCredential.kind)
+          const cachedSearchCapability = codexSearch
+            && !useWebWmTransport
+            && isChatGptCodexCredentialKind(resolvedCredential.kind)
             ? this.getCodexSearchCapability(account.id, resolvedCredential)
             : undefined
           const preferSearchFallback = cachedSearchCapability === 'responses-fallback'
           let compactFallback = codexCompact
-            ? !supportsNativeCompact(provider, resolvedCredential.kind, codexOpaqueCompactHistory)
+            ? webWmPool || !supportsNativeCompact(provider, resolvedCredential.kind, codexOpaqueCompactHistory)
             : codexCompactV2 && isResponsesAgentClient(logRoute.client)
               && (codexCompactV2Fallback || !supportsNativeCompact(
                 provider,
@@ -1620,7 +1733,7 @@ export class GatewayServer implements GatewayController {
                 resolvedCredential.accountId,
                 resolvedCredential.fedramp,
                 request.headers,
-                (codexSearch && !preferSearchFallback) || codexCompact ? 'json' : 'stream',
+                (codexSearch && !preferSearchFallback) || (codexCompact && !compactFallback) ? 'json' : 'stream',
                 account.id,
               )
             } else {
@@ -1635,8 +1748,10 @@ export class GatewayServer implements GatewayController {
                 applyChatGptCodexHeaders(upstreamHeaders, credentialBundle, request.headers, account.id)
               }
             }
-            if (codexCompact) upstreamHeaders.set('accept', 'application/json')
-            if (sessionId && !upstreamHeaders.has('session-id')) upstreamHeaders.set('session-id', sessionId)
+            if (codexCompact && !compactFallback) upstreamHeaders.set('accept', 'application/json')
+            if (sessionId && !upstreamHeaders.has('session-id')) {
+              upstreamHeaders.set('session-id', redactChatGptCodexSessionId(sessionId, account.id))
+            }
           } else {
             if (resolvedCredential.kind === 'grok-oauth') {
               const canonicalBaseUrl = provider.baseUrl.replace(/\/+$/, '')
@@ -1682,7 +1797,9 @@ export class GatewayServer implements GatewayController {
           if ((codexCompact && !compactFallback) || compactResponsePassthrough) {
             copyCompactRequestHeaders(request, upstreamHeaders, logRoute.client)
           }
-          if (codexCompactV2 && compactFallback) stripCompactRequestHeaders(upstreamHeaders)
+          if ((codexCompactV2 || (codexCompact && webWmPool)) && compactFallback) {
+            stripCompactRequestHeaders(upstreamHeaders)
+          }
           const outboundBody = codexSearch || codexCompact || compactFallback
             ? convertedBody
             : withStreamingFlag(convertedBody, provider.protocol, streaming)
@@ -1696,7 +1813,9 @@ export class GatewayServer implements GatewayController {
             : outboundBody
           const upstreamBody = preferSearchFallback
             ? withChatGptCodexBody(buildChatGptSearchFallbackBody(body, targetModel))
-            : isChatGptCodexCredentialKind(resolvedCredential.kind) && !codexSearch && !codexCompact
+            : isChatGptCodexCredentialKind(resolvedCredential.kind)
+                && !codexSearch
+                && (!codexCompact || compactFallback)
               ? withChatGptCodexBody(tieredOutboundBody)
               : tieredOutboundBody
           const serializedBodyKey = `${provider.id}\0${provider.kind}\0${provider.protocol}\0${targetModel}\0${resolvedCredential.kind}`
@@ -1733,48 +1852,92 @@ export class GatewayServer implements GatewayController {
           let upstreamResponse: Response
           try {
             if (!attemptSignal) throw new GatewayHttpError(504, 'Upstream request timed out', 'timeout_error')
-            const upstreamInit: RequestInit = {
-              method: 'POST',
-              headers: upstreamHeaders,
-              body: serializedUpstreamBody,
-              signal: attemptSignal,
-              ...redirectPolicy,
-            }
-            failureStage = 'connect'
-            outboundFetchStartMs = Math.max(0, this.now() - started)
-            const fetched = await awaitWithAbortSignal(
-              fetchWithOptionalHedge(
-                outboundFetch,
-                upstreamUrl,
-                upstreamInit,
-                provider.protocol,
-                hedgeDelayMs,
-                firstBodyTimeoutMs,
-                this.now,
-                (headersAt) => {
-                  if (!attemptActive) return
-                  if (upstreamHeadersAt === undefined) upstreamHeadersAt = headersAt
-                  if (failureStage !== 'first-byte') {
-                    failureStage = 'first-byte'
-                    scheduleProgressLog('waiting-first-byte')
-                  }
-                },
-                hedgeDelayMs === undefined
-                  ? undefined
-                  : () => {
-                      const acquired = this.scheduler.tryAcquireAccount(account, schedulingPool)
-                      if (!acquired) return undefined
-                      // A hedge occupies another real upstream slot. Keep the
-                      // account row authoritative even when the route has
-                      // reduced progress telemetry enabled.
-                      this.emitRuntimeState({ accountIds: [account.id] })
-                      return this.runtimeTrackedRelease(acquired, runtimeGeneration, account.id)
+            if (useWebWmTransport) {
+              if (resolvedCredential.kind !== 'chatgpt-oauth') {
+                throw new GatewayHttpError(
+                  503,
+                  'ChatGPT Web WM requires a verified ChatGPT OAuth account.',
+                  'account_unavailable',
+                )
+              }
+              if (!resolvedCredential.accountId) {
+                throw new GatewayHttpError(
+                  503,
+                  'ChatGPT Web WM credential has no account identity.',
+                  'account_unavailable',
+                )
+              }
+              if (!this.chatGptWebWmTransport) {
+                throw new GatewayHttpError(
+                  503,
+                  'ChatGPT Web WM transport is unavailable.',
+                  'account_unavailable',
+                )
+              }
+              failureStage = 'connect'
+              outboundFetchStartMs = Math.max(0, this.now() - started)
+              upstreamResponse = await awaitWithAbortSignal(
+                this.chatGptWebWmTransport({
+                  account,
+                  pool,
+                  credential: {
+                    accessToken: resolvedCredential.secret,
+                    accountId: resolvedCredential.accountId,
+                  },
+                  operation: codexSearch ? 'search' : 'responses',
+                  body: tieredOutboundBody,
+                  stream: upstreamStreaming,
+                  signal: attemptSignal,
+                }),
+                attemptSignal,
+              )
+              upstreamHeadersAt ??= this.now()
+              failureStage = 'first-byte'
+              scheduleProgressLog('waiting-first-byte')
+            } else {
+              const upstreamInit: RequestInit = {
+                method: 'POST',
+                headers: upstreamHeaders,
+                body: serializedUpstreamBody,
+                signal: attemptSignal,
+                ...redirectPolicy,
+              }
+              failureStage = 'connect'
+              outboundFetchStartMs = Math.max(0, this.now() - started)
+              const fetched = await awaitWithAbortSignal(
+                fetchWithOptionalHedge(
+                  outboundFetch,
+                  upstreamUrl,
+                  upstreamInit,
+                  provider.protocol,
+                  hedgeDelayMs,
+                  firstBodyTimeoutMs,
+                  this.now,
+                  (headersAt) => {
+                    if (!attemptActive) return
+                    if (upstreamHeadersAt === undefined) upstreamHeadersAt = headersAt
+                    if (failureStage !== 'first-byte') {
+                      failureStage = 'first-byte'
+                      scheduleProgressLog('waiting-first-byte')
                     }
-              ),
-              attemptSignal
-            )
-            upstreamResponse = fetched.response
-            upstreamHeadersAt = fetched.headersAt
+                  },
+                  hedgeDelayMs === undefined
+                    ? undefined
+                    : () => {
+                        const acquired = this.scheduler.tryAcquireAccount(account, schedulingPool)
+                        if (!acquired) return undefined
+                        // A hedge occupies another real upstream slot. Keep the
+                        // account row authoritative even when the route has
+                        // reduced progress telemetry enabled.
+                        this.emitRuntimeState({ accountIds: [account.id] })
+                        return this.runtimeTrackedRelease(acquired, runtimeGeneration, account.id)
+                      }
+                ),
+                attemptSignal
+              )
+              upstreamResponse = fetched.response
+              upstreamHeadersAt = fetched.headersAt
+            }
             if (countTokens) countTokensUpstreamResponseHeaders = new Headers(upstreamResponse.headers)
           } catch (error) {
             throw gatewayErrorFromProviderFailure(adapter.classifyFailure({ error, now: this.now() }))
@@ -1799,7 +1962,8 @@ export class GatewayServer implements GatewayController {
             headerSignals,
             headerObservedAt,
             selectedHealthRevision,
-            selectedResetEpoch
+            selectedResetEpoch,
+            useWebWmTransport && upstreamResponse.status === 429
           )
 
           let errorPayload: JsonObject | undefined
@@ -1950,7 +2114,8 @@ export class GatewayServer implements GatewayController {
                   headerSignals,
                   headerObservedAt,
                   selectedHealthRevision,
-                  selectedResetEpoch
+                  selectedResetEpoch,
+                  useWebWmTransport && upstreamResponse.status === 429
                 )
                 errorPayload = upstreamResponse.ok
                   ? undefined
@@ -1993,10 +2158,13 @@ export class GatewayServer implements GatewayController {
                 resolvedCredential.accountId,
                 resolvedCredential.fedramp,
                 request.headers,
-                (codexSearch && !preferSearchFallback) || codexCompact ? 'json' : 'stream'
+                (codexSearch && !preferSearchFallback) || codexCompact ? 'json' : 'stream',
+                account.id
               )
               if (codexCompact) upstreamHeaders.set('accept', 'application/json')
-              if (sessionId && !upstreamHeaders.has('session-id')) upstreamHeaders.set('session-id', sessionId)
+              if (sessionId && !upstreamHeaders.has('session-id')) {
+                upstreamHeaders.set('session-id', redactChatGptCodexSessionId(sessionId, account.id))
+              }
               if ((codexCompact && !compactFallback) || compactResponsePassthrough) {
                 copyCompactRequestHeaders(request, upstreamHeaders, logRoute.client)
               }
@@ -2020,7 +2188,8 @@ export class GatewayServer implements GatewayController {
                 headerSignals,
                 headerObservedAt,
                 selectedHealthRevision,
-                selectedResetEpoch
+                selectedResetEpoch,
+                useWebWmTransport && upstreamResponse.status === 429
               )
               errorPayload = upstreamResponse.ok
                 ? undefined
@@ -2029,6 +2198,7 @@ export class GatewayServer implements GatewayController {
             if (
               resolvedCredential.kind === 'chatgpt-oauth'
               && resolvedCredential.recoverRejectedAccess
+              && !useWebWmTransport
               && upstreamResponse.status === 401
               && !isChatGptSearchAccessPolicyRejection(upstreamResponse.status, errorPayload)
             ) {
@@ -2067,7 +2237,9 @@ export class GatewayServer implements GatewayController {
                 applyChatGptCodexHeaders(upstreamHeaders, recoveredBundle, request.headers, account.id)
               }
               if (codexCompact) upstreamHeaders.set('accept', 'application/json')
-              if (sessionId && !upstreamHeaders.has('session-id')) upstreamHeaders.set('session-id', sessionId)
+              if (sessionId && !upstreamHeaders.has('session-id')) {
+                upstreamHeaders.set('session-id', redactChatGptCodexSessionId(sessionId, account.id))
+              }
               if ((codexCompact && !compactFallback) || compactResponsePassthrough) {
                 copyCompactRequestHeaders(request, upstreamHeaders, logRoute.client)
               }
@@ -2100,7 +2272,8 @@ export class GatewayServer implements GatewayController {
                 headerSignals,
                 headerObservedAt,
                 selectedHealthRevision,
-                selectedResetEpoch
+                selectedResetEpoch,
+                useWebWmTransport && upstreamResponse.status === 429
               )
               errorPayload = upstreamResponse.ok
                 ? undefined
@@ -2178,6 +2351,7 @@ export class GatewayServer implements GatewayController {
                 headerObservedAt,
                 selectedHealthRevision,
                 selectedResetEpoch,
+                useWebWmTransport && upstreamResponse.status === 429,
               )
               errorPayload = upstreamResponse.ok
                 ? undefined
@@ -2186,6 +2360,7 @@ export class GatewayServer implements GatewayController {
           }
 
           let searchAccessPolicyRejected = codexSearch
+            && !useWebWmTransport
             && !preferSearchFallback
             && !upstreamResponse.ok
             && isChatGptCodexCredentialKind(resolvedCredential.kind)
@@ -2233,7 +2408,8 @@ export class GatewayServer implements GatewayController {
               headerSignals,
               headerObservedAt,
               selectedHealthRevision,
-              selectedResetEpoch
+              selectedResetEpoch,
+              useWebWmTransport && upstreamResponse.status === 429
             )
             errorPayload = upstreamResponse.ok
               ? undefined
@@ -2245,6 +2421,7 @@ export class GatewayServer implements GatewayController {
             this.setCodexSearchCapability(account.id, resolvedCredential, 'responses-fallback')
           } else if (
             codexSearch
+            && !useWebWmTransport
             && !preferSearchFallback
             && upstreamResponse.ok
             && isChatGptCodexCredentialKind(resolvedCredential.kind)
@@ -2254,6 +2431,7 @@ export class GatewayServer implements GatewayController {
 
           if (
             codexSearch
+            && !useWebWmTransport
             && (preferSearchFallback || searchAccessPolicyRejected)
             && isChatGptCodexCredentialKind(resolvedCredential.kind)
           ) {
@@ -2281,7 +2459,9 @@ export class GatewayServer implements GatewayController {
                   expiresAt: account.credentialExpiresAt ?? Number.MAX_SAFE_INTEGER
                 }, request.headers, account.id)
               }
-              if (sessionId && !fallbackHeaders.has('session-id')) fallbackHeaders.set('session-id', sessionId)
+              if (sessionId && !fallbackHeaders.has('session-id')) {
+                fallbackHeaders.set('session-id', redactChatGptCodexSessionId(sessionId, account.id))
+              }
               const fallbackBody = withChatGptCodexBody(buildChatGptSearchFallbackBody(body, targetModel))
               failureStage = 'connect'
               try {
@@ -2321,7 +2501,8 @@ export class GatewayServer implements GatewayController {
                 headerSignals,
                 headerObservedAt,
                 selectedHealthRevision,
-                selectedResetEpoch
+                selectedResetEpoch,
+                useWebWmTransport && upstreamResponse.status === 429
               )
               errorPayload = upstreamResponse.ok
                 ? undefined
@@ -2380,12 +2561,25 @@ export class GatewayServer implements GatewayController {
                   headers: upstreamResponse.headers,
                   now: this.now()
                 }))
+            const genericChatGptFailure = isChatGptCodexCredentialKind(resolvedCredential.kind)
+              && !useWebWmTransport
+            const chatGptContextOverflow = genericChatGptFailure
+              && isCompactContextOverflow(upstreamResponse.status, payload)
+            const responseFailureMessage = chatGptContextOverflow
+              ? 'The request history exceeds the upstream context limit and must be compacted before retrying.'
+              : providerFailure.message
             throw new GatewayHttpError(
               upstreamResponse.status,
-              isChatGptCodexCredentialKind(resolvedCredential.kind) ? providerFailure.message : upstreamErrorMessage(safePayload),
+              genericChatGptFailure ? responseFailureMessage : upstreamErrorMessage(safePayload),
               `provider_${providerFailure.category}`,
-               isChatGptCodexCredentialKind(resolvedCredential.kind)
-                ? { error: { message: providerFailure.message, type: `provider_${providerFailure.category}` } }
+              genericChatGptFailure
+                ? {
+                    error: {
+                      message: responseFailureMessage,
+                      type: chatGptContextOverflow ? 'context_length_exceeded' : `provider_${providerFailure.category}`,
+                      ...(chatGptContextOverflow ? { code: 'context_length_exceeded' } : {})
+                    }
+                  }
                 : safePayload,
               providerFailure,
               observedQuotaSignals(headerSignals, this.now())
@@ -2463,7 +2657,8 @@ export class GatewayServer implements GatewayController {
                 headerSignals,
                 headerObservedAt,
                 selectedHealthRevision,
-                selectedResetEpoch
+                selectedResetEpoch,
+                upstreamResponse.status === 429
               )
               if (!upstreamResponse.ok) {
                 const payload = await readUpstreamJson(upstreamResponse, retrySignal)
@@ -2668,7 +2863,8 @@ export class GatewayServer implements GatewayController {
                       headerSignals,
                       headerObservedAt,
                       selectedHealthRevision,
-                      selectedResetEpoch
+                      selectedResetEpoch,
+                      useWebWmTransport && upstreamResponse.status === 429
                     )
                     if (upstreamResponse.ok) {
                       errorPayload = undefined
@@ -2838,8 +3034,8 @@ export class GatewayServer implements GatewayController {
               idleTimeoutMs: streamIdleTimeoutMs,
               responsesProgressIdleTimeoutMs,
               signal: clientAbortController.signal,
-              onFirstByte: markUpstreamFirstByte,
-              onFirstToken: markFirstToken,
+              onFirstByte: useWebWmTransport ? undefined : markUpstreamFirstByte,
+              onFirstToken: useWebWmTransport ? markWebWmFirstMeaningful : markFirstToken,
               onClientWrite: markClientFirstWrite,
               onChunk: recordStreamChunk,
               onUsage: recordStreamUsage,
@@ -2892,11 +3088,14 @@ export class GatewayServer implements GatewayController {
                   sensitiveValues(resolvedCredential),
                   streamTiming,
                   {
-                    // ChatGPT may finish an otherwise healthy HTTP 200 stream
-                    // with request-scoped server_is_overloaded/slow_down. Keep
-                    // lifecycle and reasoning frames private until real output
-                    // makes replay unsafe, so Stone+ can recover transparently.
-                    commitOnlyOnOutputOrTerminal: isChatGptCodexCredentialKind(resolvedCredential.kind),
+                    // Web WM may finish an otherwise healthy HTTP 200 stream
+                    // with request-scoped capacity errors after emitting only
+                    // lifecycle/reasoning frames. Keep that transport's shell
+                    // private until real output or a terminal is observed so
+                    // WM can recover transparently. Ordinary ChatGPT OAuth
+                    // Responses must retain the normal immediate streaming
+                    // commit boundary; this option is deliberately WM-only.
+                    commitOnlyOnOutputOrTerminal: useWebWmTransport,
                   }
                 )
               : await pipeCurrentConvertedStream()
@@ -3227,6 +3426,45 @@ export class GatewayServer implements GatewayController {
             throw new GatewayHttpError(499, 'Client closed the request', 'client_closed')
           }
           const gatewayError = normalizeError(error)
+          if (
+            useWebWmTransport
+            && gatewayError.statusCode === 401
+            && !response.headersSent
+            && attemptedAccount
+            && attemptedResolvedCredential?.kind === 'chatgpt-oauth'
+            && attemptedResolvedCredential.accountId
+            && attemptedResolvedCredential.recoverRejectedAccess
+            && !webWmRejectedAccessRecoveryUsed.has(attemptedAccount.id)
+          ) {
+            webWmRejectedAccessRecoveryUsed.add(attemptedAccount.id)
+            let recoveredCredential: ResolvedGatewayCredential
+            try {
+              recoveredCredential = await attemptedResolvedCredential.recoverRejectedAccess(
+                attemptedResolvedCredential.secret,
+              )
+            } catch (recoveryError) {
+              throw gatewayErrorFromProviderFailure(classifyChatGptCredentialRefreshFailure(recoveryError))
+            }
+            if (
+              recoveredCredential.kind !== 'chatgpt-oauth'
+              || recoveredCredential.accountId !== attemptedResolvedCredential.accountId
+            ) {
+              throw new GatewayHttpError(
+                503,
+                'ChatGPT Web WM credential recovery returned an incompatible account identity.',
+                'account_unavailable',
+              )
+            }
+            recoveredWebWmCredential = {
+              accountId: attemptedAccount.id,
+              credential: recoveredCredential,
+            }
+            failedAccountIds.delete(attemptedAccount.id)
+            preferredTransientRetryAccountId = attemptedAccount.id
+            lastAttemptError = gatewayError
+            scheduleProgressLog('retrying')
+            continue
+          }
           const retryable = isRetryable(gatewayError)
           const accountAction = gatewayError.providerFailure?.accountAction
           const modelScopedFailure = isModelScopedProviderFailure(gatewayError.providerFailure)
@@ -3237,6 +3475,28 @@ export class GatewayServer implements GatewayController {
             || (
               isChatGptCodexCredentialKind(attemptedCredentialKind ?? 'api-key')
               && isChatGptTransientStreamFailure(gatewayError)
+            )
+          const requestScopedRateLimitFailure = useWebWmTransport
+            && gatewayError.statusCode === 429
+            && !requestScopedModelFailure
+            && !requestScopedTransientFailure
+          const requestScopedRetryFailure = requestScopedTransientFailure
+            || requestScopedRateLimitFailure
+          const requestTransientRetryLimit = useWebWmTransport
+            ? MAX_WEB_WM_REQUEST_TRANSIENT_RETRIES
+            : MAX_REQUEST_TRANSIENT_RETRIES
+          const transientFailureSignature = requestScopedRetryFailure
+            ? requestTransientFailureSignature(gatewayError)
+            : undefined
+          const requestTransientFailureCountBeforeHandling = requestScopedRetryFailure
+            ? transientFailureSignature === lastRequestTransientFailureSignature
+              ? consecutiveRequestTransientFailures + 1
+              : 1
+            : 0
+          const requestTransientFailureWouldBeFinal = requestScopedRetryFailure
+            && (
+              requestTransientRetriesUsed >= requestTransientRetryLimit
+              || requestTransientFailureCountBeforeHandling >= REQUEST_TRANSIENT_EXPLICIT_FAILURE_COUNT
             )
           const failureNow = this.now()
           const actualResetAt = quotaSignalCooldownUntil(gatewayError.quotaSignals, failureNow)
@@ -3259,7 +3519,8 @@ export class GatewayServer implements GatewayController {
               schedulingPool,
               requestConfig.providers,
               requiredCapabilities,
-              currentExcludedAccountIds()
+              currentExcludedAccountIds(),
+              webWmPool,
             )
           const hasCompactFallbackPeer = attemptedAccount !== undefined
             && codexCompactV2
@@ -3317,7 +3578,10 @@ export class GatewayServer implements GatewayController {
               continue
             }
           }
-          const provenAccountFailure = !requestScopedTransientFailure && gatewayError.type !== 'kiro_invalid_state' && (
+          const provenAccountFailure = (
+            !requestScopedRetryFailure
+              || (requestScopedRateLimitFailure && requestTransientFailureWouldBeFinal)
+          ) && gatewayError.type !== 'kiro_invalid_state' && (
             retryable
               || accountAction === 'disable'
               || accountAction === 'cooldown'
@@ -3365,21 +3629,35 @@ export class GatewayServer implements GatewayController {
               this.scheduler.recordStickyFailure(schedulingPool.id, sessionId, attemptedAccount.id)
             }
           }
-          if (attemptedAccount && requestScopedTransientFailure) {
-            const signature = requestTransientFailureSignature(gatewayError)
+          if (attemptedAccount && requestScopedRetryFailure) {
+            const signature = transientFailureSignature!
             if (signature === lastRequestTransientFailureSignature) {
               consecutiveRequestTransientFailures += 1
             } else {
               lastRequestTransientFailureSignature = signature
               consecutiveRequestTransientFailures = 1
             }
-            const retryDelayMs = Math.min(2_000, Math.max(
-              100,
-              gatewayError.providerFailure?.retryAfterMs ?? 500
-            ))
+            const usesFixedRequestRetryDelay = useWebWmTransport && (
+              requestScopedRateLimitFailure
+                || gatewayError.providerFailure?.scope === 'request'
+            )
+            const retryDelayMs = usesFixedRequestRetryDelay
+              ? this.requestTransientRetryDelayMs
+              : Math.min(2_000, Math.max(
+                  100,
+                  gatewayError.providerFailure?.retryAfterMs ?? 500
+                ))
+            if (
+              usesFixedRequestRetryDelay
+              && !requestTransientDeadlineExtended
+              && retryDelayMs > 0
+            ) {
+              responseStartDeadlineAt += retryDelayMs * requestTransientRetryLimit
+              requestTransientDeadlineExtended = true
+            }
             if (
               consecutiveRequestTransientFailures < REQUEST_TRANSIENT_EXPLICIT_FAILURE_COUNT
-              && requestTransientRetriesUsed < MAX_REQUEST_TRANSIENT_RETRIES
+              && requestTransientRetriesUsed < requestTransientRetryLimit
               && !response.headersSent
               && this.now() + retryDelayMs < responseStartDeadlineAt
             ) {
@@ -3390,6 +3668,9 @@ export class GatewayServer implements GatewayController {
               // health: overload/slow_down is request-scoped capacity noise.
               if (hasCurrentModeAlternative) {
                 failedAccountIds.add(attemptedAccount.id)
+                if (requestScopedRateLimitFailure) {
+                  this.scheduler.recordStickyFailure(schedulingPool.id, sessionId, attemptedAccount.id)
+                }
                 preferredTransientRetryAccountId = undefined
               } else {
                 // The peer set may be exhausted after two different accounts
@@ -3406,9 +3687,8 @@ export class GatewayServer implements GatewayController {
               await waitForRetryDelay(retryDelayMs, clientAbortController.signal)
               continue
             }
-            // Capacity shedding is not an account-health signal. Exclude the
-            // exhausted member only from this request so a peer may try, but
-            // keep its circuit, persisted status and future sticky sessions.
+            // Request-scoped shedding is not an account-health signal. An
+            // ordinary 429 reaches account health only after the third attempt.
             if (
               consecutiveRequestTransientFailures < REQUEST_TRANSIENT_EXPLICIT_FAILURE_COUNT
               && hasCurrentModeAlternative
@@ -3469,16 +3749,9 @@ export class GatewayServer implements GatewayController {
             && !response.headersSent
             && retryable
             && attemptedAccount !== undefined
-            // Request-scoped overload/slow_down has its own strict
-            // same-error budget. Do not let the ordinary pool retry budget
-            // turn the third identical failure into a fourth hidden attempt.
-            && !(
-              requestScopedTransientFailure
-              && (
-                consecutiveRequestTransientFailures >= REQUEST_TRANSIENT_EXPLICIT_FAILURE_COUNT
-                || requestTransientRetriesUsed >= MAX_REQUEST_TRANSIENT_RETRIES
-              )
-            )
+            // These failures already consumed their strict three-attempt
+            // request-local budget. Never leak into the ordinary pool budget.
+            && !requestScopedRetryFailure
             // A Claude tool-result continuation belongs to the source that
             // emitted the matching tool_use. Retrying it through another
             // account/relay can detach stateful Anthropic-compatible bridges
@@ -3486,7 +3759,7 @@ export class GatewayServer implements GatewayController {
             // invalid-state recovery path and is intentionally unaffected.
             && !(anthropicToolTurn.hasToolResult && !kiroClaudeRoute)
             && this.now() < responseStartDeadlineAt
-            && (!(requestScopedModelFailure || requestScopedTransientFailure) || hasCurrentModeAlternative)
+            && (!(requestScopedModelFailure || requestScopedRetryFailure) || hasCurrentModeAlternative)
             && (hasCurrentModeAlternative || (!hardAccountFailure && !explicitRetryAfterAdmissionFailure))
           const attemptedAccountId = attemptedAccount?.id
           const sameSourceCanUseOrdinaryResponses = attemptedProvider?.protocol === 'openai-responses'
@@ -4758,10 +5031,13 @@ export class GatewayServer implements GatewayController {
     signals: NormalizedQuotaSignals,
     observedAt: number,
     selectedHealthRevision?: number,
-    selectedResetEpoch?: number
+    selectedResetEpoch?: number,
+    deferCooldown = false
   ): number | undefined {
     const quota = observedQuotaSignals(signals, observedAt)
     if (
+      deferCooldown
+      ||
       !genericQuotaExhausted(quota.quota, observedAt)
     ) return selectedHealthRevision
 
@@ -5028,6 +5304,9 @@ function classifyIncomingRoute(pathname: string): IncomingRoute | undefined {
     return { protocol: 'anthropic-messages', operation: 'count-tokens' }
   }
   if (pathname === '/v1/responses') return { protocol: 'openai-responses', operation: 'generate' }
+  if (pathname === '/v1/responses/input_tokens') {
+    return { protocol: 'openai-responses', operation: 'responses-input-tokens' }
+  }
   if (pathname === '/v1/responses/compact') return { protocol: 'openai-responses', operation: 'codex-compact' }
   if (pathname === '/v1/alpha/search') return { protocol: 'openai-responses', operation: 'codex-search' }
   if (pathname === '/grokbuild/v1/responses') {
@@ -5038,12 +5317,18 @@ function classifyIncomingRoute(pathname: string): IncomingRoute | undefined {
   }
   if (pathname === '/v1/chat/completions') return { protocol: 'openai-chat', operation: 'generate' }
   if (pathname === '/deepseek-harness/v1/chat/completions') {
-    return { protocol: 'openai-chat', operation: 'generate', client: 'deepseek-harness' }
+    // Keep the legacy Chat body shape available to older Harness builds, but
+    // authenticate it against the Responses-native DSH route token.
+    return {
+      protocol: 'openai-chat',
+      authenticationProtocol: 'openai-responses',
+      operation: 'generate',
+      client: 'deepseek-harness',
+    }
   }
   if (pathname === '/deepseek-harness/v1/responses') {
     return {
       protocol: 'openai-responses',
-      authenticationProtocol: 'openai-chat',
       operation: 'generate',
       client: 'deepseek-harness',
     }
@@ -5051,7 +5336,6 @@ function classifyIncomingRoute(pathname: string): IncomingRoute | undefined {
   if (pathname === '/deepseek-harness/anthropic/v1/messages') {
     return {
       protocol: 'openai-responses',
-      authenticationProtocol: 'openai-chat',
       operation: 'codex-search',
       client: 'deepseek-harness',
       deepSeekHarnessSearch: true,
@@ -5113,6 +5397,7 @@ function enumerablePoolModels(
   accounts: readonly Account[],
   providers: ReadonlyMap<string, ProviderDefinition>
 ): string[] {
+  if (isChatGptWebWmPoolProtocol(pool.protocol)) return [GPT_5_6_SOL_WM_MODEL]
   const availableModels = uniqueModels(accounts.flatMap((account) => {
     if (account.modelPolicy === 'selected') return account.modelAllowlist
     if (account.modelsRefreshedAt !== undefined) return account.availableModels
@@ -5391,7 +5676,11 @@ interface ReadRawBodyResult {
 function requestBodyPolicy(route: Route, incoming: IncomingRoute): RequestBodyPolicy {
   const largeCodexBody = isResponsesAgentClient(route.client)
     && incoming.protocol === 'openai-responses'
-    && (incoming.operation === 'generate' || incoming.operation === 'codex-compact')
+    && (
+      incoming.operation === 'generate'
+      || incoming.operation === 'responses-input-tokens'
+      || incoming.operation === 'codex-compact'
+    )
   const largeDeepSeekHarnessBody = route.client === 'deepseek-harness'
     && (
       incoming.operation === 'generate'
@@ -6407,6 +6696,11 @@ function isCompactContextOverflow(statusCode: number, payload: JsonObject | unde
   }
   return /context[_ -]?(?:length|window)[_ -]?(?:exceeded|overflow)/.test(description)
     || /(?:prompt|input|request)[_ -]?(?:too[_ -]?long|too[_ -]?large)/.test(description)
+    // ChatGPT's Responses endpoint reports the hard per-request item cap as
+    // an ordinary 400 (for example: "array too long ... maximum length
+    // 16384"). Treat this as context pressure so DSH can invoke its normal
+    // lossless compaction/retry path instead of surfacing a generic 400.
+    || /\binput\b[^\n]{0,220}array\s+too\s+long[^\n]{0,220}maximum\s+length\s+\d+/.test(description)
     || /maximum context length/.test(description)
     || /context window[^\n]{0,120}(?:exceed|too (?:long|large)|overflow)/.test(description)
     || /(?:prompt|input)[^\n]{0,120}(?:exceeds?|over)[^\n]{0,80}(?:token|context|limit|maximum)/.test(description)
@@ -6971,6 +7265,10 @@ function copyCompactRequestHeaders(source: IncomingMessage, target: Headers, cli
     ? GROKBUILD_COMPACT_PASSTHROUGH_HEADERS
     : COMPACT_PASSTHROUGH_HEADERS
   for (const name of allowed) {
+    // Codex provider builders already replace identity-bearing values with
+    // account-scoped pseudonyms. Native compact must not overwrite those
+    // values with the raw client headers while copying protocol state.
+    if (target.has(name) && name !== 'x-oai-attestation') continue
     const value = source.headers[name]
     const first = Array.isArray(value) ? value[0] : value
     if (typeof first === 'string' && first.trim()) target.set(name, first.trim())
@@ -10715,6 +11013,7 @@ function isRetryable(error: GatewayHttpError): boolean {
 }
 
 function requestTransientFailureSignature(error: GatewayHttpError): string {
+  if (error.statusCode === 429) return 'request-transient-capacity'
   if (error.providerFailure?.scope === 'request') {
     // HTTP and SSE overload envelopes do not carry the same wire fields (the
     // former is normalized before it reaches this loop), so key them by the
@@ -10853,6 +11152,8 @@ const MODEL_SCOPED_RATE_LIMIT_ERROR_CODES = new Set([
   'model_rate_limit_exceeded',
 ])
 
+const CHATGPT_CODEX_UNSUPPORTED_MODEL_DETAIL = /^The '[^'\r\n]{1,256}' model is not supported when using Codex with a ChatGPT account\.$/
+
 interface ModelScopedProviderFailure extends ProviderFailure {
   readonly scope: 'model'
   readonly modelCooldownReason: 'not-found' | 'permission' | 'plan-restricted' | 'rate-limit'
@@ -10870,13 +11171,18 @@ function modelScopedProviderFailure(
   const code = error ? providerErrorCode(error) : ''
   const parameter = error ? normalizedProviderErrorField(error.param) : ''
   const declaredScope = error ? normalizedProviderErrorField(error.scope) : ''
+  const unsupportedChatGptModel = typeof payload.detail === 'string'
+    && CHATGPT_CODEX_UNSUPPORTED_MODEL_DETAIL.test(payload.detail.trim())
   const rateLimited = MODEL_SCOPED_RATE_LIMIT_ERROR_CODES.has(code)
     || (statusCode === 429 && (parameter === 'model' || declaredScope === 'model'))
   const planRestricted = MODEL_SCOPED_PLAN_ERROR_CODES.has(code)
   const accessDenied = MODEL_SCOPED_PROVIDER_ERROR_CODES.has(code)
     || ((statusCode === 403 || statusCode === 404) && parameter === 'model')
+    || (statusCode === 400 && unsupportedChatGptModel)
   if (!rateLimited && !planRestricted && !accessDenied) return undefined
-  const notFound = code === 'model_not_found' || code === 'unsupported_model'
+  const notFound = code === 'model_not_found'
+    || code === 'unsupported_model'
+    || unsupportedChatGptModel
   const retryAfterMs = rateLimited ? (parseRetryAfter(headers, now) ?? 5 * 60_000) : undefined
   const modelCooldownReason = rateLimited
     ? 'rate-limit' as const
@@ -10890,7 +11196,9 @@ function modelScopedProviderFailure(
     : planRestricted
       ? 'The requested model is not included in this account plan.'
       : notFound
-        ? 'The requested model is unavailable on this account.'
+        ? unsupportedChatGptModel
+          ? 'The requested model is not supported for this ChatGPT Codex account.'
+          : 'The requested model is unavailable on this account.'
         : 'Provider denied this account access to the requested model.'
   return {
     category: rateLimited ? 'rate_limit' : notFound ? 'not_found' : 'permission',

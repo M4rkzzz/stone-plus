@@ -608,6 +608,56 @@ describe('canonical streaming protocol conversion', () => {
     expect(wire).toContain('"finish_reason":"tool_calls"')
   })
 
+  it('buffers parallel Responses tools for DSH and emits only sanitized complete arguments', () => {
+    const streamEncoder = createCanonicalStreamEncoder('openai-responses', {
+      id: 'dsh.responses.stream',
+      model: 'gpt-recorded',
+      now: () => 1_700_000_000_000,
+      sanitizeDeepSeekHarnessToolArguments: true,
+    })
+    const output = [
+      ...streamEncoder.encode({
+        type: 'tool-call-delta', index: 1, id: 'call_b', name: 'write',
+        arguments: '{"path":"b.txt","metadata":{"justification":"keep"},"sandbox_permissions":"workspace-',
+      }),
+      ...streamEncoder.encode({
+        type: 'tool-call-delta', index: 0, id: 'call_a', name: 'pwsh',
+        arguments: '{"command":"Get-Content a.txt",',
+      }),
+      ...streamEncoder.encode({
+        type: 'tool-call-delta', index: 1,
+        arguments: 'write","justification":"write b"}',
+      }),
+      ...streamEncoder.encode({
+        type: 'tool-call-delta', index: 0,
+        arguments: '"sandbox_permissions":"danger-full-access","justification":"read a"}',
+      }),
+      ...streamEncoder.encode({ type: 'tool-call-complete', index: 0 }),
+      ...streamEncoder.encode({ type: 'tool-call-complete', index: 1 }),
+      ...streamEncoder.encode({ type: 'stop', reason: 'tool_calls' }),
+      ...streamEncoder.encode({ type: 'done' }),
+    ]
+    const wire = new TextDecoder().decode(joinBytes(output))
+
+    expect(wire).not.toContain('sandbox_permissions')
+    expect(wire).not.toContain('danger-full-access')
+    expect(wire).not.toContain('"justification":"write b"')
+    expect(wire).toContain('\\"command\\":\\"Get-Content a.txt\\"')
+    expect(wire).toContain('\\"metadata\\":{\\"justification\\":\\"keep\\"}')
+
+    const events = wire
+      .split('\n')
+      .filter((line) => line.startsWith('data: {'))
+      .map((line) => JSON.parse(line.slice(6)) as Record<string, unknown>)
+    const completed = events.find((event) => event.type === 'response.completed') as {
+      response: { output: Array<{ call_id?: string; arguments?: string }> }
+    }
+    expect(completed.response.output).toEqual([
+      expect.objectContaining({ call_id: 'call_b', arguments: '{"path":"b.txt","metadata":{"justification":"keep"}}' }),
+      expect.objectContaining({ call_id: 'call_a', arguments: '{"command":"Get-Content a.txt"}' }),
+    ])
+  })
+
   it('parses OpenAI Chat SSE across arbitrary chunks, UTF-8 boundaries, usage and [DONE]', () => {
     const recording = [
       'data: {"id":"chat_recorded","object":"chat.completion.chunk","created":1700000000,"model":"gpt-recorded","choices":[{"index":0,"delta":{"role":"assistant","content":"你"},"finish_reason":null}]}\n\n',

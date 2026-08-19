@@ -1241,7 +1241,10 @@ describe('route source FAST state changes', () => {
 
   it('rejects unsupported, official, OAuth, missing, and colliding sources without mutation', () => {
     const state = emptyState()
-    state.pools.push(standardPool('anthropic-pool', 'anthropic-messages', ['account']))
+    state.pools.push(
+      standardPool('anthropic-pool', 'anthropic-messages', ['account']),
+      standardPool('web-wm-pool', 'chatgpt-web-wm', ['account']),
+    )
     state.providers.push(
       {
         id: 'official', name: 'Official', sourceType: 'official-api', kind: 'openai',
@@ -1264,6 +1267,8 @@ describe('route source FAST state changes', () => {
 
     expect(() => setRouteSourceFastModeDraft(state, { sourceId: 'anthropic-pool', enabled: true }, NOW + 1))
       .toThrow(/only by OpenAI Responses and OpenAI Chat/)
+    expect(() => setRouteSourceFastModeDraft(state, { sourceId: 'web-wm-pool', enabled: true }, NOW + 1))
+      .toThrow(/only by OpenAI Responses and OpenAI Chat/)
     expect(() => setRouteSourceFastModeDraft(state, { sourceId: 'official', enabled: true }, NOW + 1))
       .toThrow(/only for relay sources/)
     expect(() => setRouteSourceFastModeDraft(state, { sourceId: 'oauth', enabled: true }, NOW + 1))
@@ -1275,6 +1280,8 @@ describe('route source FAST state changes', () => {
     expect(state).toEqual(before)
 
     expect(() => setRouteSourceFastModeDraft(state, { sourceId: 'anthropic-pool', enabled: false }, NOW + 2))
+      .not.toThrow()
+    expect(() => setRouteSourceFastModeDraft(state, { sourceId: 'web-wm-pool', enabled: false }, NOW + 2))
       .not.toThrow()
     expect(() => setRouteSourceFastModeDraft(state, { sourceId: 'official', enabled: false }, NOW + 3))
       .toThrow(/only for relay sources/)

@@ -7,7 +7,11 @@ import {
   resolveRouteSource,
 } from './route-sources'
 import { clientNativeProtocols } from './types'
-import { GPT_5_6_SOL_WM_MODEL, supportsPoolWmRouting } from './wm-routing'
+import {
+  GPT_5_6_SOL_WM_MODEL,
+  isChatGptWebWmPassthroughModel,
+  isChatGptWebWmPoolProtocol,
+} from './wm-routing'
 import type {
   AppSnapshot,
   RoutePreviewInput,
@@ -40,8 +44,8 @@ export function previewRoute(
     return result(sourceId, route.inboundProtocol, requestedModel, upstreamModel, 0, issues)
   }
   if (routedModel
-    && source.pool.routeToWm === true
-    && supportsPoolWmRouting(source.pool.protocol, source.accounts)) {
+    && isChatGptWebWmPoolProtocol(source.pool.protocol)
+    && !isChatGptWebWmPassthroughModel(routedModel)) {
     upstreamModel = GPT_5_6_SOL_WM_MODEL
   }
   if (sourceId !== route.poolId) {
@@ -83,7 +87,7 @@ export function previewRoute(
   const eligibility = evaluateSourceEligibility({
     accounts: eligibleAccounts,
     providers: snapshot.providers,
-    model: routedModel,
+    model: isChatGptWebWmPoolProtocol(source.pool.protocol) ? undefined : routedModel,
     poolModelPolicy: source.pool.modelPolicy,
     poolModelAllowlist: source.pool.modelAllowlist,
     requiredCapabilities: input.requiredCapabilities,
@@ -100,7 +104,7 @@ export function previewRoute(
     const capabilityOnly = evaluateSourceEligibility({
       accounts: modelEligible,
       providers: snapshot.providers,
-      model: routedModel,
+      model: isChatGptWebWmPoolProtocol(source.pool.protocol) ? undefined : routedModel,
       poolModelPolicy: source.pool.modelPolicy,
       poolModelAllowlist: source.pool.modelAllowlist,
       requiredCapabilities: [capability],

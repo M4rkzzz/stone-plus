@@ -677,7 +677,8 @@ describe('Codex Responses over xAI-compatible relays', () => {
     const gateway = new GatewayServer({
       config: config(port, 'openai-chat'),
       credentialResolver: () => credential,
-      fetchImplementation: upstreamFetch as typeof fetch
+      fetchImplementation: upstreamFetch as typeof fetch,
+      requestTransientRetryDelayMs: 0
     })
     runningServers.push(gateway)
     await gateway.start()

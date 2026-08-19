@@ -34,6 +34,8 @@ export type {
   StreamEncodingOptions
 } from './streaming'
 export type {
+  ChatGptWebWmTransport,
+  ChatGptWebWmTransportRequest,
   CredentialResolver,
   GatewayAccountState,
   GatewayAccountStateHandler,

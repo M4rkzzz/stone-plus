@@ -49,6 +49,25 @@ export type OutboundFetchResolver = (
   proxies: readonly PublicProxyDefinition[]
 ) => typeof fetch
 
+/** Protocol-level Web WM boundary. Gateway code never depends on its runtime implementation. */
+export interface ChatGptWebWmTransportRequest {
+  account: Account
+  pool: Pool
+  /** Authoritative credential resolved for this attempt; never reuse a cached web-session token. */
+  credential: {
+    accessToken: string
+    accountId: string
+  }
+  operation: 'responses' | 'search'
+  body: Record<string, unknown>
+  stream: boolean
+  signal: AbortSignal
+}
+
+export type ChatGptWebWmTransport = (
+  input: ChatGptWebWmTransportRequest,
+) => Promise<Response>
+
 export type GatewayLogHandler = (log: RequestLog) => void
 
 export interface GatewayAccountState {
@@ -121,6 +140,7 @@ export interface GatewayServerOptions {
   /** Optional loopback transport for request replay tests; production uses global fetch. */
   loopbackFetchImplementation?: typeof fetch
   outboundFetchResolver?: OutboundFetchResolver
+  chatGptWebWmTransport?: ChatGptWebWmTransport
   conversationTitleResolver?: ConversationTitleResolver
   loadGrokVideoBindings?: () => Promise<readonly PersistedGrokVideoBinding[]> | readonly PersistedGrokVideoBinding[]
   saveGrokVideoBindings?: (bindings: readonly PersistedGrokVideoBinding[]) => Promise<void>
@@ -128,6 +148,8 @@ export interface GatewayServerOptions {
   saveDeepSeekHarnessModelBindings?: (bindings: readonly PersistedDeepSeekHarnessModelBinding[]) => Promise<void>
   now?: () => number
   random?: () => number
+  /** Web WM retry delay; injectable for deterministic protocol tests. */
+  requestTransientRetryDelayMs?: number
   /** Internal protocol-stall guard; primarily injectable for deterministic tests. */
   responsesProgressIdleTimeoutMs?: number
 }

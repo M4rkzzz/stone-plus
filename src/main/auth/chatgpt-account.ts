@@ -1,5 +1,12 @@
 import { createHash } from 'node:crypto'
 
+export type ChatGptCredentialAuthMode = 'personal-access-token'
+
+// Personal Access Tokens are opaque credentials and do not carry a JWT exp
+// claim. Keep the existing timestamp-based scheduling contract without
+// pretending the token has a short-lived OAuth expiration.
+export const CHATGPT_PERSONAL_ACCESS_TOKEN_EXPIRY = Date.UTC(9999, 11, 31, 23, 59, 59, 999)
+
 export interface ChatGptCredentialBundle {
   accessToken: string
   refreshToken?: string
@@ -8,6 +15,7 @@ export interface ChatGptCredentialBundle {
   userId?: string
   email?: string
   expiresAt: number
+  authMode?: ChatGptCredentialAuthMode
 }
 
 export interface ParsedChatGptAccounts {
@@ -45,7 +53,8 @@ export function parseChatGptAccountImport(content: string, now = Date.now()): Pa
     proxyIds.push(parsedAccount.proxyId)
   }
   if (!accounts.length) throw new Error('No ChatGPT/Codex accounts were found in the import.')
-  const accessTokenOnlyCount = accounts.filter((account) => !account.refreshToken).length
+  const accessTokenOnlyCount = accounts.filter((account) =>
+    !account.refreshToken && account.authMode !== 'personal-access-token').length
   const accessTokenWarning = chatGptAccessTokenOnlyWarning(accessTokenOnlyCount)
   if (accessTokenWarning) warnings.push(accessTokenWarning)
   if (parsedValues.sub2Api) {
@@ -74,6 +83,7 @@ export function deserializeChatGptCredential(value: string): ChatGptCredentialBu
       ...(validString(parsed.idToken) ? { idToken: parsed.idToken.trim() } : {}),
       ...(validString(parsed.userId) ? { userId: parsed.userId.trim() } : {}),
       ...(validString(parsed.email) ? { email: parsed.email.trim() } : {}),
+      ...(parsed.authMode === 'personal-access-token' ? { authMode: parsed.authMode } : {}),
     }
     const userId = chatGptUserId(bundle)
     return userId && !bundle.userId ? { ...bundle, userId } : bundle
@@ -131,6 +141,7 @@ function parseAccount(value: unknown): { bundle: ChatGptCredentialBundle; repair
     ?? (typeof value === 'string' ? value.trim() : '')
   if (!accessToken) throw new Error('ChatGPT account is missing access_token.')
   const claims = jwtClaims(accessToken)
+  const personalAccessToken = isPersonalAccessTokenImport(object, accessToken)
   const auth = objectValue(claims?.['https://api.openai.com/auth'])
   const profile = objectValue(claims?.['https://api.openai.com/profile'])
   const idToken = firstString(
@@ -171,6 +182,7 @@ function parseAccount(value: unknown): { bundle: ChatGptCredentialBundle; repair
     ['extra', 'expired'], ['extra', 'expires_at']
   )
     ?? (numberValue(claims?.exp) ? numberValue(claims?.exp)! * 1000 : undefined)
+    ?? (personalAccessToken ? CHATGPT_PERSONAL_ACCESS_TOKEN_EXPIRY : undefined)
   if (!expiresAt) throw new Error('ChatGPT account expiration could not be determined.')
   const refreshToken = firstString(
     object,
@@ -204,8 +216,26 @@ function parseAccount(value: unknown): { bundle: ChatGptCredentialBundle; repair
       ...(idToken ? { idToken } : {}),
       ...(userId ? { userId } : {}),
       ...(email ? { email } : {}),
+      ...(personalAccessToken ? { authMode: 'personal-access-token' as const } : {}),
     }
   }
+}
+
+function isPersonalAccessTokenImport(
+  object: Record<string, unknown> | undefined,
+  accessToken: string
+): boolean {
+  if (accessToken.startsWith('at-')) return true
+  const declaredModes = [
+    firstString(object, ['auth_mode'], ['authMode'], ['openai_auth_mode'], ['openaiAuthMode']),
+    firstString(object, ['credentials', 'auth_mode'], ['credentials', 'authMode'],
+      ['credentials', 'openai_auth_mode'], ['credentials', 'openaiAuthMode']),
+    firstString(object, ['extra', 'auth_provider'], ['extra', 'import_source'], ['extra', 'source'])
+  ]
+  return declaredModes.some((value) => {
+    const normalized = value?.toLowerCase().replace(/[^a-z0-9]/g, '')
+    return normalized === 'personalaccesstoken' || normalized === 'codexpersonalaccesstoken'
+  })
 }
 
 /**

@@ -35,6 +35,7 @@ const stone: GatewayApi = {
   refreshAccountModels: (id) => ipcRenderer.invoke('stone:refresh-account-models', id),
   openChatGptWebLogin: (id) => ipcRenderer.invoke('stone:open-chatgpt-web-login', id),
   openChatGptCodexApp: (id) => ipcRenderer.invoke('stone:open-chatgpt-codex-app', id),
+  verifyChatGptWebWmAccount: (accountId, progressId) => ipcRenderer.invoke('stone:verify-chatgpt-web-wm-account', accountId, progressId),
   testAccountModel: (accountId, model) => ipcRenderer.invoke('stone:test-account-model', accountId, model),
   importChatGptAccounts: (input) => ipcRenderer.invoke('stone:import-chatgpt-accounts', input),
   importGrokAccounts: (input) => ipcRenderer.invoke('stone:import-grok-accounts', input),
@@ -227,6 +228,13 @@ const stone: GatewayApi = {
     }
     ipcRenderer.on('stone:runtime-delta', handler)
     return () => ipcRenderer.removeListener('stone:runtime-delta', handler)
+  },
+  onChatGptWebWmVerificationProgress: (listener) => {
+    const handler = (_event: Electron.IpcRendererEvent, progress: Parameters<typeof listener>[0]) => {
+      listener(progress)
+    }
+    ipcRenderer.on('stone:chatgpt-web-wm-verification-progress', handler)
+    return () => ipcRenderer.removeListener('stone:chatgpt-web-wm-verification-progress', handler)
   },
   onManagedClientInstancesChanged: (listener) => {
     const handler = (_event: Electron.IpcRendererEvent, instances: Awaited<ReturnType<GatewayApi['listManagedClientInstances']>>) => {

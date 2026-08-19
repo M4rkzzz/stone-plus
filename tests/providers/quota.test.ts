@@ -302,6 +302,28 @@ describe('Codex quota extraction', () => {
     })
   })
 
+  it('trusts the explicit upstream decision over a full informational meter', () => {
+    const allowed = extractCodexQuotaFromUsagePayload({
+      rate_limit: {
+        allowed: true,
+        limit_reached: false,
+        rate_limit_reached_type: null,
+        primary_window: { used_percent: 100, limit_window_seconds: 5 * 60 * 60 }
+      }
+    }, now)
+    expect(allowed?.rateLimitReachedType).toBeNull()
+    expect(codexQuotaIsExhausted(allowed!, now)).toBe(false)
+
+    const exhausted = extractCodexQuotaFromUsagePayload({
+      rate_limit: {
+        rate_limit_reached_type: 'workspace_member_usage_limit_reached',
+        primary_window: { used_percent: 42, limit_window_seconds: 5 * 60 * 60 }
+      }
+    }, now)
+    expect(exhausted?.rateLimitReachedType).toBe('workspace_member_usage_limit_reached')
+    expect(codexQuotaIsExhausted(exhausted!, now)).toBe(true)
+  })
+
   it('accepts a partial WHAM response, falls back from null reset_at, and ignores null windows', () => {
     expect(extractCodexQuotaFromUsagePayload({
       rate_limit: {

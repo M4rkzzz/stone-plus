@@ -50,6 +50,11 @@ import type { AgentLifecycleSnapshot, AgentTarget } from '@shared/agent-lifecycl
 import { clientNativeProtocols } from '@shared/types'
 import { enumerateRouteSourceModels, listRouteSourcesForClient, resolveRouteSource } from '@shared/route-sources'
 import {
+  CHATGPT_WEB_WM_POOL_PROTOCOL,
+  MINIMUM_CODEX_DESKTOP_WEB_WM_VERSION,
+  codexDesktopWebWmUpdateRequired,
+} from '@shared/wm-routing'
+import {
   buildClientConfigWorkbenchPreview,
   clientRouteSelectionDisabled,
   clientSettingOptionClassName,
@@ -91,7 +96,7 @@ interface AgentInstallMeta {
 
 const agentInstallMeta: Record<AgentTarget, AgentInstallMeta> = {
   'codex-desktop': {
-    name: 'ChatGPT Desktop',
+    name: 'Codex Desktop',
     client: 'codex',
     surface: 'desktop',
     channel: ['OpenAI 官方获取页面', 'Official OpenAI download page'],
@@ -1146,6 +1151,8 @@ export function ClientsView({
   const gatewayHost = snapshot.gateway.host.includes(':') ? `[${snapshot.gateway.host}]` : snapshot.gateway.host
   const gatewayAddress = `http://${gatewayHost}:${snapshot.gateway.port}`
   const routeHealthy = Boolean(route?.enabled && route.localToken && routeCompatible && resolvedRouteSource && currentSourceAvailable)
+  const webWmRouteSelected = activeClient === 'codex'
+    && resolvedRouteSource?.summary.protocol === CHATGPT_WEB_WM_POOL_PROTOCOL
   const connectionReady = configHealth === 'healthy' && routeHealthy && snapshot.gatewayStatus.running
   const connectionSummary = configHealth === 'checking'
     ? t('正在检查连接', 'Checking connection')
@@ -1192,11 +1199,22 @@ export function ClientsView({
           const starting = busy === `start-${target}` || item?.busyAction === 'start'
           const isDesktopDownload = target === 'codex-desktop'
           const isClaudeDesktop = target === 'claude-code-desktop'
+          const desktopUpdateRequired = isDesktopDownload
+            && webWmRouteSelected
+            && codexDesktopWebWmUpdateRequired(item?.version)
+          const desktopUpdateMessage = desktopUpdateRequired
+            ? t(
+                `当前 Codex Desktop ${item?.version ?? ''} 不支持 Web WM；请更新到 ${MINIMUM_CODEX_DESKTOP_WEB_WM_VERSION} 或更高版本后重新检测。`,
+                `Codex Desktop ${item?.version ?? ''} does not support Web WM. Update to ${MINIMUM_CODEX_DESKTOP_WEB_WM_VERSION} or newer, then check again.`,
+              )
+            : undefined
           const launchOnly = itemMeta.launchOnly === true
           const opensRunningInstance = Boolean(item?.running && item.capabilities.canOpenWhenRunning)
           const itemError = item?.error ? localizedLifecycleError(item.error, t) : agentCheckError
           const statusLabel = !item
             ? t('正在检测', 'Checking')
+            : desktopUpdateRequired
+              ? t('需要更新', 'Update required')
             : item.installed
               ? isClaudeDesktop
                 ? item.configured
@@ -1206,11 +1224,11 @@ export function ClientsView({
                   ? t('运行中', 'Running')
                   : t('已安装', 'Installed')
               : t('未安装', 'Not installed')
-          const description = !item?.installed
+          const description = desktopUpdateMessage ?? (!item?.installed
             ? isClaudeDesktop
               ? t('将打开 Claude 官方下载页；Stone+ 不会静默安装，完成安装后请返回重新检测。', 'Opens the official Claude download page. Stone+ does not install it silently; return and check again after installation.')
               : isDesktopDownload
-                ? t('ChatGPT Desktop 内含 Codex；从官方页面获取后 Stone+ 会自动识别。', 'ChatGPT Desktop includes Codex; Stone+ detects it automatically after installation.')
+                ? t('从官方页面获取 Codex Desktop 后，Stone+ 会自动识别。', 'Stone+ detects Codex Desktop automatically after installation from the official page.')
                 : target === 'deepseek-harness'
                   ? t('固定安装官方 0.1.0-rc.6，写入当前 Stone+ 路由并启动本地工作台。需要 Node.js 22.19 或更高兼容版本。', 'Installs the pinned official 0.1.0-rc.6 release, writes the current Stone+ route, and launches the local workbench. A compatible Node.js 22.19 or newer release is required.')
                   : t('打开官方安装指引；完成安装后返回此处重新检测。', 'Open the official installation guide, then return here and check again after installation.')
@@ -1222,7 +1240,7 @@ export function ClientsView({
                 ? t(...itemMeta.configuration)
                 : item.running
                   ? t('客户端已就绪，无需额外设置。', 'The client is ready with no additional setup required.')
-                  : t('检测完成，可以直接启动。', 'Detection complete. The client is ready to launch.')
+                  : t('检测完成，可以直接启动。', 'Detection complete. The client is ready to launch.'))
           const installedActionLabel = isClaudeDesktop
             ? item?.configured
               ? t('打开 Code', 'Open Code')
@@ -1245,8 +1263,8 @@ export function ClientsView({
                   <div className="client-install__copy">
                     <div className="client-install__title">
                       <strong>{itemMeta.name}</strong>
-                      <span className={`client-install__status ${itemError ? 'is-error' : item?.installed ? 'is-installed' : item ? 'is-missing' : ''}`}>
-                        {!item ? <LoaderCircle size={12} className="spin" /> : itemError ? <AlertTriangle size={12} /> : item.installed ? <CheckCircle2 size={12} /> : <Download size={12} />}
+                      <span className={`client-install__status ${itemError || desktopUpdateRequired ? 'is-error' : item?.installed ? 'is-installed' : item ? 'is-missing' : ''}`}>
+                        {!item ? <LoaderCircle size={12} className="spin" /> : itemError || desktopUpdateRequired ? <AlertTriangle size={12} /> : item.installed ? <CheckCircle2 size={12} /> : <Download size={12} />}
                         {statusLabel}{item?.version ? ` · v${item.version.replace(/^v/i, '')}` : ''}
                       </span>
                     </div>
@@ -1278,7 +1296,7 @@ export function ClientsView({
                       {t('恢复官方模式', 'Restore official mode')}
                     </button>
                   )}
-                  {!item?.installed ? (
+                  {!item?.installed || desktopUpdateRequired ? (
                     <button
                       className="button button--primary client-install__primary"
                       type="button"
@@ -1288,7 +1306,7 @@ export function ClientsView({
                       {installing
                         ? <LoaderCircle size={16} className="spin" />
                         : target === 'deepseek-harness' ? <Download size={16} /> : <ExternalLink size={16} />}
-                      {t(...itemMeta.installAction)}
+                      {desktopUpdateRequired ? t('更新 Codex', 'Update Codex') : t(...itemMeta.installAction)}
                     </button>
                   ) : (
                     <button
@@ -1309,6 +1327,7 @@ export function ClientsView({
                   : t('正在打开官方安装指引…', 'Opening the official installation guide…')
                 : startProgressLabel}</span></div>}
               {itemError && <div className="client-install__error" role="alert"><AlertTriangle size={15} /><span>{itemError}</span></div>}
+              {!itemError && desktopUpdateMessage && <div className="client-install__error" role="alert"><AlertTriangle size={15} /><span>{desktopUpdateMessage}</span></div>}
               <details className="client-install__advanced">
                 <summary className="client-install__advanced-toggle"><span><SlidersHorizontal size={15} />{t('安装详情', 'Installation details')}</span><ChevronDown size={15} /></summary>
                 <div className="client-install__advanced-body">

@@ -6,7 +6,22 @@ import tseslint from 'typescript-eslint'
 
 export default tseslint.config(
   {
-    ignores: ['node_modules/**', 'out/**', 'dist-web/**', 'release/**', '.artifacts/**']
+    ignores: [
+      'node_modules/**',
+      'out/**',
+      'dist-web/**',
+      'release/**',
+      '.artifacts/**',
+      'temp/**',
+      '_wm_*.cjs',
+      '_wm_*.json',
+      '_native_responses_*.cjs',
+      '_native_responses_*.json',
+      '_codex_app_*.cjs',
+      '_codex_app_*.json',
+      '_reasoning_*.cjs',
+      '_reasoning_*.json'
+    ]
   },
   {
     languageOptions: {

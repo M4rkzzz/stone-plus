@@ -16,6 +16,10 @@ export default defineConfig({
     plugins: [externalizeDepsPlugin()],
     build: {
       rollupOptions: {
+        input: {
+          index: resolve('src/preload/index.ts'),
+          'chatgpt-web-wm': resolve('src/preload/chatgpt-web-wm.ts')
+        },
         output: {
           format: 'cjs',
           entryFileNames: '[name].cjs',

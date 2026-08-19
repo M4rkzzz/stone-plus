@@ -1,4 +1,5 @@
 import type { RequestLog, RouteClient } from '@shared/types'
+import { GPT_5_6_SOL_WM_MODEL } from '@shared/wm-routing'
 import { requestLogSourceLabel } from './account-source-label'
 import { accountDisplayName, conversationDisplayName } from './system-generated-text'
 
@@ -21,8 +22,16 @@ export function formatTokenBillions(totalTokens: number): string {
   return `${digits ? formatted.replace(/\.?0+$/u, '') : formatted}b`
 }
 
-export const displayedRequestFirstByteMs = (log: RequestLog): number | undefined =>
-  log.requestKind === 'compaction' ? undefined : log.upstreamFirstByteMs ?? log.firstTokenMs
+/** Web WM has a protocol-shell first byte; show its first meaningful output. */
+export const displayedRequestFirstTokenMs = (log: RequestLog): number | undefined =>
+  log.requestKind === 'compaction'
+    ? undefined
+    : log.upstreamModel === GPT_5_6_SOL_WM_MODEL
+      ? log.firstTokenMs ?? log.accountFirstTokenMs ?? log.clientFirstWriteMs ?? log.upstreamFirstByteMs
+      : log.upstreamFirstByteMs ?? log.firstTokenMs ?? log.clientFirstWriteMs
+
+/** @deprecated Kept for renderer callers that still use the old helper name. */
+export const displayedRequestFirstByteMs = displayedRequestFirstTokenMs
 
 export function summarizeRequestLogs(logs: readonly RequestLog[]): RequestLogSummary {
   let successCount = 0

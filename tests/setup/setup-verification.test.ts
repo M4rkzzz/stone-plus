@@ -13,7 +13,8 @@ describe('setup route verification', () => {
     expect(claude.url).toBe('http://127.0.0.1:15721/v1/messages')
     expect(new Headers(claude.init.headers).get('x-api-key')).toBe('local-token')
     expect(gemini.url).toContain('/v1beta/models/gemini%2Ftest:generateContent')
-    expect(harness.url).toBe('http://127.0.0.1:15721/deepseek-harness/v1/chat/completions')
+    expect(harness.url).toBe('http://127.0.0.1:15721/deepseek-harness/v1/responses')
+    expect(JSON.parse(String(harness.init.body))).toMatchObject({ model: 'gpt-5.6-sol', input: 'Reply exactly with OK.', max_output_tokens: 16 })
     expect(new Headers(harness.init.headers).get('x-deepseek-harness-session-id')).toMatch(/^stone-setup-/)
   })
 

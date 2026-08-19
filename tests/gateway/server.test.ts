@@ -1045,7 +1045,8 @@ describe('GatewayServer', () => {
     const gateway = new GatewayServer({
       config: gatewayConfig,
       credentialResolver: () => 'anthropic-private',
-      fetchImplementation: upstreamFetch as typeof fetch
+      fetchImplementation: upstreamFetch as typeof fetch,
+      requestTransientRetryDelayMs: 0
     })
     runningServers.push(gateway)
     await gateway.start()
@@ -1140,7 +1141,8 @@ describe('GatewayServer', () => {
     const gateway = new GatewayServer({
       config: gatewayConfig,
       credentialResolver: () => 'anthropic-private',
-      fetchImplementation: upstreamFetch as typeof fetch
+      fetchImplementation: upstreamFetch as typeof fetch,
+      requestTransientRetryDelayMs: 0
     })
     runningServers.push(gateway)
     await gateway.start()
@@ -2388,7 +2390,8 @@ describe('GatewayServer', () => {
     const gateway = new GatewayServer({
       config: config(port),
       credentialResolver: (selected) => `key-${selected.id}`,
-      fetchImplementation: upstreamFetch as typeof fetch
+      fetchImplementation: upstreamFetch as typeof fetch,
+      requestTransientRetryDelayMs: 0
     })
     runningServers.push(gateway)
     await gateway.start()
@@ -7899,17 +7902,22 @@ describe('GatewayServer', () => {
     const liteRequest = upstreamFetch.mock.calls[0][1]!
     const liteHeaders = new Headers(liteRequest.headers)
     expect(Object.fromEntries(liteHeaders)).toMatchObject({
-      'session-id': 'session-web-run',
-      'thread-id': 'thread-web-run',
-      'x-client-request-id': 'request-web-run',
       'x-codex-beta-features': 'responses_lite',
-      'x-codex-installation-id': 'install-web-run',
-      'x-codex-parent-thread-id': 'parent-web-run',
-      'x-codex-window-id': 'window-web-run',
       'x-openai-internal-codex-responses-lite': 'true',
       'x-openai-subagent': 'false',
       version: '0.145.2'
     })
+    for (const [name, raw] of [
+      ['session-id', 'session-web-run'],
+      ['thread-id', 'thread-web-run'],
+      ['x-client-request-id', 'request-web-run'],
+      ['x-codex-installation-id', 'install-web-run'],
+      ['x-codex-parent-thread-id', 'parent-web-run'],
+      ['x-codex-window-id', 'window-web-run']
+    ] as const) {
+      expect(liteHeaders.get(name), name).toMatch(/^[0-9a-f-]{36}$/)
+      expect(liteHeaders.get(name), name).not.toBe(raw)
+    }
     expect(JSON.parse(String(liteRequest.body))).toEqual({
       model: 'source-model',
       input: liteInput,
@@ -8885,6 +8893,7 @@ describe('GatewayServer', () => {
       config: config(port),
       credentialResolver: () => 'credential',
       fetchImplementation: upstreamFetch as typeof fetch,
+      requestTransientRetryDelayMs: 0,
       onAccountState: (state) => states.push(state)
     })
     runningServers.push(gateway)
@@ -8913,6 +8922,7 @@ describe('GatewayServer', () => {
       config: gatewayConfig,
       credentialResolver: () => credential,
       fetchImplementation: upstreamFetch as typeof fetch,
+      requestTransientRetryDelayMs: 0,
       onAccountState: (state) => states.push(JSON.stringify(state)),
       onLog: (log) => logs.push(JSON.stringify(log))
     })
@@ -8941,6 +8951,7 @@ describe('GatewayServer', () => {
       config: gatewayConfig,
       credentialResolver: () => 'credential',
       fetchImplementation: upstreamFetch as typeof fetch,
+      requestTransientRetryDelayMs: 0,
       onAccountState: (state) => states.push(state)
     })
     runningServers.push(gateway)
@@ -9563,7 +9574,8 @@ describe('GatewayServer', () => {
       }), {
         status: 429,
         headers: { 'content-type': 'application/json' }
-      })) as typeof fetch
+      })) as typeof fetch,
+      requestTransientRetryDelayMs: 0
     })
     runningServers.push(gateway)
     await gateway.start()
@@ -10738,7 +10750,8 @@ describe('GatewayServer', () => {
     const gateway = new GatewayServer({
       config: gatewayConfig,
       credentialResolver: (selected) => `key-${selected.id}`,
-      fetchImplementation: upstreamFetch as typeof fetch
+      fetchImplementation: upstreamFetch as typeof fetch,
+      requestTransientRetryDelayMs: 0
     })
     runningServers.push(gateway)
     await gateway.start()
@@ -10771,7 +10784,8 @@ describe('GatewayServer', () => {
     const gateway = new GatewayServer({
       config: gatewayConfig,
       credentialResolver: (selected) => `key-${selected.id}`,
-      fetchImplementation: upstreamFetch as typeof fetch
+      fetchImplementation: upstreamFetch as typeof fetch,
+      requestTransientRetryDelayMs: 0
     })
     runningServers.push(gateway)
     await gateway.start()
@@ -11846,6 +11860,7 @@ describe('GatewayServer', () => {
       config: gatewayConfig,
       credentialResolver: () => credential,
       fetchImplementation: upstreamFetch as typeof fetch,
+      requestTransientRetryDelayMs: 0,
       onAccountState: (state) => states.push(state),
       onLog: (log) => upsertLog(logs, log)
     })
@@ -12756,7 +12771,8 @@ describe('GatewayServer', () => {
       fetchImplementation: vi.fn(async () => new Response(wire, {
         status: 200,
         headers: { 'content-type': 'text/event-stream' }
-      })) as typeof fetch
+      })) as typeof fetch,
+      requestTransientRetryDelayMs: 0
     })
     runningServers.push(gateway)
     await gateway.start()

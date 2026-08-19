@@ -169,7 +169,7 @@ describe('ManagedCliRuntimePort', () => {
             client: 'deepseek-harness',
             enabled: true,
             poolId: 'pool-dsh',
-            inboundProtocol: 'openai-chat',
+            inboundProtocol: 'openai-responses',
             modelMap: {},
             localToken: 'stone-dsh-token',
             createdAt: 1,
@@ -195,6 +195,7 @@ describe('ManagedCliRuntimePort', () => {
     expect(ensureInstalled).toHaveBeenCalledWith({
       gatewayBaseUrl: 'http://127.0.0.1:15720',
       credentialFile: 'C:\\profiles\\one\\.env',
+      executablePath: 'C:\\tools\\dsh.cmd',
     })
     expect(save).toHaveBeenCalledWith(expect.objectContaining({
       id: existing.id,

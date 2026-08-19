@@ -147,7 +147,7 @@ describe('setup routing transaction', () => {
     })
     expect(harnessDraft.routes[0]).toMatchObject({
       client: 'deepseek-harness',
-      inboundProtocol: 'openai-chat',
+      inboundProtocol: 'openai-responses',
       modelMap: {},
     })
 
