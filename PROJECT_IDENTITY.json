@@ -5,8 +5,11 @@
   "canonicalRepository": "https://github.com/M4rkzzz/stone-plus",
   "githubRepository": "M4rkzzz/stone-plus",
   "githubOwner": "M4rkzzz",
-  "authorizedMaintainers": ["M4rkzzz"],
-  "authorizedSigningEmails": ["221565539+M4rkzzz@users.noreply.github.com"],
+  "authorizedMaintainers": ["M4rkzzz", "thok404"],
+  "authorizedSigningEmails": [
+    "221565539+M4rkzzz@users.noreply.github.com",
+    "109383521+thok404@users.noreply.github.com"
+  ],
   "acceptedRepositoryPermissions": ["ADMIN", "MAINTAIN", "WRITE"],
   "license": {
     "name": "StonePlus Source Available License 1.0",

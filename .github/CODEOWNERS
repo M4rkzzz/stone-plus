@@ -1,28 +1,28 @@
 # StonePlus canonical ownership and review routing.
-* @M4rkzzz
+* @M4rkzzz @thok404
 
 # Identity, licensing, provenance, and AI policy require owner review.
-/PROJECT_IDENTITY.json @M4rkzzz
-/LICENSE @M4rkzzz
-/LICENSE_BOUNDARY.md @M4rkzzz
-/LICENSES/ @M4rkzzz
-/NOTICE @M4rkzzz
-/MODIFICATIONS.md @M4rkzzz
-/THIRD_PARTY_NOTICES.md @M4rkzzz
-/TRADEMARKS.md @M4rkzzz
-/SOURCE_ACCESS.md @M4rkzzz
-/AI_USAGE_POLICY.md @M4rkzzz
-/AGENTS.md @M4rkzzz
-/CLAUDE.md @M4rkzzz
-/GEMINI.md @M4rkzzz
-/.github/copilot-instructions.md @M4rkzzz
-/.github/workflows/ @M4rkzzz
-/scripts/verify-maintainer.mjs @M4rkzzz
-/build/signing/ @M4rkzzz
+/PROJECT_IDENTITY.json @M4rkzzz @thok404
+/LICENSE @M4rkzzz @thok404
+/LICENSE_BOUNDARY.md @M4rkzzz @thok404
+/LICENSES/ @M4rkzzz @thok404
+/NOTICE @M4rkzzz @thok404
+/MODIFICATIONS.md @M4rkzzz @thok404
+/THIRD_PARTY_NOTICES.md @M4rkzzz @thok404
+/TRADEMARKS.md @M4rkzzz @thok404
+/SOURCE_ACCESS.md @M4rkzzz @thok404
+/AI_USAGE_POLICY.md @M4rkzzz @thok404
+/AGENTS.md @M4rkzzz @thok404
+/CLAUDE.md @M4rkzzz @thok404
+/GEMINI.md @M4rkzzz @thok404
+/.github/copilot-instructions.md @M4rkzzz @thok404
+/.github/workflows/ @M4rkzzz @thok404
+/scripts/verify-maintainer.mjs @M4rkzzz @thok404
+/build/signing/ @M4rkzzz @thok404
 
 # Official application and release entry points.
-/package.json @M4rkzzz
-/package-lock.json @M4rkzzz
-/src/main/index.ts @M4rkzzz
-/src/preload/index.ts @M4rkzzz
-/src/renderer/src/ui.tsx @M4rkzzz
+/package.json @M4rkzzz @thok404
+/package-lock.json @M4rkzzz @thok404
+/src/main/index.ts @M4rkzzz @thok404
+/src/preload/index.ts @M4rkzzz @thok404
+/src/renderer/src/ui.tsx @M4rkzzz @thok404
