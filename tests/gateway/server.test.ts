@@ -6774,8 +6774,8 @@ describe('GatewayServer', () => {
     ])
   })
 
-  it.each(['upstream failed', 'Upstream request failed'])
-    ('falls back when a relay wraps a compact origin failure as generic JSON: %s', async (message) => {
+  it.each(['upstream failed', 'Upstream request failed'])(
+    'falls back when a relay wraps a compact origin failure as generic JSON: %s', async (message) => {
       const port = await freePort()
       const gatewayConfig = config(port)
       gatewayConfig.providers[0] = {
