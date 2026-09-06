@@ -3005,7 +3005,7 @@ export class GatewayServer implements GatewayController {
             release = undefined
             releaseCommittedRequestBody()
             const written = await writeBufferedResponsesStream(
-              upstreamResponse,
+              compactV2FallbackResponse(upstreamResponse.status),
               response,
               compactStream.chunks,
               sensitiveValues(resolvedCredential).filter((value) => (
@@ -6218,9 +6218,9 @@ function hasCodexOpaqueCompactHistory(body: JsonObject): boolean {
   })
 }
 
-function compactV2FallbackResponse(): Response {
+function compactV2FallbackResponse(status = 200): Response {
   return new Response(null, {
-    status: 200,
+    status,
     headers: {
       'content-type': 'text/event-stream; charset=utf-8',
       'cache-control': 'no-cache',
@@ -7547,13 +7547,17 @@ function upstreamResponseTooLargeError(): GatewayHttpError {
 async function readBoundedCompactFallbackJson(
   response: Response,
   signal: AbortSignal | undefined,
-  idleTimeoutMs: number
+  idleTimeoutMs: number,
+  timing?: CompactV2TimingCallbacks
 ): Promise<JsonObject> {
   if (!response.body) return readUpstreamJson(response, signal)
   const reader = response.body.getReader()
   const chunks: Buffer[] = []
   let totalBytes = 0
   let reachedEof = false
+  // A partial JSON document has no validated semantic progress. Bound its
+  // collection even if the peer keeps sending whitespace or tiny fragments.
+  const deadlineAt = timing ? Date.now() + timing.progressIdleTimeoutMs : undefined
   try {
     let result = await readFirstStreamChunk(reader, idleTimeoutMs, signal)
     for (;;) {
@@ -7562,6 +7566,8 @@ async function readBoundedCompactFallbackJson(
         break
       }
       if (result.value?.byteLength) {
+        if (totalBytes === 0) timing?.onFirstByte?.()
+        timing?.onChunk?.(result.value.byteLength)
         totalBytes += result.value.byteLength
         if (totalBytes > MAX_COMPACT_V2_STREAM_BYTES) {
           throw new GatewayHttpError(
@@ -7572,7 +7578,16 @@ async function readBoundedCompactFallbackJson(
         }
         chunks.push(Buffer.from(result.value))
       }
-      result = await readIdleStreamChunk(reader, idleTimeoutMs, signal)
+      const remainingMs = deadlineAt === undefined ? idleTimeoutMs : deadlineAt - Date.now()
+      if (remainingMs <= 0) throw responsesProgressTimeoutError(timing!.progressIdleTimeoutMs)
+      try {
+        result = await readIdleStreamChunk(reader, Math.min(idleTimeoutMs, remainingMs), signal)
+      } catch (error) {
+        if (timing && remainingMs < idleTimeoutMs && isStreamIdleTimeout(error)) {
+          throw responsesProgressTimeoutError(timing.progressIdleTimeoutMs)
+        }
+        throw error
+      }
     }
   } finally {
     if (!reachedEof) cancelStreamReader(reader)
@@ -8241,6 +8256,16 @@ async function collectCodexCompactV2Upstream(
   upstream: Response,
   timing: CompactV2TimingCallbacks
 ): Promise<BufferedCompactV2Stream> {
+  const inspected = await inspectCompactFallbackResponse(
+    upstream, 'openai-responses', timing.signal, timing.firstBodyTimeoutMs
+  )
+  upstream = inspected.response
+  if (inspected.kind === 'json') {
+    const payload = await readBoundedCompactFallbackJson(
+      upstream, timing.signal, timing.idleTimeoutMs, timing
+    )
+    return encodeCompactV2JsonResponse(payload)
+  }
   if (!upstream.body) {
     throw new GatewayHttpError(502, 'Remote compaction stream returned no body', 'upstream_compact_error')
   }
@@ -8342,6 +8367,48 @@ async function collectCodexCompactV2Upstream(
     cancelStreamReader(reader)
     throw error
   }
+}
+
+function encodeCompactV2JsonResponse(payload: JsonObject): BufferedCompactV2Stream {
+  const compactObject = payload.object === 'response.compaction'
+  if (
+    (!compactObject && payload.object !== 'response')
+    || typeof payload.id !== 'string' || !payload.id.trim()
+    || (compactObject
+      ? payload.status !== undefined && payload.status !== 'completed'
+      : payload.status !== 'completed')
+    || (payload.error !== undefined && payload.error !== null)
+    || (payload.incomplete_details !== undefined && payload.incomplete_details !== null)
+    || !isValidCompactReplacementHistory(payload.output)
+  ) {
+    throw new GatewayHttpError(502, 'Remote compaction JSON is not a complete compact response', 'upstream_compact_error')
+  }
+  const output = payload.output as JsonObject[]
+  const compactItems = output.filter((item) => item.type === 'compaction' || item.type === 'compaction_summary')
+  if (compactItems.length !== 1 || output.some((item) => (
+    (item.status !== undefined && item.status !== 'completed')
+    || (item.error !== undefined && item.error !== null)
+  ))) {
+    throw new GatewayHttpError(502, 'Remote compaction JSON must contain exactly one complete compaction item', 'upstream_compact_error')
+  }
+  // A fully received compact JSON object is the success evidence. Translate
+  // its replacement history into the events Codex consumes; never infer
+  // completion from EOF on an SSE stream or from a partial JSON document.
+  const events: JsonObject[] = output.map((item, output_index) => ({
+    type: 'response.output_item.done', sequence_number: output_index, output_index, item,
+  }))
+  events.push({
+    type: 'response.completed',
+    sequence_number: output.length,
+    response: { ...payload, object: 'response', status: 'completed', output: [] },
+  })
+  const wire = Buffer.from(events.map((event) => (
+    `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`
+  )).join(''), 'utf8')
+  if (wire.byteLength > MAX_COMPACT_V2_STREAM_BYTES) {
+    throw new GatewayHttpError(502, 'Remote compaction stream exceeded the gateway safety limit', 'upstream_compact_error')
+  }
+  return { chunks: [wire], usage: extractProtocolUsage('openai-responses', payload) }
 }
 
 class CodexCompactV2SseValidator {

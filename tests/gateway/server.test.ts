@@ -7051,6 +7051,170 @@ describe('GatewayServer', () => {
     expect(upstreamFetch).toHaveBeenCalledTimes(3)
   })
 
+  describe('Compact V2 JSON compatibility', () => {
+    const compactItem = { type: 'compaction', encrypted_content: 'opaque-compact-test' }
+    const userItem = { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Keep this history.' }] }
+    const compactJson = {
+      id: 'resp_compact_json', object: 'response.compaction', created_at: 123,
+      output: [userItem, compactItem],
+      usage: { input_tokens: 7, output_tokens: 3, total_tokens: 10 },
+    }
+
+    async function setup(fetchImplementation: typeof fetch, withPeer = false) {
+      const port = await freePort()
+      const gatewayConfig = config(port, { requestTimeoutSeconds: 1 })
+      gatewayConfig.providers[0] = {
+        ...gatewayConfig.providers[0], sourceType: 'relay', protocol: 'openai-responses',
+        responsesCompactMode: 'native',
+      }
+      gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+      gatewayConfig.pools[0].protocol = 'openai-responses'
+      gatewayConfig.pools[0].maxRetries = withPeer ? 1 : 0
+      if (!withPeer) gatewayConfig.accounts[1].status = 'disabled'
+      const logs: RequestLog[] = []
+      const gateway = new GatewayServer({
+        config: gatewayConfig, credentialResolver: () => 'relay-private-secret', fetchImplementation,
+        responsesProgressIdleTimeoutMs: 250,
+        onLog: (log) => logs.push(log),
+      })
+      runningServers.push(gateway)
+      await gateway.start()
+      const request = (signal?: AbortSignal) => fetch(`http://127.0.0.1:${port}/v1/responses`, {
+        method: 'POST', signal,
+        headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'source-model', input: [{ type: 'compaction_trigger' }], stream: true }),
+      })
+      return { request, logs }
+    }
+
+    it.each(['application/json', 'text/plain', 'text/event-stream'])(
+      'translates fragmented compact JSON labeled %s into complete SSE with history and usage', async (contentType) => {
+        const bytes = new TextEncoder().encode(`\uFEFF \r\n${JSON.stringify(compactJson)}`)
+        const { request, logs } = await setup(vi.fn(async () => new Response(new ReadableStream({
+          start(controller) {
+            for (let offset = 0; offset < bytes.length; offset += 2) controller.enqueue(bytes.slice(offset, offset + 2))
+            controller.close()
+          },
+        }), { headers: { 'content-type': contentType, 'x-codex-turn-state': 'compact-json-state' } })) as typeof fetch)
+        const response = await request()
+        const text = await response.text()
+        expect(response.status, text).toBe(200)
+        expect(response.headers.get('content-type')).toContain('text/event-stream')
+        expect(response.headers.get('x-codex-turn-state')).toBe('compact-json-state')
+        const events = text.split('\n').filter((line) => line.startsWith('data: ')).map((line) => JSON.parse(line.slice(6)))
+        expect(events.map((event) => event.item).filter(Boolean)).toEqual(compactJson.output)
+        expect(events.at(-1)).toMatchObject({
+          type: 'response.completed', sequence_number: 2,
+          response: { id: compactJson.id, object: 'response', status: 'completed', usage: compactJson.usage },
+        })
+        await vi.waitFor(() => expect(logs.at(-1)?.status).toBe('success'))
+        expect(logs.at(-1)).toMatchObject({ statusCode: 200, inputTokens: 7, outputTokens: 3 })
+        expect(logs.at(-1)?.streamedBytes).toBe(bytes.length)
+      }
+    )
+
+    it('accepts completed response JSON and preserves its opaque item without repeating it', async () => {
+      const { request } = await setup(vi.fn(async () => new Response(JSON.stringify({
+        ...compactJson, object: 'response', status: 'completed',
+      }))) as typeof fetch)
+      const response = await request()
+      const text = await response.text()
+      expect(response.status, text).toBe(200)
+      expect(text.match(/opaque-compact-test/g)).toHaveLength(1)
+      expect(text.match(/event: response.completed/g)).toHaveLength(1)
+    })
+
+    it.each([
+      ['truncated', JSON.stringify(compactJson).slice(0, -1)],
+      ['empty history', JSON.stringify({ ...compactJson, output: [] })],
+      ['missing compaction', JSON.stringify({ ...compactJson, output: [userItem] })],
+      ['duplicate compaction', JSON.stringify({ ...compactJson, output: [compactItem, compactItem] })],
+      ['missing opaque content', JSON.stringify({ ...compactJson, output: [{ type: 'compaction' }] })],
+      ['incomplete', JSON.stringify({ ...compactJson, status: 'incomplete' })],
+      ['explicit error', JSON.stringify({ ...compactJson, error: { message: 'private-upstream-error' } })],
+      ['incomplete details', JSON.stringify({ ...compactJson, incomplete_details: { reason: 'max_output_tokens' } })],
+      ['unfinished item', JSON.stringify({ ...compactJson, output: [{ ...compactItem, status: 'in_progress' }] })],
+      ['missing id', JSON.stringify({ ...compactJson, id: '' })],
+      ['ordinary response without completion', JSON.stringify({ ...compactJson, object: 'response' })],
+      ['unknown object', JSON.stringify({ ...compactJson, object: 'unknown' })],
+    ])('rejects %s JSON without emitting success', async (_label, body) => {
+      const { request } = await setup(vi.fn(async () => new Response(body, {
+        headers: { 'content-type': 'application/json' },
+      })) as typeof fetch)
+      const response = await request()
+      const text = await response.text()
+      expect(response.status, text).toBe(502)
+      expect(text).not.toContain('event: response.completed')
+      expect(text).not.toContain('opaque-compact-test')
+      expect(text).not.toContain('private-upstream-error')
+    })
+
+    it('bounds a partial JSON connection and releases its upstream reader', async () => {
+      const cancelled = vi.fn()
+      const { request } = await setup(vi.fn(async () => new Response(new ReadableStream({
+        start(controller) { controller.enqueue(new TextEncoder().encode('{"object":"response.compaction",')) },
+        cancel: cancelled,
+      }))) as typeof fetch)
+      const response = await request()
+      expect(response.status, await response.text()).toBe(504)
+      await vi.waitFor(() => expect(cancelled).toHaveBeenCalledOnce())
+    })
+
+    it('fails over an invalid JSON compact result before committing any history', async () => {
+      let attempts = 0
+      const { request } = await setup(vi.fn(async () => new Response(JSON.stringify(
+        ++attempts === 1 ? { ...compactJson, output: [] } : compactJson
+      ))) as typeof fetch, true)
+      const response = await request()
+      expect(response.status, await response.text()).toBe(200)
+      expect(attempts).toBe(2)
+    })
+
+    it('preserves real SSE even when the upstream labels it as JSON', async () => {
+      const wire = [
+        { type: 'response.output_item.done', item: compactItem },
+        { type: 'response.completed', response: { id: 'resp_sse', status: 'completed', output: [] } },
+      ].map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join('')
+      const { request } = await setup(vi.fn(async () => new Response(wire, {
+        headers: { 'content-type': 'application/json' },
+      })) as typeof fetch)
+      const response = await request()
+      expect(response.status).toBe(200)
+      expect(response.headers.get('content-type')).toContain('text/event-stream')
+      expect(await response.text()).toBe(wire)
+    })
+
+    it('cancels a partial JSON upstream when the client disconnects and logs 499', async () => {
+      const cancelled = vi.fn()
+      const upstreamFetch = vi.fn(async () => new Response(new ReadableStream({
+        start(controller) { controller.enqueue(new TextEncoder().encode('{')) },
+        cancel: cancelled,
+      })))
+      const { request, logs } = await setup(upstreamFetch as typeof fetch)
+      const controller = new AbortController()
+      const pending = request(controller.signal)
+      const rejected = expect(pending).rejects.toMatchObject({ name: 'AbortError' })
+      await vi.waitFor(() => expect(upstreamFetch).toHaveBeenCalledOnce())
+      controller.abort()
+      await rejected
+      await vi.waitFor(() => expect(cancelled).toHaveBeenCalledOnce())
+      await vi.waitFor(() => expect(logs.at(-1)?.statusCode).toBe(499))
+    })
+
+    it('rejects oversized compact JSON and cancels the source', async () => {
+      const cancelled = vi.fn()
+      const { request } = await setup(vi.fn(async () => new Response(new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(`{"padding":"${'x'.repeat(10 * 1024 * 1024)}`))
+        },
+        cancel: cancelled,
+      }))) as typeof fetch)
+      const response = await request()
+      expect(response.status, await response.text()).toBe(502)
+      await vi.waitFor(() => expect(cancelled).toHaveBeenCalledOnce())
+    })
+  })
+
   it('uses native compact creation and endpoint routing for upgraded relay sources', async () => {
     const port = await freePort()
     const gatewayConfig = config(port)
