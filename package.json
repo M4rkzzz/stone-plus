@@ -1,6 +1,6 @@
 {
   "name": "stone-desktop",
-  "version": "0.9.22",
+  "version": "0.9.23",
   "private": true,
   "packageManager": "npm@10.9.3",
   "engines": {

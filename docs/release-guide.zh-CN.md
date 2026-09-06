@@ -57,8 +57,8 @@ Microsoft 公共信任链中，`UnknownError` 或 SmartScreen 提示可以是预
 | DER SHA-256 | `f4ccc82f3ade7eb06f76e55afce698179b37f299fb75ad70e5cec32e0740ca05` |
 | 有效期 | 2026-07-23 至 2029-07-23 |
 | 官方 GitHub 仓库 | `M4rkzzz/stone-plus` |
-| 授权维护者 | `M4rkzzz` |
-| 授权签名邮箱 | `221565539+M4rkzzz@users.noreply.github.com` |
+| 授权维护者 | `M4rkzzz`、`thok404`；以 `PROJECT_IDENTITY.json` 为准 |
+| 授权签名邮箱 | `221565539+M4rkzzz@users.noreply.github.com`、`109383521+thok404@users.noreply.github.com` |
 
 这里存在三层不同的验证，发布公告和验收记录不得混为一谈：
 
@@ -104,7 +104,9 @@ $commitObject = gh api "repos/M4rkzzz/stone-plus/commits/$($tagObject.object.sha
 
 if (-not $tagObject.verification.verified) { throw 'Release tag is not GitHub Verified' }
 if (-not $commitObject.commit.verification.verified) { throw 'Release commit is not GitHub Verified' }
-if ($commitObject.author.login -ne 'M4rkzzz') { throw 'Unexpected release maintainer' }
+$identity = Get-Content -LiteralPath PROJECT_IDENTITY.json -Raw | ConvertFrom-Json
+if ($identity.authorizedMaintainers -notcontains $commitObject.author.login) { throw 'Unexpected release maintainer' }
+if ($identity.authorizedSigningEmails -notcontains $tagObject.tagger.email) { throw 'Unexpected release tagger' }
 ```
 
 证书轮换时必须同时更新 CER、`PROJECT_IDENTITY.json`、`build/signing/README.md`、
@@ -156,7 +158,7 @@ npm run identity:verify
 
 #### `.github/CODEOWNERS`
 
-根规则和显式关键路径必须把审核责任指向 `@M4rkzzz`。至少覆盖：
+根规则和显式关键路径必须把审核责任指向 `@M4rkzzz` 和 `@thok404`。至少覆盖：
 
 - `PROJECT_IDENTITY.json`、根许可证、许可证边界和 `LICENSES/`；
 - `NOTICE`、`MODIFICATIONS.md`、`THIRD_PARTY_NOTICES.md`、`SOURCE_ACCESS.md`；
@@ -165,7 +167,7 @@ npm run identity:verify
 - `.github/workflows/`、`scripts/verify-maintainer.mjs`、`build/signing/`；
 - `package.json`、lockfile 以及应用的 main、preload 和 renderer 关键入口。
 
-发布前检查 CODEOWNERS 不能只确认文件存在，还要确认 `@M4rkzzz` 没有被删除、被更宽泛的后置规则
+发布前检查 CODEOWNERS 不能只确认文件存在，还要确认两名授权维护者没有被删除、被更宽泛的后置规则
 覆盖，或将法律、品牌、身份和发布路径交给未知账号。
 
 #### AI 工具入口文件
@@ -272,7 +274,9 @@ GitHub Actions 必须配置以下内容：
 并保证本机 `user.email` 是 `PROJECT_IDENTITY.json` 中登记的签名邮箱：
 
 ```powershell
-$email = '221565539+M4rkzzz@users.noreply.github.com'
+$email = git config user.email
+$identity = Get-Content -LiteralPath PROJECT_IDENTITY.json -Raw | ConvertFrom-Json
+if ($identity.authorizedSigningEmails -notcontains $email) { throw 'Configure your own authorized signing email first' }
 $signingKey = "$HOME/.ssh/stoneplus_signing"
 if (-not (Test-Path -LiteralPath $signingKey)) {
   ssh-keygen -t ed25519 -a 100 -C $email -f $signingKey
@@ -352,7 +356,7 @@ npm version X.Y.Z --no-git-tag-version
 - 检查 `AI_USAGE_POLICY.md`、`AGENTS.md`、`CLAUDE.md`、`GEMINI.md` 和
   `.github/copilot-instructions.md` 与当前许可证一致，且只允许官方维护或向官方提交私有补丁。
 - 检查 `PROJECT_IDENTITY.json` 中的官方仓库、维护者、许可证 digest、Windows 证书指纹与
-  provenance 工作流准确，`.github/CODEOWNERS` 仍由 `@M4rkzzz` 覆盖法律、身份和发布文件。
+  provenance 工作流准确，`.github/CODEOWNERS` 仍由 `@M4rkzzz` 和 `@thok404` 覆盖法律、身份和发布文件。
 - 检查 `REUSE.toml` 只把 StonePlus 新增且有权授权的文件标记为
   `LicenseRef-StonePlus-Source-Available-1.0`，不得覆盖继承的 Apache 或第三方材料。
 - 第一个源码可见授权正式版的 Release Note 必须明确说明：当前许可证不是开源许可证，禁止修改、
