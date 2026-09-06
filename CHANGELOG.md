@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.21
+
+- 修复原生 Compact V2 收到完整 JSON 压缩结果时，因仅按 SSE 解析而误报缺少终止事件的 502。
+- 根据实际响应内容识别 JSON/SSE，兼容错误 Content-Type、BOM 和分片；将校验通过的压缩 JSON 转换为客户端事件流，保留历史、用量和续接头。
+- 对截断、失败、缺少或重复压缩项继续明确失败；为未完成 JSON 保留体积、等待时限、取消和故障转移保护。
+
 ## 0.9.20
 
 - 将 DeepSeek Harness、WM 路由和 OpenAI Responses 兼容链路整理为隔离的客户端专属通道，

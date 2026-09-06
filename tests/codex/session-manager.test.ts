@@ -271,8 +271,13 @@ describe('CodexSessionManager', () => {
       return originalOpen(path)
     })
 
+    // Windows can reject opening the rebound junction with ENOENT before the
+    // identity guard runs. Both paths must reject the export and preserve the
+    // managed rollout; the filesystem assertions below verify that outcome.
     await expect(manager.export(id, session.revision, join(externalDirectory, 'export.jsonl')))
-      .rejects.toThrow(/destination changed|outside the managed session directories/i)
+      .rejects.toThrow(process.platform === 'win32'
+        ? /destination changed|outside the managed session directories|ENOENT: no such file or directory/i
+        : /destination changed|outside the managed session directories/i)
     await expect(stat(join(sessionDirectory, 'export.jsonl'))).rejects.toMatchObject({ code: 'ENOENT' })
     await expect(readFile(rollout, 'utf8')).resolves.toContain(id)
   })
