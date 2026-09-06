@@ -6639,6 +6639,328 @@ describe('GatewayServer', () => {
     ])
   })
 
+  it('falls back to ordinary Responses when an auto relay compact endpoint has a Cloudflare origin failure', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers[0] = {
+      ...gatewayConfig.providers[0],
+      sourceType: 'relay',
+      kind: 'openai-compatible',
+      baseUrl: 'https://origin-failure.example.test/v1',
+      protocol: 'openai-responses',
+      responsesCompactMode: 'auto'
+    }
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    gatewayConfig.accounts[0].credentialType = 'api-key'
+    gatewayConfig.accounts[1].status = 'disabled'
+    gatewayConfig.pools[0].maxRetries = 2
+    const states: Array<{ accountId: string; status: string }> = []
+    const upstreamFetch = vi.fn(async (input: string | URL | Request) => {
+      if (String(input).endsWith('/responses/compact')) {
+        return new Response(JSON.stringify({
+          status: 502,
+          error_code: 502,
+          error_name: 'origin_bad_gateway',
+          error_category: 'origin',
+          cloudflare_error: true,
+          retryable: true,
+          retry_after: 60,
+          owner_action_required: true
+        }), { status: 502, headers: { 'content-type': 'application/json' } })
+      }
+      return new Response([
+        'event: response.output_text.delta',
+        'data: {"type":"response.output_text.delta","delta":"Summary through ordinary Responses."}',
+        '',
+        'event: response.completed',
+        'data: {"type":"response.completed","response":{"id":"resp_origin_fallback","status":"completed","output":[]}}',
+        '',
+        ''
+      ].join('\n'), { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    })
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'relay-private',
+      fetchImplementation: upstreamFetch as typeof fetch,
+      onAccountState: (state) => states.push(state)
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses/compact`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'source-model',
+        input: [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'compact me' }] },
+          { type: 'local_shell_call', call_id: 'shell-call', command: 'history-marker' },
+        ]
+      })
+    })
+
+    expect(response.status).toBe(200)
+    expect(await response.text()).toContain('Summary through ordinary Responses.')
+    expect(upstreamFetch.mock.calls.map((call) => call[0])).toEqual([
+      'https://origin-failure.example.test/v1/responses/compact',
+      'https://origin-failure.example.test/v1/responses'
+    ])
+    const fallbackBody = JSON.parse(String(upstreamFetch.mock.calls[1][1]?.body)) as Record<string, unknown>
+    expect(fallbackBody).toMatchObject({
+      max_output_tokens: 4_096,
+      reasoning: { effort: 'low' },
+    })
+    expect((fallbackBody.input as Array<Record<string, unknown>>).some((item) => item.type === 'local_shell_call'))
+      .toBe(false)
+    expect(states).not.toContainEqual(expect.objectContaining({ accountId: 'first', status: 'cooldown' }))
+  })
+
+  it('falls back when Cloudflare returns an HTML gateway page for standalone compact', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers[0] = {
+      ...gatewayConfig.providers[0],
+      sourceType: 'relay',
+      kind: 'openai-compatible',
+      baseUrl: 'https://html-origin-failure.example.test/v1',
+      protocol: 'openai-responses',
+      responsesCompactMode: 'auto'
+    }
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    gatewayConfig.accounts[0].credentialType = 'api-key'
+    gatewayConfig.accounts[1].status = 'disabled'
+    gatewayConfig.pools[0].maxRetries = 0
+    const upstreamFetch = vi.fn(async (input: string | URL | Request) => {
+      if (String(input).endsWith('/responses/compact')) {
+        return new Response(
+          '<html><title>502 Bad Gateway</title><body>cloudflare</body></html>',
+          { status: 502, headers: { 'content-type': 'text/html' } }
+        )
+      }
+      return new Response([
+        'event: response.output_text.delta',
+        'data: {"type":"response.output_text.delta","delta":"Summary after HTML gateway fallback."}',
+        '',
+        'event: response.completed',
+        'data: {"type":"response.completed","response":{"id":"resp_html_fallback","status":"completed","output":[]}}',
+        '',
+        ''
+      ].join('\n'), { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    })
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'relay-private',
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses/compact`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'source-model',
+        input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'compact html' }] }]
+      })
+    })
+
+    expect(response.status).toBe(200)
+    expect(await response.text()).toContain('Summary after HTML gateway fallback.')
+    expect(upstreamFetch.mock.calls.map((call) => call[0])).toEqual([
+      'https://html-origin-failure.example.test/v1/responses/compact',
+      'https://html-origin-failure.example.test/v1/responses'
+    ])
+  })
+
+  it.each(['upstream failed', 'Upstream request failed'])(
+    'falls back when a relay wraps a compact origin failure as generic JSON: %s', async (message) => {
+      const port = await freePort()
+      const gatewayConfig = config(port)
+      gatewayConfig.providers[0] = {
+        ...gatewayConfig.providers[0],
+        sourceType: 'relay',
+        kind: 'openai-compatible',
+        baseUrl: 'https://generic-origin-failure.example.test/v1',
+        protocol: 'openai-responses',
+        responsesCompactMode: 'auto'
+      }
+      gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+      gatewayConfig.pools[0].protocol = 'openai-responses'
+      gatewayConfig.accounts[0].credentialType = 'api-key'
+      gatewayConfig.accounts[1].status = 'disabled'
+      gatewayConfig.pools[0].maxRetries = 0
+      const upstreamFetch = vi.fn(async (input: string | URL | Request) => {
+        if (String(input).endsWith('/responses/compact')) {
+          return new Response(JSON.stringify({
+            error: { message, type: 'upstream_error' }
+          }), { status: 502, headers: { 'content-type': 'application/json' } })
+        }
+        return new Response([
+          'event: response.output_text.delta',
+          'data: {"type":"response.output_text.delta","delta":"Summary after generic origin fallback."}',
+          '',
+          'event: response.completed',
+          'data: {"type":"response.completed","response":{"id":"resp_generic_fallback","status":"completed","output":[]}}',
+          '',
+          ''
+        ].join('\n'), { status: 200, headers: { 'content-type': 'text/event-stream' } })
+      })
+      const gateway = new GatewayServer({
+        config: gatewayConfig,
+        credentialResolver: () => 'relay-private',
+        fetchImplementation: upstreamFetch as typeof fetch
+      })
+      runningServers.push(gateway)
+      await gateway.start()
+
+      const response = await fetch(`http://127.0.0.1:${port}/v1/responses/compact`, {
+        method: 'POST',
+        headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+        body: JSON.stringify({
+          model: 'source-model',
+          input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'compact generic json' }] }]
+        })
+      })
+
+      expect(response.status).toBe(200)
+      expect(await response.text()).toContain('Summary after generic origin fallback.')
+      expect(upstreamFetch.mock.calls.map((call) => call[0])).toEqual([
+        'https://generic-origin-failure.example.test/v1/responses/compact',
+        'https://generic-origin-failure.example.test/v1/responses'
+      ])
+    })
+
+  it('bounds every portable fallback text field when history contains an oversized string', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port, { requestTimeoutSeconds: 20 })
+    gatewayConfig.providers[0] = {
+      ...gatewayConfig.providers[0],
+      sourceType: 'relay',
+      kind: 'openai-compatible',
+      baseUrl: 'https://oversized-history.example.test/v1',
+      protocol: 'openai-responses',
+      responsesCompactMode: 'auto'
+    }
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    gatewayConfig.accounts[0].credentialType = 'api-key'
+    gatewayConfig.accounts[1].status = 'disabled'
+    gatewayConfig.pools[0].maxRetries = 0
+    const historyHead = 'OVERSIZED_HISTORY_HEAD_MARKER'
+    const historyTail = 'OVERSIZED_HISTORY_TAIL_MARKER'
+    const oversizedHistory = `${historyHead}${'x'.repeat(10 * 1024 * 1024)}${historyTail}`
+    const requestBodies: Array<Record<string, unknown>> = []
+    const upstreamFetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      requestBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>)
+      if (String(input).endsWith('/responses/compact')) {
+        return new Response(JSON.stringify({ error: { message: 'upstream failed' } }), {
+          status: 502,
+          headers: { 'content-type': 'application/json' }
+        })
+      }
+      return new Response([
+        'event: response.output_text.delta',
+        'data: {"type":"response.output_text.delta","delta":"Summary after oversized history fallback."}',
+        '',
+        'event: response.completed',
+        'data: {"type":"response.completed","response":{"id":"resp_oversized_history","status":"completed","output":[]}}',
+        '',
+        ''
+      ].join('\n'), { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    })
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'relay-private',
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses/compact`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'source-model',
+        input: [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: oversizedHistory }] },
+          { type: 'message', role: 'system', content: [{ type: 'input_text', text: oversizedHistory }] },
+          { type: 'local_shell_call', call_id: 'oversized-shell', command: oversizedHistory }
+        ]
+      })
+    })
+
+    expect(response.status).toBe(200)
+    expect(await response.text()).toContain('Summary after oversized history fallback.')
+    expect(upstreamFetch.mock.calls.map((call) => call[0])).toEqual([
+      'https://oversized-history.example.test/v1/responses/compact',
+      'https://oversized-history.example.test/v1/responses'
+    ])
+    const fallbackBody = requestBodies[1]
+    const textFields: string[] = []
+    const collectTextFields = (value: unknown): void => {
+      if (Array.isArray(value)) {
+        value.forEach(collectTextFields)
+        return
+      }
+      if (!value || typeof value !== 'object') return
+      for (const [key, nested] of Object.entries(value)) {
+        if (key === 'text' && typeof nested === 'string') textFields.push(nested)
+        collectTextFields(nested)
+      }
+    }
+    collectTextFields(fallbackBody)
+    expect(textFields.length).toBeGreaterThanOrEqual(4)
+    expect(textFields.every((text) => Buffer.byteLength(text, 'utf8') < 10 * 1024 * 1024)).toBe(true)
+    expect(textFields.some((text) => (
+      text.includes(historyHead)
+      && text.includes('[...history text truncated...]')
+      && text.includes(historyTail)
+    ))).toBe(true)
+  })
+
+  it('does not fallback for an unrelated JSON 502 from standalone compact', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers[0] = {
+      ...gatewayConfig.providers[0],
+      sourceType: 'relay',
+      kind: 'openai-compatible',
+      baseUrl: 'https://json-origin-failure.example.test/v1',
+      protocol: 'openai-responses',
+      responsesCompactMode: 'auto'
+    }
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    gatewayConfig.accounts[0].credentialType = 'api-key'
+    gatewayConfig.accounts[1].status = 'disabled'
+    gatewayConfig.pools[0].maxRetries = 0
+    const upstreamFetch = vi.fn(async () => new Response(JSON.stringify({
+      error: { message: 'database unavailable', type: 'upstream_error' }
+    }), { status: 502, headers: { 'content-type': 'application/json' } }))
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'relay-private',
+      fetchImplementation: upstreamFetch as typeof fetch
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses/compact`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'source-model',
+        input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'compact json error' }] }]
+      })
+    })
+
+    expect(response.status).toBe(502)
+    expect(await response.json()).toMatchObject({ error: { message: 'database unavailable' } })
+    expect(upstreamFetch).toHaveBeenCalledTimes(1)
+  })
+
   it('uses the same OAuth Responses source when its native compact extension is unavailable', async () => {
     const port = await freePort()
     const gatewayConfig = config(port)
