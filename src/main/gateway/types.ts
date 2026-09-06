@@ -152,6 +152,8 @@ export interface GatewayServerOptions {
   requestTransientRetryDelayMs?: number
   /** Internal protocol-stall guard; primarily injectable for deterministic tests. */
   responsesProgressIdleTimeoutMs?: number
+  /** Transport-only compact heartbeat interval; injectable for protocol tests. */
+  compactKeepaliveIntervalMs?: number
 }
 
 export interface GatewayController {

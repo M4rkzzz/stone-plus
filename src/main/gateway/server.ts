@@ -1,5 +1,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { createHash, randomUUID } from 'node:crypto'
+import { CompactSseKeepalive } from './compact-keepalive'
 import {
   brotliDecompress,
   gunzip,
@@ -438,6 +439,7 @@ export class GatewayServer implements GatewayController {
   private readonly random: () => number
   private readonly requestTransientRetryDelayMs: number
   private readonly responsesProgressIdleTimeoutMs: number
+  private readonly compactKeepaliveIntervalMs: number
   private server?: Server
   private responsesWebSocket?: ResponsesWebSocketAdapter
   private startedAt?: number
@@ -473,6 +475,7 @@ export class GatewayServer implements GatewayController {
       1,
       options.responsesProgressIdleTimeoutMs ?? Number.POSITIVE_INFINITY
     )
+    this.compactKeepaliveIntervalMs = Math.max(0, options.compactKeepaliveIntervalMs ?? 10_000)
     this.requestReplays = new RequestReplayStore({ now: this.now })
     this.requestReplayCaptureEnabled = this.config.settings.logPayloads === true
     this.scheduler = new PoolScheduler(this.now, this.random)
@@ -815,6 +818,10 @@ export class GatewayServer implements GatewayController {
     let upstreamHeadersAt: number | undefined
     let upstreamFirstByteAt: number | undefined
     let clientFirstWriteAt: number | undefined
+    let compactKeepalive: CompactSseKeepalive | undefined
+    let compactTransportError: GatewayHttpError | undefined
+    const hasClientOutput = (): boolean => clientFirstWriteAt !== undefined
+      || (response.headersSent && (!compactKeepalive?.committed || compactKeepalive.locksSource))
     let successfulAttemptStarted: number | undefined
     let liveUsage: NormalizedTokenUsage | undefined
     let streamedBytes = 0
@@ -1799,6 +1806,13 @@ export class GatewayServer implements GatewayController {
           }
           if ((codexCompactV2 || (codexCompact && webWmPool)) && compactFallback) {
             stripCompactRequestHeaders(upstreamHeaders)
+          }
+          if (codexCompactV2 && !compactFallback && provider.protocol === 'openai-responses') {
+            const features = (upstreamHeaders.get('x-codex-beta-features') ?? '')
+              .split(',').map((value) => value.trim()).filter(Boolean)
+            if (!features.includes('remote_compaction_v2')) {
+              upstreamHeaders.set('x-codex-beta-features', [...features, 'remote_compaction_v2'].join(','))
+            }
           }
           const outboundBody = codexSearch || codexCompact || compactFallback
             ? convertedBody
@@ -2989,14 +3003,36 @@ export class GatewayServer implements GatewayController {
           }
 
           if (codexCompactV2) {
-            const compactStream = await collectCodexCompactV2Upstream(upstreamResponse, {
-              firstBodyTimeoutMs,
-              idleTimeoutMs: streamIdleTimeoutMs,
-              progressIdleTimeoutMs: responsesProgressIdleTimeoutMs,
-              signal: clientAbortController.signal,
-              onFirstByte: markUpstreamFirstByte,
-              onChunk: recordStreamChunk
+            compactKeepalive ??= new CompactSseKeepalive(response, this.compactKeepaliveIntervalMs, () => {
+              compactTransportError = new GatewayHttpError(504, 'Compact downstream remained backpressured', 'client_write_timeout')
             })
+            // Stage only the current attempt's headers. They are committed by
+            // the first beat or by the validated output, never by a failed fast attempt.
+            try {
+              copyResponsesResponseHeaders(upstreamResponse.headers, response, logRoute.client)
+            } catch (error) {
+              if (upstreamResponse.body && !upstreamResponse.body.locked) {
+                void upstreamResponse.body.cancel().catch(() => undefined)
+              }
+              throw error
+            }
+            compactKeepalive.start(() => copyResponsesResponseHeaders(upstreamResponse.headers, response, logRoute!.client))
+            const compactWaitMs = streamIdleTimeoutMs * 4
+            const compactDeadline = createAbortDeadline(Math.max(1, responseStartDeadlineAt - this.now()))
+            let compactStream: BufferedCompactV2Stream
+            try {
+              compactStream = await collectCodexCompactV2Upstream(upstreamResponse, {
+                firstBodyTimeoutMs: compactWaitMs,
+                idleTimeoutMs: compactWaitMs,
+                progressIdleTimeoutMs: Math.min(compactWaitMs, this.responsesProgressIdleTimeoutMs),
+                signal: AbortSignal.any([clientAbortController.signal, compactDeadline.signal]),
+                onFirstByte: markUpstreamFirstByte,
+                onChunk: recordStreamChunk
+              })
+            } finally {
+              compactDeadline.clear()
+              compactKeepalive.stop()
+            }
             copyResponsesResponseHeaders(upstreamResponse.headers, response, logRoute.client)
             performanceRevision = this.reportAccountSuccess(
               account, attemptStarted, headerSignals, selectedHealthRevision, selectedResetEpoch
@@ -3746,7 +3782,7 @@ export class GatewayServer implements GatewayController {
             }
           }
           const canRetry = ordinaryRetriesUsed < retryLimit
-            && !response.headersSent
+            && !hasClientOutput()
             && retryable
             && attemptedAccount !== undefined
             // These failures already consumed their strict three-attempt
@@ -3777,7 +3813,7 @@ export class GatewayServer implements GatewayController {
                 && attemptedProvider.protocol === 'openai-responses'
                 && (attemptedProvider.responsesCompactMode === 'auto'
                   || attemptedProvider.responsesCompactMode === 'legacy')))
-            && !response.headersSent
+            && !hasClientOutput()
             && attemptedAccount !== undefined
             && compactFallbackInputUsable
             && this.now() < responseStartDeadlineAt
@@ -3797,7 +3833,7 @@ export class GatewayServer implements GatewayController {
           }
           const canRetryCompactFallbackPeer = codexCompactV2Fallback
             && attemptedCompactFallback
-            && !response.headersSent
+            && !hasClientOutput()
             && attemptedAccount !== undefined
             && hasCurrentModeAlternative
             && compactCompatibilityRetriesUsed < Math.max(1, retryLimit)
@@ -3843,11 +3879,11 @@ export class GatewayServer implements GatewayController {
       // that deterministic 413 as another misleading 499.
       const deterministicBodyFailure = normalizedError.statusCode === 413
         || normalizedError.type === 'request_body_timeout'
-      const gatewayError = deterministicBodyFailure
+      const gatewayError = compactTransportError ?? (deterministicBodyFailure
         ? normalizedError
         : clientAbortController.signal.aborted
           ? new GatewayHttpError(499, 'Client closed the request', 'client_closed')
-          : normalizedError
+          : normalizedError)
       // Authentication happens before the ordinary request-log lifecycle is
       // created. Preserve a credential-free diagnostic only when the URL
       // names a client and that client has exactly one matching enabled route.
@@ -3870,6 +3906,7 @@ export class GatewayServer implements GatewayController {
       // the diagnostic code, but count the terminal record as successful and
       // never feed the incomplete attempt into performance scoring.
       const successfulClientCancellation = !deterministicBodyFailure
+        && !compactTransportError
         && clientAbortController.signal.aborted
       if (clientAbortController.signal.aborted && !deterministicBodyFailure) failureStage = 'client'
       if (gatewayError.type === 'request_body_timeout' && !response.headersSent) {
@@ -3886,14 +3923,23 @@ export class GatewayServer implements GatewayController {
       if (gatewayError.statusCode === 429 || gatewayError.statusCode >= 500) {
         setSafeRetryAfterHeader(response, gatewayError.providerFailure?.retryAfterMs)
       }
-      await this.writeJson(
+      compactKeepalive?.stop()
+      if (compactKeepalive && !response.headersSent) {
+        copyResponsesResponseHeaders(new Headers(), response, logRoute?.client ?? 'codex')
+      }
+      const errorPayload = gatewayErrorResponseBody(incoming.protocol, gatewayError, incoming.operation === 'count-tokens')
+      if (compactKeepalive?.committed && !response.writableEnded && !response.destroyed) {
+        // HTTP status cannot change after a beat. Terminate with a real SSE
+        // failure carrying the original error, not bare EOF or a JSON body.
+        const failure = { type: 'response.failed', sequence_number: 0, response: {
+          id: requestLogId ?? randomUUID(), object: 'response', status: 'failed', output: [],
+          error: { ...objectValue(errorPayload.error), code: gatewayError.type, message: gatewayError.message },
+        } }
+        response.end(`event: response.failed\ndata: ${JSON.stringify(failure)}\n\n`)
+      } else await this.writeJson(
         response,
         gatewayError.statusCode,
-        gatewayErrorResponseBody(
-          incoming.protocol,
-          gatewayError,
-          incoming.operation === 'count-tokens'
-        )
+        errorPayload
       )
       if (!conversationName && conversationId) conversationName = fallbackConversationName(conversationId)
       const finishedLog = finishRequestLog({
@@ -3906,6 +3952,7 @@ export class GatewayServer implements GatewayController {
       })
       if (finishedLog && successfulClientCancellation) this.successRequests += 1
     } finally {
+      compactKeepalive?.stop()
       cancelScheduledProgressLog()
       if (requestLogId && !requestLogFinished) {
         const successfulClientCancellation = clientAbortController.signal.aborted
@@ -7205,6 +7252,19 @@ function extractDeepSeekHarnessSearchSources(payload: JsonObject): Array<{
 }
 
 function copyResponsesResponseHeaders(source: Headers, target: ServerResponse, client: RouteClient): void {
+  if (target.headersSent) {
+    if ((source.get('x-codex-turn-state') ?? '') !== String(target.getHeader('x-codex-turn-state') ?? '')) {
+      throw new GatewayHttpError(502, 'Compact retry changed committed continuation state', 'upstream_compact_error')
+    }
+    return
+  }
+  // A buffered attempt may have staged headers before failing. Do not leak
+  // those into a replacement attempt which has no corresponding headers.
+  for (const name of target.getHeaderNames()) {
+    if (name.startsWith('x-codex-') || (RESPONSES_PASSTHROUGH_HEADERS as readonly string[]).includes(name)) {
+      target.removeHeader(name)
+    }
+  }
   if (client === 'grokbuild') {
     const requestId = source.get('x-request-id')
     if (requestId) target.setHeader('x-request-id', requestId)
@@ -8420,6 +8480,8 @@ class CodexCompactV2SseValidator {
   private compactionItems = 0
   private progressEventCount = 0
   private completedResponse?: JsonObject
+  private completedItem?: JsonObject
+  private replacementWire?: string
   private failure?: string
   private terminalTextLength?: number
   private finalized = false
@@ -8479,7 +8541,7 @@ class CodexCompactV2SseValidator {
     }
     return {
       usage: extractProtocolUsage('openai-responses', this.completedResponse),
-      wireText: this.decodedText.slice(0, this.terminalTextLength ?? this.decodedText.length)
+      wireText: this.replacementWire ?? this.decodedText.slice(0, this.terminalTextLength ?? this.decodedText.length)
     }
   }
 
@@ -8556,11 +8618,14 @@ class CodexCompactV2SseValidator {
           (item.id !== undefined && item.id !== null && typeof item.id !== 'string')
           || typeof item.encrypted_content !== 'string'
           || !item.encrypted_content.trim()
+          || (item.status !== undefined && item.status !== 'completed')
+          || (item.error !== undefined && item.error !== null)
         ) {
           this.failure ??= 'Remote compaction item is missing encrypted_content'
           return
         }
         this.compactionItems += 1
+        this.completedItem = item
       }
       return
     }
@@ -8570,12 +8635,44 @@ class CodexCompactV2SseValidator {
       this.failure ??= 'Remote compaction response.completed is missing a response id'
       return
     }
-    if (response.status !== 'completed') {
+    if (response.status !== 'completed'
+      || (response.error !== undefined && response.error !== null)
+      || (response.incomplete_details !== undefined && response.incomplete_details !== null)) {
       this.failure ??= 'Remote compaction response.completed has an invalid response status'
       return
     }
     if (this.completedResponse) {
       this.failure ??= 'Remote compaction stream returned multiple response.completed events'
+      return
+    }
+    const terminalItems = Array.isArray(response.output)
+      ? response.output.filter((value) => {
+          const item = objectValue(value)
+          return item?.type === 'compaction' || item?.type === 'compaction_summary'
+        }) as JsonObject[]
+      : []
+    if (this.compactionItems === 0 && terminalItems.length > 0) {
+      // Some relays emit only added events or put the entire result in the
+      // terminal output array. A completed, validated replacement history is
+      // authoritative; translate it into the done events Codex actually reads.
+      // Never promote an added item or EOF by itself to successful completion.
+      try {
+        const encoded = encodeCompactV2JsonResponse({ ...response, object: response.object ?? 'response' })
+        this.replacementWire = Buffer.concat(encoded.chunks).toString('utf8')
+        this.compactionItems = 1
+      } catch (error) {
+        this.failure ??= normalizeError(error).message
+        return
+      }
+    } else if (terminalItems.length > 0 && (
+      terminalItems.length !== 1
+      || terminalItems[0].encrypted_content !== this.completedItem?.encrypted_content
+      || (terminalItems[0].id != null && this.completedItem?.id != null
+        && terminalItems[0].id !== this.completedItem.id)
+      || (terminalItems[0].status !== undefined && terminalItems[0].status !== 'completed')
+      || (terminalItems[0].error !== undefined && terminalItems[0].error !== null)
+    )) {
+      this.failure ??= 'Remote compaction terminal output conflicts with the completed item'
       return
     }
     if (this.compactionItems !== 1) {
@@ -8608,11 +8705,13 @@ async function writeBufferedResponsesStream(
   onClientWrite?: () => void
 ): Promise<boolean> {
   if (response.destroyed || response.writableEnded) return false
-  response.statusCode = upstream.status
-  response.setHeader('content-type', upstream.headers.get('content-type') ?? 'text/event-stream; charset=utf-8')
-  response.setHeader('cache-control', upstream.headers.get('cache-control') ?? 'no-cache')
-  response.setHeader('x-accel-buffering', upstream.headers.get('x-accel-buffering') ?? 'no')
-  response.flushHeaders()
+  if (!response.headersSent) {
+    response.statusCode = upstream.status
+    response.setHeader('content-type', upstream.headers.get('content-type') ?? 'text/event-stream; charset=utf-8')
+    response.setHeader('cache-control', upstream.headers.get('cache-control') ?? 'no-cache')
+    response.setHeader('x-accel-buffering', upstream.headers.get('x-accel-buffering') ?? 'no')
+    response.flushHeaders()
+  }
   const redactor = new StreamingSecretRedactor(secrets)
   for (const chunk of chunks) {
     if (!await writeStreamChunks(response, redactor.push(chunk), onClientWrite)) return false

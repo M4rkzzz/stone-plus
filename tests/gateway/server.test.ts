@@ -7051,6 +7051,204 @@ describe('GatewayServer', () => {
     expect(upstreamFetch).toHaveBeenCalledTimes(3)
   })
 
+  describe('Compact relay terminal and keepalive compatibility', () => {
+    const item = { type: 'compaction', id: 'cmp_relay', encrypted_content: 'opaque-relay-fixture' }
+    const completed = (output: unknown[] = [item]) => ({
+      type: 'response.completed', sequence_number: 2,
+      response: { object: 'response', id: 'resp_relay', status: 'completed', output,
+        usage: { input_tokens: 7, output_tokens: 3, total_tokens: 10 } },
+    })
+    const done = { type: 'response.output_item.done', sequence_number: 1, output_index: 0, item }
+    const wire = (events: unknown[]) => events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join('')
+    const initial = wire([{ type: 'response.created', response: { id: 'resp_relay', status: 'in_progress' } }])
+    async function setup(fetchImplementation: typeof fetch, options: {
+      peer?: boolean; interval?: number; timeout?: number; progress?: number
+    } = {}) {
+      const port = await freePort()
+      const gatewayConfig = config(port, { requestTimeoutSeconds: options.timeout ?? 2 })
+      gatewayConfig.providers[0] = { ...gatewayConfig.providers[0], sourceType: 'relay',
+        protocol: 'openai-responses', responsesCompactMode: 'native' }
+      gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+      gatewayConfig.pools[0].protocol = 'openai-responses'
+      gatewayConfig.pools[0].maxRetries = options.peer ? 1 : 0
+      if (!options.peer) gatewayConfig.accounts[1].status = 'disabled'
+      const logs: RequestLog[] = []
+      const gateway = new GatewayServer({ config: gatewayConfig, credentialResolver: () => 'relay-secret-private',
+        fetchImplementation, compactKeepaliveIntervalMs: options.interval ?? 0,
+        responsesProgressIdleTimeoutMs: options.progress,
+        onLog: (log) => upsertLog(logs, log),
+      })
+      runningServers.push(gateway)
+      await gateway.start()
+      const request = (headers: Record<string, string> = {}, signal?: AbortSignal, compact = true) => fetch(`http://127.0.0.1:${port}/v1/responses`, {
+        method: 'POST', signal, headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json', ...headers },
+        body: JSON.stringify({ model: 'source-model', input: compact ? [{ type: 'compaction_trigger' }] : 'hello', stream: true }),
+      })
+      return { request, logs, gateway }
+    }
+
+    it.each(['terminal-only', 'added-and-terminal', 'done-and-terminal', 'terminal-with-history'])(
+      'preserves exactly one compaction item for %s', async (shape) => {
+        const history = { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'retain this history' }] }
+        const events = shape === 'done-and-terminal' ? [done, completed()]
+          : shape === 'added-and-terminal' ? [{ ...done, type: 'response.output_item.added' }, completed()]
+            : [completed(shape === 'terminal-with-history' ? [history, item] : [item])]
+        const { request, logs } = await setup(vi.fn(async () => new Response(wire(events), {
+          headers: { 'content-type': 'text/event-stream', 'x-codex-turn-state': 'relay-state' },
+        })) as typeof fetch)
+        const response = await request()
+        const text = await response.text()
+        expect(response.status, text).toBe(200)
+        expect(response.headers.get('x-codex-turn-state')).toBe('relay-state')
+        const frames = text.split('\n').filter((line) => line.startsWith('data: ')).map((line) => JSON.parse(line.slice(6)))
+        expect(frames.filter((frame) => frame.type === 'response.output_item.done' && frame.item.type === 'compaction')).toHaveLength(1)
+        expect(frames.at(-1)?.type).toBe('response.completed')
+        if (shape === 'terminal-with-history') expect(frames.find((frame) => frame.item?.type === 'message')?.item).toEqual(history)
+        await vi.waitFor(() => expect(logs.at(-1)).toMatchObject({ status: 'success', inputTokens: 7, outputTokens: 3 }))
+      }
+    )
+
+    it.each(['missing-encrypted', 'duplicate', 'conflict', 'added-without-terminal', 'failed-terminal', 'incomplete-item'])(
+      'rejects %s without synthesizing success', async (shape) => {
+        const terminal = completed()
+        let events: unknown[] = [terminal]
+        if (shape === 'missing-encrypted') terminal.response.output = [{ type: 'compaction', id: 'cmp_bad' }]
+        if (shape === 'duplicate') terminal.response.output = [item, { ...item, id: 'cmp_other' }]
+        if (shape === 'conflict') events = [done, completed([{ ...item, encrypted_content: 'different-opaque-state' }])]
+        if (shape === 'added-without-terminal') events = [{ ...done, type: 'response.output_item.added' }]
+        if (shape === 'failed-terminal') terminal.response.status = 'failed'
+        if (shape === 'incomplete-item') terminal.response.output = [{ ...item, status: 'in_progress' }]
+        const { request, logs } = await setup(vi.fn(async () => new Response(wire(events), { headers: { 'content-type': 'text/event-stream' } })) as typeof fetch)
+        const response = await request()
+        const text = await response.text()
+        expect(response.status).toBe(502)
+        expect(text).not.toContain('"type":"response.completed"')
+        expect(logs.at(-1)?.status).toBe('error')
+      }
+    )
+
+    it('sends a comment before compact output, preserving state headers and final usage', async () => {
+      let finish!: () => void
+      const { request, logs } = await setup(vi.fn(async () => new Response(new ReadableStream({ start(controller) {
+        controller.enqueue(Buffer.from(initial))
+        finish = () => { controller.enqueue(Buffer.from(wire([completed()]))); controller.close() }
+      } }), { headers: { 'content-type': 'text/event-stream', 'x-codex-turn-state': 'state-retained' } })) as typeof fetch, { interval: 15 })
+      const response = await request()
+      const reader = response.body!.getReader()
+      const first = await reader.read()
+      expect(Buffer.from(first.value!).toString()).toBe(': keepalive\n\n')
+      expect(response.headers.get('x-codex-turn-state')).toBe('state-retained')
+      expect(logs.at(-1)?.clientFirstWriteMs).toBeUndefined()
+      finish()
+      let output = ''
+      for (;;) { const result = await reader.read(); if (result.done) break; output += Buffer.from(result.value).toString() }
+      expect(output).toContain('"type":"response.completed"')
+      await vi.waitFor(() => expect(logs.at(-1)).toMatchObject({ status: 'success', inputTokens: 7, outputTokens: 3 }))
+    })
+
+    it.each([false, true])('retains safe failover after heartbeat, boundState=%s', async (boundState) => {
+      const upstream = vi.fn(async () => {
+        if (upstream.mock.calls.length === 1) return new Response(new ReadableStream({ start(controller) {
+          controller.enqueue(Buffer.from(initial))
+          setTimeout(() => controller.close(), 100)
+        } }), { headers: { 'content-type': 'text/event-stream', ...(boundState ? { 'x-codex-turn-state': 'bound-first-source' } : {}) } })
+        return new Response(wire([completed()]), { headers: { 'content-type': 'text/event-stream' } })
+      })
+      const { request, logs } = await setup(upstream as typeof fetch, { peer: true, interval: 15 })
+      const response = await request()
+      const text = await response.text()
+      expect(response.status).toBe(200)
+      expect(text).toContain(': keepalive')
+      expect(text).toContain(boundState ? '"type":"response.failed"' : '"type":"response.completed"')
+      expect(upstream).toHaveBeenCalledTimes(boundState ? 1 : 2)
+      expect(logs.at(-1)?.status).toBe(boundState ? 'error' : 'success')
+    })
+
+    it('returns an explicit SSE failure when a retry introduces new continuation state after commitment', async () => {
+      const upstream = vi.fn(async () => {
+        if (upstream.mock.calls.length === 1) return new Response(new ReadableStream({ start(controller) {
+          controller.enqueue(Buffer.from(initial)); setTimeout(() => controller.close(), 100)
+        } }), { headers: { 'content-type': 'text/event-stream' } })
+        return new Response(wire([completed()]), { headers: { 'content-type': 'text/event-stream', 'x-codex-turn-state': 'new-state' } })
+      })
+      const { request } = await setup(upstream as typeof fetch, { peer: true, interval: 15 })
+      const text = await (await request()).text()
+      expect(text).toContain('response.failed')
+      expect(text).toContain('changed committed continuation state')
+      expect(text).not.toContain('"type":"response.completed"')
+    })
+
+    it('survives a compact wait longer than the ordinary idle budget without refreshing it forever', async () => {
+      const { request, logs } = await setup(vi.fn(async () => scheduledSseResponse([
+        { atMs: 0, data: initial }, { atMs: 700, data: ': keepalive\n\n' },
+        { atMs: 1400, data: wire([completed()]), close: true },
+      ])) as typeof fetch, { timeout: 1, interval: 20 })
+      const text = await (await request()).text()
+      expect(text).toContain('"type":"response.completed"')
+      expect(logs.at(-1)?.status).toBe('success')
+    })
+
+    it('terminates stalled compact after heartbeat with an SSE error and releases the slot', async () => {
+      const { request, logs, gateway } = await setup(vi.fn(async () => scheduledSseResponse([
+        { atMs: 0, data: initial }, { atMs: 30, data: ': keepalive\n\n' },
+        { atMs: 60, data: ': keepalive\n\n' },
+      ])) as typeof fetch, { interval: 15, progress: 120 })
+      const text = await (await request()).text()
+      expect(text).toContain('response.failed')
+      expect(text).toContain('upstream_response_progress_timeout')
+      expect(text).not.toContain('"type":"response.completed"')
+      expect(logs.at(-1)).toMatchObject({ status: 'error', statusCode: 504 })
+      expect(gateway.getStatus().activeRequests).toBe(0)
+      expect(gateway.getAccountInFlight().first).toBe(0)
+    })
+
+    it('releases upstream and the slot when the client cancels after a heartbeat', async () => {
+      const cancel = vi.fn()
+      const { request, logs, gateway } = await setup(vi.fn(async () => new Response(new ReadableStream({
+        start(controller) { controller.enqueue(Buffer.from(initial)) }, cancel,
+      }), { headers: { 'content-type': 'text/event-stream' } })) as typeof fetch, { interval: 15 })
+      const abort = new AbortController()
+      const response = await request({}, abort.signal)
+      const reader = response.body!.getReader()
+      expect(Buffer.from((await reader.read()).value!).toString()).toContain(': keepalive')
+      abort.abort()
+      await vi.waitFor(() => {
+        expect(cancel).toHaveBeenCalled()
+        expect(logs.at(-1)?.statusCode).toBe(499)
+        expect(gateway.getStatus().activeRequests).toBe(0)
+        expect(gateway.getAccountInFlight().first).toBe(0)
+      })
+    })
+
+    it('bounds the entire compact attempt even when reasoning keeps advancing', async () => {
+      const { request, logs, gateway } = await setup(vi.fn(async () => scheduledSseResponse([
+        { atMs: 0, data: initial },
+        ...Array.from({ length: 12 }, (_, index) => ({ atMs: (index + 1) * 400,
+          data: wire([{ type: 'response.reasoning_text.delta', delta: 'progress' }]) })),
+      ])) as typeof fetch, { interval: 20, timeout: 1 })
+      const text = await (await request()).text()
+      expect(text).toContain('response.failed')
+      expect(text).not.toContain('"type":"response.completed"')
+      expect(logs.at(-1)).toMatchObject({ status: 'error', statusCode: 504 })
+      expect(gateway.getStatus().activeRequests).toBe(0)
+    }, 8_000)
+
+    it('advertises native compact without rewriting ordinary Responses negotiation', async () => {
+      const upstream = vi.fn<typeof fetch>(async () => new Response(wire([done, completed()]), { headers: { 'content-type': 'text/event-stream' } }))
+      const { request } = await setup(upstream as typeof fetch)
+      for (const features of ['', 'another_feature', 'remote_compaction_v2,another_feature']) {
+        await (await request(features ? { 'x-codex-beta-features': features } : {})).text()
+        const headers = new Headers(upstream.mock.calls.at(-1)?.[1]?.headers)
+        expect(headers.get('x-codex-beta-features')?.split(',').filter((value) => value === 'remote_compaction_v2')).toHaveLength(1)
+        if (features.includes('another_feature')) expect(headers.get('x-codex-beta-features')).toContain('another_feature')
+        expect(String(upstream.mock.calls.at(-1)?.[0])).toContain('/responses')
+        expect(String(upstream.mock.calls.at(-1)?.[0])).not.toContain('/compact')
+      }
+      await (await request({}, undefined, false)).text()
+      expect(new Headers(upstream.mock.calls.at(-1)?.[1]?.headers).has('x-codex-beta-features')).toBe(false)
+    })
+  })
+
   describe('Compact V2 JSON compatibility', () => {
     const compactItem = { type: 'compaction', encrypted_content: 'opaque-compact-test' }
     const userItem = { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Keep this history.' }] }
@@ -7869,7 +8067,9 @@ describe('GatewayServer', () => {
 
   it('does not let Compact V2 lifecycle heartbeats hold a buffered request open', async () => {
     const port = await freePort()
-    const gatewayConfig = config(port, { requestTimeoutSeconds: 1 })
+    // Leave room for the existing three OAuth transient attempts; test the
+    // per-attempt progress guard independently of the overall compact budget.
+    const gatewayConfig = config(port, { requestTimeoutSeconds: 2 })
     gatewayConfig.providers[0] = {
       ...gatewayConfig.providers[0], sourceType: 'oauth-system', kind: 'openai', protocol: 'openai-responses'
     }
@@ -7896,6 +8096,7 @@ describe('GatewayServer', () => {
       credentialResolver: () => ({
         secret: 'oauth-compact-stall', kind: 'chatgpt-oauth' as const, accountId: 'acct-compact-stall'
       }),
+      responsesProgressIdleTimeoutMs: 1_000,
       fetchImplementation: upstreamFetch as typeof fetch,
       onLog: (log) => upsertLog(logs, log)
     })
@@ -7910,6 +8111,7 @@ describe('GatewayServer', () => {
 
     expect(response.status).toBe(504)
     expect(await response.text()).toContain('upstream_response_progress_timeout')
+    expect(upstreamFetch).toHaveBeenCalledTimes(3)
     expect(logs[0]).toMatchObject({ status: 'error', statusCode: 504 })
     expect(gateway.getStatus().activeRequests).toBe(0)
     expect(gateway.getAccountInFlight().first).toBe(0)
