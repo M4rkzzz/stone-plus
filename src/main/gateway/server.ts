@@ -3629,8 +3629,13 @@ export class GatewayServer implements GatewayController {
             && !hardAccountFailure
           const failureCooldownDisabled = this.config.settings.disableCooldown === true
             && accountAction !== 'disable'
-            && gatewayError.providerFailure?.category !== 'rate_limit'
-            && !quotaExhausted
+            && (
+              attemptedProvider?.sourceType === 'relay'
+              || (
+                gatewayError.providerFailure?.category !== 'rate_limit'
+                && !quotaExhausted
+              )
+            )
           if (attemptedAccount && modelScopedFailure) {
             // Remember the exact account/model pair across requests. This is
             // deliberately detached from account-wide health: every other
@@ -5084,8 +5089,8 @@ export class GatewayServer implements GatewayController {
     const quota = observedQuotaSignals(signals, observedAt)
     if (
       deferCooldown
-      ||
-      !genericQuotaExhausted(quota.quota, observedAt)
+      || this.relayCooldownDisabled(account)
+      || !genericQuotaExhausted(quota.quota, observedAt)
     ) return selectedHealthRevision
 
     const cooldownUntil = quotaSignalCooldownUntil(quota, observedAt)
@@ -5150,6 +5155,11 @@ export class GatewayServer implements GatewayController {
       ...quota
     })
     return health.revision
+  }
+
+  private relayCooldownDisabled(account: Account): boolean {
+    return this.config.settings.disableCooldown === true
+      && this.configIndex.providersById.get(account.providerId)?.sourceType === 'relay'
   }
 
   private emitAccountState(state: GatewayAccountState): void {

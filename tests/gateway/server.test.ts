@@ -13053,6 +13053,47 @@ describe('GatewayServer', () => {
     expect(states).toEqual([])
   })
 
+  it('keeps a relay schedulable after a rate limit when cooldown is disabled', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.settings.disableCooldown = true
+    gatewayConfig.providers[0] = {
+      ...gatewayConfig.providers[0],
+      sourceType: 'relay'
+    }
+    gatewayConfig.accounts[1].status = 'disabled'
+    gatewayConfig.pools[0].maxRetries = 0
+    const states: Array<{ accountId: string; status: string }> = []
+    const upstreamFetch = vi.fn(async () => new Response(JSON.stringify({
+      error: { message: 'Too many pending requests, please retry later' }
+    }), {
+      status: 429,
+      headers: {
+        'content-type': 'application/json',
+        'retry-after': '120',
+        'x-ratelimit-limit-requests': '100',
+        'x-ratelimit-remaining-requests': '0'
+      }
+    }))
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'credential',
+      fetchImplementation: upstreamFetch as typeof fetch,
+      now: () => timestamp,
+      onAccountState: (state) => states.push(state)
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const first = await post(port)
+    const second = await post(port)
+
+    expect(first.status).toBe(429)
+    expect(second.status).toBe(429)
+    expect(upstreamFetch).toHaveBeenCalledTimes(2)
+    expect(states).toEqual([])
+  })
+
   it('does not disable a Grok account for an explicit model-scoped 403', async () => {
     const port = await freePort()
     const gatewayConfig = config(port)
