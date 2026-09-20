@@ -800,7 +800,17 @@ describe('refresh provider models IPC', () => {
     failureCooled.id = 'account-failure-cooled'
     const quotaCooled = oauthAccount()
     quotaCooled.id = 'account-quota-cooled'
-    const harness = createHarness([failureCooled, quotaCooled], {}, vi.fn())
+    const relayQuotaCooled = oauthAccount()
+    relayQuotaCooled.id = 'account-relay-quota-cooled'
+    relayQuotaCooled.providerId = 'provider-relay'
+    const harness = createHarness([failureCooled, quotaCooled, relayQuotaCooled], {}, vi.fn())
+    harness.store.getSnapshot().providers.push({
+      ...provider,
+      id: 'provider-relay',
+      name: 'Relay',
+      sourceType: 'relay',
+      kind: 'openai-compatible'
+    })
     const failureState = {
       status: 'cooldown' as const,
       circuitState: 'open' as const,
@@ -817,8 +827,14 @@ describe('refresh provider models IPC', () => {
     }
     Object.assign(failureCooled, failureState)
     Object.assign(quotaCooled, quotaState)
+    Object.assign(relayQuotaCooled, quotaState, {
+      quota: { requests: { limit: 100, remaining: 0 }, observedAt: Date.now() }
+    })
     Object.assign(harness.store.getSnapshot().accounts.find(({ id }) => id === failureCooled.id), failureState)
     Object.assign(harness.store.getSnapshot().accounts.find(({ id }) => id === quotaCooled.id), quotaState)
+    Object.assign(harness.store.getSnapshot().accounts.find(({ id }) => id === relayQuotaCooled.id), quotaState, {
+      quota: { requests: { limit: 100, remaining: 0 }, observedAt: Date.now() }
+    })
     const handler = electron.handlers.get('stone:update-gateway')
     if (!handler) throw new Error('update-gateway handler was not registered')
 
@@ -828,23 +844,43 @@ describe('refresh provider models IPC', () => {
     }) as AppSnapshot
 
     expect(result.gateway.disableCooldown).toBe(true)
-    expect(harness.store.updateAccountRuntimeStates).toHaveBeenCalledWith([{
-      id: failureCooled.id,
-      patch: expect.objectContaining({
-        status: 'active',
-        circuitState: 'closed',
-        consecutiveFailures: 0,
-        cooldownReason: undefined,
-        cooldownUntil: undefined,
-      }),
-    }])
+    expect(harness.store.updateAccountRuntimeStates).toHaveBeenCalledWith([
+      {
+        id: failureCooled.id,
+        patch: expect.objectContaining({
+          status: 'active',
+          circuitState: 'closed',
+          consecutiveFailures: 0,
+          cooldownReason: undefined,
+          cooldownUntil: undefined,
+        }),
+      },
+      {
+        id: relayQuotaCooled.id,
+        patch: expect.objectContaining({
+          status: 'active',
+          circuitState: 'closed',
+          consecutiveFailures: 0,
+          cooldownReason: undefined,
+          cooldownUntil: undefined,
+          quota: undefined,
+        }),
+      },
+    ])
     expect(quotaCooled).toMatchObject({
       status: 'cooldown',
       circuitState: 'open',
       cooldownReason: 'quota',
     })
-    expect(harness.gateway.resetAccountHealth).toHaveBeenCalledOnce()
+    expect(relayQuotaCooled).toMatchObject({
+      status: 'active',
+      circuitState: 'closed',
+      cooldownReason: undefined,
+      quota: undefined,
+    })
+    expect(harness.gateway.resetAccountHealth).toHaveBeenCalledTimes(2)
     expect(harness.gateway.resetAccountHealth).toHaveBeenCalledWith(failureCooled.id)
+    expect(harness.gateway.resetAccountHealth).toHaveBeenCalledWith(relayQuotaCooled.id)
     expect(harness.gateway.stop).not.toHaveBeenCalled()
     expect(harness.gateway.start).not.toHaveBeenCalled()
   })

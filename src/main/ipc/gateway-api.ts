@@ -1196,9 +1196,14 @@ export function registerGatewayApi(
   })
 
   const persistAccountState = async (state: GatewayAccountState, revision: number): Promise<void> => {
+    const before = store.getRuntimeAccount(state.accountId)
+    const beforeProvider = before ? store.getRuntimeProvider(before.providerId) : undefined
+    const relayCooldownDisabled = store.getRuntimeGatewaySettings().disableCooldown === true
+      && state.status === 'cooldown'
+      && beforeProvider?.sourceType === 'relay'
     if (store.getRuntimeGatewaySettings().disableCooldown === true
       && state.status === 'cooldown'
-      && state.cooldownReason === 'failure') {
+      && (state.cooldownReason === 'failure' || relayCooldownDisabled)) {
       state = {
         ...state,
         status: 'active',
@@ -1208,7 +1213,6 @@ export function registerGatewayApi(
         cooldownReason: undefined,
       }
     }
-    const before = store.getRuntimeAccount(state.accountId)
     await store.updateAccountRuntimeState(state.accountId, {
       status: state.status,
       circuitState: state.circuitState,
@@ -1219,7 +1223,9 @@ export function registerGatewayApi(
       latencyMs: state.latencyMs,
       lastError: state.lastError,
       lastUsedAt: state.lastUsedAt,
-      ...(state.quota ? { quota: state.quota } : {}),
+      ...(relayCooldownDisabled
+        ? { quota: undefined, quotaRemaining: undefined, quotaUnit: undefined }
+        : state.quota ? { quota: state.quota } : {}),
       ...(state.codexQuota ? { codexQuota: state.codexQuota } : {})
     })
     // Persistence is serialized per account below, but a newer lifecycle state
@@ -2338,10 +2344,17 @@ export function registerGatewayApi(
       await store.updateGateway(settings)
       const savedGateway = store.getSnapshot().gateway
       if (previousSettings.disableCooldown !== true && savedGateway.disableCooldown === true) {
-        const failureCooledAccounts = store.getSnapshot().accounts.filter((account) => (
-          account.status === 'cooldown' && account.cooldownReason === 'failure'
+        const currentSnapshot = store.getSnapshot()
+        const providersById = new Map(currentSnapshot.providers.map((provider) => [provider.id, provider]))
+        const cooldownBypassedAccounts = currentSnapshot.accounts.filter((account) => (
+          account.status === 'cooldown'
+          && (
+            account.cooldownReason === 'failure'
+            || (account.cooldownReason === 'quota'
+              && providersById.get(account.providerId)?.sourceType === 'relay')
+          )
         ))
-        await store.updateAccountRuntimeStates(failureCooledAccounts.map((account) => ({
+        await store.updateAccountRuntimeStates(cooldownBypassedAccounts.map((account) => ({
           id: account.id,
           patch: {
             status: 'active' as const,
@@ -2350,9 +2363,12 @@ export function registerGatewayApi(
             cooldownUntil: undefined,
             cooldownReason: undefined,
             lastError: undefined,
+            ...(account.cooldownReason === 'quota'
+              ? { quota: undefined, quotaRemaining: undefined, quotaUnit: undefined }
+              : {}),
           },
         })))
-        for (const account of failureCooledAccounts) gateway.resetAccountHealth(account.id)
+        for (const account of cooldownBypassedAccounts) gateway.resetAccountHealth(account.id)
       }
       if (backups
         && (previousSettings.automaticBackups !== false) !== (savedGateway.automaticBackups !== false)) {
