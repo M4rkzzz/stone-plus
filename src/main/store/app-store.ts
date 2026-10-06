@@ -174,6 +174,10 @@ const DEFAULT_GATEWAY: GatewaySettings = {
   outboundNetworkMode: 'direct'
 }
 
+// Before this point, one-click Codex relay setup persisted its default model as
+// both an account restriction and a same-protocol wildcard route mapping.
+const RELAY_OPEN_MODEL_DEFAULTS_INTRODUCED_AT = 1_785_152_928_000
+
 const SUPPORTED_POOL_STRATEGIES = new Set<Pool['strategy']>([
   'balanced',
   'autobalanced',
@@ -2492,6 +2496,8 @@ export class AppStore {
         localToken: route.localToken.trim() || createLocalToken(),
         modelMap: normalizeRouteModelMap(route.modelMap),
         modelSourceMap,
+        legacyRelayDefaultsReviewedAt: route.legacyRelayDefaultsReviewedAt
+          ?? existing.legacyRelayDefaultsReviewedAt,
         createdAt: route.createdAt || timestamp,
         updatedAt: timestamp
       }
@@ -3905,6 +3911,13 @@ function normalizePersistedState(
     }
   })
   const pools = migrateGrokPoolProtocols(normalizedPools, accounts, providers)
+  let routes = normalizePersistedRoutes(state.routes, timestamp, { providers, accounts, pools })
+  ;({ accounts, routes } = migrateLegacyCodexRelayModelDefaults(
+    providers,
+    accounts,
+    routes,
+    timestamp,
+  ))
   const normalized: PersistedState = {
     ...state,
     version: 1,
@@ -3919,7 +3932,7 @@ function normalizePersistedState(
     proxyProfiles,
     accounts,
     pools,
-    routes: normalizePersistedRoutes(state.routes, timestamp, { providers, accounts, pools }),
+    routes,
     gateway: {
       ...DEFAULT_GATEWAY,
       ...state.gateway,
@@ -3938,6 +3951,68 @@ function normalizePersistedState(
     healthEvents: Array.isArray(state.healthEvents) ? state.healthEvents.slice(0, 2_000) : []
   }
   return normalized
+}
+
+function migrateLegacyCodexRelayModelDefaults(
+  providers: readonly ProviderDefinition[],
+  sourceAccounts: Account[],
+  sourceRoutes: Route[],
+  timestamp: number,
+): { accounts: Account[]; routes: Route[] } {
+  const providersById = new Map(providers.map((provider) => [provider.id, provider]))
+  const accountsByProviderId = new Map<string, Account[]>()
+  for (const account of sourceAccounts) {
+    const linked = accountsByProviderId.get(account.providerId) ?? []
+    linked.push(account)
+    accountsByProviderId.set(account.providerId, linked)
+  }
+
+  const migratedAccountIds = new Set<string>()
+  const routes = sourceRoutes.map((route) => {
+    if (route.client !== 'codex'
+      || route.createdAt >= RELAY_OPEN_MODEL_DEFAULTS_INTRODUCED_AT
+      || route.legacyRelayDefaultsReviewedAt !== undefined) {
+      return route
+    }
+
+    const reviewedRoute = { ...route, legacyRelayDefaultsReviewedAt: timestamp }
+    const provider = providersById.get(route.poolId)
+    const modelMapEntries = Object.entries(route.modelMap)
+    if (provider?.sourceType !== 'relay'
+      || provider.protocol !== route.inboundProtocol
+      || provider.createdAt >= RELAY_OPEN_MODEL_DEFAULTS_INTRODUCED_AT
+      || provider.models.length < 2
+      || modelMapEntries.length !== 1
+      || modelMapEntries[0][0] !== '*'
+      || Object.keys(route.modelSourceMap ?? {}).length > 0) {
+      return reviewedRoute
+    }
+
+    const fallbackModel = modelMapEntries[0][1]
+    const linkedAccounts = accountsByProviderId.get(provider.id) ?? []
+    const account = linkedAccounts.length === 1 ? linkedAccounts[0] : undefined
+    if (!account
+      || account.credentialType !== 'api-key'
+      || account.createdAt !== provider.createdAt
+      || account.createdAt >= RELAY_OPEN_MODEL_DEFAULTS_INTRODUCED_AT
+      || account.modelPolicy !== 'selected'
+      || account.modelAllowlist.length !== 1
+      || account.modelAllowlist[0] !== fallbackModel
+      || account.availableModels.length > 0
+      || account.modelsRefreshedAt !== undefined
+      || !provider.models.includes(fallbackModel)) {
+      return reviewedRoute
+    }
+
+    migratedAccountIds.add(account.id)
+    return { ...reviewedRoute, modelMap: {}, updatedAt: timestamp }
+  })
+
+  if (migratedAccountIds.size === 0) return { accounts: sourceAccounts, routes }
+  const accounts = sourceAccounts.map((account) => migratedAccountIds.has(account.id)
+    ? { ...account, modelPolicy: 'all' as const, modelAllowlist: [], updatedAt: timestamp }
+    : account)
+  return { accounts, routes }
 }
 
 /** Finite catalog for configuration UI. It is not the runtime wildcard authorization check. */
@@ -4038,6 +4113,7 @@ function normalizePersistedRoutes(
       highConcurrencyMode: route.highConcurrencyMode === true,
       modelMap: normalizeRouteModelMap(route.modelMap),
       modelSourceMap: normalizedModelSourceMap,
+      legacyRelayDefaultsReviewedAt: normalizeTimestamp(route.legacyRelayDefaultsReviewedAt),
     }
   }
   const defaults = createDefaultRoutes(timestamp).map((fallback) => {

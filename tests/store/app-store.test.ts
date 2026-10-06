@@ -1557,6 +1557,60 @@ describe('AppStore', () => {
       .toMatchObject({ modelMap: { '*': 'claude-fable-5' } })
   })
 
+  it('opens pre-correction Codex relay defaults so requested models pass through', async () => {
+    const state = directCodexRelayState(1_785_000_000_000)
+    await writeFile(join(directory, LEGACY_JSON_FILENAME), JSON.stringify(state), 'utf8')
+
+    const store = createStore()
+    await store.initialize()
+    expect(store.getSnapshot().accounts.find((account) => account.id === 'relay-account'))
+      .toMatchObject({ modelPolicy: 'all', modelAllowlist: [] })
+    expect(store.getSnapshot().routes.find((route) => route.client === 'codex'))
+      .toMatchObject({ modelMap: {}, legacyRelayDefaultsReviewedAt: expect.any(Number) })
+
+    await store.close()
+    const restarted = createStore()
+    await restarted.initialize()
+    expect(restarted.getSnapshot().accounts.find((account) => account.id === 'relay-account'))
+      .toMatchObject({ modelPolicy: 'all', modelAllowlist: [] })
+    expect(restarted.getSnapshot().routes.find((route) => route.client === 'codex'))
+      .toMatchObject({ modelMap: {} })
+
+    const account = restarted.getSnapshot().accounts.find((candidate) => candidate.id === 'relay-account')!
+    await restarted.saveAccount({
+      id: account.id,
+      providerId: account.providerId,
+      name: account.name,
+      priority: account.priority,
+      weight: account.weight,
+      maxConcurrency: account.maxConcurrency,
+      modelPolicy: 'selected',
+      modelAllowlist: ['gpt-5.6-sol'],
+    })
+    const route = restarted.getSnapshot().routes.find((candidate) => candidate.client === 'codex')!
+    await restarted.updateRoute({ ...route, modelMap: { '*': 'gpt-5.6-sol' } })
+    await restarted.close()
+
+    const explicitlyRestricted = createStore()
+    await explicitlyRestricted.initialize()
+    expect(explicitlyRestricted.getSnapshot().accounts.find((candidate) => candidate.id === 'relay-account'))
+      .toMatchObject({ modelPolicy: 'selected', modelAllowlist: ['gpt-5.6-sol'] })
+    expect(explicitlyRestricted.getSnapshot().routes.find((candidate) => candidate.client === 'codex'))
+      .toMatchObject({ modelMap: { '*': 'gpt-5.6-sol' } })
+  })
+
+  it('preserves an explicit Codex relay wildcard configured after the correction', async () => {
+    const state = directCodexRelayState(1_790_000_000_000)
+    await writeFile(join(directory, LEGACY_JSON_FILENAME), JSON.stringify(state), 'utf8')
+
+    const store = createStore()
+    await store.initialize()
+    expect(store.getSnapshot().accounts.find((account) => account.id === 'relay-account'))
+      .toMatchObject({ modelPolicy: 'selected', modelAllowlist: ['gpt-5.6-sol'] })
+    expect(store.getSnapshot().routes.find((route) => route.client === 'codex'))
+      .toMatchObject({ modelMap: { '*': 'gpt-5.6-sol' } })
+  })
+
   it('persists probed capabilities only while the source connection and probe revision still match', async () => {
     const store = createStore()
     await store.initialize()
@@ -4750,6 +4804,58 @@ function legacyState(): PersistedState {
     clientProfiles: [],
     healthEvents: []
   }
+}
+
+function directCodexRelayState(timestamp: number): PersistedState {
+  const state = legacyState()
+  state.providers = [{
+    id: 'relay-provider',
+    name: 'Relay Provider',
+    sourceType: 'relay',
+    kind: 'openai-compatible',
+    baseUrl: 'https://relay.example.test/v1',
+    protocol: 'openai-responses',
+    models: ['gpt-5.6-sol', 'gpt-6.1-sol'],
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  }]
+  state.accounts = [{
+    id: 'relay-account',
+    providerId: 'relay-provider',
+    name: 'Relay Account',
+    credentialId: 'relay-credential',
+    maskedCredential: '****cret',
+    credentialType: 'api-key',
+    status: 'active',
+    priority: 1,
+    weight: 1,
+    maxConcurrency: 2,
+    inFlight: 0,
+    availableModels: [],
+    modelPolicy: 'selected',
+    modelAllowlist: ['gpt-5.6-sol'],
+    circuitState: 'closed',
+    consecutiveFailures: 0,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  }]
+  state.pools = []
+  state.routes = [{
+    id: 'route-codex',
+    client: 'codex',
+    enabled: true,
+    poolId: 'relay-provider',
+    inboundProtocol: 'openai-responses',
+    modelMap: { '*': 'gpt-5.6-sol' },
+    modelSourceMap: {},
+    localToken: 'relay-local-token',
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  }]
+  state.credentials = {
+    'relay-credential': Buffer.from('vault:relay-secret', 'utf8').toString('base64'),
+  }
+  return state
 }
 
 function legacyJsonState(): Omit<PersistedState, 'clientProfiles'> {

@@ -947,6 +947,8 @@ export interface Route {
   modelMap: Record<string, string>
   /** Exact requested-model to route-source overrides. Unmatched models keep using poolId. */
   modelSourceMap?: Record<string, string>
+  /** Records the one-time review of pre-correction Codex relay model defaults. */
+  legacyRelayDefaultsReviewedAt?: number
   localToken: string
   createdAt: number
   updatedAt: number
