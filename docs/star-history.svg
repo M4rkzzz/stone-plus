@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="960" height="480" viewBox="0 0 960 480" role="img" aria-labelledby="title description">
   <title id="title">M4rkzzz/stone-plus star history</title>
-  <desc id="description">M4rkzzz/stone-plus · 基于 GitHub Stargazer 时间戳自动生成</desc>
+  <desc id="description">M4rkzzz/stone-plus · Generated from GitHub stargazer timestamps</desc>
   <style>
     .title { fill: #18211e; font: 700 24px Inter, "Segoe UI", "Microsoft YaHei", Arial, sans-serif; }
     .subtitle, .axis { fill: #6d7974; font: 12px Inter, "Segoe UI", "Microsoft YaHei", Arial, sans-serif; }
@@ -16,10 +16,10 @@
   <rect width="960" height="480" rx="12" fill="#f8faf9"/>
   <rect x=".5" y=".5" width="959" height="479" rx="11.5" fill="none" stroke="#dfe5e2"/>
   <text x="34" y="48" fill="#176b52" font-size="25">★</text>
-  <text class="title" x="66" y="45">StonePlus Star 趋势</text>
-  <text class="subtitle" x="34" y="68">M4rkzzz/stone-plus · 基于 GitHub Stargazer 时间戳自动生成</text>
-  <text class="label" x="926" y="33" text-anchor="end">当前 Star</text>
-  <text class="count" x="926" y="67" text-anchor="end">50</text>
+  <text class="title" x="66" y="45">StonePlus Star History</text>
+  <text class="subtitle" x="34" y="68">M4rkzzz/stone-plus · Generated from GitHub stargazer timestamps</text>
+  <text class="label" x="926" y="33" text-anchor="end">TOTAL STARS</text>
+  <text class="count" x="926" y="67" text-anchor="end">53</text>
   <line class="grid" x1="74" y1="422" x2="926" y2="422"/>
   <line class="grid" x1="74" y1="358.4" x2="926" y2="358.4"/>
   <line class="grid" x1="74" y1="294.8" x2="926" y2="294.8"/>
@@ -32,18 +32,18 @@
   <line class="grid" x1="713" y1="104" x2="713" y2="422"/>
   <line class="grid" x1="926" y1="104" x2="926" y2="422"/>
   <text class="axis" x="62" y="426" text-anchor="end">0</text>
-  <text class="axis" x="62" y="362.4" text-anchor="end">10</text>
-  <text class="axis" x="62" y="298.8" text-anchor="end">20</text>
-  <text class="axis" x="62" y="235.2" text-anchor="end">30</text>
-  <text class="axis" x="62" y="171.6" text-anchor="end">40</text>
-  <text class="axis" x="62" y="108" text-anchor="end">50</text>
+  <text class="axis" x="62" y="362.4" text-anchor="end">20</text>
+  <text class="axis" x="62" y="298.8" text-anchor="end">40</text>
+  <text class="axis" x="62" y="235.2" text-anchor="end">60</text>
+  <text class="axis" x="62" y="171.6" text-anchor="end">80</text>
+  <text class="axis" x="62" y="108" text-anchor="end">100</text>
   <text class="axis" x="74" y="452" text-anchor="middle">7/18</text>
-  <text class="axis" x="287" y="452" text-anchor="middle">7/19</text>
-  <text class="axis" x="500" y="452" text-anchor="middle">7/21</text>
-  <text class="axis" x="713" y="452" text-anchor="middle">7/22</text>
-  <text class="axis" x="926" y="452" text-anchor="middle">7/23</text>
-  <path class="area" d="M 74 422 H 83.94 V 415.64 H 90.99 V 409.28 H 94.74 V 402.92 H 96.55 V 396.56 H 99.73 V 390.2 H 181.19 V 383.84 H 182.79 V 377.48 H 198.89 V 371.12 H 224.84 V 364.76 H 228.68 V 358.4 H 250.92 V 352.04 H 266.39 V 345.68 H 282.13 V 339.32 H 300.84 V 332.96 H 316.94 V 326.6 H 336.24 V 320.24 H 349.9 V 313.88 H 362.13 V 307.52 H 362.75 V 301.16 H 371.25 V 294.8 H 378.52 V 288.44 H 388.84 V 282.08 H 393.34 V 275.72 H 395.52 V 269.36 H 404.51 V 263 H 407.92 V 256.64 H 419.55 V 250.28 H 423.12 V 243.92 H 453.54 V 237.56 H 456.37 V 231.2 H 462.23 V 224.84 H 476.15 V 218.48 H 505.58 V 212.12 H 522.77 V 205.76 H 525.04 V 199.4 H 551.21 V 193.04 H 565.69 V 186.68 H 577.14 V 180.32 H 626.53 V 173.96 H 627.71 V 167.6 H 662.31 V 161.24 H 677.73 V 154.88 H 720.5 V 148.52 H 722.91 V 142.16 H 740.97 V 135.8 H 741.63 V 129.44 H 745.47 V 123.08 H 746.42 V 116.72 H 774.39 V 110.36 H 926 V 104 H 926 V 422 H 74 Z"/>
-  <path class="line" d="M 74 422 H 83.94 V 415.64 H 90.99 V 409.28 H 94.74 V 402.92 H 96.55 V 396.56 H 99.73 V 390.2 H 181.19 V 383.84 H 182.79 V 377.48 H 198.89 V 371.12 H 224.84 V 364.76 H 228.68 V 358.4 H 250.92 V 352.04 H 266.39 V 345.68 H 282.13 V 339.32 H 300.84 V 332.96 H 316.94 V 326.6 H 336.24 V 320.24 H 349.9 V 313.88 H 362.13 V 307.52 H 362.75 V 301.16 H 371.25 V 294.8 H 378.52 V 288.44 H 388.84 V 282.08 H 393.34 V 275.72 H 395.52 V 269.36 H 404.51 V 263 H 407.92 V 256.64 H 419.55 V 250.28 H 423.12 V 243.92 H 453.54 V 237.56 H 456.37 V 231.2 H 462.23 V 224.84 H 476.15 V 218.48 H 505.58 V 212.12 H 522.77 V 205.76 H 525.04 V 199.4 H 551.21 V 193.04 H 565.69 V 186.68 H 577.14 V 180.32 H 626.53 V 173.96 H 627.71 V 167.6 H 662.31 V 161.24 H 677.73 V 154.88 H 720.5 V 148.52 H 722.91 V 142.16 H 740.97 V 135.8 H 741.63 V 129.44 H 745.47 V 123.08 H 746.42 V 116.72 H 774.39 V 110.36 H 926 V 104 H 926"/>
-  <circle class="point" cx="926" cy="104" r="5"/>
+  <text class="axis" x="287" y="452" text-anchor="middle">7/25</text>
+  <text class="axis" x="500" y="452" text-anchor="middle">8/2</text>
+  <text class="axis" x="713" y="452" text-anchor="middle">8/9</text>
+  <text class="axis" x="926" y="452" text-anchor="middle">8/17</text>
+  <path class="area" d="M 74 422 H 75.73 V 418.82 H 76.96 V 415.64 H 77.62 V 412.46 H 77.93 V 409.28 H 78.49 V 406.1 H 92.7 V 402.92 H 95.78 V 399.74 H 100.31 V 396.56 H 100.98 V 393.38 H 104.86 V 390.2 H 107.56 V 387.02 H 110.3 V 383.84 H 113.57 V 380.66 H 116.37 V 377.48 H 119.74 V 374.3 H 122.12 V 371.12 H 124.26 V 367.94 H 124.37 V 364.76 H 125.85 V 361.58 H 127.12 V 358.4 H 128.92 V 355.22 H 129.7 V 352.04 H 130.08 V 348.86 H 131.65 V 345.68 H 132.24 V 342.5 H 134.27 V 339.32 H 134.9 V 336.14 H 140.2 V 332.96 H 140.7 V 329.78 H 141.72 V 326.6 H 144.15 V 323.42 H 149.28 V 320.24 H 152.28 V 317.06 H 152.67 V 313.88 H 157.24 V 310.7 H 159.76 V 307.52 H 161.76 V 304.34 H 170.38 V 301.16 H 170.58 V 297.98 H 176.62 V 294.8 H 179.31 V 291.62 H 186.77 V 288.44 H 187.19 V 285.26 H 190.34 V 282.08 H 190.45 V 278.9 H 191.12 V 275.72 H 191.29 V 272.54 H 196.17 V 269.36 H 222.61 V 266.18 H 589 V 263 H 768.42 V 259.82 H 895.14 V 256.64 H 926 V 253.46 H 926 V 422 H 74 Z"/>
+  <path class="line" d="M 74 422 H 75.73 V 418.82 H 76.96 V 415.64 H 77.62 V 412.46 H 77.93 V 409.28 H 78.49 V 406.1 H 92.7 V 402.92 H 95.78 V 399.74 H 100.31 V 396.56 H 100.98 V 393.38 H 104.86 V 390.2 H 107.56 V 387.02 H 110.3 V 383.84 H 113.57 V 380.66 H 116.37 V 377.48 H 119.74 V 374.3 H 122.12 V 371.12 H 124.26 V 367.94 H 124.37 V 364.76 H 125.85 V 361.58 H 127.12 V 358.4 H 128.92 V 355.22 H 129.7 V 352.04 H 130.08 V 348.86 H 131.65 V 345.68 H 132.24 V 342.5 H 134.27 V 339.32 H 134.9 V 336.14 H 140.2 V 332.96 H 140.7 V 329.78 H 141.72 V 326.6 H 144.15 V 323.42 H 149.28 V 320.24 H 152.28 V 317.06 H 152.67 V 313.88 H 157.24 V 310.7 H 159.76 V 307.52 H 161.76 V 304.34 H 170.38 V 301.16 H 170.58 V 297.98 H 176.62 V 294.8 H 179.31 V 291.62 H 186.77 V 288.44 H 187.19 V 285.26 H 190.34 V 282.08 H 190.45 V 278.9 H 191.12 V 275.72 H 191.29 V 272.54 H 196.17 V 269.36 H 222.61 V 266.18 H 589 V 263 H 768.42 V 259.82 H 895.14 V 256.64 H 926 V 253.46 H 926"/>
+  <circle class="point" cx="926" cy="253.46" r="5"/>
   
 </svg>

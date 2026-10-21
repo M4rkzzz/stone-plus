@@ -141,7 +141,7 @@ function renderStarHistory(repo, { createdAt, stars }) {
   const finalPoint = points.at(-1)
   const xTicks = Array.from({ length: 5 }, (_, index) => createdAt + (timeSpan * index) / 4)
   const yTicks = Array.from({ length: 6 }, (_, index) => (yMaximum * index) / 5)
-  const subtitle = `${repo} · 基于 GitHub Stargazer 时间戳自动生成`
+  const subtitle = `${repo} · Generated from GitHub stargazer timestamps`
   const emptyMessage = stars.length === 0
     ? '<text class="empty" x="480" y="278" text-anchor="middle">Star history starts with the first star</text>'
     : ''
@@ -164,9 +164,9 @@ function renderStarHistory(repo, { createdAt, stars }) {
   <rect width="960" height="480" rx="12" fill="#f8faf9"/>
   <rect x=".5" y=".5" width="959" height="479" rx="11.5" fill="none" stroke="#dfe5e2"/>
   <text x="34" y="48" fill="#176b52" font-size="25">★</text>
-  <text class="title" x="66" y="45">StonePlus Star 趋势</text>
+  <text class="title" x="66" y="45">StonePlus Star History</text>
   <text class="subtitle" x="34" y="68">${escapeXml(subtitle)}</text>
-  <text class="label" x="926" y="33" text-anchor="end">当前 Star</text>
+  <text class="label" x="926" y="33" text-anchor="end">TOTAL STARS</text>
   <text class="count" x="926" y="67" text-anchor="end">${stars.length}</text>
   ${yTicks.map((count) => `<line class="grid" x1="${plot.left}" y1="${formatNumber(y(count))}" x2="${width - plot.right}" y2="${formatNumber(y(count))}"/>`).join('\n  ')}
   ${xTicks.map((timestamp) => `<line class="grid" x1="${formatNumber(x(timestamp))}" y1="${plot.top}" x2="${formatNumber(x(timestamp))}" y2="${height - plot.bottom}"/>`).join('\n  ')}
@@ -200,7 +200,7 @@ function niceMaximum(value) {
 function formatDate(timestamp, span) {
   const date = new Date(timestamp)
   if (span <= 2 * 24 * 60 * 60 * 1000) {
-    return new Intl.DateTimeFormat('zh-CN', {
+    return new Intl.DateTimeFormat('en-US', {
       month: 'short',
       day: 'numeric',
       hour: '2-digit',
@@ -210,9 +210,9 @@ function formatDate(timestamp, span) {
     }).format(date)
   }
   if (span <= 180 * 24 * 60 * 60 * 1000) {
-    return new Intl.DateTimeFormat('zh-CN', { month: 'numeric', day: 'numeric', timeZone: 'UTC' }).format(date)
+    return new Intl.DateTimeFormat('en-US', { month: 'numeric', day: 'numeric', timeZone: 'UTC' }).format(date)
   }
-  return new Intl.DateTimeFormat('zh-CN', { year: 'numeric', month: 'numeric', timeZone: 'UTC' }).format(date)
+  return new Intl.DateTimeFormat('en-US', { year: 'numeric', month: 'numeric', timeZone: 'UTC' }).format(date)
 }
 
 function formatCount(value) {

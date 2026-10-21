@@ -1,358 +1,221 @@
 <p align="center">
-  <img src="build/icon.svg" width="104" alt="Stone+ 图标">
+  <img src="build/icon.svg" width="96" alt="Stone+ logo">
 </p>
 
 <h1 align="center">StonePlus</h1>
 
-<p align="center"><strong>StonePlus（应用内保留 Stone+ 品牌）：把多个 AI 账号、API 与编程客户端，收进一个本地智能网关</strong></p>
+<p align="center"><strong>One local gateway for your AI coding clients</strong></p>
 
 <p align="center">
-  <a href="README.en.md">English</a> · <strong>简体中文</strong>
+  <strong>English</strong> | <a href="README.zh-CN.md">Chinese (Simplified)</a>
 </p>
 
 > [!IMPORTANT]
-> StonePlus 已于 2026-10-21 转为标准 [Apache-2.0](LICENSE) 开源，允许修改、Fork、再分发、商业使用与 AI 辅助开发。
-> 代码、文档、构建脚本及项目自有视觉素材适用同一开源许可；第三方组件保留各自条款。
-> 历史版本说明见 [LICENSE_BOUNDARY.md](LICENSE_BOUNDARY.md)，欢迎提交 Issue 和 Pull Request。
+> StonePlus is open source under standard [Apache-2.0](LICENSE) as of 2026-10-21, including original code, documentation, build scripts, and visual assets.
+> Modification, forks, redistribution, commercial use, hosted services, and AI-assisted development are permitted. Third-party terms remain applicable.
+> See [LICENSE_BOUNDARY.md](LICENSE_BOUNDARY.md) for historical artifacts. Issues and pull requests are welcome.
 
 <p align="center">
-  <a href="https://github.com/M4rkzzz/stone-plus/releases/latest"><img src="https://img.shields.io/github/v/release/M4rkzzz/stone-plus?display_name=tag&sort=semver&color=176b52" alt="最新版本"></a>
-  <a href="https://github.com/M4rkzzz/stone-plus/actions/workflows/release.yml"><img src="https://github.com/M4rkzzz/stone-plus/actions/workflows/release.yml/badge.svg" alt="多平台构建"></a>
-  <a href="https://github.com/M4rkzzz/stone-plus/releases/latest"><img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-3d4a45" alt="Windows、macOS 与 Linux"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-3d6fa8" alt="Apache License 2.0"></a>
-  <a href="https://github.com/M4rkzzz/stone-plus/stargazers"><img src="https://img.shields.io/github/stars/M4rkzzz/stone-plus?style=flat&logo=github" alt="GitHub Stars"></a>
+  <a href="https://github.com/M4rkzzz/stone-plus/releases/latest"><img src="https://img.shields.io/github/v/release/M4rkzzz/stone-plus?display_name=tag&sort=semver" alt="Latest release"></a>
+  <a href="https://github.com/M4rkzzz/stone-plus/actions/workflows/release.yml"><img src="https://github.com/M4rkzzz/stone-plus/actions/workflows/release.yml/badge.svg" alt="Release build"></a>
+  <a href="https://github.com/M4rkzzz/stone-plus/releases/latest"><img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-555" alt="Windows, macOS, and Linux"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue" alt="Apache License 2.0"></a>
+  <a href="https://github.com/M4rkzzz/stone-plus/stargazers"><img src="https://img.shields.io/github/stars/M4rkzzz/stone-plus?style=flat&logo=github" alt="GitHub stars"></a>
 </p>
 
 <p align="center">
-  <strong>本地优先 · 多账号智能调度 · OpenAI / Anthropic / Gemini 协议转换 · OAuth / CPA 批量管理</strong>
+  <strong>Local credentials. Smart account routing. Protocol conversion. Clear diagnostics.</strong>
 </p>
 
 <p align="center">
-  <a href="https://github.com/M4rkzzz/stone-plus/releases/latest"><strong>下载最新版</strong></a> ·
-  <a href="#三分钟开始使用">三分钟上手</a> ·
-  <a href="#核心亮点">核心亮点</a> ·
-  <a href="#技术原理">技术原理</a> ·
-  <a href="#界面预览">界面预览</a>
+  <a href="https://github.com/M4rkzzz/stone-plus/releases/latest"><strong>Download latest release</strong></a> ·
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#features">Features</a> ·
+  <a href="#screenshots">Screenshots</a> ·
+  <a href="#development">Development</a> ·
+  <a href="SECURITY.md">Security</a>
 </p>
+
+StonePlus — shown as **Stone+** inside the app and also searchable as **Stone Plus** or **stone-plus** — is built on [upstream Stone](https://github.com/EasyCode-Obsidian/Stone) and adds practical features for faster routing, smarter scheduling, request diagnostics, Codex session repair, account import, and FRP tunneling. It remains an independent, unofficial community fork. Add your providers, decide which models each account can expose, combine compatible accounts into pools, and connect Claude Code, Codex, or Gemini CLI through one local gateway.
+
+Stone+ selects an available account according to its model support, quota, health, and pool policy. It can also translate between OpenAI, Anthropic, and Gemini protocols, so a client and its upstream pool do not need to use the same API format.
+
+> Stone+ is intended for credentials and subscriptions that you own or are authorized to use. It does not provide account sharing, resale, public access, or mechanisms to bypass provider limits.
+
+## Stone+ additions
+
+- **Faster streaming path.** Reuses upstream connections, negotiates HTTP/2, flushes SSE headers immediately, and avoids unnecessary state cloning and stream buffering.
+- **Fast On pools.** Optionally enforces the supported `priority` service tier on OpenAI Responses-compatible requests.
+- **Performance-aware routing.** Adds optional `autobalanced` scheduling using EWMA TTFT and output speed, plus output-token speed charts for recent and weekly trends.
+- **Better request diagnostics.** Shows TTFT, conversation titles, compact adjustable columns, and a privacy toggle for titles.
+- **Correct client disconnect semantics.** Records HTTP 499 without cooling down an account or triggering failover.
+- **Codex session repair.** Repairs historical-session provider metadata and SQLite indexes through previews, backups, transactional updates, and rollback.
+- **Batch account import.** Imports CPA and Sub2API JSON files, recovers missing account IDs from JWT claims, and immediately checks imported accounts concurrently.
+- **Embedded FRP tunnel.** Runs a bundled `frpc` from pasted configuration and exposes copyable connection details.
+
+See [CHANGELOG.md](CHANGELOG.md) and [MODIFICATIONS.md](MODIFICATIONS.md) for release and attribution details.
 
 <p align="center">
-  <img src="docs/media/stone-demo.gif" width="100%" alt="Stone+ 动态功能演示">
+  <img src="docs/screenshots/en/overview.png" width="100%" alt="StonePlus overview in English with sample accounts, quota, and request metrics">
 </p>
 
-## StonePlus 是什么？
+## Why Stone+
 
-StonePlus（应用内仍显示 **Stone+**，也可搜索 **Stone Plus** 或 **stone-plus**）是 [Stone](https://github.com/EasyCode-Obsidian/Stone) 的社区功能增强版。它运行在你的电脑上，在 **Codex、Claude Code、Gemini CLI** 与多个上游账号/API 之间充当一个本地控制平面：
+- **Local control and storage.** No server deployment or remote control service is required; credentials, profiles, account metadata, and history stay on this computer.
+- **One place for every account.** Manage official providers, compatible endpoints, API keys, access tokens, and Codex / ChatGPT OAuth sessions from one desktop app.
+- **Fewer interruptions.** Account pools can retry, cool down failing accounts, respect quota limits, and fail over to another usable account.
+- **Use the model where it is available.** Each account has its own discovered and exposed model list; pools combine the models provided by their members.
+- **Connect clients without repeated manual editing.** Stone+ manages Claude Code, Codex, and Gemini CLI profiles with previews, backups, and restore.
+- **Bring your own network route.** Assign HTTP, HTTPS, SOCKS4, or SOCKS5 outbound proxies at account or pool level.
 
-- 客户端只连接 `http://127.0.0.1:15721`；
-- Stone+ 按模型、额度、健康、并发、会话粘性与历史表现选择账号；
-- 上游失败、冷却或额度耗尽时，按规则切换到其他可用来源；
-- OpenAI Responses、Chat Completions、Anthropic Messages 与 Gemini 请求可以互相转换；
-- 凭据、路由、统计和客户端配置全部保存在本机。
-
-> 如果你有多个 Codex/ChatGPT 订阅、官方 API、兼容中转站，或者同时使用多种编程客户端，Stone+ 可以把分散的配置变成一个可观察、可调度、可恢复的本地入口。
-
-## 为什么值得用？
-
-| 你遇到的问题                       | Stone+ 的处理方式                                                         |
-| ---------------------------------- | ------------------------------------------------------------------------- |
-| 多个账号需要反复切换               | 号池自动调度，冷却、额度耗尽和故障账号会暂时退出候选                      |
-| 同时开多个对话容易挤在一个账号     | 会话粘性保证上下文稳定，多活跃对话会软分流到不同健康账号                  |
-| 客户端协议与上游协议不一致         | 在 OpenAI、Anthropic、Gemini 协议间转换普通请求、流式事件、工具调用和用量 |
-| 导入大量 CPA / Sub2API JSON 很繁琐 | 批量导入、Tag、出口代理、状态刷新、额度探测和模型查询一步完成             |
-| 不知道慢在本地、代理还是上游       | 一键检查 DNS、TLS、ChatGPT、Codex、OAuth、系统代理、账号、号池和路由      |
-| 切换反代时把客户端配置改坏         | 客户端文件固定连接 Stone+；换上游只切内部路由，异常时可一键备份并修复     |
-| 希望数据留在自己电脑               | SQLite + 操作系统安全存储，无远程控制服务，不记录请求/响应正文            |
-
-## 界面预览
-
-### 总览：一眼看清网关、账号与请求
-
-![Stone+ 总览](docs/screenshots/overview.png)
-
-| 账号、额度与历史体质                                  | 号池、模型与调度策略                                 |
-| ----------------------------------------------------- | ---------------------------------------------------- |
-| ![Stone+ 账号与中转](docs/screenshots/accounts.png)   | ![Stone+ 号池](docs/screenshots/pools.png)           |
-| 新手向导与 OAuth                                      | 多客户端路由                                         |
-| ![Stone+ 新手向导](docs/screenshots/setup-wizard.png) | ![Stone+ 路由](docs/screenshots/routes.png)          |
-| 内置浏览器与 JSON 队列                                | 一键网络诊断                                         |
-| ![Stone+ 内置浏览器](docs/screenshots/browser.png)    | ![Stone+ 网络诊断](docs/screenshots/diagnostics.png) |
-
-<details>
-<summary><strong>查看应用内更新弹窗</strong></summary>
-
-![Stone+ 在线更新](docs/screenshots/online-update.png)
-
-</details>
-
-## 核心亮点
-
-### 1. 新手向导：从“有账号”到“真实请求跑通”
-
-向导不是只保存几项配置，而是按真实链路逐步验收：
+## How It Works
 
 ```text
-环境扫描 → 选择来源 → 配置来源 → 网络出口 → 上游真实测试
-        → 选择客户端 → 创建号池/路由 → 启动网关
-        → 本地端到端验证 → 一键接好客户端
+Claude Code / Codex / Gemini CLI
+                 |
+                 v
+        Stone+ local gateway
+       models + pool policy
+          /      |      \
+     Account A Account B Account C
 ```
 
-- 支持 **OpenAI OAuth PKCE**、Token/JSON、官方 API、中转站、已有账号和聚合中转；
-- OAuth 可设置账号名称、Tag、目标号池与 Token 交换/后续请求的出口代理；
-- 自动刷新状态、查询模型，再发送一个极小的真实请求确认权限；
-- 放弃本次向导后会清除进度，下次从环境扫描重新开始；
-- 最后从本地网关再请求一次，确保鉴权、路由、调度、协议和上游全部可用。
+The client connects only to Stone+'s local address. Stone+ chooses a suitable account from the selected pool, forwards or converts the request, and returns the response in the protocol expected by the client.
 
-### 2. 智能均衡：不只看“现在谁最快”
+## Features
 
-`autobalanced` 先执行硬性过滤，再做软评分：
+| Area                   | What you can do                                                                                                                                                                                                                  |
+| ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Providers and accounts | Add OpenAI, Anthropic, Gemini, compatible or custom endpoints; keep multiple independent accounts under one provider                                                                                                             |
+| Model control          | Discover models per account, expose all or selected models, test an individual model, and choose the models published by each pool                                                                                               |
+| Account pools          | Use priority, balanced, round-robin, or weighted-random scheduling with concurrency limits, session affinity, retry, cooldown, and failover                                                                                      |
+| Quota visibility       | View Codex five-hour and weekly quota windows, 24-hour and 14-day trends, and supported provider rate limits                                                                                                                     |
+| Outbound proxies       | Configure HTTP, HTTPS, SOCKS4, and SOCKS5 proxies per account or pool; view the configured endpoint, public egress IP, and latency                                                                                               |
+| Coding clients         | Detect and manage Claude Code, Codex, and Gemini CLI profiles; preview changes and restore backups                                                                                                                               |
+| Protocol gateway       | Accept OpenAI Responses, OpenAI Chat Completions, Anthropic Messages, and Gemini generateContent; convert normal and streaming requests, including tool calls and usage                                                          |
+| Local visibility       | Review request status, latency, token usage, account health events, and desktop notifications without storing request or response bodies                                                                                         |
+| Application updates    | Compare the installed version with GitHub Releases, review notes, and ignore a version; Windows setup and Linux AppImage builds can download and restart into updates, while other packages open Releases for manual replacement |
 
-1. **硬过滤**：账号是否启用、模型是否开放、是否冷却、额度是否耗尽、熔断状态、并发槽位；
-2. **会话粘性**：同一对话尽量留在原账号，避免上下文和缓存频繁迁移；
-3. **并发软分流**：多个活跃对话优先分散到多个健康账号，而不是全部粘住同一个号；
-4. **历史移动评价**：综合长期成功率、EWMA 首字、输出速度、稳定性、失败惩罚与实际有效并发；
-5. **受控探索**：保留小幅探索机会，避免一个账号因为短期抖动永久失去流量。
+## Screenshots
 
-账号列表用 `SP86` 这样的 **SP 体质分**展示长期表现；分数采用移动评价，不会因为当前可用账号较少就把其中最好者简单标成 100。
+Screenshots show the English interface with sample data.
 
-### 3. 账号、CPA 与 Sub2API 批量工作流
+| Accounts, quota, and health                                         | Pool scheduling and model policies                                 |
+| ------------------------------------------------------------------- | ------------------------------------------------------------------ |
+| ![Stone+ account management](docs/screenshots/en/accounts.png)         | ![Stone+ account pools](docs/screenshots/en/pools.png)                |
+| Coding client configuration                                         | Client routes and model selection                                   |
+| ![Stone+ coding client configuration](docs/screenshots/en/clients.png) | ![StonePlus client routes](docs/screenshots/en/routes.png) |
 
-- 支持 OAuth、Access Token、单个 JSON、JSON 数组、逐行 JSON 和多文件导入；
-- 自动从 JWT 补全缺失的 CPA `account_id`；
-- 导入时显示“解析/导入 + 状态刷新 + 模型查询”的总体进度；
-- 可批量设置 K12、Plus 或自定义 Tag，并把检测成功的账号追加到指定号池；
-- 可保留文件代理、强制直连，或给整批账号统一选择 HTTP/SOCKS 出口；
-- 列表显示额度恢复倒计时、5 小时/周额度、实时占槽、延迟和 SP 分；
-- 删除账号时自动从相关号池移除并协调模型白名单。
+## Quick Start
 
-### 4. 多来源路由与聚合中转
+### 1. Download Stone+
 
-一个路由可以直接指向：
+Download the package for your platform and `SHA256SUMS` from [GitHub Releases](https://github.com/M4rkzzz/stone-plus/releases/latest).
 
-- 普通账号号池；
-- 多成员聚合中转；
-- 官方 OpenAI / Anthropic / Google API；
-- OpenAI/Anthropic 兼容中转站。
+| Platform            | Choose                                                                                                    |
+| ------------------- | --------------------------------------------------------------------------------------------------------- |
+| Windows x64         | `StonePlus-*-windows-x64-setup.exe` to install, or `StonePlus-*-windows-x64-portable.exe` to run directly |
+| macOS Intel         | `StonePlus-*-macos-x64.dmg` or `StonePlus-*-macos-x64.zip`                                                |
+| macOS Apple Silicon | `StonePlus-*-macos-arm64.dmg` or `StonePlus-*-macos-arm64.zip`                                            |
+| Linux x64           | `StonePlus-*-linux-x86_64.AppImage` or `StonePlus-*-linux-amd64.deb`                                      |
+| Linux arm64         | `StonePlus-*-linux-arm64.AppImage` or `StonePlus-*-linux-arm64.deb`                                       |
 
-聚合中转支持故障转移、按请求轮询、按会话轮询和平滑加权轮询。普通号池、聚合中转和中转站都可以在卡片上开启 **FAST**，为兼容的 OpenAI 请求使用 priority service tier。
+Windows builds use the persistent StonePlus project self-signed Authenticode certificate with an RFC 3161 timestamp; because it is not rooted in Microsoft's public trust store, SmartScreen may still warn. macOS builds are ad-hoc signed and are not Apple-notarized. Verify the certificate fingerprint, `SHA256SUMS`, and GitHub build provenance before approving a download.
 
-### 5. 低延迟流式数据面
+If you are upgrading directly from `v0.7.1` or earlier, the first upgrade to `v0.8.0` or later must be installed manually because the older release does not contain the updater. After `v0.8.0` is installed, Windows setup builds and Linux AppImages can download an update in Stone+ and restart into it. Windows Portable, Linux deb, and current macOS builds open Releases for manual replacement.
 
-Stone+ 针对长连接与流式输出做了专门优化：
-
-- HTTP/2 协商、连接复用、keepalive、预热主通道与按负载扩展的备用通道；
-- 收到上游流后尽早发送 SSE 响应头和首个可见片段；
-- 首正文超时可以切换其他账号，减少“连接成功但一直没字”的等待；
-- OAuth 刷新使用 singleflight，同一账号的并发请求不会重复刷新 Token；
-- SQLite 请求日志采用批量/合并写入，瞬时并发占槽不写入数据库；
-- 可选低延迟竞速请求默认关闭，需要时再显式启用。
-
-### 6. 内置浏览器：下载完再一次导入
-
-- 多标签页、前进/后退、地址栏、缩放和自定义快捷入口；
-- 默认快捷入口为 `https://aiprobe.top/`；
-- 下载的 JSON 自动进入挂起队列，不必每下载一个就立即处理；
-- 全部下载后可批量导入并统一选择出口代理；
-- 下载文件同时保留在缓存列表，可再次“另存为”，避免 JSON 丢失。
-
-### 7. 诊断、更新与桌面整合
-
-- 一键诊断 ChatGPT、Codex、OAuth、DNS、TLS、系统代理、上游账号、号池和路由；
-- 设置中可明确开启“适配系统代理”，适配 PAC、Clash 等本机代理环境；
-- 检测到新版本时在品牌区显示绿色“更新”，点击查看 Release 亮点；
-- Windows 安装版与 Linux AppImage 确认后自动下载、校验、覆盖安装并重启；
-- 单实例运行：重复打开时聚焦已有主窗口；
-- 顶栏 ChatGPT 按钮可安全修复 Codex 会话索引并重新启动 ChatGPT；
-- Windows 提供内置 FRP 管理；非 Windows 平台不显示该入口。
-
-## 技术原理
-
-### 请求路径
-
-```mermaid
-flowchart LR
-  C1["Codex"] --> G["Stone+ 本地网关"]
-  C2["Claude Code"] --> G
-  C3["Gemini CLI"] --> G
-
-  G --> A["鉴权与客户端路由"]
-  A --> P["协议转换与模型映射"]
-  P --> S["调度器"]
-
-  S --> O1["OAuth / CPA 账号池"]
-  S --> O2["官方 API"]
-  S --> O3["兼容中转站"]
-  S --> O4["聚合中转"]
-
-  O1 --> R["流式响应转换"]
-  O2 --> R
-  O3 --> R
-  O4 --> R
-  R --> C1
-  R --> C2
-  R --> C3
-```
-
-### 调度决策
-
-```mermaid
-flowchart TD
-  Q["收到请求"] --> M{"模型可用？"}
-  M -- 否 --> X["排除账号"]
-  M -- 是 --> H{"启用 / 未冷却 / 未熔断？"}
-  H -- 否 --> X
-  H -- 是 --> L{"额度和并发可用？"}
-  L -- 否 --> X
-  L -- 是 --> T{"已有会话粘性？"}
-  T -- 是 --> D["满足软分流后优先复用"]
-  T -- 否 --> E["按成功率、TTFT、速度、稳定性、负载评分"]
-  D --> U["选择账号并占用并发槽"]
-  E --> U
-  U --> F{"请求结果"}
-  F -- 成功 --> W["更新 EWMA / SP / 粘性"]
-  F -- 失败 --> B["惩罚、重试、冷却或熔断"]
-```
-
-### 协议与客户端
-
-| 客户端/入口        | 入站协议                     | 可连接的上游                                        |
-| ------------------ | ---------------------------- | --------------------------------------------------- |
-| Codex              | OpenAI Responses             | OpenAI/OAuth、兼容中转、Anthropic、Gemini（经转换） |
-| Claude Code        | Anthropic Messages           | Anthropic、兼容中转、OpenAI、Gemini（经转换）       |
-| Gemini CLI         | Gemini generateContent       | Gemini、OpenAI、Anthropic（经转换）                 |
-| 通用 OpenAI 客户端 | Responses / Chat Completions | 账号池、官方 API、兼容中转与聚合中转                |
-
-协议层覆盖普通与流式文本、工具调用、停止原因和 Token 用量。不同厂商能力并不完全对等，Stone+ 会保留能可靠转换的字段，并在不支持时返回明确错误。
-
-### 本地数据与安全边界
-
-| 数据                           | 保存位置与处理方式                                                                    |
-| ------------------------------ | ------------------------------------------------------------------------------------- |
-| API Key、OAuth Token、代理密码 | Electron `safeStorage`，由 Windows DPAPI、macOS Keychain 或 Linux Secret Service 保护 |
-| 账号、号池、路由、统计         | 本地 SQLite 状态库                                                                    |
-| 请求日志                       | 保存状态、耗时、Token 与调度信息；不保存请求/响应正文                                 |
-| 客户端配置                     | 切换上游只改 Stone+ 内部路由；一键修复连接前自动备份，损坏文件可安全重建              |
-| 诊断导出                       | 输出经过脱敏的状态和错误摘要，不导出真实凭据                                          |
-
-Stone+ 默认只监听回环地址，不提供云端控制台、公共账号服务或远程凭据托管。
-
-## 三分钟开始使用
-
-### 1. 下载
-
-从 [GitHub Releases](https://github.com/M4rkzzz/stone-plus/releases/latest) 下载对应平台文件，并可使用 `SHA256SUMS` 校验：
-
-| 平台                | 推荐文件                                                             |
-| ------------------- | -------------------------------------------------------------------- |
-| Windows x64         | `StonePlus-*-windows-x64-setup.exe`；免安装可选 portable             |
-| macOS Intel         | `StonePlus-*-macos-x64.dmg` 或 `.zip`                                |
-| macOS Apple Silicon | `StonePlus-*-macos-arm64.dmg` 或 `.zip`                              |
-| Linux x64           | `StonePlus-*-linux-x86_64.AppImage` 或 `StonePlus-*-linux-amd64.deb` |
-| Linux arm64         | `StonePlus-*-linux-arm64.AppImage` 或 `.deb`                         |
-
-Windows 包使用项目持续自签名证书进行 Authenticode 签名并带时间戳，但该证书不在 Microsoft 公共信任链中，SmartScreen 仍可能警告；macOS 为 ad-hoc 签名且未经过 Apple 公证。首次启动前请核对 Release 中的证书指纹、`SHA256SUMS` 与 GitHub 构建来源证明。
-
-Linux AppImage：
+On Linux, run an AppImage or install a deb package:
 
 ```bash
-chmod +x StonePlus-*-linux-*.AppImage
-./StonePlus-*-linux-*.AppImage
+chmod +x StonePlus-*.AppImage
+./StonePlus-*.AppImage
+
+sudo apt install ./StonePlus-*.deb
 ```
 
-Linux deb：
+### 2. Add Accounts and Start Routing
+
+> [!NOTE]
+> StonePlus supports English and Simplified Chinese and follows your system language by default. Select English under **Settings → Language** if needed.
+
+1. Open **Accounts & Relays**, confirm or add an upstream, then add an API key or access token. Use **Add Codex account** for a Codex / ChatGPT OAuth session.
+2. Test the account connection, refresh its available models, and choose the models it may expose.
+3. Open **Pools**, add compatible accounts, choose a scheduling policy, and select the models published by the pool.
+4. Open **Routes**, select a pool for Claude Code, Codex, or Gemini CLI, then save and enable the route.
+5. Open **Client Configuration**, preview the changes, and apply them. Stone+ backs up existing files first.
+6. Start the local gateway, then launch the coding client.
+
+The default gateway address is `http://127.0.0.1:15721`. Manual connection values and the route token are available on the **Routes** page.
+
+## Development
+
+Use the Node.js and npm versions pinned in `.nvmrc` and `package.json`.
 
 ```bash
-sudo apt install ./StonePlus-*-linux-*.deb
-```
-
-### 2. 跟着向导走
-
-1. 点击顶部 **配置向导**；
-2. 选择 OAuth、Token/JSON、官方 API、中转站或已有来源；
-3. 选择直连或出口代理，完成网络和真实上游测试；
-4. 选择 Codex、Claude Code 或 Gemini CLI；
-5. 让向导创建号池与路由并启动本地网关；
-6. 运行端到端验证，一键修复并接好客户端配置。
-
-之后客户端只需要连接 Stone+。如果已经有完整配置，也可以跳过向导，直接在“账号与中转 → 号池 → 路由 → 客户端配置”中精细调整。
-
-## 功能地图
-
-| 模块       | 主要能力                                                                         |
-| ---------- | -------------------------------------------------------------------------------- |
-| 总览       | 请求量、成功率、账号可用性、平均延迟、Token 与成本、输出速度趋势                 |
-| 账号与中转 | OAuth/JSON 导入、官方 API、中转站、Tag、额度、SP、批量操作、模型发现             |
-| 出口代理   | HTTP、HTTPS、SOCKS4、SOCKS5，连通测试、公网出口与系统代理适配                    |
-| 号池       | priority、balanced、autobalanced、round-robin、weighted-random、粘性、重试、FAST |
-| 路由       | Codex、Claude Code、Gemini CLI，多源选择、模型映射、本地 Token                   |
-| 客户端配置 | Codex 默认打开；上游无损热切、一键修复连接、最近备份恢复，高级编辑默认收起       |
-| 会话修复   | 扫描 Codex 历史、预览差异、备份 rollout/SQLite、事务修复                         |
-| 内置浏览器 | 多标签、缩放、快捷入口、JSON 队列、缓存另存、批量代理选择                        |
-| 诊断       | 网络、OAuth、系统代理、账号、号池、路由与本地网关的分阶段诊断                    |
-| 请求记录   | 首字、总耗时、Token、模型、账号、路由结果与详细阶段时间                          |
-| 设置       | 网关、系统代理、自启动、更新、备份与诊断导出                                     |
-
-## 相比原版 Stone 的主要增强
-
-Stone+ 保留上游 Stone 的本地网关、协议转换、号池、路由和客户端配置基础，并重点扩展：
-
-- 高并发流式性能、连接预热和首正文故障切换；
-- 历史 SP 体质分、自适应并发、额度解冻探测和智能均衡；
-- CPA/Sub2API 批量导入、Tag、代理、模型查询和安全导出；
-- OpenAI OAuth PKCE 与完整新手向导；
-- 官方 API、兼容中转、聚合中转和统一多来源路由；
-- 内置浏览器 JSON 队列与缓存；
-- 网络诊断、Codex 会话修复、Windows FRP、单实例与应用内更新；
-- 更完整的请求观测、Token 成本和客户端配置管理。
-
-完整逐版本变化见 [CHANGELOG.md](CHANGELOG.md)，与上游的差异及许可证说明见 [MODIFICATIONS.md](MODIFICATIONS.md)。
-
-## 从源码运行
-
-需要 Node.js 22.20.0 与 npm 10.9.3；仓库会在安装依赖前自动校验该工具链：
-
-```bash
-git clone https://github.com/M4rkzzz/stone-plus.git
-cd stone-plus
 npm ci
-npm run dev
+npm run dev:web
 ```
 
-质量检查与构建：
+The web preview uses sample data, so you can explore the interface without
+connecting a provider account. For the desktop application, use `npm run dev`.
+Packaging requires the bundled runtimes described in the release guide.
 
 ```bash
-npm run check
-npm run dist
+npm run lint
+npm run typecheck
+npm test
+npm run build
+npm run license:verify
 ```
 
-架构说明见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。发布维护者请使用
-[Release Guide](docs/release-guide.zh-CN.md)，并同时遵守
-[sing-box 分发合规清单](docs/distribution-compliance.md)。
+Contributions are welcome. Read [AGENTS.md](AGENTS.md) for development guidance,
+[MODIFICATIONS.md](MODIFICATIONS.md) for upstream attribution, and
+[the release compliance guide](docs/distribution-compliance.md) for bundled
+runtime and source-distribution requirements.
 
-## 使用边界
+## Privacy and Local Data
 
-- 仅导入你本人拥有或已获授权使用的账号、Token 与 API Key；
-- 模型测试和向导验证会发送真实的小请求，可能消耗额度或产生上游费用；
-- OAuth/订阅账号能否使用某个模型，最终由上游权限决定；
-- Stone+ 不扫描浏览器 Cookie，也不会未经确认自动读取其他应用的凭据；
-- 当前产品定位是个人本地桌面网关，不是账号共享、转售、团队计费或公共代理平台。
+- The gateway accepts connections only from this computer.
+- Stored provider credentials and proxy passwords are protected by the operating system's secure credential storage.
+- Request and response bodies are not written to Stone+'s request history.
+- Stone+ backs up client configuration files before changing them so they can be restored when needed.
+- Account metadata, profiles, quota history, and request statistics remain in the local Stone+ data directory.
 
-## Star 趋势
+## Important Notes
+
+- Stone+ is a personal local desktop application, not a team-management, billing, or remote-administration platform.
+- A model test sends a real, small request to the upstream. It consumes quota and may incur provider charges.
+- Importing a Codex / ChatGPT session does not verify a subscription tier. Available models and backend access are determined by the upstream account.
+- `v0.8.1` fixes imports for multiple members of one ChatGPT Team or shared workspace. If an older Stone+ version replaced one imported member with another, install the latest release and reimport the original JSON; overwritten credentials cannot be recovered from Stone+'s database. Add newly recreated accounts back to the required pools and reassign their proxies when needed.
+- Stone+ does not scan browser cookies or automatically import `~/.codex/auth.json`. A session without a Refresh Token must be imported again after its Access Token expires.
+- Codex quota charts are available only for ChatGPT OAuth accounts and begin collecting data after Stone+ first receives quota information.
+- Proxy connectivity tests contact `api.ipify.org` and fall back to `icanhazip.com` to identify the proxy's public egress IP.
+- Linux credential storage requires a Secret Service-compatible keyring such as `libsecret` or KWallet. AppImage may also require FUSE 2.
+- Stone+ checks GitHub Releases at startup. You can also check manually, read release notes, or ignore a version under **Settings → Application Updates**.
+- Windows setup builds and Linux AppImages support in-app download and restart installation. Windows Portable, Linux deb, and current macOS builds require a manual update from Releases.
+- Windows releases use the persistent StonePlus project self-signed Authenticode certificate and timestamp; SmartScreen may still warn. macOS releases are ad-hoc signed and are not Apple-notarized.
+
+## Community
+
+Use [GitHub Discussions](https://github.com/M4rkzzz/stone-plus/discussions) for questions and workflow ideas, [GitHub Issues](https://github.com/M4rkzzz/stone-plus/issues) for reproducible bugs and feature requests, and [Private Vulnerability Reporting](https://github.com/M4rkzzz/stone-plus/security/advisories/new) for suspected security issues. Read the [Security Policy](SECURITY.md) before sharing diagnostics, and never post real credentials or account data.
+
+For Chinese-language community discussion, join QQ group **1061282900**. The community does not support credential sharing, account trading, or advice for bypassing provider terms.
+
+## Star History
 
 <p align="center">
   <a href="https://github.com/M4rkzzz/stone-plus/stargazers">
-    <img src="docs/star-history.svg" width="100%" alt="Stone+ Star 趋势图">
+    <img src="docs/star-history.svg" alt="Stone+ star history">
   </a>
 </p>
 
-<p align="center"><sub>每天从 GitHub Stargazer 时间戳自动刷新，与当前仓库真实 Star 数据一致。</sub></p>
+## License
 
-## 许可证、第三方组件与品牌
+- StonePlus-owned code, documentation, build scripts, and original visual assets are licensed under the standard [Apache License 2.0](LICENSE). Modification, forks, rebranding, redistribution, commercial use, hosted services, and AI-assisted development are allowed.
+- Preserve applicable copyright and attribution notices and identify modifications as required by Apache-2.0. See [AGENTS.md](AGENTS.md) and [AI_USAGE_POLICY.md](AI_USAGE_POLICY.md) for contribution guidance.
+- See [SOURCE_ACCESS.md](SOURCE_ACCESS.md) for exact source and build instructions. Official releases include source archives tied to the exact tag, checksums, and build provenance.
+- Upstream Stone and third-party components retain their original licenses. Bundled sing-box keeps its GPL and corresponding-source obligations. See [NOTICE](NOTICE), [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md), and [SOURCE_OFFER-sing-box.md](SOURCE_OFFER-sing-box.md).
+- Apache-2.0 grants no trademark rights. [TRADEMARKS.md](TRADEMARKS.md) distinguishes official and third-party origin without prohibiting open-source forks or commercial use.
+- This migration applies from the 2026-10-21 repository revision. Previously published tags and binaries keep their accompanying notices; see [LICENSE_BOUNDARY.md](LICENSE_BOUNDARY.md). Use the migrated source or a later release explicitly marked Apache-2.0 for the open-source version.
 
-- StonePlus 自有代码、文档、构建脚本及原创视觉素材采用标准 [Apache License 2.0](LICENSE)，允许修改、Fork、换标、再分发、商业使用、托管服务及 AI 辅助开发。
-- 请保留适用的版权与归属声明，并按 Apache-2.0 要求说明修改；贡献指南见 [AGENTS.md](AGENTS.md) 和 [AI_USAGE_POLICY.md](AI_USAGE_POLICY.md)。
-- 准确源码和构建方式见 [SOURCE_ACCESS.md](SOURCE_ACCESS.md)；官方 Release 提供准确 Tag 对应的源码归档、校验和及构建来源证明。
-- 上游 Stone 及第三方组件保留各自原许可证；随包 sing-box 的 GPL 和对应源码交付义务继续适用，详情见 [NOTICE](NOTICE)、[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) 与 [SOURCE_OFFER-sing-box.md](SOURCE_OFFER-sing-box.md)。
-- Apache-2.0 不授予商标权；[TRADEMARKS.md](TRADEMARKS.md) 只区分官方与第三方来源，不禁止开源 Fork 或商业使用。
-- 迁移自 2026-10-21 的本仓库修订起生效；已发布的旧 Tag 与二进制保留随附声明，详见 [LICENSE_BOUNDARY.md](LICENSE_BOUNDARY.md)。获取开源版本请使用迁移后的源码或明确标注 Apache-2.0 的后续版本。
-
-官方 Release 提供代码签名（适用平台）、`SHA256SUMS` 与构建来源证明，便于核验来源。
+Official releases provide code signatures where supported, `SHA256SUMS`, and build provenance to verify origin.

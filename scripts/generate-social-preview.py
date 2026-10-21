@@ -100,7 +100,7 @@ def main() -> None:
     draw.text((70, 559), "Apache-2.0  ·  Windows  ·  macOS  ·  Linux", font=font("bold", 14), fill="#d7e7e1")
     draw.text((70, 591), "github.com/M4rkzzz/stone-plus", font=font("regular", 14), fill="#75bea5")
 
-    screenshot = Image.open(ROOT / "docs" / "screenshots" / "overview.png").convert("RGB")
+    screenshot = Image.open(ROOT / "docs" / "screenshots" / "en" / "overview.png").convert("RGB")
     screenshot = fit_inside(screenshot, (676, 470))
     shot_x, shot_y = 570, 96
 
