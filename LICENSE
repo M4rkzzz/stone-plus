@@ -1,167 +1,201 @@
-StonePlus Source Available License 1.0
-Effective date: 2026-07-23
+                                 Apache License
+                           Version 2.0, January 2004
+                        http://www.apache.org/licenses/
 
-Copyright (c) 2026 StonePlus Contributors. All rights reserved except as
-expressly stated in this License.
+   TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
 
-This is a source-available license, not an open-source license. By accessing,
-downloading, building, running, or otherwise using the Covered Material, you
-accept this License.
+   1. Definitions.
 
-1. Definitions
+      "License" shall mean the terms and conditions for use, reproduction,
+      and distribution as defined by Sections 1 through 9 of this document.
 
-"Licensor" means the applicable copyright holder or holders identified in
-NOTICE who have authority to license the Covered Material.
+      "Licensor" shall mean the copyright owner or entity authorized by
+      the copyright owner that is granting the License.
 
-"Covered Material" means the source code, documentation, build material,
-original visual material, and other copyrightable material in this repository
-for which the Licensor holds the necessary rights and which is made available
-under this License.
+      "Legal Entity" shall mean the union of the acting entity and all
+      other entities that control, are controlled by, or are under common
+      control with that entity. For the purposes of this definition,
+      "control" means (i) the power, direct or indirect, to cause the
+      direction or management of such entity, whether by contract or
+      otherwise, or (ii) ownership of fifty percent (50%) or more of the
+      outstanding shares, or (iii) beneficial ownership of such entity.
 
-"Third-Party Material" means material identified in NOTICE,
-THIRD_PARTY_NOTICES.md, LICENSES/, file headers, or accompanying notices as
-being owned or licensed by another person. Third-Party Material is excluded
-from the Covered Material and remains governed by its own terms.
+      "You" (or "Your") shall mean an individual or Legal Entity
+      exercising permissions granted by this License.
 
-"Official Channels" means the StonePlus repository, issue tracker, private
-security-reporting channel, and other submission channels expressly designated
-by the Licensor.
+      "Source" form shall mean the preferred form for making modifications,
+      including but not limited to software source code, documentation
+      source, and configuration files.
 
-2. Limited permission
+      "Object" form shall mean any form resulting from mechanical
+      transformation or translation of a Source form, including but
+      not limited to compiled object code, generated documentation,
+      and conversions to other media types.
 
-Subject to continuous compliance with this License, the Licensor grants you a
-personal, limited, non-exclusive, non-transferable, non-sublicensable,
-revocable, royalty-free permission to:
+      "Work" shall mean the work of authorship, whether in Source or
+      Object form, made available under the License, as indicated by a
+      copyright notice that is included in or attached to the work
+      (an example is provided in the Appendix below).
 
-a. view and inspect the Covered Material for personal learning, evaluation,
-   security review, and interoperability analysis;
-b. download and retain a reasonable number of unmodified copies solely as
-   technically necessary for those permitted purposes;
-c. run an unmodified official build, or build and run an unmodified copy
-   locally, as an internal end-user tool for its intended purpose, including
-   personal or organizational work, evaluation, and good-faith security
-   research; and
-d. prepare a private issue report or proposed patch solely for submission to
-   the Licensor through an Official Channel.
+      "Derivative Works" shall mean any work, whether in Source or Object
+      form, that is based on (or derived from) the Work and for which the
+      editorial revisions, annotations, elaborations, or other modifications
+      represent, as a whole, an original work of authorship. For the purposes
+      of this License, Derivative Works shall not include works that remain
+      separable from, or merely link (or bind by name) to the interfaces of,
+      the Work and Derivative Works thereof.
 
-No permission is granted by implication, estoppel, exhaustion, or otherwise.
-All rights not expressly granted are reserved.
+      "Contribution" shall mean any work of authorship, including
+      the original version of the Work and any modifications or additions
+      to that Work or Derivative Works thereof, that is intentionally
+      submitted to Licensor for inclusion in the Work by the copyright owner
+      or by an individual or Legal Entity authorized to submit on behalf of
+      the copyright owner. For the purposes of this definition, "submitted"
+      means any form of electronic, verbal, or written communication sent
+      to the Licensor or its representatives, including but not limited to
+      communication on electronic mailing lists, source code control systems,
+      and issue tracking systems that are managed by, or on behalf of, the
+      Licensor for the purpose of discussing and improving the Work, but
+      excluding communication that is conspicuously marked or otherwise
+      designated in writing by the copyright owner as "Not a Contribution."
 
-3. Security research and submissions
+      "Contributor" shall mean Licensor and any individual or Legal Entity
+      on behalf of whom a Contribution has been received by Licensor and
+      subsequently incorporated within the Work.
 
-Security testing must be conducted only against systems and accounts you own
-or are expressly authorized to test. It must not disrupt other users, access
-unrelated data, or publish an unremediated vulnerability or exploit before a
-reasonable coordinated-disclosure period.
+   2. Grant of Copyright License. Subject to the terms and conditions of
+      this License, each Contributor hereby grants to You a perpetual,
+      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+      copyright license to reproduce, prepare Derivative Works of,
+      publicly display, publicly perform, sublicense, and distribute the
+      Work and such Derivative Works in Source or Object form.
 
-You may submit issues, suggestions, or proposed patches through Official
-Channels. By intentionally submitting a patch or other copyrightable
-contribution, you grant the Licensor a perpetual, irrevocable, worldwide,
-royalty-free, transferable, sublicensable license to use, reproduce, modify,
-distribute, publicly perform, publicly display, and otherwise exploit that
-submission for any purpose. You represent that you have the right to grant
-that permission. Submitting material does not require the Licensor to accept,
-use, or respond to it.
+   3. Grant of Patent License. Subject to the terms and conditions of
+      this License, each Contributor hereby grants to You a perpetual,
+      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+      (except as stated in this section) patent license to make, have made,
+      use, offer to sell, sell, import, and otherwise transfer the Work,
+      where such license applies only to those patent claims licensable
+      by such Contributor that are necessarily infringed by their
+      Contribution(s) alone or by combination of their Contribution(s)
+      with the Work to which such Contribution(s) was submitted. If You
+      institute patent litigation against any entity (including a
+      cross-claim or counterclaim in a lawsuit) alleging that the Work
+      or a Contribution incorporated within the Work constitutes direct
+      or contributory patent infringement, then any patent licenses
+      granted to You under this License for that Work shall terminate
+      as of the date such litigation is filed.
 
-4. Prohibited conduct
+   4. Redistribution. You may reproduce and distribute copies of the
+      Work or Derivative Works thereof in any medium, with or without
+      modifications, and in Source or Object form, provided that You
+      meet the following conditions:
 
-Except for the narrow permissions in Sections 2 and 3, you must not, directly
-or indirectly:
+      (a) You must give any other recipients of the Work or
+          Derivative Works a copy of this License; and
 
-a. copy, modify, adapt, translate, transform, port, reverse engineer, or create
-   derivative works from the Covered Material;
-b. publish, distribute, redistribute, sublicense, sell, lease, transfer,
-   mirror, or make the Covered Material or any derivative available to another
-   person, including through a public or shared fork;
-c. repackage, relabel, rebrand, white-label, or combine the Covered Material
-   into another application, extension, service, appliance, or distribution;
-d. use the Covered Material to create, operate, support, or market a product or
-   service that has the same or substantially similar purpose or functionality,
-   or that competes with StonePlus or Stone+;
-e. sell, license, rent, monetize, or commercially distribute the Covered
-   Material; provide it to third parties as a hosted service, managed service,
-   software as a service, or paid feature; or embed it in a product or service
-   offered to another person. This does not prohibit using an unmodified
-   official StonePlus build internally as an end-user tool;
-f. provide the Covered Material, or a non-trivial portion or representation of
-   it, to an artificial-intelligence or machine-learning system for training,
-   fine-tuning, dataset creation, embedding, indexing, retrieval-augmented
-   generation, automated code generation, code transformation, migration, or
-   creation of derivative code;
-g. use Stone+, StonePlus, Stone Plus, any confusingly similar name, the project
-   logo, application icon, interface artwork, official update channel,
-   signature, certificate, provenance, or other Brand Asset except for a
-   truthful, non-confusing reference permitted by TRADEMARKS.md;
-h. remove, hide, alter, or misrepresent any copyright, license, attribution,
-   provenance, source, or trademark notice; or
-i. assist, authorize, encourage, or enable another person to do any prohibited
-   act, or attempt to circumvent this License or a technical measure supporting
-   it.
+      (b) You must cause any modified files to carry prominent notices
+          stating that You changed the files; and
 
-Core restriction / 核心限制：
+      (c) You must retain, in the Source form of any Derivative Works
+          that You distribute, all copyright, patent, trademark, and
+          attribution notices from the Source form of the Work,
+          excluding those notices that do not pertain to any part of
+          the Derivative Works; and
 
-无论使用人工、生成式人工智能、自动化程序或其他技术手段，均不得基于本软件创建、修改、转换、重新包装、分发或运营衍生产品。
+      (d) If the Work includes a "NOTICE" text file as part of its
+          distribution, then any Derivative Works that You distribute must
+          include a readable copy of the attribution notices contained
+          within such NOTICE file, excluding those notices that do not
+          pertain to any part of the Derivative Works, in at least one
+          of the following places: within a NOTICE text file distributed
+          as part of the Derivative Works; within the Source form or
+          documentation, if provided along with the Derivative Works; or,
+          within a display generated by the Derivative Works, if and
+          wherever such third-party notices normally appear. The contents
+          of the NOTICE file are for informational purposes only and
+          do not modify the License. You may add Your own attribution
+          notices within Derivative Works that You distribute, alongside
+          or as an addendum to the NOTICE text from the Work, provided
+          that such additional attribution notices cannot be construed
+          as modifying the License.
 
-Whether by human effort, generative artificial intelligence, automated
-programs, or any other technical means, you may not create, modify, transform,
-repackage, distribute, or operate a derivative product based on this software.
-The English text governs if the two statements are interpreted inconsistently.
+      You may add Your own copyright statement to Your modifications and
+      may provide additional or different license terms and conditions
+      for use, reproduction, or distribution of Your modifications, or
+      for any such Derivative Works as a whole, provided Your use,
+      reproduction, and distribution of the Work otherwise complies with
+      the conditions stated in this License.
 
-5. Brand assets
+   5. Submission of Contributions. Unless You explicitly state otherwise,
+      any Contribution intentionally submitted for inclusion in the Work
+      by You to the Licensor shall be under the terms and conditions of
+      this License, without any additional terms or conditions.
+      Notwithstanding the above, nothing herein shall supersede or modify
+      the terms of any separate license agreement you may have executed
+      with Licensor regarding such Contributions.
 
-No trademark, trade dress, logo, signing identity, update-channel identity, or
-other brand right is granted. TRADEMARKS.md applies in addition to this
-License. A permitted truthful reference does not authorize branding, product
-naming, endorsement claims, or use of official visual assets.
+   6. Trademarks. This License does not grant permission to use the trade
+      names, trademarks, service marks, or product names of the Licensor,
+      except as required for reasonable and customary use in describing the
+      origin of the Work and reproducing the content of the NOTICE file.
 
-6. Third-party and historical material
+   7. Disclaimer of Warranty. Unless required by applicable law or
+      agreed to in writing, Licensor provides the Work (and each
+      Contributor provides its Contributions) on an "AS IS" BASIS,
+      WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+      implied, including, without limitation, any warranties or conditions
+      of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
+      PARTICULAR PURPOSE. You are solely responsible for determining the
+      appropriateness of using or redistributing the Work and assume any
+      risks associated with Your exercise of permissions under this License.
 
-This License does not replace or restrict any license that applies to
-Third-Party Material. In particular, material inherited from upstream Stone
-and identified as Apache-2.0 remains available under Apache-2.0, and bundled
-third-party components remain under their respective licenses.
+   8. Limitation of Liability. In no event and under no legal theory,
+      whether in tort (including negligence), contract, or otherwise,
+      unless required by applicable law (such as deliberate and grossly
+      negligent acts) or agreed to in writing, shall any Contributor be
+      liable to You for damages, including any direct, indirect, special,
+      incidental, or consequential damages of any character arising as a
+      result of this License or out of the use or inability to use the
+      Work (including but not limited to damages for loss of goodwill,
+      work stoppage, computer failure or malfunction, or any and all
+      other commercial damages or losses), even if such Contributor
+      has been advised of the possibility of such damages.
 
-StonePlus v0.9.5 and earlier remain available under the license terms shipped
-with those versions. Repository revisions that were first published with an
-AGPL-3.0-or-later notice before this License took effect remain available under
-the AGPL terms that accompanied those revisions. This License is prospective
-and does not revoke permissions already granted for historical material.
+   9. Accepting Warranty or Additional Liability. While redistributing
+      the Work or Derivative Works thereof, You may choose to offer,
+      and charge a fee for, acceptance of support, warranty, indemnity,
+      or other liability obligations and/or rights consistent with this
+      License. However, in accepting such obligations, You may act only
+      on Your own behalf and on Your sole responsibility, not on behalf
+      of any other Contributor, and only if You agree to indemnify,
+      defend, and hold each Contributor harmless for any liability
+      incurred by, or claims asserted against, such Contributor by reason
+      of your accepting any such warranty or additional liability.
 
-7. Termination
+   END OF TERMS AND CONDITIONS
 
-Your permissions terminate automatically and immediately if you breach this
-License. Upon termination, you must stop using the Covered Material and delete
-all copies in your possession or control, except copies that applicable law
-requires you to retain. Sections 3 through 11 survive termination. The Licensor
-may reinstate permission only in a signed writing.
+   APPENDIX: How to apply the Apache License to your work.
 
-8. No patent or other license
+      To apply the Apache License to your work, attach the following
+      boilerplate notice, with the fields enclosed by brackets "[]"
+      replaced with your own identifying information. (Don't include
+      the brackets!)  The text should be enclosed in the appropriate
+      comment syntax for the file format. We also recommend that a
+      file or class name and description of purpose be included on the
+      same "printed page" as the copyright notice for easier
+      identification within third-party archives.
 
-No patent license is granted. No right is granted to use any name, mark,
-identity, data, account, credential, model, service, or other right belonging
-to the Licensor or a third party.
+   Copyright [yyyy] [name of copyright owner]
 
-9. Disclaimer of warranty
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
 
-TO THE MAXIMUM EXTENT PERMITTED BY LAW, THE COVERED MATERIAL IS PROVIDED
-"AS IS" AND "AS AVAILABLE," WITHOUT WARRANTY OF ANY KIND, EXPRESS, IMPLIED,
-OR STATUTORY, INCLUDING WARRANTIES OF TITLE, NON-INFRINGEMENT,
-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, ACCURACY, SECURITY, OR
-AVAILABILITY.
+       http://www.apache.org/licenses/LICENSE-2.0
 
-10. Limitation of liability
-
-TO THE MAXIMUM EXTENT PERMITTED BY LAW, THE LICENSOR AND CONTRIBUTORS WILL NOT
-BE LIABLE FOR ANY DIRECT, INDIRECT, SPECIAL, INCIDENTAL, CONSEQUENTIAL,
-EXEMPLARY, OR PUNITIVE DAMAGES, OR FOR LOSS OF DATA, PROFITS, REVENUE,
-GOODWILL, OR BUSINESS INTERRUPTION, ARISING FROM OR RELATING TO THE COVERED
-MATERIAL OR THIS LICENSE, UNDER ANY THEORY OF LIABILITY.
-
-11. General
-
-If any provision is unenforceable, it will be limited to the minimum extent
-necessary and the remaining provisions will remain effective. A failure to
-enforce a provision is not a waiver. This License and the documents it
-expressly incorporates constitute the complete permission granted for the
-Covered Material. Any broader permission requires a separate written agreement
-signed by the Licensor.
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.

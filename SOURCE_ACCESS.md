@@ -1,53 +1,39 @@
-# StonePlus Source Access
+# StonePlus Open Source Access
 
-StonePlus publishes source so users can inspect how the local gateway handles
-accounts, routing, diagnostics, updates, and local data. Source visibility is
-not permission to create or distribute a modified product.
-
-New StonePlus-owned material is provided under the
-[StonePlus Source Available License 1.0](LICENSE), subject to upstream and
-third-party licenses identified in `NOTICE` and `THIRD_PARTY_NOTICES.md`.
-The canonical owner, repository, license digest, signing fingerprints, and
-provenance policy are recorded in `PROJECT_IDENTITY.json`.
+StonePlus is open source under the standard [Apache License 2.0](LICENSE).
+You may inspect, modify, fork, build, redistribute, and use it commercially
+under that license. StonePlus-owned documentation, build scripts, and original
+visual assets are included in the same grant. See `LICENSE_BOUNDARY.md` for
+the effective date and historical artifacts.
 
 ## Obtain the exact source
 
 - Repository: <https://github.com/M4rkzzz/stone-plus>
-- Release page: <https://github.com/M4rkzzz/stone-plus/releases>
-- Exact version: select the Git tag matching the application version.
-- Each applicable official Release includes `StonePlus-X.Y.Z-source.tar.gz`,
-  generated from the exact release commit and covered by `SHA256SUMS` and
-  GitHub build provenance.
+- Releases: <https://github.com/M4rkzzz/stone-plus/releases>
+- Use a revision after the 2026-10-21 Apache-2.0 migration or a later release
+  explicitly marked Apache-2.0. Older release assets keep their shipped terms.
+- Official releases include `StonePlus-X.Y.Z-source.tar.gz` generated from the
+  exact release commit with `SHA256SUMS` and GitHub build provenance.
 
-The archive contains application source, the dependency lockfile, build and
-packaging scripts, workflow definitions, and license/notice material. Secrets
-and private signing keys are not included or needed for an unsigned build.
-The separately bundled sing-box runtime has its own corresponding-source
-archive and details in `SOURCE_OFFER-sing-box.md`.
+The source archive contains application source, the dependency lockfile,
+build/packaging scripts, workflows, and license/notice material. Private keys,
+tokens, and real account data are not included or needed for unsigned builds.
 
-## Permitted use
+## Build and contribute
 
-The current license permits viewing, auditing, learning, local use of an
-unmodified build, good-faith security research, and submitting issues or
-proposed patches through official project channels. It prohibits modification
-and derivative products outside that narrow submission permission,
-redistribution, public forks, rebranding, competitive products, commercial
-distribution or third-party hosted services, and use for AI training or
-automated code generation. Read `LICENSE` before downloading or using the
-source.
+Use the Node/npm versions in `.nvmrc` and `package.json`, install dependencies
+with `npm ci`, and run the documented checks. See `AGENTS.md` and
+`AI_USAGE_POLICY.md` for contribution guidance. Forks and local development do
+not require an official maintainer account or `npm run identity:verify`.
+`npm run license:verify` checks license metadata offline in any clone.
 
-Automated coding tools should also read `AI_USAGE_POLICY.md` and the applicable
-repository instruction file. Those summaries do not replace `LICENSE`.
+## Third-party components and origin
 
-## Historical versions
+Upstream and bundled components keep their original licenses in `NOTICE`,
+`THIRD_PARTY_NOTICES.md`, and `LICENSES/`. The separately bundled sing-box
+runtime has its own corresponding-source archive and delivery details in
+`SOURCE_OFFER-sing-box.md`; Apache-2.0 does not replace its GPL obligations.
 
-StonePlus v0.9.5 and earlier remain under the Apache-2.0 terms shipped with
-those versions. Repository revisions first published under
-AGPL-3.0-or-later before this source-available license took effect remain
-available under their accompanying AGPL terms. No earlier grant is revoked.
-
-## Brand separation
-
-The current source license grants no brand permission. Truthful references and
-all Stone+/StonePlus names, logos, official updates, signatures, and visual
-identity are governed separately by `TRADEMARKS.md`.
+`TRADEMARKS.md` explains truthful identification of official and third-party
+builds without restricting the open-source permissions. Official release
+signatures verify origin; they do not determine the software license.

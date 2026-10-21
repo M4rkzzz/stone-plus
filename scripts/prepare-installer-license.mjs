@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-StonePlus-Source-Available-1.0
+// SPDX-License-Identifier: Apache-2.0
 // See LICENSE and PROJECT_IDENTITY.json in the repository root.
 
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
@@ -13,8 +13,8 @@ export function encodeInstallerLicense(source) {
   const textBytes = hasBom ? bytes.subarray(UTF8_BOM.length) : bytes
   const text = new TextDecoder('utf-8', { fatal: true }).decode(textBytes)
 
-  if (!text.includes('StonePlus Source Available License') || !text.includes('核心限制')) {
-    throw new Error('Stone+ installer license is missing the expected bilingual license text.')
+  if (!text.includes('Apache License') || !text.includes('Version 2.0, January 2004') || !text.includes('END OF TERMS AND CONDITIONS')) {
+    throw new Error('Stone+ installer license must contain the complete Apache License 2.0 text.')
   }
 
   return hasBom ? bytes : Buffer.concat([UTF8_BOM, bytes])

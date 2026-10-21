@@ -1,27 +1,17 @@
 # Third-Party Notices
 
-The StonePlus project, whose desktop application currently retains the Stone+
-product name, provides new original material under the StonePlus Source
-Available License 1.0 beginning with the migration recorded on 2026-07-23.
-This does not relicense material inherited from upstream Stone or any
-third-party component. Those materials remain under their respective licenses,
-and all applicable copyright, attribution, source-availability, and notice
-obligations continue to apply.
+StonePlus-owned material in the current revision is licensed under the
+standard Apache License 2.0, effective 2026-10-21. Third-party components
+retain their own licenses, copyright, attribution, and source-delivery
+obligations. This migration does not relicense those components.
 
 ## Upstream Stone
 
-StonePlus is derived from
-[Stone](https://github.com/EasyCode-Obsidian/Stone), Copyright 2026 Stone
-Contributors, licensed under the Apache License, Version 2.0. The retained
-Apache-2.0 text is distributed as `LICENSES/Apache-2.0.txt`; attribution and a
-summary of StonePlus changes are retained in `NOTICE` and `MODIFICATIONS.md`.
-The StonePlus Source Available License does not remove or replace the upstream
-Stone license or notices. Historical StonePlus revisions retain the license
-terms under which they were first published.
-
-Third-party packages and bundled runtimes listed below likewise remain under
-their stated licenses. Nothing in the StonePlus license replaces or modifies
-those terms.
+StonePlus is derived from [Stone](https://github.com/EasyCode-Obsidian/Stone),
+Copyright 2026 Stone Contributors, licensed under Apache-2.0. The complete
+license is in `LICENSE` and `LICENSES/Apache-2.0.txt`; attribution and changes
+are recorded in `NOTICE` and `MODIFICATIONS.md`. Historical artifacts retain
+their accompanying terms; see `LICENSE_BOUNDARY.md`.
 
 ## Runtime Packages
 

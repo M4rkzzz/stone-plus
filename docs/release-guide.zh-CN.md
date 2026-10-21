@@ -1,8 +1,8 @@
 # Stone+ Release Guide
 
 本文档是 Stone+ 后续正式版与预发布版的可重复发布手册。当前跨平台签名、打包、完整源码归档、
-provenance 与线上发布基线来自 `v0.9.6` 已实际跑通并完成线上验收的流程。`v0.9.6` 同时完成了
-源码可见只读授权、品牌隔离、完整 StonePlus 源码归档及五个运行时目标的统一发布。发布工作流仍以
+provenance 与线上发布基线来自 `v0.9.6` 已实际跑通并完成线上验收的流程。当前版本自 2026-10-21 起采用标准 Apache-2.0 开源许可，
+完整源码归档、第三方许可和五个运行时目标的交付流程继续适用。发布工作流仍以
 [`release.yml`](../.github/workflows/release.yml) 为唯一执行源，合规要求以
 [`distribution-compliance.md`](distribution-compliance.md) 为准。
 
@@ -28,7 +28,7 @@ provenance 与线上发布基线来自 `v0.9.6` 已实际跑通并完成线上�
 | npm | 10.9.3（与 `packageManager`、`package.json#engines` 一致） |
 | sing-box | v1.13.14 |
 | frpc | v0.69.0（Windows x64，固定归档与运行文件 SHA-256） |
-| StonePlus 自有材料 | StonePlus Source Available License 1.0（`SEE LICENSE IN LICENSE`） |
+| StonePlus 自有材料 | Apache License 2.0（`Apache-2.0`） |
 | 上游 Stone | Apache-2.0，完整原文保留在 `LICENSES/Apache-2.0.txt` |
 | 历史授权边界 | v0.9.5 及更早版本保留随附的 Apache-2.0；迁移前以 AGPL 首次发布的修订保留当时条款 |
 | 运行时目标 | Windows x64、Linux x64、Linux arm64、macOS x64、macOS arm64 |
@@ -113,9 +113,9 @@ if ($identity.authorizedSigningEmails -notcontains $tagObject.tagger.email) { th
 GitHub Secrets 和本文基线；工作流只接受身份文件登记的指纹。发布一个 prerelease 完成签名、时间戳、下载后校验和与 provenance 验证后，
 才能把新证书用于正式版。旧 Release 保留原证书、原指纹和原校验和，不得覆盖。
 
-### 2.3 受保护源码身份门与许可证分布检查
+### 2.3 开源许可一致性与官方发布来源检查
 
-从 `v0.9.6` 起，以下文件共同组成 StonePlus 的受保护源码身份门。它们不是可选说明文件；发布前必须
+以下文件共同记录 StonePlus 的开源许可和官方发布来源。官方发布前必须
 逐项确认仍存在、内容互相一致，并且已进入 StonePlus 完整源码归档。任何一项缺失、摘要不一致或被
 绕过都必须阻断发布。
 
@@ -129,7 +129,7 @@ GitHub Secrets 和本文基线；工作流只接受身份文件登记的指纹�
 - StonePlus 主许可证名称、文件路径和 SHA-256；
 - Windows Authenticode CER 路径、SHA-1 Thumbprint 和 DER SHA-256；
 - Release provenance 工作流、attestation 要求及 `SHA256SUMS` 文件名；
-- 首个 Source Available 版本和历史许可证边界。
+- 2026-10-21 标准 Apache-2.0 迁移日期和历史版本说明。
 
 修改许可证、证书、仓库、维护者、签名邮箱或 provenance 工作流时，必须同步更新此文件及所有引用
 文档。发布前不允许通过临时跳过字段、放宽权限或改写摘要来让验证“变绿”。
@@ -145,16 +145,15 @@ GitHub Secrets 和本文基线；工作流只接受身份文件登记的指纹�
 5. 核对许可证边界、签名配置和 provenance 配置；
 6. 只有全部通过时返回 `"verified": true`。
 
-这既是人工发布门，也是仓库内 AI 编辑门。官方维护者使用 Codex、Claude Code、Gemini CLI、Copilot
-或其他自动化编辑器前，必须先执行：
+上述在线核验仅适用于官方发布，不是本地编辑、Fork、修改或再分发的前提。
+所有贡献者都可在未登录 GitHub 的克隆中执行离线许可一致性检查：
 
 ```powershell
-npm run identity:verify
+npm run license:verify
 ```
 
-只有输出 `"verified": true` 才允许继续编辑。仓库名称、目录名称、口头声明、Fork 所有者身份或复制的
-身份文件本身都不能替代在线 GitHub 身份和权限验证。发布质量门必须再次运行该命令，不能只依赖开发
-会话开始时的一次结果。
+官方维护者发布前额外执行 `npm run identity:verify`，确认官方仓库权限、签名和来源配置。
+Fork 可以使用自己的仓库、维护者、更新地址和签名身份；不得冒充官方发布。
 
 #### `.github/CODEOWNERS`
 
@@ -172,30 +171,14 @@ npm run identity:verify
 
 #### AI 工具入口文件
 
-以下四个入口必须同时要求编辑前阅读许可证、身份和 AI 使用政策，并执行
-`npm run identity:verify`：
-
-- `AGENTS.md`；
-- `CLAUDE.md`；
-- `GEMINI.md`；
-- `.github/copilot-instructions.md`。
-
-发布前统一检查：
-
-```powershell
-$agentFiles = @(
-  'AGENTS.md', 'CLAUDE.md', 'GEMINI.md', '.github/copilot-instructions.md'
-)
-foreach ($file in $agentFiles) {
-  if (-not (Select-String -LiteralPath $file -SimpleMatch 'npm run identity:verify' -Quiet)) {
-    throw "$file no longer requires identity verification"
-  }
-}
-```
+`AGENTS.md`、`CLAUDE.md`、`GEMINI.md` 和 `.github/copilot-instructions.md`
+须与标准 Apache-2.0 一致，允许人工及 AI 辅助开发、Fork、修改、再分发和商业使用。
+普通编辑无需官方账号或在线身份核验；许可或打包变更运行 `npm run license:verify`。
+官方发布才额外运行 `npm run identity:verify`，两类检查不可混用为许可限制。
 
 #### 多处许可证与来源声明
 
-以下位置必须继续公开且互相一致地说明 Source Available 许可证、历史许可边界、第三方归属、品牌限制
+以下位置必须继续公开且互相一致地说明 Apache-2.0 开源许可证、历史许可边界、第三方归属、品牌限制
 和官方来源，不能只在根 `LICENSE` 中出现一次：
 
 - `README.md` 与 `README.en.md`；
@@ -204,13 +187,13 @@ foreach ($file in $agentFiles) {
 - `SOURCE_ACCESS.md`；
 - `TRADEMARKS.md`；
 - `AI_USAGE_POLICY.md`；
-- `LICENSES/LicenseRef-StonePlus-Source-Available-1.0.txt`；
+- `LICENSES/Apache-2.0.txt`；
 - `REUSE.toml`；
 - Release Note、完整源码归档和安装包 resources。
 
-根 `LICENSE` 与 `LICENSES/LicenseRef-StonePlus-Source-Available-1.0.txt` 必须字节完全一致，且 SHA-256
+根 `LICENSE` 与 `LICENSES/Apache-2.0.txt` 必须字节完全一致，且 SHA-256
 等于 `PROJECT_IDENTITY.json.license.sha256`。继承的 Apache、AGPL、GPL 及其他第三方材料必须继续
-保留各自文件和 NOTICE，不得被 StonePlus 自定义许可证覆盖。
+保留各自文件和 NOTICE，不得被项目根许可证覆盖。
 
 #### 安装包 resources
 
@@ -219,20 +202,19 @@ foreach ($file in $agentFiles) {
 - `LICENSE`、`LICENSE_BOUNDARY.md`、`NOTICE`、`MODIFICATIONS.md`；
 - `THIRD_PARTY_NOTICES.md`、`SOURCE_ACCESS.md`、`TRADEMARKS.md`；
 - `AI_USAGE_POLICY.md`、`PROJECT_IDENTITY.json`；
-- Source Available、Apache、AGPL、GPL、sing-box 和 libcronet 的许可证材料；
+- Apache、历史 AGPL、GPL、sing-box 和 libcronet 的许可证材料；
 - `lazy-val@1.0.5` npm 包缺失的完整 MIT notice；
 - `SOURCE_OFFER-sing-box.md` 及随包第三方组件需要的声明。
 
 不能以“仓库里有”为理由跳过安装包验收。Windows unpacked resources 检查见本文 4.4；其他平台由
-原生 runner 的打包产物和 Release 源码/资产门共同验证。正式发布记录必须明确写出身份门、CODEOWNERS、
+原生 runner 的打包产物和 Release 源码/资产门共同验证。正式发布记录必须明确写出官方来源校验、CODEOWNERS、
 四个 AI 入口、许可证镜像和安装包 resources 均已验收。
 
 macOS 应用为 ad-hoc 签名且未经过 Apple 公证。上游 sing-box Mach-O 必须保持原始
 字节，`package.json` 中的 `mac.signIgnore` 不得在没有同步调整完整性设计的情况下移除。
 
-StonePlus Source Available License 只约束 StonePlus 有权授权的材料，不替换上游或第三方许可证；
-源码可见不授权修改、衍生、再分发、商业发行/对外托管或 AI 自动改造，也不授予 Stone+、StonePlus、
-Logo、官方更新入口或签名身份。边界分别以 `LICENSE`、`NOTICE`、
+Apache License 2.0 只约束 StonePlus 有权授权的材料，不替换上游或第三方许可证；
+Apache-2.0 允许修改、Fork、再分发、商业使用、托管服务与 AI 辅助开发，但不授予商标或官方签名身份。边界分别以 `LICENSE`、`NOTICE`、
 `THIRD_PARTY_NOTICES.md`、`SOURCE_ACCESS.md` 和 `TRADEMARKS.md` 为准。
 
 ### 2.1 v0.9.6 已验收发布记录
@@ -346,7 +328,7 @@ npm version X.Y.Z --no-git-tag-version
 - 更新 `CHANGELOG.md`，写清功能、修复、迁移与已知限制。
 - 新建 `docs/releases/vX.Y.Z.md`，按下方 v0.9.3 范例编写中文 Release Note；禁止使用 GitHub 自动生成的 PR/贡献者列表代替正式说明。
 - 检查 `package.json` 和 `package-lock.json` 的版本一致。
-- 检查二者根包许可证均为 `SEE LICENSE IN LICENSE`，根 `LICENSE` 标题为 `StonePlus Source Available License 1.0`。
+- 检查二者根包许可证均为 `Apache-2.0`，根 `LICENSE` 为未经改写的标准 Apache License, Version 2.0 全文。
 - 若修改 sing-box 版本或平台矩阵，同步更新两个 manifest、下载脚本、许可证、
   `THIRD_PARTY_NOTICES.md`、对应源码脚本、工作流资产白名单和本文档。
 - 检查 README 和 Release 警告仍准确描述 Windows 自签名与 macOS 未公证限制。
@@ -354,13 +336,12 @@ npm version X.Y.Z --no-git-tag-version
   `TRADEMARKS.md`、`SOURCE_ACCESS.md`、`LICENSES/Apache-2.0.txt` 和
   `LICENSES/AGPL-3.0-or-later.txt` 均被官方安装包保留。
 - 检查 `AI_USAGE_POLICY.md`、`AGENTS.md`、`CLAUDE.md`、`GEMINI.md` 和
-  `.github/copilot-instructions.md` 与当前许可证一致，且只允许官方维护或向官方提交私有补丁。
+  `.github/copilot-instructions.md` 与当前许可证一致，且允许 Fork、修改、再分发、商用及 AI 辅助开发，无需官方维护者认证。
 - 检查 `PROJECT_IDENTITY.json` 中的官方仓库、维护者、许可证 digest、Windows 证书指纹与
   provenance 工作流准确，`.github/CODEOWNERS` 仍由 `@M4rkzzz` 和 `@thok404` 覆盖法律、身份和发布文件。
 - 检查 `REUSE.toml` 只把 StonePlus 新增且有权授权的文件标记为
-  `LicenseRef-StonePlus-Source-Available-1.0`，不得覆盖继承的 Apache 或第三方材料。
-- 第一个源码可见授权正式版的 Release Note 必须明确说明：当前许可证不是开源许可证，禁止修改、
-  衍生产品、再分发、商业发行或对外托管及 AI 自动代码生成；同时说明历史 Apache/AGPL 授权不追溯撤销。
+  `Apache-2.0`，不得覆盖继承的 Apache 或第三方材料。
+- Apache-2.0 迁移后的 Release Note 必须说明允许修改、Fork、再分发、商用和 AI 辅助开发；历史二进制保留随附声明，第三方条款继续适用。
 - 确认工作树中没有 PFX、私钥、Token、订阅 URL 或真实账号数据。
 
 不要在这个阶段创建或推送正式标签。
@@ -375,8 +356,8 @@ Release Note 必须使用以下顺序：
 4. `WARNING`：如实说明 Windows 签名、macOS 公证、Linux 密钥环等限制。
 5. `完整变更`：使用相邻版本的 compare 链接。
 
-从第一个源码可见授权版本开始，`下载` 还必须列出 `StonePlus-X.Y.Z-source.tar.gz`；版本亮点或
-升级说明须链接 `LICENSE`、`SOURCE_ACCESS.md` 与 `TRADEMARKS.md`，并明确源码归档公开不等于授权修改或再分发。
+`下载` 必须列出 `StonePlus-X.Y.Z-source.tar.gz`；版本亮点或升级说明须链接 `LICENSE`、
+`SOURCE_ACCESS.md` 与 `TRADEMARKS.md`，明确 Apache-2.0 的修改和再分发许可，并区分第三方组件的原许可。
 
 不要出现 `What's Changed`、PR 编号列表、`New Contributors` 或只有一段自动生成的
 `Full Changelog`。以下为风格基准，后续版本应保持同等信息密度与可读性：
@@ -452,8 +433,7 @@ $resources = 'release/win-unpacked/resources'
 $required = @(
   'LICENSE', 'NOTICE', 'MODIFICATIONS.md', 'THIRD_PARTY_NOTICES.md',
   'TRADEMARKS.md', 'SOURCE_ACCESS.md', 'PROJECT_IDENTITY.json',
-  'AI_USAGE_POLICY.md', 'licenses/LicenseRef-StonePlus-Source-Available-1.0.txt',
-  'licenses/Apache-2.0.txt',
+  'AI_USAGE_POLICY.md', 'licenses/Apache-2.0.txt',
   'licenses/AGPL-3.0-or-later.txt',
   'licenses/GPL-3.0-or-later.txt', 'SOURCE_OFFER-sing-box.md',
   'licenses/npm/lazy-val-1.0.5-MIT.txt'
@@ -559,7 +539,7 @@ $sourceArchive = Join-Path $env:TEMP "StonePlus-$version-source.tar.gz"
 git archive --format=tar.gz --prefix="StonePlus-$version-source/" --output=$sourceArchive HEAD
 $sourceEntries = tar -tzf $sourceArchive
 foreach ($required in @(
-  'LICENSE', 'LICENSES/LicenseRef-StonePlus-Source-Available-1.0.txt',
+  'LICENSE', 'LICENSES/Apache-2.0.txt',
   'PROJECT_IDENTITY.json', 'AI_USAGE_POLICY.md', 'package-lock.json',
   'SOURCE_ACCESS.md', 'TRADEMARKS.md'
 )) {
@@ -776,7 +756,7 @@ gh api "repos/M4rkzzz/stone-plus/actions/jobs/$releaseJobId/logs"
 处理规则：
 
 - 测试断言失败：先判断实现回归还是测试硬编码了平台行为；在 `main` 修复并完整复测后启动新运行。
-- 发布提交或标签未显示 GitHub Verified：不得降级为轻量/未签名标签，也不得关闭身份门；检查 GitHub
+- 发布提交或标签未显示 GitHub Verified：不得降级为轻量/未签名标签，也不得关闭官方来源校验；检查 GitHub
   signing key、`user.email`、签名格式与 `PROJECT_IDENTITY.json`。如果标签已推送，使用新补丁版本。
 - macOS sing-box size/SHA 变化：优先检查 ad-hoc 深度签名是否重新签了上游 Mach-O，
   不得更新 manifest 来接受被意外改写的二进制。
@@ -923,7 +903,6 @@ foreach ($required in @(
   'LICENSE', 'NOTICE', 'package-lock.json', 'SOURCE_ACCESS.md',
   'PROJECT_IDENTITY.json', 'AI_USAGE_POLICY.md', 'AGENTS.md',
   '.github/CODEOWNERS', 'REUSE.toml',
-  'LICENSES/LicenseRef-StonePlus-Source-Available-1.0.txt',
   'LICENSES/npm/lazy-val-1.0.5-MIT.txt',
   'TRADEMARKS.md', 'LICENSES/Apache-2.0.txt',
   'LICENSES/AGPL-3.0-or-later.txt', '.github/workflows/release.yml'
@@ -934,14 +913,14 @@ foreach ($required in @(
 
 还必须核对：
 
-- 根 `LICENSE` 是 StonePlus Source Available License 1.0，包元数据使用 `SEE LICENSE IN LICENSE`；
+- 根 `LICENSE` 是 Apache License 2.0，包元数据使用 `Apache-2.0`；
 - `PROJECT_IDENTITY.json` 的官方仓库、维护者、证书指纹和许可证 SHA-256 与实际文件一致，
-  `LICENSES/LicenseRef-StonePlus-Source-Available-1.0.txt` 与根 `LICENSE` 字节完全一致；
+  `LICENSES/Apache-2.0.txt` 与根 `LICENSE` 字节完全一致；
 - `LICENSES/Apache-2.0.txt`、`LICENSES/AGPL-3.0-or-later.txt`、`NOTICE` 和
   `THIRD_PARTY_NOTICES.md` 仍保留上游、历史修订及第三方条款；
 - 安装包构建日志确认 `TRADEMARKS.md`、`SOURCE_ACCESS.md` 和上述法律文件进入 resources；
-- Release Note 明确新许可证不是开源许可证，且没有追溯覆盖历史 Apache/AGPL 修订；
-- `LICENSE` 明确禁止修改、衍生、换标和再分发；`TRADEMARKS.md` 另行保护名称、Logo、更新及签名身份。
+- Release Note 明确采用标准 Apache-2.0 开源，并如实区分历史二进制和第三方许可；
+- `LICENSE` 使用未经添加限制的标准 Apache-2.0；`TRADEMARKS.md` 不得限制开源 Fork、修改、商用或再分发。
 
 ### 9.5 provenance
 
@@ -981,9 +960,9 @@ gh api "repos/M4rkzzz/stone-plus/attestations/sha256:$assetDigest" `
 - Windows 签名指纹、时间戳和自签名信任限制；
 - provenance 覆盖数量；
 - StonePlus 完整源码归档、sing-box 对应源码归档名称和 digest；
-- Source Available 1.0、历史 Apache/AGPL、第三方 NOTICE、SOURCE_ACCESS 和品牌隔离验收结果；
+- Apache-2.0、历史 Apache/AGPL、第三方 NOTICE、SOURCE_ACCESS 和品牌隔离验收结果；
 - `PROJECT_IDENTITY.json`、维护者权限、canonical remote、许可证/CER 摘要、CODEOWNERS、四个 AI
-  编辑入口、许可证多处声明和安装包 resources 的身份门验收结果；
+  开发指引入口、许可证多处声明和安装包 resources 的来源与许可一致性验收结果；
 - GitHub 文件列表中主要目录与根文件右侧均显示本次版本号的检查结果；
 - 已知限制与任何不阻断的警告。
 

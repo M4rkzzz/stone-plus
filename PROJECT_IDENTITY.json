@@ -5,22 +5,29 @@
   "canonicalRepository": "https://github.com/M4rkzzz/stone-plus",
   "githubRepository": "M4rkzzz/stone-plus",
   "githubOwner": "M4rkzzz",
-  "authorizedMaintainers": ["M4rkzzz", "thok404"],
+  "authorizedMaintainers": [
+    "M4rkzzz",
+    "thok404"
+  ],
   "authorizedSigningEmails": [
     "221565539+M4rkzzz@users.noreply.github.com",
     "109383521+thok404@users.noreply.github.com"
   ],
-  "acceptedRepositoryPermissions": ["ADMIN", "MAINTAIN", "WRITE"],
+  "acceptedRepositoryPermissions": [
+    "ADMIN",
+    "MAINTAIN",
+    "WRITE"
+  ],
   "license": {
-    "name": "StonePlus Source Available License 1.0",
-    "spdxReference": "LicenseRef-StonePlus-Source-Available-1.0",
+    "name": "Apache License 2.0",
+    "spdxReference": "Apache-2.0",
     "primaryFile": "LICENSE",
-    "mirrorFile": "LICENSES/LicenseRef-StonePlus-Source-Available-1.0.txt",
-    "sha256": "991dec5dbeef6daa5ba64687cbdb4d941deab6a6f79684636b8c0f3f93c84dd4"
+    "mirrorFile": "LICENSES/Apache-2.0.txt",
+    "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
   },
   "licenseBoundary": {
-    "firstSourceAvailableVersion": "0.9.6",
-    "lastHistoricalReleaseTag": "v0.9.5",
+    "openSourceEffectiveDate": "2026-10-21",
+    "lastSourceAvailableReleaseTag": "v0.9.25",
     "policyFile": "LICENSE_BOUNDARY.md"
   },
   "signing": {

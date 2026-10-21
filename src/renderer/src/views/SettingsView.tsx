@@ -867,7 +867,7 @@ export function SettingsView({
         <StoneMark small />
         <div className="about-line__identity">
           <strong>Stone+</strong>
-          <span>{__APP_VERSION__} · Source Available 1.0 · Unofficial community fork</span>
+          <span>{__APP_VERSION__} · Apache-2.0 · Unofficial community fork</span>
         </div>
         <div className="about-line__links" aria-label={t('项目法律信息', 'Project legal information')}>
           <button className="text-button" type="button" onClick={() => void api.openProjectPage('source')}>{t('对应源码', 'Source')}</button>

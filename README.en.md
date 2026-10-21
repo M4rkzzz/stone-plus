@@ -11,19 +11,15 @@
 </p>
 
 > [!IMPORTANT]
-> StonePlus source is public for inspection and audit, but it is not open
-> source. Modification, cloning, rebranding, derivative products,
-> redistribution, commercial distribution/third-party hosting, and automated
-> AI code generation are restricted by the
-> [StonePlus Source Available License 1.0](LICENSE). See
-> The current/historical licensing boundary is recorded in [LICENSE_BOUNDARY.md](LICENSE_BOUNDARY.md). See [PROJECT_IDENTITY.json](PROJECT_IDENTITY.json); automated agents must run
-> `npm run identity:verify` before editing.
+> StonePlus is open source under standard [Apache-2.0](LICENSE) as of 2026-10-21, including original code, documentation, build scripts, and visual assets.
+> Modification, forks, redistribution, commercial use, hosted services, and AI-assisted development are permitted. Third-party terms remain applicable.
+> See [LICENSE_BOUNDARY.md](LICENSE_BOUNDARY.md) for historical artifacts. Issues and pull requests are welcome.
 
 <p align="center">
   <a href="https://github.com/M4rkzzz/stone-plus/releases/latest"><img src="https://img.shields.io/github/v/release/M4rkzzz/stone-plus?display_name=tag&sort=semver" alt="Latest release"></a>
   <a href="https://github.com/M4rkzzz/stone-plus/actions/workflows/release.yml"><img src="https://github.com/M4rkzzz/stone-plus/actions/workflows/release.yml/badge.svg" alt="Release build"></a>
   <a href="https://github.com/M4rkzzz/stone-plus/releases/latest"><img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-555" alt="Windows, macOS, and Linux"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Source%20Available%201.0-blue" alt="StonePlus Source Available License 1.0"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue" alt="Apache License 2.0"></a>
   <a href="https://github.com/M4rkzzz/stone-plus/stargazers"><img src="https://img.shields.io/github/stars/M4rkzzz/stone-plus?style=flat&logo=github" alt="GitHub stars"></a>
 </p>
 
@@ -191,14 +187,11 @@ Chinese-language discussion is also welcome in QQ group **1061282900**. The comm
 
 ## License
 
-- StonePlus-owned source is published under the [StonePlus Source Available License 1.0](LICENSE) for inspection, learning, limited local evaluation, and security research. This is not an open-source license and does not permit modification, derivative products, repackaging, redistribution, commercial distribution or third-party hosted use, AI training, or automated code generation.
-- See [LICENSE_BOUNDARY.md](LICENSE_BOUNDARY.md) for the exact current/historical boundary. The retained Apache-2.0 text applies only to identified upstream, third-party, or historical material.
-- Repository instructions for Codex, Claude Code, Gemini CLI, and Copilot are summarized in [AI_USAGE_POLICY.md](AI_USAGE_POLICY.md). Automated tools must not assist cloning, rebranding, license removal, or attribution removal.
-- See [SOURCE_ACCESS.md](SOURCE_ACCESS.md) for exact source access. Official Releases provide a source archive tied to the exact release tag and covered by checksums and provenance.
-- Upstream code, dependencies, and bundled components remain under their respective original licenses. See [NOTICE](NOTICE), [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md), and the bundled license files for attribution and terms.
-- The **Stone+** and **StonePlus** names, project logo, and official visual assets are not licensed with the source code. See [TRADEMARKS.md](TRADEMARKS.md).
-- Without written permission, you may not create, publish, or operate a fork, rebranded/repackaged build, or functionally identical or substantially similar derivative product. The Stone+, StonePlus, logo, official updater, and signing identity are separately protected by [TRADEMARKS.md](TRADEMARKS.md).
+- StonePlus-owned code, documentation, build scripts, and original visual assets are licensed under the standard [Apache License 2.0](LICENSE). Modification, forks, rebranding, redistribution, commercial use, hosted services, and AI-assisted development are allowed.
+- Preserve applicable copyright and attribution notices and identify modifications as required by Apache-2.0. See [AGENTS.md](AGENTS.md) and [AI_USAGE_POLICY.md](AI_USAGE_POLICY.md) for contribution guidance.
+- See [SOURCE_ACCESS.md](SOURCE_ACCESS.md) for exact source and build instructions. Official releases include source archives tied to the exact tag, checksums, and build provenance.
+- Upstream Stone and third-party components retain their original licenses. Bundled sing-box keeps its GPL and corresponding-source obligations. See [NOTICE](NOTICE), [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md), and [SOURCE_OFFER-sing-box.md](SOURCE_OFFER-sing-box.md).
+- Apache-2.0 grants no trademark rights. [TRADEMARKS.md](TRADEMARKS.md) distinguishes official and third-party origin without prohibiting open-source forks or commercial use.
+- This migration applies from the 2026-10-21 repository revision. Previously published tags and binaries keep their accompanying notices; see [LICENSE_BOUNDARY.md](LICENSE_BOUNDARY.md). Use the migrated source or a later release explicitly marked Apache-2.0 for the open-source version.
 
-The migration is not retroactive: StonePlus v0.9.5 and earlier retain their shipped Apache-2.0 terms, and repository revisions first published under AGPL-3.0-or-later before this license took effect retain their accompanying AGPL terms.
-
-Official releases provide code signatures where supported, `SHA256SUMS`, and build provenance so users can verify their origin.
+Official releases provide code signatures where supported, `SHA256SUMS`, and build provenance to verify origin.

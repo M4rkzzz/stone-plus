@@ -15,4 +15,4 @@ path = [
 ]
 precedence = "override"
 SPDX-FileCopyrightText = "2026 StonePlus Contributors"
-SPDX-License-Identifier = "LicenseRef-StonePlus-Source-Available-1.0"
+SPDX-License-Identifier = "Apache-2.0"

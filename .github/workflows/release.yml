@@ -103,42 +103,14 @@ jobs:
       - name: Verify pinned frpc runtime
         run: npm run frp:verify
 
-      - name: Validate source-available license boundary
+      - name: Validate open-source license and official release origin
         shell: bash
         run: |
+          npm run license:verify
           node --input-type=module <<'NODE'
           import { readFileSync } from 'node:fs'
-          const pkg = JSON.parse(readFileSync('package.json', 'utf8'))
-          const lock = JSON.parse(readFileSync('package-lock.json', 'utf8'))
+          import { createHash } from 'node:crypto'
           const identity = JSON.parse(readFileSync('PROJECT_IDENTITY.json', 'utf8'))
-          if (pkg.license !== 'SEE LICENSE IN LICENSE' || lock.packages?.['']?.license !== 'SEE LICENSE IN LICENSE') {
-            throw new Error('Root package license metadata must point to LICENSE.')
-          }
-          const core = (value) => {
-            const match = /^(?:v)?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/.exec(String(value))
-            if (!match) throw new Error(`Invalid semantic version: ${value}`)
-            return match.slice(1, 4).map(Number)
-          }
-          const candidate = core(pkg.version)
-          const baseline = core(identity.licenseBoundary.firstSourceAvailableVersion)
-          const isAtLeastBaseline = candidate.every((part, index) => part === baseline[index])
-            ? true
-            : candidate.some((part, index) => part > baseline[index]
-              && candidate.slice(0, index).every((previous, previousIndex) => previous === baseline[previousIndex]))
-          if (!isAtLeastBaseline || lock.version !== pkg.version) {
-            throw new Error('Package version predates the protected license baseline or lockfile is inconsistent.')
-          }
-          const license = readFileSync('LICENSE', 'utf8')
-          if (!license.startsWith('StonePlus Source Available License 1.0')) {
-            throw new Error('Unexpected root LICENSE.')
-          }
-          const { createHash } = await import('node:crypto')
-          const mirror = readFileSync(identity.license.mirrorFile)
-          const digest = createHash('sha256').update(Buffer.from(license)).digest('hex')
-          const mirrorDigest = createHash('sha256').update(mirror).digest('hex')
-          if (digest !== identity.license.sha256 || mirrorDigest !== digest) {
-            throw new Error('License identity digest or mirror is invalid.')
-          }
           const certificate = readFileSync(identity.signing.windowsAuthenticode.certificateFile)
           const certificateDigest = createHash('sha256').update(certificate).digest('hex')
           if (certificateDigest !== identity.signing.windowsAuthenticode.sha256) {
@@ -470,7 +442,6 @@ jobs:
           grep -Fxq "StonePlus-${version}-source/LICENSE_BOUNDARY.md" "$source_list"
           grep -Fxq "StonePlus-${version}-source/.github/CODEOWNERS" "$source_list"
           grep -Fxq "StonePlus-${version}-source/REUSE.toml" "$source_list"
-          grep -Fxq "StonePlus-${version}-source/LICENSES/LicenseRef-StonePlus-Source-Available-1.0.txt" "$source_list"
           grep -Fxq "StonePlus-${version}-source/LICENSES/npm/lazy-val-1.0.5-MIT.txt" "$source_list"
           grep -Fxq "StonePlus-${version}-source/LICENSES/Apache-2.0.txt" "$source_list"
           grep -Fxq "StonePlus-${version}-source/LICENSES/AGPL-3.0-or-later.txt" "$source_list"

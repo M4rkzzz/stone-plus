@@ -97,7 +97,7 @@ def main() -> None:
     for label in ("Smart routing", "Account pools", "Diagnostics"):
         pill_x += draw_pill(draw, (pill_x, 404), label) + 10
 
-    draw.text((70, 559), "Source available  ·  Windows  ·  macOS  ·  Linux", font=font("bold", 14), fill="#d7e7e1")
+    draw.text((70, 559), "Apache-2.0  ·  Windows  ·  macOS  ·  Linux", font=font("bold", 14), fill="#d7e7e1")
     draw.text((70, 591), "github.com/M4rkzzz/stone-plus", font=font("regular", 14), fill="#75bea5")
 
     screenshot = Image.open(ROOT / "docs" / "screenshots" / "overview.png").convert("RGB")

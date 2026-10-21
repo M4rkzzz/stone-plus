@@ -8,11 +8,9 @@ StonePlus project certificate in `StonePlus-CodeSigning.cer`.
 - DER SHA-256: `f4ccc82f3ade7eb06f76e55afce698179b37f299fb75ad70e5cec32e0740ca05`
 - Validity: 2026-07-23 through 2029-07-23
 
-The words `Open Source Release` are part of the certificate's immutable legacy
-subject, created before the source-available license migration. They identify
-this existing certificate only and do not describe or grant a software
-license. The current license is the StonePlus Source Available License 1.0 in
-the repository root.
+The certificate subject identifies release origin and does not grant a
+software license. The current software license is standard Apache-2.0 in the
+repository root. Open-source forks can use their own signing identities.
 
 This certificate is self-signed. It provides a stable cryptographic identity
 for comparing StonePlus releases, but it is not a Microsoft-trusted or

@@ -11,16 +11,15 @@
 </p>
 
 > [!IMPORTANT]
-> StonePlus 源码公开供查看与审计，但不是开源许可证。修改、Clone、换标、衍生产品、再分发、
-> 商业发行/对外托管及 AI 自动代码生成受 [StonePlus Source Available License 1.0](LICENSE)
-> 限制。当前受保护版本与历史许可证边界见 [LICENSE_BOUNDARY.md](LICENSE_BOUNDARY.md)。官方项目身份与维护者验证见 [PROJECT_IDENTITY.json](PROJECT_IDENTITY.json)，AI 修改前须运行
-> `npm run identity:verify`。
+> StonePlus 已于 2026-10-21 转为标准 [Apache-2.0](LICENSE) 开源，允许修改、Fork、再分发、商业使用与 AI 辅助开发。
+> 代码、文档、构建脚本及项目自有视觉素材适用同一开源许可；第三方组件保留各自条款。
+> 历史版本说明见 [LICENSE_BOUNDARY.md](LICENSE_BOUNDARY.md)，欢迎提交 Issue 和 Pull Request。
 
 <p align="center">
   <a href="https://github.com/M4rkzzz/stone-plus/releases/latest"><img src="https://img.shields.io/github/v/release/M4rkzzz/stone-plus?display_name=tag&sort=semver&color=176b52" alt="最新版本"></a>
   <a href="https://github.com/M4rkzzz/stone-plus/actions/workflows/release.yml"><img src="https://github.com/M4rkzzz/stone-plus/actions/workflows/release.yml/badge.svg" alt="多平台构建"></a>
   <a href="https://github.com/M4rkzzz/stone-plus/releases/latest"><img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-3d4a45" alt="Windows、macOS 与 Linux"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Source%20Available%201.0-3d6fa8" alt="StonePlus Source Available License 1.0"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-3d6fa8" alt="Apache License 2.0"></a>
   <a href="https://github.com/M4rkzzz/stone-plus/stargazers"><img src="https://img.shields.io/github/stars/M4rkzzz/stone-plus?style=flat&logo=github" alt="GitHub Stars"></a>
 </p>
 
@@ -349,14 +348,11 @@ npm run dist
 
 ## 许可证、第三方组件与品牌
 
-- StonePlus 自有源代码依据 [StonePlus Source Available License 1.0](LICENSE) 公开供查看、审计、学习、有限本地测试和安全研究；这不是开源许可证，不授权修改、衍生产品、重新包装、再分发、商业发行或对外托管、AI 训练或自动代码生成；
-- 当前源码与历史版本的许可分界见 [LICENSE_BOUNDARY.md](LICENSE_BOUNDARY.md)；保留的 Apache-2.0 文本仅适用于明确标识的上游、第三方或历史材料；
-- Codex、Claude Code、Gemini CLI 与 Copilot 的仓库操作边界见 [AI_USAGE_POLICY.md](AI_USAGE_POLICY.md)；自动化工具不得协助 Clone、换标、清理许可证或删除来源归属；
-- 官方版本的准确源码获取方式见 [SOURCE_ACCESS.md](SOURCE_ACCESS.md)，Release 会提供与准确 Tag 对应并带校验和及 provenance 的源码归档；
-- 上游代码、依赖与随包组件继续适用各自的原许可证，归属和许可详情见 [NOTICE](NOTICE)、[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) 与随附许可证文件；
-- **Stone+、StonePlus、项目 Logo 与官方视觉资产不随源码授权。** 使用规则见 [TRADEMARKS.md](TRADEMARKS.md)；
-- 未经书面许可，不得创建、发布或运营 Fork、换标版、重包装版或功能相同/实质相似的衍生产品；Stone+、StonePlus、Logo、官方更新和签名身份另受 [TRADEMARKS.md](TRADEMARKS.md) 保护。
+- StonePlus 自有代码、文档、构建脚本及原创视觉素材采用标准 [Apache License 2.0](LICENSE)，允许修改、Fork、换标、再分发、商业使用、托管服务及 AI 辅助开发。
+- 请保留适用的版权与归属声明，并按 Apache-2.0 要求说明修改；贡献指南见 [AGENTS.md](AGENTS.md) 和 [AI_USAGE_POLICY.md](AI_USAGE_POLICY.md)。
+- 准确源码和构建方式见 [SOURCE_ACCESS.md](SOURCE_ACCESS.md)；官方 Release 提供准确 Tag 对应的源码归档、校验和及构建来源证明。
+- 上游 Stone 及第三方组件保留各自原许可证；随包 sing-box 的 GPL 和对应源码交付义务继续适用，详情见 [NOTICE](NOTICE)、[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) 与 [SOURCE_OFFER-sing-box.md](SOURCE_OFFER-sing-box.md)。
+- Apache-2.0 不授予商标权；[TRADEMARKS.md](TRADEMARKS.md) 只区分官方与第三方来源，不禁止开源 Fork 或商业使用。
+- 迁移自 2026-10-21 的本仓库修订起生效；已发布的旧 Tag 与二进制保留随附声明，详见 [LICENSE_BOUNDARY.md](LICENSE_BOUNDARY.md)。获取开源版本请使用迁移后的源码或明确标注 Apache-2.0 的后续版本。
 
-许可证迁移不追溯撤销既有授权：StonePlus v0.9.5 及更早版本继续适用其随附的 Apache-2.0 条款；在本许可证生效前以 AGPL-3.0-or-later 首次发布的仓库修订继续适用当时的 AGPL 条款。
-
-官方 Release 提供代码签名（适用平台）、`SHA256SUMS` 与构建来源证明（provenance），建议据此核验安装包来源。
+官方 Release 提供代码签名（适用平台）、`SHA256SUMS` 与构建来源证明，便于核验来源。

@@ -95,20 +95,17 @@ For the Windows x64, Linux x64/arm64, and macOS x64/arm64 packages:
 
 ## License record
 
-- `LICENSE` contains the complete StonePlus Source Available License 1.0 governing
-  new StonePlus-owned material first published after the migration; package metadata
-  uses `SEE LICENSE IN LICENSE`.
-- `PROJECT_IDENTITY.json` binds the canonical repository and maintainer to the
-  license digest, Windows certificate fingerprints, signed release-tag policy,
-  and GitHub artifact-attestation workflow. The `LICENSES/LicenseRef-StonePlus-Source-Available-1.0.txt`
-  mirror must remain byte-identical to root `LICENSE`.
-- `LICENSES/Apache-2.0.txt` retains the complete license for material inherited
-  from upstream Stone; `LICENSES/AGPL-3.0-or-later.txt` retains the historical
-  AGPL text; historical releases and revisions retain their accompanying terms.
-- `TRADEMARKS.md` separately protects the Stone+/StonePlus names, logos, official
-  release identity, updater endpoints, and signing identity.
-- `SOURCE_ACCESS.md` identifies the exact-version StonePlus source archive and
-  public repository, while `SOURCE_OFFER-sing-box.md` covers the bundled core.
+- `LICENSE` and `LICENSES/Apache-2.0.txt` contain identical, complete standard
+  Apache-2.0 text for current StonePlus-owned material and upstream Stone.
+  Root package metadata uses `Apache-2.0`; run `npm run license:verify`.
+- `PROJECT_IDENTITY.json` records the license digest and official signing and
+  provenance metadata. Official publisher verification is separate from open
+  source development and redistribution permissions.
+- `LICENSE_BOUNDARY.md` describes the 2026-10-21 migration and historical
+  artifacts. Retain the historical AGPL text and all third-party licenses.
+- `TRADEMARKS.md` explains official origin without adding software restrictions.
+- `SOURCE_ACCESS.md` identifies exact-version source; `SOURCE_OFFER-sing-box.md`
+  covers the separately bundled core and its corresponding-source obligations.
 - `LICENSES/GPL-3.0-or-later.txt` contains the complete GPL version 3 text.
 - `LICENSES/npm/lazy-val-1.0.5-MIT.txt` supplies the complete MIT notice omitted
   from the published `lazy-val@1.0.5` npm artifact and is copied into installed

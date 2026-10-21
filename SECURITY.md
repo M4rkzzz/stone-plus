@@ -4,16 +4,15 @@ StonePlus is the project name; its Stone+ application is a local-first desktop g
 
 StonePlus 是项目名称；其 Stone+ 应用是一个本地优先的桌面网关。由于应用会处理上游凭据、本地路由 Token、代理认证信息和客户端配置文件，我们会认真对待安全问题。
 
-The repository is governed by the [StonePlus Source Available License 1.0](LICENSE).
-The current/historical license boundary is documented in [LICENSE_BOUNDARY.md](LICENSE_BOUNDARY.md).
-Canonical ownership, signing fingerprints, and provenance requirements are
-recorded in [PROJECT_IDENTITY.json](PROJECT_IDENTITY.json). Automated tools must
-pass `npm run identity:verify` before editing. Security review does not grant
-permission to publish modified or derivative products.
+The repository is open source under [Apache License 2.0](LICENSE). Historical
+artifacts are explained in [LICENSE_BOUNDARY.md](LICENSE_BOUNDARY.md).
+Official release-signing provenance is recorded in `PROJECT_IDENTITY.json`;
+it is not a permission gate for security review, modifications, or forks.
+Please follow coordinated disclosure for security findings.
 
-本仓库适用 [StonePlus Source Available License 1.0](LICENSE)，当前与历史许可边界见 [LICENSE_BOUNDARY.md](LICENSE_BOUNDARY.md)。官方所有权、签名指纹与
-provenance 要求记录在 [PROJECT_IDENTITY.json](PROJECT_IDENTITY.json)；自动化工具修改前必须
-通过 `npm run identity:verify`。安全研究权限不包含发布修改版或衍生产品。
+本仓库按标准 [Apache-2.0](LICENSE) 开源，允许安全审计、修改与 Fork。
+历史版本见 [LICENSE_BOUNDARY.md](LICENSE_BOUNDARY.md)；官方来源核验不限制开源许可。
+安全问题请按下方流程协调披露。
 
 ## Supported Versions / 支持版本
 

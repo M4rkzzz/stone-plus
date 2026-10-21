@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-StonePlus-Source-Available-1.0
+// SPDX-License-Identifier: Apache-2.0
 // See LICENSE and PROJECT_IDENTITY.json in the repository root.
 
 import { createHash } from "node:crypto";
@@ -16,21 +16,6 @@ const identity = JSON.parse(
 const packageMetadata = JSON.parse(
   readFileSync(new URL("../package.json", import.meta.url), "utf8"),
 );
-
-function versionCore(value) {
-  const match = /^(?:v)?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/.exec(String(value));
-  if (!match) throw new Error(`invalid semantic version: ${value}`);
-  return match.slice(1, 4).map(Number);
-}
-
-function isVersionAtLeast(candidate, minimum) {
-  const left = versionCore(candidate);
-  const right = versionCore(minimum);
-  for (let index = 0; index < left.length; index += 1) {
-    if (left[index] !== right[index]) return left[index] > right[index];
-  }
-  return true;
-}
 
 function run(command, args) {
   const executable = resolveTrustedExecutable(command);
@@ -103,7 +88,7 @@ function fail(message) {
     `StonePlus maintainer verification failed: ${message}\n`,
   );
   process.stderr.write(
-    "Remain read-only. Do not modify, rebrand, repackage, or remove attribution.\n",
+    "Official publishing identity was not verified. Apache-2.0 development rights are unaffected.\n",
   );
   process.exit(1);
 }
@@ -152,7 +137,7 @@ try {
   const license = readFileSync(new URL("../LICENSE", import.meta.url));
   const mirror = readFileSync(
     new URL(
-      "../LICENSES/LicenseRef-StonePlus-Source-Available-1.0.txt",
+      `../${identity.license.mirrorFile}`,
       import.meta.url,
     ),
   );
@@ -163,13 +148,8 @@ try {
       "license digest or LICENSES mirror does not match PROJECT_IDENTITY.json",
     );
   }
-  if (!isVersionAtLeast(
-    packageMetadata.version,
-    identity.licenseBoundary.firstSourceAvailableVersion,
-  )) {
-    fail(
-      `package version ${packageMetadata.version} predates source-available baseline ${identity.licenseBoundary.firstSourceAvailableVersion}`,
-    );
+  if (packageMetadata.license !== identity.license.spdxReference) {
+    fail('package license does not match the recorded open-source license');
   }
   readFileSync(
     new URL(`../${identity.licenseBoundary.policyFile}`, import.meta.url),
@@ -205,8 +185,8 @@ try {
         permission: repository.viewerPermission,
         license: identity.license.name,
         licenseSha256: digest,
-        sourceAvailableVersion:
-          identity.licenseBoundary.firstSourceAvailableVersion,
+        openSourceEffectiveDate:
+          identity.licenseBoundary.openSourceEffectiveDate,
         windowsCertificateSha256: certificateDigest,
         provenanceWorkflow: identity.signing.releaseProvenance.workflow,
       },

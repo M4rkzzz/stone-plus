@@ -6,24 +6,14 @@ or endorsed by the upstream Stone maintainers.
 
 ## Licensing of the modifications
 
-Beginning with the source-available migration recorded on 2026-07-23, new
-original modifications authored for StonePlus are provided under the
-StonePlus Source Available License 1.0 in `LICENSE`. This statement applies
-only to material for which the StonePlus copyright holders have authority to
-grant that license.
+Effective 2026-10-21, original StonePlus modifications in the current
+revision are licensed under the standard Apache License 2.0 in `LICENSE`.
+The grant includes StonePlus-owned material carried forward from earlier
+revisions. Third-party components keep their original terms and notices;
+see `NOTICE`, `THIRD_PARTY_NOTICES.md`, and `LICENSES/`.
 
-Code inherited from upstream Stone remains available under Apache-2.0, and
-third-party components remain under their respective licenses. The StonePlus
-license does not remove, replace, or narrow any copyright, attribution,
-source-delivery, or notice obligation applying to upstream or third-party
-material. See `NOTICE`, `LICENSES/Apache-2.0.txt`, and
-`THIRD_PARTY_NOTICES.md`.
-
-The change is prospective. StonePlus v0.9.5 and earlier remain governed by
-the Apache-2.0 materials shipped with those versions. Repository revisions
-first published under AGPL-3.0-or-later before the source-available migration
-remain available under their accompanying AGPL terms. Those earlier grants
-are not revoked.
+Previously published tags and binaries retain their accompanying notices.
+Historical Apache and AGPL grants are preserved; see `LICENSE_BOUNDARY.md`.
 
 The first StonePlus project release (distributed under the Stone+ application
 name), `v0.8.3`, is based on upstream Stone `v0.8.2` (`4077f2f`). A current,

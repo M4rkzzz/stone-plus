@@ -9,7 +9,7 @@
 - 最新版下载：https://github.com/M4rkzzz/stone-plus/releases/latest
 - `v0.8.0` Release：https://github.com/M4rkzzz/stone-plus/releases/tag/v0.8.0
 - Issues：https://github.com/M4rkzzz/stone-plus/issues
-- 源码可见许可证：https://github.com/M4rkzzz/stone-plus/blob/main/LICENSE
+- Apache-2.0 开源许可证：https://github.com/M4rkzzz/stone-plus/blob/main/LICENSE
 - QQ 交流群：`1061282900`
 
 QQ群目前只使用群号，不编造或转发无法长期验证的加群链接。
@@ -149,7 +149,7 @@ Stone+ 面向个人管理自己有权使用的账号，不提供多租户、计�
 
 Linux 还需要 Secret Service 兼容的 Keyring，例如 `libsecret` 或 KWallet；部分发行版运行 AppImage 时可能需要 FUSE 2。
 
-StonePlus 自有源代码采用 StonePlus Source Available License 1.0，允许查看、审计、学习、有限本地测试和安全研究，但禁止修改、衍生产品、再分发、商业发行或对外托管、AI 训练或自动代码生成；上游及第三方代码继续适用各自原许可证。欢迎通过 Issues 或 QQ 群反馈具体环境、客户端、上游类型和复现步骤。
+StonePlus 自有代码、文档、构建脚本与原创视觉素材采用标准 Apache-2.0 开源，允许修改、Fork、再分发、商业使用及 AI 辅助开发；上游及第三方组件保留各自条款。欢迎通过 Issues 或 Pull Request 参与维护。
 
 - GitHub：https://github.com/M4rkzzz/stone-plus
 - Releases：https://github.com/M4rkzzz/stone-plus/releases/latest
@@ -299,7 +299,7 @@ StonePlus 自有源代码采用 StonePlus Source Available License 1.0，允许�
 >
 > 每个账号或号池也可以指定 HTTP 或 SOCKS 出口代理。配置客户端前会先预览并备份，账号凭据由操作系统安全存储保护，请求历史不保存提示词和回复正文。
 >
-> Stone+ 是个人本地工具，不是团队共享或计费平台。StonePlus 自有源码公开供审计，但不授权修改、衍生产品、再分发或 AI 自动生成；下载和当前限制都在 GitHub Release。
+> Stone+ 是个人本地工具，不是团队共享或计费平台。StonePlus 按标准 Apache-2.0 开源，允许修改、Fork、再分发、商用和 AI 辅助开发；下载与平台说明都在 GitHub Release。
 
 ### 镜头脚本
 
@@ -313,7 +313,7 @@ StonePlus 自有源代码采用 StonePlus Source Available License 1.0，允许�
 | 48–58 秒 | 展示协议选择、一次流式响应或工具调用的请求元数据 | 常用协议转换，支持流式与工具调用 |
 | 58–66 秒 | 代理管理与 Codex 额度图 | 账号/号池出口代理与额度趋势 |
 | 66–74 秒 | 配置预览、备份列表和安全存储状态 | 写入前预览，凭据留在本机 |
-| 74–82 秒 | 在线更新弹窗，再切 GitHub 项目页与 Release 页 | Source Available 1.0 · GitHub / Issues / QQ群 1061282900 |
+| 74–82 秒 | 在线更新弹窗，再切 GitHub 项目页与 Release 页 | Apache-2.0 · GitHub / Issues / QQ群 1061282900 |
 
 ### 视频简介
 
@@ -428,7 +428,7 @@ Stone+ 只管理所选 Profile 目录对应的用户层配置。写入前可以�
 
 ### 是免费的吗？可以商用吗？
 
-StonePlus 自有源代码根据 StonePlus Source Available License 1.0 公开供查看、审计、学习、有限本地测试和安全研究；禁止修改、衍生产品、Fork 重包装、再分发、商业发行或对外托管、AI 训练和自动代码生成。上游及第三方组件继续适用各自许可证；Stone+、StonePlus、Logo、官方更新和签名身份另受品牌政策保护。上游模型或账号产生的费用与使用规则不属于 Stone+ 许可证范围。
+StonePlus 自有材料按标准 Apache-2.0 免费开源，可修改、再分发和商用，遵守许可证中的版权、归属和修改说明要求即可。第三方组件保留原许可证；商标政策只用于避免官方来源混淆。模型或账号服务的费用另计。
 
 ### 出问题时应该提供什么？
 
