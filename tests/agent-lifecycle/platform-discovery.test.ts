@@ -6,6 +6,17 @@ import {
 } from '../../src/main/agent-lifecycle/platform-discovery'
 
 describe('agent platform discovery', () => {
+  it('uses the same resolved PATH for command discovery as CLI launch', async () => {
+    const findCommand = vi.fn(async () => ['/opt/node/bin/codex'])
+    const resolveEnvironment = vi.fn(async (env: NodeJS.ProcessEnv) => ({ ...env, PATH: '/opt/node/bin:/usr/bin' }))
+    const result = await discoverAgentExecutable('codex-cli', {
+      platform: 'darwin', environment: { PATH: '/usr/bin', HOME: '/Users/a' },
+      resolveEnvironment, findCommand, fileExists: async () => true,
+    })
+    expect(findCommand).toHaveBeenCalledWith('codex', 'darwin', { PATH: '/opt/node/bin:/usr/bin', HOME: '/Users/a' })
+    expect(result.executablePath).toBe('/opt/node/bin/codex')
+  })
+
   it('prefers an injected PATH result and marks every CLI as managed-only', async () => {
     const fileExists = vi.fn(async (path: string) => path === 'C:\\Tools\\codex.cmd')
     const result = await discoverAgentExecutable('codex-cli', {

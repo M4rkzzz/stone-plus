@@ -31,7 +31,7 @@ import type {
   RestoreBackupSetResult,
   SupportedClient,
 } from './types'
-import { ClientConfigValidationError } from './types'
+import { ClientConfigRollbackError, ClientConfigValidationError } from './types'
 
 const backupMarker = '.stone-backup.'
 const missingBackupMarker = '.missing'
@@ -151,6 +151,10 @@ export class ClientConfigService {
   async plan(client: SupportedClient, target: ClientConnectionTarget) {
     const existing = await this.readExisting(client)
     return planClientConfig(client, this.paths, existing, target)
+  }
+
+  async planRepair(client: SupportedClient, target: ClientConnectionTarget) {
+    return planClientConfigRepair(client, this.paths, await this.readExisting(client), target)
   }
 
   async editor(client: SupportedClient): Promise<ClientConfigEditorSnapshot> {
@@ -376,7 +380,7 @@ export class ClientConfigService {
     } catch (error) {
       const rollbackFailures = await this.rollback(written, backups, plan)
       if (rollbackFailures.length) {
-        throw new Error(`${messageOf(error)}; rollback was incomplete for: ${rollbackFailures.join(', ')}`)
+        throw new ClientConfigRollbackError(`${messageOf(error)}; rollback was incomplete for: ${rollbackFailures.join(', ')}`, { cause: error })
       }
       throw error
     }
@@ -394,6 +398,7 @@ export class ClientConfigService {
     return {
       client,
       changedFiles: changes.map((file) => file.path),
+      postWriteRevisions: Object.fromEntries(changes.map((file) => [file.role, revisionOf(file, file.content)])),
       backups,
       removedBackups,
       ...(retentionWarning ? { retentionWarning } : {}),
@@ -511,13 +516,15 @@ export class ClientConfigService {
   async restoreBackupSet(
     client: SupportedClient,
     groupIdOrCreatedAt: string | number,
+    expectedRevisions?: ApplyClientConfigResult['postWriteRevisions'],
   ): Promise<RestoreBackupSetResult> {
-    return runConfigMutation(() => this.restoreBackupSetUnlocked(client, groupIdOrCreatedAt))
+    return runConfigMutation(() => this.restoreBackupSetUnlocked(client, groupIdOrCreatedAt, expectedRevisions))
   }
 
   private async restoreBackupSetUnlocked(
     client: SupportedClient,
     groupIdOrCreatedAt: string | number,
+    expectedRevisions?: ApplyClientConfigResult['postWriteRevisions'],
   ): Promise<RestoreBackupSetResult> {
     const backups = await this.listBackups(client)
     if (backups.length === 0) throw new Error(`No backups are available for ${client}.`)
@@ -568,6 +575,17 @@ export class ClientConfigService {
     // The safety snapshot includes all current files, not only files present in
     // the source set. This gives rollback one coherent pre-restore state.
     const safetyBackups = await this.backupFiles(eligibleFiles, this.now(), true)
+    // Compare the exact safety snapshot that subsequent writes are guarded
+    // against, not an earlier read that could race a client-side config edit.
+    if (expectedRevisions) {
+      for (const file of restoreFiles) {
+        const current = safetyBackups.find((backup) => backup.role === file.role)!
+        const content = current.existed ? await readFile(current.backupPath, 'utf8') : undefined
+        if (!expectedRevisions[file.role] || revisionOf(file, content) !== expectedRevisions[file.role]) {
+          throw new ClientConfigValidationError(`Automatic rollback refused: ${file.role} changed after connection repair. Newer configuration was preserved.`)
+        }
+      }
+    }
     const safetyBackupSet = safetyBackups.length > 0
       ? backupSetFromRecords(client, safetyBackups)
       : undefined

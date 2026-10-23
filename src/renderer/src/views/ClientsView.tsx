@@ -62,13 +62,12 @@ import {
   getClientConfigFieldGuide,
   isClientConfigWorkbenchDirty,
   localizeClientConfigEditorField,
-  oneClickAgentRuntimeAction,
   oneClickRouteModelMap,
-  oneClickRouteNeedsUpdate,
   resetClientConfigDrafts,
   type ClientConfigFieldDrafts,
   type ClientConfigFileDrafts,
 } from '../client-config-workbench'
+import { runClientConnectionWorkflow } from '../client-connection-workflow'
 import { localizeBackendMessage } from '../backend-message'
 import { clientBrandMeta as clientMeta } from '../brand-icons'
 import { useI18n, type UiLanguage } from '../i18n'
@@ -817,69 +816,21 @@ export function ClientsView({
       setError(t('请先选择一个可用上游', 'Select an available upstream first'))
       return
     }
-    const result = await run(`connect-${activeClient}`, async () => {
-      const routeUpdated = oneClickRouteNeedsUpdate(route, draft)
-      if (routeUpdated) await api.updateRoute(draft)
-      if (!snapshot.gatewayStatus.running) await api.startGateway()
-      let preflightChanged = true
-      try {
-        const preview = await api.previewClientConfig(activeClient, activeProfileId)
-        preflightChanged = preview.files.some((file) => file.changed)
-      } catch {
-        // A malformed file is still repairable. The repair call below owns the
-        // backup/rebuild behavior and the postflight must become readable.
-      }
-      const repair = await api.repairClientConfig(activeClient, activeProfileId)
-      const verification = await api.previewClientConfig(activeClient, activeProfileId)
-      const remaining = verification.files.filter((file) => file.changed).map((file) => file.role)
-      if (remaining.length > 0) {
-        throw new Error(t(
-          `一键连接后仍检测到配置残留：${remaining.join('、')}`,
-          `Configuration drift remains after one-click connection: ${remaining.join(', ')}`,
-        ))
-      }
-      const connectionUpdated = routeUpdated || preflightChanged || repair.changedFiles.length > 0
-      const restarted: string[] = []
-      let unmanagedRunning = false
-      if (connectionUpdated) {
-        let lifecycle = await api.getAgentLifecycleSnapshot()
-        acceptAgentLifecycle(lifecycle)
-        for (const target of clientAgentTargets[activeClient]) {
-          const agent = lifecycle.agents[target]
-          const runtimeAction = oneClickAgentRuntimeAction(agent)
-          if (runtimeAction === 'none') continue
-          if (runtimeAction === 'manual-restart') {
-            unmanagedRunning = true
-            continue
-          }
-          const operation = await api.restartAgent(target)
-          acceptAgentLifecycle(operation.snapshot)
-          lifecycle = operation.snapshot
-          const failure = operation.results.find((item) => item.target === target)?.error
-          if (operation.status === 'failed' || failure) {
-            throw new Error(failure
-              ? localizedLifecycleError(failure, t)
-              : t(`${agentInstallMeta[target].name} 未能重启`, `${agentInstallMeta[target].name} could not restart`))
-          }
-          restarted.push(agentInstallMeta[target].name)
-        }
-      }
-      return {
-        repair,
-        updated: connectionUpdated,
-        restarted,
-        unmanagedRunning,
-      }
-    })
-    if (!result) return
+    if (!route) return
+    const result = await run(`connect-${activeClient}`, () => runClientConnectionWorkflow({
+      api, previous: route, desired: draft, profileId: activeProfileId,
+      targets: clientAgentTargets[activeClient], onLifecycle: acceptAgentLifecycle,
+      confirmActivation,
+    }))
+    if (!result || result.cancelled) return
     const verified = result.updated
       ? t('已复核并更新旧连接残留', 'Legacy connection residue was checked and updated')
       : t('未发现冲突残留，连接配置已确认', 'No conflicting residue was found; the connection was verified')
-    const activation = result.restarted.length > 0
-      ? t(`；已自动重启 ${result.restarted.join('、')}`, `; automatically restarted ${result.restarted.join(', ')}`)
-      : result.unmanagedRunning
-        ? t('；检测到非 Stone+ 托管会话，请手动重启客户端后生效', '; an unmanaged session is running; restart the client manually to apply the change')
-        : ''
+    const activation = (result.restarted.length > 0
+      ? t(`；已重新生效 ${result.restarted.map((target) => agentInstallMeta[target].name).join('、')}`, `; reapplied for ${result.restarted.map((target) => agentInstallMeta[target].name).join(', ')}`)
+      : '') + (result.pendingNewSession
+      ? t('；外部会话或自定义配置目录需要手动重启或新开会话生效', '; external sessions or custom profile directories require a manual restart or a new session')
+      : '')
     setNotice(t(`${meta.name} 已连接到 Stone+；${verified}${activation}`, `${meta.name} is connected to Stone+; ${verified}${activation}`))
     await loadWorkspace(activeClient, activeProfileId)
   }
@@ -891,11 +842,15 @@ export function ClientsView({
   }
 
   const switchUpstream = async (sourceId: string) => {
-    if (!sourceId || sourceId === route?.poolId) return
+    if (!route || !sourceId || sourceId === route.poolId) return
     const client = activeClient
     setRouteSelections((current) => ({ ...current, [client]: sourceId }))
-    const result = await run(`switch-upstream-${client}`, () => api.setClientRouteSource({ client, sourceId }))
-    if (!result) {
+    const result = await run(`switch-upstream-${client}`, () => runClientConnectionWorkflow({
+      api, previous: route, desired: { ...route, poolId: sourceId }, profileId: activeProfileId,
+      targets: clientAgentTargets[client], sourceOnly: true, onLifecycle: acceptAgentLifecycle,
+      confirmActivation,
+    }))
+    if (!result || result.cancelled) {
       setRouteSelections((current) => {
         const next = { ...current }
         delete next[client]
@@ -903,14 +858,19 @@ export function ClientsView({
       })
       return
     }
-    const nextRoute = result.routes.find((candidate) => candidate.client === client)
-    setRouteSelections((current) => ({ ...current, [client]: nextRoute?.poolId ?? sourceId }))
-    const sourceName = resolveRouteSource(sourceId, result)?.summary.name ?? t('新上游', 'the new upstream')
+    setRouteSelections((current) => ({ ...current, [client]: sourceId }))
+    const sourceName = resolveRouteSource(sourceId, snapshot)?.summary.name ?? t('新上游', 'the new upstream')
     setNotice(t(
-      `已切换到 ${sourceName}，客户端配置文件未改动`,
-      `Switched to ${sourceName}; the client configuration files were not changed`,
+      `已切换到 ${sourceName}${result.pendingNewSession ? '；请新开会话或手动重启客户端生效' : result.restarted.length ? '；客户端已重新生效' : '；后续请求使用新源'}`,
+      `Switched to ${sourceName}${result.pendingNewSession ? '; start a new session or restart the client manually' : result.restarted.length ? '; client connection reapplied' : '; subsequent requests use the new source'}`,
     ))
+    await loadWorkspace(client, activeProfileId)
   }
+
+  const confirmActivation = (targets: readonly AgentTarget[], manual: boolean) => window.confirm(t(
+    `${targets.length ? `需要关闭并重新开启 ${targets.map((target) => agentInstallMeta[target].name).join('、')}，运行中的任务可能中断。` : ''}${manual ? '外部会话或自定义配置目录不会被自动关闭，需要手动重启或新开会话。' : ''}是否继续？取消将保留原设置。`,
+    `${targets.length ? `Applying this change requires reopening ${targets.map((target) => agentInstallMeta[target].name).join(', ')} and may interrupt running tasks. ` : ''}${manual ? 'External sessions and custom profile directories require a manual restart or a new session. ' : ''}Continue? Cancel keeps the current settings.`,
+  ))
 
   const selectUpstream = (sourceId: string) => {
     if (!route) {

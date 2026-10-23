@@ -619,15 +619,24 @@ export class PoolScheduler {
       !excluded?.has(account.id)
       && this.isAvailable(account, input.pool, this.now(), input.modelCooldownKey ?? input.model)
     )
-    const verified = eligibility.verified.filter(available)
-    const tier = verified.length > 0 ? verified : eligibility.unknown.filter(available)
     const adaptive = input.pool.strategy === 'autobalanced'
-    return tier
-      .filter((account) => !hasRouteAccountCapacity(
-        account,
-        this.inFlight(account),
-        this.concurrencyLimit(account, adaptive),
-      ))
+    const capacityBlocked = (account: Account): boolean => !hasRouteAccountCapacity(
+      account,
+      this.inFlight(account),
+      this.concurrencyLimit(account, adaptive),
+    )
+    // selectAndAcquire falls through from the verified tier to the unknown tier
+    // whenever every verified member is saturated, so the account that will
+    // actually serve once capacity frees may be an unknown-tier member. A waiter
+    // must therefore wake when ANY available member of EITHER tier releases a
+    // slot. Collapsing to the verified tier alone (verified.length > 0) left
+    // waiters registered only on saturated verified accounts, so freed capacity
+    // on an unknown member never fulfilled them and the request expired as a
+    // false 503 despite capacity being available within milliseconds. A wake
+    // that does not actually enable selection is harmless: fulfillOneCapacityWaiter
+    // re-runs selectAndAcquire and keeps waiting.
+    return [...eligibility.verified, ...eligibility.unknown]
+      .filter((account) => available(account) && capacityBlocked(account))
       .map((account) => account.id)
   }
 
@@ -1277,8 +1286,17 @@ export class PoolScheduler {
     const cooldownUntil = Math.max(account.cooldownUntil ?? 0, health?.cooldownUntil ?? 0)
     if (!isRouteAccountRuntimeAvailable(account, now)) return false
     if (quotaExhausted(account, now)) return false
-    if (quotaProtectionBlocks(account.codexQuota, account.quotaProtection, now)) return false
-    if (quotaProtectionBlocks(account.codexQuota, pool?.quotaProtection, now)) return false
+    // codexQuota is populated only for Codex credentials (chatgpt-oauth /
+    // chatgpt-agent-identity); relay/api-key/grok accounts never report it.
+    // Applying a codexQuota-based protection policy to those types would hit the
+    // "unavailable" branch forever and, under unavailableBehavior: 'block',
+    // permanently 503 the pool with no path to ever observe a quota snapshot.
+    // The 5h/7d reserve policy is a Codex feature, so it simply does not apply
+    // to non-Codex sources.
+    if (accountReportsCodexQuota(account)) {
+      if (quotaProtectionBlocks(account.codexQuota, account.quotaProtection, now)) return false
+      if (quotaProtectionBlocks(account.codexQuota, pool?.quotaProtection, now)) return false
+    }
     if (cooldownUntil > now || (health?.circuitState === 'half-open' && this.inFlight(account) > 0)) return false
     return true
   }
@@ -1749,6 +1767,16 @@ export class PoolScheduler {
       routeAccountConcurrencyLimit(this.performance.get(account.id)?.dynamicConcurrency ?? configured),
     ))
   }
+}
+
+/**
+ * Only Codex credentials populate account.codexQuota (via x-codex-* headers and
+ * the ChatGPT usage endpoint). A codexQuota-based reserve policy is meaningless
+ * for other credential types and must not be allowed to block them.
+ */
+function accountReportsCodexQuota(account: Account): boolean {
+  return account.credentialType === 'chatgpt-oauth'
+    || account.credentialType === 'chatgpt-agent-identity'
 }
 
 /** Pure policy evaluator exported for diagnostics and deterministic tests. */

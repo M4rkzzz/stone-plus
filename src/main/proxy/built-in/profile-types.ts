@@ -48,7 +48,11 @@ export interface InternalProxyTransportOptions {
 }
 
 export interface InternalProxyNode {
-  /** Stable SHA-256-derived identifier. It never contains a credential verbatim. */
+  /**
+   * Stable SHA-256-derived identifier over the salted node identity. It never
+   * contains a credential verbatim and, once salted, cannot be recomputed from
+   * a guessed credential outside the main process.
+   */
   id: string
   name: string
   type: BuiltInProxyNodeType
@@ -110,6 +114,12 @@ export interface ParsedBuiltInProxyProfile {
   format: BuiltInProxyImportFormat
   /** Hash of the imported bytes, suitable for refresh/change detection. */
   sourceFingerprint: string
+  /**
+   * Per-profile salt for node identifiers. Absent on profiles imported before
+   * salting; a refresh must keep it verbatim so stored node selections and
+   * latency results stay addressable.
+   */
+  nodeIdSalt?: string
   nodes: InternalProxyNode[]
   groups: InternalProxyGroup[]
   rules: InternalProxyRule[]

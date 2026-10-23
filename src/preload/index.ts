@@ -92,7 +92,9 @@ const stone: GatewayApi = {
   ensureGatewayRunning: (input) => ipcRenderer.invoke('stone:ensure-gateway-running', input),
   verifySetupRoute: (input) => ipcRenderer.invoke('stone:verify-setup-route', input),
   setClientRouteSource: (input) => ipcRenderer.invoke('stone:set-client-route-source', input),
-  updateRoute: (route) => ipcRenderer.invoke('stone:update-route', route),
+  updateRoute: (route, expected) => expected
+    ? ipcRenderer.invoke('stone:update-route', route, expected)
+    : ipcRenderer.invoke('stone:update-route', route),
   updateGateway: (settings) => ipcRenderer.invoke('stone:update-gateway', settings),
   startGateway: () => ipcRenderer.invoke('stone:start-gateway'),
   stopGateway: () => ipcRenderer.invoke('stone:stop-gateway'),
@@ -119,7 +121,11 @@ const stone: GatewayApi = {
   importClientProfile: (bundle) => ipcRenderer.invoke('stone:import-client-profile', bundle),
   chooseClientConfigDirectory: (client, currentDirectory) => ipcRenderer.invoke('stone:choose-client-config-directory', client, currentDirectory),
   getClientConfigs: (profileId) => ipcRenderer.invoke('stone:get-client-configs', profileId),
-  previewClientConfig: (client, profileId) => ipcRenderer.invoke('stone:preview-client-config', client, profileId),
+  previewClientConfig: (client, profileId, proposedRoute, mode) => mode
+    ? ipcRenderer.invoke('stone:preview-client-config', client, profileId, proposedRoute, mode)
+    : proposedRoute ? ipcRenderer.invoke('stone:preview-client-config', client, profileId, proposedRoute)
+      : ipcRenderer.invoke('stone:preview-client-config', client, profileId),
+  rollbackClientConfigRepair: (client, profileId, groupId, revisions) => ipcRenderer.invoke('stone:rollback-client-config-repair', client, profileId, groupId, revisions),
   applyClientConfig: (client, profileId) => ipcRenderer.invoke('stone:apply-client-config', client, profileId),
   repairClientConfig: (client, profileId) => ipcRenderer.invoke('stone:repair-client-config', client, profileId),
   restoreCodexOfficialLoginAndSessions: (profileId) => ipcRenderer.invoke('stone:restore-codex-official-login-and-sessions', profileId),

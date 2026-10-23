@@ -169,6 +169,17 @@ export class FrpTunnelService {
         this.child = undefined
         this.startedAt = undefined
       }
+      // The process may already be running: spawn succeeded and the tunnel is
+      // live, but a post-spawn step (marker write, early-exit check) failed.
+      // Never leave an untracked frpc forwarding a public port with no way to
+      // stop it — terminate it before surfacing the startup failure.
+      try {
+        child.kill()
+        if (!await waitForExit(child, 3_000) && child.pid) await this.terminateProcessTree(child.pid)
+      } catch {
+        // Best-effort teardown; the original startup error is authoritative.
+      }
+      await this.clearProcessMarker().catch(() => undefined)
       throw error
     }
     return this.getState()

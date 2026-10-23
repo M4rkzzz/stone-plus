@@ -1,9 +1,11 @@
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { ClientConfigConnectionPort } from '../../src/main/agent-lifecycle/client-config-connection-port'
 import { ClientConfigService } from '../../src/main/client-config/service'
+import { repairAndValidateConnection } from '../../src/main/agent-lifecycle/integration'
+import { CodexLifecycleAdapter } from '../../src/main/agent-lifecycle/codex-adapter'
 
 const roots: string[] = []
 const connection = { gatewayBaseUrl: 'http://127.0.0.1:15720', token: 'local-token' }
@@ -25,6 +27,42 @@ afterEach(async () => {
 })
 
 describe('ClientConfigConnectionPort', () => {
+  it.each([false, true])('only restores desktop runtime after configuration rollback succeeds (external edit=%s)', async (externalEdit) => {
+    const { service, port } = await createPort()
+    await service.apply('codex', connection)
+    const original = await readFile(service.paths.codex.config.path, 'utf8')
+    vi.spyOn(port, 'validate').mockImplementation(async () => {
+      if (externalEdit) await writeFile(service.paths.codex.config.path, 'model = "gpt-user-new"\n')
+      throw new Error('injected validation failure')
+    })
+    const desktop = { shutdownForRepair: vi.fn(async () => ({ wasRunning: true, launchTarget: 'fixture' })), relaunch: vi.fn(async () => undefined) }
+    const adapter = new CodexLifecycleAdapter({ target: 'codex-desktop', desktop,
+      desktopProbe: { inspect: async () => ({ installed: true, running: true, configured: false }) },
+      deepRepair: { run: vi.fn() },
+      prepareConnection: () => repairAndValidateConnection(port, 'codex', { ...connection, gatewayBaseUrl: 'http://127.0.0.1:15722' }),
+    })
+    await expect(adapter.start()).rejects.toThrow(externalEdit ? 'rollback also failed' : 'injected validation failure')
+    expect(desktop.relaunch).toHaveBeenCalledTimes(externalEdit ? 0 : 1)
+    expect(await readFile(service.paths.codex.config.path, 'utf8')).toBe(externalEdit ? 'model = "gpt-user-new"\n' : original)
+  })
+
+  it('preserves a newer external edit instead of blindly rolling it back', async () => {
+    const { service, port } = await createPort()
+    const repair = await port.repair('claude', connection)
+    const newer = '{"env":{"ANTHROPIC_BASE_URL":"https://new.example"},"keep":"new"}\n'
+    await writeFile(service.paths.claude.settings.path, newer)
+    await expect(port.rollback('claude', repair)).rejects.toThrow('changed after connection repair')
+    expect(await readFile(service.paths.claude.settings.path, 'utf8')).toBe(newer)
+  })
+
+  it('removes only untouched files created by first-run connection repair', async () => {
+    const { service, port } = await createPort()
+    const repair = await port.repair('gemini', connection)
+    await port.rollback('gemini', repair)
+    await expect(readFile(service.paths.gemini.env.path)).rejects.toMatchObject({ code: 'ENOENT' })
+    await expect(readFile(service.paths.gemini.settings.path)).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
   it('repairs only Claude connection fields and validates the committed state', async () => {
     const { service, port } = await createPort()
     await mkdir(service.paths.claude.directory, { recursive: true })

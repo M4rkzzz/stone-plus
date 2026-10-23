@@ -5,6 +5,7 @@ import { posix, win32 } from 'node:path'
 import { clean as cleanSemver, satisfies as satisfiesSemver } from 'semver'
 import type { AgentTarget } from '../../shared/agent-lifecycle'
 import { terminateProcessTree } from '../proxy/built-in/process-utils'
+import { resolveCliEnvironment, type CliEnvironmentResolver } from '../agent-lifecycle/cli-environment'
 
 export type AgentInstallTarget = AgentTarget
 export type AgentInstallChannel = 'recommended' | 'preview'
@@ -128,7 +129,7 @@ export class AgentInstallationService {
 
   public constructor(options: AgentInstallationServiceOptions = {}) {
     this.platform = options.platform ?? process.platform
-    this.processPort = options.processPort ?? new NativeAgentInstallerProcessPort(this.platform)
+    this.processPort = options.processPort ?? new NativeAgentInstallerProcessPort(this.platform, options.environment)
     this.openExternal = options.openExternal
     this.runtimeCheckTimeoutMs = positiveTimeout(options.runtimeCheckTimeoutMs, DEFAULT_RUNTIME_CHECK_TIMEOUT_MS)
     this.installTimeoutMs = positiveTimeout(options.installTimeoutMs, DEFAULT_INSTALL_TIMEOUT_MS)
@@ -443,16 +444,22 @@ export class AgentInstallerProcessError extends Error {
 }
 
 export class NativeAgentInstallerProcessPort implements AgentInstallerProcessPort {
-  public constructor(private readonly platform: NodeJS.Platform = process.platform) {}
+  public constructor(
+    private readonly platform: NodeJS.Platform = process.platform,
+    private readonly environment: NodeJS.ProcessEnv = process.env,
+    private readonly resolveEnvironment: CliEnvironmentResolver = resolveCliEnvironment,
+  ) {}
 
-  public execute(
+  public async execute(
     executable: string,
     args: readonly string[],
     options: { timeoutMs: number },
   ): Promise<AgentInstallerProcessResult> {
+    const environment = await this.resolveEnvironment(this.environment, this.platform)
     return new Promise((resolve, reject) => {
       let child: ChildProcess
       const spawnOptions: SpawnOptions = {
+        env: environment,
         shell: false,
         windowsHide: true,
         detached: this.platform !== 'win32',

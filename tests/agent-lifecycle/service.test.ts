@@ -184,6 +184,24 @@ describe('AgentLifecycleService', () => {
     expect(result.results.find((entry) => entry.target === 'codex-cli')?.status).toBe('skipped')
   })
 
+  it('global repair preserves stopped clients and does not launch every installed Agent', async () => {
+    const running = new Set<AgentTarget>(['claude-code'])
+    const adapters = adaptersWith(Object.fromEntries(targets.map((target) => [target, {
+      inspect: vi.fn(async () => ({ ...healthySnapshot(), running: running.has(target), managedInstanceCount: Number(running.has(target)) })),
+      restore: vi.fn(async (options) => {
+        if (options?.ensureRunning) running.add(target)
+        return { changed: true }
+      }),
+      start: vi.fn(async () => { running.add(target) }),
+    }])))
+    const service = createService(adapters)
+    const result = await service.repairAllAffected()
+    expect(result.status).toBe('succeeded')
+    expect([...running]).toEqual(['claude-code'])
+    for (const target of targets) expect(adapters[target].start).not.toHaveBeenCalled()
+    expect(result.results.find((entry) => entry.target === 'gemini-cli')).toMatchObject({ wasRunning: false, runningAfter: false })
+  })
+
   it('repairs a shared Codex home once during aggregate repair', async () => {
     const desktopRestore = vi.fn(async () => ({ changed: true }))
     const cliRestore = vi.fn(async () => ({ changed: true }))
@@ -197,7 +215,7 @@ describe('AgentLifecycleService', () => {
     expect(desktopRestore).toHaveBeenCalledOnce()
     expect(desktopRestore).toHaveBeenCalledWith({
       preserveRunningState: true,
-      ensureRunning: true,
+      ensureRunning: false,
       repairSessions: true,
       repairWorkspaceIndex: true,
     })

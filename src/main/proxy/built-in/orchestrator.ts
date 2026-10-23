@@ -591,10 +591,15 @@ export class BuiltInProxyOrchestrator implements BuiltInProxyStoreFacade, BuiltI
       throw new BuiltInProxyOperationError('subscription-update', 'The encrypted subscription URL is unavailable.', false)
     }
     const content = await this.fetchSubscription(secrets.subscriptionUrl, secrets.subscriptionToken)
+    // Reuse the stored salt so refreshed nodes keep the identifiers the active
+    // selection and latency results are keyed by. Profiles saved before salting
+    // stay unsalted for the same reason.
+    const storedSalt = readStoredNodeIdSalt(secrets.configuration)
     const parsed = this.parseProfile(content, {
       profileId: existing.id,
       name: existing.name,
       formatHint: existing.format,
+      ...(storedSalt ? { nodeIdSalt: storedSalt } : { legacyUnsaltedNodeIds: true }),
     })
     await this.store.saveBuiltInProxyProfile(this.toStoreInput(
       parsed,
@@ -1115,6 +1120,12 @@ export class BuiltInProxyOrchestrator implements BuiltInProxyStoreFacade, BuiltI
     return { profile, parsed, built }
   }
 
+  /**
+   * A loopback node server can never be a real remote proxy: the generated
+   * config sends loopback direct, so sing-box would hairpin into whatever local
+   * service answers instead of leaving the machine. Reject the whole class, and
+   * name the Stone+ endpoint explicitly when the profile targets one of ours.
+   */
   private assertNoOwnedEndpointNode(profile: ParsedBuiltInProxyProfile, settings: BuiltInProxySettings): void {
     const currentCore = this.core.getState()
     const ownedPorts = new Set([
@@ -1123,14 +1134,13 @@ export class BuiltInProxyOrchestrator implements BuiltInProxyStoreFacade, BuiltI
       currentCore.mixedPort,
       currentCore.controllerPort,
     ].filter((port): port is number => typeof port === 'number' && Number.isInteger(port) && port > 0))
-    const collision = profile.nodes.find((node) => (
-      isLoopbackHostname(node.server)
-      && ownedPorts.has(node.serverPort)
-    ))
+    const collision = profile.nodes.find((node) => isLoopbackHostname(node.server))
     if (!collision) return
     throw new BuiltInProxyOperationError(
       'configuration-invalid',
-      `Proxy node "${collision.name}" points back to a Stone+ local endpoint.`,
+      ownedPorts.has(collision.serverPort)
+        ? `Proxy node "${collision.name}" points back to a Stone+ local endpoint.`
+        : `Proxy node "${collision.name}" points at a loopback address instead of a remote proxy server.`,
       false,
     )
   }
@@ -1963,6 +1973,11 @@ class BuiltInProxyAccessRollbackError extends BuiltInProxyOperationError {
     this.name = 'BuiltInProxyAccessRollbackError'
     this.rollbackFailure = rollbackFailure
   }
+}
+
+function readStoredNodeIdSalt(configuration: unknown): string | undefined {
+  const candidate = (configuration as Partial<ParsedBuiltInProxyProfile> | null | undefined)?.nodeIdSalt
+  return typeof candidate === 'string' && /^[0-9a-f]{32}$/.test(candidate) ? candidate : undefined
 }
 
 function validateParsedProfile(value: unknown): ParsedBuiltInProxyProfile {

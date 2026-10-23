@@ -93,4 +93,41 @@ describe('built-in proxy network policy summary', () => {
       rendererControlsRuntime: false,
     })
   })
+
+  it('reports the custom overlay state without dropping the base rule policy', () => {
+    const base = { ruleMode: 'rule' as const, profile: { format: 'uri-list' as const, ruleStatus: 'fallback' as const } }
+    const none = summarizeBuiltInProxyNetworkPolicy(base)
+    const applied = summarizeBuiltInProxyNetworkPolicy({
+      ...base,
+      customRules: {
+        rules: [{ id: 'a', condition: 'domain-suffix', values: ['work.example'], action: 'proxy' }],
+        finalAction: 'proxy',
+      },
+    })
+    const partial = summarizeBuiltInProxyNetworkPolicy({
+      ...base,
+      customRules: {
+        rules: [
+          { id: 'a', condition: 'domain-suffix', values: ['work.example'], action: 'proxy' },
+          { id: 'b', condition: 'mainland-china', values: [], action: 'direct' },
+        ],
+        finalAction: 'proxy',
+      },
+    })
+    const onlyUnsupported = summarizeBuiltInProxyNetworkPolicy({
+      ...base,
+      customRules: {
+        rules: [{ id: 'b', condition: 'mainland-china', values: [], action: 'direct' }],
+        finalAction: 'proxy',
+      },
+    })
+
+    expect(none.rules.customOverlay).toBe('not-used')
+    expect(applied.rules.customOverlay).toBe('applied')
+    expect(partial.rules.customOverlay).toBe('partially-applied')
+    expect(onlyUnsupported.rules.customOverlay).toBe('not-used')
+    // The overlay is additive: it must not repaint the base policy.
+    expect(applied.rules.policy).toBe('subscription-fallback')
+    expect(applied.rules.chinaRuleSets).toBe('not-used')
+  })
 })

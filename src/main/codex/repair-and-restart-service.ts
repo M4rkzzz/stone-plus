@@ -1,4 +1,5 @@
 import { execFile, spawn } from 'node:child_process'
+import { ClientConfigRollbackError, hasClientConfigRollbackFailure } from '../client-config/types'
 import type {
   ChatGptDesktopRestartState,
   CodexSessionIndexCleanupRestartResult,
@@ -414,6 +415,7 @@ export class CodexRepairAndRestartService {
         }
       }
       if (restartState && !relaunched && !relaunchAttempted
+        && !rollbackCause && !hasClientConfigRollbackFailure(cause)
         && (!options.preserveRunningState || restartState.wasRunning)) {
         try {
           await this.desktop.relaunch(restartState)
@@ -430,7 +432,7 @@ export class CodexRepairAndRestartService {
         throw new Error(`Codex 会话修复已完成，但桌面端未能重新启动：${messageOf(cause)}`)
       }
       if (rollbackCause) {
-        throw new Error(`${messageOf(cause)}；切换配置回滚失败：${messageOf(rollbackCause)}`)
+        throw new ClientConfigRollbackError(`${messageOf(cause)}；切换配置回滚失败：${messageOf(rollbackCause)}`, { cause: rollbackCause })
       }
       throw cause
     }
@@ -510,7 +512,11 @@ function emptySessionRepairResult(targetProvider: string): CodexSessionRepairRes
 
 function runCommand(file: string, args: string[]): Promise<CommandResult> {
   return new Promise((resolve, reject) => {
-    execFile(file, args, { encoding: 'utf8', windowsHide: true }, (error, stdout, stderr) => {
+    // taskkill /F /T and AppX queries can wedge on an unresponsive target; a
+    // hung child would otherwise leave the repair transaction (and the shared
+    // codex-home maintenance lock) permanently in-flight. Bound it so it always
+    // settles.
+    execFile(file, args, { encoding: 'utf8', windowsHide: true, timeout: 15_000 }, (error, stdout, stderr) => {
       if (error) {
         reject(new Error(String(stderr || stdout || error.message).trim()))
         return

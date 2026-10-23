@@ -4,6 +4,7 @@ import { mkdir, stat } from 'node:fs/promises'
 import { extname, isAbsolute, resolve } from 'node:path'
 import type { ManagedClientInstance, ManagedClientInstanceInput, ManagedClientLaunchMode, RouteClient } from '@shared/types'
 import { isClaudeClientModelName, withoutClaudeRelayModelEnvironment } from '../client-config/claude-environment'
+import { resolveCliEnvironment, type CliEnvironmentResolver } from '../agent-lifecycle/cli-environment'
 
 const METADATA_KEY = 'managed_client_instances_v1'
 const SHUTDOWN_PERSIST_TIMEOUT_MS = 250
@@ -62,6 +63,7 @@ export interface ClientInstanceManagerOptions {
   ) => ClientInstanceLaunchPlan | Promise<ClientInstanceLaunchPlan>
   validateLaunchPlan?: (plan: ClientInstanceLaunchPlan) => void | Promise<void>
   baseEnvironment?: NodeJS.ProcessEnv
+  resolveEnvironment?: CliEnvironmentResolver
   platform?: NodeJS.Platform
   hasControllingTerminal?: () => boolean
   now?: () => number
@@ -296,6 +298,9 @@ export class ClientInstanceManager {
     await this.awaitStartStep(mkdir(instance.configDirectory, { recursive: true }).then(() => undefined))
     await this.awaitStartStep(assertDirectory(instance.configDirectory, 'Configuration directory'))
     const binding = this.options.resolveBinding?.(structuredClone(instance))
+    const environment = await this.awaitStartStep((this.options.resolveEnvironment ?? resolveCliEnvironment)(
+      this.options.baseEnvironment ?? process.env, this.platform,
+    ))
     const basePlan: ClientInstanceLaunchPlan = Object.freeze({
       instanceId: instance.id,
       executable: launchExecutable,
@@ -304,7 +309,7 @@ export class ClientInstanceManager {
       args: Object.freeze(sanitizeManagedClientLaunchArgs(instance.client, instance.launchArgs)),
       ...(instance.workingDirectory ? { cwd: instance.workingDirectory } : {}),
       env: Object.freeze({
-        ...clientBaseEnvironment(instance.client, this.options.baseEnvironment ?? process.env),
+        ...clientBaseEnvironment(instance.client, environment),
         ...configDirectoryEnvironment(instance.client, instance.configDirectory),
         ...(binding?.env ?? {}),
       }),

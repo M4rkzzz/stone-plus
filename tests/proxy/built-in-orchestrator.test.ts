@@ -181,7 +181,7 @@ describe('BuiltInProxyOrchestrator', () => {
     const importProfile = () => harness.orchestrator.importProfile({
       source: 'import' as const,
       name: 'Local',
-      content: 'socks5://127.0.0.1:1080#Local',
+      content: 'socks5://198.51.100.10:1080#Local',
       format: 'uri-list' as const,
     })
 
@@ -851,6 +851,49 @@ describe('BuiltInProxyOrchestrator', () => {
       subscriptionUrl: 'https://subscription.example/private-path',
       subscriptionToken: 'subscription-private-token',
     })
+  })
+
+  it('refuses to start when a profile node points at loopback instead of a remote proxy', async () => {
+    const harness = createHarness({ withProfile: false })
+    await harness.orchestrator.importProfile({
+      source: 'import',
+      name: 'Hairpin',
+      content: 'socks5://127.0.0.1:9999#Hairpin',
+      format: 'uri-list',
+    })
+
+    await expect(harness.orchestrator.setEnabled(true)).rejects.toMatchObject({
+      category: 'configuration-invalid',
+      retryable: false,
+    })
+    expect(harness.core.start).not.toHaveBeenCalled()
+  })
+
+  it('keeps refreshed node identifiers addressable by reusing the stored profile salt', async () => {
+    const harness = createHarness({ withProfile: false })
+    harness.subscriptionFetch.mockResolvedValue(new Response(
+      'socks5://user:password@proxy.example:1080#Remote',
+      { status: 200, headers: { 'content-type': 'text/plain' } },
+    ))
+    await harness.orchestrator.importProfile({
+      source: 'subscription',
+      name: 'Remote list',
+      url: 'https://subscription.example/list',
+      format: 'uri-list',
+    })
+    const profileId = harness.store.profiles[0].id
+    const importedNodeIds = harness.store.profiles[0].nodes.map((node: { id: string }) => node.id)
+    const salt = harness.store.secrets.get(profileId)?.configuration?.nodeIdSalt
+
+    harness.subscriptionFetch.mockResolvedValue(new Response(
+      'socks5://user:password@proxy.example:1080#Remote renamed',
+      { status: 200, headers: { 'content-type': 'text/plain' } },
+    ))
+    await harness.orchestrator.refreshProfile(profileId)
+
+    expect(salt).toMatch(/^[0-9a-f]{32}$/)
+    expect(harness.store.secrets.get(profileId)?.configuration?.nodeIdSalt).toBe(salt)
+    expect(harness.store.profiles[0].nodes.map((node: { id: string }) => node.id)).toEqual(importedNodeIds)
   })
 
   it('persists latency outcomes and annotates controller connections without exposing node credentials', async () => {

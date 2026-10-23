@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
+import { ClientConfigRollbackError } from '../../src/main/client-config/types'
 import {
   CodexRepairAndRestartService,
   MacChatGptDesktopController,
@@ -511,6 +512,28 @@ describe('CodexRepairAndRestartService', () => {
 
     expect(repair.analyze).not.toHaveBeenCalled()
     expect(desktop.relaunch).toHaveBeenCalledOnce()
+  })
+
+  it('does not reopen Codex when preparation reports an incomplete configuration rollback', async () => {
+    const repair = repairService()
+    const desktop = desktopController()
+    const service = new CodexRepairAndRestartService(repair.value, desktop.value)
+    await expect(service.run({ beforeRepair: async () => { throw new ClientConfigRollbackError('config rollback refused') } }))
+      .rejects.toThrow('config rollback refused')
+    expect(desktop.relaunch).not.toHaveBeenCalled()
+    expect(repair.repair).not.toHaveBeenCalled()
+  })
+
+  it('does not reopen Codex when rollback of completed preparation fails', async () => {
+    const repair = repairService()
+    repair.repair.mockRejectedValueOnce(new Error('session sync failed'))
+    const desktop = desktopController()
+    const service = new CodexRepairAndRestartService(repair.value, desktop.value)
+    const operation = service.run({ beforeRepair: async () => undefined,
+      rollbackBeforeRepair: async () => { throw new Error('backup read denied') } })
+    await expect(operation).rejects.toThrow(/session sync failed.*backup read denied/)
+    await expect(operation).rejects.toBeInstanceOf(ClientConfigRollbackError)
+    expect(desktop.relaunch).not.toHaveBeenCalled()
   })
 
   it('relaunches ChatGPT even when session repair fails', async () => {

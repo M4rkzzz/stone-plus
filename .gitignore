@@ -87,6 +87,7 @@ pnpm-debug.log*
 .eslintcache
 /tmp/
 /temp/
+/.tmp-*/
 /crashpad/
 
 # Root-level research probes and captured responses

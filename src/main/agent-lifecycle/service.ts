@@ -57,12 +57,15 @@ export interface AgentRouteState {
   compatibility: AgentLifecycleState['compatibility']
   sourceId?: string
   sourceName?: string
+  reason?: string
 }
 
 export interface AgentLifecycleServiceOptions {
   adapters: Readonly<Record<AgentTarget, AgentLifecycleAdapterPort>>
   installer: AgentInstallationPort
   resolveRoute(target: AgentTarget): AgentRouteState
+  /** Production gate shared by desktop, CLI and launch-only surfaces. */
+  ensureGatewayReady?: () => Promise<void>
   now?: () => number
   id?: () => string
   operationTimeoutMs?: number
@@ -100,6 +103,7 @@ export class AgentLifecycleService {
   private readonly adapters: Readonly<Record<AgentTarget, AgentLifecycleAdapterPort>>
   private readonly installer: AgentInstallationPort
   private readonly resolveRoute: (target: AgentTarget) => AgentRouteState
+  private readonly ensureGatewayReady?: () => Promise<void>
   private readonly now: () => number
   private readonly id: () => string
   private readonly operationTimeoutMs: number
@@ -124,6 +128,7 @@ export class AgentLifecycleService {
     this.adapters = options.adapters
     this.installer = options.installer
     this.resolveRoute = options.resolveRoute
+    this.ensureGatewayReady = options.ensureGatewayReady
     this.now = options.now ?? (() => Date.now())
     this.id = options.id ?? randomUUID
     this.operationTimeoutMs = options.operationTimeoutMs ?? 90_000
@@ -225,6 +230,7 @@ export class AgentLifecycleService {
       if (target === 'deepseek-harness' && installed.status === 'installed') {
         const afterInstall = await adapter.inspect()
         await this.assertStartable(target, afterInstall, false)
+        await this.ensureLaunchReady(target)
         try {
           // The DSH adapter transactionally repairs and validates ~/.dsh/.env
           // before launching the managed local workbench.
@@ -253,6 +259,10 @@ export class AgentLifecycleService {
       const before = await adapter.inspect()
       assertRestoreOptions(options)
       const restoreOptions = { preserveRunningState: true, ...options }
+      this.assertRouteUsable(target)
+      const shouldRun = options?.ensureRunning === true || (before.running && options?.preserveRunningState !== false)
+      if (shouldRun) await this.ensureLaunchReady(target)
+      throwIfLifecycleCancelled(execution.signal)
       const result = hasLifecycleExecution(execution)
         ? await adapter.restore(restoreOptions, execution)
         : await adapter.restore(restoreOptions)
@@ -260,7 +270,6 @@ export class AgentLifecycleService {
       if (target === 'codex-desktop' || target === 'codex-cli') phases.push('repair-residue')
       if (AGENT_CAPABILITIES[target].canRepairSessions && options?.repairSessions !== false) phases.push('repair-sessions')
       phases.push('validate')
-      const shouldRun = options?.ensureRunning === true || (before.running && options?.preserveRunningState !== false)
       if (shouldRun) {
         if (!before.running) await adapter.start()
         phases.push('start')
@@ -290,6 +299,8 @@ export class AgentLifecycleService {
         throw taggedError('process-start-failed', `${target} cannot be restarted safely; open it instead.`, 'start')
       }
       await this.assertStartable(target, before, true)
+      await this.ensureLaunchReady(target)
+      throwIfLifecycleCancelled(execution.signal)
       if (!before.running) {
         await adapter.start()
         return { before, phases: ['inspect', 'start'], changed: true, expectedRunningAfter: true }
@@ -329,6 +340,7 @@ export class AgentLifecycleService {
     return this.runSingle('start', target, 'start', async (adapter) => {
       const before = await adapter.inspect()
       await this.assertStartable(target, before, !before.running)
+      await this.ensureLaunchReady(target)
       const capabilities = AGENT_CAPABILITIES[target]
       const detectsRunning = capabilities.canDetectRunning
       if (detectsRunning && before.running && before.configured && !capabilities.canOpenWhenRunning) {
@@ -377,7 +389,6 @@ export class AgentLifecycleService {
     checkCodexConflict: boolean,
   ): Promise<void> {
     const capabilities = AGENT_CAPABILITIES[target]
-    const route = this.resolveRoute(target)
     if (!snapshot.installed) throw taggedError('not-installed', 'Agent is not installed.')
     if (!(capabilities.canLaunch ?? capabilities.canRestart)) {
       throw taggedError('process-start-failed', 'This Agent cannot be opened by Stone+.', 'start')
@@ -385,12 +396,7 @@ export class AgentLifecycleService {
     // Launch-only surfaces repair their surface-specific settings as part of
     // opening, or deliberately hand off a documented manual setup flow. They
     // cannot claim a reliable running state before that handoff completes.
-    if (!route.enabled) {
-      throw taggedError('not-enabled', 'Agent is not configured for Stone+.')
-    }
-    if (route.compatibility === 'unsupported') {
-      throw taggedError('unsupported-source', 'The selected source is not compatible with this Agent.')
-    }
+    this.assertRouteUsable(target)
     const conflictingCodexTarget = target === 'codex-cli'
       ? 'codex-desktop'
       : target === 'codex-desktop'
@@ -405,6 +411,24 @@ export class AgentLifecycleService {
       'operation-conflict',
       `${runningName} is already running and using Stone+'s shared Codex state. Close it before starting ${requestedName}.`,
     )
+  }
+
+  private assertRouteUsable(target: AgentTarget): void {
+    const route = this.resolveRoute(target)
+    if (!route.enabled) throw taggedError('not-enabled', 'Agent is not configured for Stone+.', 'inspect')
+    if (route.compatibility === 'unsupported') {
+      throw taggedError('unsupported-source', route.reason ?? 'The selected source is not compatible with this Agent.', 'inspect')
+    }
+  }
+
+  private async ensureLaunchReady(target: AgentTarget): Promise<void> {
+    try {
+      await this.ensureGatewayReady?.()
+    } catch (cause) {
+      throw taggedError('validation-failed', cause instanceof Error ? cause.message : 'The local gateway is unavailable.', 'validate')
+    }
+    // Route edits may have occurred while the listener was being started.
+    this.assertRouteUsable(target)
   }
 
   private runRepairAggregate(
@@ -447,11 +471,9 @@ export class AgentLifecycleService {
       }
       const result = await this.runTarget(target, mode, mode === 'restore' ? 'smart-repair' : 'close', {
         preserveRunningState: true,
-        // Launch-only surfaces (Claude Desktop Code and VS Code) cannot
-        // report a reliable running state. Aggregate repair must configure
-        // them without opening a host application and then failing an
-        // impossible running-state postcondition.
-        ensureRunning: AGENT_CAPABILITIES[target].canDetectRunning,
+        // Repair is not "launch everything". Adapters restore only instances
+        // that were running, including preserving stopped CLI/desktop surfaces.
+        ensureRunning: false,
         repairSessions: true,
         repairWorkspaceIndex: true,
       }, execution)
@@ -545,6 +567,10 @@ export class AgentLifecycleService {
         return { before, result, phases: ['inspect', 'close'], changed: before.running, expectedRunningAfter: false }
       }
       assertRestoreOptions(options)
+      this.assertRouteUsable(target)
+      const shouldRun = options?.ensureRunning === true || (before.running && options?.preserveRunningState !== false)
+      if (shouldRun) await this.ensureLaunchReady(target)
+      throwIfLifecycleCancelled(execution.signal)
       const result = hasLifecycleExecution(execution)
         ? await adapter.restore(options, execution)
         : await adapter.restore(options)
@@ -552,7 +578,6 @@ export class AgentLifecycleService {
       if (target === 'codex-desktop' || target === 'codex-cli') phases.push('repair-residue')
       if (AGENT_CAPABILITIES[target].canRepairSessions && options?.repairSessions !== false) phases.push('repair-sessions')
       phases.push('validate')
-      const shouldRun = options?.ensureRunning === true || (before.running && options?.preserveRunningState !== false)
       if (shouldRun) {
         if (!before.running) await adapter.start()
         phases.push('start')

@@ -346,6 +346,10 @@ export class BuiltInProxyRouteCoordinator {
     if (this.route.kind !== 'external') {
       this.publish({ generation: this.nextGeneration++, kind: 'external' })
     }
+    // The user is deliberately back on the external route with nothing of ours
+    // published. A later failed enable must leave that working route alone
+    // rather than fail closed on behalf of a takeover that already ended.
+    this.hasActivated = false
     this.emit()
     return this.getSnapshot()
   }

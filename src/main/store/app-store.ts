@@ -1,6 +1,7 @@
 import { safeStorage } from 'electron'
 import { createHash, randomUUID } from 'node:crypto'
 import { isIP } from 'node:net'
+import { isDeepStrictEqual } from 'node:util'
 import { isAbsolute, join, normalize } from 'node:path'
 import { valid as validSemver } from 'semver'
 import {
@@ -2422,11 +2423,14 @@ export class AppStore {
     return this.getSnapshot()
   }
 
-  public async updateRoute(route: Route): Promise<AppSnapshot> {
+  public async updateRoute(route: Route, expected?: Route): Promise<AppSnapshot> {
     const timestamp = Date.now()
     await this.store.mutate((state) => {
       const existing = state.routes.find((candidate) => candidate.id === route.id)
       if (!existing) throw new Error('A client route must keep its existing route id.')
+      if (expected && !isDeepStrictEqual(existing, expected)) {
+        throw new Error('The client route changed during this operation. Reload it before retrying.')
+      }
       if (existing.client !== route.client) throw new Error('A route client cannot change after creation.')
       if (state.routes.some((candidate) => candidate.id !== route.id && candidate.client === route.client)) {
         throw new Error(`The ${route.client} client already has one route.`)

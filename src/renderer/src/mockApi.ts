@@ -2843,6 +2843,9 @@ export function createMockApi(): GatewayApi {
       const result = await this.applyClientConfig(client, profileId)
       return { ...result, rebuiltRoles: [] }
     },
+    async rollbackClientConfigRepair() {
+      throw new Error(mockText('演示模式不操作真实配置备份', 'Demo mode does not restore real configuration backups'))
+    },
     async restoreCodexOfficialLoginAndSessions(profileId) {
       const profile = snapshot.clientProfiles.find((candidate) => candidate.id === profileId)
       if (profileId && !profile) throw new Error(mockText('客户端配置 Profile 不存在', 'The client configuration profile does not exist'))

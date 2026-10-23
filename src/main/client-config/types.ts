@@ -162,6 +162,8 @@ export interface ApplyClientConfigResult {
   changedFiles: string[]
   backups: BackupRecord[]
   removedBackups: string[]
+  /** Content revisions owned by this write, used only for conditional automatic rollback. */
+  postWriteRevisions?: Partial<Record<ClientConfigFileRole, string>>
   retentionWarning?: string
   /** A Manual-to-Auto Claude permission change applies only to new conversations. */
   requiresNewConversation?: boolean
@@ -236,4 +238,22 @@ export class ClientConfigValidationError extends Error {
     super(message)
     this.name = 'ClientConfigValidationError'
   }
+}
+
+/** Files could not be restored; relaunching a client is not a safe recovery. */
+export class ClientConfigRollbackError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options)
+    this.name = 'ClientConfigRollbackError'
+  }
+}
+
+export function hasClientConfigRollbackFailure(error: unknown): boolean {
+  const seen = new Set<Error>()
+  while (error instanceof Error && !seen.has(error)) {
+    if (error instanceof ClientConfigRollbackError) return true
+    seen.add(error)
+    error = error.cause
+  }
+  return false
 }

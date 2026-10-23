@@ -52,7 +52,8 @@ export class ClientConfigConnectionPort implements CliConnectionConfigPort {
     if (groups.length !== 1) {
       throw new Error('Connection repair does not contain one coherent rollback backup set.')
     }
-    const restored = await (this.repairServices.get(repair) ?? this.service).restoreBackupSet(client, groups[0])
+    if (!repair.postWriteRevisions) throw new Error('Connection repair has no revisions for safe automatic rollback.')
+    const restored = await (this.repairServices.get(repair) ?? this.service).restoreBackupSet(client, groups[0], repair.postWriteRevisions)
     return {
       client,
       changedFiles: [...restored.restoredFiles, ...restored.deletedFiles],

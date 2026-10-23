@@ -49,19 +49,47 @@ describe('built-in proxy profile parser', () => {
     expect(JSON.stringify(profile)).not.toContain('external_controller')
   })
 
-  it('keeps node IDs stable across names and subscription ordering', () => {
+  it('keeps node IDs stable across names and subscription ordering when a refresh reuses the stored salt', () => {
     const node = {
       type: 'trojan', server: 'edge.example.com', server_port: 443, password: 'node-password'
     }
     const first = parseBuiltInProxyProfile(JSON.stringify({
       outbounds: [{ ...node, tag: 'Old name' }]
     }))
-    const second = parseBuiltInProxyProfile(JSON.stringify({
+    const nodeIdSalt = first.nodeIdSalt!
+    const refreshed = parseBuiltInProxyProfile(JSON.stringify({
       outbounds: [{ type: 'direct', tag: 'direct' }, { ...node, tag: 'Renamed' }]
-    }))
+    }), { nodeIdSalt })
 
-    expect(first.nodes[0].id).toBe(second.nodes[0].id)
-    expect(stableNodeId(first.nodes[0])).toBe(first.nodes[0].id)
+    expect(nodeIdSalt).toMatch(/^[0-9a-f]{32}$/)
+    expect(refreshed.nodeIdSalt).toBe(nodeIdSalt)
+    expect(first.nodes[0].id).toBe(refreshed.nodes[0].id)
+    expect(stableNodeId(first.nodes[0], nodeIdSalt)).toBe(first.nodes[0].id)
+  })
+
+  it('salts node IDs so they cannot be recomputed from a guessed credential', () => {
+    const outbounds = [{
+      type: 'trojan', tag: 'Node', server: 'edge.example.com', server_port: 443, password: 'node-password'
+    }]
+    const first = parseBuiltInProxyProfile(JSON.stringify({ outbounds }))
+    const second = parseBuiltInProxyProfile(JSON.stringify({ outbounds }))
+
+    expect(first.nodeIdSalt).not.toBe(second.nodeIdSalt)
+    expect(first.nodes[0].id).not.toBe(second.nodes[0].id)
+    // Knowing the full node identity is not enough without the profile's salt.
+    expect(stableNodeId(first.nodes[0])).not.toBe(first.nodes[0].id)
+  })
+
+  it('keeps unsalted identifiers for profiles imported before salting', () => {
+    const outbounds = [{
+      type: 'trojan', tag: 'Node', server: 'edge.example.com', server_port: 443, password: 'node-password'
+    }]
+    const legacy = parseBuiltInProxyProfile(JSON.stringify({ outbounds }), {
+      legacyUnsaltedNodeIds: true,
+    })
+
+    expect(legacy.nodeIdSalt).toBeUndefined()
+    expect(stableNodeId(legacy.nodes[0])).toBe(legacy.nodes[0].id)
   })
 
   it('parses controlled Clash Meta YAML including groups, transports and safe rules', () => {
@@ -147,6 +175,51 @@ rules:
     expect(profile.ruleDowngrade).toMatchObject({ code: 'unsupported-rules', unsupportedCount: 1 })
     expect(profile.warnings.join(' ')).toContain('not imported or executed')
     expect(JSON.stringify(profile)).not.toContain('untrusted.invalid')
+  })
+
+  it('preserves a sing-box route.final default outbound instead of silently proxying it', () => {
+    const outbounds = [
+      { type: 'trojan', tag: 'Node', server: 'edge.example.com', server_port: 443, password: 'password' },
+      { type: 'direct', tag: 'direct' },
+    ]
+    const withRules = parseBuiltInProxyProfile(JSON.stringify({
+      outbounds,
+      route: {
+        rules: [{ domain_suffix: ['proxied.example'], outbound: 'Node' }],
+        final: 'direct',
+      },
+    }))
+    const rulesOnly = parseBuiltInProxyProfile(JSON.stringify({ outbounds, route: { final: 'direct' } }))
+
+    expect(withRules.ruleStatus).toBe('preserved')
+    expect(withRules.rules).toEqual([
+      { domainSuffixes: ['proxied.example'], action: 'proxy' },
+      { action: 'direct' },
+    ])
+    expect(rulesOnly.ruleStatus).toBe('preserved')
+    expect(rulesOnly.rules).toEqual([{ action: 'direct' }])
+  })
+
+  it('lets a trailing catch-all rule win over route.final and downgrades an unknown final tag', () => {
+    const outbounds = [
+      { type: 'trojan', tag: 'Node', server: 'edge.example.com', server_port: 443, password: 'password' },
+      { type: 'direct', tag: 'direct' },
+    ]
+    const explicitCatchAll = parseBuiltInProxyProfile(JSON.stringify({
+      outbounds,
+      route: { rules: [{ outbound: 'Node' }], final: 'direct' },
+    }))
+    const unknownFinal = parseBuiltInProxyProfile(JSON.stringify({
+      outbounds,
+      route: {
+        rules: [{ domain_suffix: ['proxied.example'], outbound: 'Node' }],
+        final: 'nowhere',
+      },
+    }))
+
+    expect(explicitCatchAll.rules).toEqual([{ action: 'proxy' }])
+    expect(unknownFinal.ruleStatus).toBe('fallback')
+    expect(unknownFinal.ruleDowngrade).toMatchObject({ code: 'unsupported-rules' })
   })
 
   it('rejects YAML anchors/scripts and ignores executable proxy plugins', () => {

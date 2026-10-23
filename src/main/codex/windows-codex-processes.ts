@@ -74,7 +74,10 @@ function uniqueSortedPids(values: number[]): number[] {
 
 function runProcessCommand(file: string, args: string[]): Promise<ProcessCommandResult> {
   return new Promise((resolve, reject) => {
-    execFile(file, args, { encoding: 'utf8', windowsHide: true }, (error, stdout, stderr) => {
+    // A hung PowerShell/tasklist child (corrupt AppX subsystem, unresponsive
+    // target) must never block process discovery indefinitely: bound it so the
+    // callback always fires and callers can fall back rather than deadlock.
+    execFile(file, args, { encoding: 'utf8', windowsHide: true, timeout: 10_000 }, (error, stdout, stderr) => {
       if (error) {
         reject(new Error(String(stderr || stdout || error.message).trim()))
         return

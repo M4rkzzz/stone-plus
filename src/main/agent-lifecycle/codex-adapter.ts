@@ -1,4 +1,5 @@
 import type { ChatGptDesktopRestartState } from '../../shared/types'
+import { hasClientConfigRollbackFailure } from '../client-config/types'
 import {
   AGENT_CAPABILITIES,
   type AgentCapabilities,
@@ -51,6 +52,8 @@ export interface CodexCliPort {
   restoreConnection(configDirectories?: readonly string[]): Promise<void>
   validateConnection(configDirectories?: readonly string[]): Promise<void>
   prepareStart(options?: AgentStartOptions): Promise<void>
+  rollbackConnection?(): Promise<void>
+  commitConnection?(): void
 }
 
 /**
@@ -69,7 +72,7 @@ export interface CodexLifecycleAdapterOptions {
   deepRepair: CodexDeepRepairPort
   cli?: CodexCliPort
   /** Repairs and validates the default desktop CODEX_HOME transactionally. */
-  prepareConnection?: () => Promise<void>
+  prepareConnection?: () => Promise<void | (() => Promise<void>)>
 }
 
 export interface CodexLifecycleSnapshot {
@@ -126,7 +129,7 @@ export class CodexLifecycleAdapter {
   private readonly desktopProbe: CodexDesktopProbe
   private readonly deepRepair: CodexDeepRepairPort
   private readonly cli?: CodexCliPort
-  private readonly prepareConnection?: () => Promise<void>
+  private readonly prepareConnection?: () => Promise<void | (() => Promise<void>)>
   private closedDesktopState?: ChatGptDesktopRestartState
   private operationTail: Promise<void> = Promise.resolve()
 
@@ -252,6 +255,11 @@ export class CodexLifecycleAdapter {
             { cause },
           )
         }
+      } else if (before.running && options.preserveRunningState !== false) {
+        await this.startUnlocked()
+      } else {
+        if (before.running) await this.closeUnlocked()
+        await this.prepareConnection?.()
       }
       return {
         target: this.target,
@@ -277,6 +285,7 @@ export class CodexLifecycleAdapter {
     const configDirectories = uniqueConfigDirectories(before.managedInstances)
     const closed: string[] = []
     let connectionRestored = false
+    let sessionRepairStarted = false
     try {
       for (const id of runningIds) {
         await cli.closeManaged(id)
@@ -287,6 +296,10 @@ export class CodexLifecycleAdapter {
       const repairSessions = options.repairSessions === true
       const repairWorkspaceIndex = options.repairWorkspaceIndex === true
       if (repairSessions || repairWorkspaceIndex) {
+        // Session repair can commit provider metadata in multiple stores.
+        // Once entered, reverting only connection files is no longer safe.
+        sessionRepairStarted = true
+        cli.commitConnection?.()
         try {
           await this.deepRepair.run(this.deepRepairOptions(true, execution), configDirectories)
         } catch (cause) {
@@ -309,6 +322,7 @@ export class CodexLifecycleAdapter {
           restartErrors,
         )
       }
+      cli.commitConnection?.()
       return {
         target: this.target,
         wasRunning: runningIds.length > 0 || before.externalSessionDetected,
@@ -321,9 +335,27 @@ export class CodexLifecycleAdapter {
         pendingNewSession: before.externalSessionDetected,
       }
     } catch (cause) {
+      if (cli.rollbackConnection && !sessionRepairStarted && closed.length === runningIds.length) {
+        const recoveryErrors: string[] = []
+        // A failed launch can leave some instances alive with the new config.
+        // Stop all affected managed instances before restoring any files.
+        try {
+          for (const id of closed) await cli.closeManaged(id)
+          await cli.rollbackConnection()
+        } catch (rollbackCause) {
+          recoveryErrors.push(`connection rollback: ${messageOf(rollbackCause)}`)
+        }
+        if (recoveryErrors.length === 0 && options.preserveRunningState !== false) {
+          recoveryErrors.push(...await this.restartManaged(closed))
+        }
+        throw new CodexLifecycleOperationError(this.target,
+          cause instanceof CodexLifecycleOperationError ? cause.phase : 'restore-connection',
+          messageOf(cause), recoveryErrors, { cause })
+      }
       if (cause instanceof CodexLifecycleOperationError) {
         if (cause.phase === 'start') throw cause
-        const recoveryErrors = options.preserveRunningState === false ? [] : await this.restartManaged(closed)
+        const recoveryErrors = options.preserveRunningState === false || hasClientConfigRollbackFailure(cause)
+          ? [] : await this.restartManaged(closed)
         throw new CodexLifecycleOperationError(
           this.target,
           cause.phase,
@@ -332,7 +364,8 @@ export class CodexLifecycleAdapter {
           { cause },
         )
       }
-      const recoveryErrors = options.preserveRunningState === false ? [] : await this.restartManaged(closed)
+      const recoveryErrors = options.preserveRunningState === false || hasClientConfigRollbackFailure(cause)
+        ? [] : await this.restartManaged(closed)
       const phase = closed.length < runningIds.length ? 'close' : connectionRestored ? 'validate' : 'restore-connection'
       throw new CodexLifecycleOperationError(
         this.target,
@@ -349,7 +382,21 @@ export class CodexLifecycleAdapter {
       const snapshot = await this.cli!.inspect()
       if (!snapshot.installation.installed) throw new Error('Codex CLI is not installed.')
       await this.cli!.prepareStart(options)
-      await this.cli!.startNew(options)
+      try {
+        await this.cli!.startNew(options)
+        this.cli!.commitConnection?.()
+      } catch (cause) {
+        const recoveryErrors: string[] = []
+        try {
+          const after = await this.cli!.inspect()
+          const priorRunning = new Set(snapshot.managedInstances.filter((instance) => instance.running).map((instance) => instance.id))
+          for (const instance of after.managedInstances) {
+            if (instance.running && !priorRunning.has(instance.id)) await this.cli!.closeManaged(instance.id)
+          }
+          await this.cli!.rollbackConnection?.()
+        } catch (rollbackCause) { recoveryErrors.push(`connection rollback: ${messageOf(rollbackCause)}`) }
+        throw new CodexLifecycleOperationError(this.target, 'start', messageOf(cause), recoveryErrors, { cause })
+      }
       return
     }
 
@@ -360,15 +407,16 @@ export class CodexLifecycleAdapter {
     // environment and cached connection state.
     const state = this.closedDesktopState ?? await this.desktop.shutdownForRepair()
     this.closedDesktopState = state
+    let rollbackConnection: void | (() => Promise<void>)
     try {
-      await this.prepareConnection?.()
+      rollbackConnection = await this.prepareConnection?.()
     } catch (cause) {
       const recoveryErrors: string[] = []
       // Transactional connection preparation restores the previous files on
       // validation failure. If this call interrupted an already-running
       // desktop, restore that captured process state instead of stranding the
       // user with a stopped client.
-      if (state.wasRunning) {
+      if (state.wasRunning && !hasClientConfigRollbackFailure(cause)) {
         try {
           await this.desktop.relaunch(state)
           this.closedDesktopState = undefined
@@ -379,7 +427,8 @@ export class CodexLifecycleAdapter {
       throw new CodexLifecycleOperationError(
         this.target,
         'restore-connection',
-        `Unable to prepare the Codex desktop connection: ${messageOf(cause)}`,
+        `Unable to prepare the Codex desktop connection: ${messageOf(cause)}`
+          + (hasClientConfigRollbackFailure(cause) ? '; Codex was kept stopped because configuration rollback was incomplete.' : ''),
         recoveryErrors,
         { cause },
       )
@@ -388,11 +437,22 @@ export class CodexLifecycleAdapter {
       await this.desktop.relaunch(state)
       this.closedDesktopState = undefined
     } catch (cause) {
+      const recoveryErrors: string[] = []
+      if (rollbackConnection) {
+        try {
+          await this.desktop.shutdownForRepair()
+          await rollbackConnection()
+          if (state.wasRunning) {
+            await this.desktop.relaunch(state)
+            this.closedDesktopState = undefined
+          }
+        } catch (rollbackCause) { recoveryErrors.push(`connection rollback/relaunch: ${messageOf(rollbackCause)}`) }
+      }
       throw new CodexLifecycleOperationError(
         this.target,
         'start',
         `Unable to start Codex desktop: ${messageOf(cause)}`,
-        [],
+        recoveryErrors,
         { cause },
       )
     }

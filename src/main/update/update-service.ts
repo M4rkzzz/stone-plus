@@ -17,6 +17,12 @@ const MAX_RELEASE_RESPONSE_BYTES = 512 * 1024
 const MAX_RELEASE_NOTES_LENGTH = 32_000
 const DEFAULT_CHECK_DELAY_MS = 12_000
 const DEFAULT_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000
+// prepareToInstall() stops the gateway and tears down managed client instances;
+// if any of that wedges, the install must not leave the dialog stuck in the
+// non-closable `installing` state forever. Bound it so the UI can always
+// return to an actionable error.
+const INSTALL_PREPARE_TIMEOUT_MS = 30_000
+const INSTALL_PREPARE_TIMEOUT_MARKER = 'install-preparation-timeout'
 
 type FetchImplementation = (input: string, init?: RequestInit) => Promise<Response>
 
@@ -260,7 +266,7 @@ export class UpdateService {
     this.installPrepared = false
     this.installFailureRecoveryStarted = false
     try {
-      await this.options.prepareToInstall()
+      await this.prepareToInstallWithinDeadline()
       this.installPrepared = true
       this.options.updater.quitAndInstall(true, true)
       // electron-updater reports a missing installer or a synchronous launch
@@ -275,6 +281,23 @@ export class UpdateService {
       this.updateState({ status: 'error', error: updateDownloadErrorMessage(error) })
       await this.recoverFromInstallFailure(error)
       throw error
+    }
+  }
+
+  private async prepareToInstallWithinDeadline(): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      await Promise.race([
+        this.options.prepareToInstall(),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(
+            () => reject(new Error(`Preparing the update timed out (${INSTALL_PREPARE_TIMEOUT_MARKER}).`)),
+            INSTALL_PREPARE_TIMEOUT_MS,
+          )
+        }),
+      ])
+    } finally {
+      if (timer) clearTimeout(timer)
     }
   }
 
@@ -555,6 +578,7 @@ function updateCheckErrorMessage(error: unknown): string {
 
 function updateDownloadErrorMessage(error: unknown): string {
   const message = messageOf(error)
+  if (message.includes(INSTALL_PREPARE_TIMEOUT_MARKER)) return '准备安装更新超时，请重启 Stone+ 后重试。'
   if (/metadata does not match/i.test(message)) return '更新文件与已确认版本不一致，已停止安装。'
   if (/latest.*\.ya?ml|status 404|cannot find/i.test(message)) {
     return '该版本缺少在线更新文件，请改为打开 GitHub Release 下载。'

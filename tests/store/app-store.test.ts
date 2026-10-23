@@ -1175,6 +1175,18 @@ describe('AppStore', () => {
       .toEqual(seeded.routes.filter((candidate) => candidate.client !== 'codex'))
   })
 
+  it('rejects stale route writes and rollbacks even within the same timestamp', async () => {
+    const store = createStore()
+    await store.initialize()
+    vi.spyOn(Date, 'now').mockReturnValue(123456)
+    const original = store.getSnapshot().routes.find((route) => route.client === 'codex')!
+    const first = await store.updateRoute({ ...original, enabled: false, localToken: 'first-token' }, original)
+    const written = first.routes.find((route) => route.id === original.id)!
+    const second = await store.updateRoute({ ...written, localToken: 'second-token' }, written)
+    await expect(store.updateRoute(original, written)).rejects.toThrow('route changed during this operation')
+    expect(store.getSnapshot().routes).toEqual(second.routes)
+  })
+
   it('rejects duplicate or client-changing route writes', async () => {
     const store = createStore()
     await store.initialize()

@@ -44,6 +44,7 @@ import {
 } from './codex'
 import { registerCodexSessionRepairApi } from './ipc/session-repair-api'
 import { ClientInstanceManager } from './client-instances'
+import { analyzeRouteSourceCompatibility, resolveRouteSource } from '../shared/route-sources'
 import { registerClientInstanceApi } from './ipc/client-instance-api'
 import { registerAgentLifecycleApi } from './ipc/agent-lifecycle-api'
 import { registerClaudeDesktopApi } from './ipc/claude-desktop-api'
@@ -580,6 +581,16 @@ async function bootstrap(): Promise<void> {
   // race through separate in-memory queues.
   claudeDesktopConfig = new ClaudeDesktopConfig()
   claudeDesktopCoordinator = new ClaudeDesktopOperationCoordinator(claudeDesktopConfig)
+  const ensureAgentGatewayReady = async (): Promise<void> => {
+    const expected = store.getSnapshot().gateway
+    if (!gateway.getStatus().running) await gateway.start(expected)
+    const status = gateway.getStatus()
+    const current = store.getSnapshot().gateway
+    if (!status.running) throw new Error('The local gateway could not be started.')
+    if (status.host !== current.host || status.port !== current.port) {
+      throw new Error('The local gateway is running on a different address. Restart it before launching this client.')
+    }
+  }
   clientInstanceManager = new ClientInstanceManager({
     store: store.getStateRepository(),
     prepareLaunchPlan: async (plan, instance) => {
@@ -597,15 +608,7 @@ async function bootstrap(): Promise<void> {
         args: withDeepSeekHarnessCompanionPatch(plan.args, installed.patchPath),
       }
     },
-    validateLaunchPlan: async () => {
-      const expected = store.getSnapshot().gateway
-      if (!gateway.getStatus().running) await gateway.start(expected)
-      const status = gateway.getStatus()
-      if (!status.running) throw new Error('The local gateway could not be started.')
-      if (status.host !== expected.host || status.port !== expected.port) {
-        throw new Error('The local gateway is running on a different address. Restart it before launching this client.')
-      }
-    },
+    validateLaunchPlan: ensureAgentGatewayReady,
     resolveBinding: (instance) => {
       const snapshot = store.getSnapshot()
       const route = instance.routeId
@@ -614,6 +617,8 @@ async function bootstrap(): Promise<void> {
       if (!route) throw new Error(instance.routeId ? 'The bound client route no longer exists.' : 'No enabled client route is available.')
       if (!route.enabled) throw new Error('The bound client route is disabled.')
       if (route.client !== instance.client) throw new Error('The bound route does not match this client type.')
+      const compatibility = analyzeRouteSourceCompatibility(instance.client, resolveRouteSource(route.poolId, snapshot), snapshot)
+      if (!compatibility.eligible) throw new Error(compatibility.reason ?? 'The bound source is incompatible with this client.')
       if (instance.profileId) {
         const profile = snapshot.clientProfiles.find((candidate) => candidate.id === instance.profileId)
         if (!profile || profile.client !== instance.client) throw new Error('The bound client profile is unavailable.')
@@ -658,6 +663,7 @@ async function bootstrap(): Promise<void> {
     openExternal: (url) => shell.openExternal(url),
     claudeDesktopCoordinator,
     beforeDefaultCodexConnectionRepair: () => codexOfficialAuthBridge.reclaimCurrent(),
+    ensureGatewayReady: ensureAgentGatewayReady,
   })
   clientInstanceManager.initialize()
   const initializedInstances = await clientInstanceManager.recoverOrphanedProcesses()
@@ -1244,10 +1250,52 @@ function shutdownServices(): Promise<void> {
   return flight
 }
 
-async function shutdownStep(name: string, operation: () => void | Promise<void>): Promise<void> {
+async function shutdownStep(
+  name: string,
+  operation: () => void | Promise<void>,
+  timeoutMs = 12_000,
+): Promise<void> {
   try {
-    await operation()
+    await runShutdownStepWithTimeout(name, operation, timeoutMs)
   } catch (error: unknown) {
     console.error(`Stone+ could not close ${name} during graceful shutdown`, error)
   }
+}
+
+// Each best-effort shutdown step is bounded so a single hung service (e.g. a
+// wedged taskkill/AppX child inside the Codex repair or client-instance
+// teardown) cannot stall the whole quit sequence. before-quit has already
+// called preventDefault(), so an unbounded step would keep the app running
+// forever. On timeout the step is abandoned and shutdown continues; the
+// intentional proxy-safety boundary above runs before any shutdownStep and is
+// deliberately left unbounded, so this does not override it.
+function runShutdownStepWithTimeout(
+  name: string,
+  operation: () => void | Promise<void>,
+  timeoutMs: number,
+): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    let settled = false
+    const timer = setTimeout(() => {
+      if (settled) return
+      settled = true
+      console.error(`Stone+ shutdown step ${name} exceeded ${timeoutMs}ms; continuing without it`)
+      resolve()
+    }, timeoutMs)
+    if (typeof timer.unref === 'function') timer.unref()
+    Promise.resolve().then(operation).then(
+      () => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        resolve()
+      },
+      (error: unknown) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        reject(error instanceof Error ? error : new Error(String(error)))
+      },
+    )
+  })
 }

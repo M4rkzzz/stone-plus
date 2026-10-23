@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
+import { ClientConfigRollbackError } from '../../src/main/client-config/types'
 import type { ChatGptDesktopController } from '../../src/main/codex'
 import {
   CodexLifecycleAdapter,
@@ -8,6 +9,85 @@ import {
 } from '../../src/main/agent-lifecycle/codex-adapter'
 
 describe('CodexLifecycleAdapter', () => {
+  it('does not restart managed CLI instances when deep repair wraps an unsafe configuration rollback', async () => {
+    const cli = makeCli({ externalSessionDetected: false })
+    const adapter = new CodexLifecycleAdapter({ target: 'codex-cli', cli, desktop: makeDesktop(),
+      desktopProbe: makeDesktopProbe({ installed: true, running: false }),
+      deepRepair: { run: async () => { throw new Error('deep repair failed', { cause: new ClientConfigRollbackError('rollback failed') }) } } })
+    await expect(adapter.restore({ repairSessions: true })).rejects.toThrow('deep repair failed')
+    expect(cli.restartManaged).not.toHaveBeenCalled()
+  })
+
+  it('rolls back prepared desktop connection when launch fails, then restores original runtime', async () => {
+    const desktop = makeDesktop()
+    vi.mocked(desktop.shutdownForRepair).mockResolvedValue({ wasRunning: true, launchTarget: 'Codex.exe' })
+    vi.mocked(desktop.relaunch).mockRejectedValueOnce(new Error('launch failed'))
+    const rollback = vi.fn(async () => undefined)
+    const adapter = new CodexLifecycleAdapter({ target: 'codex-desktop', desktop,
+      desktopProbe: makeDesktopProbe({ installed: true, running: true }), deepRepair: { run: vi.fn() },
+      prepareConnection: vi.fn(async () => rollback) })
+    await expect(adapter.start()).rejects.toMatchObject({ phase: 'start', recoveryErrors: [] })
+    expect(rollback).toHaveBeenCalledOnce()
+    expect(desktop.shutdownForRepair).toHaveBeenCalledTimes(2)
+    expect(desktop.relaunch).toHaveBeenCalledTimes(2)
+  })
+
+  it('repairs desktop connection without rewriting sessions for source-only activation', async () => {
+    const desktop = makeDesktop()
+    const prepareConnection = vi.fn(async () => undefined)
+    const deepRepair = { run: vi.fn() }
+    const adapter = new CodexLifecycleAdapter({ target: 'codex-desktop', desktop,
+      desktopProbe: makeDesktopProbe({ installed: true, running: true }), deepRepair, prepareConnection })
+    await adapter.restore({ repairSessions: false, repairWorkspaceIndex: false })
+    expect(prepareConnection).toHaveBeenCalledOnce()
+    expect(desktop.relaunch).toHaveBeenCalledOnce()
+    expect(deepRepair.run).not.toHaveBeenCalled()
+  })
+
+  it('retains the CLI connection rollback until launch succeeds', async () => {
+    const cli = makeCli({ externalSessionDetected: false })
+    cli.rollbackConnection = vi.fn(async () => undefined)
+    cli.commitConnection = vi.fn()
+    vi.mocked(cli.startNew).mockRejectedValueOnce(new Error('terminal unavailable'))
+    const adapter = new CodexLifecycleAdapter({ target: 'codex-cli', cli, desktop: makeDesktop(),
+      desktopProbe: makeDesktopProbe({ installed: true, running: false }), deepRepair: { run: vi.fn() } })
+    await expect(adapter.start()).rejects.toMatchObject({ phase: 'start' })
+    expect(cli.rollbackConnection).toHaveBeenCalledOnce()
+    expect(cli.commitConnection).not.toHaveBeenCalled()
+    await adapter.start()
+    expect(cli.commitConnection).toHaveBeenCalledOnce()
+  })
+
+  it('closes partially restarted CLI instances before rollback and recovery', async () => {
+    const cli = makeCli({ externalSessionDetected: false })
+    const events: string[] = []
+    cli.closeManaged = vi.fn(async (id) => { events.push(`close:${id}`) })
+    let failed = false
+    cli.restartManaged = vi.fn(async (id) => {
+      events.push(`start:${id}`)
+      if (!failed) { failed = true; throw new Error('launch failed') }
+    })
+    cli.rollbackConnection = vi.fn(async () => { events.push('rollback') })
+    const adapter = new CodexLifecycleAdapter({ target: 'codex-cli', cli, desktop: makeDesktop(),
+      desktopProbe: makeDesktopProbe({ installed: true, running: false }), deepRepair: { run: vi.fn() } })
+    await expect(adapter.restore({ repairSessions: false, repairWorkspaceIndex: false }))
+      .rejects.toMatchObject({ phase: 'start', recoveryErrors: [] })
+    expect(events).toEqual(['close:one', 'close:two', 'start:one', 'start:two',
+      'close:one', 'close:two', 'rollback', 'start:one', 'start:two'])
+  })
+
+  it('does not roll back only the connection after a deep session migration has started', async () => {
+    const cli = makeCli({ externalSessionDetected: false })
+    cli.rollbackConnection = vi.fn(async () => undefined)
+    cli.commitConnection = vi.fn()
+    const adapter = new CodexLifecycleAdapter({ target: 'codex-cli', cli, desktop: makeDesktop(),
+      desktopProbe: makeDesktopProbe({ installed: true, running: false }),
+      deepRepair: { run: vi.fn(async () => { throw new Error('partial migration') }) } })
+    await expect(adapter.restore({ repairSessions: true })).rejects.toMatchObject({ phase: 'repair-sessions' })
+    expect(cli.commitConnection).toHaveBeenCalledOnce()
+    expect(cli.rollbackConnection).not.toHaveBeenCalled()
+  })
+
   it('binds desktop and CLI to the same state group while preserving their control boundary', async () => {
     const desktop = makeDesktop()
     const desktopProbe = makeDesktopProbe({ installed: true, running: true, version: '1.2.3' })

@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Existing signed annotated release tag, for example v0.9.6
+        description: Existing signed annotated release tag matching the package.json version
         required: true
         type: string
       prerelease:

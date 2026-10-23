@@ -48,6 +48,7 @@ import { clientFiles, type ClientConfigService, type ClientConnectionTarget } fr
 import { WebDavBackupService, type DatabaseBackupService } from '../backup'
 import type { PersistedState } from '../store/types'
 import { serializeDiagnostics } from './diagnostics'
+import { applyGatewaySettingsTransaction } from './gateway-settings-transaction'
 import { assertTrustedSender } from './trusted-sender'
 import { OutboundTransportManager, probeProxy, resolveEffectiveProxy } from '../proxy'
 import {
@@ -2300,9 +2301,9 @@ export function registerGatewayApi(
       ? { ...result, ok: false, error: '验证期间路由已变更，请重新运行端到端验证。' }
       : result
   })
-  ipcMain.handle('stone:update-route', (event, route: Route) => {
+  ipcMain.handle('stone:update-route', (event, route: Route, expected?: Route) => {
     assertTrustedSender(event)
-    return mutate(() => store.updateRoute(route))
+    return mutate(() => expected ? store.updateRoute(route, expected) : store.updateRoute(route))
   })
   ipcMain.handle('stone:preview-route', (event, input: Parameters<GatewayApi['previewRoute']>[0]) => {
     assertTrustedSender(event)
@@ -2343,80 +2344,96 @@ export function registerGatewayApi(
       if (enablingAutomaticBackups) await backups.prepareForRawBackup()
       await store.updateGateway(settings)
       const savedGateway = store.getSnapshot().gateway
-      if (previousSettings.disableCooldown !== true && savedGateway.disableCooldown === true) {
-        const currentSnapshot = store.getSnapshot()
-        const providersById = new Map(currentSnapshot.providers.map((provider) => [provider.id, provider]))
-        const cooldownBypassedAccounts = currentSnapshot.accounts.filter((account) => (
-          account.status === 'cooldown'
-          && (
-            account.cooldownReason === 'failure'
-            || (account.cooldownReason === 'quota'
-              && providersById.get(account.providerId)?.sourceType === 'relay')
-          )
-        ))
-        await store.updateAccountRuntimeStates(cooldownBypassedAccounts.map((account) => ({
-          id: account.id,
-          patch: {
-            status: 'active' as const,
-            circuitState: 'closed' as const,
-            consecutiveFailures: 0,
-            cooldownUntil: undefined,
-            cooldownReason: undefined,
-            lastError: undefined,
-            ...(account.cooldownReason === 'quota'
-              ? { quota: undefined, quotaRemaining: undefined, quotaUnit: undefined }
-              : {}),
-          },
-        })))
-        for (const account of cooldownBypassedAccounts) gateway.resetAccountHealth(account.id)
-      }
-      if (backups
-        && (previousSettings.automaticBackups !== false) !== (savedGateway.automaticBackups !== false)) {
-        if (savedGateway.automaticBackups === false) {
-          backups.stopAutomaticBackups()
-        } else {
-          try {
-            await backups.startAutomaticBackups()
-          } catch (error) {
-            backups.stopAutomaticBackups()
-            await store.updateGateway(previousSettings).catch(() => undefined)
-            throw error
-          }
+      const applySavedSettings = async () => {
+        if (backups
+          && (previousSettings.automaticBackups !== false) !== (savedGateway.automaticBackups !== false)) {
+          if (savedGateway.automaticBackups === false) backups.stopAutomaticBackups()
+          else await backups.startAutomaticBackups()
         }
-      }
-      const requiresRestart = wasRunning
-        && (previousSettings.host !== savedGateway.host || previousSettings.port !== savedGateway.port)
-      const outboundModeChanged = (previousSettings.outboundNetworkMode ?? 'direct')
-        !== (savedGateway.outboundNetworkMode ?? 'direct')
-      outboundTransport.configureOutboundNetwork(
-        savedGateway.outboundNetworkMode ?? 'direct',
-        savedGateway.port
-      )
-      if (outboundModeChanged && savedGateway.outboundNetworkMode === 'system') {
-        // Network failures recorded before this switch may have opened account
-        // circuits. Re-check only failure-cooled accounts that actually use the
-        // global system route; quota cooldowns and explicit proxies are left
-        // untouched.
-        await outboundReloadCoordinator.reloadExternalSystemRoute()
-      }
-      if (outboundModeChanged && wasRunning) warmGatewayConnections(store, outboundTransport)
-      if (backups) {
-        if ((previousSettings.backupRetention ?? 10) !== (savedGateway.backupRetention ?? 10)) {
+        const requiresRestart = wasRunning
+          && (previousSettings.host !== savedGateway.host || previousSettings.port !== savedGateway.port)
+        const outboundModeChanged = (previousSettings.outboundNetworkMode ?? 'direct')
+          !== (savedGateway.outboundNetworkMode ?? 'direct')
+        outboundTransport.configureOutboundNetwork(
+          savedGateway.outboundNetworkMode ?? 'direct',
+          savedGateway.port
+        )
+        if (backups && (previousSettings.backupRetention ?? 10) !== (savedGateway.backupRetention ?? 10)) {
           await backups.setAutomaticRetention(savedGateway.backupRetention ?? 10)
         }
-      }
-      if (requiresRestart) await gateway.stop()
-      gateway.updateConfig(toGatewayConfig(store))
-      try {
-        if (requiresRestart) {
-          await gateway.start()
+        if (requiresRestart) await gateway.stop()
+        gateway.updateConfig(toGatewayConfig(store))
+        if (requiresRestart) await gateway.start()
+        if (outboundModeChanged && savedGateway.outboundNetworkMode === 'system') {
+          // Re-check failure-cooled accounts only after the new endpoint works.
+          // Quota cooldowns and explicit proxy routes remain untouched.
+          await outboundReloadCoordinator.reloadExternalSystemRoute()
+        }
+        // Avoid changing account health when a listener migration cannot commit.
+        if (previousSettings.disableCooldown !== true && savedGateway.disableCooldown === true) {
+          const currentSnapshot = store.getSnapshot()
+          const providersById = new Map(currentSnapshot.providers.map((provider) => [provider.id, provider]))
+          const cooldownBypassedAccounts = currentSnapshot.accounts.filter((account) => (
+            account.status === 'cooldown'
+            && (
+              account.cooldownReason === 'failure'
+              || (account.cooldownReason === 'quota'
+                && providersById.get(account.providerId)?.sourceType === 'relay')
+            )
+          ))
+          await store.updateAccountRuntimeStates(cooldownBypassedAccounts.map((account) => ({
+            id: account.id,
+            patch: {
+              status: 'active' as const,
+              circuitState: 'closed' as const,
+              consecutiveFailures: 0,
+              cooldownUntil: undefined,
+              cooldownReason: undefined,
+              lastError: undefined,
+              ...(account.cooldownReason === 'quota'
+                ? { quota: undefined, quotaRemaining: undefined, quotaUnit: undefined }
+                : {}),
+            },
+          })))
+          // The new listener already received its config above. Publish the
+          // cleared persisted health too, not just the scheduler circuit.
+          gateway.updateRuntimeAccounts(cooldownBypassedAccounts.flatMap((account) => {
+            const current = store.getRuntimeAccount(account.id)
+            return current ? [current] : []
+          }))
+          for (const account of cooldownBypassedAccounts) gateway.resetAccountHealth(account.id)
+        }
+        if (wasRunning && (requiresRestart || outboundModeChanged)) {
           warmGatewayConnections(store, outboundTransport)
         }
-      } catch (error: unknown) {
-        store.setGatewayStatus(gateway.getStatus())
-        publish(store.getSnapshot())
-        throw error
       }
+      await applyGatewaySettingsTransaction({
+        previous: previousSettings,
+        wasRunning,
+        apply: applySavedSettings,
+        restoreSettings: async () => { await store.updateGateway(previousSettings) },
+        restoreOutbound: () => outboundTransport.configureOutboundNetwork(
+          previousSettings.outboundNetworkMode ?? 'direct', previousSettings.port,
+        ),
+        restoreBackups: async () => {
+          if (!backups) return
+          if ((previousSettings.automaticBackups !== false) !== (savedGateway.automaticBackups !== false)) {
+            if (previousSettings.automaticBackups === false) backups.stopAutomaticBackups()
+            else await backups.startAutomaticBackups()
+          }
+          if ((previousSettings.backupRetention ?? 10) !== (savedGateway.backupRetention ?? 10)) {
+            await backups.setAutomaticRetention(previousSettings.backupRetention ?? 10)
+          }
+        },
+        refreshConfig: () => gateway.updateConfig(toGatewayConfig(store)),
+        status: () => gateway.getStatus(),
+        stop: () => gateway.stop(),
+        start: () => gateway.start(),
+        publishStatus: () => {
+          store.setGatewayStatus(gateway.getStatus())
+          publish(store.getSnapshot())
+        },
+      })
       store.setGatewayStatus(gateway.getStatus())
       return publish(store.getSnapshot())
     })
@@ -2900,13 +2917,21 @@ export function registerGatewayApi(
     })
     return selection.canceled ? null : selection.filePaths[0] ?? null
   })
-  ipcMain.handle('stone:preview-client-config', async (event, client: RouteClient, profileId?: string) => {
+  ipcMain.handle('stone:preview-client-config', async (event, client: RouteClient, profileId?: string, proposedRoute?: Route, mode?: 'repair') => {
     assertTrustedSender(event)
     assertRouteClient(client)
     const profile = resolveClientProfile(store, profileId, client)
-    const plan = await scopedClientConfig(clientConfig, profile).plan(client, clientConnectionTarget(store, client))
+    const scoped = scopedClientConfig(clientConfig, profile)
+    if (mode !== undefined && mode !== 'repair') throw new Error('Unsupported client configuration preview mode.')
+    const plan = mode === 'repair'
+      ? await scoped.planRepair(client, clientConnectionTarget(store, client, proposedRoute))
+      : await scoped.plan(client, clientConnectionTarget(store, client, proposedRoute))
+    const currentPlan = proposedRoute ? await scoped.plan(client, clientConnectionTarget(store, client)) : undefined
     return {
       client,
+      ...(currentPlan ? { routeChangesConnection: plan.files.some((file) => (
+        currentPlan.files.find((current) => current.role === file.role)?.content !== file.content
+      )) || currentPlan.files.length !== plan.files.length } : {}),
       profileId: profile?.id ?? `default-${client}`,
       files: plan.files.map((file) => ({
         role: file.role,
@@ -2937,6 +2962,17 @@ export function registerGatewayApi(
       clientConnectionTarget(store, client),
       { backupRetention: profile?.backupRetention ?? 10 }
     )
+  })
+  ipcMain.handle('stone:rollback-client-config-repair', async (event, client: RouteClient, profileId: string, groupId: string, revisions: Record<string, string>) => {
+    assertTrustedSender(event)
+    assertRouteClient(client)
+    if (typeof groupId !== 'string' || !groupId.trim() || !revisions || typeof revisions !== 'object'
+      || Array.isArray(revisions) || Object.keys(revisions).length === 0
+      || Object.values(revisions).some((value) => typeof value !== 'string' || !value)) {
+      throw new Error('Automatic configuration rollback requires a backup group and write revisions.')
+    }
+    const profile = resolveClientProfile(store, profileId, client)
+    await scopedClientConfig(clientConfig, profile).restoreBackupSet(client, groupId, revisions)
   })
   ipcMain.handle('stone:list-client-config-backups', (event, client: RouteClient, profileId?: string) => {
     assertTrustedSender(event)
@@ -3128,9 +3164,14 @@ function scopedClientConfig(service: ClientConfigService, profile?: ClientConfig
 function clientConnectionTarget(
   store: AppStore,
   client: RouteClient,
+  proposedRoute?: Route,
 ): ClientConnectionTarget {
   const snapshot = store.getSnapshot()
-  const route = snapshot.routes.find((candidate) => candidate.client === client)
+  const currentRoute = snapshot.routes.find((candidate) => candidate.client === client)
+  if (proposedRoute && (proposedRoute.client !== client || proposedRoute.id !== currentRoute?.id)) {
+    throw new Error('Proposed route does not match the selected client.')
+  }
+  const route = proposedRoute ?? currentRoute
   if (!route) throw new Error(`The ${client} route does not exist.`)
   if (!route.localToken) throw new Error(`The ${client} route has no local token.`)
   if (route.inboundProtocol !== clientNativeProtocols[client]) {

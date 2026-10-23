@@ -469,6 +469,116 @@ describe('GatewayServer', () => {
     expect(gateway.getRequestReplayTemplate(terminal!.id)).toBeUndefined()
   })
 
+  it('converts orphan Codex app bootstrap outputs into developer messages for HTTP Responses relays', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers[0].protocol = 'openai-responses'
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    gatewayConfig.pools[0].maxRetries = 0
+    gatewayConfig.accounts[1].status = 'disabled'
+    let upstreamBody: Record<string, unknown> | undefined
+    const upstreamFetch = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      upstreamBody = JSON.parse(String(init?.body)) as Record<string, unknown>
+      return new Promise<Response>(() => undefined)
+    })
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'credential',
+      fetchImplementation: upstreamFetch as typeof fetch,
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const controller = new AbortController()
+    const response = fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      signal: controller.signal,
+      body: JSON.stringify({
+        model: 'source-model',
+        previous_response_id: 'resp-parent',
+        input: [{
+          type: 'function_call_output',
+          id: 'fco-bootstrap',
+          name: 'send_message_to_thread',
+          output: '<codex_delegation>continue the delegated task</codex_delegation>',
+        }],
+        stream: true,
+      }),
+    })
+
+    await vi.waitFor(() => expect(upstreamFetch).toHaveBeenCalledOnce())
+    expect(upstreamBody).toMatchObject({
+      previous_response_id: 'resp-parent',
+      input: [{
+        type: 'message',
+        role: 'developer',
+        content: [{
+          type: 'input_text',
+          text: '<codex_delegation>continue the delegated task</codex_delegation>',
+        }],
+      }],
+    })
+    controller.abort()
+    await expect(response).rejects.toMatchObject({ name: 'AbortError' })
+  })
+
+  it('does not rewrite ordinary Responses function outputs that carry a call id', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.providers[0].protocol = 'openai-responses'
+    gatewayConfig.routes[0].inboundProtocol = 'openai-responses'
+    gatewayConfig.pools[0].protocol = 'openai-responses'
+    gatewayConfig.pools[0].maxRetries = 0
+    gatewayConfig.accounts[1].status = 'disabled'
+    let upstreamBody: Record<string, unknown> | undefined
+    const upstreamFetch = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      upstreamBody = JSON.parse(String(init?.body)) as Record<string, unknown>
+      return new Response([
+        'event: response.created',
+        'data: {"type":"response.created","response":{"id":"resp-tool","status":"in_progress"}}',
+        '',
+        'event: response.completed',
+        'data: {"type":"response.completed","response":{"id":"resp-tool","object":"response","status":"completed","model":"source-model","output":[],"usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}}',
+        '', '',
+      ].join('\n'), { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    })
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'credential',
+      fetchImplementation: upstreamFetch as typeof fetch,
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'source-model',
+        previous_response_id: 'resp-tool-parent',
+        input: [{
+          type: 'function_call_output',
+          call_id: 'call-real',
+          name: 'send_message_to_thread',
+          output: '<codex_delegation>real tool output</codex_delegation>',
+        }],
+        stream: true,
+      }),
+    })
+
+    const responseText = await response.text()
+    expect(response.status, responseText).toBe(200)
+    expect(upstreamBody).toMatchObject({
+      input: [{
+        type: 'function_call_output',
+        call_id: 'call-real',
+        name: 'send_message_to_thread',
+      }],
+    })
+  })
+
   it('does not let an in-flight upload repopulate replay after an explicit clear', async () => {
     const port = await freePort()
     const gatewayConfig = config(port, { logPayloads: true })
@@ -9626,7 +9736,7 @@ describe('GatewayServer', () => {
     expect(logs.join('')).not.toContain(credential)
   })
 
-  it('records one account failure when the retry round has no eligible account', async () => {
+  it('does not record an account failure for a rate-limited sole remaining source', async () => {
     const port = await freePort()
     const gatewayConfig = config(port)
     gatewayConfig.accounts[1].status = 'disabled'
@@ -9647,8 +9757,11 @@ describe('GatewayServer', () => {
 
     expect((await post(port)).status).toBe(429)
     expect(upstreamFetch).toHaveBeenCalledOnce()
-    expect(states).toHaveLength(1)
-    expect(states[0]).toMatchObject({ accountId: 'first', consecutiveFailures: 1 })
+    // Orphan-source protection: a transient 429 on the only usable account is
+    // not an account-health event. No cooldown and no failure is recorded, so
+    // the client keeps receiving the real upstream 429 rather than a synthetic
+    // 503, and a per-minute limit is never amplified into a long cooldown.
+    expect(states).toHaveLength(0)
   })
 
   it('does not spin maxRetries or report fake failovers when no account is initially eligible', async () => {
@@ -13318,7 +13431,7 @@ describe('GatewayServer', () => {
     expect(logs[0]).toMatchObject({ outputTokens: 3, reasoningTokens: 1 })
   })
 
-  it('honors a single-source 503 Retry-After instead of immediately retrying the same account', async () => {
+  it('does not cool down the sole remaining source on a 503 Retry-After and surfaces the upstream error', async () => {
     const port = await freePort()
     const gatewayConfig = config(port)
     gatewayConfig.accounts[1].status = 'disabled'
@@ -13339,8 +13452,41 @@ describe('GatewayServer', () => {
     await gateway.start()
 
     const response = await post(port)
+    // Orphan-source protection: the only usable account must not be cooled on a
+    // transient failure. It is still not retried against itself (upstream called
+    // once), and the real upstream 503 reaches the client instead of a synthetic
+    // 503 that hides the status and Retry-After and can be amplified into a long
+    // exponential-backoff outage.
     expect(response.status).toBe(503)
     expect(upstreamFetch).toHaveBeenCalledOnce()
+    expect(states.some((state) => (
+      state.accountId === 'first' && (state.status === 'cooldown' || state.status === 'disabled')
+    ))).toBe(false)
+  })
+
+  it('cools down and fails over a 503 Retry-After when another source is available', async () => {
+    const port = await freePort()
+    const gatewayConfig = config(port)
+    gatewayConfig.pools[0].maxRetries = 2
+    const states: Array<{ accountId: string; status: string; cooldownUntil?: number }> = []
+    const upstreamFetch = vi.fn(async () => new Response(JSON.stringify({ error: { message: 'overloaded' } }), {
+      status: 503,
+      headers: { 'content-type': 'application/json', 'retry-after': '120' }
+    }))
+    const gateway = new GatewayServer({
+      config: gatewayConfig,
+      credentialResolver: () => 'credential',
+      fetchImplementation: upstreamFetch as typeof fetch,
+      now: () => timestamp,
+      onAccountState: (state) => states.push(state)
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await post(port)
+    // With a usable alternative the multi-source path is unchanged: the failing
+    // account is cooled for the upstream Retry-After and failover is attempted.
+    expect(response.status).toBe(503)
     expect(states).toContainEqual(expect.objectContaining({
       accountId: 'first',
       status: 'cooldown',

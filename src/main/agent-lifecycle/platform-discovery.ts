@@ -3,6 +3,7 @@ import { readdir, stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { posix, win32 } from 'node:path'
 import type { AgentProcessControl, AgentTarget } from '@shared/agent-lifecycle'
+import { resolveCliEnvironment, type CliEnvironmentResolver } from './cli-environment'
 
 export type DiscoverableAgentTarget = AgentTarget
 type DiscoverableCliTarget = 'codex-cli' | 'claude-code' | 'gemini-cli' | 'grok-build' | 'deepseek-harness'
@@ -44,7 +45,8 @@ export interface PlatformDiscoveryOptions {
   environment?: NodeJS.ProcessEnv
   fileExists?: (path: string) => Promise<boolean>
   readDirectoryNames?: (path: string) => Promise<string[]>
-  findCommand?: (name: string, platform: NodeJS.Platform) => Promise<string[]>
+  findCommand?: (name: string, platform: NodeJS.Platform, environment: NodeJS.ProcessEnv) => Promise<string[]>
+  resolveEnvironment?: CliEnvironmentResolver
   runCommand?: (file: string, args: string[]) => Promise<PlatformCommandResult>
 }
 
@@ -81,7 +83,8 @@ export async function discoverAgentExecutable(
   }
 
   if (isDiscoverableCliTarget(target)) {
-    return discoverCli(target, { platform, homeDir, workingDirectory, environment, fileExists, findCommand })
+    const cliEnvironment = await (options.resolveEnvironment ?? resolveCliEnvironment)(environment, platform)
+    return discoverCli(target, { platform, homeDir, workingDirectory, environment: cliEnvironment, fileExists, findCommand })
   }
   return unsupported(target, platform)
 }
@@ -97,7 +100,7 @@ interface ResolvedDiscoveryOptions {
 async function discoverCli(
   target: DiscoverableCliTarget,
   options: ResolvedDiscoveryOptions & {
-    findCommand: (name: string, platform: NodeJS.Platform) => Promise<string[]>
+    findCommand: (name: string, platform: NodeJS.Platform, environment: NodeJS.ProcessEnv) => Promise<string[]>
   },
 ): Promise<AgentExecutableDiscovery> {
   if (!isDesktopPlatform(options.platform)) return unsupported(target, options.platform)
@@ -106,7 +109,7 @@ async function discoverCli(
 
   let commandPaths: string[] = []
   try {
-    commandPaths = await options.findCommand(command, options.platform)
+    commandPaths = await options.findCommand(command, options.platform, options.environment)
   } catch {
     // A missing/broken PATH lookup is not fatal; well-known locations remain useful.
   }
@@ -524,16 +527,16 @@ async function directoryNames(path: string): Promise<string[]> {
   return entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name)
 }
 
-async function findCommandOnPath(name: string, platform: NodeJS.Platform): Promise<string[]> {
+async function findCommandOnPath(name: string, platform: NodeJS.Platform, environment: NodeJS.ProcessEnv): Promise<string[]> {
   const result = platform === 'win32'
-    ? await executeCommand('where.exe', [name])
-    : await executeCommand('which', ['-a', name])
+    ? await executeCommand(win32.join(environment.SystemRoot || process.env.SystemRoot || 'C:\\Windows', 'System32', 'where.exe'), [name], environment)
+    : await executeCommand('/usr/bin/which', ['-a', name], environment)
   return result.stdout.split(/\r?\n/).map((value) => value.trim()).filter(Boolean)
 }
 
-function executeCommand(file: string, args: string[]): Promise<PlatformCommandResult> {
+function executeCommand(file: string, args: string[], environment = process.env): Promise<PlatformCommandResult> {
   return new Promise((resolve, reject) => {
-    execFile(file, args, { encoding: 'utf8', windowsHide: true, timeout: 3_000, maxBuffer: 64 * 1024 },
+    execFile(file, args, { env: environment, encoding: 'utf8', windowsHide: true, timeout: 3_000, maxBuffer: 64 * 1024 },
       (error, stdout, stderr) => {
         if (error) {
           reject(new Error(String(stderr || stdout || error.message).trim()))

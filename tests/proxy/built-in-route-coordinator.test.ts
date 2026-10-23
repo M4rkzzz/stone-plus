@@ -245,6 +245,48 @@ describe('BuiltInProxyRouteCoordinator', () => {
     })
   })
 
+  it('keeps the external route after a completed disable when a later enable fails to start', async () => {
+    const coordinator = trackCoordinator(new BuiltInProxyRouteCoordinator({ externalMode: 'system' }))
+    const externalFetch = fetchSpy('external')
+    const routed = coordinator.bind(externalFetch, fetchSpy('loopback'))
+
+    coordinator.requestEnable()
+    coordinator.activate({
+      fetchImplementation: fetchSpy('mixed'),
+      mixedEndpoint: 'http://127.0.0.1:19096',
+    })
+    coordinator.beginDisable()
+    coordinator.completeDisable()
+    expect(coordinator.getSnapshot().hasActivated).toBe(false)
+
+    coordinator.requestEnable()
+    coordinator.reportError({ category: 'core-missing', message: 'core is unavailable', retryable: true })
+
+    expect(coordinator.getSnapshot()).toMatchObject({
+      status: 'error',
+      effectiveRoute: { kind: 'external', externalMode: 'system' },
+    })
+    expect(await (await routed('https://api.example/after-failed-restart')).text()).toBe('external')
+  })
+
+  it('still fails closed when a start fails while a published route was never disabled', async () => {
+    const coordinator = trackCoordinator(new BuiltInProxyRouteCoordinator({ externalMode: 'system' }))
+    const routed = coordinator.bind(fetchSpy('external'), fetchSpy('loopback'))
+
+    coordinator.requestEnable()
+    coordinator.activate({
+      fetchImplementation: fetchSpy('mixed'),
+      mixedEndpoint: 'http://127.0.0.1:19097',
+    })
+    coordinator.markStarting()
+    coordinator.reportError({ category: 'core-crashed', message: 'core exited', retryable: true })
+
+    expect(coordinator.getSnapshot().effectiveRoute.kind).toBe('blocked')
+    await expect(routed('https://api.example/after-crash')).rejects.toBeInstanceOf(
+      BuiltInProxyRouteUnavailableError,
+    )
+  })
+
   it('rejects non-loopback mixed endpoints before publishing a route', () => {
     const coordinator = trackCoordinator(new BuiltInProxyRouteCoordinator())
     coordinator.requestEnable()

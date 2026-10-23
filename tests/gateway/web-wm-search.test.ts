@@ -507,6 +507,43 @@ describe('ChatGPT Web WM endpoint routing', () => {
     expect(webTransport).toHaveBeenCalledTimes(3)
   })
 
+  it('does not disable the shared account when a Web WM turn is rejected with 403', async () => {
+    const port = await freePort()
+    const states: Array<{ accountId: string; status: string }> = []
+    const webTransport = vi.fn(async () => (
+      webWmFailureStream('permission_denied', 'Work session requires re-authentication')
+    ))
+    const gateway = new GatewayServer({
+      config: webWmConfig(port),
+      credentialResolver: () => ({
+        secret: 'oauth-token', kind: 'chatgpt-oauth', accountId: 'chatgpt-account',
+      }),
+      fetchImplementation: vi.fn(async () => {
+        throw new Error('Web WM failure must remain on the Work transport')
+      }) as typeof fetch,
+      chatGptWebWmTransport: webTransport,
+      requestTransientRetryDelayMs: 0,
+      onAccountState: (state) => states.push(state),
+    })
+    runningServers.push(gateway)
+    await gateway.start()
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'client-model', input: 'Complete this turn.', stream: true }),
+    })
+    await response.text()
+
+    // The 403 reflects the browser Work session, not the API OAuth token, so
+    // the account must never be disabled — that would also remove it from
+    // ordinary Codex/official-API pools. In this single-account pool no cooldown
+    // applies either (no usable alternative).
+    expect(response.status).toBe(403)
+    expect(states.some((state) => state.status === 'disabled')).toBe(false)
+    expect(states.some((state) => state.status === 'cooldown')).toBe(false)
+  })
+
   it('does not count local Web WM lifecycle or reasoning frames as an upstream first byte', async () => {
     const port = await freePort()
     let clock = timestamp

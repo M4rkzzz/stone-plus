@@ -55,6 +55,30 @@ describe('ClientInstanceManager', () => {
   const directories: string[] = []
   afterEach(async () => Promise.all(directories.splice(0).map((path) => rm(path, { recursive: true, force: true }))))
 
+  it('resolves CLI runtime PATH before validation without overriding isolated connection fields', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'stone-cli-runtime-'))
+    directories.push(root)
+    const executable = join(root, 'codex')
+    await writeFile(executable, '')
+    const configDirectory = join(root, 'config')
+    const spawn = vi.fn(() => new FakeProcess())
+    const resolveEnvironment = vi.fn(async (env: NodeJS.ProcessEnv) => ({ ...env, PATH: '/opt/node/bin:/usr/bin' }))
+    const validateLaunchPlan = vi.fn()
+    const manager = new ClientInstanceManager({
+      store: new MemoryMetadata(), platform: 'darwin', processAdapter: { spawn },
+      baseEnvironment: { PATH: '/usr/bin', CODEX_HOME: '/old/home', KEEP: 'yes' },
+      resolveEnvironment, validateLaunchPlan,
+      resolveBinding: () => ({ env: { OPENAI_BASE_URL: 'http://127.0.0.1:15721/v1' } }),
+    })
+    manager.initialize()
+    const [instance] = await manager.save({ name: 'Codex', client: 'codex', configDirectory, executablePath: executable, launchMode: 'background' })
+    await manager.start(instance.id)
+    const expected = { PATH: '/opt/node/bin:/usr/bin', CODEX_HOME: configDirectory, KEEP: 'yes', OPENAI_BASE_URL: 'http://127.0.0.1:15721/v1' }
+    expect(validateLaunchPlan).toHaveBeenCalledWith(expect.objectContaining({ env: expect.objectContaining(expected) }))
+    expect(spawn).toHaveBeenCalledWith(executable, [], expect.objectContaining({ env: expect.objectContaining(expected) }))
+    await manager.stop(instance.id)
+  })
+
   it('persists isolated instance definitions and manages an injected process without deleting directories', async () => {
     const root = await mkdtemp(join(tmpdir(), 'stone-client-instance-'))
     directories.push(root)

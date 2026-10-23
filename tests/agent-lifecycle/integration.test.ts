@@ -175,6 +175,11 @@ describe('ManagedCliRuntimePort', () => {
             createdAt: 1,
             updatedAt: 1,
           }],
+          pools: [],
+          providers: [{ id: 'pool-dsh', name: 'DSH relay', kind: 'deepseek-compatible', sourceType: 'relay',
+            protocol: 'openai-responses', baseUrl: 'https://example.invalid', models: ['deepseek-v4'], createdAt: 1, updatedAt: 1 }],
+          accounts: [{ id: 'dsh-account', providerId: 'pool-dsh', credentialType: 'api-key', status: 'active',
+            modelPolicy: 'all', modelAllowlist: [], availableModels: [], updatedAt: 1 }],
         }),
       } as unknown as AppStore,
       vi.fn(async () => ({
@@ -358,8 +363,9 @@ describe('Claude launch surface integration boundaries', () => {
     const bootstrapSource = readFileSync(new URL('../../src/main/index.ts', import.meta.url), 'utf8')
 
     expect(integrationSource).toMatch(
-      /beforeRepair:\s*async\s*\(\)\s*=>\s*\{\s*await options\.beforeDefaultCodexConnectionRepair\?\.\(\)\s*await prepareDefaultCodexConnection\(\)/,
+      /beforeRepair:\s*async\s*\(\)\s*=>\s*\{\s*await options\.beforeDefaultCodexConnectionRepair\?\.\(\)\s*rollbackConnection = await prepareDefaultCodexConnection\(\)/,
     )
+    expect(integrationSource).toContain('rollbackBeforeRepair: async () =>')
     expect(bootstrapSource).toContain(
       'beforeDefaultCodexConnectionRepair: () => codexOfficialAuthBridge.reclaimCurrent()',
     )

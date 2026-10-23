@@ -448,6 +448,7 @@ export class GatewayServer implements GatewayController {
   private readonly responsesProgressIdleTimeoutMs: number
   private readonly compactKeepaliveIntervalMs: number
   private server?: Server
+  private startFlight?: Promise<void>
   private responsesWebSocket?: ResponsesWebSocketAdapter
   private startedAt?: number
   private activeRequests = 0
@@ -500,6 +501,23 @@ export class GatewayServer implements GatewayController {
     }
     if (credentialResolver) this.credentialResolver = credentialResolver
     if (this.server) return
+    // The listen sequence below yields on several awaits before `this.server`
+    // is assigned. Without this single-flight guard, a second concurrent
+    // start() (tray toggle, bootstrap auto-start, or a client-instance launch
+    // — none of which pass through the IPC lifecycle queue) would pass the
+    // `if (this.server)` check, create a second listener, and lose the loser to
+    // EADDRINUSE while `this.server` is cleared to undefined — leaving a live
+    // but unmanageable listener that getStatus() reports as stopped.
+    if (this.startFlight) return this.startFlight
+    this.startFlight = this.performStart()
+    try {
+      await this.startFlight
+    } finally {
+      this.startFlight = undefined
+    }
+  }
+
+  private async performStart(): Promise<void> {
     await this.beforeStart?.()
     await this.restoreGrokVideoBindings()
     await this.restoreDeepSeekHarnessModelBindings()
@@ -1118,6 +1136,7 @@ export class GatewayServer implements GatewayController {
       }
       if (incoming.protocol === 'openai-responses' && isResponsesAgentClient(logRoute.client)) {
         body = normalizeCodexCompactHistory(body)
+        body = normalizeCodexHttpBootstrapOutputs(body)
       }
       const anthropicToolTurn = incoming.protocol === 'anthropic-messages'
         && incoming.operation === 'generate'
@@ -3511,11 +3530,28 @@ export class GatewayServer implements GatewayController {
             continue
           }
           const retryable = isRetryable(gatewayError)
-          const accountAction = gatewayError.providerFailure?.accountAction
           const modelScopedFailure = isModelScopedProviderFailure(gatewayError.providerFailure)
             ? gatewayError.providerFailure
             : undefined
           const requestScopedModelFailure = modelScopedFailure !== undefined
+          // A Web WM (Work-mode) 401/402/403 reflects the browser session
+          // (cookies / Cloudflare challenge / workspace access), not the
+          // account's API OAuth token. Classifying it as an account-level
+          // 'disable' would remove the account from its ordinary Codex and
+          // official-API pools too, where its token is still valid — a single
+          // chatgpt.com challenge would take the whole account offline until a
+          // manual re-enable. Neutralize the account action so the request
+          // fails visibly (prompting a Work re-auth) without disabling the
+          // shared account. The one-shot 401 recoverRejectedAccess above still
+          // runs first; 429 keeps its existing request-scoped retry path.
+          const webWmSessionRejection = useWebWmTransport
+            && !requestScopedModelFailure
+            && (gatewayError.statusCode === 401
+              || gatewayError.statusCode === 402
+              || gatewayError.statusCode === 403)
+          const accountAction = webWmSessionRejection
+            ? undefined
+            : gatewayError.providerFailure?.accountAction
           const requestScopedTransientFailure = gatewayError.providerFailure?.scope === 'request'
             || (
               isChatGptCodexCredentialKind(attemptedCredentialKind ?? 'api-key')
@@ -3753,11 +3789,21 @@ export class GatewayServer implements GatewayController {
               // global circuit or suppressing its ordinary Responses path.
               nativeCompactCapabilityFailedAccountIds.add(attemptedAccount.id)
             }
+            // Orphan-source protection: when this is the only usable source
+            // unit (a single relay, or a pool whose one remaining account still
+            // has quota), a transient failure must NOT drive a global cooldown.
+            // Cooling the sole source only converts a real upstream error into a
+            // synthetic 503 and — via exponential backoff that can exceed the
+            // upstream Retry-After — amplifies a brief limit into a multi-minute
+            // outage, while the client never sees the real status/Retry-After.
+            // rate_limit / quota / 5xx-with-Retry-After therefore no longer
+            // bypass hasUsableAlternative here; only a genuine credential death
+            // (accountAction === 'disable') still applies to the last source.
+            // Multi-source pools are unchanged: hasUsableAlternative keeps
+            // cooldown + failover fully intact.
             if (!compactCapabilityFailure && (
               accountAction === 'disable'
               || hasUsableAlternative
-              || hardAccountFailure
-              || explicitRetryAfterAdmissionFailure
             )) {
               failedAccountIds.add(attemptedAccount.id)
               if (!failureCooldownDisabled) {
@@ -6238,6 +6284,57 @@ function normalizeCodexCompactHistory(body: JsonObject): JsonObject {
     }]
   })
   return changed ? { ...body, input } : body
+}
+
+function normalizeCodexHttpBootstrapOutputs(body: JsonObject): JsonObject {
+  if (!Array.isArray(body.input)) return body
+  let changed = false
+  const input = body.input.map((value) => {
+    const item = objectValue(value)
+    const callId = typeof item?.call_id === 'string' ? item.call_id.trim() : ''
+    if (!item || item.type !== 'function_call_output' || callId) return value
+
+    const name = typeof item.name === 'string' ? item.name.trim() : ''
+    const namespace = typeof item.namespace === 'string' ? item.namespace.trim() : ''
+    const text = codexBootstrapOutputText(item.output)
+    const normalizedName = name.toLowerCase()
+    const codexAppBootstrap = namespace.toLowerCase() === 'codex_app'
+      || normalizedName.endsWith('automation_update')
+      || (
+        normalizedName.endsWith('send_message_to_thread')
+        && text?.includes('<codex_delegation>') === true
+      )
+    if (!codexAppBootstrap || text === undefined) return value
+
+    // Codex app-server can seed a newly delegated/automated task with a
+    // standalone function_call_output that intentionally has no call_id. That
+    // compact continuation form is valid only on Responses WebSocket v2. Stone
+    // dispatches every upstream attempt through HTTP, whose schema requires a
+    // real matching call_id. Preserve the bootstrap content as a developer
+    // message instead of inventing a call id or letting strict relays reject
+    // the task before its first model turn.
+    changed = true
+    return {
+      type: 'message',
+      role: 'developer',
+      content: [{ type: 'input_text', text }],
+    }
+  })
+  return changed ? { ...body, input } : body
+}
+
+function codexBootstrapOutputText(value: unknown): string | undefined {
+  if (typeof value === 'string') return value
+  if (Array.isArray(value)) {
+    const textParts = value.map((part) => objectValue(part)?.text)
+    if (textParts.every((part): part is string => typeof part === 'string')) return textParts.join('\n')
+  }
+  if (value === undefined) return undefined
+  try {
+    return JSON.stringify(value)
+  } catch {
+    return undefined
+  }
 }
 
 function encodeStoneCompactFallback(summary: string): string {

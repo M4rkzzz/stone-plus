@@ -239,6 +239,9 @@ describe('PoolScheduler', () => {
       quotaProtection: { sevenDayRemainingPercent: 20, unavailableBehavior: 'block', staleAfterMinutes: 5 }
     })
     const stale = account('stale', {
+      // codexQuota is only ever populated for Codex credentials, so quota
+      // protection likewise only applies to them.
+      credentialType: 'chatgpt-oauth',
       codexQuota: {
         observedAt: timestamp - 6 * 60_000,
         source: 'usage-endpoint',
@@ -250,6 +253,7 @@ describe('PoolScheduler', () => {
       .toThrow(NoEligibleAccountError)
 
     const accountGuarded = account('account-guarded', {
+      credentialType: 'chatgpt-oauth',
       quotaProtection: { fiveHourRemainingPercent: 25 },
       codexQuota: {
         observedAt: timestamp,
@@ -260,6 +264,21 @@ describe('PoolScheduler', () => {
     })
     expect(() => scheduler.selectAndAcquire({ pool: pool(), accounts: [accountGuarded], model: 'model' }))
       .toThrow(NoEligibleAccountError)
+  })
+
+  it('does not let a codexQuota reserve policy block a non-Codex source that can never report it', () => {
+    const scheduler = new PoolScheduler(() => timestamp)
+    // A codexQuota-based reserve with unavailableBehavior: 'block' on a relay
+    // pool would otherwise permanently 503 the pool: an api-key/relay account
+    // never populates codexQuota, so it would sit in the "unavailable" branch
+    // forever with no path to ever observe a snapshot.
+    const guardedPool = pool({
+      quotaProtection: { fiveHourRemainingPercent: 10, unavailableBehavior: 'block', staleAfterMinutes: 5 }
+    })
+    const relay = account('relay', { credentialType: 'api-key' })
+    const selection = scheduler.selectAndAcquire({ pool: guardedPool, accounts: [relay], model: 'model' })
+    expect(selection.account.id).toBe('relay')
+    selection.release()
   })
   it('globally reclaims expired sticky assignments and failure avoidances', () => {
     let now = timestamp

@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { isIP } from 'node:net'
 import {
   BUILT_IN_PROXY_PROFILE_VERSION,
@@ -18,6 +18,12 @@ const MAX_IMPORT_BYTES = 5 * 1024 * 1024
 const MAX_NODES = 2_048
 const MAX_RULES = 20_000
 const MAX_YAML_DEPTH = 16
+/**
+ * Node identifiers are derived from the full node identity, which includes its
+ * credentials. Salting keeps the published identifier from doubling as an
+ * offline verifier for a guessed password/UUID.
+ */
+const NODE_ID_SALT_BYTES = 16
 const FORBIDDEN_KEYS = new Set(['__proto__', 'prototype', 'constructor'])
 const FORBIDDEN_RUNTIME_KEYS = new Set([
   'plugin', 'plugin-opts', 'plugin_opts', 'script', 'script-path', 'script_path',
@@ -51,6 +57,10 @@ export interface ParseBuiltInProxyProfileOptions {
   profileId?: string
   name?: string
   formatHint?: BuiltInProxyImportFormat
+  /** Reuse a stored profile's salt so a subscription refresh keeps node IDs stable. */
+  nodeIdSalt?: string
+  /** Profiles imported before salted identifiers keep their original unsalted IDs. */
+  legacyUnsaltedNodeIds?: boolean
 }
 
 type NodeDraft = Omit<InternalProxyNode, 'id'>
@@ -88,7 +98,10 @@ export function parseBuiltInProxyProfile(
       ? parseClashYaml(payload.content, context)
       : parseUriList(payload.content, context)
 
-  const nodes = deduplicateNodes(parsed.nodes, context)
+  const nodeIdSalt = options.legacyUnsaltedNodeIds
+    ? undefined
+    : validNodeIdSalt(options.nodeIdSalt) ?? randomBytes(NODE_ID_SALT_BYTES).toString('hex')
+  const nodes = deduplicateNodes(parsed.nodes, context, nodeIdSalt)
   if (nodes.length === 0) {
     throw new BuiltInProxyProfileError(
       'no-supported-nodes',
@@ -104,8 +117,9 @@ export function parseBuiltInProxyProfile(
     name: profileName,
     format: payload.format,
     sourceFingerprint,
+    ...(nodeIdSalt ? { nodeIdSalt } : {}),
     nodes,
-    groups: parsed.groups(nodes),
+    groups: parsed.groups(nodes, nodeIdSalt),
     rules: parsed.rules,
     ruleStatus: parsed.downgrade ? 'fallback' : 'preserved',
     ...(parsed.downgrade ? { ruleDowngrade: parsed.downgrade } : {}),
@@ -116,7 +130,7 @@ export function parseBuiltInProxyProfile(
 interface FormatParseResult {
   name?: string
   nodes: NodeDraft[]
-  groups: (nodes: InternalProxyNode[]) => InternalProxyGroup[]
+  groups: (nodes: InternalProxyNode[], nodeIdSalt?: string) => InternalProxyGroup[]
   rules: InternalProxyRule[]
   downgrade?: ProxyRuleDowngrade
 }
@@ -204,7 +218,7 @@ function parseSingBoxJson(content: string, context: ParseContext): FormatParseRe
   const rulesResult = parseSingBoxRules(root.route, knownProxyTargets, directTags, blockTags)
   return {
     nodes,
-    groups: (finalNodes) => buildGroups(groupRecords, tagToDraft, finalNodes),
+    groups: (finalNodes, nodeIdSalt) => buildGroups(groupRecords, tagToDraft, finalNodes, nodeIdSalt),
     rules: rulesResult.rules,
     downgrade: rulesResult.downgrade ?? (groupNames.size > 0 && nodes.length === 0
       ? downgrade('missing-targets', 1, 'Imported groups do not reference a supported node; unmatched traffic will use the selected node.')
@@ -329,7 +343,12 @@ function parseSingBoxRules(
   directTags: ReadonlySet<string>,
   blockTags: ReadonlySet<string>
 ): { rules: InternalProxyRule[]; downgrade?: ProxyRuleDowngrade } {
+  // sing-box expresses its default outbound through `route.final`, not through
+  // a trailing catch-all rule. Dropping it would silently re-route everything
+  // the profile meant to send direct.
+  const routeFinal = resolveSingBoxFinal(routeValue, proxyTargets, directTags, blockTags)
   if (!isRecord(routeValue) || !Array.isArray(routeValue.rules) || routeValue.rules.length === 0) {
+    if (routeFinal.action) return { rules: [{ action: routeFinal.action }] }
     return { rules: [], downgrade: downgrade('no-rules', 0, 'No safely convertible subscription rules were found; unmatched traffic will use the selected node.') }
   }
   const importedRules: unknown[] = routeValue.rules
@@ -337,7 +356,7 @@ function parseSingBoxRules(
     return { rules: [], downgrade: downgrade('unsupported-rules', importedRules.length, 'The imported rule set is too large to preserve safely; unmatched traffic will use the selected node.') }
   }
   const rules: InternalProxyRule[] = []
-  let unsupported = 0
+  let unsupported = routeFinal.unresolved ? 1 : 0
   importedRules.forEach((value, index) => {
     const converted = isRecord(value)
       ? convertSingRule(value, proxyTargets, directTags, blockTags)
@@ -345,6 +364,9 @@ function parseSingBoxRules(
     if (!converted || (isCatchAll(converted) && index !== importedRules.length - 1)) unsupported += 1
     else rules.push(converted)
   })
+  // A catch-all rule matches before `route.final` in sing-box, so only an
+  // otherwise-unterminated rule list adopts the declared default outbound.
+  if (routeFinal.action && !rules.some(isCatchAll)) rules.push({ action: routeFinal.action })
   if (unsupported > 0 || rules.length === 0) return {
     rules,
     downgrade: downgrade(
@@ -354,6 +376,26 @@ function parseSingBoxRules(
     ),
   }
   return { rules }
+}
+
+/**
+ * An absent `final` keeps Stone+'s own default of routing unmatched traffic
+ * through the selected node. A tag Stone+ could not import is a real semantic
+ * loss and downgrades the whole rule set instead of being ignored.
+ */
+function resolveSingBoxFinal(
+  routeValue: unknown,
+  proxyTargets: ReadonlySet<string>,
+  directTags: ReadonlySet<string>,
+  blockTags: ReadonlySet<string>
+): { action?: InternalProxyRuleAction; unresolved: boolean } {
+  if (!isRecord(routeValue)) return { unresolved: false }
+  const target = optionalString(routeValue.final)?.toLowerCase()
+  if (!target) return { unresolved: false }
+  if (blockTags.has(target)) return { action: 'block', unresolved: false }
+  if (directTags.has(target)) return { action: 'direct', unresolved: false }
+  if (proxyTargets.has(target)) return { action: 'proxy', unresolved: false }
+  return { unresolved: true }
 }
 
 const SING_RULE_KEYS = new Set([
@@ -437,7 +479,7 @@ function parseClashYaml(content: string, context: ParseContext): FormatParseResu
   return {
     name: optionalString(root.name),
     nodes,
-    groups: (finalNodes) => buildGroups(groupRecords, nameToDraft, finalNodes),
+    groups: (finalNodes, nodeIdSalt) => buildGroups(groupRecords, nameToDraft, finalNodes, nodeIdSalt),
     rules: rulesResult.rules,
     downgrade: rulesResult.downgrade
   }
@@ -697,11 +739,12 @@ function tlsFromUri(query: URLSearchParams, defaultEnabled = false): InternalPro
 function buildGroups(
   records: Array<{ tag: string; type: string; members: string[] }>,
   names: ReadonlyMap<string, NodeDraft>,
-  nodes: InternalProxyNode[]
+  nodes: InternalProxyNode[],
+  nodeIdSalt?: string
 ): InternalProxyGroup[] {
   const draftToId = new Map<NodeDraft, string>()
   nodes.forEach((node) => {
-    const draft = [...names.values()].find((candidate) => stableNodeId(candidate) === node.id)
+    const draft = [...names.values()].find((candidate) => stableNodeId(candidate, nodeIdSalt) === node.id)
     if (draft) draftToId.set(draft, node.id)
   })
   const recordMap = new Map(records.map((record) => [record.tag.toLowerCase(), record]))
@@ -725,11 +768,15 @@ function buildGroups(
   })).filter((group) => group.nodeIds.length > 0)
 }
 
-function deduplicateNodes(drafts: NodeDraft[], context: ParseContext): InternalProxyNode[] {
+function deduplicateNodes(
+  drafts: NodeDraft[],
+  context: ParseContext,
+  nodeIdSalt?: string
+): InternalProxyNode[] {
   const seen = new Set<string>()
   const nodes: InternalProxyNode[] = []
   for (const draft of drafts) {
-    const id = stableNodeId(draft)
+    const id = stableNodeId(draft, nodeIdSalt)
     if (seen.has(id)) { context.warnings.push('A duplicate proxy node was ignored.'); continue }
     seen.add(id)
     nodes.push({ id, ...draft })
@@ -737,9 +784,20 @@ function deduplicateNodes(drafts: NodeDraft[], context: ParseContext): InternalP
   return nodes
 }
 
-export function stableNodeId(node: NodeDraft | InternalProxyNode): string {
+/**
+ * Renaming a node must not change its identifier, so the display name is
+ * excluded. Everything else, including credentials, participates. Pass the
+ * profile's stored salt so the published identifier cannot be recomputed from
+ * a guessed credential; omit it only for profiles saved before salting.
+ */
+export function stableNodeId(node: NodeDraft | InternalProxyNode, nodeIdSalt?: string): string {
   const { name: _name, ...identity } = node
-  return `node-${sha256(stableStringify(identity)).slice(0, 24)}`
+  const serialized = stableStringify(identity)
+  return `node-${sha256(nodeIdSalt ? `${nodeIdSalt}:${serialized}` : serialized).slice(0, 24)}`
+}
+
+function validNodeIdSalt(value: unknown): string | undefined {
+  return typeof value === 'string' && /^[0-9a-f]{32}$/.test(value) ? value : undefined
 }
 
 function stableGroupId(name: string): string {

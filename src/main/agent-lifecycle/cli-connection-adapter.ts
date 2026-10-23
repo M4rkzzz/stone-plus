@@ -193,7 +193,7 @@ export class ConnectionOnlyCliLifecycleAdapter {
           .at(0)
         const configDirectory = selected?.configDirectory
         const repairs: RepairClientConfigResult[] = []
-        let phase: 'restore-connection' | 'validate' = 'restore-connection'
+        let phase: 'restore-connection' | 'validate' | 'start' = 'restore-connection'
         try {
           repairs.push(await this.config.repair(
             this.client,
@@ -202,8 +202,22 @@ export class ConnectionOnlyCliLifecycleAdapter {
           ))
           phase = 'validate'
           await this.config.validate(this.client, connection, configDirectory)
+          phase = 'start'
+          await this.runtime.startNew(this.client, options)
         } catch (error) {
-          const rollbackErrors = await this.rollbackRepairs(repairs)
+          const cleanupErrors: string[] = []
+          if (phase === 'start') {
+            try {
+              const after = await this.runtime.snapshot(this.client)
+              const previouslyRunning = new Set(runtime.managedInstances.filter((instance) => instance.running).map((instance) => instance.id))
+              for (const instance of after.managedInstances) {
+                if (instance.running && !previouslyRunning.has(instance.id)) await this.runtime.closeManaged(instance.id)
+              }
+            } catch (cleanupError) {
+              cleanupErrors.push(`launch cleanup: ${messageOf(cleanupError)}`)
+            }
+          }
+          const rollbackErrors = cleanupErrors.length ? cleanupErrors : await this.rollbackRepairs(repairs)
           throw new CliLifecycleOperationError(
             this.target,
             rollbackErrors.length > 0 ? 'rollback' : phase,
@@ -212,6 +226,7 @@ export class ConnectionOnlyCliLifecycleAdapter {
             { cause: error },
           )
         }
+        return
       } else if (!config.configured) {
         throw new Error(`${displayName(this.target)} is not configured for Stone+.`)
       }
@@ -292,7 +307,7 @@ export class ConnectionOnlyCliLifecycleAdapter {
       }
     } catch (error) {
       const rollbackErrors = await this.rollbackRepairs(repairs)
-      const recoveryErrors = await this.restartManaged(closed)
+      const recoveryErrors = rollbackErrors.length === 0 ? await this.restartManaged(closed) : []
       throw new CliLifecycleOperationError(
         this.target,
         rollbackErrors.length > 0 ? 'rollback' : repairPhase,
@@ -304,11 +319,20 @@ export class ConnectionOnlyCliLifecycleAdapter {
 
     const restartErrors = preserveRunningState ? await this.restartManaged(closed) : []
     if (restartErrors.length > 0) {
+      // Some instances may already be running the new configuration. Quiesce
+      // this exact owned set before restoring its backups, never external CLI.
+      const cleanupErrors: string[] = []
+      for (const id of closed) {
+        try { await this.runtime.closeManaged(id) }
+        catch (error) { cleanupErrors.push(`${id}: restart cleanup: ${messageOf(error)}`) }
+      }
+      const rollbackErrors = cleanupErrors.length ? cleanupErrors : await this.rollbackRepairs(repairs)
+      const recoveryErrors = rollbackErrors.length === 0 ? await this.restartManaged(closed) : []
       throw new CliLifecycleOperationError(
         this.target,
-        'start',
-        `The ${displayName(this.target)} connection was restored, but its previous managed instances could not all restart.`,
-        restartErrors,
+        rollbackErrors.length ? 'rollback' : 'start',
+        `Unable to restart ${displayName(this.target)} with the new connection: ${restartErrors.join('; ')}`,
+        [...restartErrors, ...rollbackErrors, ...recoveryErrors],
       )
     }
 

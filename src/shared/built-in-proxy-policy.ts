@@ -35,6 +35,12 @@ export type BuiltInProxyEffectiveRulePolicy =
 export interface BuiltInProxyRuleSourceSummary {
   policy: BuiltInProxyEffectiveRulePolicy
   importedRules: 'not-used' | 'safe-converted' | 'downgraded'
+  /**
+   * Custom rules are a global additive overlay placed ahead of the imported
+   * rules. `partially-applied` means at least one saved rule uses a condition
+   * Stone+ can no longer honour and was skipped.
+   */
+  customOverlay: 'not-used' | 'applied' | 'partially-applied'
   chinaRuleSets: 'not-used'
   ruleSetDownload: 'not-used'
   importedRuleSetSourcesUsed: false
@@ -73,6 +79,16 @@ export function summarizeBuiltInProxyNetworkPolicy(
   }
 }
 
+function summarizeCustomOverlay(
+  customRules: BuiltInProxyCustomRuleSet | undefined,
+): BuiltInProxyRuleSourceSummary['customOverlay'] {
+  const rules = customRules?.rules ?? []
+  if (rules.length === 0) return 'not-used'
+  const honoured = rules.filter((rule) => rule.condition !== 'mainland-china')
+  if (honoured.length === 0) return 'not-used'
+  return honoured.length === rules.length ? 'applied' : 'partially-applied'
+}
+
 function summarizeRules(input: BuiltInProxyPolicySummaryInput): BuiltInProxyRuleSourceSummary {
   let policy: BuiltInProxyEffectiveRulePolicy
   let importedRules: BuiltInProxyRuleSourceSummary['importedRules']
@@ -95,6 +111,7 @@ function summarizeRules(input: BuiltInProxyPolicySummaryInput): BuiltInProxyRule
   return {
     policy,
     importedRules,
+    customOverlay: summarizeCustomOverlay(input.customRules),
     chinaRuleSets,
     ruleSetDownload: 'not-used',
     importedRuleSetSourcesUsed: false,

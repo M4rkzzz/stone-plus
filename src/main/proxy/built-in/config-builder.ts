@@ -1,5 +1,5 @@
 import { isIP } from 'node:net'
-import type { BuiltInProxyCustomRuleSet } from '@shared/types'
+import type { BuiltInProxyCustomRuleSet, BuiltInProxyEditableRule } from '@shared/types'
 import type {
   BuiltInProxyRuleMode,
   InternalProxyNode,
@@ -62,7 +62,11 @@ export interface BuildSingBoxConfigInput {
   mode: BuiltInProxyRuleMode
   /** Runtime listener ownership stays in SingBoxService; this controls policy only. */
   accessMode: BuiltInProxyAccessMode
-  /** Explicit visual override for rule mode. Undefined preserves profile rules/fallback behavior. */
+  /**
+   * Global additive overlay. These rules are layered on top of whichever base
+   * policy the rule mode selects; they never replace the subscription rules or
+   * the base final action.
+   */
   customRules?: BuiltInProxyCustomRuleSet
   /** Configured relay/provider hosts supplement the stable first-party list. */
   requiredProxyDomains?: readonly string[]
@@ -103,7 +107,12 @@ export class BuiltInProxyConfigError extends Error {
 export function buildSingBoxConfig(input: BuildSingBoxConfigInput): BuildSingBoxConfigResult {
   validateProfileShape(input.profile)
   const warnings: string[] = []
+  const overlayRules = resolveCustomOverlay(input.customRules, warnings)
+  // A proxy action in the overlay needs the node outbounds even in direct mode,
+  // otherwise "global" would silently exclude the one mode users reach for when
+  // they want a short list of proxied destinations.
   const needsProxy = input.mode !== 'direct'
+    || overlayRules.some((rule) => rule.action === 'proxy')
   const requested = input.activeNodeId
   const active = requested
     ? input.profile.nodes.find((node) => node.id === requested) ?? input.profile.nodes[0]
@@ -131,9 +140,6 @@ export function buildSingBoxConfig(input: BuildSingBoxConfigInput): BuildSingBox
       : importedRules.length > 0
         ? 'preserved'
         : 'fallback'
-  if (input.mode === 'rule' && input.customRules !== undefined) {
-    warnings.push('The saved standalone custom rule set was ignored; rule mode now follows the active subscription rules.')
-  }
   if (input.mode === 'rule' && input.profile.ruleDowngrade?.message) {
     warnings.push(input.profile.ruleDowngrade.message)
   }
@@ -143,6 +149,7 @@ export function buildSingBoxConfig(input: BuildSingBoxConfigInput): BuildSingBox
     selectedPolicy,
     activeTag,
     normalizeRequiredProxyDomains(input.requiredProxyDomains),
+    overlayRules,
   )
   return {
     config: {
@@ -169,8 +176,14 @@ function buildRoute(
   policy: BuildSingBoxConfigResult['routePolicy'],
   proxyTag?: string,
   requiredProxyDomains: readonly string[] = BUILT_IN_REQUIRED_PROXY_DOMAINS,
+  overlayRules: readonly BuiltInProxyEditableRule[] = [],
 ): SingBoxSourceConfiguration['route'] {
+  // sing-box ANDs different matcher families within one rule and does not
+  // resolve a domain before testing ip_cidr, so loopback needs two rules: the
+  // literal hostnames a client may hand to the mixed listener, and the
+  // addresses. Neither needs sniffing; the mixed inbound already knows both.
   const rules: Array<Record<string, SingBoxJson>> = [
+    routeRule({ domain: ['localhost'], domain_suffix: ['.localhost'] }, 'direct', proxyTag),
     routeRule({ ip_cidr: ['127.0.0.0/8', '::1/128'] }, 'direct', proxyTag)
   ]
   let sniffActionAdded = false
@@ -205,8 +218,12 @@ function buildRoute(
   }
 
   if (policy !== 'direct') {
+    // The overlay is emitted above the final action, so a domain that is only
+    // "guaranteed" by that final action is not guaranteed against an overlay
+    // rule. Evaluate the overlay first and pin anything it could divert.
+    const decisiveRules = [...overlayRules.flatMap(overlayDomainRule), ...policyRules]
     const missingDomains = requiredProxyDomains.filter((domain) => (
-      !isDomainGuaranteedProxy(domain, policyRules, finalAction)
+      !isDomainGuaranteedProxy(domain, decisiveRules, finalAction)
     ))
     if (missingDomains.length > 0) {
       pushPolicyRule(
@@ -214,6 +231,14 @@ function buildRoute(
         true,
       )
     }
+  }
+
+  // The user's own rules are an increment placed ahead of the subscription so
+  // they win over it, but behind the mandatory first-party proxy rule so an
+  // overlay cannot cut off the upstreams Stone+ itself depends on. They apply
+  // in every rule mode, including direct.
+  for (const rule of overlayRules) {
+    pushPolicyRule(convertOverlayRule(rule, proxyTag), overlayRuleRequiresSniff(rule))
   }
 
   for (const rule of policyRules) {
@@ -230,6 +255,84 @@ function buildRoute(
     rules,
     final
   }
+}
+
+/**
+ * Keeps only overlay rules Stone+ can actually honour. `mainland-china` needs
+ * the geographic rule sets Stone+ no longer ships or downloads, so it is
+ * dropped with an explicit reason instead of silently matching nothing.
+ */
+function resolveCustomOverlay(
+  customRules: BuiltInProxyCustomRuleSet | undefined,
+  warnings: string[],
+): BuiltInProxyEditableRule[] {
+  if (!customRules || customRules.rules.length === 0) return []
+  const supported: BuiltInProxyEditableRule[] = []
+  let unsupported = 0
+  for (const rule of customRules.rules) {
+    if (rule.condition === 'mainland-china') {
+      unsupported += 1
+      continue
+    }
+    supported.push(rule)
+  }
+  if (unsupported > 0) {
+    warnings.push(
+      `${unsupported} custom rule${unsupported === 1 ? '' : 's'} using the mainland-China condition were skipped; `
+      + 'Stone+ no longer ships or downloads a geographic rule set.',
+    )
+  }
+  if (supported.length > 0) {
+    warnings.push(
+      'Custom rules are applied as a global overlay ahead of the subscription rules; '
+      + 'their final action is not used because the rule mode still decides unmatched traffic.',
+    )
+  }
+  return supported
+}
+
+function convertOverlayRule(
+  rule: BuiltInProxyEditableRule,
+  proxyTag?: string
+): Record<string, SingBoxJson> {
+  return routeRule(overlayMatch(rule), rule.action, proxyTag)
+}
+
+function overlayMatch(rule: BuiltInProxyEditableRule): Record<string, SingBoxJson> {
+  switch (rule.condition) {
+    case 'domain': return { domain: [...rule.values] }
+    case 'domain-suffix': return { domain_suffix: [...rule.values] }
+    case 'domain-keyword': return { domain_keyword: [...rule.values] }
+    case 'ip-cidr': return { ip_cidr: [...rule.values] }
+    case 'port': return { port: rule.values.map(Number) }
+    case 'port-range': return { port_range: [...rule.values] }
+    case 'network': return { network: [...rule.values] }
+    case 'protocol': return { protocol: [...rule.values] }
+    case 'private-network': return { ip_is_private: true }
+    default: throw new BuiltInProxyConfigError(
+      'invalid-profile',
+      'The custom rule overlay contains an unsupported condition.',
+    )
+  }
+}
+
+/**
+ * Projects the overlay rules that can decide a bare domain on their own, so the
+ * mandatory first-party check can see them. Address/port/protocol conditions
+ * carry extra requirements and are not decisive for a domain by themselves.
+ */
+function overlayDomainRule(rule: BuiltInProxyEditableRule): InternalProxyRule[] {
+  if (rule.condition === 'domain') return [{ domains: [...rule.values], action: rule.action }]
+  if (rule.condition === 'domain-suffix') return [{ domainSuffixes: [...rule.values], action: rule.action }]
+  if (rule.condition === 'domain-keyword') return [{ domainKeywords: [...rule.values], action: rule.action }]
+  return []
+}
+
+function overlayRuleRequiresSniff(rule: BuiltInProxyEditableRule): boolean {
+  return rule.condition === 'domain'
+    || rule.condition === 'domain-suffix'
+    || rule.condition === 'domain-keyword'
+    || rule.condition === 'protocol'
 }
 
 function importedRuleRequiresSniff(rule: InternalProxyRule): boolean {

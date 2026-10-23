@@ -1,14 +1,14 @@
 import { execFile } from 'node:child_process'
 import { resolve as resolvePath, win32 as win32Path } from 'node:path'
 import type { AgentRestoreOptions, AgentStartOptions, AgentTarget } from '@shared/agent-lifecycle'
-import { agentRouteClient } from '@shared/agent-lifecycle'
 import {
   clientNativeProtocols,
   type ManagedClientInstance,
   type PoolProtocol,
   type RouteClient,
 } from '@shared/types'
-import { enumerateRouteSourceModels, listRouteSources, resolveRouteSource } from '@shared/route-sources'
+import { analyzeRouteSourceCompatibility, enumerateRouteSourceModels, resolveRouteSource } from '@shared/route-sources'
+import { resolveAgentRouteState } from './route-state'
 import { codexConnectionRouteMetadata } from '@shared/codex-model-repair'
 import {
   CodexSessionRepairService,
@@ -19,6 +19,7 @@ import {
 import { findBlockingWindowsCodexPids } from '../codex/windows-codex-processes'
 import type { ClientConfigService } from '../client-config'
 import type { ClientConnectionTarget } from '../client-config'
+import { ClientConfigRollbackError } from '../client-config/types'
 import { sanitizeManagedClientLaunchArgs, type ClientInstanceManager } from '../client-instances'
 import type { AppStore } from '../store/app-store'
 import type { AgentInstallationService } from '../agent-installation'
@@ -52,7 +53,6 @@ import {
   AgentLifecycleService,
   type AgentAdapterSnapshot,
   type AgentLifecycleAdapterPort,
-  type AgentRouteState,
 } from './service'
 
 export interface CreateAgentLifecycleServiceOptions {
@@ -66,6 +66,7 @@ export interface CreateAgentLifecycleServiceOptions {
   claudeDesktopCoordinator: ClaudeDesktopOperationCoordinatorPort
   /** Reclaims a Codex-owned OAuth generation after shutdown and before Stone rewrites auth.json. */
   beforeDefaultCodexConnectionRepair?: () => Promise<void>
+  ensureGatewayReady?: () => Promise<void>
 }
 
 export function createAgentLifecycleService(options: CreateAgentLifecycleServiceOptions): AgentLifecycleService {
@@ -110,27 +111,37 @@ export function createAgentLifecycleService(options: CreateAgentLifecycleService
       const homes = configDirectories.length > 0
         ? uniqueFilesystemPaths(configDirectories)
         : defaultCodexHome ? [defaultCodexHome] : []
-      if (homes.length === 0) {
+      const repairDefaultHome = async () => {
+        let rollbackConnection: (() => Promise<void>) | undefined
         return options.codexRepair.run({
           ...effectiveRepairOptions,
           beforeRepair: async () => {
             await options.beforeDefaultCodexConnectionRepair?.()
-            await prepareDefaultCodexConnection()
-            await effectiveRepairOptions.beforeRepair?.()
+            rollbackConnection = await prepareDefaultCodexConnection()
+            try { await effectiveRepairOptions.beforeRepair?.() }
+            catch (cause) {
+              try { await rollbackConnection() }
+              catch (rollbackCause) {
+                throw new ClientConfigRollbackError(`${messageOf(cause)}; connection rollback: ${messageOf(rollbackCause)}`, { cause: rollbackCause })
+              }
+              throw cause
+            }
+          },
+          // The existing repair service calls this only before session
+          // migration commits. Never undo provider config under migrated data.
+          rollbackBeforeRepair: async () => {
+            try { await effectiveRepairOptions.rollbackBeforeRepair?.() }
+            finally { await rollbackConnection?.() }
           },
         })
+      }
+      if (homes.length === 0) {
+        return repairDefaultHome()
       }
       const results: unknown[] = []
       for (const codexHome of homes) {
         if (defaultCodexHome && sameFilesystemPath(codexHome, defaultCodexHome)) {
-          results.push(await options.codexRepair.run({
-            ...effectiveRepairOptions,
-            beforeRepair: async () => {
-              await options.beforeDefaultCodexConnectionRepair?.()
-              await prepareDefaultCodexConnection()
-              await effectiveRepairOptions.beforeRepair?.()
-            },
-          }))
+          results.push(await repairDefaultHome())
           continue
         }
         // Managed CLI instances can own an isolated CODEX_HOME. They have
@@ -269,7 +280,8 @@ export function createAgentLifecycleService(options: CreateAgentLifecycleService
   return new AgentLifecycleService({
     adapters,
     installer: options.installer,
-    resolveRoute: (target) => resolveRouteState(options.store, target),
+    ensureGatewayReady: options.ensureGatewayReady,
+    resolveRoute: (target) => resolveAgentRouteState(options.store.getSnapshot(), target),
   })
 }
 
@@ -355,12 +367,12 @@ async function isConnectionConfigured(
   }
 }
 
-async function repairAndValidateConnection(
+export async function repairAndValidateConnection(
   config: ClientConfigConnectionPort,
   client: RouteClient,
   target: ClientConnectionTarget,
   configDirectory?: string,
-): Promise<void> {
+): Promise<() => Promise<void>> {
   const repair = await config.repair(client, target, configDirectory ? { configDirectory } : {})
   try {
     await config.validate(client, target, configDirectory)
@@ -368,10 +380,11 @@ async function repairAndValidateConnection(
     try {
       await config.rollback(client, repair)
     } catch (rollbackCause) {
-      throw new Error(`Connection validation failed and rollback also failed: ${messageOf(cause)}; rollback: ${messageOf(rollbackCause)}`)
+      throw new ClientConfigRollbackError(`Connection validation failed and rollback also failed: ${messageOf(cause)}; rollback: ${messageOf(rollbackCause)}`, { cause: rollbackCause })
     }
     throw cause
   }
+  return async () => { await config.rollback(client, repair) }
 }
 
 class DiscoveryInstallationPort implements CliInstallationPort {
@@ -635,10 +648,12 @@ class ManagedCodexCliPort implements CodexCliPort {
     } catch (cause) {
       await this.rollbackRepairs()
       throw cause
-    } finally {
-      this.repairResults = []
     }
   }
+
+  commitConnection(): void { this.repairResults = [] }
+
+  rollbackConnection(): Promise<void> { return this.rollbackRepairs() }
 
   private async rollbackRepairs(): Promise<void> {
     const failures: string[] = []
@@ -646,6 +661,7 @@ class ManagedCodexCliPort implements CodexCliPort {
       try { await this.config.rollback('codex', repair) } catch (cause) { failures.push(String(cause)) }
     }
     if (failures.length > 0) throw new Error(`Codex profile rollback failed: ${failures.join('; ')}`)
+    this.repairResults = []
   }
 
   private resolveStartConfigDirectory(options?: AgentStartOptions): string | undefined {
@@ -718,23 +734,11 @@ function messageOf(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause)
 }
 
-function resolveRouteState(store: AppStore, target: AgentTarget): AgentRouteState {
-  const client = agentRouteClient(target)
-  const snapshot = store.getSnapshot()
-  const route = snapshot.routes.find((candidate) => candidate.client === client && candidate.enabled)
-  if (!route) return { enabled: false, compatibility: 'unsupported' }
-  const source = listRouteSources(snapshot).find((candidate) => candidate.id === route.poolId)
-  return {
-    enabled: true,
-    compatibility: route.inboundProtocol === clientNativeProtocols[client] ? 'native' : 'unsupported',
-    sourceId: route.poolId,
-    sourceName: source?.name ?? route.poolId,
-  }
-}
-
 function resolveConnection(store: AppStore, client: RouteClient): ClientConnectionTarget {
   const snapshot = store.getSnapshot()
   const route = enabledNativeRoute(store, client)
+  const compatibility = analyzeRouteSourceCompatibility(client, resolveRouteSource(route.poolId, snapshot), snapshot)
+  if (!compatibility.eligible) throw new Error(compatibility.reason ?? 'The selected source is not compatible with this client.')
   if (!route.localToken) throw new Error(`The ${client} route has no local token.`)
   const host = snapshot.gateway.host.includes(':') ? `[${snapshot.gateway.host}]` : snapshot.gateway.host
   return {

@@ -703,6 +703,57 @@ describe('refresh provider models IPC', () => {
     expect(plan).not.toHaveBeenCalled()
   })
 
+  it('previews source contract changes without mutating routes or exposing credentials', async () => {
+    const plan = vi.fn(async (_client: string, target: { token: string }) => ({ files: [{
+      role: 'codex-auth', path: '/test/auth.json', changed: true, existed: true,
+      containsCredential: true, managedFields: ['token'], content: target.token,
+    }] }))
+    const harness = createHarness([], {}, vi.fn(), [], { current: 'test' }, planService())
+    function planService() { return { plan } as unknown as ClientConfigService }
+    const snapshot = harness.store.getSnapshot()
+    const route = { id: 'preview-codex', client: 'codex' as const, enabled: false, poolId: 'old',
+      inboundProtocol: 'openai-responses' as const, modelMap: {}, localToken: 'old-secret', createdAt: 1, updatedAt: 1 }
+    snapshot.routes = [route]
+    const handler = electron.handlers.get('stone:preview-client-config')!
+    const unchanged = await handler(rendererEvent(407), 'codex', undefined, { ...route, poolId: 'new' })
+    expect(unchanged).toMatchObject({ routeChangesConnection: false })
+    const changed = await handler(rendererEvent(407), 'codex', undefined, { ...route, localToken: 'new-secret' })
+    expect(changed).toMatchObject({ routeChangesConnection: true })
+    expect(JSON.stringify(changed)).not.toContain('secret')
+    expect(snapshot.routes).toEqual([route])
+    await expect(handler(rendererEvent(407), 'codex', undefined, { ...route, client: 'gemini' }))
+      .rejects.toThrow()
+  })
+
+  it('uses repair semantics for explicit repair preview without exposing file content', async () => {
+    const plan = vi.fn(async () => ({ files: [] }))
+    const planRepair = vi.fn(async () => ({ files: [{ role: 'codex-config', path: '/fixture/config.toml',
+      changed: true, existed: true, containsCredential: false, managedFields: ['model'], content: 'private-fixture-content' }] }))
+    const harness = createHarness([], {}, vi.fn(), [], { current: 'test' }, { plan, planRepair } as unknown as ClientConfigService)
+    const route = { id: 'preview-codex', client: 'codex' as const, enabled: false, poolId: 'old',
+      inboundProtocol: 'openai-responses' as const, modelMap: {}, localToken: 'fixture', createdAt: 1, updatedAt: 1 }
+    harness.store.getSnapshot().routes = [route]
+    const handler = electron.handlers.get('stone:preview-client-config')!
+    const result = await handler(rendererEvent(407), 'codex', undefined, route, 'repair')
+    expect(planRepair).toHaveBeenCalledOnce()
+    expect(result).toMatchObject({ files: [{ changed: true, managedFields: ['model'] }] })
+    expect(JSON.stringify(result)).not.toContain('private-fixture-content')
+    await expect(handler(rendererEvent(407), 'codex', undefined, route, 'unknown')).rejects.toThrow('preview mode')
+  })
+
+  it('requires revision guards for automatic config rollback and forwards them to the selected service', async () => {
+    const restoreBackupSet = vi.fn(async () => undefined)
+    createHarness([], {}, vi.fn(), [], { current: 'test' }, { restoreBackupSet } as unknown as ClientConfigService)
+    const handler = electron.handlers.get('stone:rollback-client-config-repair')!
+    await expect(handler(rendererEvent(407), 'codex', undefined, 'group', {})).rejects.toThrow('write revisions')
+    expect(restoreBackupSet).not.toHaveBeenCalled()
+    const revisions = { 'codex-config': 'opaque-test-revision' }
+    await handler(rendererEvent(407), 'codex', undefined, 'group', revisions)
+    expect(restoreBackupSet).toHaveBeenCalledWith('codex', 'group', revisions)
+    await expect(handler({ senderFrame: { url: 'https://untrusted.invalid' }, sender: {} }, 'codex', undefined, 'group', revisions)).rejects.toThrow()
+    expect(restoreBackupSet).toHaveBeenCalledOnce()
+  })
+
   it('configures Grok Build directly against a native Responses Grok relay', async () => {
     const account = apiKeyAccount()
     const plan = vi.fn(async () => ({ files: [] }))
@@ -844,6 +895,10 @@ describe('refresh provider models IPC', () => {
     }) as AppSnapshot
 
     expect(result.gateway.disableCooldown).toBe(true)
+    expect(harness.gateway.updateRuntimeAccounts).toHaveBeenCalledWith([
+      expect.objectContaining({ id: failureCooled.id, status: 'active', cooldownReason: undefined }),
+      expect.objectContaining({ id: relayQuotaCooled.id, status: 'active', cooldownReason: undefined }),
+    ])
     expect(harness.store.updateAccountRuntimeStates).toHaveBeenCalledWith([
       {
         id: failureCooled.id,
@@ -1150,6 +1205,55 @@ describe('refresh provider models IPC', () => {
       .toBeLessThan(vi.mocked(harness.store.updateGateway).mock.invocationCallOrder[1])
   })
 
+  it.each(['stop', 'start', 'transport'] as const)('restores the working gateway settings and listener after a %s failure', async (failure) => {
+    const harness = createHarness([oauthAccount()], {}, vi.fn())
+    const handler = electron.handlers.get('stone:update-gateway')!
+    const previous = structuredClone(harness.store.getSnapshot().gateway)
+    const status = { ...harness.gateway.getStatus(), running: true }
+    vi.mocked(harness.gateway.getStatus).mockImplementation(() => ({ ...status }))
+    vi.mocked(harness.gateway.stop).mockImplementation(async () => { status.running = false })
+    vi.mocked(harness.gateway.start).mockImplementation(async () => {
+      Object.assign(status, { running: true, host: harness.store.getSnapshot().gateway.host,
+        port: harness.store.getSnapshot().gateway.port })
+    })
+    if (failure === 'stop') vi.mocked(harness.gateway.stop).mockRejectedValueOnce(new Error('stop failed'))
+    if (failure === 'start') vi.mocked(harness.gateway.start).mockRejectedValueOnce(new Error('start failed'))
+    if (failure === 'transport') vi.mocked(harness.transport.configureOutboundNetwork).mockImplementationOnce(() => {
+      throw new Error('transport failed')
+    })
+
+    await expect(handler(rendererEvent(103), { ...previous, port: 15722, outboundNetworkMode: 'system' }))
+      .rejects.toThrow(`${failure} failed`)
+
+    expect(harness.store.getSnapshot().gateway).toEqual(previous)
+    expect(status).toMatchObject({ running: true, port: previous.port, host: previous.host })
+    expect(harness.gateway.updateConfig).toHaveBeenLastCalledWith(expect.objectContaining({ settings: previous }))
+    expect(harness.transport.configureOutboundNetwork).toHaveBeenLastCalledWith('direct', previous.port)
+    expect(harness.store.setGatewayStatus).toHaveBeenLastCalledWith(expect.objectContaining({ running: true, port: previous.port }))
+    await harness.dispose()
+  })
+
+  it('keeps a concurrent source switch when gateway settings roll back', async () => {
+    const harness = createHarness([oauthAccount()], {}, vi.fn())
+    const handler = electron.handlers.get('stone:update-gateway')!
+    const snapshot = harness.store.getSnapshot()
+    const previous = { ...snapshot.gateway }
+    snapshot.routes.push({ id: 'codex', client: 'codex', enabled: true, poolId: 'old-source',
+      inboundProtocol: 'openai-responses', modelMap: {}, localToken: 'local-test', createdAt: 1, updatedAt: 1 })
+    snapshot.gatewayStatus.running = true
+    vi.mocked(harness.gateway.stop).mockImplementation(async () => { snapshot.gatewayStatus.running = false })
+    vi.mocked(harness.gateway.start).mockImplementationOnce(async () => {
+      snapshot.routes[0] = { ...snapshot.routes[0], poolId: 'new-source', updatedAt: 2 }
+      throw new Error('controlled bind failure')
+    }).mockImplementation(async () => { snapshot.gatewayStatus.running = true })
+    await expect(handler(rendererEvent(103), { ...previous, port: 15722 })).rejects.toThrow('controlled bind failure')
+    expect(snapshot.routes[0].poolId).toBe('new-source')
+    expect(harness.gateway.updateConfig).toHaveBeenLastCalledWith(expect.objectContaining({
+      settings: previous, routes: [expect.objectContaining({ poolId: 'new-source' })],
+    }))
+    await harness.dispose()
+  })
+
   it('continues the gateway lifecycle queue after an earlier update fails', async () => {
     const harness = createHarness([oauthAccount()], {}, vi.fn())
     const handler = electron.handlers.get('stone:update-gateway')
@@ -1171,7 +1275,10 @@ describe('refresh provider models IPC', () => {
 
     await expect(first).rejects.toThrow('temporary stop failure')
     await expect(second).resolves.toMatchObject({ gateway: { port: 15723 } })
-    expect(harness.store.updateGateway).toHaveBeenCalledTimes(2)
+    // First save, its rollback, then the queued second change.
+    expect(harness.store.updateGateway).toHaveBeenCalledTimes(3)
+    expect(vi.mocked(harness.store.updateGateway).mock.calls.map(([settings]) => settings.port))
+      .toEqual([15722, 15721, 15723])
     expect(harness.gateway.stop).toHaveBeenCalledTimes(2)
     expect(harness.gateway.start).toHaveBeenCalledOnce()
   })
@@ -3551,7 +3658,7 @@ function createHarness(
     }),
     setGatewayStatus: vi.fn(),
     updateGateway: vi.fn(async (settings) => {
-      snapshot.gateway = { ...snapshot.gateway, ...settings }
+      snapshot.gateway = { ...settings }
       return snapshot
     }),
     getPublicRuntimeAccounts: vi.fn((ids?: ReadonlySet<string>) => snapshot.accounts.filter((account) => !ids || ids.has(account.id))),

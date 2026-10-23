@@ -65,6 +65,37 @@ function harness(target: 'claude-code' | 'gemini-cli' | 'grok-build' | 'deepseek
 }
 
 describe('connection-only CLI lifecycle adapters', () => {
+  it.each(['claude-code', 'gemini-cli', 'grok-build', 'deepseek-harness'] as const)(
+    'rolls back connection files when %s fails to launch', async (target) => {
+      const { adapter, runtime, config, events } = harness(target)
+      vi.mocked(runtime.startNew).mockRejectedValueOnce(new Error('spawn denied'))
+      await expect(adapter.start(undefined, connection)).rejects.toMatchObject({ phase: 'start', message: expect.stringContaining('spawn denied') })
+      expect(config.rollback).toHaveBeenCalledOnce()
+      expect(events).toEqual(['repair', 'validate', 'rollback'])
+    },
+  )
+
+  it('rolls back failed restart configuration before recovering the original managed instance', async () => {
+    const { adapter, runtime, events } = harness()
+    vi.mocked(runtime.startManaged).mockImplementationOnce(async () => {
+      events.push('restart-failed')
+      throw new Error('new connection rejected')
+    })
+    await expect(adapter.restore(connection)).rejects.toMatchObject({ phase: 'start' })
+    expect(events).toEqual(['close:one', 'repair', 'validate', 'restart-failed', 'close:one', 'rollback', 'restart:one'])
+    expect(runtime.closeManaged).not.toHaveBeenCalledWith('idle')
+  })
+
+  it('does not overwrite files while a partially restarted managed process refuses to close', async () => {
+    const { adapter, runtime, config } = harness()
+    vi.mocked(runtime.startManaged).mockRejectedValueOnce(new Error('start failed'))
+    vi.mocked(runtime.closeManaged).mockResolvedValueOnce(undefined).mockRejectedValueOnce(new Error('still alive'))
+    await expect(adapter.restore(connection)).rejects.toMatchObject({ phase: 'rollback',
+      recoveryErrors: expect.arrayContaining(['one: restart cleanup: still alive']) })
+    expect(config.rollback).not.toHaveBeenCalled()
+    expect(runtime.startManaged).toHaveBeenCalledTimes(1)
+  })
+
   it.each([
     ['claude-code', 'claude'],
     ['gemini-cli', 'gemini'],

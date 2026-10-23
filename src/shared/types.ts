@@ -381,6 +381,8 @@ export interface ClientConfigStatus {
 }
 
 export interface ClientConfigPreview {
+  /** Read-only comparison of current and proposed route connection contracts. */
+  routeChangesConnection?: boolean
   client: RouteClient
   profileId: string
   files: Array<{
@@ -545,6 +547,8 @@ export interface ClientConfigBackupSetRestoreResult {
 }
 
 export interface ClientConfigApplyResult {
+  /** Opaque revisions of this operation's writes; never configuration content. */
+  postWriteRevisions?: Partial<Record<ClientConfigFileRole, string>>
   client: RouteClient
   changedFiles: string[]
   backups: ClientConfigBackup[]
@@ -2207,7 +2211,7 @@ export interface GatewayApi {
   ensureGatewayRunning(input?: EnsureGatewayRunningInput): Promise<EnsureGatewayRunningResult>
   verifySetupRoute(input: SetupRouteVerificationInput): Promise<SetupRouteVerificationResult>
   setClientRouteSource(input: ClientRouteSourceInput): Promise<AppSnapshot>
-  updateRoute(route: Route): Promise<AppSnapshot>
+  updateRoute(route: Route, expected?: Route): Promise<AppSnapshot>
   updateGateway(settings: GatewaySettings): Promise<AppSnapshot>
   startGateway(): Promise<AppSnapshot>
   stopGateway(): Promise<AppSnapshot>
@@ -2235,7 +2239,8 @@ export interface GatewayApi {
   importClientProfile(bundle: ProfileBundle): Promise<AppSnapshot>
   chooseClientConfigDirectory(client: RouteClient, currentDirectory?: string): Promise<string | null>
   getClientConfigs(profileId?: string): Promise<ClientConfigStatus[]>
-  previewClientConfig(client: RouteClient, profileId?: string): Promise<ClientConfigPreview>
+  previewClientConfig(client: RouteClient, profileId?: string, proposedRoute?: Route, mode?: 'repair'): Promise<ClientConfigPreview>
+  rollbackClientConfigRepair(client: RouteClient, profileId: string, groupId: string, revisions: Partial<Record<ClientConfigFileRole, string>>): Promise<void>
   applyClientConfig(client: RouteClient, profileId?: string): Promise<ClientConfigApplyResult>
   repairClientConfig(client: RouteClient, profileId?: string): Promise<ClientConfigRepairResult>
   restoreCodexOfficialLoginAndSessions(profileId?: string): Promise<CodexOfficialLoginRecoveryResult>

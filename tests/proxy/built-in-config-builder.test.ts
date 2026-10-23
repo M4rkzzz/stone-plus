@@ -7,6 +7,12 @@ import { parseBuiltInProxyProfile } from '../../src/main/proxy/built-in/profile-
 
 const UUID = '9f1c5f42-7702-4a12-b50c-2fb36b7bba4a'
 
+/** Loopback is pinned direct by hostname and by address before any other rule. */
+const loopbackRules = [
+  { domain: ['localhost'], domain_suffix: ['.localhost'], action: 'route', outbound: 'stone-direct' },
+  { ip_cidr: ['127.0.0.0/8', '::1/128'], action: 'route', outbound: 'stone-direct' },
+]
+
 describe('built-in sing-box config builder', () => {
   it('reconstructs a listener-free allow-listed source config with platform DNS', () => {
     const profile = parseBuiltInProxyProfile(JSON.stringify({
@@ -40,9 +46,7 @@ describe('built-in sing-box config builder', () => {
     const profile = parseBuiltInProxyProfile('trojan://password@edge.example.com:443#Node')
     const result = buildSingBoxConfig({ profile, mode: 'rule', accessMode: 'tun' })
 
-    expect(result.config.route.rules).toEqual([
-      expect.objectContaining({ ip_cidr: ['127.0.0.0/8', '::1/128'], outbound: 'stone-direct' }),
-    ])
+    expect(result.config.route.rules).toEqual(loopbackRules)
     expect(result.config.route.rule_set).toBeUndefined()
     expect(JSON.stringify(result.config)).not.toContain('githubusercontent.com')
     expect(JSON.stringify(result.config)).not.toContain('geosite')
@@ -66,7 +70,8 @@ describe('built-in sing-box config builder', () => {
     const result = buildSingBoxConfig({ profile, mode: 'rule', accessMode: 'system' })
 
     expect(result.routePolicy).toBe('preserved')
-    expect(result.config.route.rules.slice(1)).toEqual([
+    expect(result.config.route.rules.slice(0, 2)).toEqual(loopbackRules)
+    expect(result.config.route.rules.slice(2)).toEqual([
       { action: 'sniff', timeout: '300ms' },
       { domain: ['ads.example'], action: 'reject', method: 'default' },
       { domain_suffix: ['internal.example'], action: 'route', outbound: 'stone-direct' },
@@ -92,7 +97,9 @@ describe('built-in sing-box config builder', () => {
       accessMode: 'system',
       requiredProxyDomains: ['relay.vendor.example'],
     })
-    const supplemental = result.config.route.rules.find((rule) => Array.isArray(rule.domain_suffix))
+    const supplemental = result.config.route.rules.find((rule) => (
+      rule.domain_suffix?.includes?.('chatgpt.com') === true
+    ))
 
     expect(supplemental).toMatchObject({ action: 'route', outbound: result.activeOutboundTag })
     expect(supplemental?.domain_suffix).toContain('relay.vendor.example')
@@ -127,7 +134,7 @@ describe('built-in sing-box config builder', () => {
     )
   })
 
-  it('ignores legacy standalone custom rules and keeps subscription rules', () => {
+  it('layers custom rules ahead of subscription rules without replacing them or the base final action', () => {
     const profile = parseBuiltInProxyProfile(JSON.stringify({
       outbounds: [
         { type: 'trojan', tag: 'Node', server: 'edge.example.com', server_port: 443, password: 'password' },
@@ -143,15 +150,97 @@ describe('built-in sing-box config builder', () => {
       mode: 'rule',
       accessMode: 'system',
       customRules: {
-        rules: [{ id: 'old', condition: 'domain-suffix', values: ['custom.example'], action: 'direct' }],
+        rules: [{ id: 'own', condition: 'domain-suffix', values: ['custom.example'], action: 'direct' }],
+        // An increment must not take over unmatched traffic; the mode still does.
+        finalAction: 'direct',
+      },
+    })
+    const overlayIndex = result.config.route.rules.findIndex((rule) => (
+      rule.domain_suffix?.includes?.('custom.example') === true
+    ))
+    const subscriptionIndex = result.config.route.rules.findIndex((rule) => (
+      rule.domain_suffix?.includes?.('subscription.example') === true
+    ))
+
+    expect(result.routePolicy).toBe('preserved')
+    expect(overlayIndex).toBeGreaterThan(-1)
+    expect(subscriptionIndex).toBeGreaterThan(-1)
+    expect(overlayIndex).toBeLessThan(subscriptionIndex)
+    expect(result.config.route.rules[overlayIndex]).toMatchObject({
+      action: 'route', outbound: 'stone-direct',
+    })
+    expect(result.config.route.final).toBe(result.activeOutboundTag)
+    expect(result.warnings.join(' ')).toContain('global overlay')
+  })
+
+  it('applies the custom overlay in direct mode and pulls in the node outbound for a proxy action', () => {
+    const profile = parseBuiltInProxyProfile('trojan://password@edge.example.com:443#Node')
+    const result = buildSingBoxConfig({
+      profile,
+      mode: 'direct',
+      accessMode: 'system',
+      customRules: {
+        rules: [{ id: 'via-proxy', condition: 'domain-suffix', values: ['work.example'], action: 'proxy' }],
         finalAction: 'direct',
       },
     })
 
-    expect(result.routePolicy).toBe('preserved')
-    expect(JSON.stringify(result.config)).toContain('subscription.example')
-    expect(JSON.stringify(result.config)).not.toContain('custom.example')
-    expect(result.warnings.join(' ')).toContain('standalone custom rule set was ignored')
+    expect(result.routePolicy).toBe('direct')
+    expect(result.config.route.final).toBe('stone-direct')
+    expect(result.activeOutboundTag).toBeDefined()
+    expect(result.config.outbounds).toEqual([
+      expect.objectContaining({ type: 'trojan', tag: result.activeOutboundTag }),
+      expect.objectContaining({ type: 'direct', tag: 'stone-direct' }),
+    ])
+    expect(result.config.route.rules).toEqual([
+      ...loopbackRules,
+      { action: 'sniff', timeout: '300ms' },
+      { domain_suffix: ['work.example'], action: 'route', outbound: result.activeOutboundTag },
+    ])
+  })
+
+  it('keeps a custom overlay from cutting off a mandatory first-party domain', () => {
+    const profile = parseBuiltInProxyProfile('trojan://password@edge.example.com:443#Node')
+    const result = buildSingBoxConfig({
+      profile,
+      mode: 'rule',
+      accessMode: 'system',
+      customRules: {
+        rules: [{ id: 'block-upstream', condition: 'domain-suffix', values: ['openai.com'], action: 'block' }],
+        finalAction: 'proxy',
+      },
+    })
+    const mandatoryIndex = result.config.route.rules.findIndex((rule) => (
+      rule.domain_suffix?.includes?.('openai.com') === true && rule.outbound === result.activeOutboundTag
+    ))
+    const overlayIndex = result.config.route.rules.findIndex((rule) => rule.action === 'reject')
+
+    expect(mandatoryIndex).toBeGreaterThan(-1)
+    expect(overlayIndex).toBeGreaterThan(-1)
+    expect(mandatoryIndex).toBeLessThan(overlayIndex)
+  })
+
+  it('skips a mainland-China custom rule because Stone+ ships no geographic rule set', () => {
+    const profile = parseBuiltInProxyProfile('trojan://password@edge.example.com:443#Node')
+    const result = buildSingBoxConfig({
+      profile,
+      mode: 'rule',
+      accessMode: 'system',
+      customRules: {
+        rules: [
+          { id: 'cn', condition: 'mainland-china', values: [], action: 'direct' },
+          { id: 'lan', condition: 'private-network', values: [], action: 'direct' },
+        ],
+        finalAction: 'proxy',
+      },
+    })
+
+    expect(JSON.stringify(result.config)).not.toContain('geosite')
+    expect(JSON.stringify(result.config)).not.toContain('geoip')
+    expect(result.config.route.rules).toContainEqual({
+      ip_is_private: true, action: 'route', outbound: 'stone-direct',
+    })
+    expect(result.warnings.join(' ')).toContain('mainland-China condition were skipped')
   })
 
   it('skips legacy external-database rules without losing the supported subset', () => {
@@ -177,9 +266,8 @@ describe('built-in sing-box config builder', () => {
     const global = buildSingBoxConfig({ profile, mode: 'global', accessMode: 'tun' })
     const direct = buildSingBoxConfig({ profile, mode: 'direct', accessMode: 'system' })
 
-    expect(global.config.route.rules).toEqual([
-      expect.objectContaining({ ip_cidr: ['127.0.0.0/8', '::1/128'], outbound: 'stone-direct' }),
-    ])
+    expect(global.config.route.rules).toEqual(loopbackRules)
+    expect(direct.config.route.rules).toEqual(loopbackRules)
     expect(global.config.route.final).toBe(global.activeOutboundTag)
     expect(direct.config.outbounds).toEqual([
       expect.objectContaining({ type: 'direct', tag: 'stone-direct' }),

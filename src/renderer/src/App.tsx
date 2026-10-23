@@ -530,12 +530,17 @@ export default function App() {
   }, [mobileLayout, mobileNavOpen])
 
   useEffect(() => {
-    if (!snapshot || page === 'setup' || window.localStorage.getItem(SETUP_AUTO_SHOWN_STORAGE_KEY) === 'true') return
+    if (!snapshot || page === 'setup' || storedBoolean(SETUP_AUTO_SHOWN_STORAGE_KEY)) return
     const usableAccounts = snapshot.accounts.filter((account) => account.status !== 'disabled' && account.status !== 'expired')
     const usableSourceIds = new Set(listRouteSources(snapshot).map((source) => source.id))
     const hasEnabledRoute = snapshot.routes.some((route) => route.enabled && usableSourceIds.has(route.poolId))
     if (usableAccounts.length && usableSourceIds.size && hasEnabledRoute) return
-    window.localStorage.setItem(SETUP_AUTO_SHOWN_STORAGE_KEY, 'true')
+    try {
+      window.localStorage.setItem(SETUP_AUTO_SHOWN_STORAGE_KEY, 'true')
+    } catch {
+      // Storage may be unavailable (web preview, blocked cookies); showing the
+      // setup wizard once more is harmless when the flag cannot be persisted.
+    }
     setPage('setup')
     window.history.replaceState(null, '', '#setup')
   }, [page, snapshot])
