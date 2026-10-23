@@ -635,8 +635,14 @@ try {
   if (!switchTargetId) throw new Error('No alternate smoke route source was available for the client switch test.')
   const codexConfigBeforeSourceSwitch = await readFile(codexConfigPath, 'utf8')
   await clientUpstreamSelect.selectOption(switchTargetId)
-  await window.getByText(/客户端配置文件未改动/).waitFor()
-  await window.waitForTimeout(250)
+  // Observe completion of the current workflow, not the old implementation's
+  // promise that every source switch leaves client files untouched. A switch
+  // with a different connection contract may legitimately repair those files.
+  await window.locator('.client-easy-toast[role="status"]').filter({ hasText: /^已切换到 / }).waitFor()
+  await window.waitForFunction(async (sourceId) => {
+    const snapshot = await window.stone.getSnapshot()
+    return snapshot.routes.some((route) => route.client === 'codex' && route.poolId === sourceId)
+  }, switchTargetId)
   const sourceSwitchSnapshot = await window.evaluate(() => window.stone.getSnapshot())
   const codexConfigAfterSourceSwitch = await readFile(codexConfigPath, 'utf8')
   const agentLimitSetting = window.locator('[data-testid="codex-agent-limit-setting"]')
